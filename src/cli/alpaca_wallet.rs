@@ -15,6 +15,7 @@ use st0x_finance::Usdc;
 use st0x_float_serde::format_float_with_fallback;
 
 use super::ConvertDirection;
+use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpressure};
 use st0x_config::{BrokerCtx, Ctx};
 
 pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write>(
@@ -44,9 +45,11 @@ pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write
     writeln!(stdout, "   Fetching Alpaca deposit address...")?;
     let usdc_symbol = TokenSymbol::new("USDC");
     let ethereum = Network::new("ethereum");
-    let deposit_address = alpaca_wallet
-        .get_wallet_address(&usdc_symbol, &ethereum)
-        .await?;
+    let deposit_address = retry_on_backpressure(
+        || alpaca_wallet.get_wallet_address(&usdc_symbol, &ethereum),
+        BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+    )
+    .await?;
     writeln!(stdout, "   Alpaca deposit address: {deposit_address}")?;
 
     let amount_u256 = amount.to_u256_6_decimals()?;
@@ -224,7 +227,11 @@ pub(super) async fn alpaca_withdraw_command<Registry: IntoErrorRegistry, W: Writ
     // Check whitelist before on-chain balance to fail fast on invalid destinations.
     // Chain comparison intentionally omitted -- Alpaca returns inconsistent chain
     // values ("ETH" vs "ethereum"). Matches is_address_whitelisted_and_approved.
-    let whitelist = alpaca_wallet.get_whitelisted_addresses().await?;
+    let whitelist = retry_on_backpressure(
+        || alpaca_wallet.get_whitelisted_addresses(),
+        BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+    )
+    .await?;
     let is_whitelisted = whitelist.iter().any(|entry| {
         entry.address == to_address
             && entry.asset == usdc_asset
@@ -364,7 +371,11 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     );
 
     writeln!(stdout, "   Checking existing whitelist entries...")?;
-    let existing = alpaca_wallet.get_whitelisted_addresses().await?;
+    let existing = retry_on_backpressure(
+        || alpaca_wallet.get_whitelisted_addresses(),
+        BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+    )
+    .await?;
 
     for entry in &existing {
         if entry.address == target_address && entry.asset.as_ref() == "USDC" {

@@ -350,6 +350,7 @@ where
         offchain_order: context.frameworks.offchain_order.clone(),
         order_placer: order_placer.clone(),
         poll_status_queue: poll_status_queue.clone(),
+        hedge_queue: hedge_queue.clone(),
         assets: context.ctx.assets.clone(),
         counter_trade_submission_lock: counter_trade_submission_lock.clone(),
         counter_trade_slippage_bps: match &context.ctx.broker {
@@ -1278,6 +1279,7 @@ mod tests {
     use st0x_wrapper::{MockWrapper, Wrapper};
 
     use super::*;
+    use crate::conductor::job::BackpressureStreak;
     use crate::equity_redemption::RedemptionAggregateId;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::{
@@ -1395,6 +1397,8 @@ mod tests {
                 aggregate_id: poison_id.clone(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -1423,6 +1427,8 @@ mod tests {
                 aggregate_id: healthy_id,
                 symbol,
                 quantity: FractionalShares::new(float!(1)),
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -1462,6 +1468,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: 0,
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -1491,6 +1499,8 @@ mod tests {
                 symbol,
                 quantity: FractionalShares::new(float!(1)),
                 generation: 0,
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();

@@ -29,14 +29,18 @@ use tracing::{error, warn};
 
 use st0x_bridge::cctp::CctpError;
 use st0x_evm::Wallet;
-use st0x_execution::AlpacaWalletError;
+use st0x_execution::{AlpacaWalletError, Backpressure};
 use st0x_finance::Usdc;
 
 use super::UsdcTransferError;
 use super::manager::CrossVenueCashTransfer;
 use crate::alerts::Notifier;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
-use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
+use crate::conductor::job::{
+    BACKPRESSURE_ALERT_STREAK, BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureOutcome,
+    BackpressureStep, BackpressureStreak, Job, JobQueue, Label, QueuePushError,
+    advance_backpressure, apply_backpressure_step, find_backpressure,
+};
 use crate::usdc_rebalance::UsdcRebalanceId;
 
 const ATTESTATION_REDRIVE_DELAY: Duration = Duration::from_secs(60);
@@ -292,6 +296,161 @@ where
     }
 }
 
+#[derive(Clone, Copy)]
+enum BackpressureSite {
+    Hedging,
+    MarketMaking,
+    WithdrawalPoll { deadline_elapsed: bool },
+}
+
+struct BackpressureLabels {
+    direction: &'static str,
+    context: &'static str,
+    state: &'static str,
+    alert: &'static str,
+}
+
+impl BackpressureSite {
+    const fn labels(self) -> BackpressureLabels {
+        match self {
+            Self::Hedging => BackpressureLabels {
+                direction: "Base->Alpaca",
+                context: "broker rate-limiting",
+                state: "mid-flight",
+                alert: "hedging",
+            },
+            Self::MarketMaking => BackpressureLabels {
+                direction: "Alpaca->Base",
+                context: "broker rate-limiting",
+                state: "mid-flight",
+                alert: "market-making",
+            },
+            Self::WithdrawalPoll { .. } => BackpressureLabels {
+                direction: "Alpaca->Base",
+                context: "withdrawal poll broker rate-limiting",
+                state: "in Withdrawing",
+                alert: "withdrawal-poll",
+            },
+        }
+    }
+
+    const fn should_page_at_streak(self) -> bool {
+        !matches!(
+            self,
+            Self::WithdrawalPoll {
+                deadline_elapsed: true
+            }
+        )
+    }
+}
+
+/// Shared log-and-notify tail for a backpressure `outcome`, used by every
+/// call site that routes a classified 429 through `advance_backpressure`/
+/// `apply_backpressure_step`: logs a loud, distinct `error!` and pages the
+/// operator once on `DeadLettered` (unconditionally), or once when the
+/// reschedule streak first crosses `BACKPRESSURE_ALERT_STREAK` on
+/// `Rescheduled`. The typed `site` selects the direction, rate-limited
+/// operation, held aggregate state, and alert-delivery label as one coherent
+/// set so callers cannot accidentally combine labels from different transfer
+/// stages. `streak_before_this_attempt` is only read on `DeadLettered` -- that
+/// variant carries no streak of its own, so the caller's already-known
+/// `backpressure_streak` (the value that made this attempt exhaust the budget)
+/// is what gets logged.
+async fn log_and_alert_backpressure_outcome(
+    id: &UsdcRebalanceId,
+    site: BackpressureSite,
+    streak_before_this_attempt: BackpressureStreak,
+    outcome: BackpressureOutcome,
+    notifier: &Arc<dyn Notifier>,
+) {
+    let BackpressureLabels {
+        direction,
+        context,
+        state,
+        alert,
+    } = site.labels();
+
+    match outcome {
+        BackpressureOutcome::DeadLettered => {
+            let BackpressureStreak(streak) = streak_before_this_attempt;
+            error!(
+                target: "rebalance",
+                %id,
+                streak,
+                limit = BACKPRESSURE_RESCHEDULE_LIMIT,
+                "{direction} USDC transfer: {context} exceeded the reschedule \
+                 budget; dead-lettering instead of opening the circuit breaker -- \
+                 treat as a structurally-dead Alpaca integration needing manual \
+                 reconciliation"
+            );
+            let message = format!(
+                "USDC transfer {id}: {context} exceeded the \
+                 {BACKPRESSURE_RESCHEDULE_LIMIT}-reschedule budget. Aggregate stays \
+                 {state} (guard held); likely a structurally-dead Alpaca \
+                 integration (suspended account, revoked key) needing manual \
+                 reconciliation."
+            );
+            if let Err(error) = notifier.notify(&message).await {
+                warn!(
+                    target: "rebalance", ?error,
+                    "Failed to deliver USDC {alert} backpressure dead-letter alert"
+                );
+            }
+        }
+        BackpressureOutcome::Rescheduled {
+            next_streak: BackpressureStreak(streak),
+            visible,
+        } => {
+            if visible {
+                error!(
+                    target: "rebalance",
+                    %id,
+                    streak,
+                    "{direction} USDC transfer: {context} still rescheduling after \
+                     sustained broker rate-limiting"
+                );
+            }
+            if streak == BACKPRESSURE_ALERT_STREAK && site.should_page_at_streak() {
+                let message = format!(
+                    "USDC transfer {id}: {context} has persisted for {streak} consecutive \
+                     reschedules. Aggregate stays {state} (guard held); investigate \
+                     Alpaca connectivity/rate limits before the \
+                     {BACKPRESSURE_RESCHEDULE_LIMIT}-attempt budget is exhausted."
+                );
+                if let Err(error) = notifier.notify(&message).await {
+                    warn!(
+                        target: "rebalance", ?error,
+                        "Failed to deliver USDC {alert} sustained-backpressure alert"
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn alert_withdrawal_poll_deadline_elapsed(
+    id: &UsdcRebalanceId,
+    elapsed: Duration,
+    source: &AlpacaWalletError,
+    notifier: &Arc<dyn Notifier>,
+) {
+    let message = format!(
+        "Alpaca->Base USDC transfer {id}: withdrawal polling inconclusive \
+         for {elapsed:?} (>{WITHDRAWAL_POLL_ALERT_DEADLINE:?}). Alpaca may \
+         be unreachable or credentials may have changed ({source}). Aggregate stays in \
+         Withdrawing (guard held). Use `stox transfer resume --kind usdc --id \
+         {id} --direction to-raindex` to manually re-poll, or investigate \
+         Alpaca connectivity."
+    );
+    if let Err(notify_err) = notifier.notify(&message).await {
+        warn!(
+            target: "rebalance",
+            ?notify_err,
+            "Failed to deliver withdrawal-poll-deadline-elapsed alert"
+        );
+    }
+}
+
 /// Apalis queue type for [`TransferUsdcToHedging`].
 pub(crate) type TransferUsdcToHedgingJobQueue = JobQueue<TransferUsdcToHedging>;
 
@@ -408,6 +567,13 @@ pub(crate) struct TransferUsdcToHedging {
     /// so the bound is durable across restarts.
     #[serde(default)]
     pub(crate) revert_redrive_attempts: u32,
+    /// Count of consecutive broker rate-limit (429) reschedules leading up to
+    /// this attempt (RAI-1494). `#[serde(default)]` so a row enqueued under
+    /// the pre-this-change payload shape still deserializes to `0` instead of
+    /// crashing the poll stream's `sqlx::Decode`. Independent of
+    /// `revert_redrive_attempts`, which covers a different failure class.
+    #[serde(default)]
+    pub(crate) backpressure_streak: BackpressureStreak,
 }
 
 impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
@@ -634,35 +800,7 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                     warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging vault-liquidity alert");
                 }
             }
-            Err(error) => {
-                // Terminal non-redriven error: fire notifier before surfacing
-                // to apalis so the operator is alerted before the circuit opens.
-                //
-                // KNOWN LIMITATION: this arm fires on every apalis attempt (up
-                // to 4x with the default RetryPolicy::retries(3)). Because the
-                // apalis retry uses the same serialized payload and `perform`
-                // has no visibility into the current attempt number, suppressing
-                // duplicates here is not feasible without threading apalis
-                // attempt context through. The bounded-limit path
-                // (BurnRevertLimitReached / TimeoutLimitReached) already fires
-                // exactly once via the Ok-return redrive pattern; this generic
-                // terminal arm is a best-effort alert that may duplicate.
-                let id = &self.id;
-                error!(
-                    target: "rebalance",
-                    %id,
-                    %error,
-                    "Base->Alpaca USDC transfer failed terminally; circuit will open"
-                );
-                let message = format!(
-                    "USDC transfer {id} failed: {error}. \
-                     Check if apalis will retry before acting."
-                );
-                if let Err(error) = ctx.notifier.notify(&message).await {
-                    warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging terminal-error alert");
-                }
-                return Err(error.into());
-            }
+            Err(error) => return self.handle_terminal_or_backpressure_error(ctx, error).await,
         }
 
         Ok(())
@@ -670,6 +808,81 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
 }
 
 impl TransferUsdcToHedging {
+    /// Handles the generic (unclassified-by-name) terminal error arm:
+    /// reschedules with a classified delay on broker rate-limiting (429)
+    /// instead of consuming the terminal retry budget and alerting, or falls
+    /// through to the pre-existing terminal alert+propagate path for any
+    /// other error. `TransferUsdcToHedging` is a "true retry" job (RAI-1494
+    /// plan): `resume_base_to_alpaca` re-drives from the top on every attempt
+    /// with no committed guard specific to this failure class, so every
+    /// reschedule genuinely re-attempts the resume. Exception: the USDC->USD
+    /// conversion placement sub-step never reaches this arm on a 429 -- it
+    /// fails fast unconditionally (see `execute_usdc_to_usd_conversion`) and
+    /// returns `ConversionPlacementFailed`, which `find_backpressure` never
+    /// classifies, so it falls through to the plain terminal path below.
+    async fn handle_terminal_or_backpressure_error(
+        &self,
+        ctx: &TransferUsdcToHedgingCtx,
+        error: UsdcTransferError,
+    ) -> Result<(), TransferUsdcToHedgingJobError> {
+        if let Some(backpressure) = find_backpressure(&error) {
+            let step = advance_backpressure(&backpressure, self.backpressure_streak);
+            let mut job_queue = ctx.job_queue.clone();
+            let outcome = apply_backpressure_step(step, &mut job_queue, |next_streak| Self {
+                id: self.id.clone(),
+                amount: self.amount,
+                revert_redrive_attempts: self.revert_redrive_attempts,
+                backpressure_streak: next_streak,
+            })
+            .await?;
+
+            // Per the RAI-1494 plan's binding M2 decision: this is a
+            // supervised worker, so dead-letter instead of propagating `Err`
+            // into the shared supervised on-event path. RAI-1494 pass 3:
+            // both dead-lettering and sustained rescheduling must page the
+            // operator -- rerouting a 429 through this reschedule machinery
+            // must not silently drop the alerting the pre-existing terminal
+            // path gave every sustained failure.
+            log_and_alert_backpressure_outcome(
+                &self.id,
+                BackpressureSite::Hedging,
+                self.backpressure_streak,
+                outcome,
+                &ctx.notifier,
+            )
+            .await;
+
+            return Ok(());
+        }
+
+        // Terminal non-redriven error: fire notifier before surfacing
+        // to apalis so the operator is alerted before the circuit opens.
+        //
+        // KNOWN LIMITATION: this arm fires on every apalis attempt (up
+        // to 4x with the default RetryPolicy::retries(3)). Because the
+        // apalis retry uses the same serialized payload and `perform`
+        // has no visibility into the current attempt number, suppressing
+        // duplicates here is not feasible without threading apalis
+        // attempt context through. The bounded-limit path
+        // (BurnRevertLimitReached / TimeoutLimitReached) already fires
+        // exactly once via the Ok-return redrive pattern; this generic
+        // terminal arm is a best-effort alert that may duplicate.
+        let id = &self.id;
+        error!(
+            target: "rebalance",
+            %id,
+            %error,
+            "Base->Alpaca USDC transfer failed terminally; circuit will open"
+        );
+        let message = format!(
+            "USDC transfer {id} failed: {error}. Check if apalis will retry before acting."
+        );
+        if let Err(error) = ctx.notifier.notify(&message).await {
+            warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging terminal-error alert");
+        }
+        Err(error.into())
+    }
+
     /// Handles a per-attempt timeout by either opening the circuit (when the
     /// redrive limit is reached) or scheduling a delayed redrive attempt.
     /// Extracted from `Job::perform` to mirror the market-making extraction and
@@ -759,6 +972,7 @@ impl TransferUsdcToHedging {
 
         let updated = Self {
             revert_redrive_attempts: next_attempts,
+            backpressure_streak: BackpressureStreak::default(),
             ..self.clone()
         };
         ctx.job_queue
@@ -861,6 +1075,7 @@ impl TransferUsdcToHedging {
 
         let updated = Self {
             revert_redrive_attempts: next_attempts,
+            backpressure_streak: BackpressureStreak::default(),
             ..self.clone()
         };
         ctx.job_queue
@@ -943,6 +1158,13 @@ pub(crate) struct TransferUsdcToMarketMaking {
     /// the apalis payload so the bound is durable across restarts.
     #[serde(default)]
     pub(crate) revert_redrive_attempts: u32,
+    /// Count of consecutive broker rate-limit (429) reschedules leading up to
+    /// this attempt (RAI-1494). `#[serde(default)]` so a row enqueued under
+    /// the pre-this-change payload shape still deserializes to `0` instead of
+    /// crashing the poll stream's `sqlx::Decode`. Independent of
+    /// `revert_redrive_attempts`, which covers a different failure class.
+    #[serde(default)]
+    pub(crate) backpressure_streak: BackpressureStreak,
 }
 
 impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
@@ -1116,14 +1338,35 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
             // the same transfer ID is re-polled. Before the alert deadline only
             // a warn log fires; at or after the deadline the operator is paged on
             // every redrive while the guard stays held and re-polling continues.
+            // A classified broker rate-limit (429) on the withdrawal poll must
+            // route through the same bounded backpressure machinery as every
+            // other call site (RAI-1494), not the old unbounded inconclusive
+            // redrive: without this, a sustained 429 here would never
+            // increment `backpressure_streak`, honour `Retry-After`, or ever
+            // dead-letter at `BACKPRESSURE_RESCHEDULE_LIMIT`. Any other
+            // inconclusive poll error (timeout, network, non-429 API error)
+            // keeps the pre-existing unbounded redrive via
+            // `handle_withdrawal_poll_inconclusive`.
             Err(UsdcTransferError::WithdrawalPollInconclusive {
                 id,
                 initiated_at,
                 source,
-            }) => {
-                self.handle_withdrawal_poll_inconclusive(ctx, id, initiated_at, source)
+            }) => match source.backpressure() {
+                None => {
+                    self.handle_withdrawal_poll_inconclusive(ctx, id, initiated_at, source)
+                        .await?;
+                }
+                Some(backpressure) => {
+                    self.handle_withdrawal_poll_backpressure(
+                        ctx,
+                        id,
+                        initiated_at,
+                        source,
+                        backpressure,
+                    )
                     .await?;
-            }
+                }
+            },
             // Revert-class burn failures: safe to redrive because
             // `resume_bridging_submitting` scans for an existing burn before
             // re-burning (the scan lower bound is durably recorded). The safety
@@ -1193,35 +1436,7 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
                     warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making inconclusive-burn alert");
                 }
             }
-            Err(error) => {
-                // Terminal non-redriven error: fire notifier before surfacing
-                // to apalis so the operator is alerted before the circuit opens.
-                //
-                // KNOWN LIMITATION: this arm fires on every apalis attempt (up
-                // to 4x with the default RetryPolicy::retries(3)). Because the
-                // apalis retry uses the same serialized payload and `perform`
-                // has no visibility into the current attempt number, suppressing
-                // duplicates here is not feasible without threading apalis
-                // attempt context through. The bounded-limit path
-                // (BurnRevertLimitReached) already fires exactly once via the
-                // Ok-return redrive pattern; this generic terminal arm is a
-                // best-effort alert that may duplicate.
-                let id = &self.id;
-                error!(
-                    target: "rebalance",
-                    %id,
-                    %error,
-                    "Alpaca->Base USDC transfer failed terminally; circuit will open"
-                );
-                let message = format!(
-                    "USDC transfer {id} failed: {error}. \
-                     Check if apalis will retry before acting."
-                );
-                if let Err(error) = ctx.notifier.notify(&message).await {
-                    warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making terminal-error alert");
-                }
-                return Err(error.into());
-            }
+            Err(error) => return self.handle_terminal_or_backpressure_error(ctx, error).await,
         }
 
         Ok(())
@@ -1264,6 +1479,139 @@ impl TransferUsdcToMarketMaking {
         Ok(())
     }
 
+    /// Handles the generic (unclassified-by-name) terminal error arm:
+    /// reschedules with a classified delay on broker rate-limiting (429)
+    /// instead of consuming the terminal retry budget and alerting, or falls
+    /// through to the pre-existing terminal alert+propagate path for any
+    /// other error. `TransferUsdcToMarketMaking` is a "true retry" job
+    /// (RAI-1494 plan): `resume_alpaca_to_base` re-drives from the top on
+    /// every attempt with no committed guard specific to this failure class,
+    /// so every reschedule genuinely re-attempts the resume. Exception: the
+    /// USD->USDC conversion placement sub-step never reaches this arm on a
+    /// 429 -- it fails fast unconditionally (see
+    /// `execute_usd_to_usdc_conversion`) and returns
+    /// `ConversionPlacementFailed`, which `find_backpressure` never
+    /// classifies, so it falls through to the plain terminal path below.
+    async fn handle_terminal_or_backpressure_error(
+        &self,
+        ctx: &TransferUsdcToMarketMakingCtx,
+        error: UsdcTransferError,
+    ) -> Result<(), TransferUsdcToMarketMakingJobError> {
+        if let Some(backpressure) = find_backpressure(&error) {
+            let step = advance_backpressure(&backpressure, self.backpressure_streak);
+            let mut job_queue = ctx.job_queue.clone();
+            let outcome = apply_backpressure_step(step, &mut job_queue, |next_streak| Self {
+                id: self.id.clone(),
+                amount: self.amount,
+                revert_redrive_attempts: self.revert_redrive_attempts,
+                backpressure_streak: next_streak,
+            })
+            .await?;
+
+            // Per the RAI-1494 plan's binding M2 decision: this is a
+            // supervised worker, so dead-letter instead of propagating `Err`
+            // into the shared supervised on-event path. RAI-1494 pass 3:
+            // both dead-lettering and sustained rescheduling must page the
+            // operator -- rerouting a 429 through this reschedule machinery
+            // must not silently drop the alerting the pre-existing terminal
+            // path gave every sustained failure.
+            log_and_alert_backpressure_outcome(
+                &self.id,
+                BackpressureSite::MarketMaking,
+                self.backpressure_streak,
+                outcome,
+                &ctx.notifier,
+            )
+            .await;
+
+            return Ok(());
+        }
+
+        // Terminal non-redriven error: fire notifier before surfacing
+        // to apalis so the operator is alerted before the circuit opens.
+        //
+        // KNOWN LIMITATION: this arm fires on every apalis attempt (up
+        // to 4x with the default RetryPolicy::retries(3)). Because the
+        // apalis retry uses the same serialized payload and `perform`
+        // has no visibility into the current attempt number, suppressing
+        // duplicates here is not feasible without threading apalis
+        // attempt context through. The bounded-limit path
+        // (BurnRevertLimitReached) already fires exactly once via the
+        // Ok-return redrive pattern; this generic terminal arm is a
+        // best-effort alert that may duplicate.
+        let id = &self.id;
+        error!(
+            target: "rebalance",
+            %id,
+            %error,
+            "Alpaca->Base USDC transfer failed terminally; circuit will open"
+        );
+        let message = format!(
+            "USDC transfer {id} failed: {error}. Check if apalis will retry before acting."
+        );
+        if let Err(error) = ctx.notifier.notify(&message).await {
+            warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making terminal-error alert");
+        }
+        Err(error.into())
+    }
+
+    /// Bounded backpressure path for a CLASSIFIED broker rate-limit (429) on the
+    /// withdrawal poll. Routes through the same machinery as every other call
+    /// site (RAI-1494) rather than the unbounded inconclusive redrive in
+    /// [`Self::handle_withdrawal_poll_inconclusive`]: without this, a sustained
+    /// 429 here would never increment `backpressure_streak`, honour
+    /// `Retry-After`, or ever dead-letter at `BACKPRESSURE_RESCHEDULE_LIMIT`.
+    async fn handle_withdrawal_poll_backpressure(
+        &self,
+        ctx: &TransferUsdcToMarketMakingCtx,
+        id: UsdcRebalanceId,
+        initiated_at: DateTime<Utc>,
+        source: AlpacaWalletError,
+        backpressure: Backpressure,
+    ) -> Result<(), TransferUsdcToMarketMakingJobError> {
+        let elapsed = Utc::now().signed_duration_since(initiated_at).to_std().ok();
+        let deadline_elapsed = deadline_elapsed(elapsed, WITHDRAWAL_POLL_ALERT_DEADLINE);
+        let mut step = advance_backpressure(&backpressure, self.backpressure_streak);
+        if deadline_elapsed.is_some()
+            && let BackpressureStep::Reschedule { delay, .. } = &mut step
+        {
+            *delay = (*delay).max(WITHDRAWAL_POLL_POST_DEADLINE_REDRIVE_DELAY);
+        }
+        let mut job_queue = ctx.job_queue.clone();
+        let outcome = apply_backpressure_step(step, &mut job_queue, |next_streak| Self {
+            id: id.clone(),
+            amount: self.amount,
+            revert_redrive_attempts: self.revert_redrive_attempts,
+            backpressure_streak: next_streak,
+        })
+        .await?;
+
+        if let Some(elapsed) = deadline_elapsed {
+            alert_withdrawal_poll_deadline_elapsed(&id, elapsed, &source, &ctx.notifier).await;
+        }
+
+        // Per the RAI-1494 plan's binding M2 decision: dead-letter instead of
+        // propagating `Err` into the shared supervised on-event path. The
+        // aggregate stays in Withdrawing (guard held); the pre-existing 4-hour
+        // alert deadline path (`handle_withdrawal_poll_inconclusive`) does not
+        // run on this bounded backpressure path, so this pages the operator
+        // directly instead (RAI-1494 pass 3) rather than staying silent until a
+        // manual restart is noticed, and pages once more when sustained
+        // backpressure crosses a deadline comparable to that same 4h alert.
+        log_and_alert_backpressure_outcome(
+            &id,
+            BackpressureSite::WithdrawalPoll {
+                deadline_elapsed: deadline_elapsed.is_some(),
+            },
+            self.backpressure_streak,
+            outcome,
+            &ctx.notifier,
+        )
+        .await;
+
+        Ok(())
+    }
+
     async fn handle_withdrawal_poll_inconclusive(
         &self,
         ctx: &TransferUsdcToMarketMakingCtx,
@@ -1298,26 +1646,20 @@ impl TransferUsdcToMarketMaking {
         );
 
         if let Some(elapsed) = alert_deadline_elapsed {
-            let message = format!(
-                "Alpaca->Base USDC transfer {id}: withdrawal polling inconclusive \
-                 for {elapsed:?} (>{WITHDRAWAL_POLL_ALERT_DEADLINE:?}). Alpaca may \
-                 be unreachable or credentials may have changed ({source}). Aggregate stays in \
-                 Withdrawing (guard held). Use `stox transfer resume --kind usdc --id \
-                 {id} --direction to-raindex` to manually re-poll, or investigate \
-                 Alpaca connectivity."
-            );
-            if let Err(notify_err) = ctx.notifier.notify(&message).await {
-                warn!(
-                    target: "rebalance",
-                    ?notify_err,
-                    "Failed to deliver withdrawal-poll-deadline-elapsed alert"
-                );
-            }
+            alert_withdrawal_poll_deadline_elapsed(&id, elapsed, &source, &ctx.notifier).await;
         }
 
+        // Reset backpressure_streak: this arm now only handles NON-backpressure
+        // inconclusive polls (a classified 429 is routed through the bounded
+        // backpressure machinery before reaching here), so any prior streak is
+        // unrelated to this redrive cause.
+        let updated = Self {
+            backpressure_streak: BackpressureStreak::default(),
+            ..self.clone()
+        };
         ctx.job_queue
             .clone()
-            .push_with_delay(self.clone(), redrive_delay)
+            .push_with_delay(updated, redrive_delay)
             .await?;
         Ok(())
     }
@@ -1441,6 +1783,7 @@ impl TransferUsdcToMarketMaking {
 
         let updated = Self {
             revert_redrive_attempts: next_attempts,
+            backpressure_streak: BackpressureStreak::default(),
             ..self.clone()
         };
         ctx.job_queue
@@ -1614,6 +1957,74 @@ mod tests {
             _amount: Usdc,
         ) -> Result<(), UsdcTransferError> {
             Err(UsdcTransferError::AttestationTimedOut { id: id.clone() })
+        }
+    }
+
+    fn wallet_429() -> UsdcTransferError {
+        UsdcTransferError::AlpacaWallet(AlpacaWalletError::ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: "rate limited".to_string(),
+            retry_after: Some(Duration::from_millis(1)),
+        })
+    }
+
+    fn wallet_500() -> UsdcTransferError {
+        UsdcTransferError::AlpacaWallet(AlpacaWalletError::ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "boom".to_string(),
+            retry_after: None,
+        })
+    }
+
+    struct RateLimitedBaseToAlpaca;
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for RateLimitedBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            _id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(wallet_429())
+        }
+    }
+
+    struct RateLimitedAlpacaToBase;
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for RateLimitedAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            _id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(wallet_429())
+        }
+    }
+
+    struct FailingBaseToAlpaca;
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for FailingBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            _id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(wallet_500())
+        }
+    }
+
+    struct FailingAlpacaToBase;
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for FailingAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            _id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(wallet_500())
         }
     }
 
@@ -1827,6 +2238,49 @@ mod tests {
         }
     }
 
+    /// Withdrawal poll returning a CLASSIFIED broker rate-limit (429), unlike
+    /// [`InconclusiveAlpacaToBase`]'s unclassifiable timeout -- pins that a
+    /// 429 here routes through the bounded backpressure machinery
+    /// (RAI-1494), not the old unbounded `WITHDRAWAL_POLL_REDRIVE_DELAY` path.
+    struct RateLimitedWithdrawalPollAlpacaToBase {
+        initiated_at: DateTime<Utc>,
+    }
+
+    impl RateLimitedWithdrawalPollAlpacaToBase {
+        fn before_deadline() -> Self {
+            Self {
+                initiated_at: Utc::now(),
+            }
+        }
+
+        fn after_deadline() -> Self {
+            Self {
+                initiated_at: Utc::now()
+                    - chrono::Duration::from_std(WITHDRAWAL_POLL_ALERT_DEADLINE).unwrap()
+                    - chrono::Duration::seconds(1),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for RateLimitedWithdrawalPollAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::WithdrawalPollInconclusive {
+                id: id.clone(),
+                initiated_at: self.initiated_at,
+                source: AlpacaWalletError::ApiError {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    message: "rate limited".to_string(),
+                    retry_after: Some(Duration::from_millis(1)),
+                },
+            })
+        }
+    }
+
     async fn setup_queue_pool() -> apalis_sqlite::SqlitePool {
         setup_test_apalis_pool().await
     }
@@ -1864,6 +2318,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let before = Utc::now().timestamp();
@@ -1916,6 +2371,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let before = Utc::now().timestamp();
@@ -1968,6 +2424,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 3,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -2007,6 +2464,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let before = Utc::now().timestamp();
@@ -2038,6 +2496,300 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transfer_usdc_to_hedging_payload_without_backpressure_streak_deserializes_to_zero() {
+        let payload = serde_json::json!({
+            "id": UsdcRebalanceId(Uuid::new_v4()),
+            "amount": Usdc::new(float!(100)),
+            "revert_redrive_attempts": 0,
+        });
+
+        let job: TransferUsdcToHedging = serde_json::from_value(payload).unwrap();
+        assert_eq!(job.backpressure_streak, BackpressureStreak::default());
+    }
+
+    #[tokio::test]
+    async fn hedging_job_429_reschedules_with_incremented_streak() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(RateLimitedBaseToAlpaca),
+            timeout: Duration::from_secs(3600),
+            job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        // `revert_redrive_attempts` starts nonzero and distinct from
+        // `backpressure_streak` so a copy-paste swap of which counter
+        // receives which value at the `handle_terminal_or_backpressure_error`
+        // struct-literal construction site would fail this assertion instead
+        // of passing coincidentally (both fields would otherwise start at the
+        // same value, 0, and a swap would be invisible).
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 2,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        let (payload, _run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
+        let rescheduled: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(rescheduled.backpressure_streak, BackpressureStreak(1));
+        assert_eq!(
+            rescheduled.revert_redrive_attempts, 2,
+            "a backpressure reschedule must not touch the unrelated revert-redrive budget"
+        );
+        // RAI-1494 pass 3: a lone 429, far below BACKPRESSURE_ALERT_STREAK,
+        // must not page the operator.
+        assert!(
+            notifier.messages().is_empty(),
+            "a single 429 far below the alert streak must not fire an operator alert, got: {:?}",
+            notifier.messages()
+        );
+    }
+
+    #[tokio::test]
+    async fn hedging_job_429_past_reschedule_limit_dead_letters_without_propagating_err() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(RateLimitedBaseToAlpaca),
+            timeout: Duration::from_secs(3600),
+            job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak(BACKPRESSURE_RESCHEDULE_LIMIT),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToHedging>(&pool).await,
+            0,
+            "an exhausted backpressure streak must dead-letter, not reschedule"
+        );
+        // RAI-1494 pass 3: dead-lettering after exhausting the reschedule
+        // budget must page the operator -- rerouting a 429 through this
+        // machinery must not silently drop the alerting a terminal failure
+        // used to always get.
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "dead-lettering a sustained 429 must page the operator exactly once, got: {:?}",
+            notifier.messages()
+        );
+    }
+
+    /// Sustained backpressure crossing `BACKPRESSURE_ALERT_STREAK` must page
+    /// the operator once, well before the full `BACKPRESSURE_RESCHEDULE_LIMIT`
+    /// dead-letter -- otherwise a sustained 429 silently degrades the
+    /// pre-existing paging SLA a terminal failure used to get on every
+    /// attempt (RAI-1494 pass 3).
+    #[tokio::test]
+    async fn hedging_job_429_crossing_alert_streak_pages_operator_once() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(RateLimitedBaseToAlpaca),
+            timeout: Duration::from_secs(3600),
+            job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak(BACKPRESSURE_ALERT_STREAK - 1),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        let (payload, _run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
+        let rescheduled: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.backpressure_streak,
+            BackpressureStreak(BACKPRESSURE_ALERT_STREAK)
+        );
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "crossing BACKPRESSURE_ALERT_STREAK must page the operator exactly once, got: {:?}",
+            notifier.messages()
+        );
+    }
+
+    #[tokio::test]
+    async fn hedging_job_non_backpressure_error_still_fails_terminally() {
+        let pool = setup_queue_pool().await;
+        let ctx = hedging_ctx(Arc::new(FailingBaseToAlpaca), &pool);
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let error = job.perform(&ctx).await.unwrap_err();
+        let TransferUsdcToHedgingJobError::Transfer(UsdcTransferError::AlpacaWallet(
+            AlpacaWalletError::ApiError { status, .. },
+        )) = error
+        else {
+            panic!("expected the non-backpressure error to propagate unchanged, got {error:?}");
+        };
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn transfer_usdc_to_market_making_payload_without_backpressure_streak_deserializes_to_zero() {
+        let payload = serde_json::json!({
+            "id": UsdcRebalanceId(Uuid::new_v4()),
+            "amount": Usdc::new(float!(100)),
+            "revert_redrive_attempts": 0,
+        });
+
+        let job: TransferUsdcToMarketMaking = serde_json::from_value(payload).unwrap();
+        assert_eq!(job.backpressure_streak, BackpressureStreak::default());
+    }
+
+    #[tokio::test]
+    async fn market_making_job_429_reschedules_with_incremented_streak() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(RateLimitedAlpacaToBase),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        // See the hedging-direction sibling test: a nonzero, distinct
+        // `revert_redrive_attempts` closes the swap-risk gap between the two
+        // same-typed counters (RAI-1494 review finding).
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 3,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        let (payload, _run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        let rescheduled: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(rescheduled.backpressure_streak, BackpressureStreak(1));
+        assert_eq!(
+            rescheduled.revert_redrive_attempts, 3,
+            "a backpressure reschedule must not touch the unrelated revert-redrive budget"
+        );
+        // RAI-1494 pass 3: a lone 429, far below BACKPRESSURE_ALERT_STREAK,
+        // must not page the operator.
+        assert!(
+            notifier.messages().is_empty(),
+            "a single 429 far below the alert streak must not fire an operator alert, got: {:?}",
+            notifier.messages()
+        );
+    }
+
+    #[tokio::test]
+    async fn market_making_job_429_past_reschedule_limit_dead_letters_without_propagating_err() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(RateLimitedAlpacaToBase),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak(BACKPRESSURE_RESCHEDULE_LIMIT),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            0,
+            "an exhausted backpressure streak must dead-letter, not reschedule"
+        );
+        // RAI-1494 pass 3: dead-lettering after exhausting the reschedule
+        // budget must page the operator -- rerouting a 429 through this
+        // machinery must not silently drop the alerting a terminal failure
+        // used to always get.
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "dead-lettering a sustained 429 must page the operator exactly once, got: {:?}",
+            notifier.messages()
+        );
+    }
+
+    /// Sustained backpressure crossing `BACKPRESSURE_ALERT_STREAK` must page
+    /// the operator once, well before the full `BACKPRESSURE_RESCHEDULE_LIMIT`
+    /// dead-letter (RAI-1494 pass 3), mirroring the hedging-direction sibling.
+    #[tokio::test]
+    async fn market_making_job_429_crossing_alert_streak_pages_operator_once() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(RateLimitedAlpacaToBase),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak(BACKPRESSURE_ALERT_STREAK - 1),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        let (payload, _run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        let rescheduled: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.backpressure_streak,
+            BackpressureStreak(BACKPRESSURE_ALERT_STREAK)
+        );
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "crossing BACKPRESSURE_ALERT_STREAK must page the operator exactly once, got: {:?}",
+            notifier.messages()
+        );
+    }
+
+    #[tokio::test]
+    async fn market_making_job_non_backpressure_error_still_fails_terminally() {
+        let pool = setup_queue_pool().await;
+        let ctx = market_making_ctx(Arc::new(FailingAlpacaToBase), &pool);
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let error = job.perform(&ctx).await.unwrap_err();
+        let TransferUsdcToMarketMakingJobError::Transfer(UsdcTransferError::AlpacaWallet(
+            AlpacaWalletError::ApiError { status, .. },
+        )) = error
+        else {
+            panic!("expected the non-backpressure error to propagate unchanged, got {error:?}");
+        };
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     /// `WithdrawalPollInconclusive` before the alert deadline must schedule a
     /// delayed redrive (one Pending job row with `WITHDRAWAL_POLL_REDRIVE_DELAY`) and
     /// return `Ok` so the apalis retry budget is not consumed -- warn log only,
@@ -2053,10 +2805,16 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
         };
+        // `backpressure_streak` starts nonzero: this non-429 inconclusive
+        // poll error routes through `handle_withdrawal_poll_inconclusive`
+        // (not the backpressure branch), which must reset the streak since
+        // it is now unrelated (RAI-1494 review finding: closes the
+        // swap-risk gap between the two same-typed counters).
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak(4),
         };
 
         let before = Utc::now().timestamp();
@@ -2101,6 +2859,193 @@ mod tests {
             "WithdrawalPollInconclusive must not increment revert_redrive_attempts: \
              the re-poll redrive is unbounded and independent of the burn-revert budget"
         );
+        assert_eq!(
+            rescheduled.backpressure_streak,
+            BackpressureStreak::default(),
+            "a non-429 inconclusive poll redrive is unrelated to backpressure and must \
+             reset the streak"
+        );
+    }
+
+    /// A classified 429 on the withdrawal poll (unlike the plain-timeout
+    /// `InconclusiveAlpacaToBase` case above) must route through the bounded
+    /// backpressure machinery (RAI-1494): increment `backpressure_streak`
+    /// and use `decide_backpressure`'s delay, not the old unbounded
+    /// `WITHDRAWAL_POLL_REDRIVE_DELAY` redrive.
+    #[tokio::test]
+    async fn market_making_job_withdrawal_poll_429_reschedules_through_backpressure_machinery() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(RateLimitedWithdrawalPollAlpacaToBase::before_deadline()),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        // `RateLimitedWithdrawalPollAlpacaToBase` returns `retry_after:
+        // Some(Duration::from_millis(1))`, which `decide_backpressure`
+        // deterministically floors to exactly `MIN_BACKPRESSURE_DELAY` (1s) --
+        // captured before the call so the assertion below can pin an exact
+        // window, not just a one-sided upper bound that would also pass for
+        // an unintended zero-delay reschedule.
+        let before_now = Utc::now().timestamp();
+
+        job.perform(&ctx).await.unwrap();
+
+        let (payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        let rescheduled: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.backpressure_streak,
+            BackpressureStreak(1),
+            "a classified 429 on the withdrawal poll must route through the bounded \
+             backpressure machinery (incrementing the streak), not the old unbounded \
+             inconclusive redrive"
+        );
+        assert!(
+            notifier.messages().is_empty(),
+            "a single 429 below the reschedule limit must not fire an operator alert, got: {:?}",
+            notifier.messages()
+        );
+        // `decide_backpressure` floors the delay at MIN_BACKPRESSURE_DELAY (1s),
+        // far below the old unbounded WITHDRAWAL_POLL_REDRIVE_DELAY (30s) --
+        // pin the exact expected window (not just "somewhere under 30s") so a
+        // regression to a different delay computation would fail this test.
+        assert!(
+            (before_now + 1..before_now + 3).contains(&run_at),
+            "a classified 429 must use the deterministic MIN_BACKPRESSURE_DELAY (1s) \
+             floor, not the old {WITHDRAWAL_POLL_REDRIVE_DELAY:?} unbounded redrive \
+             delay or any other value; got run_at={run_at}, before_now={before_now}"
+        );
+    }
+
+    /// Once the withdrawal-poll 429 streak exhausts `BACKPRESSURE_RESCHEDULE_LIMIT`,
+    /// the job must dead-letter (loud log, `Ok(())`) instead of rescheduling
+    /// again or propagating `Err` -- symmetric with every other backpressure
+    /// call site.
+    #[tokio::test]
+    async fn market_making_job_withdrawal_poll_429_past_reschedule_limit_dead_letters_without_propagating_err()
+     {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(RateLimitedWithdrawalPollAlpacaToBase::before_deadline()),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak(BACKPRESSURE_RESCHEDULE_LIMIT),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            0,
+            "an exhausted backpressure streak on the withdrawal poll must dead-letter, \
+             not reschedule"
+        );
+        // RAI-1494 pass 3: dead-lettering the withdrawal-poll backpressure path
+        // must page the operator directly -- the pre-existing 4h
+        // `handle_withdrawal_poll_inconclusive` alert path does not run here,
+        // so this arm must not silently drop paging altogether.
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "dead-lettering a sustained withdrawal-poll 429 must page the operator \
+             exactly once, got: {:?}",
+            notifier.messages()
+        );
+    }
+
+    /// Sustained withdrawal-poll backpressure crossing `BACKPRESSURE_ALERT_STREAK`
+    /// must page the operator once, well before the full
+    /// `BACKPRESSURE_RESCHEDULE_LIMIT` dead-letter (RAI-1494 pass 3) --
+    /// otherwise the bounded backpressure path silently degrades the
+    /// pre-existing 4h withdrawal-poll paging SLA to ~8-42h.
+    #[tokio::test]
+    async fn market_making_job_withdrawal_poll_429_crossing_alert_streak_pages_operator_once() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(RateLimitedWithdrawalPollAlpacaToBase::before_deadline()),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak(BACKPRESSURE_ALERT_STREAK - 1),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        let (payload, _run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        let rescheduled: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.backpressure_streak,
+            BackpressureStreak(BACKPRESSURE_ALERT_STREAK)
+        );
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "crossing BACKPRESSURE_ALERT_STREAK on the withdrawal poll must page the \
+             operator exactly once, got: {:?}",
+            notifier.messages()
+        );
+    }
+
+    #[tokio::test]
+    async fn market_making_job_withdrawal_poll_429_preserves_wall_clock_alert_and_cadence() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(RateLimitedWithdrawalPollAlpacaToBase::after_deadline()),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak(BACKPRESSURE_ALERT_STREAK - 1),
+        };
+        let before_now = Utc::now().timestamp();
+
+        job.perform(&ctx).await.unwrap();
+
+        let (payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        let rescheduled: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.backpressure_streak,
+            BackpressureStreak(BACKPRESSURE_ALERT_STREAK)
+        );
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "the wall-clock page must replace, not duplicate, the streak-threshold page"
+        );
+
+        let expected_delay =
+            i64::try_from(WITHDRAWAL_POLL_POST_DEADLINE_REDRIVE_DELAY.as_secs()).unwrap();
+        assert!(
+            (before_now + expected_delay..before_now + expected_delay + 2).contains(&run_at),
+            "post-deadline backpressure must preserve the 30-minute alert cadence; \
+             got run_at={run_at}, before_now={before_now}"
+        );
     }
 
     /// A future `initiated_at` can happen after clock skew on restart. The
@@ -2120,6 +3065,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let before = Utc::now().timestamp();
@@ -2170,6 +3116,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // perform must still return Ok: deadline-elapsed does NOT consume the
@@ -2243,6 +3190,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // perform must return Ok even at the exact boundary.
@@ -2300,6 +3248,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let before = Utc::now().timestamp();
@@ -2357,6 +3306,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let before = Utc::now().timestamp();
@@ -2443,6 +3393,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let before = Utc::now().timestamp();
@@ -2496,6 +3447,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let before = Utc::now().timestamp();
@@ -2561,6 +3513,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx)
@@ -2585,6 +3538,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx).await.expect(
@@ -2609,6 +3563,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx)
@@ -2633,6 +3588,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx).await.expect(
@@ -2657,6 +3613,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx)
@@ -2694,6 +3651,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         Job::perform(&job, &ctx).await.unwrap_or_else(|error| {
@@ -2743,6 +3701,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         Job::perform(&job, &ctx).await.unwrap_or_else(|error| {
@@ -2908,6 +3867,7 @@ mod tests {
             id: id.clone(),
             amount,
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         Job::perform(&job, &ctx).await.unwrap();
@@ -2934,6 +3894,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         Job::perform(&job, &ctx).await.unwrap();
@@ -2953,6 +3914,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -3055,6 +4017,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let before = Utc::now().timestamp();
@@ -3098,6 +4061,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let before = Utc::now().timestamp();
@@ -3159,6 +4123,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let before = Utc::now().timestamp();
@@ -3233,6 +4198,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let before = Utc::now().timestamp();
@@ -3295,6 +4261,7 @@ mod tests {
                     id: id.clone(),
                     amount,
                     revert_redrive_attempts: 0,
+                    backpressure_streak: BackpressureStreak::default(),
                 })
                 .await
                 .expect_err("push to a closed pool must fail");
@@ -3321,6 +4288,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let before = Utc::now().timestamp();
@@ -3371,6 +4339,7 @@ mod tests {
                     id: id.clone(),
                     amount,
                     revert_redrive_attempts: 0,
+                    backpressure_streak: BackpressureStreak::default(),
                 })
                 .await
                 .expect_err("push to a closed pool must fail");
@@ -3399,6 +4368,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let before = Utc::now().timestamp();
@@ -3471,6 +4441,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // A failing notifier must not prevent the redrive from being enqueued
@@ -3534,10 +4505,16 @@ mod tests {
     async fn hedging_job_redrives_burn_revert_first_attempt() {
         let pool = setup_queue_pool().await;
         let ctx = hedging_ctx(Arc::new(BurnRevertResume), &pool);
+        // `backpressure_streak` starts nonzero (a prior 429 streak that this
+        // unrelated burn-revert redrive must clear) so a copy-paste swap of
+        // which counter gets reset vs incremented at this struct-literal
+        // construction site would fail the assertion below instead of
+        // passing coincidentally (RAI-1494 review finding).
         let job = TransferUsdcToHedging {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak(4),
         };
 
         let before = Utc::now().timestamp();
@@ -3564,6 +4541,11 @@ mod tests {
             rescheduled.revert_redrive_attempts, 1,
             "revert_redrive_attempts must be incremented to 1 in the redrive payload"
         );
+        assert_eq!(
+            rescheduled.backpressure_streak,
+            BackpressureStreak::default(),
+            "a burn-revert redrive is unrelated to backpressure and must reset the streak"
+        );
         assert!(
             run_at >= before + i64::try_from(BURN_REVERT_REDRIVE_DELAY.as_secs()).unwrap() - 5
                 && run_at
@@ -3589,6 +4571,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 3,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -3618,6 +4601,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -3650,6 +4634,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         Job::perform(&job, &ctx).await.unwrap_err();
@@ -3686,6 +4671,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 2,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         Job::perform(&job, &ctx).await.unwrap();
@@ -3732,6 +4718,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 2,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // Returns Ok (last redrive enqueued), NOT Err
@@ -3777,6 +4764,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 3,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -3819,6 +4807,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         Job::perform(&job, &ctx).await.unwrap();
@@ -3860,6 +4849,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 1,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         Job::perform(&job, &ctx).await.unwrap();
@@ -3896,6 +4886,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 2,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // Returns Ok (last redrive enqueued), NOT Err
@@ -3941,6 +4932,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 3,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -3982,6 +4974,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 2,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         Job::perform(&job, &ctx).await.unwrap();
@@ -4030,10 +5023,14 @@ mod tests {
     async fn market_making_job_redrives_burn_revert_first_attempt() {
         let pool = setup_queue_pool().await;
         let ctx = market_making_ctx(Arc::new(BurnRevertAlpacaToBase), &pool);
+        // See the hedging-direction sibling test: a nonzero starting
+        // `backpressure_streak` closes the swap-risk gap between the two
+        // same-typed counters (RAI-1494 review finding).
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak(4),
         };
 
         let before = Utc::now().timestamp();
@@ -4060,6 +5057,11 @@ mod tests {
             rescheduled.revert_redrive_attempts, 1,
             "revert_redrive_attempts must be incremented to 1 in the redrive payload"
         );
+        assert_eq!(
+            rescheduled.backpressure_streak,
+            BackpressureStreak::default(),
+            "a burn-revert redrive is unrelated to backpressure and must reset the streak"
+        );
         assert!(
             run_at >= before + i64::try_from(BURN_REVERT_REDRIVE_DELAY.as_secs()).unwrap() - 5
                 && run_at
@@ -4084,6 +5086,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 3,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -4120,6 +5123,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 2,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         Job::perform(&job, &ctx).await.unwrap();
@@ -4164,6 +5168,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 2,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // Returns Ok (last redrive enqueued), NOT Err
@@ -4208,6 +5213,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 3,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -4261,6 +5267,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         Job::perform(&job, &ctx).await.unwrap_err();
@@ -4295,6 +5302,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx)
@@ -4329,6 +5337,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx)
@@ -4388,6 +5397,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // Must error (terminal), not Ok (redrive)
@@ -4448,6 +5458,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -4489,6 +5500,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx)

@@ -27,7 +27,7 @@ use super::{CrossVenueEquityTransfer, MintError, RedemptionError};
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
-use crate::conductor::job::{Job, JobQueue, Label};
+use crate::conductor::job::{BackpressureStreak, Job, JobQueue, Label};
 use crate::equity_redemption::RedemptionAggregateId;
 
 /// Apalis queue type for [`ResumeTokenizationAggregate`].
@@ -51,6 +51,20 @@ pub(crate) enum ResumeTokenizationTarget {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ResumeTokenizationAggregate {
     pub(crate) target: ResumeTokenizationTarget,
+    /// Count of consecutive broker rate-limit (429) reschedules leading up to
+    /// this attempt (RAI-1494). `#[serde(default)]` so a row enqueued under
+    /// the pre-this-change payload shape still deserializes to `0` instead of
+    /// crashing the poll stream's `sqlx::Decode`.
+    ///
+    /// NOT YET wired to a reschedule: mirrors `TransferEquityToMarketMaking`'s
+    /// identical gap (see its field doc) -- `resume_mint`/`resume_redemption`
+    /// dispatch to the same `TokenizedEquityMint`/`EquityRedemption` command
+    /// handlers, which convert tokenizer failures to
+    /// `{ error_message: String }` fields via `error.to_string()`, discarding
+    /// the original error type before it reaches this job. Field added now
+    /// so the payload schema is ready when that follow-up lands.
+    #[serde(default)]
+    pub(crate) backpressure_streak: BackpressureStreak,
 }
 
 /// Dependencies the job needs.
@@ -265,6 +279,8 @@ mod tests {
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id),
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // Terminal aggregate: resume_mint returns Ok(()) immediately.
@@ -316,6 +332,8 @@ mod tests {
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id),
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let calls_before = tokenizer.call_count();
@@ -396,6 +414,8 @@ mod tests {
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Redemption(id),
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // Completed aggregate is terminal: resume_redemption returns Ok(()).
@@ -444,6 +464,8 @@ mod tests {
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id.clone()),
+
+            backpressure_streak: BackpressureStreak::default(),
         };
         Job::perform(&job, &ctx).await.unwrap();
 
@@ -557,6 +579,7 @@ mod tests {
         };
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         Job::perform(&job, &ctx)
@@ -584,6 +607,8 @@ mod tests {
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id),
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -605,6 +630,8 @@ mod tests {
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Redemption(id),
+
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -671,6 +698,8 @@ mod tests {
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Redemption(id.clone()),
+
+            backpressure_streak: BackpressureStreak::default(),
         };
         Job::perform(&job, &ctx).await.unwrap();
 
@@ -697,9 +726,13 @@ mod tests {
 
         let mint_job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(mint_id.clone()),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
-        let expected_mint = json!({ "target": { "Mint": mint_id.to_string() } });
+        let expected_mint = json!({
+            "target": { "Mint": mint_id.to_string() },
+            "backpressure_streak": 0_u32,
+        });
         assert_eq!(serde_json::to_value(&mint_job).unwrap(), expected_mint);
 
         let roundtripped_mint: ResumeTokenizationAggregate =
@@ -709,12 +742,20 @@ mod tests {
             ResumeTokenizationTarget::Mint(mint_id),
             "roundtripped mint target must match original"
         );
+        assert_eq!(
+            roundtripped_mint.backpressure_streak,
+            BackpressureStreak::default()
+        );
 
         let redemption_job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Redemption(redemption_id.clone()),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
-        let expected_redemption = json!({ "target": { "Redemption": redemption_id.to_string() } });
+        let expected_redemption = json!({
+            "target": { "Redemption": redemption_id.to_string() },
+            "backpressure_streak": 0_u32,
+        });
         assert_eq!(
             serde_json::to_value(&redemption_job).unwrap(),
             expected_redemption
@@ -727,5 +768,20 @@ mod tests {
             ResumeTokenizationTarget::Redemption(redemption_id),
             "roundtripped redemption target must match original"
         );
+        assert_eq!(
+            roundtripped_redemption.backpressure_streak,
+            BackpressureStreak::default()
+        );
+    }
+
+    /// Mandatory RAI-1494 test (M1): a row enqueued before `backpressure_streak`
+    /// existed must still deserialize, defaulting the field to `0`.
+    #[test]
+    fn resume_tokenization_aggregate_payload_without_backpressure_streak_deserializes_to_zero() {
+        let mint_id = issuer_request_id("legacy-mint");
+        let legacy_payload = json!({ "target": { "Mint": mint_id.to_string() } });
+
+        let job: ResumeTokenizationAggregate = serde_json::from_value(legacy_payload).unwrap();
+        assert_eq!(job.backpressure_streak, BackpressureStreak::default());
     }
 }

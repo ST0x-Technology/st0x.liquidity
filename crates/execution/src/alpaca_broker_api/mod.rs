@@ -5,12 +5,14 @@ use serde::Deserialize;
 use st0x_float_serde::format_float_with_fallback;
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::alpaca_market_data::AlpacaMarketDataError;
 use crate::{
-    ClientOrderId, CounterTradeCostError, ExecutorOrderId, FractionalShares, Positive, Symbol, Usd,
+    Backpressure, ClientOrderId, CounterTradeCostError, ExecutorOrderId, FractionalShares,
+    Positive, Symbol, Usd,
 };
 
 /// Time-in-force specifies how long an order remains active before it expires.
@@ -165,6 +167,11 @@ pub enum AlpacaBrokerApiError {
         alpaca_code: Option<u64>,
         /// Human-readable error message from Alpaca
         message: String,
+        /// Parsed `Retry-After` header from the response, when the broker
+        /// sent one. Only meaningful when `status == 429 Too Many Requests`;
+        /// captured unconditionally regardless of status since it costs
+        /// nothing to carry and keeps `parse_api_error` a single call site.
+        retry_after: Option<Duration>,
     },
 
     #[error("Invalid order ID: {0}")]
@@ -300,4 +307,128 @@ fn format_api_error(
         || format!("Alpaca API error ({status}): {message}"),
         |code| format!("Alpaca API error {code} ({status}): {message}"),
     )
+}
+
+impl AlpacaBrokerApiError {
+    /// Classifies this error as broker rate-limiting (HTTP 429), returning
+    /// its `Retry-After` hint when the broker sent one. Every other variant
+    /// returns `None` -- an exhaustive match so a new variant added later
+    /// forces a conscious decision here rather than silently classifying as
+    /// "not backpressure".
+    ///
+    /// The bare-429 assumption is not a guess: it is the classification
+    /// RAI-1492's actual incident (a `PollOrderStatus` job's persisted
+    /// `last_result`) recorded, and matches RFC 6585's standard status code
+    /// for rate limiting that Alpaca (like virtually every REST API) uses.
+    /// The `Retry-After` hint carried alongside it is a separate, softer
+    /// assumption -- see `rate_limit::parse_retry_after`'s doc comment and
+    /// its fixture test for that one, since Alpaca's own SDKs do not trust
+    /// the header even when present.
+    pub fn backpressure(&self) -> Option<Backpressure> {
+        match self {
+            Self::ApiError {
+                status,
+                retry_after,
+                ..
+            } if *status == reqwest::StatusCode::TOO_MANY_REQUESTS => Some(Backpressure {
+                retry_after: *retry_after,
+            }),
+
+            Self::ApiError { .. }
+            | Self::HttpClient(_)
+            | Self::JsonParse(_)
+            | Self::InvalidHeader(_)
+            | Self::InvalidOrderId(_)
+            | Self::IncompleteOrder { .. }
+            | Self::AccountNotActive { .. }
+            | Self::CryptoOrderFailed { .. }
+            | Self::DuplicateOrderNotFound { .. }
+            | Self::CalendarIterationInvariantViolation
+            | Self::CalendarDateMismatch { .. }
+            | Self::CalendarLocalTimeUnresolvable { .. }
+            | Self::InvalidAccountActivitiesUrl { .. }
+            | Self::AccountActivitiesPaginationInvariantViolation
+            | Self::AccountActivitiesPageLimitExceeded { .. }
+            | Self::AssetNotActive { .. }
+            | Self::AssetNotTradable { .. }
+            | Self::InvalidLimitPricePrecision { .. }
+            | Self::UsdBalanceConversion(_)
+            | Self::FractionalCents(_)
+            | Self::InvalidSymbol(_)
+            | Self::MissingPositionQuantity
+            | Self::BelowPrecision { .. }
+            | Self::UsdcBelowPrecision { .. }
+            | Self::UsdcPrecisionExceeded { .. }
+            | Self::NotPositive(_)
+            | Self::NotPositiveLimitPrice(_)
+            | Self::FloatConversion(_)
+            | Self::CounterTradeCost(_) => None,
+
+            // Delegate rather than returning `None`: `find_backpressure`'s
+            // chain-walk downcasts `AlpacaBrokerApiError` before it ever
+            // reaches the wrapped `AlpacaMarketDataError`, so classifying
+            // here means a 429 from `fetch_latest_trade_price` (e.g. the
+            // extended-hours limit-price lookup) is caught at this first
+            // hop instead of relying on a second, separate
+            // `AlpacaMarketDataError` downcast one level further down the
+            // chain.
+            Self::LatestTrade(source) => source.backpressure(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backpressure_some_for_429_with_retry_after() {
+        let error = AlpacaBrokerApiError::ApiError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            alpaca_code: None,
+            message: "rate limited".to_string(),
+            retry_after: Some(Duration::from_secs(20)),
+        };
+
+        assert_eq!(
+            error.backpressure(),
+            Some(Backpressure {
+                retry_after: Some(Duration::from_secs(20))
+            })
+        );
+    }
+
+    #[test]
+    fn backpressure_some_with_none_retry_after_for_429_without_header() {
+        let error = AlpacaBrokerApiError::ApiError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            alpaca_code: None,
+            message: "rate limited".to_string(),
+            retry_after: None,
+        };
+
+        assert_eq!(
+            error.backpressure(),
+            Some(Backpressure { retry_after: None })
+        );
+    }
+
+    #[test]
+    fn backpressure_none_for_non_429_api_error() {
+        let error = AlpacaBrokerApiError::ApiError {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            alpaca_code: None,
+            message: "boom".to_string(),
+            retry_after: None,
+        };
+
+        assert_eq!(error.backpressure(), None);
+    }
+
+    #[test]
+    fn backpressure_none_for_a_non_api_error_variant() {
+        let error = AlpacaBrokerApiError::MissingPositionQuantity;
+
+        assert_eq!(error.backpressure(), None);
+    }
 }

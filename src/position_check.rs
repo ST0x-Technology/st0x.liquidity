@@ -23,7 +23,7 @@ use st0x_execution::{
     ClientOrderId, CounterTradePreflight, Direction, Executor, MarketOrder, MarketSession, Symbol,
 };
 
-use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
+use crate::conductor::job::{BackpressureStreak, Job, JobQueue, Label, QueuePushError};
 use crate::conductor::{clamp_shares_to_reservation, recover_orphaned_pending_offchain_orders};
 use crate::equity_redemption::symbols_with_active_transfers;
 use crate::offchain::order::{
@@ -320,6 +320,7 @@ where
             threshold: self.ctx.execution_threshold,
             offchain_order_id: OffchainOrderId::new(),
             market_session: ready.market_session,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let mut queue = self.hedge_queue.clone();

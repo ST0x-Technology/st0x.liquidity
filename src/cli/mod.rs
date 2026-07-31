@@ -1,6 +1,7 @@
 //! CLI commands for trading, asset transfers, and authentication.
 
 mod alpaca_wallet;
+mod backpressure_retry;
 mod cctp;
 mod dividend;
 mod rebalancing;

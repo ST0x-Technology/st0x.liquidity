@@ -41,7 +41,10 @@ use st0x_evm::{
     EvmError, IERC20, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
     OpenChainErrorRegistry, Wallet, wait_for_node_sync,
 };
-use st0x_execution::{AlpacaAccountId, FractionalShares, Network, PollingConfig, Symbol};
+use st0x_execution::{
+    AlpacaAccountId, Backpressure, FractionalShares, Network, PollingConfig, Symbol,
+    retry_after_from_response_headers,
+};
 
 use super::{
     IssuerRequestId, MintVerificationError, TokenizationRequestId, Tokenizer, TokenizerError,
@@ -427,6 +430,7 @@ pub enum AlpacaTokenizationError {
     ApiError {
         status: StatusCode,
         message: AlpacaApiErrorMessage,
+        retry_after: Option<Duration>,
     },
 
     #[error("Insufficient position for symbol: {symbol}")]
@@ -470,6 +474,18 @@ impl AlpacaApiErrorMessage {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl AlpacaApiErrorMessage {
+    /// Test-only constructor so downstream crates can build a classified
+    /// `AlpacaTokenizationError::ApiError` (e.g. RAI-1494's `find_backpressure`
+    /// tests) without depending on the production `from_response` path, which
+    /// stays crate-private since it is only ever built from a real HTTP
+    /// response body.
+    pub fn for_test(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
 impl std::fmt::Display for AlpacaApiErrorMessage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}", self.0)
@@ -505,9 +521,43 @@ impl AlpacaTokenizationError {
             _ => None,
         }
     }
+
+    /// Classifies this error as broker rate-limiting (HTTP 429), returning
+    /// its `Retry-After` hint when the broker sent one. Every other variant
+    /// returns `None` -- an exhaustive match so a new variant added later
+    /// forces a conscious decision here rather than silently classifying as
+    /// "not backpressure".
+    pub fn backpressure(&self) -> Option<Backpressure> {
+        match self {
+            Self::ApiError {
+                status,
+                retry_after,
+                ..
+            } if *status == StatusCode::TOO_MANY_REQUESTS => Some(Backpressure {
+                retry_after: *retry_after,
+            }),
+
+            Self::ApiError { .. }
+            | Self::Reqwest(_)
+            | Self::JsonParse(_)
+            | Self::Utf8(_)
+            | Self::InsufficientPosition { .. }
+            | Self::UnsupportedAccount
+            | Self::InvalidParameters { .. }
+            | Self::RequestNotFound { .. }
+            | Self::Evm(_)
+            | Self::PollTimeout { .. }
+            | Self::MissingRedemptionWallet => None,
+        }
+    }
 }
 
-fn map_mint_error(status: StatusCode, message: String, symbol: Symbol) -> AlpacaTokenizationError {
+fn map_mint_error(
+    status: StatusCode,
+    message: String,
+    symbol: Symbol,
+    retry_after: Option<Duration>,
+) -> AlpacaTokenizationError {
     match status {
         StatusCode::FORBIDDEN => {
             if message.contains("insufficient") || message.contains("position") {
@@ -522,6 +572,7 @@ fn map_mint_error(status: StatusCode, message: String, symbol: Symbol) -> Alpaca
         _ => AlpacaTokenizationError::ApiError {
             status,
             message: AlpacaApiErrorMessage::from_response(message),
+            retry_after,
         },
     }
 }
@@ -594,6 +645,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             .await?;
 
         let status = response.status();
+        let retry_after = retry_after_from_response_headers(response.headers());
 
         if status.is_success() {
             // Read raw bytes and parse with `from_slice` so invalid UTF-8 fails
@@ -631,7 +683,12 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             "Alpaca tokenization mint error response body received"
         );
         warn!(target: "tokenization", status = %status, message = %message, "Tokenization request failed");
-        Err(map_mint_error(status, message, request.underlying_symbol))
+        Err(map_mint_error(
+            status,
+            message,
+            request.underlying_symbol,
+            retry_after,
+        ))
     }
 
     /// List tokenization requests with optional filtering.
@@ -907,6 +964,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         let response = request.send().await?;
 
         let status = response.status();
+        let retry_after = retry_after_from_response_headers(response.headers());
         // Read raw bytes; convert the success body with strict `String::from_utf8`
         // so invalid UTF-8 fails fast for the caller's parse. Lossy decoding is
         // used only for the trace line and the error-body message.
@@ -930,6 +988,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             message: AlpacaApiErrorMessage::from_response(
                 String::from_utf8_lossy(&bytes).into_owned(),
             ),
+            retry_after,
         })
     }
 }
@@ -1300,6 +1359,78 @@ pub(crate) mod tests {
         );
 
         mint_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_request_mint_rate_limited_captures_retry_after() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let mint_mock = server.mock(|when, then| {
+            when.method(POST).path(tokenization_mint_path());
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("Retry-After", "18")
+                .json_body(json!({ "message": "rate limited" }));
+        });
+
+        let request = create_mint_request();
+
+        let err = client.request_mint(request).await.unwrap_err();
+        let AlpacaTokenizationError::ApiError {
+            status,
+            retry_after,
+            ..
+        } = err
+        else {
+            panic!("expected ApiError");
+        };
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(retry_after, Some(Duration::from_secs(18)));
+
+        mint_mock.assert();
+    }
+
+    #[test]
+    fn tokenization_backpressure_some_for_429_with_retry_after() {
+        let error = AlpacaTokenizationError::ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: AlpacaApiErrorMessage::from_response("rate limited".to_string()),
+            retry_after: Some(Duration::from_secs(18)),
+        };
+
+        assert_eq!(
+            error.backpressure(),
+            Some(Backpressure {
+                retry_after: Some(Duration::from_secs(18))
+            })
+        );
+    }
+
+    #[test]
+    fn tokenization_backpressure_some_with_none_without_header() {
+        let error = AlpacaTokenizationError::ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: AlpacaApiErrorMessage::from_response("rate limited".to_string()),
+            retry_after: None,
+        };
+
+        assert_eq!(
+            error.backpressure(),
+            Some(Backpressure { retry_after: None })
+        );
+    }
+
+    #[test]
+    fn tokenization_backpressure_none_for_non_429() {
+        let error = AlpacaTokenizationError::ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: AlpacaApiErrorMessage::from_response("boom".to_string()),
+            retry_after: None,
+        };
+
+        assert_eq!(error.backpressure(), None);
     }
 
     fn sample_tokenization_request_json(

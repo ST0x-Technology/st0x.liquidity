@@ -114,6 +114,27 @@ pub(crate) enum UsdcTransferError {
          operator reconciliation"
     )]
     ResumeIndeterminateConversion { id: UsdcRebalanceId },
+    /// A USDC conversion order placement (`convert_usdc_usd`) failed with a
+    /// classified broker rate-limit (429). Conversion placement fails fast
+    /// unconditionally on ANY error -- `FailConversion` has already been sent
+    /// (recorded in the event's `reason`) by the time this is returned --
+    /// but a 429 specifically must not surface as `AlpacaBrokerApi` (which
+    /// would keep the underlying error as a downcastable `#[source]`): the
+    /// job's backpressure classifier (`find_backpressure`, which walks the
+    /// `.source()` chain) would then reschedule an already-terminalized
+    /// aggregate instead of treating this as the terminal failure it is.
+    /// Retrying a conversion placement risks submitting the order twice
+    /// against real money, so this variant deliberately carries no
+    /// `#[source]`. Every other placement failure (a non-429 broker error, a
+    /// terminally rejected/canceled/expired order, ...) keeps surfacing the
+    /// original `AlpacaBrokerApi` variant instead, since `find_backpressure`
+    /// already classifies those as non-backpressure and preserving the
+    /// specific failure reason is useful for operators and callers.
+    #[error(
+        "USDC rebalance {id} conversion order placement failed; recorded as \
+         ConversionFailed for operator reconciliation (not retriable)"
+    )]
+    ConversionPlacementFailed { id: UsdcRebalanceId },
     #[error(
         "USDC rebalance {id} cannot resume from Attested state: no mint scan \
          bound was captured (pre-resume-hardening event); manual reconciliation \
@@ -350,6 +371,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::WithdrawalFailed { .. }
             | Self::DepositFailed { .. }
             | Self::UsdcConversion(_)
+            | Self::ConversionPlacementFailed { .. }
             | Self::Float(_)
             | Self::InvalidShares(_)
             | Self::NotPositive(_)

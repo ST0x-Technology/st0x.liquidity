@@ -58,6 +58,7 @@ use crate::bot_gas::{
     RecordBotGasReceiptCostJobQueue,
 };
 use crate::conductor::exit::{ConductorExit, MonitorTaskError};
+use crate::conductor::job::{BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureStreak};
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
 use crate::dashboard::{Broadcaster, DashboardTradeDelivery};
 use crate::equity_redemption::{
@@ -68,12 +69,13 @@ use crate::inventory::{
 };
 use crate::offchain::order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacer,
-    PollOrderStatusJobQueue, TerminalPositionFinalization, client_order_id_for_placement,
-    finalize_cancelled_position_or_log_unpriced, place_offchain_order_at_broker,
-    position_command_for_finalization, push_poll_job_if_absent, terminal_position_finalization,
+    PollOrderStatus, PollOrderStatusJobQueue, TerminalPositionFinalization,
+    client_order_id_for_placement, finalize_cancelled_position_or_log_unpriced,
+    place_offchain_order_at_broker, position_command_for_finalization, push_poll_job_if_absent,
+    terminal_position_finalization,
 };
 #[cfg(test)]
-use crate::offchain::order::{OffchainOrderCommand, PollOrderStatus, noop_order_placer};
+use crate::offchain::order::{OffchainOrderCommand, noop_order_placer};
 use crate::onchain::OnchainTrade;
 #[cfg(test)]
 use crate::onchain::accumulator::check_all_positions;
@@ -1292,9 +1294,19 @@ fn spawn_finished_job_cleanup(
             // prevent generic tokenization recovery from racing a requeued
             // transfer job or resurrecting a terminal dead letter. Transfer
             // jobs are low-volume, so retaining their finished rows is cheap.
+            //
+            // A completed PollOrderStatus row at the backpressure limit is
+            // likewise a durable dead-letter marker. Retain only that narrow
+            // subset; ordinary completed poll rows remain disposable.
             let cleanup_result = sqlx_apalis::query(
                 "DELETE FROM Jobs \
                  WHERE job_type NOT IN (?, ?, ?, ?) \
+                 AND NOT ( \
+                     job_type = ? \
+                     AND status = ? \
+                     AND json_valid(CAST(job AS TEXT)) \
+                     AND json_extract(CAST(job AS TEXT), '$.backpressure_streak') >= ? \
+                 ) \
                  AND ( \
                      status = ? \
                      OR status = ? \
@@ -1305,6 +1317,9 @@ fn spawn_finished_job_cleanup(
             .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
             .bind(std::any::type_name::<TransferEquityToHedging>())
             .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+            .bind(std::any::type_name::<PollOrderStatus>())
+            .bind(Status::Done.to_string())
+            .bind(i64::from(BACKPRESSURE_RESCHEDULE_LIMIT))
             .bind(Status::Done.to_string())
             .bind(Status::Killed.to_string())
             .bind(Status::Failed.to_string())
@@ -2293,6 +2308,7 @@ async fn recover_interrupted_tokenization_aggregates(
             resume_queue
                 .push(ResumeTokenizationAggregate {
                     target: ResumeTokenizationTarget::Mint(mint_id.clone()),
+                    backpressure_streak: BackpressureStreak::default(),
                 })
                 .await?;
         }
@@ -2319,6 +2335,7 @@ async fn recover_interrupted_tokenization_aggregates(
             resume_queue
                 .push(ResumeTokenizationAggregate {
                     target: ResumeTokenizationTarget::Redemption(redemption_id.clone()),
+                    backpressure_streak: BackpressureStreak::default(),
                 })
                 .await?;
         }
@@ -3179,6 +3196,7 @@ where
             threshold: cqrs.execution_threshold,
             offchain_order_id,
             market_session: execution.market_session,
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         if let Err(error) = cqrs.hedge_queue.clone().push(job).await {
@@ -4717,6 +4735,7 @@ mod tests {
             .push(UnwrappedEquityRecoveryJob {
                 symbol: Symbol::new("AAPL").unwrap(),
                 recovery_id: UnwrappedEquityRecoveryId(uuid::Uuid::new_v4()),
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -5058,6 +5077,8 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: 1,
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -5068,6 +5089,8 @@ mod tests {
                 aggregate_id: redemption_id,
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -5135,6 +5158,8 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: 1,
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -5145,6 +5170,8 @@ mod tests {
                 aggregate_id: redemption_id,
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
+
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -5642,10 +5669,33 @@ mod tests {
         let market_making_type = std::any::type_name::<TransferUsdcToMarketMaking>();
         let equity_to_hedging_type = std::any::type_name::<TransferEquityToHedging>();
         let equity_to_market_making_type = std::any::type_name::<TransferEquityToMarketMaking>();
+        let poll_order_status_type = std::any::type_name::<PollOrderStatus>();
 
         // Non-transfer finished rows must be pruned (Done and exhausted Failed).
         insert_job_row(&apalis_pool, "other-done", "test", Status::Done, 1, 25).await;
         insert_job_row(&apalis_pool, "other-failed", "test", Status::Failed, 25, 25).await;
+
+        let mut poll_queue = PollOrderStatusJobQueue::new(&apalis_pool);
+        poll_queue
+            .push(PollOrderStatus {
+                offchain_order_id: OffchainOrderId::from_uuid(uuid::Uuid::from_u128(1)),
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+        poll_queue
+            .push(PollOrderStatus {
+                offchain_order_id: OffchainOrderId::from_uuid(uuid::Uuid::from_u128(2)),
+                backpressure_streak: BackpressureStreak(BACKPRESSURE_RESCHEDULE_LIMIT),
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query("UPDATE Jobs SET status = ? WHERE job_type = ?")
+            .bind(Status::Done.to_string())
+            .bind(poll_order_status_type)
+            .execute(&apalis_pool)
+            .await
+            .unwrap();
 
         // USDC transfer finished rows must survive cleanup: they are the durable
         // startup re-arm idempotency + redrive-budget signal.
@@ -5689,8 +5739,9 @@ mod tests {
         let handle =
             spawn_finished_job_cleanup(pool.clone(), apalis_pool.clone(), Duration::from_secs(60));
 
-        // The two non-transfer finished rows are pruned; all transfer rows remain.
-        wait_for_job_count(&apalis_pool, 4).await;
+        // The two non-transfer rows and ordinary completed poll row are pruned;
+        // transfer rows and the exhausted poll dead-letter marker remain.
+        wait_for_job_count(&apalis_pool, 5).await;
         handle.abort();
 
         let mut remaining: Vec<String> = sqlx_apalis::query_scalar("SELECT job_type FROM Jobs")
@@ -5703,11 +5754,12 @@ mod tests {
             market_making_type.to_string(),
             equity_to_hedging_type.to_string(),
             equity_to_market_making_type.to_string(),
+            poll_order_status_type.to_string(),
         ];
         expected.sort();
         assert_eq!(
             remaining, expected,
-            "transfer finished rows must survive cleanup regardless of direction or Done/Failed status"
+            "transfer rows and the exhausted poll marker must survive cleanup"
         );
     }
 
@@ -11519,7 +11571,10 @@ mod tests {
         // duplicate.
         cqrs.poll_status_queue
             .clone()
-            .push(PollOrderStatus { offchain_order_id })
+            .push(PollOrderStatus {
+                offchain_order_id,
+                backpressure_streak: BackpressureStreak::default(),
+            })
             .await
             .unwrap();
         assert_eq!(

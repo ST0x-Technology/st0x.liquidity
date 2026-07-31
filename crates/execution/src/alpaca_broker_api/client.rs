@@ -15,6 +15,7 @@ use super::journal::{JournalRequest, JournalResponse};
 use super::order::{
     CryptoOrderRequest, CryptoOrderResponse, LimitOrderRequest, OrderRequest, OrderResponse,
 };
+use crate::rate_limit::retry_after_from_response_headers;
 use crate::{CancellationOutcome, ClientOrderId, FractionalShares, Positive, Symbol};
 
 /// Request timeout applied to every Alpaca Broker API HTTP call.
@@ -357,9 +358,10 @@ impl AlpacaBrokerApiClient {
             return Ok(());
         }
 
+        let retry_after = retry_after_from_response_headers(response.headers());
         let bytes = response.bytes().await?;
 
-        Err(parse_api_error(status, &bytes))
+        Err(parse_api_error(status, &bytes, retry_after))
     }
 
     /// Perform a POST request with JSON body
@@ -380,6 +382,9 @@ impl AlpacaBrokerApiClient {
     ) -> Result<T, AlpacaBrokerApiError> {
         let status = response.status();
         let url = response.url().clone();
+        // Captured before `response.bytes()` consumes the response --
+        // headers are no longer readable afterward.
+        let retry_after = retry_after_from_response_headers(response.headers());
         // Read raw bytes and parse successful responses with `from_slice` so
         // invalid UTF-8 fails fast (matching the prior `response.json()`),
         // rather than being silently replaced by `response.text()`'s lossy
@@ -399,14 +404,18 @@ impl AlpacaBrokerApiClient {
             return Ok(serde_json::from_slice(&bytes)?);
         }
 
-        Err(parse_api_error(status, &bytes))
+        Err(parse_api_error(status, &bytes, retry_after))
     }
 }
 
 /// Parse an Alpaca error response body into an `ApiError`, falling back to the
 /// raw (lossy-decoded) body when it does not match `AlpacaApiErrorBody`. Shared
 /// by `delete` and `handle_response` so both error paths stay in sync.
-fn parse_api_error(status: reqwest::StatusCode, bytes: &[u8]) -> AlpacaBrokerApiError {
+fn parse_api_error(
+    status: reqwest::StatusCode,
+    bytes: &[u8],
+    retry_after: Option<Duration>,
+) -> AlpacaBrokerApiError {
     let (alpaca_code, message) = match serde_json::from_slice::<AlpacaApiErrorBody>(bytes) {
         Ok(parsed) => (parsed.code, parsed.message),
         Err(_) => (None, String::from_utf8_lossy(bytes).into_owned()),
@@ -416,6 +425,7 @@ fn parse_api_error(status: reqwest::StatusCode, bytes: &[u8]) -> AlpacaBrokerApi
         status,
         alpaca_code,
         message,
+        retry_after,
     }
 }
 
@@ -569,6 +579,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_order_captures_retry_after_on_429() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let order_id = uuid!("44444444-4444-4444-4444-444444444444");
+
+        let mock = server.mock(|when, then| {
+            when.method(DELETE).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("retry-after", "15")
+                .json_body(serde_json::json!({ "message": "rate limited" }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = client.cancel_order(order_id).await.unwrap_err();
+
+        mock.assert();
+        let AlpacaBrokerApiError::ApiError { retry_after, .. } = error else {
+            panic!("expected ApiError, got {error:?}");
+        };
+        assert_eq!(retry_after, Some(Duration::from_secs(15)));
+    }
+
+    #[tokio::test]
     async fn test_verify_account_success() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
@@ -652,6 +688,53 @@ mod tests {
         assert!(
             matches!(err, AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 401)
         );
+    }
+
+    #[tokio::test]
+    async fn handle_response_captures_retry_after_seconds_header_on_429() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("retry-after", "30")
+                .json_body(serde_json::json!({ "message": "rate limited" }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = client.verify_account().await.unwrap_err();
+
+        mock.assert();
+        let AlpacaBrokerApiError::ApiError { retry_after, .. } = error else {
+            panic!("expected ApiError, got {error:?}");
+        };
+        assert_eq!(retry_after, Some(Duration::from_secs(30)));
+    }
+
+    #[tokio::test]
+    async fn handle_response_has_no_retry_after_when_header_absent() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(429)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "message": "rate limited" }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = client.verify_account().await.unwrap_err();
+
+        mock.assert();
+        let AlpacaBrokerApiError::ApiError { retry_after, .. } = error else {
+            panic!("expected ApiError, got {error:?}");
+        };
+        assert_eq!(retry_after, None);
     }
 
     #[tracing_test::traced_test]

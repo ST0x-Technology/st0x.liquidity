@@ -12,14 +12,17 @@ use apalis_core::backend::poll_strategy::{BackoffConfig, IntervalStrategy, Strat
 use apalis_core::worker::context::WorkerContext;
 use apalis_core::worker::event::Event;
 use apalis_sqlite::{Config, SqliteContext, SqlitePool, SqliteStorage, SqlxError};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{debug, error, warn};
+
+use st0x_execution::{AlpacaBrokerApiError, AlpacaWalletError, Backpressure};
+use st0x_tokenization::{AlpacaTokenizationError, TokenizerError};
 
 /// Recovery timeout for the fail-stop circuit breaker. Effectively
 /// infinite for any plausible bot uptime; chosen to be finite so
@@ -63,6 +66,246 @@ impl Backoff for ExponentialBackoff {
 /// Sequence for `RetryPolicy::retries(3)`: 1s, 2s, 4s.
 pub(crate) const RETRY_BACKOFF: ExponentialBackoff =
     ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(30));
+
+/// Minimum delay before a backpressure reschedule fires (RAI-1494). Floors a
+/// `Retry-After: 0` (or a malformed near-zero value) so a broker signal
+/// meant to be honoured cannot produce a hot reschedule loop against an
+/// already-rate-limited endpoint. Not a financial clamp -- rate-limit
+/// hygiene, distinct from this codebase's fail-fast rule for financial
+/// values.
+pub(crate) const MIN_BACKPRESSURE_DELAY: Duration = Duration::from_secs(1);
+
+/// Ceiling on an exact `Retry-After` value, guarding only against a
+/// malformed or bogus huge header. A legitimate broker-specified wait within
+/// this bound is always honoured exactly.
+pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// Escalating fallback when the broker signals backpressure without a usable
+/// `Retry-After`. Same base as [`RETRY_BACKOFF`] so a single 429 is no more
+/// aggressive than today's non-backpressure backoff; capped higher (60s vs
+/// 30s) since sustained backpressure, now that rescheduling frees the worker
+/// between tries, can afford a longer per-attempt ceiling.
+pub(crate) const BACKPRESSURE_FALLBACK_BASE: Duration = Duration::from_secs(1);
+pub(crate) const BACKPRESSURE_FALLBACK_CAP: Duration = Duration::from_secs(60);
+
+/// Reschedule budget before a persistently-429ing item is treated as a
+/// structurally-dead integration (suspended account, revoked key) rather
+/// than transient rate-limiting. ~8.3h worst case when the fallback
+/// escalation is in play (60s cap); up to ~41.6h if every reschedule honours
+/// a broker-specified `Retry-After` at the [`MAX_RETRY_AFTER`] ceiling. A
+/// judgment call, revisited once real sustained-429 durations are observed
+/// in production.
+pub(crate) const BACKPRESSURE_RESCHEDULE_LIMIT: u32 = 500;
+
+/// Streak count at which sustained backpressure should page an operator
+/// (RAI-1494 pass 3), rather than staying silent until the full
+/// [`BACKPRESSURE_RESCHEDULE_LIMIT`] dead-letter. Before this PR, a stuck
+/// Alpaca withdrawal poll paged at `WITHDRAWAL_POLL_ALERT_DEADLINE` (4h);
+/// routing a classified 429 through this reschedule machinery instead must
+/// not silently drop that SLA. Halfway to the limit (mirrors the
+/// `warn_threshold` pattern used for redrive budgets elsewhere) lands close
+/// to the pre-existing 4h bar under the escalating fallback delay (capped at
+/// [`BACKPRESSURE_FALLBACK_CAP`] = 60s): 250 reschedules * 60s = ~4.17h. With
+/// a broker-specified `Retry-After` at the [`MAX_RETRY_AFTER`] ceiling this
+/// extends to ~20.9h -- still far tighter than the ~41.6h a dead-letter-only
+/// page would allow.
+pub(crate) const BACKPRESSURE_ALERT_STREAK: u32 = BACKPRESSURE_RESCHEDULE_LIMIT / 2 + 1;
+
+/// Durable count of consecutive broker rate-limit (429) reschedules leading
+/// up to a job's current attempt (RAI-1494). Every participating job payload
+/// carries this in the same field name (`backpressure_streak`), distinct at
+/// the type level from unrelated durable counters like
+/// `revert_redrive_attempts` -- a copy-paste swap between the two at a
+/// construction site is now a compile error instead of a silent behaviour
+/// bug. `#[serde(transparent)]` keeps the wire format an unadorned integer,
+/// so no schema migration is implied and pre-existing rows still decode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct BackpressureStreak(pub(crate) u32);
+
+/// Outcome of [`decide_backpressure`]: the delay before a rescheduled
+/// successor should run, and whether the streak has exhausted
+/// [`BACKPRESSURE_RESCHEDULE_LIMIT`].
+pub(crate) struct BackpressureDecision {
+    pub(crate) delay: Duration,
+    /// `true` once `streak` has reached [`BACKPRESSURE_RESCHEDULE_LIMIT`] --
+    /// the caller must not reschedule again. Per the RAI-1494 plan's binding
+    /// M2 decision, a supervised job's `perform()` treats this as its own
+    /// self-contained terminal event (a loud `error!` log, then `Ok(())`)
+    /// rather than propagating the original `Err` into the shared
+    /// supervised on-event path, so a persistently-429ing item cannot
+    /// re-open the circuit breaker RAI-1495 already knows how to latch.
+    pub(crate) exhausted: bool,
+}
+
+/// Pure: computes the reschedule delay and whether the budget is exhausted
+/// for a given consecutive-backpressure streak. No apalis/tower types, no
+/// I/O, no `Job` bound -- trivially unit-testable and shared by every
+/// participating job. Logging (the every-10th-streak visibility line, and
+/// the loud exhaustion log) is the caller's responsibility, keeping this
+/// function a plain computation.
+pub(crate) fn decide_backpressure(
+    backpressure: &Backpressure,
+    streak: BackpressureStreak,
+) -> BackpressureDecision {
+    let BackpressureStreak(streak) = streak;
+
+    let delay = backpressure.retry_after.map_or_else(
+        || {
+            let factor = 2u32.saturating_pow(streak);
+            BACKPRESSURE_FALLBACK_BASE
+                .saturating_mul(factor)
+                .clamp(MIN_BACKPRESSURE_DELAY, BACKPRESSURE_FALLBACK_CAP)
+        },
+        |retry_after| retry_after.clamp(MIN_BACKPRESSURE_DELAY, MAX_RETRY_AFTER),
+    );
+
+    BackpressureDecision {
+        delay,
+        exhausted: streak >= BACKPRESSURE_RESCHEDULE_LIMIT,
+    }
+}
+
+/// Outcome of [`advance_backpressure`]: either the reschedule budget is
+/// exhausted (the caller should dead-letter) or a successor should be
+/// pushed after `delay` with `next_streak`. Centralizes the
+/// exhaustion/streak-increment/every-10th-visibility decision that was
+/// previously copy-pasted verbatim across every participating job's error
+/// handler; each job still owns its own log message fields and successor
+/// struct construction, since both are job-specific.
+pub(crate) enum BackpressureStep {
+    /// `streak` has reached [`BACKPRESSURE_RESCHEDULE_LIMIT`] -- the caller
+    /// must log its own dead-letter message and return `Ok(())` rather than
+    /// propagate the original `Err` (see [`BackpressureDecision::exhausted`]).
+    DeadLetter,
+    /// Reschedule a successor with `next_streak` after `delay`. `visible`
+    /// is `true` on every 10th consecutive reschedule (1-indexed), telling
+    /// the caller to also emit its own "still rescheduling" visibility log.
+    Reschedule {
+        next_streak: BackpressureStreak,
+        delay: Duration,
+        visible: bool,
+    },
+}
+
+/// Combines [`decide_backpressure`]'s pure delay/exhaustion computation with
+/// the streak-increment and every-10th visibility decision every
+/// participating job repeats verbatim. Still pure and unit-testable; logging
+/// text and successor construction stay with each job's own handler because
+/// both carry job-specific fields.
+pub(crate) fn advance_backpressure(
+    backpressure: &Backpressure,
+    streak: BackpressureStreak,
+) -> BackpressureStep {
+    let decision = decide_backpressure(backpressure, streak);
+
+    if decision.exhausted {
+        return BackpressureStep::DeadLetter;
+    }
+
+    let BackpressureStreak(streak) = streak;
+    let next_streak = BackpressureStreak(streak.saturating_add(1));
+    let BackpressureStreak(next_streak_value) = next_streak;
+    BackpressureStep::Reschedule {
+        next_streak,
+        delay: decision.delay,
+        visible: next_streak_value % 10 == 0,
+    }
+}
+
+/// Outcome of [`apply_backpressure_step`]: which branch of a
+/// [`BackpressureStep`] was taken. `next_streak` and `visible` are threaded
+/// back through the `Rescheduled` variant so the caller can still log its own
+/// "still rescheduling" message with the actual scheduled streak; both
+/// branches' message text stay job-specific and are not centralized here.
+pub(crate) enum BackpressureOutcome {
+    /// The reschedule budget was exhausted; no successor was pushed. The
+    /// caller logs its own dead-letter message and returns `Ok(())`.
+    DeadLettered,
+    /// A successor was pushed after the computed delay.
+    Rescheduled {
+        next_streak: BackpressureStreak,
+        visible: bool,
+    },
+}
+
+/// Executes a [`BackpressureStep`] against `queue`: a no-op for
+/// [`BackpressureStep::DeadLetter`], or builds the successor via
+/// `build_successor` and pushes it after the computed delay for
+/// [`BackpressureStep::Reschedule`]. Centralizes the
+/// push-then-return-the-outcome boilerplate that was copy-pasted verbatim
+/// across every participating job's error handler; each job still owns its
+/// own tracing text and successor struct construction, since both are
+/// job-specific.
+pub(crate) async fn apply_backpressure_step<
+    Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static,
+>(
+    step: BackpressureStep,
+    queue: &mut JobQueue<Task>,
+    build_successor: impl FnOnce(BackpressureStreak) -> Task,
+) -> Result<BackpressureOutcome, QueuePushError> {
+    match step {
+        BackpressureStep::DeadLetter => Ok(BackpressureOutcome::DeadLettered),
+        BackpressureStep::Reschedule {
+            next_streak,
+            delay,
+            visible,
+        } => {
+            queue
+                .push_with_delay(build_successor(next_streak), delay)
+                .await?;
+            Ok(BackpressureOutcome::Rescheduled {
+                next_streak,
+                visible,
+            })
+        }
+    }
+}
+
+/// Walks the `.source()` chain of a job error looking for a classified
+/// broker rate-limit (429) response, checking the error itself before
+/// descending into its sources. Tries each of four known error types in
+/// turn, short-circuiting on the first `Some` -- this is the one place that
+/// needs to "know about" all of them (RAI-1494).
+///
+/// `AlpacaMarketDataError` (market-data 429s, e.g. from
+/// `fetch_latest_trade_price`) is NOT one of the four: it only ever reaches
+/// the wider app wrapped in `AlpacaBrokerApiError::LatestTrade`, and that
+/// variant's `backpressure()` delegates straight to the wrapped error, so
+/// classification happens at the `AlpacaBrokerApiError` hop already --
+/// naming `AlpacaMarketDataError` here would be a redundant, leaky second
+/// downcast (`st0x-execution`'s `AGENTS.md` keeps it test-only).
+///
+/// `TokenizerError` needs its own downcast (not just `AlpacaTokenizationError`):
+/// `TokenizerError::Alpaca` is `#[error(transparent)]`, which makes `.source()`
+/// forward straight through to the WRAPPED error's own source rather than
+/// returning the wrapped error itself -- so a chain-walk alone would skip
+/// right past an `AlpacaTokenizationError` arriving wrapped in a
+/// `TokenizerError` (as every `Tokenizer` trait method returns) without ever
+/// downcasting it. `TokenizerError::backpressure()` delegates internally
+/// instead of relying on `.source()`.
+pub(crate) fn find_backpressure(error: &(dyn std::error::Error + 'static)) -> Option<Backpressure> {
+    std::iter::successors(Some(error), |error| error.source()).find_map(|error| {
+        error
+            .downcast_ref::<AlpacaBrokerApiError>()
+            .and_then(AlpacaBrokerApiError::backpressure)
+            .or_else(|| {
+                error
+                    .downcast_ref::<AlpacaWalletError>()
+                    .and_then(AlpacaWalletError::backpressure)
+            })
+            .or_else(|| {
+                error
+                    .downcast_ref::<AlpacaTokenizationError>()
+                    .and_then(AlpacaTokenizationError::backpressure)
+            })
+            .or_else(|| {
+                error
+                    .downcast_ref::<TokenizerError>()
+                    .and_then(TokenizerError::backpressure)
+            })
+    })
+}
 
 type Storage<Task> = SqliteStorage<
     Task,
@@ -741,6 +984,321 @@ mod tests {
 
     use super::*;
     use crate::test_utils::setup_test_apalis_pool;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("intermediate wrapper: {0}")]
+    struct IntermediateTestError(#[source] AlpacaBrokerApiError);
+
+    fn api_error_429(retry_after: Option<Duration>) -> AlpacaBrokerApiError {
+        AlpacaBrokerApiError::ApiError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            alpaca_code: None,
+            message: "rate limited".to_string(),
+            retry_after,
+        }
+    }
+
+    #[test]
+    fn find_backpressure_walks_multiple_hops_to_a_wrapped_429() {
+        let error = IntermediateTestError(api_error_429(Some(Duration::from_secs(7))));
+
+        let backpressure = find_backpressure(&error).expect("expected a classified 429");
+        assert_eq!(backpressure.retry_after, Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn find_backpressure_none_for_an_unrelated_error_chain() {
+        let io_error = std::io::Error::other("boom");
+
+        assert_eq!(find_backpressure(&io_error), None);
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("intermediate wrapper: {0}")]
+    struct IntermediateWalletTestError(#[source] AlpacaWalletError);
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("intermediate wrapper: {0}")]
+    struct IntermediateTokenizationTestError(#[source] AlpacaTokenizationError);
+
+    /// Pins the REAL production wrapping shape (not a synthetic intermediate
+    /// wrapper): `fetch_latest_trade_price` failures surface as
+    /// `AlpacaBrokerApiError::LatestTrade(AlpacaMarketDataError)`, and
+    /// `AlpacaBrokerApiError::backpressure()` delegates straight to the
+    /// wrapped market-data error (RAI-1494) instead of `find_backpressure`
+    /// needing its own separate `AlpacaMarketDataError` downcast.
+    #[test]
+    fn find_backpressure_classifies_a_market_data_429_wrapped_in_latest_trade() {
+        let error =
+            AlpacaBrokerApiError::LatestTrade(st0x_execution::AlpacaMarketDataError::ApiError {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                body: "rate limited".to_string(),
+                retry_after: Some(Duration::from_secs(9)),
+            });
+
+        let backpressure = find_backpressure(&error).expect("expected a classified 429");
+        assert_eq!(backpressure.retry_after, Some(Duration::from_secs(9)));
+    }
+
+    #[test]
+    fn find_backpressure_walks_multiple_hops_to_a_wrapped_wallet_429() {
+        let error = IntermediateWalletTestError(AlpacaWalletError::ApiError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            message: "rate limited".to_string(),
+            retry_after: Some(Duration::from_secs(11)),
+        });
+
+        let backpressure = find_backpressure(&error).expect("expected a classified 429");
+        assert_eq!(backpressure.retry_after, Some(Duration::from_secs(11)));
+    }
+
+    #[test]
+    fn find_backpressure_walks_multiple_hops_to_a_wrapped_tokenization_429() {
+        let error = IntermediateTokenizationTestError(AlpacaTokenizationError::ApiError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            message: st0x_tokenization::AlpacaApiErrorMessage::for_test("rate limited"),
+            retry_after: Some(Duration::from_secs(13)),
+        });
+
+        let backpressure = find_backpressure(&error).expect("expected a classified 429");
+        assert_eq!(backpressure.retry_after, Some(Duration::from_secs(13)));
+    }
+
+    /// Pins the `#[error(transparent)]` gotcha `TokenizerError::backpressure()`
+    /// exists to work around: every `Tokenizer` trait method returns
+    /// `TokenizerError`, not `AlpacaTokenizationError` directly, and
+    /// `#[error(transparent)]` makes `.source()` skip straight past the
+    /// wrapped `AlpacaTokenizationError` to ITS OWN source (`None` for
+    /// `ApiError`) instead of returning the wrapped error itself. Without the
+    /// dedicated `TokenizerError` downcast in `find_backpressure`, a 429 from
+    /// any `Tokenizer` call site (e.g. `retry_on_backpressure`-wrapped CLI
+    /// tokenization calls) would never classify -- this regressed silently
+    /// once during this change (a `TokenizerError`-typed 429 produced zero
+    /// retries against a real mocked response) and must not regress again.
+    #[test]
+    fn find_backpressure_classifies_a_tokenizer_error_wrapped_429_despite_transparent_forwarding() {
+        let error: st0x_tokenization::TokenizerError = AlpacaTokenizationError::ApiError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            message: st0x_tokenization::AlpacaApiErrorMessage::for_test("rate limited"),
+            retry_after: Some(Duration::from_secs(21)),
+        }
+        .into();
+
+        let backpressure = find_backpressure(&error).expect("expected a classified 429");
+        assert_eq!(backpressure.retry_after, Some(Duration::from_secs(21)));
+    }
+
+    #[test]
+    fn decide_backpressure_floors_a_zero_retry_after() {
+        let backpressure = Backpressure {
+            retry_after: Some(Duration::ZERO),
+        };
+
+        let decision = decide_backpressure(&backpressure, BackpressureStreak(0));
+
+        assert_eq!(decision.delay, MIN_BACKPRESSURE_DELAY);
+        assert!(!decision.exhausted);
+    }
+
+    #[test]
+    fn decide_backpressure_honours_a_large_retry_after_within_the_ceiling() {
+        let backpressure = Backpressure {
+            retry_after: Some(Duration::from_secs(120)),
+        };
+
+        let decision = decide_backpressure(&backpressure, BackpressureStreak(0));
+
+        assert_eq!(decision.delay, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn decide_backpressure_caps_a_retry_after_above_the_ceiling() {
+        let backpressure = Backpressure {
+            retry_after: Some(Duration::from_secs(10 * 60)),
+        };
+
+        let decision = decide_backpressure(&backpressure, BackpressureStreak(0));
+
+        assert_eq!(decision.delay, MAX_RETRY_AFTER);
+    }
+
+    #[test]
+    fn decide_backpressure_escalates_the_fallback_when_retry_after_is_absent() {
+        let backpressure = Backpressure { retry_after: None };
+
+        let delays: Vec<Duration> = (0..8)
+            .map(|streak| decide_backpressure(&backpressure, BackpressureStreak(streak)).delay)
+            .collect();
+
+        for window in delays.windows(2) {
+            assert!(
+                window[1] >= window[0],
+                "the fallback delay must never decrease as the streak grows: {delays:?}"
+            );
+        }
+        assert_eq!(
+            delays.last().copied().unwrap(),
+            BACKPRESSURE_FALLBACK_CAP,
+            "the fallback must plateau at its cap for a long streak: {delays:?}"
+        );
+        assert!(
+            delays[0] < delays[3],
+            "the fallback must actually escalate, not start already at the cap: {delays:?}"
+        );
+    }
+
+    #[test]
+    fn decide_backpressure_is_not_exhausted_below_the_limit() {
+        let backpressure = Backpressure {
+            retry_after: Some(Duration::from_secs(1)),
+        };
+
+        let decision = decide_backpressure(
+            &backpressure,
+            BackpressureStreak(BACKPRESSURE_RESCHEDULE_LIMIT - 1),
+        );
+
+        assert!(!decision.exhausted);
+    }
+
+    #[test]
+    fn decide_backpressure_is_exhausted_at_the_limit() {
+        let backpressure = Backpressure {
+            retry_after: Some(Duration::from_secs(1)),
+        };
+
+        let decision = decide_backpressure(
+            &backpressure,
+            BackpressureStreak(BACKPRESSURE_RESCHEDULE_LIMIT),
+        );
+
+        assert!(decision.exhausted);
+    }
+
+    #[test]
+    fn advance_backpressure_reschedules_with_incremented_streak_below_the_limit() {
+        let backpressure = Backpressure {
+            retry_after: Some(Duration::from_secs(5)),
+        };
+
+        let step = advance_backpressure(&backpressure, BackpressureStreak(3));
+
+        match step {
+            BackpressureStep::Reschedule {
+                next_streak,
+                delay,
+                visible,
+            } => {
+                assert_eq!(next_streak, BackpressureStreak(4));
+                assert_eq!(delay, Duration::from_secs(5));
+                assert!(!visible);
+            }
+            BackpressureStep::DeadLetter => panic!("expected a reschedule step, got DeadLetter"),
+        }
+    }
+
+    #[test]
+    fn advance_backpressure_marks_every_tenth_streak_visible() {
+        let backpressure = Backpressure {
+            retry_after: Some(Duration::from_secs(1)),
+        };
+
+        let step = advance_backpressure(&backpressure, BackpressureStreak(9));
+
+        match step {
+            BackpressureStep::Reschedule {
+                next_streak,
+                visible,
+                ..
+            } => {
+                assert_eq!(next_streak, BackpressureStreak(10));
+                assert!(visible);
+            }
+            BackpressureStep::DeadLetter => panic!("expected a reschedule step, got DeadLetter"),
+        }
+    }
+
+    #[test]
+    fn advance_backpressure_dead_letters_at_the_limit() {
+        let backpressure = Backpressure {
+            retry_after: Some(Duration::from_secs(1)),
+        };
+
+        let step = advance_backpressure(
+            &backpressure,
+            BackpressureStreak(BACKPRESSURE_RESCHEDULE_LIMIT),
+        );
+
+        match step {
+            BackpressureStep::DeadLetter => {}
+            BackpressureStep::Reschedule { .. } => {
+                panic!("expected DeadLetter at the reschedule limit")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_backpressure_step_dead_letter_pushes_nothing() {
+        let apalis_pool = setup_test_apalis_pool().await;
+        let mut queue = JobQueue::<u32>::new(&apalis_pool);
+
+        let outcome = apply_backpressure_step(BackpressureStep::DeadLetter, &mut queue, |_| {
+            panic!("build_successor must not be called on the DeadLetter branch")
+        })
+        .await
+        .unwrap();
+
+        match outcome {
+            BackpressureOutcome::DeadLettered => {}
+            BackpressureOutcome::Rescheduled { .. } => {
+                panic!("expected DeadLettered, got Rescheduled")
+            }
+        }
+        assert!(
+            !queue.has_in_flight().await.unwrap(),
+            "DeadLetter must not push a successor"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_backpressure_step_reschedule_pushes_the_built_successor() {
+        let apalis_pool = setup_test_apalis_pool().await;
+        let mut queue = JobQueue::<u32>::new(&apalis_pool);
+
+        let step = BackpressureStep::Reschedule {
+            next_streak: BackpressureStreak(7),
+            delay: Duration::from_millis(1),
+            visible: true,
+        };
+
+        let outcome =
+            apply_backpressure_step(step, &mut queue, |BackpressureStreak(streak)| streak)
+                .await
+                .unwrap();
+
+        match outcome {
+            BackpressureOutcome::Rescheduled {
+                next_streak,
+                visible,
+            } => {
+                assert_eq!(next_streak, BackpressureStreak(7));
+                assert!(visible);
+            }
+            BackpressureOutcome::DeadLettered => panic!("expected Rescheduled, got DeadLettered"),
+        }
+
+        let pushed_payload = sqlx_apalis::query_scalar::<_, String>(
+            "SELECT CAST(job AS TEXT) FROM Jobs WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<u32>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pushed_payload, "7",
+            "the pushed successor must be built from the step's next_streak"
+        );
+    }
 
     #[tokio::test]
     async fn has_in_flight_detects_pending_and_ignores_terminal() {

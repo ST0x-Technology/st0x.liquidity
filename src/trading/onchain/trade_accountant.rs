@@ -24,10 +24,14 @@ use st0x_registry::{SymbolCache, get_symbol_lock};
 
 use super::inclusion::EmittedOnChain;
 use super::skipped_fill::{SkipReason, record_skipped_fill};
-use crate::conductor::job::{Job, JobQueue, Label};
+use crate::conductor::job::{
+    BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureOutcome, BackpressureStreak, Job, JobQueue, Label,
+    advance_backpressure, apply_backpressure_step, find_backpressure,
+};
 use crate::conductor::{
     TradeProcessingCqrs, VaultDiscoveryCtx, discover_vaults_for_trade, process_queued_trade,
 };
+use crate::offchain::order::PlaceOffchainOrderError;
 use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::{RaindexTradeEvent, TradeValidationError};
 use crate::onchain::{OnChainError, OnchainTrade};
@@ -43,6 +47,22 @@ pub(crate) type DexTradeAccountingJobQueue = JobQueue<AccountForDexTrade>;
 pub struct AccountForDexTrade {
     /// Raindex trade event with block inclusion metadata
     pub(crate) trade: EmittedOnChain<RaindexTradeEvent>,
+    /// Count of consecutive broker rate-limit (429) reschedules leading up to
+    /// this attempt (RAI-1494). `#[serde(default)]` so a row enqueued under
+    /// the pre-this-change payload shape still deserializes to `0` instead of
+    /// crashing the poll stream's `sqlx::Decode`.
+    ///
+    /// This job is "reschedule-then-backstop", not "true retry":
+    /// `account_for_onchain_fill` commits on `(tx_hash, log_index)` before
+    /// any Alpaca touch, so once that guard commits, a 429 later in the same
+    /// attempt reschedules, but the pushed successor's
+    /// `account_for_onchain_fill` hits `FillAccountingOutcome::
+    /// AlreadyAcknowledged` and never re-attempts the hedge -- the streak
+    /// structurally caps at 1 and never approaches
+    /// `BACKPRESSURE_RESCHEDULE_LIMIT`. Actual completion of the hedge is
+    /// delegated to the existing `CheckPositions` backstop.
+    #[serde(default)]
+    pub(crate) backpressure_streak: BackpressureStreak,
 }
 
 /// Bundles the shared dependencies needed by the trade accounting job.
@@ -309,14 +329,92 @@ where
 
         let trading_enabled = ctx.ctx.assets.is_trading_enabled(trade.symbol.base());
 
-        process_queued_trade(
+        match process_queued_trade(
             &ctx.executor,
             trade_event,
             trade,
             &ctx.cqrs,
             trading_enabled,
         )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => self.handle_process_queued_trade_error(ctx, error).await,
+        }
+    }
+}
+
+impl AccountForDexTrade {
+    /// Handles a `process_queued_trade` failure: reschedules with a
+    /// classified delay on broker rate-limiting (429) instead of consuming
+    /// the terminal retry budget, or propagates any other error through the
+    /// normal, unmodified retry/circuit-breaker path.
+    ///
+    /// `account_for_onchain_fill` commits its `(tx_hash, log_index)` guard
+    /// before any Alpaca touch, so a rescheduled successor short-circuits to
+    /// `AlreadyAcknowledged` rather than re-driving the hedge -- this job is
+    /// "reschedule-then-backstop", not "true retry" (see the RAI-1494 plan's
+    /// per-job classification table). The reschedule's value here is only:
+    /// don't burn the terminal retry budget, don't latch the worker; actual
+    /// completion is `CheckPositions`' job, unchanged by this plan.
+    async fn handle_process_queued_trade_error<Node, Exec>(
+        &self,
+        ctx: &AccountantCtx<Node, Exec>,
+        error: TradeAccountingError,
+    ) -> Result<(), TradeAccountingError>
+    where
+        Node: Provider + Clone + Send + Sync + 'static,
+        Exec: Executor + Clone + Send + 'static,
+        TradeAccountingError: From<Exec::Error>,
+    {
+        let Some(backpressure) = find_backpressure(&error) else {
+            return Err(error);
+        };
+
+        let step = advance_backpressure(&backpressure, self.backpressure_streak);
+        let mut queue = ctx.job_queue.clone();
+        let outcome = apply_backpressure_step(step, &mut queue, |next_streak| Self {
+            trade: self.trade.clone(),
+            backpressure_streak: next_streak,
+        })
         .await?;
+
+        match outcome {
+            BackpressureOutcome::DeadLettered => {
+                // Per the RAI-1494 plan's binding M2 decision (applied uniformly
+                // to every supervised job, not just the five that can sustain a
+                // genuine streak): dead-letter instead of propagating `Err` into
+                // the shared supervised on-event path, so a persistently-429ing
+                // item cannot re-open the circuit breaker RAI-1495 already knows
+                // how to latch.
+                let BackpressureStreak(streak) = self.backpressure_streak;
+                error!(
+                    target: "hedge",
+                    tx_hash = ?self.trade.tx_hash,
+                    log_index = self.trade.log_index,
+                    streak,
+                    limit = BACKPRESSURE_RESCHEDULE_LIMIT,
+                    "AccountForDexTrade: broker rate-limiting exceeded the reschedule \
+                     budget; dead-lettering this fill instead of opening the circuit \
+                     breaker -- treat as a structurally-dead Alpaca integration needing \
+                     manual reconciliation"
+                );
+            }
+            BackpressureOutcome::Rescheduled {
+                next_streak: BackpressureStreak(streak),
+                visible,
+            } => {
+                if visible {
+                    error!(
+                        target: "hedge",
+                        tx_hash = ?self.trade.tx_hash,
+                        log_index = self.trade.log_index,
+                        streak,
+                        "AccountForDexTrade: still rescheduling after sustained broker rate-limiting"
+                    );
+                }
+            }
+        }
 
         Ok(())
     }
@@ -403,6 +501,8 @@ pub(crate) enum TradeAccountingError {
     PositionCommand(#[from] SendError<crate::position::Position>),
     #[error("Offchain order command failed: {0}")]
     OffchainOrderCommand(#[from] SendError<crate::offchain::order::OffchainOrder>),
+    #[error("Offchain order placement failed: {0}")]
+    OffchainOrderPlacement(#[from] PlaceOffchainOrderError),
     #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
     // TODO: TradeAccountingError should not be coupled to a concrete executor error type.
@@ -467,6 +567,7 @@ pub(crate) enum TradeAccountingError {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::time::Duration;
 
     use alloy::primitives::{Address, B256, U256, address};
     use alloy::providers::mock::Asserter;
@@ -480,7 +581,8 @@ mod tests {
     use st0x_event_sorcery::StoreBuilder;
     use st0x_evm::IERC20::{decimalsCall, symbolCall};
     use st0x_execution::{
-        FractionalShares, MockExecutor, MockExecutorCtx, Positive, Symbol, TryIntoExecutor,
+        CancellationOutcome, FractionalShares, InventoryResult, MockExecutor, MockExecutorCtx,
+        Positive, SupportedExecutor, Symbol, TryIntoExecutor,
     };
     use st0x_float_macro::float;
 
@@ -588,6 +690,7 @@ mod tests {
 
         AccountForDexTrade {
             trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            backpressure_streak: BackpressureStreak::default(),
         }
     }
 
@@ -663,6 +766,7 @@ mod tests {
         let event = RaindexTradeEvent::TakeOrderV3(Box::new(take_event));
         let job = AccountForDexTrade {
             trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // Mock EVM responses: receipt first, then decimals()+symbol() for each token.
@@ -764,6 +868,7 @@ mod tests {
         let event = RaindexTradeEvent::ClearV3(Box::new(clear_event));
         let job = AccountForDexTrade {
             trade: EmittedOnChain::from_log(event, &clear_log).unwrap(),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // AfterClearV2 crediting alice 9 shares (aliceOutput) for 0 USDC
@@ -889,6 +994,7 @@ mod tests {
         let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
         let job = AccountForDexTrade {
             trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // Reconstructed log's tx_hash is get_test_log's; the parser fetches the
@@ -980,6 +1086,7 @@ mod tests {
         let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
         let job = AccountForDexTrade {
             trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let tx_hash = alloy::primitives::fixed_bytes!(
@@ -1067,6 +1174,7 @@ mod tests {
         let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
         let job = AccountForDexTrade {
             trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let tx_hash = alloy::primitives::fixed_bytes!(
@@ -1164,6 +1272,7 @@ mod tests {
         let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
         let job = AccountForDexTrade {
             trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let tx_hash = alloy::primitives::fixed_bytes!(
@@ -1274,6 +1383,7 @@ mod tests {
         let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
         let job = AccountForDexTrade {
             trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // The parser fetches the receipt, then the deposit- (USDC, 6dp)
@@ -1399,6 +1509,234 @@ mod tests {
         assert_eq!(order_count, 1, "the hedge order must be placed");
     }
 
+    /// Executor whose `preflight_counter_trade` always fails with a
+    /// classified broker rate-limit (429) -- `MockExecutor`'s errors are all
+    /// `ExecutionError`, which is never classifiable, so a real `Executor`
+    /// impl with `Error = AlpacaBrokerApiError` is needed to drive a
+    /// classified 429 through the REAL `process_queued_trade` call site
+    /// (RAI-1494 finding: the perform -> handler wiring itself was
+    /// previously unverified for this job).
+    #[derive(Clone)]
+    struct RateLimitedPreflightExecutor;
+
+    #[async_trait::async_trait]
+    impl Executor for RateLimitedPreflightExecutor {
+        type Error = AlpacaBrokerApiError;
+        type OrderId = String;
+        type Ctx = ();
+
+        async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
+            Ok(Self)
+        }
+
+        async fn is_market_open(&self) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn place_market_order(
+            &self,
+            _order: st0x_execution::MarketOrder,
+        ) -> Result<st0x_execution::OrderPlacement<Self::OrderId>, Self::Error> {
+            unimplemented!("not exercised: the preflight check fails before any placement")
+        }
+
+        async fn get_order_status(
+            &self,
+            _order_id: &Self::OrderId,
+        ) -> Result<st0x_execution::OrderState, Self::Error> {
+            unimplemented!("not exercised: the preflight check fails before any status poll")
+        }
+
+        fn to_supported_executor(&self) -> SupportedExecutor {
+            SupportedExecutor::DryRun
+        }
+
+        fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error> {
+            Ok(order_id_str.to_string())
+        }
+
+        async fn get_inventory(&self) -> Result<InventoryResult, Self::Error> {
+            Ok(InventoryResult::Unimplemented)
+        }
+
+        async fn place_limit_order(
+            &self,
+            _order: st0x_execution::LimitOrder,
+        ) -> Result<st0x_execution::OrderPlacement<Self::OrderId>, Self::Error> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn cancel_order(
+            &self,
+            _order_id: &Self::OrderId,
+        ) -> Result<CancellationOutcome, Self::Error> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn preflight_counter_trade(
+            &self,
+            _order: st0x_execution::MarketOrder,
+        ) -> Result<st0x_execution::CounterTradePreflight, Self::Error> {
+            Err(AlpacaBrokerApiError::ApiError {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                alpaca_code: None,
+                message: "rate limited".to_string(),
+                retry_after: Some(Duration::from_millis(1)),
+            })
+        }
+
+        async fn preflight_counter_trade_at_price(
+            &self,
+            order: st0x_execution::MarketOrder,
+            _reference_price: st0x_execution::Positive<st0x_execution::Usd>,
+        ) -> Result<st0x_execution::CounterTradePreflight, Self::Error> {
+            self.preflight_counter_trade(order).await
+        }
+    }
+
+    /// Drives a classified 429 through the REAL `Job::perform` entry point
+    /// (not `handle_process_queued_trade_error` called directly), pinning
+    /// the perform -> handler wiring the sibling `handle_process_queued_trade_error`-only
+    /// tests above cannot prove. Reuses
+    /// `perform_hedges_inventory_trade_with_hedgeable_pair`'s fixture with
+    /// the executor swapped for one that fails the preflight check: the fill
+    /// is accounted (guard commits) before the 429 surfaces, matching this
+    /// job's "reschedule-then-backstop" shape -- no hedge order is placed.
+    #[tokio::test]
+    async fn perform_reschedules_with_incremented_streak_on_a_preflight_429_without_placing_a_hedge()
+     {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let asserter = Asserter::new();
+
+        let usdc_token = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+        let equity_token = address!("0x5CdA0E1cA4ce2Af96315F7F8963c85399c172204");
+        let operator = address!("0x8b8b6e0507c125934c6129563f48e48c66f86475");
+
+        let inventory_trade = InventoryTrade {
+            deposit: OperatorDeposit {
+                operator,
+                token: usdc_token,
+                vaultId: alloy::primitives::b256!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000004"
+                ),
+                amount: alloy::primitives::uint!(5_000_000_U256),
+            },
+            withdraw: OperatorWithdraw {
+                operator,
+                token: equity_token,
+                vaultId: alloy::primitives::b256!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000003"
+                ),
+                amount: alloy::primitives::uint!(34_172_366_621_067_031_U256),
+            },
+        };
+
+        let tx_hash = alloy::primitives::fixed_bytes!(
+            "0xe13a11de734768f08a9c1ef66e8de3bcb9072f8cdabce9f1d819e1ae9909d4b9"
+        );
+        let mut log = crate::test_utils::create_log(0x97);
+        log.transaction_hash = Some(tx_hash);
+        log.block_number = Some(48_030_415);
+        log.block_timestamp = Some(1_782_850_177);
+
+        let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
+        let job = AccountForDexTrade {
+            trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x3b",
+            "blockHash": "0x373307a0e2154c2de6b046e349fc27f9bb02b01fdddbb15eeba57f3ce3b24973",
+            "blockNumber": "0x2dce2cf",
+            "from": "0x679df30b30ac2947aa3143490add6717af81dcc3",
+            "to": "0xbeb0009aca35087ce7ccf11637e24dd1aad3bf2a",
+            "gasUsed": "0x7a62d",
+            "effectiveGasPrice": "0x57bcf0",
+            "cumulativeGasUsed": "0xa00b4e",
+            "status": "0x1",
+            "type": "0x2",
+            "logsBloom": format!("0x{}", "0".repeat(512)),
+            "logs": []
+        }));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = RateLimitedPreflightExecutor;
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+
+        let mut symbols = HashMap::new();
+        symbols.insert(
+            Symbol::new("COIN").unwrap(),
+            EquityAssetConfig {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: equity_token,
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+        ctx.assets = AssetsConfig {
+            equities: EquitiesConfig {
+                operational_limit: None,
+                symbols,
+            },
+            cash: None,
+        };
+
+        let cache = SymbolCache::default();
+        cache.preload_symbol(usdc_token, "USDC");
+        cache.preload_symbol(equity_token, "wtCOIN");
+
+        let accountant_ctx = build_test_accountant_ctx(
+            pool.clone(),
+            &apalis_pool,
+            ctx,
+            cache,
+            provider,
+            executor,
+            ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(0.01))).unwrap()),
+        )
+        .await;
+
+        // The 429 must reschedule (Ok(())) through the REAL Job::perform
+        // entry point, not propagate as Err.
+        job.perform(&accountant_ctx).await.unwrap();
+
+        assert_eq!(successor_backpressure_streak(&apalis_pool).await, 1);
+
+        // The fill was still accounted (the guard commits before any Alpaca
+        // touch), but no hedge order was placed -- this job is
+        // "reschedule-then-backstop", not "true retry".
+        let (fill_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                .bind("OnChainTradeEvent::Filled")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            fill_count, 1,
+            "the fill must still be accounted before the preflight 429 surfaces"
+        );
+
+        let (order_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'OffchainOrderEvent::Placed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            order_count, 0,
+            "a preflight 429 must not place a hedge order"
+        );
+    }
+
     /// The real univ4-routed prod settlement (`0x9ee8e401a6f12227df1a30a236b60ac83c72b2b1eb610d83cf292ae789eb0805`,
     /// also pinned at the parser level in `onchain::trade`'s
     /// `try_from_inventory_trade_real_univ4_fill_is_buy`) must flow all the
@@ -1451,6 +1789,7 @@ mod tests {
         let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
         let job = AccountForDexTrade {
             trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // The parser fetches the receipt, then the deposit- (wtCOIN, 18dp)
@@ -1620,5 +1959,164 @@ mod tests {
         assert_eq!(decoded.token, withdraw.token);
         assert_eq!(decoded.vaultId, withdraw.vaultId);
         assert_eq!(decoded.amount, withdraw.amount);
+    }
+
+    fn account_for_dex_trade_job_type() -> &'static str {
+        std::any::type_name::<AccountForDexTrade>()
+    }
+
+    async fn successor_backpressure_streak(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
+        let streaks: Vec<i64> = sqlx_apalis::query_scalar(
+            "SELECT json_extract(CAST(job AS TEXT), '$.backpressure_streak') FROM Jobs \
+             WHERE job_type = ?",
+        )
+        .bind(account_for_dex_trade_job_type())
+        .fetch_all(apalis_pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            streaks.len(),
+            1,
+            "a 429 must enqueue exactly one AccountForDexTrade successor"
+        );
+        streaks.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn account_for_dex_trade_payload_without_backpressure_streak_deserializes_to_zero() {
+        let job = test_job();
+        let mut value = serde_json::to_value(&job).unwrap();
+        value.as_object_mut().unwrap().remove("backpressure_streak");
+
+        let decoded: AccountForDexTrade = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.backpressure_streak, BackpressureStreak::default());
+    }
+
+    /// `handle_process_queued_trade_error` is the actual new RAI-1494
+    /// mechanism this job gained; `account_for_onchain_fill`'s
+    /// `(tx_hash, log_index)` guard (the reason this job is
+    /// "reschedule-then-backstop", not "true retry") is pre-existing,
+    /// untouched by this plan, and already idempotent under the existing
+    /// `retries(3)` path -- exercised directly at the unit level here rather
+    /// than re-proven end to end.
+    #[tokio::test]
+    async fn account_for_dex_trade_429_reschedules_with_incremented_streak_and_does_not_propagate_err()
+     {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+
+        let accountant_ctx = build_test_accountant_ctx(
+            pool,
+            &apalis_pool,
+            ctx,
+            SymbolCache::default(),
+            provider,
+            executor,
+            ExecutionThreshold::whole_share(),
+        )
+        .await;
+
+        let job = test_job();
+        let error = TradeAccountingError::AlpacaBrokerApi(AlpacaBrokerApiError::ApiError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            alpaca_code: None,
+            message: "rate limited".to_string(),
+            retry_after: Some(Duration::from_millis(1)),
+        });
+
+        job.handle_process_queued_trade_error(&accountant_ctx, error)
+            .await
+            .unwrap();
+
+        assert_eq!(successor_backpressure_streak(&apalis_pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn account_for_dex_trade_429_past_reschedule_limit_dead_letters_without_propagating_err()
+    {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+
+        let accountant_ctx = build_test_accountant_ctx(
+            pool,
+            &apalis_pool,
+            ctx,
+            SymbolCache::default(),
+            provider,
+            executor,
+            ExecutionThreshold::whole_share(),
+        )
+        .await;
+
+        let mut job = test_job();
+        job.backpressure_streak = BackpressureStreak(BACKPRESSURE_RESCHEDULE_LIMIT);
+        let error = TradeAccountingError::AlpacaBrokerApi(AlpacaBrokerApiError::ApiError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            alpaca_code: None,
+            message: "rate limited".to_string(),
+            retry_after: Some(Duration::from_millis(1)),
+        });
+
+        job.handle_process_queued_trade_error(&accountant_ctx, error)
+            .await
+            .unwrap();
+
+        let job_count: i64 =
+            sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(account_for_dex_trade_job_type())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            job_count, 0,
+            "an exhausted backpressure streak must dead-letter, not reschedule"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_for_dex_trade_non_backpressure_error_propagates_unchanged() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+
+        let accountant_ctx = build_test_accountant_ctx(
+            pool,
+            &apalis_pool,
+            ctx,
+            SymbolCache::default(),
+            provider,
+            executor,
+            ExecutionThreshold::whole_share(),
+        )
+        .await;
+
+        let job = test_job();
+        let error = TradeAccountingError::AlpacaBrokerApi(AlpacaBrokerApiError::ApiError {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            alpaca_code: None,
+            message: "boom".to_string(),
+            retry_after: None,
+        });
+
+        let result = job
+            .handle_process_queued_trade_error(&accountant_ctx, error)
+            .await;
+        let Err(TradeAccountingError::AlpacaBrokerApi(AlpacaBrokerApiError::ApiError {
+            status,
+            ..
+        })) = result
+        else {
+            panic!("expected the non-backpressure error to propagate unchanged");
+        };
+        assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

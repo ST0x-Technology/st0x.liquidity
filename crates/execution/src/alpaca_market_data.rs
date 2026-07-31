@@ -3,11 +3,13 @@
 use rain_math_float::Float;
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::Deserialize;
+use std::time::Duration;
 use tracing::trace;
 
+use crate::rate_limit::retry_after_from_response_headers;
 use crate::{
-    LatestQuote, LatestQuoteError, Positive, Symbol, Usd, deserialize_float_from_number_or_string,
-    deserialize_option_float_from_number_or_string,
+    Backpressure, LatestQuote, LatestQuoteError, Positive, Symbol, Usd,
+    deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -15,7 +17,11 @@ pub enum AlpacaMarketDataError {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("API error (status {status}): {body}")]
-    ApiError { status: StatusCode, body: String },
+    ApiError {
+        status: StatusCode,
+        body: String,
+        retry_after: Option<Duration>,
+    },
     #[error("failed to parse latest trade response: {0}")]
     JsonParse(#[from] serde_json::Error),
     #[error("latest trade response for {symbol} did not include a price")]
@@ -41,6 +47,37 @@ pub enum AlpacaMarketDataError {
         #[source]
         source: LatestQuoteError,
     },
+}
+
+impl AlpacaMarketDataError {
+    /// Classifies this error as broker rate-limiting (HTTP 429), returning
+    /// its `Retry-After` hint when the broker sent one. Every other variant
+    /// returns `None` -- an exhaustive match so a new variant added later
+    /// forces a conscious decision here rather than silently classifying as
+    /// "not backpressure".
+    pub fn backpressure(&self) -> Option<Backpressure> {
+        match self {
+            Self::ApiError {
+                status,
+                retry_after,
+                ..
+            } if *status == StatusCode::TOO_MANY_REQUESTS => Some(Backpressure {
+                retry_after: *retry_after,
+            }),
+
+            Self::ApiError { .. }
+            | Self::Http(_)
+            | Self::JsonParse(_)
+            | Self::MissingPrice { .. }
+            | Self::NonPositivePrice { .. }
+            | Self::MissingQuote { .. }
+            | Self::MissingBid { .. }
+            | Self::MissingAsk { .. }
+            | Self::NonPositiveBid { .. }
+            | Self::NonPositiveAsk { .. }
+            | Self::InvalidQuote { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +134,7 @@ async fn get_market_data_bytes(request: RequestBuilder) -> Result<Vec<u8>, Alpac
     let response = request.send().await?;
     let status = response.status();
     let url = response.url().clone();
+    let retry_after = retry_after_from_response_headers(response.headers());
     let bytes = response.bytes().await?;
 
     trace!(
@@ -111,6 +149,7 @@ async fn get_market_data_bytes(request: RequestBuilder) -> Result<Vec<u8>, Alpac
         return Err(AlpacaMarketDataError::ApiError {
             status,
             body: String::from_utf8_lossy(&bytes).into_owned(),
+            retry_after,
         });
     }
 
@@ -453,6 +492,7 @@ mod tests {
             when.method(GET).path("/v2/stocks/AAPL/trades/latest");
             then.status(429)
                 .header("content-type", "application/json")
+                .header("Retry-After", "30")
                 .json_body(json!({
                     "message": "rate limited",
                     "market_data_marker": "error-body"
@@ -463,11 +503,16 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
-            error,
-            AlpacaMarketDataError::ApiError { status, .. }
-                if status == StatusCode::TOO_MANY_REQUESTS
-        ));
+        let AlpacaMarketDataError::ApiError {
+            status,
+            retry_after,
+            ..
+        } = error
+        else {
+            panic!("expected ApiError");
+        };
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(retry_after, Some(Duration::from_secs(30)));
         assert!(logs_contain("Alpaca market data response body received"));
         assert!(logs_contain("market_data_marker"));
         assert!(logs_contain("error-body"));
@@ -503,5 +548,74 @@ mod tests {
             AlpacaMarketDataError::ApiError { status, .. }
                 if status == StatusCode::FORBIDDEN
         ));
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_trade_price_backpressure_some_for_429_with_header() {
+        let server = MockServer::start();
+        let client = Client::new();
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/v2/stocks/AAPL/trades/latest");
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("Retry-After", "12")
+                .json_body(json!({ "message": "rate limited" }));
+        });
+
+        let error = fetch_latest_trade_price(&client, &server.base_url(), &symbol)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.backpressure(),
+            Some(Backpressure {
+                retry_after: Some(Duration::from_secs(12))
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_trade_price_backpressure_some_with_none_without_header() {
+        let server = MockServer::start();
+        let client = Client::new();
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/v2/stocks/AAPL/trades/latest");
+            then.status(429)
+                .header("content-type", "application/json")
+                .json_body(json!({ "message": "rate limited" }));
+        });
+
+        let error = fetch_latest_trade_price(&client, &server.base_url(), &symbol)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.backpressure(),
+            Some(Backpressure { retry_after: None })
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_trade_price_backpressure_none_for_non_429() {
+        let server = MockServer::start();
+        let client = Client::new();
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/v2/stocks/AAPL/trades/latest");
+            then.status(500)
+                .header("content-type", "application/json")
+                .json_body(json!({ "message": "boom" }));
+        });
+
+        let error = fetch_latest_trade_price(&client, &server.base_url(), &symbol)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.backpressure(), None);
     }
 }

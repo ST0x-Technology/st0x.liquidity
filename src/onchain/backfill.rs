@@ -29,7 +29,7 @@ use st0x_execution::Executor;
 use super::OnChainError;
 use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
 use crate::bindings::IRaindexV6::{ClearV3, TakeOrderV3};
-use crate::conductor::job::{Job, Label};
+use crate::conductor::job::{BackpressureStreak, Job, Label};
 use crate::onchain::trade::{BotOperator, InventoryTrade, RaindexTradeEvent};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{
@@ -738,7 +738,10 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         // "ClearV3"/"TakeOrderV3"/"InventoryTrade".
         counter!("onchain_events_total", "event_type" => trade_event.event.kind()).increment(1);
         job_queue
-            .push(AccountForDexTrade { trade: trade_event })
+            .push(AccountForDexTrade {
+                trade: trade_event,
+                backpressure_streak: BackpressureStreak::default(),
+            })
             .await?;
     }
 

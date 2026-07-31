@@ -20,6 +20,7 @@ use st0x_execution::{
 };
 use st0x_float_serde::format_float_with_fallback;
 
+use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpressure};
 use crate::conductor::{
     FillAccountingOutcome, account_for_onchain_fill, execute_mark_acknowledged,
     execute_settle_fill, is_expected_place_offchain_order_rejection,
@@ -259,7 +260,12 @@ async fn get_broker_order_status<W: Write>(
     match &ctx.broker {
         BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
             let broker = alpaca_auth.clone().try_into_executor().await?;
-            Ok(broker.get_order_status(&order_id.to_string()).await?)
+            let order_id = order_id.to_string();
+            Ok(retry_on_backpressure(
+                || broker.get_order_status(&order_id),
+                BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+            )
+            .await?)
         }
         BrokerCtx::DryRun => {
             let broker = MockExecutorCtx.try_into_executor().await?;
@@ -364,16 +370,19 @@ async fn execute_alpaca_limit_order<W: Write>(
     writeln!(stdout, "🔄 Executing Alpaca Broker API limit order...")?;
 
     let broker = alpaca_auth.clone().try_into_executor().await?;
-    let placement = broker
-        .place_alpaca_limit_order(AlpacaLimitOrder {
-            symbol: request.symbol.clone(),
-            shares: request.shares,
-            direction: request.direction,
-            limit_price,
-            extended_hours,
-            client_order_id: ClientOrderId::cli(Uuid::new_v4()),
-        })
-        .await?;
+    let order = AlpacaLimitOrder {
+        symbol: request.symbol.clone(),
+        shares: request.shares,
+        direction: request.direction,
+        limit_price,
+        extended_hours,
+        client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+    };
+    let placement = retry_on_backpressure(
+        || broker.place_alpaca_limit_order(order.clone()),
+        BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+    )
+    .await?;
 
     writeln!(
         stdout,
@@ -495,7 +504,11 @@ pub(super) async fn execute_broker_order<W: Write>(
                 auth.time_in_force = tif;
             }
             let broker = auth.try_into_executor().await?;
-            let placement = broker.place_market_order(market_order).await?;
+            let placement = retry_on_backpressure(
+                || broker.place_market_order(market_order.clone()),
+                BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+            )
+            .await?;
             writeln!(
                 stdout,
                 "✅ Alpaca Broker API order placed with ID: {}",
@@ -563,11 +576,20 @@ async fn place_market_order_until_filled<Exec: Executor, W: Write>(
     market_order: MarketOrder,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    let placement = broker.place_market_order(market_order).await?;
+    let placement = retry_on_backpressure(
+        || broker.place_market_order(market_order.clone()),
+        BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+    )
+    .await?;
     writeln!(stdout, "   Buy order placed: {}", placement.order_id)?;
 
     for attempt in 1..=BUY_FILL_MAX_ATTEMPTS {
-        match broker.get_order_status(&placement.order_id).await? {
+        let order_state = retry_on_backpressure(
+            || broker.get_order_status(&placement.order_id),
+            BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+        )
+        .await?;
+        match order_state {
             OrderState::Filled { order_id, .. } => {
                 writeln!(stdout, "   Buy filled (order {order_id})")?;
                 return Ok(());
@@ -1888,6 +1910,217 @@ mod tests {
         assert!(
             error.to_string().contains("buy order failed"),
             "a rejected order must fail the buy-fill wait, got: {error}"
+        );
+    }
+
+    /// Executor error carrying an optional Alpaca 429 as its `source`, so
+    /// `find_backpressure` classifies it exactly like a real
+    /// `AlpacaBrokerApiError` -- used to pin that
+    /// `place_market_order_until_filled` retries a classified 429 in place
+    /// (RAI-1494) instead of failing the buy-fill wait immediately.
+    #[derive(Debug, thiserror::Error)]
+    #[error("test executor error")]
+    struct BackpressureTestError {
+        #[source]
+        source: Option<st0x_execution::AlpacaBrokerApiError>,
+    }
+
+    fn backpressure_429_error() -> BackpressureTestError {
+        BackpressureTestError {
+            source: Some(st0x_execution::AlpacaBrokerApiError::ApiError {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                alpaca_code: None,
+                message: "rate limited".to_string(),
+                retry_after: Some(std::time::Duration::from_millis(1)),
+            }),
+        }
+    }
+
+    /// Executor whose `place_market_order` returns a classified 429 for the
+    /// first `placement_429s` calls before succeeding, and whose
+    /// `get_order_status` returns a classified 429 for the first
+    /// `status_429s` calls before reporting `Filled`.
+    #[derive(Clone)]
+    struct BackpressureThenFilledExecutor {
+        placement_429s: usize,
+        status_429s: usize,
+        placement_calls: Arc<AtomicUsize>,
+        status_calls: Arc<AtomicUsize>,
+    }
+
+    impl BackpressureThenFilledExecutor {
+        fn new(placement_429s: usize, status_429s: usize) -> Self {
+            Self {
+                placement_429s,
+                status_429s,
+                placement_calls: Arc::new(AtomicUsize::new(0)),
+                status_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Executor for BackpressureThenFilledExecutor {
+        type Error = BackpressureTestError;
+        type OrderId = String;
+        type Ctx = ();
+
+        async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
+            Ok(Self::new(0, 0))
+        }
+
+        async fn is_market_open(&self) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn place_market_order(
+            &self,
+            order: MarketOrder,
+        ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+            let call_index = self.placement_calls.fetch_add(1, Ordering::SeqCst);
+            if call_index < self.placement_429s {
+                return Err(backpressure_429_error());
+            }
+            Ok(OrderPlacement {
+                order_id: "backpressure-order-id".to_string(),
+                symbol: order.symbol,
+                shares: order.shares,
+                direction: order.direction,
+                placed_at: Utc::now(),
+                extended_hours: false,
+                limit_price: None,
+            })
+        }
+
+        async fn get_order_status(
+            &self,
+            _order_id: &Self::OrderId,
+        ) -> Result<OrderState, Self::Error> {
+            let call_index = self.status_calls.fetch_add(1, Ordering::SeqCst);
+            if call_index < self.status_429s {
+                return Err(backpressure_429_error());
+            }
+            Ok(OrderState::Filled {
+                executed_at: Utc::now(),
+                order_id: ExecutorOrderId::new("backpressure-order-id"),
+                price: st0x_execution::Usd::new(Float::parse("195.30".to_string()).unwrap()),
+            })
+        }
+
+        fn to_supported_executor(&self) -> SupportedExecutor {
+            SupportedExecutor::DryRun
+        }
+
+        fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error> {
+            Ok(order_id_str.to_string())
+        }
+
+        async fn get_inventory(&self) -> Result<InventoryResult, Self::Error> {
+            Ok(InventoryResult::Unimplemented)
+        }
+
+        async fn place_limit_order(
+            &self,
+            _order: LimitOrder,
+        ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+            unimplemented!("not exercised by the buy-fill backpressure tests")
+        }
+
+        async fn cancel_order(
+            &self,
+            _order_id: &Self::OrderId,
+        ) -> Result<CancellationOutcome, Self::Error> {
+            unimplemented!("not exercised by the buy-fill backpressure tests")
+        }
+
+        async fn preflight_counter_trade_at_price(
+            &self,
+            order: MarketOrder,
+            _reference_price: Positive<Usd>,
+        ) -> Result<CounterTradePreflight, Self::Error> {
+            self.preflight_counter_trade(order).await
+        }
+    }
+
+    #[tokio::test]
+    async fn market_buy_retries_placement_after_a_429_then_succeeds() {
+        let broker = BackpressureThenFilledExecutor::new(2, 0);
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: positive_shares("10"),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+        };
+        let mut stdout = Vec::new();
+
+        place_market_order_until_filled(&broker, order, &mut stdout)
+            .await
+            .expect("a classified 429 on placement must be retried, not fail the buy-fill wait");
+
+        assert_eq!(
+            broker.placement_calls.load(Ordering::SeqCst),
+            3,
+            "must retry placement exactly twice after the first two 429s before succeeding"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_buy_retries_status_poll_after_a_429_then_succeeds() {
+        let broker = BackpressureThenFilledExecutor::new(0, 2);
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: positive_shares("10"),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+        };
+        let mut stdout = Vec::new();
+
+        place_market_order_until_filled(&broker, order, &mut stdout)
+            .await
+            .expect(
+                "a classified 429 on the status poll must be retried, not fail the buy-fill wait",
+            );
+
+        assert_eq!(
+            broker.status_calls.load(Ordering::SeqCst),
+            3,
+            "must retry the status poll exactly twice after the first two 429s before succeeding"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_buy_placement_fails_when_429s_exceed_the_retry_budget() {
+        let broker =
+            BackpressureThenFilledExecutor::new(BACKPRESSURE_RETRY_MAX_ATTEMPTS as usize, 0);
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: positive_shares("10"),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+        };
+        let mut stdout = Vec::new();
+
+        let error = place_market_order_until_filled(&broker, order, &mut stdout)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            broker.placement_calls.load(Ordering::SeqCst),
+            BACKPRESSURE_RETRY_MAX_ATTEMPTS as usize,
+            "must stop retrying after exactly the bounded attempt budget"
+        );
+        let backpressure_error = error
+            .downcast_ref::<BackpressureTestError>()
+            .expect("the exhausted 429 must surface as the executor's own error type unwrapped");
+        assert!(
+            matches!(
+                backpressure_error.source,
+                Some(st0x_execution::AlpacaBrokerApiError::ApiError {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    ..
+                })
+            ),
+            "the exhausted 429 must retain its classified source, got: {backpressure_error:?}"
         );
     }
 

@@ -50,7 +50,7 @@ use super::aggregate::{
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
-use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
+use crate::conductor::job::{BackpressureStreak, Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 use crate::inventory::BroadcastingInventory;
 use crate::inventory::view::{InFlightEquityLocation, InventoryView};
@@ -156,6 +156,22 @@ pub(crate) enum UnwrappedEquityRecoveryJobError {
 pub(crate) struct UnwrappedEquityRecoveryJob {
     pub(crate) symbol: Symbol,
     pub(crate) recovery_id: UnwrappedEquityRecoveryId,
+    /// Count of consecutive broker rate-limit (429) reschedules leading up to
+    /// this attempt (RAI-1494). `#[serde(default)]` so a row enqueued under
+    /// the pre-this-change payload shape still deserializes to `0` instead of
+    /// crashing the poll stream's `sqlx::Decode`.
+    ///
+    /// NOT YET wired to a reschedule: mirrors `WrappedEquityRecoveryJob`'s
+    /// identical gap -- `resume_mint`/`resume_redemption` failures are caught
+    /// inside the aggregate's command handler and recorded as a terminal
+    /// `RecoveryFailed` event with only a Display-formatted `String` reason,
+    /// so `ctx.store.send()` returns `Ok(())` regardless and `perform()`
+    /// never observes an `Err` to classify. See `WrappedEquityRecoveryJob`'s
+    /// field doc and the RAI-1494 decision log for the follow-up needed to
+    /// close this gap. Field added now so the payload schema is ready when
+    /// that follow-up lands.
+    #[serde(default)]
+    pub(crate) backpressure_streak: BackpressureStreak,
 }
 
 impl Job<UnwrappedEquityRecoveryCtx> for UnwrappedEquityRecoveryJob {
@@ -757,6 +773,17 @@ mod tests {
     use super::super::aggregate::UnwrappedEquityRecoveryServices;
     use super::*;
 
+    #[test]
+    fn unwrapped_equity_recovery_job_payload_without_backpressure_streak_deserializes_to_zero() {
+        let payload = serde_json::json!({
+            "symbol": Symbol::new("AAPL").unwrap(),
+            "recovery_id": UnwrappedEquityRecoveryId(Uuid::new_v4()),
+        });
+
+        let job: UnwrappedEquityRecoveryJob = serde_json::from_value(payload).unwrap();
+        assert_eq!(job.backpressure_streak, BackpressureStreak::default());
+    }
+
     fn mock_vault_lookup() -> MockVaultLookup {
         MockVaultLookup::new()
             .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
@@ -905,6 +932,7 @@ mod tests {
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // Guard contention must NOT yield a retryable error (exhausting the retry
@@ -1050,6 +1078,7 @@ mod tests {
             .push(UnwrappedEquityRecoveryJob {
                 symbol: Symbol::new("GOOGL").unwrap(),
                 recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
+                backpressure_streak: BackpressureStreak::default(),
             })
             .await
             .unwrap();
@@ -1356,6 +1385,7 @@ mod tests {
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx)
@@ -1379,6 +1409,7 @@ mod tests {
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         let error = job
@@ -1407,6 +1438,7 @@ mod tests {
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx)
@@ -1453,6 +1485,7 @@ mod tests {
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         // Must return Ok(()) -- no apalis retry.
@@ -1515,6 +1548,7 @@ mod tests {
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: recovery_id.clone(),
+            backpressure_streak: BackpressureStreak::default(),
         };
         job.perform(&ctx)
             .await
@@ -1546,6 +1580,7 @@ mod tests {
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx)
@@ -1586,6 +1621,7 @@ mod tests {
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: recovery_id.clone(),
+            backpressure_streak: BackpressureStreak::default(),
         };
         job.perform(&ctx)
             .await
@@ -1625,6 +1661,7 @@ mod tests {
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: recovery_id.clone(),
+            backpressure_streak: BackpressureStreak::default(),
         };
         job.perform(&ctx)
             .await
@@ -1664,6 +1701,7 @@ mod tests {
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: recovery_id.clone(),
+            backpressure_streak: BackpressureStreak::default(),
         };
         job.perform(&ctx)
             .await
@@ -1734,6 +1772,7 @@ mod tests {
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
+            backpressure_streak: BackpressureStreak::default(),
         };
         job.perform(&ctx)
             .await
@@ -1796,6 +1835,7 @@ mod tests {
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
+            backpressure_streak: BackpressureStreak::default(),
         };
         job.perform(&ctx)
             .await
@@ -1864,6 +1904,7 @@ mod tests {
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: recovery_id.clone(),
+            backpressure_streak: BackpressureStreak::default(),
         };
         job.perform(&ctx)
             .await
@@ -1929,6 +1970,7 @@ mod tests {
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: recovery_id.clone(),
+            backpressure_streak: BackpressureStreak::default(),
         };
         job.perform(&ctx)
             .await
@@ -2001,6 +2043,7 @@ mod tests {
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: recovery_id.clone(),
+            backpressure_streak: BackpressureStreak::default(),
         };
         job.perform(&ctx)
             .await
@@ -2118,6 +2161,7 @@ mod tests {
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
             recovery_id: recovery_id.clone(),
+            backpressure_streak: BackpressureStreak::default(),
         };
 
         job.perform(&ctx)
