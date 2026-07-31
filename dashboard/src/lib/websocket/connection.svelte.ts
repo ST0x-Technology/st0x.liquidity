@@ -4,7 +4,7 @@ import type { Statement } from '$lib/api/Statement'
 import { isStatement } from '$lib/api/StatementGuard'
 import { matcher } from '$lib/fp'
 import { reactive } from '$lib/frp.svelte'
-import { seedTrades, appendFill } from './trades'
+import { seedTrades, appendTrade } from './trades'
 import { seedInventory, updateSnapshot, upsertPosition } from './inventory'
 import { seedTransfers, upsertTransfer } from './transfers'
 
@@ -38,7 +38,7 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
         seedTransfers(queryClient, data)
       },
 
-      trade_fill: ({ data }) => { appendFill(queryClient, data); },
+      trade_update: ({ data }) => { appendTrade(queryClient, data); },
 
       position_update: ({ data }) => { upsertPosition(queryClient, data); },
 

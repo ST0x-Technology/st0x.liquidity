@@ -15,7 +15,7 @@ use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use st0x_dto::{Direction, Trade, TradingVenue};
+use st0x_dto::{Direction, Trade, TradeOutcome, TradingVenue};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::Symbol;
 use st0x_finance::FractionalShares;
@@ -264,14 +264,15 @@ impl OnChainTrade {
         self.acknowledged_at.is_some()
     }
 
-    pub(crate) fn to_trade(&self, id: &OnChainTradeId) -> Trade {
+    pub(crate) fn into_trade(self, id: &OnChainTradeId) -> Trade {
         Trade {
             id: id.to_string(),
-            filled_at: self.filled_at,
+            occurred_at: self.block_timestamp,
             venue: TradingVenue::Raindex,
             direction: self.direction,
-            symbol: self.symbol.clone(),
+            symbol: self.symbol,
             shares: FractionalShares::new(self.amount),
+            outcome: TradeOutcome::Filled,
         }
     }
 }

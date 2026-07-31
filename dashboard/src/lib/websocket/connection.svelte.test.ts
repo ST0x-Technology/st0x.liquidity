@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { createWebSocket } from '.'
-import type { QueryClient } from '@tanstack/svelte-query'
+import { QueryClient } from '@tanstack/svelte-query'
 import type { Statement } from '$lib/api/Statement'
 import type { Trade } from '$lib/api/Trade'
 import type { TransferOperation } from '$lib/api/TransferOperation'
@@ -74,24 +74,26 @@ const WS_URL = 'ws://localhost:8001/api/ws'
 
 const makeTrade = (overrides: Partial<Trade> = {}): Trade => ({
   id: 'trade-1',
-  filledAt: '2024-01-01T12:00:00Z',
+  occurredAt: '2024-01-01T12:00:00Z',
   venue: 'raindex',
   direction: 'buy',
   symbol: 'AAPL',
   shares: '10',
+  outcome: { status: 'filled' },
   ...overrides
 })
 
-const makeTransfer = (overrides: Partial<TransferOperation> = {}): TransferOperation => ({
-  kind: 'equity_mint',
-  id: 'transfer-1',
-  symbol: 'AAPL',
-  quantity: '10',
-  status: { status: 'minting' },
-  startedAt: '2024-01-01T12:00:00Z',
-  updatedAt: '2024-01-01T12:00:00Z',
-  ...overrides
-} as TransferOperation)
+const makeTransfer = (overrides: Partial<TransferOperation> = {}): TransferOperation =>
+  ({
+    kind: 'equity_mint',
+    id: 'transfer-1',
+    symbol: 'AAPL',
+    quantity: '10',
+    status: { status: 'minting' },
+    startedAt: '2024-01-01T12:00:00Z',
+    updatedAt: '2024-01-01T12:00:00Z',
+    ...overrides
+  }) as TransferOperation
 
 const setupWebSocketTest = () => {
   const instances: MockWebSocket[] = []
@@ -191,7 +193,8 @@ describe('createWebSocket', () => {
         data: {
           trades: [trade],
           inventory: {
-            perSymbol: [], usdc: {
+            perSymbol: [],
+            usdc: {
               onchainAvailable: '0',
               onchainInflight: '0',
               offchainAvailable: '0',
@@ -209,7 +212,8 @@ describe('createWebSocket', () => {
             usdcTarget: null,
             usdcDeviation: null,
             cashReserved: null,
-            executionThreshold: '$2', assets: [],
+            executionThreshold: '$2',
+            assets: [],
             wallet: null,
             logLevel: 'Debug',
             serverPort: 8001,
@@ -232,16 +236,20 @@ describe('createWebSocket', () => {
       expect(trades).toBeDefined()
       expect(trades).toEqual([trade])
 
-      const active = queryClient.cache.get('["transfers","active"]') as TransferOperation[] | undefined
+      const active = queryClient.cache.get('["transfers","active"]') as
+        | TransferOperation[]
+        | undefined
       expect(active).toBeDefined()
       expect(active).toEqual([activeTransfer])
 
-      const recent = queryClient.cache.get('["transfers","recent"]') as TransferOperation[] | undefined
+      const recent = queryClient.cache.get('["transfers","recent"]') as
+        | TransferOperation[]
+        | undefined
       expect(recent).toBeDefined()
       expect(recent).toEqual([recentTransfer])
     })
 
-    it('prepends fill to trades cache', () => {
+    it('prepends trade updates to the trades cache', () => {
       const { getInstance } = setupWebSocketTest()
       const queryClient = createMockQueryClient()
       const ws = createWebSocket(WS_URL, queryClient)
@@ -250,10 +258,10 @@ describe('createWebSocket', () => {
       getInstance(0).simulateOpen()
 
       // Seed with existing trade
-      queryClient.cache.set('["trades"]', [makeTrade({ symbol: 'TSLA' })])
+      queryClient.cache.set('["trades"]', [makeTrade({ id: 'trade-old', symbol: 'TSLA' })])
 
       const newTrade = makeTrade({ symbol: 'AAPL' })
-      const message: Statement = { type: 'trade_fill', data: newTrade }
+      const message: Statement = { type: 'trade_update', data: newTrade }
 
       getInstance(0).simulateMessage(message)
 
@@ -261,6 +269,33 @@ describe('createWebSocket', () => {
       expect(trades).toHaveLength(2)
       expect(trades[0]?.symbol).toBe('AAPL')
       expect(trades[1]?.symbol).toBe('TSLA')
+    })
+
+    it('replaces a matching initial trade with its live update', () => {
+      const { getInstance } = setupWebSocketTest()
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } }
+      })
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      getInstance(0).simulateOpen()
+
+      queryClient.setQueryData(['trades'], [makeTrade({ symbol: 'STALE' })])
+      const failure = makeTrade({
+        symbol: 'SPCX',
+        outcome: {
+          status: 'failed',
+          error: 'asset is not tradable',
+          filledShares: '0',
+          remainingShares: '10',
+          excessShares: '0'
+        }
+      })
+      getInstance(0).simulateMessage({ type: 'trade_update', data: failure })
+
+      const trades = queryClient.getQueryData<Trade[]>(['trades'])
+      expect(trades).toEqual([failure])
     })
 
     it('limits trades to 100', () => {
@@ -272,12 +307,12 @@ describe('createWebSocket', () => {
       getInstance(0).simulateOpen()
 
       const existing = Array.from({ length: 100 }, (_, idx) =>
-        makeTrade({ symbol: `SYM${String(idx)}` })
+        makeTrade({ id: `trade-${String(idx)}`, symbol: `SYM${String(idx)}` })
       )
       queryClient.cache.set('["trades"]', existing)
 
       const newTrade = makeTrade({ symbol: 'NEW' })
-      getInstance(0).simulateMessage({ type: 'trade_fill', data: newTrade })
+      getInstance(0).simulateMessage({ type: 'trade_update', data: newTrade })
 
       const trades = queryClient.cache.get('["trades"]') as Trade[]
       expect(trades).toHaveLength(100)
@@ -293,17 +328,19 @@ describe('createWebSocket', () => {
       getInstance(0).simulateOpen()
 
       const inventory = {
-        perSymbol: [{
-          symbol: 'AAPL',
-          onchainAvailable: '10',
-          onchainInflight: '0',
-          offchainAvailable: '5',
-          offchainInflight: '0',
-          inflightEquity: {
-            baseWalletUnwrapped: '0',
-            baseWalletWrapped: '0'
+        perSymbol: [
+          {
+            symbol: 'AAPL',
+            onchainAvailable: '10',
+            onchainInflight: '0',
+            offchainAvailable: '5',
+            offchainInflight: '0',
+            inflightEquity: {
+              baseWalletUnwrapped: '0',
+              baseWalletWrapped: '0'
+            }
           }
-        }],
+        ],
         usdc: {
           onchainAvailable: '1000',
           onchainInflight: '0',
@@ -352,7 +389,10 @@ describe('createWebSocket', () => {
       const recent = queryClient.cache.get('["transfers","recent"]') as TransferOperation[]
       expect(recent).toHaveLength(1)
       expect(recent[0]?.id).toBe('mint-1')
-      expect(recent[0]?.status).toEqual({ status: 'completed', completedAt: '2024-01-01T13:00:00Z' })
+      expect(recent[0]?.status).toEqual({
+        status: 'completed',
+        completedAt: '2024-01-01T13:00:00Z'
+      })
     })
 
     it('ignores invalid messages', () => {

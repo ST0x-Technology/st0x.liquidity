@@ -1,13 +1,13 @@
-//! Loads filled trades from the event store for the initial dashboard state.
+//! Loads terminal trade outcomes from the event store for dashboard history.
 
 use futures_util::{StreamExt, stream};
 use sqlx::SqlitePool;
 use tracing::warn;
 
-use st0x_dto::Trade;
-use st0x_event_sorcery::{load_all_ids, load_entity};
+use st0x_dto::{Trade, sort_trades_newest_first};
+use st0x_event_sorcery::{LoadAllIdsError, SendError, load_all_ids, load_entity};
 
-use crate::offchain::order::OffchainOrder;
+use crate::offchain::order::{OffchainOrder, TradeConversionError};
 use crate::onchain_trade::OnChainTrade;
 
 const MAX_TRADES: usize = 100;
@@ -15,65 +15,124 @@ const MAX_TRADES: usize = 100;
 /// Load recent filled trades from both onchain and offchain sources.
 ///
 /// Returns up to [`MAX_TRADES`] trades sorted by fill time (newest first).
-pub(crate) async fn load_trades(pool: &SqlitePool) -> Vec<Trade> {
+pub(crate) async fn load_trades(pool: &SqlitePool) -> Result<Vec<Trade>, TradeHistoryError> {
     let mut trades: Vec<Trade> = load_onchain_trades(pool)
-        .await
+        .await?
         .into_iter()
-        .chain(load_offchain_trades(pool).await)
+        .chain(load_offchain_trades(pool).await?)
         .collect();
 
-    trades.sort_by(|lhs, rhs| rhs.filled_at.cmp(&lhs.filled_at));
+    sort_trades_newest_first(&mut trades);
     trades.truncate(MAX_TRADES);
 
-    trades
+    Ok(trades)
 }
 
-async fn load_onchain_trades(pool: &SqlitePool) -> Vec<Trade> {
+async fn load_onchain_trades(pool: &SqlitePool) -> Result<Vec<Trade>, TradeHistoryError> {
     let ids = load_all_ids::<OnChainTrade>(pool)
         .await
-        .inspect_err(|error| warn!(?error, "Failed to load OnChainTrade IDs for trade history"))
-        .unwrap_or_default();
+        .map_err(TradeHistoryError::OnchainIds)?;
 
-    stream::iter(ids)
+    Ok(stream::iter(ids)
         .filter_map(|id| async move {
-            match load_entity::<OnChainTrade>(pool, &id).await {
-                Ok(Some(entity)) => Some(entity.to_trade(&id)),
+            let entity = match load_entity::<OnChainTrade>(pool, &id).await {
+                Ok(Some(entity)) => entity,
                 Ok(None) => {
-                    warn!(?id, "OnChainTrade replayed to empty state");
-                    None
+                    let error = TradeHistoryError::OnchainMissing { id: id.to_string() };
+                    warn!(target: "dashboard", %error, "Skipping unloadable onchain trade");
+                    return None;
                 }
-                Err(error) => {
-                    warn!(?error, ?id, "Failed to load OnChainTrade");
-                    None
+                Err(source) => {
+                    let error = TradeHistoryError::OnchainReplay {
+                        id: id.to_string(),
+                        source,
+                    };
+                    warn!(target: "dashboard", %error, "Skipping unloadable onchain trade");
+                    return None;
                 }
-            }
+            };
+
+            Some(entity.into_trade(&id))
         })
         .collect()
-        .await
+        .await)
 }
 
-async fn load_offchain_trades(pool: &SqlitePool) -> Vec<Trade> {
+async fn load_offchain_trades(pool: &SqlitePool) -> Result<Vec<Trade>, TradeHistoryError> {
     let ids = load_all_ids::<OffchainOrder>(pool)
         .await
-        .inspect_err(|error| warn!(?error, "Failed to load OffchainOrder IDs for trade history"))
-        .unwrap_or_default();
+        .map_err(TradeHistoryError::OffchainIds)?;
 
-    stream::iter(ids)
+    Ok(stream::iter(ids)
         .filter_map(|id| async move {
-            match load_entity::<OffchainOrder>(pool, &id).await {
-                Ok(Some(order)) => order.try_to_trade(&id).ok(),
+            let order = match load_entity::<OffchainOrder>(pool, &id).await {
+                Ok(Some(order)) => order,
                 Ok(None) => {
-                    warn!(?id, "OffchainOrder replayed to empty state");
-                    None
+                    let error = TradeHistoryError::OffchainMissing { id: id.to_string() };
+                    warn!(target: "dashboard", %error, "Skipping unloadable offchain trade");
+                    return None;
                 }
-                Err(error) => {
-                    warn!(?error, ?id, "Failed to load OffchainOrder");
+                Err(source) => {
+                    let error = TradeHistoryError::OffchainReplay {
+                        id: id.to_string(),
+                        source,
+                    };
+                    warn!(target: "dashboard", %error, "Skipping unloadable offchain trade");
+                    return None;
+                }
+            };
+
+            match order.try_into_trade(&id) {
+                Ok(trade) => Some(trade),
+                Err(
+                    TradeConversionError::Pending
+                    | TradeConversionError::Submitted
+                    | TradeConversionError::PartiallyFilled
+                    | TradeConversionError::Cancelling
+                    | TradeConversionError::Cancelled,
+                ) => None,
+                Err(source) => {
+                    let error = TradeHistoryError::OffchainConversion {
+                        id: id.to_string(),
+                        source,
+                    };
+                    warn!(target: "dashboard", %error, "Skipping unrepresentable offchain trade");
                     None
                 }
             }
         })
         .collect()
-        .await
+        .await)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TradeHistoryError {
+    #[error("failed to load onchain trade IDs: {0}")]
+    OnchainIds(#[source] LoadAllIdsError),
+    #[error("failed to load offchain trade IDs: {0}")]
+    OffchainIds(#[source] LoadAllIdsError),
+    #[error("failed to replay onchain trade {id}: {source}")]
+    OnchainReplay {
+        id: String,
+        #[source]
+        source: SendError<OnChainTrade>,
+    },
+    #[error("onchain trade {id} replayed to empty state")]
+    OnchainMissing { id: String },
+    #[error("failed to replay offchain trade {id}: {source}")]
+    OffchainReplay {
+        id: String,
+        #[source]
+        source: SendError<OffchainOrder>,
+    },
+    #[error("offchain trade {id} replayed to empty state")]
+    OffchainMissing { id: String },
+    #[error("offchain trade {id} cannot be represented in history: {source}")]
+    OffchainConversion {
+        id: String,
+        #[source]
+        source: TradeConversionError,
+    },
 }
 
 #[cfg(test)]
@@ -91,7 +150,7 @@ mod tests {
     #[tokio::test]
     async fn load_trades_empty_database() {
         let pool = setup_test_db().await;
-        let trades = load_trades(&pool).await;
+        let trades = load_trades(&pool).await.unwrap();
         assert!(trades.is_empty());
     }
 
@@ -125,7 +184,7 @@ mod tests {
             .await
             .unwrap();
 
-        let trades = load_trades(&pool).await;
+        let trades = load_trades(&pool).await.unwrap();
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].symbol, Symbol::new("AAPL").unwrap());
         assert!(matches!(trades[0].venue, st0x_dto::TradingVenue::Raindex));
@@ -184,7 +243,7 @@ mod tests {
             .await
             .unwrap();
 
-        let trades = load_trades(&pool).await;
+        let trades = load_trades(&pool).await.unwrap();
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].symbol, Symbol::new("TSLA").unwrap());
         assert!(matches!(trades[0].venue, st0x_dto::TradingVenue::Alpaca));
@@ -210,17 +269,22 @@ mod tests {
             tx_hash: alloy::primitives::TxHash::ZERO,
             log_index: 1,
         };
+        let tied_id = OnChainTradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 2,
+        };
 
         store
             .send(
                 &older_id,
-                OnChainTradeCommand::Witness {
+                OnChainTradeCommand::WitnessAt {
                     symbol: Symbol::new("AAPL").unwrap(),
                     amount: float!(10),
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_number: 1,
-                    block_timestamp: now,
+                    block_timestamp: now - chrono::Duration::seconds(1),
+                    filled_at: now,
                 },
             )
             .await
@@ -229,26 +293,97 @@ mod tests {
         store
             .send(
                 &newer_id,
-                OnChainTradeCommand::Witness {
+                OnChainTradeCommand::WitnessAt {
                     symbol: Symbol::new("TSLA").unwrap(),
                     amount: float!(5),
                     direction: Direction::Sell,
                     price_usdc: float!(200),
                     block_number: 2,
                     block_timestamp: now,
+                    filled_at: now,
                 },
             )
             .await
             .unwrap();
 
-        let trades = load_trades(&pool).await;
-        assert_eq!(trades.len(), 2);
-        assert!(
-            trades[0].filled_at >= trades[1].filled_at,
-            "trades should be sorted newest first: {:?} >= {:?}",
-            trades[0].filled_at,
-            trades[1].filled_at
-        );
+        store
+            .send(
+                &tied_id,
+                OnChainTradeCommand::WitnessAt {
+                    symbol: Symbol::new("NVDA").unwrap(),
+                    amount: float!(3),
+                    direction: Direction::Buy,
+                    price_usdc: float!(300),
+                    block_number: 2,
+                    block_timestamp: now,
+                    filled_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let trades = load_trades(&pool).await.unwrap();
+        assert_eq!(trades.len(), 3);
+        assert_eq!(trades[0].id, tied_id.to_string());
+        assert_eq!(trades[1].id, newer_id.to_string());
+        assert_eq!(trades[2].id, older_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn load_trades_skips_rows_that_fail_to_replay() {
+        let pool = setup_test_db().await;
+
+        let store = st0x_event_sorcery::StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+
+        let corrupt_id = OnChainTradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 0,
+        };
+        let intact_id = OnChainTradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 1,
+        };
+
+        for (id, symbol) in [(&corrupt_id, "AAPL"), (&intact_id, "TSLA")] {
+            store
+                .send(
+                    id,
+                    OnChainTradeCommand::WitnessAt {
+                        symbol: Symbol::new(symbol).unwrap(),
+                        amount: float!(1),
+                        direction: Direction::Buy,
+                        price_usdc: float!(100),
+                        block_number: 1,
+                        block_timestamp: now,
+                        filled_at: now,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        // Simulates a legacy row whose persisted payload no longer
+        // deserializes under the current event shapes.
+        sqlx::query("UPDATE events SET payload = '{\"bogus\":true}' WHERE aggregate_id = ?")
+            .bind(corrupt_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM snapshots WHERE aggregate_id = ?")
+            .bind(corrupt_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let trades = load_trades(&pool).await.unwrap();
+
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].id, intact_id.to_string());
     }
 
     #[tokio::test]
@@ -283,12 +418,12 @@ mod tests {
                 .unwrap();
         }
 
-        let trades = load_trades(&pool).await;
+        let trades = load_trades(&pool).await.unwrap();
         assert_eq!(trades.len(), MAX_TRADES, "should be capped at {MAX_TRADES}");
     }
 
     #[tokio::test]
-    async fn load_trades_excludes_unfilled_offchain_orders() {
+    async fn load_trades_includes_failed_offchain_orders() {
         let pool = setup_test_db().await;
 
         let (store, _projection) =
@@ -314,7 +449,58 @@ mod tests {
             .await
             .unwrap();
 
-        let trades = load_trades(&pool).await;
-        assert!(trades.is_empty(), "unfilled orders should not appear");
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkPlacementFailed {
+                    error: "asset is not tradable".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let trades = load_trades(&pool).await.unwrap();
+        assert_eq!(trades.len(), 1, "failed orders should appear");
+        assert!(matches!(
+            &trades[0].outcome,
+            st0x_dto::TradeOutcome::Failed {
+                error,
+                filled_shares,
+                remaining_shares,
+                excess_shares,
+            } if error == "asset is not tradable"
+                && filled_shares.inner().inner().eq(float!(0)).unwrap()
+                && remaining_shares.inner().inner().eq(float!(10)).unwrap()
+                && excess_shares.inner().inner().is_zero().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn load_trades_excludes_pending_offchain_orders() {
+        let pool = setup_test_db().await;
+        let (store, _projection) =
+            st0x_event_sorcery::StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(crate::offchain::order::noop_order_placer())
+                .await
+                .unwrap();
+        let id = OffchainOrderId::new();
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("NVDA").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+                    direction: Direction::Buy,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+
+        let trades = load_trades(&pool).await.unwrap();
+        assert!(trades.is_empty(), "pending orders should not appear");
     }
 }
