@@ -24,7 +24,10 @@ mod event;
 pub(crate) mod pnl;
 mod trade_loader;
 pub(crate) mod transfer_loader;
-pub(crate) use event::Broadcaster;
+pub(crate) use event::{
+    Broadcaster, DashboardTradeDelivery, DashboardTradeDeliveryCtx, DashboardTradeDeliveryJobQueue,
+    DashboardTradeHandoffMonitor, DeliverDashboardTrade,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]

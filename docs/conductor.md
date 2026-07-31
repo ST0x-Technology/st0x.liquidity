@@ -270,6 +270,37 @@ the job needs: config, symbol cache, configured Pyth feed IDs (`PythFeedIds`),
 EVM provider, orderbook address, CQRS frameworks, vault registry, executor,
 database pool, and job queue. Wrapped in `Arc` and injected via apalis `Data`.
 
+### DeliverDashboardTrade
+
+Defined in `src/dashboard/event.rs`. The dashboard CQRS reactor enqueues this
+job for each terminal trade outcome instead of publishing the update inline. The
+serialized `Trade` payload is the replay record. A separate
+`dashboard_trade_delivery` ledger, keyed by trade ID, records whether the live
+update completed. The reactor registers the ledger row before its idempotent
+queue insertion. If either insertion fails after the terminal event commits, a
+supervised handoff monitor retains the outcome in a bounded in-memory queue and
+retries it with exponential backoff a fixed number of times. An outcome that
+exhausts its immediate retries is not lost: the monitor schedules a periodic
+authoritative reconciliation that rebuilds every undelivered terminal trade from
+the event log, so one poison handoff cannot block later outcomes. A handoff
+whose trade can never be represented (a deterministic conversion failure) stops
+the monitor through the supervisor instead of retrying forever. Startup
+reconstructs every terminal trade from the event log, creates any ledger rows or
+jobs missing after a crash, and resets `Running`/`Queued`/`Failed`/`Killed` jobs
+to `Pending` before workers start. This closes both the event-to-job handoff
+window and the dequeue-to-publish restart window.
+
+The worker checks the ledger before publishing and records `delivered_at`
+afterward. A database failure in either step is retryable; a crash after publish
+but before the update commits can replay the message safely. Retry exhaustion
+notifies the conductor monitor and is logged as an undelivered terminal update.
+
+The Tokio broadcast channel reports an error when it has no receivers. That is
+not a delivery failure here: a later WebSocket connection loads terminal trades
+from the authoritative snapshot, so zero connected clients completes the job.
+Replaying a publish is safe because the dashboard replaces an existing trade
+with the same trade ID; a completed ledger row prevents unnecessary replays.
+
 ### CheckPositions
 
 Defined in `src/position_check.rs`. A durable, self-rescheduling apalis job that

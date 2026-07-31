@@ -34,6 +34,10 @@ use super::monitor::gas::{GasMonitor, ProviderBalanceReader};
 use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
 use crate::alerts::TelegramNotifier;
+use crate::dashboard::{
+    DashboardTradeDeliveryCtx, DashboardTradeDeliveryJobQueue, DashboardTradeHandoffMonitor,
+    DeliverDashboardTrade,
+};
 use crate::inventory::{
     BroadcastingInventory, InventoryDivergenceRecoveryCtx, InventoryPollingService,
     InventorySnapshot, InventorySnapshotId, WalletPollingCtx,
@@ -156,6 +160,9 @@ pub(crate) fn spawn<Prov, Exec>(
     context: ConductorCtx<Prov, Exec>,
     job_queue: DexTradeAccountingJobQueue,
     backfill_queue: BackfillJobQueue,
+    dashboard_trade_delivery_queue: DashboardTradeDeliveryJobQueue,
+    dashboard_trade_delivery_ctx: Arc<DashboardTradeDeliveryCtx>,
+    dashboard_trade_handoff_monitor: DashboardTradeHandoffMonitor,
     hedge_queue: HedgeJobQueue,
     poll_status_queue: PollOrderStatusJobQueue,
     reconcile_queue: ReconcileOrderFillJobQueue,
@@ -373,7 +380,11 @@ where
         .with_base_restart_delay(std::time::Duration::from_secs(1))
         .with_dead_tasks_threshold(Some(0.0))
         .with_task("order-fill-monitor", order_fill_monitor)
-        .with_task("inventory-monitor", inventory_monitor);
+        .with_task("inventory-monitor", inventory_monitor)
+        .with_task(
+            "dashboard-trade-handoff-monitor",
+            dashboard_trade_handoff_monitor,
+        );
 
     log_optional_task_status("executor maintenance", maintenance_interval.is_some());
 
@@ -404,6 +415,8 @@ where
         job_queue,
         hedge_queue,
         backfill_queue,
+        dashboard_trade_delivery_queue,
+        dashboard_trade_delivery_ctx,
         poll_status_queue,
         reconcile_queue,
         rejection_queue,
@@ -463,6 +476,8 @@ where
     job_queue: DexTradeAccountingJobQueue,
     hedge_queue: HedgeJobQueue,
     backfill_queue: BackfillJobQueue,
+    dashboard_trade_delivery_queue: DashboardTradeDeliveryJobQueue,
+    dashboard_trade_delivery_ctx: Arc<DashboardTradeDeliveryCtx>,
     poll_status_queue: PollOrderStatusJobQueue,
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
@@ -510,6 +525,8 @@ where
             job_queue,
             hedge_queue,
             backfill_queue,
+            dashboard_trade_delivery_queue,
+            dashboard_trade_delivery_ctx,
             poll_status_queue,
             reconcile_queue,
             rejection_queue,
@@ -541,6 +558,8 @@ where
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_backfill = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_dashboard_trade_delivery = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_poll = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_reconcile = failure_injector.clone();
@@ -571,6 +590,7 @@ where
         let failure_notify = Arc::new(tokio::sync::Notify::new());
         let failure_notify_for_hedge = failure_notify.clone();
         let failure_notify_for_backfill = failure_notify.clone();
+        let failure_notify_for_dashboard_trade_delivery = failure_notify.clone();
         let failure_notify_for_poll = failure_notify.clone();
         let failure_notify_for_reconcile = failure_notify.clone();
         let failure_notify_for_rejection = failure_notify.clone();
@@ -589,6 +609,7 @@ where
             .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
         let fail_stop_for_hedge = fail_stop.clone();
         let fail_stop_for_backfill = fail_stop.clone();
+        let fail_stop_for_dashboard_trade_delivery = fail_stop.clone();
         let fail_stop_for_poll = fail_stop.clone();
         let fail_stop_for_reconcile = fail_stop.clone();
         let fail_stop_for_rejection = fail_stop.clone();
@@ -615,6 +636,18 @@ where
                         failure_notify.clone(),
                         #[cfg(any(test, feature = "test-support"))]
                         failure_injector.clone(),
+                    )
+                })
+                .register(move |index| {
+                    build_supervised_worker!(
+                        ::<DashboardTradeDeliveryCtx, DeliverDashboardTrade>,
+                        index,
+                        dashboard_trade_delivery_queue.clone(),
+                        dashboard_trade_delivery_ctx.clone(),
+                        fail_stop_for_dashboard_trade_delivery.clone(),
+                        failure_notify_for_dashboard_trade_delivery.clone(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        failure_injector_for_dashboard_trade_delivery.clone(),
                     )
                 })
                 .register(move |index| {

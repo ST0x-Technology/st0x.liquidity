@@ -227,7 +227,9 @@ mod tests {
             Arc::new(crate::alerts::NoopNotifier),
         ));
 
-        let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
+        let broadcaster =
+            crate::dashboard::DashboardTradeDelivery::new(&apalis_pool, &pool, event_sender)
+                .broadcaster;
         let hedge_latency = HedgeLatencyProjection::new(pool.clone());
         let rebalance_timing = RebalanceTimingProjection::new(pool.clone());
         let equity_timing = EquityTimingProjection::new(pool.clone());
@@ -289,7 +291,9 @@ mod tests {
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::NoopNotifier),
         ));
-        let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
+        let broadcaster =
+            crate::dashboard::DashboardTradeDelivery::new(&apalis_pool, &pool, event_sender)
+                .broadcaster;
         let hedge_latency = HedgeLatencyProjection::new(pool.clone());
         let rebalance_timing = RebalanceTimingProjection::new(pool.clone());
         let equity_timing = EquityTimingProjection::new(pool.clone());
@@ -407,7 +411,9 @@ mod tests {
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::NoopNotifier),
         ));
-        let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
+        let broadcaster =
+            crate::dashboard::DashboardTradeDelivery::new(&apalis_pool, &pool, event_sender)
+                .broadcaster;
         let hedge_latency = HedgeLatencyProjection::new(pool.clone());
         let rebalance_timing = RebalanceTimingProjection::new(pool.clone());
         let equity_timing = EquityTimingProjection::new(pool.clone());
