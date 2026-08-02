@@ -44,7 +44,7 @@ use st0x_evm::{OpenChainErrorRegistry, USDC_BASE, Wallet};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, ClientOrderId, CounterTradePreflight,
     CounterTradeReservation, CounterTradeSkipReason, ExecutionError, Executor, FractionalShares,
-    MarketOrder, MarketSession, Symbol, TryIntoExecutor,
+    MarketOrder, MarketSession, Network, Symbol, TryIntoExecutor,
 };
 use st0x_issuance_client::IssuanceClient;
 use st0x_raindex::{RaindexService, RaindexVaultId, RevokeOutcome};
@@ -2027,6 +2027,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             alpaca_auth.api_key.clone(),
             alpaca_auth.api_secret.clone(),
             base_wallet.clone(),
+            Network::new("base"),
             Some(redemption_wallet),
         ));
 

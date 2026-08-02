@@ -1,7 +1,7 @@
 //! Transfer equity and USDC rebalancing CLI commands.
 
 use alloy::primitives::{Address, U256};
-use alloy::providers::Provider;
+use alloy::providers::RootProvider;
 use anyhow::Context;
 use sqlx::SqlitePool;
 use std::future::Future;
@@ -12,11 +12,14 @@ use tracing::warn;
 use uuid::Uuid;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
+use st0x_config::{BrokerCtx, Ctx, OnchainWalletCtx};
 use st0x_event_sorcery::{AggregateError, StoreBuilder};
-use st0x_evm::{Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, USDC_BASE, USDC_ETHEREUM};
+use st0x_evm::{
+    Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, USDC_BASE, USDC_ETHEREUM, Wallet,
+};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletService, Executor,
-    FractionalShares, Symbol, TimeInForce,
+    FractionalShares, Network, Symbol, TimeInForce,
 };
 use st0x_finance::Usdc;
 use st0x_raindex::{RaindexService, RaindexVaultId};
@@ -27,7 +30,7 @@ use st0x_tokenization::{
 use st0x_wrapper::{Wrapper, WrapperService};
 
 use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpressure};
-use super::{TransferDirection, TransferType};
+use super::{TokenizationNetwork, TransferDirection, TransferType};
 use crate::api::ResumeResponse;
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::equity_redemption::{
@@ -44,7 +47,6 @@ use crate::usdc_rebalance::{
 };
 use crate::vault_lookup::{VaultLookup, VaultRegistryLookup};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
-use st0x_config::{BrokerCtx, Ctx};
 
 struct EquityTransferCliServices {
     transfer: CrossVenueEquityTransfer,
@@ -53,9 +55,31 @@ struct EquityTransferCliServices {
 
 /// Resolves the redemption wallet address from CLI flag or config.
 ///
-/// CLI flag takes precedence. Falls back to `[tokenization]` config.
+/// CLI flag takes precedence; otherwise `[tokenization]` config is used for
+/// every network. Alpaca's redemption address is the same on all EVM chains
+/// (same key → same address), so ethereum does not need a separate override.
 fn resolve_redemption_wallet(flag: Option<Address>, ctx: &Ctx) -> anyhow::Result<Address> {
-    flag.map_or_else(|| ctx.redemption_wallet().map_err(Into::into), Ok)
+    if let Some(address) = flag {
+        return Ok(address);
+    }
+
+    ctx.redemption_wallet().map_err(Into::into)
+}
+
+/// The bot wallet whose chain matches the selected tokenization network,
+/// paired with that network's Alpaca `network` wire value. One match produces
+/// both so a wallet/wire mismatch cannot be constructed at the call site.
+fn tokenization_network_context(
+    wallet_ctx: &OnchainWalletCtx,
+    network: TokenizationNetwork,
+) -> (Arc<dyn Wallet<Provider = RootProvider>>, Network) {
+    match network {
+        TokenizationNetwork::Base => (wallet_ctx.base_wallet().clone(), Network::new("base")),
+        TokenizationNetwork::Ethereum => (
+            wallet_ctx.ethereum_wallet().clone(),
+            Network::new("ethereum"),
+        ),
+    }
 }
 
 async fn build_equity_transfer_services(
@@ -78,6 +102,7 @@ async fn build_equity_transfer_services(
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
         base_caller.clone(),
+        Network::new("base"),
         Some(redemption_wallet),
     ));
 
@@ -1027,23 +1052,47 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
     Ok(())
 }
 
+/// Resolves the tokenized-equity (tStock) address for a tokenization
+/// command: an explicit `--token` override wins; otherwise the Base address
+/// comes from `[assets.equities]`. Non-base networks have no config source,
+/// so they require the override.
+fn resolve_tokenization_token(
+    token_override: Option<Address>,
+    network: TokenizationNetwork,
+    symbol: &Symbol,
+    ctx: &Ctx,
+) -> anyhow::Result<Address> {
+    if let Some(address) = token_override {
+        return Ok(address);
+    }
+
+    match network {
+        TokenizationNetwork::Base => ctx.assets.tokenized_equity(symbol).ok_or_else(|| {
+            anyhow::anyhow!("equity {symbol} is not configured in [assets.equities]")
+        }),
+        TokenizationNetwork::Ethereum => Err(anyhow::anyhow!(
+            "pass --token with the Ethereum tStock address for {symbol}: \
+             [assets.equities] holds Base addresses only"
+        )),
+    }
+}
+
 /// Isolated tokenization command - calls Alpaca tokenization API directly.
-pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clone + 'static>(
+pub(super) async fn alpaca_tokenize_command<Writer: Write>(
     stdout: &mut Writer,
     symbol: Symbol,
     quantity: FractionalShares,
     recipient: Option<Address>,
+    network: TokenizationNetwork,
+    token_override: Option<Address>,
     ctx: &Ctx,
-    provider: Prov,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "🔄 Requesting tokenization via Alpaca API")?;
     writeln!(stdout, "   Symbol: {symbol}")?;
     writeln!(stdout, "   Quantity: {quantity}")?;
+    writeln!(stdout, "   Network: {network:?}")?;
 
-    let token = ctx
-        .assets
-        .tokenized_equity(&symbol)
-        .ok_or_else(|| anyhow::anyhow!("equity {symbol} is not configured in [assets.equities]"))?;
+    let token = resolve_tokenization_token(token_override, network, &symbol, ctx)?;
     writeln!(stdout, "   Token: {token}")?;
 
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
@@ -1051,11 +1100,12 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
     };
 
     let wallet_ctx = ctx.wallet()?;
+    let (wallet, wire_network) = tokenization_network_context(wallet_ctx, network);
 
-    let receiving_wallet = recipient.unwrap_or_else(|| wallet_ctx.base_wallet().address());
+    let receiving_wallet = recipient.unwrap_or_else(|| wallet.address());
     writeln!(stdout, "   Receiving wallet: {receiving_wallet}")?;
 
-    let read_evm = ReadOnlyEvm::new(provider.clone());
+    let read_evm = ReadOnlyEvm::new(wallet.provider().clone());
     let initial_balance: U256 = read_evm
         .call::<OpenChainErrorRegistry, _>(
             token,
@@ -1079,7 +1129,8 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
         alpaca_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-        wallet_ctx.base_wallet().clone(),
+        wallet,
+        wire_network,
         None,
     );
 
@@ -1128,7 +1179,7 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
         }
     }
 
-    writeln!(stdout, "   Polling for tokens to arrive on Base...")?;
+    writeln!(stdout, "   Polling for tokens to arrive on {network:?}...")?;
 
     let poll_interval = std::time::Duration::from_secs(5);
     let max_attempts = 60; // 5 minutes max
@@ -1180,16 +1231,16 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
     symbol: Symbol,
     quantity: FractionalShares,
     redemption_wallet_flag: Option<Address>,
+    network: TokenizationNetwork,
+    token_override: Option<Address>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "🔄 Requesting redemption via Alpaca API")?;
     writeln!(stdout, "   Symbol: {symbol}")?;
     writeln!(stdout, "   Quantity: {quantity}")?;
+    writeln!(stdout, "   Network: {network:?}")?;
 
-    let token = ctx
-        .assets
-        .tokenized_equity(&symbol)
-        .ok_or_else(|| anyhow::anyhow!("equity {symbol} is not configured in [assets.equities]"))?;
+    let token = resolve_tokenization_token(token_override, network, &symbol, ctx)?;
     writeln!(stdout, "   Token: {token}")?;
 
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
@@ -1198,6 +1249,7 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
 
     let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, ctx)?;
     let wallet_ctx = ctx.wallet()?;
+    let (wallet, wire_network) = tokenization_network_context(wallet_ctx, network);
     writeln!(stdout, "   Redemption wallet: {redemption_wallet}")?;
 
     let tokenization_service = AlpacaTokenizationService::new(
@@ -1205,7 +1257,8 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
         alpaca_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
-        wallet_ctx.base_wallet().clone(),
+        wallet,
+        wire_network,
         Some(redemption_wallet),
     );
 
@@ -1281,6 +1334,7 @@ pub(super) async fn alpaca_tokenization_requests_command<Writer: Write>(
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
         wallet_ctx.base_wallet().clone(),
+        Network::new("base"),
         None,
     );
 
@@ -1700,7 +1754,6 @@ pub(crate) async fn resume_interrupted_transfers_command<W: Write>(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, address, b256};
-    use alloy::providers::ProviderBuilder;
     use chrono::Utc;
     use rain_math_float::Float;
     use url::Url;
@@ -1716,6 +1769,8 @@ mod tests {
     };
     use st0x_config::{EvmCtx, IngestionCutoff, InventoryMode};
     use st0x_event_sorcery::LifecycleError;
+    #[cfg(feature = "test-support")]
+    use st0x_evm::StubWallet;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTransferId,
         AlpacaWalletError, ClientOrderId, TimeInForce,
@@ -2727,6 +2782,42 @@ mod tests {
             err_msg.contains("requires [tokenization]"),
             "Expected tokenization config error, got: {err_msg}"
         );
+    }
+
+    /// Same key → same address on every EVM chain; ethereum uses the
+    /// `[tokenization]` config wallet without requiring `--redemption-wallet`.
+    #[test]
+    fn resolve_redemption_wallet_ethereum_uses_config() {
+        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        let config_wallet = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        ctx.redemption_wallet = Some(config_wallet);
+
+        let result = resolve_redemption_wallet(None, &ctx).unwrap();
+        assert_eq!(result, config_wallet);
+    }
+
+    /// One match yields both the wallet and the wire value, so the pairing is
+    /// pinned here for both networks: ethereum selects the ethereum wallet and
+    /// the "ethereum" wire value, base the base pair.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn tokenization_network_context_pairs_wallet_and_wire() {
+        let base_address = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let ethereum_address = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let wallet_ctx = OnchainWalletCtx::from_wallets(
+            StubWallet::stub(base_address),
+            StubWallet::stub(ethereum_address),
+        );
+
+        let (base_wallet, base_wire) =
+            tokenization_network_context(&wallet_ctx, TokenizationNetwork::Base);
+        assert_eq!(base_wallet.address(), base_address);
+        assert_eq!(base_wire, Network::new("base"));
+
+        let (ethereum_wallet, ethereum_wire) =
+            tokenization_network_context(&wallet_ctx, TokenizationNetwork::Ethereum);
+        assert_eq!(ethereum_wallet.address(), ethereum_address);
+        assert_eq!(ethereum_wire, Network::new("ethereum"));
     }
 
     async fn seed_to_withdrawal_complete(
@@ -3770,8 +3861,6 @@ mod tests {
     #[tokio::test]
     async fn alpaca_tokenize_fails_when_symbol_not_configured() {
         let ctx = create_alpaca_ctx_without_rebalancing();
-        let provider =
-            ProviderBuilder::new().connect_http(Url::parse("http://localhost:8545").unwrap());
         let mut stdout = Vec::new();
 
         let error = alpaca_tokenize_command(
@@ -3779,8 +3868,9 @@ mod tests {
             Symbol::new("COIN").unwrap(),
             FractionalShares::new(float!(10)),
             None,
+            TokenizationNetwork::Base,
+            None,
             &ctx,
-            provider,
         )
         .await
         .unwrap_err();
@@ -3802,6 +3892,8 @@ mod tests {
             &mut stdout,
             Symbol::new("COIN").unwrap(),
             FractionalShares::new(float!(10)),
+            None,
+            TokenizationNetwork::Base,
             None,
             &ctx,
         )
@@ -3845,6 +3937,7 @@ mod tests {
             "test_key".to_string(),
             "test_secret".to_string(),
             st0x_evm::StubWallet::stub(Address::ZERO),
+            Network::new("base"),
             None,
         );
         let issuer_request_id = IssuerRequestId::generate();
@@ -3897,6 +3990,7 @@ mod tests {
             "test_key".to_string(),
             "test_secret".to_string(),
             st0x_evm::StubWallet::stub(Address::ZERO),
+            Network::new("base"),
             None,
         );
         let tx_hash = alloy::primitives::TxHash::ZERO;
@@ -3916,6 +4010,45 @@ mod tests {
         list_mock
             .assert_calls_async(BACKPRESSURE_RETRY_MAX_ATTEMPTS as usize)
             .await;
+    }
+
+    #[tokio::test]
+    async fn ethereum_network_requires_explicit_token_address() {
+        let ctx = create_alpaca_ctx_without_rebalancing();
+        let mut stdout = Vec::new();
+
+        let error = alpaca_redeem_command(
+            &mut stdout,
+            Symbol::new("RKLB").unwrap(),
+            FractionalShares::new(float!(1)),
+            None,
+            TokenizationNetwork::Ethereum,
+            None,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("pass --token"),
+            "ethereum without --token must fail closed, got: {error}"
+        );
+    }
+
+    #[test]
+    fn token_override_bypasses_assets_config() {
+        let ctx = create_alpaca_ctx_without_rebalancing();
+        let token = address!("0xED0c085d92C262FB46937CB0B3C9763Af7fCCf30");
+
+        let resolved = resolve_tokenization_token(
+            Some(token),
+            TokenizationNetwork::Ethereum,
+            &Symbol::new("RKLB").unwrap(),
+            &ctx,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, token);
     }
 
     fn redemption_services() -> EquityTransferServices {

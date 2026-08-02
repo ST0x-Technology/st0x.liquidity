@@ -10,19 +10,16 @@
 
 use std::io::Write;
 
-use alloy::providers::Provider;
-
 use st0x_config::Ctx;
 use st0x_execution::{FractionalShares, Positive, Symbol};
 
-use super::{rebalancing, trading, wrapper};
+use super::{TokenizationNetwork, rebalancing, trading, wrapper};
 
-pub(super) async fn dividend_bump_command<Writer: Write, Prov: Provider + Clone + 'static>(
+pub(super) async fn dividend_bump_command<Writer: Write>(
     stdout: &mut Writer,
     symbol: Symbol,
     quantity: Positive<FractionalShares>,
     ctx: &Ctx,
-    provider: Prov,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "Dividend NAV bump: {quantity} {symbol}")?;
 
@@ -38,8 +35,9 @@ pub(super) async fn dividend_bump_command<Writer: Write, Prov: Provider + Clone 
         symbol.clone(),
         quantity.inner(),
         None,
+        TokenizationNetwork::Base,
+        None,
         ctx,
-        provider,
     )
     .await?;
 
@@ -56,7 +54,6 @@ pub(super) async fn dividend_bump_command<Writer: Write, Prov: Provider + Clone 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address};
-    use alloy::providers::ProviderBuilder;
     use url::Url;
 
     use st0x_config::create_test_issuance_ctx;
@@ -122,8 +119,6 @@ mod tests {
     #[tokio::test]
     async fn dividend_bump_stops_after_buy_when_tokenize_fails() {
         let ctx = dry_run_ctx();
-        let provider =
-            ProviderBuilder::new().connect_http(Url::parse("http://localhost:8545").unwrap());
         let mut stdout = Vec::new();
 
         let error = dividend_bump_command(
@@ -131,7 +126,6 @@ mod tests {
             Symbol::new("COIN").unwrap(),
             positive_shares("10"),
             &ctx,
-            provider,
         )
         .await
         .unwrap_err();
