@@ -23918,4 +23918,101 @@ mod tests {
             "an absent slot must report a successful (no-op) clear",
         );
     }
+
+    /// The regression the direct-seam test above cannot catch: a gate write
+    /// that lands BEFORE `restore_inventory_at_boot` (production used to seed
+    /// the gate during rebalancing-infrastructure setup). Guard 1 is then
+    /// live during hydration and the gated symbol boots with an
+    /// uninitialized offchain balance, silently disabling imbalance
+    /// detection for it. The boot seam must clear the gate before hydrating
+    /// so hydrate-before-seed holds structurally, regardless of what ran
+    /// earlier in startup.
+    #[tokio::test]
+    async fn boot_hydration_survives_gate_seeded_before_restore() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let pool = crate::test_utils::setup_test_db().await;
+
+        let snapshot_store = test_store::<InventorySnapshot>(pool.clone(), ());
+        snapshot_store
+            .send(
+                &InventorySnapshotId {
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+                InventorySnapshotCommand::OffchainEquity {
+                    positions: BTreeMap::from([(symbol.clone(), shares(90))]),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let position_store = test_store::<Position>(pool.clone(), ());
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: shares(10),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: OffchainOrderId::new(),
+                    shares: Positive::new(shares(10)).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        let projection = Projection::<Position>::sqlite(pool.clone());
+        projection.catch_up().await.unwrap();
+
+        // The regression shape: something seeds the gate before the boot
+        // seam runs.
+        trigger
+            .inventory
+            .write_without_broadcast()
+            .await
+            .mark_offchain_order_pending(symbol.clone());
+
+        crate::conductor::restore_inventory_at_boot(
+            &pool,
+            &trigger.inventory,
+            Some(&trigger),
+            &projection,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            trigger.has_pending_offchain_order(&symbol).await,
+            "the open hedge order must still be gated after boot"
+        );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(shares(90)),
+            "a gate seeded before the boot seam must not starve hydration; \
+             None means guard 1 was live while the snapshot replayed"
+        );
+    }
 }
