@@ -1,10 +1,7 @@
 //! Parsing helpers for persisted PnL event payloads and report decimals.
 use chrono::{DateTime, Utc};
-use num_decimal::Num;
-use num_decimal::num_bigint::BigInt;
-use num_traits::Zero;
+use rain_math_float::Float;
 use serde_json::Value;
-use std::str::FromStr;
 
 use super::SAFE_SYMBOL_CHARS;
 use super::query::{PnlError, PnlFinancialFieldError};
@@ -50,7 +47,7 @@ pub(crate) fn persisted_decimal_field(
     row: &PositionEventRow,
     payload: &Value,
     key: &'static str,
-) -> Result<Option<Num>, PnlError> {
+) -> Result<Option<Float>, PnlError> {
     persisted_decimal_value(row.rowid, "Position", row.event_type.clone(), payload, key)
 }
 
@@ -58,7 +55,7 @@ pub(crate) fn optional_persisted_decimal_field(
     row: &PositionEventRow,
     payload: &Value,
     key: &'static str,
-) -> Result<Option<Num>, PnlError> {
+) -> Result<Option<Float>, PnlError> {
     optional_persisted_decimal_value(row.rowid, "Position", row.event_type.clone(), payload, key)
 }
 
@@ -68,7 +65,7 @@ pub(crate) fn persisted_decimal_value(
     event_type: String,
     payload: &Value,
     key: &'static str,
-) -> Result<Option<Num>, PnlError> {
+) -> Result<Option<Float>, PnlError> {
     persisted_decimal_value_with_null_policy(rowid, aggregate_type, event_type, payload, key, false)
 }
 
@@ -78,7 +75,7 @@ pub(crate) fn optional_persisted_decimal_value(
     event_type: String,
     payload: &Value,
     key: &'static str,
-) -> Result<Option<Num>, PnlError> {
+) -> Result<Option<Float>, PnlError> {
     persisted_decimal_value_with_null_policy(rowid, aggregate_type, event_type, payload, key, true)
 }
 
@@ -89,7 +86,7 @@ fn persisted_decimal_value_with_null_policy(
     payload: &Value,
     key: &'static str,
     null_allowed: bool,
-) -> Result<Option<Num>, PnlError> {
+) -> Result<Option<Float>, PnlError> {
     let value = match payload.get(key) {
         None => return Ok(None),
         Some(Value::Null) if null_allowed => return Ok(None),
@@ -107,7 +104,7 @@ fn persisted_decimal_value_with_null_policy(
         }
     };
 
-    Num::from_str(&value)
+    Float::parse(value.clone())
         .map(Some)
         .map_err(|error| PnlError::InvalidFinancialField {
             rowid,
@@ -115,7 +112,7 @@ fn persisted_decimal_value_with_null_policy(
             event_type,
             field: key,
             value,
-            source: PnlFinancialFieldError::InvalidDecimal(error),
+            source: PnlFinancialFieldError::InvalidDecimal(Box::new(error)),
         })
 }
 
@@ -174,92 +171,21 @@ pub(crate) fn ordered_position_events(
     Ok(sortable.into_iter().map(|(_, _, row)| row).collect())
 }
 
-pub(crate) fn fmt_decimal(value: &Num) -> String {
-    let (mut numerator, denominator): (BigInt, BigInt) = value.clone().into();
-    if numerator.is_zero() {
-        return "0".to_owned();
-    }
-
-    let negative = numerator.sign() == num_decimal::num_bigint::Sign::Minus;
-    if negative {
-        numerator = -numerator;
-    }
-
-    let mut denominator = denominator;
-    let twos = factor_count(&mut denominator, 2);
-    let fives = factor_count(&mut denominator, 5);
-    assert!(
-        denominator == BigInt::from(1),
-        "PnL decimal output must be a finite decimal: {value:?}"
-    );
-
-    let scale = twos.max(fives);
-    let scaled = multiply_factor(
-        multiply_factor(numerator, 2, scale - twos),
-        5,
-        scale - fives,
-    );
-    let mut digits = scaled.to_string();
-
-    if scale > 0 {
-        if digits.len() <= scale {
-            digits.insert_str(0, &"0".repeat(scale + 1 - digits.len()));
-        }
-        let dot_index = digits.len() - scale;
-        digits.insert(dot_index, '.');
-        while digits.ends_with('0') {
-            digits.pop();
-        }
-        if digits.ends_with('.') {
-            digits.pop();
-        }
-    }
-
-    if negative {
-        format!("-{digits}")
-    } else {
-        digits
-    }
+/// Formats a report value as a decimal string.
+///
+/// `Float` carries a 224-bit coefficient, wide enough for any report value.
+/// Delegates to the shared formatter rather than calling
+/// `format_with_scientific(false)` directly: that rejects exponents below
+/// -76, which a small residual PnL value reaches, and the shared helper
+/// falls back to scientific notation instead of losing the value.
+pub(crate) fn fmt_decimal(value: Float) -> Result<String, PnlError> {
+    Ok(st0x_float_serde::format_float(&value)?)
 }
 
-fn factor_count(value: &mut BigInt, factor: u8) -> usize {
-    let factor = BigInt::from(factor);
-    let mut count = 0;
-    while (&*value % &factor).is_zero() {
-        *value /= &factor;
-        count += 1;
-    }
-    count
-}
-
-fn multiply_factor(mut value: BigInt, factor: u8, count: usize) -> BigInt {
-    let factor = BigInt::from(factor);
-    for _ in 0..count {
-        value *= &factor;
-    }
-    value
-}
-
-pub(crate) fn abs_decimal(value: &Num) -> Num {
-    if value.is_negative() {
-        -value.clone()
-    } else {
-        value.clone()
-    }
-}
-
-pub(crate) fn min_decimal(left: &Num, right: &Num) -> Num {
-    if left <= right {
-        left.clone()
-    } else {
-        right.clone()
-    }
-}
-
-pub(crate) fn parse_internal_decimal(field: &'static str, value: &str) -> Result<Num, PnlError> {
-    Num::from_str(value).map_err(|source| PnlError::InvalidInternalDecimal {
+pub(crate) fn parse_internal_decimal(field: &'static str, value: &str) -> Result<Float, PnlError> {
+    Float::parse(value.to_owned()).map_err(|source| PnlError::InvalidInternalDecimal {
         field,
         value: value.to_owned(),
-        source,
+        source: Box::new(source),
     })
 }

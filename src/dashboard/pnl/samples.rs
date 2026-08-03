@@ -1,7 +1,6 @@
+use rain_math_float::Float;
 use std::collections::{BTreeSet, HashMap};
-use std::str::FromStr;
 
-use num_decimal::Num;
 use st0x_finance::Symbol;
 
 use super::parsing::{is_safe_symbol, position_event_replay_timestamp};
@@ -13,7 +12,7 @@ use super::state::{PositionEventRow, PositionViewRow, SampleStatsAcc};
 pub(crate) fn parse_position_view(
     rows: &[PositionViewRow],
     warnings: &mut Vec<String>,
-) -> Result<(HashMap<Symbol, Num>, Vec<Symbol>), PnlError> {
+) -> Result<(HashMap<Symbol, Float>, Vec<Symbol>), PnlError> {
     let mut position_nets = HashMap::new();
     let mut symbols = BTreeSet::new();
 
@@ -32,7 +31,7 @@ pub(crate) fn parse_position_view(
 
         symbols.insert(symbol.clone());
         if let Some(net_position) = &row.net_position {
-            match Num::from_str(net_position) {
+            match Float::parse(net_position.clone()) {
                 Ok(value) => {
                     position_nets.insert(symbol, value);
                 }
@@ -43,7 +42,7 @@ pub(crate) fn parse_position_view(
                         event_type: "position_view".to_owned(),
                         field: "net_position",
                         value: net_position.clone(),
-                        source: PnlFinancialFieldError::InvalidDecimal(error),
+                        source: PnlFinancialFieldError::InvalidDecimal(Box::new(error)),
                     });
                 }
             }

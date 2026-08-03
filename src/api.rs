@@ -29,7 +29,8 @@ use st0x_tokenization::IssuerRequestId;
 use crate::AppState;
 use crate::dashboard::TradeProtocol;
 use crate::dashboard::pnl::{
-    PnlError, PnlQuery, PnlResponse, build_pnl_report, validate_pnl_snapshot_rowid,
+    PnlError, PnlQuery, PnlResponse, acquire_pnl_report_permit, build_pnl_report_with_permit,
+    validate_pnl_snapshot_rowid,
 };
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
@@ -173,6 +174,8 @@ async fn pnl(
     query
         .symbol_filter(&mut Vec::new())
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let permit =
+        acquire_pnl_report_permit(&state.pnl_report_admission).map_err(pnl_error_response)?;
     validate_pnl_snapshot_rowid(&state.pool, &query)
         .await
         .map_err(pnl_error_response)?;
@@ -192,7 +195,7 @@ async fn pnl(
         Vec::new()
     };
 
-    build_pnl_report(&state.pool, &query, activities, Utc::now())
+    build_pnl_report_with_permit(&state.pool, &query, activities, Utc::now(), permit)
         .await
         .map(Json)
         .map_err(pnl_error_response)
@@ -228,8 +231,22 @@ fn pnl_error_response(error: PnlError) -> (StatusCode, String) {
                 "Failed to build PnL report".to_string(),
             )
         }
-        PnlError::CapitalFloat(error) => {
-            error!(%error, "Failed to convert a PnL total for capital/return computation");
+        PnlError::Arithmetic(error) => {
+            error!(%error, "PnL arithmetic failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to build PnL report".to_string(),
+            )
+        }
+        PnlError::ReplayAdmission(error) => {
+            warn!(%error, "PnL report capacity exhausted");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PnL report capacity exhausted".to_string(),
+            )
+        }
+        PnlError::ReplayWorker(error) => {
+            error!(%error, "PnL replay worker failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to build PnL report".to_string(),
@@ -1936,8 +1953,78 @@ mod tests {
             )),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
+            pnl_report_admission: crate::dashboard::pnl::pnl_report_admission(),
             metrics_handle: crate::metrics::setup().expect("metrics setup"),
         }
+    }
+
+    #[tokio::test]
+    async fn pnl_internal_failures_return_a_stable_generic_response() {
+        let left = rain_math_float::Float::parse("1e2147483646".to_owned()).unwrap();
+        let right = rain_math_float::Float::parse("1e2".to_owned()).unwrap();
+        let arithmetic = PnlError::from((left * right).unwrap_err());
+
+        let worker = tokio::spawn(std::future::pending::<()>());
+        worker.abort();
+        let worker = PnlError::ReplayWorker(worker.await.unwrap_err());
+
+        for error in [arithmetic, worker] {
+            let (status, body) = pnl_error_response(error);
+
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(body, "Failed to build PnL report");
+        }
+    }
+
+    #[tokio::test]
+    async fn pnl_route_returns_a_stable_generic_response_for_report_failures() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        sqlx::query(
+            "INSERT INTO portfolio_snapshot ( \
+               et_day, captured_at, location, asset, available_balance, inflight_balance, \
+               usd_mark, mark_captured_at \
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind("2026-05-15")
+        .bind("2026-05-15T04:05:00+00:00")
+        .bind("market_making")
+        .bind("USDC")
+        .bind("not-a-float")
+        .bind("0")
+        .bind("1")
+        .bind("2026-05-15T04:05:00+00:00")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_app(state)
+            .oneshot(Request::builder().uri("/pnl").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_to_string(response).await, "Failed to build PnL report");
+    }
+
+    #[tokio::test]
+    async fn pnl_route_rejects_requests_when_report_capacity_is_exhausted() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let _permits = (0..crate::dashboard::pnl::MAX_CONCURRENT_PNL_REPORTS)
+            .map(|_| acquire_pnl_report_permit(&state.pnl_report_admission).unwrap())
+            .collect::<Vec<_>>();
+
+        let response = build_app(state)
+            .oneshot(Request::builder().uri("/pnl").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body_to_string(response).await,
+            "PnL report capacity exhausted"
+        );
     }
 
     #[test]

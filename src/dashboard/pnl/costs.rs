@@ -1,14 +1,14 @@
 //! Cost and revenue classification for backend PnL reports.
-use num_decimal::Num;
+use rain_math_float::Float;
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 
 use st0x_execution::alpaca_broker_api::AccountActivity;
-use st0x_finance::Symbol;
+use st0x_finance::{Symbol, Usd};
+use st0x_float_macro::float;
 
 use super::parsing::{
-    abs_decimal, fmt_decimal, is_safe_symbol, nested_record, parse_internal_decimal,
-    persisted_decimal_value, text_field,
+    fmt_decimal, is_safe_symbol, nested_record, parse_internal_decimal, persisted_decimal_value,
+    text_field,
 };
 use super::query::{PnlError, PnlFinancialFieldError};
 use super::response::{PnlCostCoverage, PnlCostSummary, PnlSummary};
@@ -102,7 +102,7 @@ pub(crate) struct CostEntryInternal {
     pub(crate) category: CostCategory,
     pub(crate) accounting_bucket: AccountingBucket,
     pub(crate) effect: AccountingEffect,
-    pub(crate) amount_usd: Num,
+    pub(crate) amount_usd: CostMagnitude,
     pub(crate) occurred_at: String,
     pub(crate) aggregate_type: String,
     pub(crate) aggregate_id: String,
@@ -111,37 +111,94 @@ pub(crate) struct CostEntryInternal {
     pub(crate) detail: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CostMagnitude(Usd);
+
+impl CostMagnitude {
+    pub(crate) fn inner(self) -> Float {
+        self.0.inner()
+    }
+}
+
+pub(crate) fn validated_cost_magnitude(
+    amount_usd: Float,
+    event_rowid: i64,
+    aggregate_type: &'static str,
+    event_type: String,
+) -> Result<CostMagnitude, PnlError> {
+    if amount_usd.lt(float!(0))? {
+        return Err(PnlError::MalformedPayload {
+            rowid: event_rowid,
+            aggregate_type,
+            event_type,
+            reason: "negative cost magnitude",
+        });
+    }
+
+    Ok(CostMagnitude(Usd::new(amount_usd)))
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct CostSummaryAcc {
-    pub(crate) counter_trade_costs_usd: Num,
-    pub(crate) onchain_netting_costs_usd: Num,
-    pub(crate) directional_exposure_costs_usd: Num,
-    pub(crate) generic_costs_usd: Num,
-    pub(crate) generic_revenue_usd: Num,
-    pub(crate) dividend_revenue_usd: Num,
-    pub(crate) offchain_execution_fees_usd: Num,
-    pub(crate) tokenization_fees_usd: Num,
-    pub(crate) cctp_fees_usd: Num,
-    pub(crate) conversion_slippage_usd: Num,
-    pub(crate) oracle_write_cost_usd: Num,
-    pub(crate) broker_fees_usd: Num,
-    pub(crate) regulatory_fees_usd: Num,
-    pub(crate) margin_interest_usd: Num,
-    pub(crate) bot_gas_usd: Num,
-    pub(crate) wallet_transfer_fees_usd: Num,
-    pub(crate) unclassified_costs_usd: Num,
+    pub(crate) counter_trade_costs_usd: Float,
+    pub(crate) onchain_netting_costs_usd: Float,
+    pub(crate) directional_exposure_costs_usd: Float,
+    pub(crate) generic_costs_usd: Float,
+    pub(crate) generic_revenue_usd: Float,
+    pub(crate) dividend_revenue_usd: Float,
+    pub(crate) offchain_execution_fees_usd: Float,
+    pub(crate) tokenization_fees_usd: Float,
+    pub(crate) cctp_fees_usd: Float,
+    pub(crate) conversion_slippage_usd: Float,
+    pub(crate) oracle_write_cost_usd: Float,
+    pub(crate) broker_fees_usd: Float,
+    pub(crate) regulatory_fees_usd: Float,
+    pub(crate) margin_interest_usd: Float,
+    pub(crate) bot_gas_usd: Float,
+    pub(crate) wallet_transfer_fees_usd: Float,
+    pub(crate) unclassified_costs_usd: Float,
     pub(crate) missing_cost_observation_count: usize,
     pub(crate) broker_fee_entry_count: usize,
     pub(crate) margin_interest_entry_count: usize,
     pub(crate) dividend_activity_entry_count: usize,
 }
 
-fn signed_category_amount(effect: AccountingEffect, amount: &Num) -> Num {
-    match effect {
-        AccountingEffect::Cost => -amount.clone(),
-        AccountingEffect::Revenue => amount.clone(),
-        AccountingEffect::None => Num::default(),
+/// See `SummaryAcc`: `Float` has no meaningful derived `Default`, so the
+/// compile-time zero keeps this accumulator infallibly constructible.
+impl Default for CostSummaryAcc {
+    fn default() -> Self {
+        Self {
+            counter_trade_costs_usd: float!(0),
+            onchain_netting_costs_usd: float!(0),
+            directional_exposure_costs_usd: float!(0),
+            generic_costs_usd: float!(0),
+            generic_revenue_usd: float!(0),
+            dividend_revenue_usd: float!(0),
+            offchain_execution_fees_usd: float!(0),
+            tokenization_fees_usd: float!(0),
+            cctp_fees_usd: float!(0),
+            conversion_slippage_usd: float!(0),
+            oracle_write_cost_usd: float!(0),
+            broker_fees_usd: float!(0),
+            regulatory_fees_usd: float!(0),
+            margin_interest_usd: float!(0),
+            bot_gas_usd: float!(0),
+            wallet_transfer_fees_usd: float!(0),
+            unclassified_costs_usd: float!(0),
+            missing_cost_observation_count: 0,
+            broker_fee_entry_count: 0,
+            margin_interest_entry_count: 0,
+            dividend_activity_entry_count: 0,
+        }
     }
+}
+
+fn signed_category_amount(effect: AccountingEffect, amount: Float) -> Result<Float, PnlError> {
+    Ok(match effect {
+        AccountingEffect::Cost => (float!(0) - amount)?,
+        AccountingEffect::Revenue => amount,
+        AccountingEffect::None => float!(0),
+    })
 }
 
 fn add_cost(
@@ -149,41 +206,48 @@ fn add_cost(
     category: CostCategory,
     accounting_bucket: AccountingBucket,
     effect: AccountingEffect,
-    amount: &Num,
-) {
+    amount: Float,
+) -> Result<(), PnlError> {
     match (effect, accounting_bucket) {
         (AccountingEffect::Cost, AccountingBucket::CounterTrade) => {
-            summary.counter_trade_costs_usd += amount;
+            summary.counter_trade_costs_usd = (summary.counter_trade_costs_usd + amount)?;
         }
         (AccountingEffect::Cost, AccountingBucket::OnchainNetting) => {
-            summary.onchain_netting_costs_usd += amount;
+            summary.onchain_netting_costs_usd = (summary.onchain_netting_costs_usd + amount)?;
         }
         (AccountingEffect::Cost, AccountingBucket::DirectionalExposure) => {
-            summary.directional_exposure_costs_usd += amount;
+            summary.directional_exposure_costs_usd =
+                (summary.directional_exposure_costs_usd + amount)?;
         }
         (AccountingEffect::Cost, _) => {
-            summary.generic_costs_usd += amount;
+            summary.generic_costs_usd = (summary.generic_costs_usd + amount)?;
         }
         (AccountingEffect::Revenue, AccountingBucket::DividendRevenue) => {
-            summary.dividend_revenue_usd += amount;
+            summary.dividend_revenue_usd = (summary.dividend_revenue_usd + amount)?;
         }
         (AccountingEffect::Revenue, _) => {
-            summary.generic_revenue_usd += amount;
+            summary.generic_revenue_usd = (summary.generic_revenue_usd + amount)?;
         }
         (AccountingEffect::None, _) => {}
     }
 
-    let signed_amount = signed_category_amount(effect, amount);
+    let signed_amount = signed_category_amount(effect, amount)?;
     match category {
-        CostCategory::TokenizationFee => summary.tokenization_fees_usd += &signed_amount,
-        CostCategory::CctpFee => summary.cctp_fees_usd += &signed_amount,
-        CostCategory::BotGas => summary.bot_gas_usd += amount,
+        CostCategory::TokenizationFee => {
+            summary.tokenization_fees_usd = (summary.tokenization_fees_usd + signed_amount)?;
+        }
+        CostCategory::CctpFee => {
+            summary.cctp_fees_usd = (summary.cctp_fees_usd + signed_amount)?;
+        }
+        CostCategory::BotGas => {
+            summary.bot_gas_usd = (summary.bot_gas_usd + amount)?;
+        }
         CostCategory::BrokerFee => {
-            summary.broker_fees_usd += &signed_amount;
+            summary.broker_fees_usd = (summary.broker_fees_usd + signed_amount)?;
             summary.broker_fee_entry_count += 1;
         }
         CostCategory::MarginInterest => {
-            summary.margin_interest_usd += &signed_amount;
+            summary.margin_interest_usd = (summary.margin_interest_usd + signed_amount)?;
             summary.margin_interest_entry_count += 1;
         }
         CostCategory::DividendIncome => {
@@ -191,16 +255,20 @@ fn add_cost(
         }
         CostCategory::CashCredit => {}
     }
+
+    Ok(())
 }
 
-fn total_tracked_costs(summary: &CostSummaryAcc) -> Num {
-    &(&(&summary.counter_trade_costs_usd + &summary.onchain_netting_costs_usd)
-        + &summary.directional_exposure_costs_usd)
-        + &summary.generic_costs_usd
+fn total_tracked_costs(summary: &CostSummaryAcc) -> Result<Float, PnlError> {
+    Ok(
+        (((summary.counter_trade_costs_usd + summary.onchain_netting_costs_usd)?
+            + summary.directional_exposure_costs_usd)?
+            + summary.generic_costs_usd)?,
+    )
 }
 
-fn total_tracked_revenue(summary: &CostSummaryAcc) -> Num {
-    &summary.dividend_revenue_usd + &summary.generic_revenue_usd
+fn total_tracked_revenue(summary: &CostSummaryAcc) -> Result<Float, PnlError> {
+    Ok((summary.dividend_revenue_usd + summary.generic_revenue_usd)?)
 }
 
 fn included_when_observed(count: usize) -> &'static str {
@@ -211,8 +279,8 @@ fn included_when_observed(count: usize) -> &'static str {
     }
 }
 
-fn fmt_signed_category_amount(value: &Num) -> String {
-    fmt_decimal(&abs_decimal(value))
+fn fmt_signed_category_amount(value: Float) -> Result<String, PnlError> {
+    fmt_decimal(value.abs()?)
 }
 
 fn coverage(
@@ -220,41 +288,44 @@ fn coverage(
     bucket: AccountingBucket,
     effect: AccountingEffect,
     status: &'static str,
-    amount: &Num,
+    amount: Float,
     note: &'static str,
-) -> PnlCostCoverage {
-    PnlCostCoverage {
+) -> Result<PnlCostCoverage, PnlError> {
+    Ok(PnlCostCoverage {
         source,
         accounting_bucket: bucket.as_str(),
         effect: effect.as_str(),
         status,
-        amount_usd: fmt_signed_category_amount(amount),
+        amount_usd: fmt_signed_category_amount(amount)?,
         note,
-    }
+    })
 }
 
-fn cost_summary_to_dto(summary: &CostSummaryAcc, cost_entry_count: usize) -> PnlCostSummary {
+fn cost_summary_to_dto(
+    summary: &CostSummaryAcc,
+    cost_entry_count: usize,
+) -> Result<PnlCostSummary, PnlError> {
     let offchain_execution_fees =
-        &summary.offchain_execution_fees_usd + &summary.regulatory_fees_usd;
-    PnlCostSummary {
-        total_tracked_costs_usd: fmt_decimal(&total_tracked_costs(summary)),
-        total_tracked_revenue_usd: fmt_decimal(&total_tracked_revenue(summary)),
-        counter_trade_costs_usd: fmt_decimal(&summary.counter_trade_costs_usd),
-        onchain_netting_costs_usd: fmt_decimal(&summary.onchain_netting_costs_usd),
-        directional_exposure_costs_usd: fmt_decimal(&summary.directional_exposure_costs_usd),
-        generic_costs_usd: fmt_decimal(&summary.generic_costs_usd),
-        dividend_revenue_usd: fmt_decimal(&summary.dividend_revenue_usd),
-        offchain_execution_fees_usd: fmt_signed_category_amount(&offchain_execution_fees),
-        tokenization_fees_usd: fmt_signed_category_amount(&summary.tokenization_fees_usd),
-        cctp_fees_usd: fmt_signed_category_amount(&summary.cctp_fees_usd),
-        conversion_slippage_usd: fmt_decimal(&summary.conversion_slippage_usd),
-        oracle_write_cost_usd: fmt_decimal(&summary.oracle_write_cost_usd),
-        broker_fees_usd: fmt_signed_category_amount(&summary.broker_fees_usd),
-        regulatory_fees_usd: fmt_decimal(&summary.regulatory_fees_usd),
-        margin_interest_usd: fmt_signed_category_amount(&summary.margin_interest_usd),
-        bot_gas_usd: fmt_decimal(&summary.bot_gas_usd),
-        wallet_transfer_fees_usd: fmt_decimal(&summary.wallet_transfer_fees_usd),
-        unclassified_costs_usd: fmt_decimal(&summary.unclassified_costs_usd),
+        (summary.offchain_execution_fees_usd + summary.regulatory_fees_usd)?;
+    Ok(PnlCostSummary {
+        total_tracked_costs_usd: fmt_decimal(total_tracked_costs(summary)?)?,
+        total_tracked_revenue_usd: fmt_decimal(total_tracked_revenue(summary)?)?,
+        counter_trade_costs_usd: fmt_decimal(summary.counter_trade_costs_usd)?,
+        onchain_netting_costs_usd: fmt_decimal(summary.onchain_netting_costs_usd)?,
+        directional_exposure_costs_usd: fmt_decimal(summary.directional_exposure_costs_usd)?,
+        generic_costs_usd: fmt_decimal(summary.generic_costs_usd)?,
+        dividend_revenue_usd: fmt_decimal(summary.dividend_revenue_usd)?,
+        offchain_execution_fees_usd: fmt_signed_category_amount(offchain_execution_fees)?,
+        tokenization_fees_usd: fmt_signed_category_amount(summary.tokenization_fees_usd)?,
+        cctp_fees_usd: fmt_signed_category_amount(summary.cctp_fees_usd)?,
+        conversion_slippage_usd: fmt_decimal(summary.conversion_slippage_usd)?,
+        oracle_write_cost_usd: fmt_decimal(summary.oracle_write_cost_usd)?,
+        broker_fees_usd: fmt_signed_category_amount(summary.broker_fees_usd)?,
+        regulatory_fees_usd: fmt_decimal(summary.regulatory_fees_usd)?,
+        margin_interest_usd: fmt_signed_category_amount(summary.margin_interest_usd)?,
+        bot_gas_usd: fmt_decimal(summary.bot_gas_usd)?,
+        wallet_transfer_fees_usd: fmt_decimal(summary.wallet_transfer_fees_usd)?,
+        unclassified_costs_usd: fmt_decimal(summary.unclassified_costs_usd)?,
         cost_entry_count,
         missing_cost_observation_count: summary.missing_cost_observation_count,
         coverage: vec![
@@ -263,97 +334,97 @@ fn cost_summary_to_dto(summary: &CostSummaryAcc, cost_entry_count: usize) -> Pnl
                 AccountingBucket::CounterTrade,
                 AccountingEffect::Cost,
                 included_when_observed(summary.broker_fee_entry_count),
-                &summary.broker_fees_usd,
+                summary.broker_fees_usd,
                 "Read from Alpaca account activity fee rows. These rows are not subtype-classified for now and are not allocated to symbols unless Alpaca supplies a symbol.",
-            ),
+            )?,
             coverage(
                 "On-chain netting execution costs",
                 AccountingBucket::OnchainNetting,
                 AccountingEffect::None,
                 "zero",
-                &summary.onchain_netting_costs_usd,
+                summary.onchain_netting_costs_usd,
                 "Passive on-chain fills do not create bot-paid trade execution costs for the on-chain netting bucket.",
-            ),
+            )?,
             coverage(
                 "Directional drift direct costs",
                 AccountingBucket::DirectionalExposure,
                 AccountingEffect::None,
                 "zero",
-                &summary.directional_exposure_costs_usd,
+                summary.directional_exposure_costs_usd,
                 "Raw inventory drift is price movement on held exposure; it has no direct execution cost by itself.",
-            ),
+            )?,
             coverage(
                 "Tokenization fees",
                 AccountingBucket::Generic,
                 AccountingEffect::Cost,
                 "included",
-                &summary.tokenization_fees_usd,
+                summary.tokenization_fees_usd,
                 "Read from TokenizedEquityMint terminal events when Alpaca reports fees.",
-            ),
+            )?,
             coverage(
                 "CCTP fees",
                 AccountingBucket::Generic,
                 AccountingEffect::Cost,
                 "included",
-                &summary.cctp_fees_usd,
+                summary.cctp_fees_usd,
                 "Read from UsdcRebalance bridge completion events as fee_collected.",
-            ),
+            )?,
             coverage(
                 "USD/USDC reporting basis",
                 AccountingBucket::Generic,
                 AccountingEffect::None,
                 "zero",
-                &summary.conversion_slippage_usd,
+                summary.conversion_slippage_usd,
                 "USD and USDC are treated as equivalent for reporting; conversion basis is not modeled as PnL. Only explicit persisted fees are deducted.",
-            ),
+            )?,
             coverage(
                 "Oracle writes",
                 AccountingBucket::Generic,
                 AccountingEffect::None,
                 "zero",
-                &summary.oracle_write_cost_usd,
+                summary.oracle_write_cost_usd,
                 "Current setup does not pay oracle write cost through the bot.",
-            ),
+            )?,
             coverage(
                 "Dividend income",
                 AccountingBucket::DividendRevenue,
                 AccountingEffect::Revenue,
                 included_when_observed(summary.dividend_activity_entry_count),
-                &summary.dividend_revenue_usd,
+                summary.dividend_revenue_usd,
                 "Dividend-bearing stock revenue increases net PnL when Alpaca dividend activity rows are available.",
-            ),
+            )?,
             coverage(
                 "Margin interest",
                 AccountingBucket::Generic,
                 AccountingEffect::Cost,
                 included_when_observed(summary.margin_interest_entry_count),
-                &summary.margin_interest_usd,
+                summary.margin_interest_usd,
                 "Included when Alpaca account activity interest rows are available; negative rows are costs and positive rows are credits.",
-            ),
+            )?,
             coverage(
                 "Bot gas",
                 AccountingBucket::Generic,
                 AccountingEffect::Cost,
-                included_when_observed(usize::from(!summary.bot_gas_usd.is_zero())),
-                &summary.bot_gas_usd,
+                included_when_observed(usize::from(!summary.bot_gas_usd.is_zero()?)),
+                summary.bot_gas_usd,
                 "Read from persisted bot-paid transaction receipts after gas-payer classification and ETH/USD valuation.",
-            ),
+            )?,
             coverage(
                 "Wallet transfer fees",
                 AccountingBucket::Generic,
                 AccountingEffect::Cost,
                 "not_ingested",
-                &summary.wallet_transfer_fees_usd,
+                summary.wallet_transfer_fees_usd,
                 "Alpaca wallet fee fields are not currently persisted into the event stream.",
-            ),
+            )?,
         ],
-    }
+    })
 }
 
 pub(crate) fn summarize_cost_entries(
     entries: &[CostEntryInternal],
     missing_cost_observation_count: usize,
-) -> PnlCostSummary {
+) -> Result<PnlCostSummary, PnlError> {
     let mut summary = CostSummaryAcc {
         missing_cost_observation_count,
         ..CostSummaryAcc::default()
@@ -365,8 +436,8 @@ pub(crate) fn summarize_cost_entries(
             entry.category,
             entry.accounting_bucket,
             entry.effect,
-            &entry.amount_usd,
-        );
+            entry.amount_usd.inner(),
+        )?;
     }
 
     cost_summary_to_dto(&summary, entries.len())
@@ -379,7 +450,7 @@ pub(crate) fn summarize_cost_entries(
 pub(crate) fn with_costs(
     summary: PnlSummary,
     costs: &PnlCostSummary,
-) -> Result<(PnlSummary, Num), PnlError> {
+) -> Result<(PnlSummary, Float), PnlError> {
     let gross = parse_internal_decimal("summary.totalPnlUsd", &summary.total_pnl_usd)?;
     let tracked_costs =
         parse_internal_decimal("costs.totalTrackedCostsUsd", &costs.total_tracked_costs_usd)?;
@@ -387,42 +458,71 @@ pub(crate) fn with_costs(
         "costs.totalTrackedRevenueUsd",
         &costs.total_tracked_revenue_usd,
     )?;
-    let net = &(&gross - &tracked_costs) + &tracked_revenue;
+    let net = ((gross - tracked_costs)? + tracked_revenue)?;
 
     Ok((
         PnlSummary {
-            gross_realized_pnl_usd: fmt_decimal(&gross),
-            tracked_costs_usd: fmt_decimal(&tracked_costs),
-            tracked_revenue_usd: fmt_decimal(&tracked_revenue),
-            net_realized_pnl_usd: fmt_decimal(&net),
+            gross_realized_pnl_usd: fmt_decimal(gross)?,
+            tracked_costs_usd: fmt_decimal(tracked_costs)?,
+            tracked_revenue_usd: fmt_decimal(tracked_revenue)?,
+            net_realized_pnl_usd: fmt_decimal(net)?,
             ..summary
         },
         net,
     ))
 }
 
-fn cost_entry(
-    row: &CostEventRow,
+#[derive(Debug, Clone, Copy)]
+struct CostEntryDefinition {
+    aggregate_type: &'static str,
     category: CostCategory,
     accounting_bucket: AccountingBucket,
     effect: AccountingEffect,
-    amount_usd: Num,
+    detail: &'static str,
+}
+
+const TOKENIZATION_FEE_ENTRY: CostEntryDefinition = CostEntryDefinition {
+    aggregate_type: "TokenizedEquityMint",
+    category: CostCategory::TokenizationFee,
+    accounting_bucket: AccountingBucket::Generic,
+    effect: AccountingEffect::Cost,
+    detail: "Alpaca tokenization fee reported by tokenization provider",
+};
+
+const CCTP_FEE_ENTRY: CostEntryDefinition = CostEntryDefinition {
+    aggregate_type: "UsdcRebalance",
+    category: CostCategory::CctpFee,
+    accounting_bucket: AccountingBucket::Generic,
+    effect: AccountingEffect::Cost,
+    detail: "CCTP fee_collected from bridge mint",
+};
+
+fn cost_entry(
+    row: &CostEventRow,
+    definition: CostEntryDefinition,
+    amount_usd: Float,
     occurred_at: String,
-    detail: &str,
     symbol: Option<Symbol>,
-) -> CostEntryInternal {
-    CostEntryInternal {
-        category,
-        accounting_bucket,
-        effect,
+) -> Result<CostEntryInternal, PnlError> {
+    let amount_usd = validated_cost_magnitude(
+        amount_usd,
+        row.rowid,
+        definition.aggregate_type,
+        row.event_type.clone(),
+    )?;
+
+    Ok(CostEntryInternal {
+        category: definition.category,
+        accounting_bucket: definition.accounting_bucket,
+        effect: definition.effect,
         amount_usd,
         occurred_at,
-        aggregate_type: row.aggregate_type.clone(),
+        aggregate_type: definition.aggregate_type.to_owned(),
         aggregate_id: row.aggregate_id.clone(),
         event_rowid: row.rowid,
         symbol,
-        detail: detail.to_owned(),
-    }
+        detail: definition.detail.to_owned(),
+    })
 }
 
 fn parse_tokenized_equity_mint_cost_event(
@@ -483,20 +583,17 @@ fn parse_tokenized_equity_mint_cost_event(
         return Err(malformed_cost_payload(row, "missing tokenization fees"));
     };
 
-    if fees.is_zero() {
+    if fees.is_zero()? {
         return Ok(None);
     }
 
     let entry = cost_entry(
         row,
-        CostCategory::TokenizationFee,
-        AccountingBucket::Generic,
-        AccountingEffect::Cost,
+        TOKENIZATION_FEE_ENTRY,
         fees,
         occurred_at,
-        "Alpaca tokenization fee reported by tokenization provider",
         symbols_by_mint_aggregate.get(&row.aggregate_id).cloned(),
-    );
+    )?;
     Ok(Some(entry))
 }
 
@@ -536,20 +633,17 @@ fn parse_usdc_rebalance_cost_event(
         ));
     };
 
-    if fee_collected.is_zero() {
+    if fee_collected.is_zero()? {
         return Ok(None);
     }
 
     Ok(Some(cost_entry(
         row,
-        CostCategory::CctpFee,
-        AccountingBucket::Generic,
-        AccountingEffect::Cost,
+        CCTP_FEE_ENTRY,
         fee_collected,
         occurred_at,
-        "CCTP fee_collected from bridge mint",
         None,
-    )))
+    )?))
 }
 
 pub(crate) struct CostReplay {
@@ -631,65 +725,66 @@ fn activity_timestamp(activity: &AccountActivity) -> Option<String> {
 
 fn classify_activity(
     activity_type: &str,
-    signed_amount: &Num,
-) -> Option<(CostCategory, AccountingBucket, AccountingEffect)> {
+    signed_amount: Float,
+) -> Result<Option<(CostCategory, AccountingBucket, AccountingEffect)>, PnlError> {
     // Treat Alpaca `net_amount` as the signed broker-cash delta for the account activity row:
     // negative values decrease cash and positive values increase cash. The broker docs enumerate
     // activity codes but do not publish a status/sign matrix for every activity, so unknown
     // activity/status values fail the report instead of being silently skipped.
     if FEE_ACTIVITY_TYPES.contains(&activity_type) {
-        return Some((
+        return Ok(Some((
             CostCategory::BrokerFee,
             AccountingBucket::CounterTrade,
-            if signed_amount.is_negative() {
+            if signed_amount.lt(float!(0))? {
                 AccountingEffect::Cost
             } else {
                 AccountingEffect::Revenue
             },
-        ));
+        )));
     }
 
     if INTEREST_ACTIVITY_TYPES.contains(&activity_type) {
-        return Some((
+        return Ok(Some((
             CostCategory::MarginInterest,
             AccountingBucket::Generic,
-            if signed_amount.is_negative() {
+            if signed_amount.lt(float!(0))? {
                 AccountingEffect::Cost
             } else {
                 AccountingEffect::Revenue
             },
-        ));
+        )));
     }
 
     if DIVIDEND_ACTIVITY_TYPES.contains(&activity_type) {
-        return Some((
+        let is_negative = signed_amount.lt(float!(0))?;
+        return Ok(Some((
             CostCategory::DividendIncome,
-            if signed_amount.is_negative() {
+            if is_negative {
                 AccountingBucket::Generic
             } else {
                 AccountingBucket::DividendRevenue
             },
-            if signed_amount.is_negative() {
+            if is_negative {
                 AccountingEffect::Cost
             } else {
                 AccountingEffect::Revenue
             },
-        ));
+        )));
     }
 
     if CASH_CREDIT_ACTIVITY_TYPES.contains(&activity_type) {
-        return Some((
+        return Ok(Some((
             CostCategory::CashCredit,
             AccountingBucket::Generic,
-            if signed_amount.is_negative() {
+            if signed_amount.lt(float!(0))? {
                 AccountingEffect::Cost
             } else {
                 AccountingEffect::Revenue
             },
-        ));
+        )));
     }
 
-    None
+    Ok(None)
 }
 
 fn activity_detail(activity: &AccountActivity) -> String {
@@ -742,7 +837,7 @@ fn malformed_alpaca_activity(
     }
 }
 
-fn parse_alpaca_net_amount(activity: &AccountActivity, rowid: i64) -> Result<Num, PnlError> {
+fn parse_alpaca_net_amount(activity: &AccountActivity, rowid: i64) -> Result<Float, PnlError> {
     let Some(net_amount) = activity.net_amount.as_deref() else {
         return Err(malformed_alpaca_activity(
             activity,
@@ -751,13 +846,13 @@ fn parse_alpaca_net_amount(activity: &AccountActivity, rowid: i64) -> Result<Num
         ));
     };
 
-    Num::from_str(net_amount).map_err(|error| PnlError::InvalidFinancialField {
+    Float::parse(net_amount.to_owned()).map_err(|error| PnlError::InvalidFinancialField {
         rowid,
         aggregate_type: "AlpacaAccountActivity",
         event_type: activity.activity_type.clone(),
         field: "net_amount",
         value: net_amount.to_owned(),
-        source: PnlFinancialFieldError::InvalidDecimal(error),
+        source: PnlFinancialFieldError::InvalidDecimal(Box::new(error)),
     })
 }
 
@@ -817,8 +912,10 @@ pub(crate) fn build_alpaca_activity_cost_entries(
                 Ok(amount) => amount,
                 Err(error) => return Some(Err(error)),
             };
-            if signed_amount.is_zero() {
-                return None;
+            match signed_amount.is_zero() {
+                Ok(true) => return None,
+                Ok(false) => {}
+                Err(error) => return Some(Err(error.into())),
             }
             if let Some(currency) = activity.currency.as_deref()
                 && !currency.eq_ignore_ascii_case("USD")
@@ -852,9 +949,11 @@ pub(crate) fn build_alpaca_activity_cost_entries(
                     }
                 }
             }
-            let Some((category, accounting_bucket, effect)) =
-                classify_activity(&activity.activity_type, &signed_amount)
-            else {
+            let classified = match classify_activity(&activity.activity_type, signed_amount) {
+                Ok(classified) => classified,
+                Err(error) => return Some(Err(error)),
+            };
+            let Some((category, accounting_bucket, effect)) = classified else {
                 return Some(Err(malformed_alpaca_activity(
                     activity,
                     event_rowid,
@@ -862,11 +961,24 @@ pub(crate) fn build_alpaca_activity_cost_entries(
                 )));
             };
 
+            let amount_usd = match signed_amount.abs() {
+                Ok(amount) => match validated_cost_magnitude(
+                    amount,
+                    event_rowid,
+                    "AlpacaAccountActivity",
+                    activity.activity_type.clone(),
+                ) {
+                    Ok(amount) => amount,
+                    Err(error) => return Some(Err(error)),
+                },
+                Err(error) => return Some(Err(error.into())),
+            };
+
             Some(Ok(CostEntryInternal {
                 category,
                 accounting_bucket,
                 effect,
-                amount_usd: abs_decimal(&signed_amount),
+                amount_usd,
                 occurred_at,
                 aggregate_type: "AlpacaAccountActivity".to_owned(),
                 aggregate_id: activity.id.clone(),

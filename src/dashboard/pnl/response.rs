@@ -1,18 +1,11 @@
 //! Serializable DTOs for the backend PnL report endpoint.
-use num_decimal::Num;
+use rain_math_float::Float;
 use serde::{Serialize, Serializer};
 use st0x_finance::Symbol;
 
 use super::costs::CostEntryInternal;
 use super::parsing::fmt_decimal;
 use super::state::{Direction, PnlBucket, Venue};
-
-fn serialize_decimal<S>(value: &Num, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    serializer.serialize_str(&fmt_decimal(value))
-}
 
 #[expect(
     clippy::trivially_copy_pass_by_ref,
@@ -182,22 +175,22 @@ pub(crate) struct PnlEntry {
     pub(crate) opening_direction: Direction,
     #[serde(serialize_with = "serialize_direction")]
     pub(crate) closing_direction: Direction,
-    #[serde(serialize_with = "serialize_decimal")]
-    pub(crate) opening_price_usd: Num,
-    #[serde(serialize_with = "serialize_decimal")]
-    pub(crate) closing_price_usd: Num,
+    #[serde(serialize_with = "st0x_float_serde::serialize_float_as_string")]
+    pub(crate) opening_price_usd: Float,
+    #[serde(serialize_with = "st0x_float_serde::serialize_float_as_string")]
+    pub(crate) closing_price_usd: Float,
     pub(crate) onchain_trade_id: String,
     pub(crate) offchain_order_id: String,
     pub(crate) onchain_direction: String,
     pub(crate) offchain_direction: String,
-    #[serde(serialize_with = "serialize_decimal")]
-    pub(crate) shares: Num,
+    #[serde(serialize_with = "st0x_float_serde::serialize_float_as_string")]
+    pub(crate) shares: Float,
     pub(crate) onchain_price_usdc: String,
     pub(crate) offchain_price_usd: String,
-    #[serde(serialize_with = "serialize_decimal")]
-    pub(crate) spread_usd: Num,
-    #[serde(serialize_with = "serialize_decimal")]
-    pub(crate) realized_pnl_usd: Num,
+    #[serde(serialize_with = "st0x_float_serde::serialize_float_as_string")]
+    pub(crate) spread_usd: Float,
+    #[serde(serialize_with = "st0x_float_serde::serialize_float_as_string")]
+    pub(crate) realized_pnl_usd: Float,
     pub(crate) elapsed_seconds: i64,
     pub(crate) counter_trade_threshold_seconds: i64,
     pub(crate) delayed_counter_trade: bool,
@@ -242,20 +235,22 @@ pub(crate) struct PnlCostEntry {
     pub(crate) detail: String,
 }
 
-impl From<&CostEntryInternal> for PnlCostEntry {
-    fn from(value: &CostEntryInternal) -> Self {
-        Self {
+impl TryFrom<&CostEntryInternal> for PnlCostEntry {
+    type Error = super::query::PnlError;
+
+    fn try_from(value: &CostEntryInternal) -> Result<Self, Self::Error> {
+        Ok(Self {
             category: value.category.as_str(),
             accounting_bucket: value.accounting_bucket.as_str(),
             effect: value.effect.as_str(),
-            amount_usd: fmt_decimal(&value.amount_usd),
+            amount_usd: fmt_decimal(value.amount_usd.inner())?,
             occurred_at: value.occurred_at.clone(),
             aggregate_type: value.aggregate_type.clone(),
             aggregate_id: value.aggregate_id.clone(),
             event_rowid: value.event_rowid,
             symbol: value.symbol.clone(),
             detail: value.detail.clone(),
-        }
+        })
     }
 }
 

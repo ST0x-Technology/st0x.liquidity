@@ -83,6 +83,11 @@ impl Usd {
     pub fn lt(&self, other: &Self) -> Result<bool, FloatError> {
         self.0.lt(other.0)
     }
+
+    /// Fallible greater-than comparison.
+    pub fn gt(&self, other: &Self) -> Result<bool, FloatError> {
+        self.0.gt(other.0)
+    }
 }
 
 impl HasZero for Usd {
@@ -197,6 +202,17 @@ mod tests {
     fn sub_succeeds() {
         let result = (Usd::new(float!(5)) - Usd::new(float!(2))).unwrap();
         assert!(result.inner().eq(float!(3)).unwrap());
+    }
+
+    #[test]
+    fn gt_returns_true_when_greater() {
+        assert!(Usd::new(float!(5)).gt(&Usd::new(float!(2))).unwrap());
+    }
+
+    #[test]
+    fn gt_returns_false_when_not_greater() {
+        assert!(!Usd::new(float!(2)).gt(&Usd::new(float!(5))).unwrap());
+        assert!(!Usd::new(float!(2)).gt(&Usd::new(float!(2))).unwrap());
     }
 
     #[test]

@@ -48,7 +48,11 @@ pub(crate) mod read;
 pub(crate) mod write;
 
 pub(crate) use projection::PortfolioSnapshotProjection;
-pub(crate) use read::{EtDayRange, ReadError, capital_summary, load_portfolio_days};
+#[cfg(test)]
+pub(crate) use read::load_portfolio_days;
+pub(crate) use read::{
+    EtDayRange, ReadError, capital_summary, evaluate_portfolio_days, load_portfolio_day_rows,
+};
 pub(crate) use write::{
     CAPTURE_BUFFER, PortfolioSnapshotCtx, PortfolioSnapshotJob, PortfolioSnapshotJobQueue,
     bootstrap_portfolio_snapshot,

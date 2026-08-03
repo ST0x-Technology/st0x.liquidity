@@ -504,6 +504,7 @@ fn is_transient_rpc_error(error: &EthUsdValuationError) -> bool {
         EthUsdValuationError::Pyth(PythError::InvalidTimestamp(_))
         | EthUsdValuationError::NonPositivePrice { .. }
         | EthUsdValuationError::Decimal { .. }
+        | EthUsdValuationError::Arithmetic(_)
         | EthUsdValuationError::InvalidPublishTime(_)
         | EthUsdValuationError::ExponentOutOfRange { .. } => false,
     }
@@ -542,6 +543,7 @@ mod tests {
     use st0x_evm::PythStructs::Price;
     use st0x_evm::{Evm, EvmError};
     use st0x_finance::Symbol;
+    use st0x_float_macro::float;
 
     use super::*;
     use crate::dashboard::pnl::{PnlQuery, build_pnl_report};
@@ -1224,6 +1226,14 @@ mod tests {
             pending, 0,
             "a data error must dead-letter rather than consume the redrive window"
         );
+    }
+
+    #[test]
+    fn arithmetic_valuation_error_is_not_transient() {
+        let source = (float!(1) / float!(0)).unwrap_err();
+        let error = EthUsdValuationError::Arithmetic(source);
+
+        assert!(!is_transient_rpc_error(&error));
     }
 
     /// The other side of the same switch: an RPC failure reading the price is

@@ -90,12 +90,86 @@ let negated = (-a)?;
 | Position events     | `Decimal`                   | `Float`                   |
 | Dashboard DTOs      | `Decimal`                   | `Float`                   |
 
-## Broker API Boundary
+## Formatting for output
 
-`num_decimal::Num` is still used at the Alpaca API boundary as a private
-implementation detail inside `st0x-execution`. The broker API (via the `apca`
-crate) expects `Num` values, so conversion happens at the edge via
-`Float::format_with_scientific(false)` and string parsing.
+Use `st0x_float_serde::format_float` (or `serialize_float_as_string` in a
+`#[serde(serialize_with = ...)]`) for persistence and human-facing output. The
+helper falls back to scientific notation when plain formatting rejects an
+extreme exponent. Fixed-decimal protocol and integer-conversion boundaries may
+call `Float::format_with_scientific(false)` directly when plain decimal notation
+is part of the contract and the formatting error is propagated.
 
-These converters live in `st0x-execution` and are not part of the public API.
-`num-decimal` remains as a dependency of `st0x-execution` only.
+## Cost of an operation
+
+`Float` arithmetic is not a plain Rust op. Every `+`/`-`/`*`/`/`, comparison,
+and format ABI-encodes a call and executes it in a thread-local revm -- that is
+what buys the guarantee that results match the contracts. Measured on this
+codebase: **~4 us per op in release, ~140 us in debug**. It is cheap enough for
+report-sized workloads, but do not put it inside a hot loop that runs
+per-message.
+
+`Float` has no `PartialEq`/`Ord`; comparisons are fallible (`eq`, `lt`, `gt`,
+`min`, `max` all return `Result`). It derives `Default`, but **nothing in this
+codebase treats `Float::default()` as zero** -- use `float!(0)` from
+`st0x-float-macro`, which resolves at compile time and so stays infallible
+inside a `Default` impl.
+
+## Do not compute in any other numeric type
+
+Financial values are computed in `Float` everywhere. The former implementation
+used `num_decimal::Num` at some boundaries; references to its formatting and
+rounding behavior describe legacy persisted data, not an active dependency or an
+exception to the `Float` rule.
+
+### Persist values losslessly by default
+
+Persist `Float` values with the shared decimal-string serde helpers. Formatting
+does not round, so prices, quantities, positions, snapshots, and other audit
+facts retain their full representable precision across serialization.
+
+Round before persistence only when a field declares a fixed-decimal persistence
+contract, including both its precision and rounding mode. `src/bot_gas` is one
+such compatibility boundary: its USD cost preserves the legacy eight-decimal,
+round-half-to-even contract, then persists that already-rounded `Float`
+losslessly. Do not copy that rounding into fields without the same declared
+contract.
+
+### Equality on a type holding `Float`
+
+`Float` has no `PartialEq`, but `cqrs_es::DomainEvent` requires one on event
+types. Hand-write it, routing through `Float`'s fallible comparison:
+
+```rust
+impl PartialEq for Usd {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq(other.0).unwrap_or(false)
+    }
+}
+```
+
+This fallback is limited to an unavoidable `PartialEq -> bool` adapter: the
+trait signature cannot propagate `FloatError`, and persisted domain values are
+validated before they reach equality checks. For optional prices use
+`crate::position::option_float_eq`, which is `pub(crate)` precisely so event
+equality callers reuse the same constrained adapter.
+
+Business predicates and validation must not use `unwrap_or(false)`. Propagate
+`FloatError` with `?` where possible. If a persisted, `Serialize`-able error
+enum cannot carry `FloatError` (it is not `Clone`/`Eq`/`Serialize`), map the
+failure to an explicit serializable domain error variant; do not stringify the
+source or collapse an arithmetic failure into a legitimate `false` result.
+
+Presentation boundaries (Prometheus gauges, dashboard DTOs consumed by
+JavaScript) convert out of `Float` for display. That is fine; what is not fine
+is substituting a fallback value when the conversion fails, which fabricates a
+financial number.
+
+### Why not arbitrary-precision rationals
+
+The PnL replay once accumulated in `num_decimal::Num` to stay _exact_. Exact
+arithmetic has no width bound: a 67-digit derived price (an on-chain price is
+`usdc_amount / equity_amount`, and that division rarely terminates) times an
+18-decimal share count produced an 84-digit total. Converting that back into
+`Float` for the capital calculation failed, and `/pnl` returned 500 for every
+range containing realized PnL. `Float`'s 224-bit coefficient bounds the width at
+~67 significant digits, which is far beyond what money needs.

@@ -13,8 +13,11 @@ const ALPACA_ACTIVITY_FETCH_PADDING_DAYS: i64 = 7;
 pub(crate) enum PnlFinancialFieldError {
     #[error("expected string or number")]
     InvalidJsonType,
+    // Boxed: `FloatError` embeds revm's `EVMError`/`HaltReason`, which makes
+    // it far larger than every other payload here, and this error is returned
+    // from most of the module's functions.
     #[error("invalid decimal: {0}")]
-    InvalidDecimal(#[source] num_decimal::ParseNumError),
+    InvalidDecimal(#[source] Box<rain_math_float::FloatError>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -64,7 +67,7 @@ pub(crate) enum PnlError {
         field: &'static str,
         value: String,
         #[source]
-        source: num_decimal::ParseNumError,
+        source: Box<rain_math_float::FloatError>,
     },
     #[error("invalid symbol filter: {value}")]
     InvalidSymbolFilter { value: String },
@@ -72,8 +75,43 @@ pub(crate) enum PnlError {
     Database(#[from] sqlx::Error),
     #[error("failed to load portfolio snapshot data for capital/return computation: {0}")]
     PortfolioSnapshot(#[from] crate::portfolio_snapshot::ReadError),
-    #[error("failed to convert a PnL total for capital/return computation: {0}")]
-    CapitalFloat(#[from] rain_math_float::FloatError),
+    #[error("PnL arithmetic failed: {0}")]
+    Arithmetic(#[source] Box<ArithmeticFailure>),
+    #[error("PnL report admission capacity exhausted: {0}")]
+    ReplayAdmission(#[from] tokio::sync::TryAcquireError),
+    #[error("PnL replay worker failed: {0}")]
+    ReplayWorker(#[from] tokio::task::JoinError),
+}
+
+/// A `Float` arithmetic/comparison/formatting failure, tagged with the source
+/// location of the `?` that converted it. Nearly every function in this
+/// module is fallible on `Float` now, so the location -- not a hand-picked
+/// "operation" label -- is what actually distinguishes one failure site from
+/// another (cost summary vs. FIFO replay vs. capital block vs. window
+/// aggregation) when `/pnl` logs a 500. `#[track_caller]` on the `From` impl
+/// below makes `Location::caller()` resolve to the exact `?` call site, not
+/// this impl's own body. A handful of arithmetic accumulator helpers
+/// (`replay.rs`'s `add_venue_notional`/`add_realized_pnl`/`add_summary`) are
+/// invoked from more than one pipeline stage; those are themselves marked
+/// `#[track_caller]` so the location forwards one frame further, to the
+/// stage that called the helper, rather than to a line inside the shared
+/// helper that is identical regardless of which stage triggered it.
+#[derive(Debug, thiserror::Error)]
+#[error("{location}: {source}")]
+pub(crate) struct ArithmeticFailure {
+    pub(super) location: &'static std::panic::Location<'static>,
+    #[source]
+    source: Box<rain_math_float::FloatError>,
+}
+
+impl From<rain_math_float::FloatError> for PnlError {
+    #[track_caller]
+    fn from(error: rain_math_float::FloatError) -> Self {
+        Self::Arithmetic(Box::new(ArithmeticFailure {
+            location: std::panic::Location::caller(),
+            source: Box::new(error),
+        }))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

@@ -24,7 +24,6 @@ chrono-tz.workspace = true
 cqrs-es.workspace = true
 flate2.workspace = true
 httpmock = { workspace = true, optional = true }
-num-decimal.workspace = true
 num-traits.workspace = true
 rain-math-float.workspace = true
 rand.workspace = true
