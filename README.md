@@ -289,7 +289,8 @@ nix run .#deployAll   # first deployment
 ### CI/CD
 
 - **CI** (`.github/workflows/ci.yaml`): Builds all packages, runs tests and
-  clippy inside nix derivations, builds dashboard. Runs on every push.
+  clippy inside nix derivations, and builds the dashboard. Runs for pull request
+  activity and pushes to `master`.
 - **CD** (`.github/workflows/cd.yaml`): Deploys to the NixOS host via
   `nix run .#deployAll`. Runs on push to master.
 
