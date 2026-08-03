@@ -5,10 +5,12 @@ use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::str::FromStr;
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use task_supervisor::{SupervisedTask, TaskResult};
 #[cfg(test)]
@@ -17,8 +19,10 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::time::{Instant, interval, sleep_until};
 use tracing::{debug, info, warn};
 
-use st0x_dto::{Statement, Trade, TradeOutcome, TradingVenue};
-use st0x_event_sorcery::{EntityList, Reactor, SendError, deps, load_entity};
+use st0x_dto::{Statement, Trade, TradeOutcome};
+use st0x_event_sorcery::{
+    AggregateError, EntityList, Reactor, SendError, deps, is_retryable_sqlite_busy, load_entity,
+};
 use st0x_finance::{FractionalShares, NotPositive, Positive};
 
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
@@ -26,7 +30,9 @@ use crate::equity_redemption::EquityRedemption;
 use crate::offchain::order::{
     OffchainOrder, OffchainOrderEvent, OffchainOrderId, TradeConversionError,
 };
-use crate::onchain_trade::{OnChainTrade, OnChainTradeEvent};
+use crate::onchain_trade::{
+    OnChainTrade, OnChainTradeEvent, OnChainTradeId, ParseOnChainTradeIdError,
+};
 use crate::position::{Position, PositionEvent};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
@@ -51,6 +57,50 @@ const HANDOFF_RETRY_MAX_ATTEMPTS: usize = 3;
 const HANDOFF_RETRY_QUEUE_CAPACITY: usize = 64;
 const HANDOFF_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
 
+#[derive(Clone, Default)]
+struct OnchainRevisionReloadFault {
+    #[cfg(test)]
+    failures_remaining: Arc<AtomicUsize>,
+    #[cfg(not(test))]
+    never_fail: bool,
+}
+
+impl OnchainRevisionReloadFault {
+    #[cfg(test)]
+    fn should_fail(&self) -> bool {
+        consume_failure(&self.failures_remaining)
+    }
+
+    #[cfg(not(test))]
+    const fn should_fail(&self) -> bool {
+        self.never_fail
+    }
+
+    #[cfg(test)]
+    fn fail_next(&self, count: usize) {
+        self.failures_remaining.store(count, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone, Default)]
+struct OnchainRevisionTracker {
+    pending: Arc<Mutex<HashSet<OnChainTradeId>>>,
+}
+
+impl OnchainRevisionTracker {
+    async fn track(&self, id: OnChainTradeId) {
+        self.pending.lock().await.insert(id);
+    }
+
+    async fn resolve(&self, id: &OnChainTradeId) {
+        self.pending.lock().await.remove(id);
+    }
+
+    async fn pending(&self) -> Vec<OnChainTradeId> {
+        self.pending.lock().await.iter().cloned().collect()
+    }
+}
+
 /// Runtime dependencies shared by terminal-trade reactors and their worker.
 pub(crate) struct DashboardTradeDelivery {
     pub(crate) queue: DashboardTradeDeliveryJobQueue,
@@ -71,21 +121,36 @@ impl DashboardTradeDelivery {
         let queue = DashboardTradeDeliveryJobQueue::new(apalis_pool);
         let store = Arc::new(DashboardTradeDeliveryStore::new(pool.clone()));
         let enqueuer = Arc::new(DashboardTradeEnqueuer::new(queue.clone(), store.clone()));
+        let revision_reload_fault = OnchainRevisionReloadFault::default();
+        let revision_tracker = OnchainRevisionTracker::default();
+        let publish_lock = Arc::new(Mutex::new(()));
         #[cfg(test)]
         let test_store = store.clone();
         let (handoff_retry_sender, handoff_retry_receiver) =
             mpsc::channel(HANDOFF_RETRY_QUEUE_CAPACITY);
-        let ctx = Arc::new(DashboardTradeDeliveryCtx::with_store(sender.clone(), store));
+        let ctx = Arc::new(DashboardTradeDeliveryCtx::with_store(
+            sender.clone(),
+            store,
+            pool.clone(),
+            publish_lock.clone(),
+        ));
         let broadcaster = Arc::new(Broadcaster::new(
-            sender,
+            sender.clone(),
             pool.clone(),
             enqueuer.clone(),
             handoff_retry_sender,
+            revision_reload_fault.clone(),
+            revision_tracker.clone(),
+            publish_lock.clone(),
         ));
         let handoff_monitor = DashboardTradeHandoffMonitor::new(
             handoff_retry_receiver,
             enqueuer.clone(),
             pool.clone(),
+            sender,
+            revision_reload_fault,
+            revision_tracker,
+            publish_lock,
         );
 
         Self {
@@ -141,6 +206,10 @@ impl DashboardTradeDelivery {
                 "Reconciled durable dashboard trade deliveries",
             );
         }
+
+        self.handoff_monitor
+            .skip_first_terminal_reconciliation
+            .store(true, Ordering::SeqCst);
 
         Ok(undelivered)
     }
@@ -224,6 +293,7 @@ impl DashboardTradeEnqueuer {
 pub(crate) enum DashboardTradeHandoff {
     Trade(Box<Trade>),
     ReloadOffchainOrder(OffchainOrderId),
+    ReloadOnchainTradeRevision(OnChainTradeId),
 }
 
 struct ScheduledDashboardTradeHandoff {
@@ -254,14 +324,65 @@ impl ScheduledDashboardTradeHandoff {
     }
 }
 
+struct LoadedOnchainTrade {
+    trade: Trade,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OnchainTradeReplayError {
+    #[error("failed to replay onchain trade {id}: {source}")]
+    Replay {
+        id: OnChainTradeId,
+        #[source]
+        source: Box<SendError<OnChainTrade>>,
+    },
+    #[error("onchain trade {id} cannot be represented: {source}")]
+    Conversion {
+        id: OnChainTradeId,
+        #[source]
+        source: NotPositive<FractionalShares>,
+    },
+}
+
+async fn load_authoritative_onchain_trade(
+    pool: &SqlitePool,
+    id: &OnChainTradeId,
+) -> Result<Option<LoadedOnchainTrade>, OnchainTradeReplayError> {
+    let Some(entity) = load_entity::<OnChainTrade>(pool, id)
+        .await
+        .map_err(|source| OnchainTradeReplayError::Replay {
+            id: id.clone(),
+            source: Box::new(source),
+        })?
+    else {
+        return Ok(None);
+    };
+    let trade =
+        entity
+            .try_into_trade(id)
+            .map_err(|source| OnchainTradeReplayError::Conversion {
+                id: id.clone(),
+                source,
+            })?;
+
+    Ok(Some(LoadedOnchainTrade { trade }))
+}
+
 #[derive(Clone)]
 pub(crate) struct DashboardTradeHandoffMonitor {
     receiver: Arc<Mutex<mpsc::Receiver<DashboardTradeHandoff>>>,
     enqueuer: Arc<DashboardTradeEnqueuer>,
     pool: SqlitePool,
+    sender: broadcast::Sender<Statement>,
+    revision_reload_fault: OnchainRevisionReloadFault,
+    revision_tracker: OnchainRevisionTracker,
+    publish_lock: Arc<Mutex<()>>,
+    skip_first_terminal_reconciliation: Arc<AtomicBool>,
     reconciliation_interval: Duration,
     #[cfg(test)]
     exhaustion_notify: Arc<Notify>,
+    #[cfg(test)]
+    startup_notify: Arc<Notify>,
 }
 
 impl DashboardTradeHandoffMonitor {
@@ -269,14 +390,25 @@ impl DashboardTradeHandoffMonitor {
         receiver: mpsc::Receiver<DashboardTradeHandoff>,
         enqueuer: Arc<DashboardTradeEnqueuer>,
         pool: SqlitePool,
+        sender: broadcast::Sender<Statement>,
+        revision_reload_fault: OnchainRevisionReloadFault,
+        revision_tracker: OnchainRevisionTracker,
+        publish_lock: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             receiver: Arc::new(Mutex::new(receiver)),
             enqueuer,
             pool,
+            sender,
+            revision_reload_fault,
+            revision_tracker,
+            publish_lock,
+            skip_first_terminal_reconciliation: Arc::new(AtomicBool::new(false)),
             reconciliation_interval: HANDOFF_RECONCILIATION_INTERVAL,
             #[cfg(test)]
             exhaustion_notify: Arc::new(Notify::new()),
+            #[cfg(test)]
+            startup_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -291,6 +423,11 @@ impl DashboardTradeHandoffMonitor {
         self.exhaustion_notify.clone()
     }
 
+    #[cfg(test)]
+    fn startup_notification(&self) -> Arc<Notify> {
+        self.startup_notify.clone()
+    }
+
     async fn receive(&self) -> Option<DashboardTradeHandoff> {
         self.receiver.lock().await.recv().await
     }
@@ -299,8 +436,10 @@ impl DashboardTradeHandoffMonitor {
         &self,
         handoff: &DashboardTradeHandoff,
     ) -> Result<(), DashboardTradeHandoffAttemptError> {
-        let trade = match handoff {
-            DashboardTradeHandoff::Trade(trade) => trade.as_ref().clone(),
+        match handoff {
+            DashboardTradeHandoff::Trade(trade) => {
+                self.enqueuer.enqueue(trade.as_ref().clone()).await?;
+            }
             DashboardTradeHandoff::ReloadOffchainOrder(id) => {
                 let order = load_entity::<OffchainOrder>(&self.pool, id)
                     .await
@@ -310,13 +449,54 @@ impl DashboardTradeHandoffMonitor {
                     })?
                     .ok_or(DashboardTradeHandoffAttemptError::Missing { id: *id })?;
 
-                order.try_into_trade(id).map_err(|source| {
+                let trade = order.try_into_trade(id).map_err(|source| {
                     DashboardTradeHandoffAttemptError::Conversion { id: *id, source }
-                })?
-            }
-        };
+                })?;
 
-        self.enqueuer.enqueue(trade).await?;
+                self.enqueuer.enqueue(trade).await?;
+            }
+            DashboardTradeHandoff::ReloadOnchainTradeRevision(id) => {
+                self.revision_tracker.track(id.clone()).await;
+                self.broadcast_onchain_trade_revision(id).await?;
+                self.revision_tracker.resolve(id).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn broadcast_onchain_trade_revision(
+        &self,
+        id: &OnChainTradeId,
+    ) -> Result<(), DashboardTradeHandoffAttemptError> {
+        if self.revision_reload_fault.should_fail() {
+            #[cfg(test)]
+            return Err(DashboardTradeHandoffAttemptError::InjectedOnchainReplay {
+                id: id.clone(),
+            });
+        }
+
+        let _publish_guard = self.publish_lock.lock().await;
+        let Some(loaded) = load_authoritative_onchain_trade(&self.pool, id)
+            .await
+            .map_err(|source| DashboardTradeHandoffAttemptError::Onchain(Box::new(source)))?
+        else {
+            warn!(
+                target: "dashboard",
+                %id,
+                "Source-attributed onchain trade replayed to empty state"
+            );
+            return Ok(());
+        };
+        if let Err(error) = self.sender.send(Statement::TradeUpdate(loaded.trade)) {
+            debug!(
+                target: "dashboard",
+                %id,
+                %error,
+                "No dashboard receivers for corrected onchain trade"
+            );
+        }
+
         Ok(())
     }
 
@@ -338,6 +518,12 @@ impl DashboardTradeHandoffMonitor {
             if error.is_retryable() {
                 if scheduled.attempt < HANDOFF_RETRY_MAX_ATTEMPTS {
                     pending.push_back(scheduled.reschedule());
+                } else if let DashboardTradeHandoff::ReloadOnchainTradeRevision(id) =
+                    &scheduled.handoff
+                {
+                    return Err(DashboardTradeHandoffMonitorError::RevisionRetryExhausted {
+                        id: id.clone(),
+                    });
                 } else {
                     exhausted = true;
                     #[cfg(test)]
@@ -351,7 +537,7 @@ impl DashboardTradeHandoffMonitor {
                 }
             } else {
                 return Err(DashboardTradeHandoffMonitorError::DeterministicConversion(
-                    error,
+                    Box::new(error),
                 ));
             }
         }
@@ -388,11 +574,38 @@ impl DashboardTradeHandoffMonitor {
             ),
         }
     }
+
+    async fn reconcile_pending_onchain_revisions(
+        &self,
+    ) -> Result<(), DashboardTradeHandoffMonitorError> {
+        for id in self.revision_tracker.pending().await {
+            self.broadcast_onchain_trade_revision(&id)
+                .await
+                .map_err(|source| {
+                    DashboardTradeHandoffMonitorError::RevisionReconciliation(Box::new(source))
+                })?;
+            self.revision_tracker.resolve(&id).await;
+        }
+
+        Ok(())
+    }
 }
 
 impl SupervisedTask for DashboardTradeHandoffMonitor {
     async fn run(&mut self) -> TaskResult {
         info!(target: "dashboard", "Dashboard trade handoff monitor started");
+        if !self
+            .skip_first_terminal_reconciliation
+            .swap(false, Ordering::SeqCst)
+        {
+            self.enqueuer
+                .reconcile_undelivered()
+                .await
+                .map_err(DashboardTradeHandoffMonitorError::TerminalReconciliation)?;
+        }
+        self.reconcile_pending_onchain_revisions().await?;
+        #[cfg(test)]
+        self.startup_notify.notify_one();
         let mut pending = VecDeque::with_capacity(HANDOFF_RETRY_QUEUE_CAPACITY);
         let mut reconciliation = interval(self.reconciliation_interval);
         reconciliation.tick().await;
@@ -432,7 +645,13 @@ enum DashboardTradeHandoffMonitorError {
     #[error("dashboard trade handoff retry queue closed unexpectedly")]
     QueueClosed,
     #[error("dashboard trade cannot be represented for durable delivery: {0}")]
-    DeterministicConversion(#[source] DashboardTradeHandoffAttemptError),
+    DeterministicConversion(#[source] Box<DashboardTradeHandoffAttemptError>),
+    #[error("source-attribution broadcast retries exhausted for onchain trade {id}")]
+    RevisionRetryExhausted { id: OnChainTradeId },
+    #[error("failed to reconcile terminal dashboard trade deliveries: {0}")]
+    TerminalReconciliation(#[source] anyhow::Error),
+    #[error("failed to reconcile a source-attributed onchain trade broadcast: {0}")]
+    RevisionReconciliation(#[source] Box<DashboardTradeHandoffAttemptError>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -445,6 +664,11 @@ enum DashboardTradeHandoffAttemptError {
         #[source]
         source: SendError<OffchainOrder>,
     },
+    #[error("failed to load source-attributed onchain trade: {0}")]
+    Onchain(#[source] Box<OnchainTradeReplayError>),
+    #[cfg(test)]
+    #[error("injected source-attributed onchain trade replay failure for {id}")]
+    InjectedOnchainReplay { id: OnChainTradeId },
     #[error("terminal offchain order {id} replayed to empty state")]
     Missing { id: OffchainOrderId },
     #[error("terminal offchain order {id} cannot be represented for delivery: {source}")]
@@ -459,6 +683,20 @@ impl DashboardTradeHandoffAttemptError {
     fn is_retryable(&self) -> bool {
         match self {
             Self::Persistence(_) | Self::Replay { .. } | Self::Missing { .. } => true,
+            Self::Onchain(source) => match source.as_ref() {
+                OnchainTradeReplayError::Replay { source, .. } => match source.as_ref() {
+                    AggregateError::DatabaseConnectionError(inner) => {
+                        is_retryable_onchain_replay_database_error(inner.as_ref())
+                    }
+                    AggregateError::UserError(_)
+                    | AggregateError::AggregateConflict
+                    | AggregateError::DeserializationError(_)
+                    | AggregateError::UnexpectedError(_) => false,
+                },
+                OnchainTradeReplayError::Conversion { .. } => false,
+            },
+            #[cfg(test)]
+            Self::InjectedOnchainReplay { .. } => true,
             // Exhaustive: a new conversion failure must force a deliberate
             // retry-or-fail-stop decision here. A catch-all would silently
             // classify it as fail-stop, which terminates the monitor.
@@ -476,6 +714,27 @@ impl DashboardTradeHandoffAttemptError {
             },
         }
     }
+}
+
+fn is_retryable_onchain_replay_database_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    if is_retryable_sqlite_busy(error) {
+        return true;
+    }
+
+    let mut current = Some(error);
+    while let Some(source) = current {
+        if let Some(sqlx_error) = source.downcast_ref::<sqlx::Error>()
+            && matches!(
+                sqlx_error,
+                sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::WorkerCrashed
+            )
+        {
+            return true;
+        }
+        current = source.source();
+    }
+
+    false
 }
 
 /// Persistent delivery job for one terminal dashboard trade outcome.
@@ -580,19 +839,33 @@ fn consume_failure(failures_remaining: &AtomicUsize) -> bool {
 pub(crate) struct DashboardTradeDeliveryCtx {
     sender: broadcast::Sender<Statement>,
     store: Arc<DashboardTradeDeliveryStore>,
+    pool: SqlitePool,
+    publish_lock: Arc<Mutex<()>>,
 }
 
 impl DashboardTradeDeliveryCtx {
     #[cfg(test)]
     pub(crate) fn new(sender: broadcast::Sender<Statement>, pool: SqlitePool) -> Self {
-        Self::with_store(sender, Arc::new(DashboardTradeDeliveryStore::new(pool)))
+        Self::with_store(
+            sender,
+            Arc::new(DashboardTradeDeliveryStore::new(pool.clone())),
+            pool,
+            Arc::new(Mutex::new(())),
+        )
     }
 
     fn with_store(
         sender: broadcast::Sender<Statement>,
         store: Arc<DashboardTradeDeliveryStore>,
+        pool: SqlitePool,
+        publish_lock: Arc<Mutex<()>>,
     ) -> Self {
-        Self { sender, store }
+        Self {
+            sender,
+            store,
+            pool,
+            publish_lock,
+        }
     }
 
     #[cfg(test)]
@@ -612,6 +885,23 @@ impl DashboardTradeDeliveryCtx {
             debug!(target: "dashboard", %error, "No dashboard receivers for legacy trade fill");
         }
     }
+
+    async fn authoritative_trade(
+        &self,
+        trade: &Trade,
+    ) -> Result<Trade, DashboardTradeDeliveryError> {
+        if !trade.venue.is_onchain() {
+            return Ok(trade.clone());
+        }
+
+        let id = OnChainTradeId::from_str(&trade.id)?;
+        let loaded = load_authoritative_onchain_trade(&self.pool, &id)
+            .await
+            .map_err(|source| DashboardTradeDeliveryError::Onchain(Box::new(source)))?
+            .ok_or_else(|| DashboardTradeDeliveryError::OnchainMissing { id: id.clone() })?;
+
+        Ok(loaded.trade)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -620,6 +910,12 @@ pub(crate) enum DashboardTradeDeliveryError {
     Database(#[from] sqlx::Error),
     #[error("dashboard trade delivery record is missing for {trade_id}")]
     MissingRecord { trade_id: String },
+    #[error("invalid onchain dashboard trade ID: {0}")]
+    OnchainId(#[from] ParseOnChainTradeIdError),
+    #[error("failed to load authoritative onchain dashboard trade: {0}")]
+    Onchain(#[source] Box<OnchainTradeReplayError>),
+    #[error("onchain dashboard trade {id} replayed to empty state")]
+    OnchainMissing { id: OnChainTradeId },
     #[cfg(test)]
     #[error("injected dashboard trade delivery failure")]
     Injected,
@@ -642,6 +938,7 @@ impl Job<DashboardTradeDeliveryCtx> for DeliverDashboardTrade {
     }
 
     async fn perform(&self, ctx: &DashboardTradeDeliveryCtx) -> Result<Self::Output, Self::Error> {
+        let _publish_guard = ctx.publish_lock.lock().await;
         if ctx.store.is_delivered(&self.trade.id).await? {
             debug!(
                 target: "dashboard",
@@ -651,7 +948,7 @@ impl Job<DashboardTradeDeliveryCtx> for DeliverDashboardTrade {
             return Ok(());
         }
 
-        ctx.publish(self.trade.clone());
+        ctx.publish(ctx.authoritative_trade(&self.trade).await?);
         ctx.store.mark_delivered(&self.trade.id).await
     }
 }
@@ -663,6 +960,9 @@ pub(crate) struct Broadcaster {
     pool: SqlitePool,
     trade_enqueuer: Arc<DashboardTradeEnqueuer>,
     handoff_retry_sender: mpsc::Sender<DashboardTradeHandoff>,
+    revision_reload_fault: OnchainRevisionReloadFault,
+    revision_tracker: OnchainRevisionTracker,
+    publish_lock: Arc<Mutex<()>>,
 }
 
 impl Broadcaster {
@@ -671,13 +971,24 @@ impl Broadcaster {
         pool: SqlitePool,
         trade_enqueuer: Arc<DashboardTradeEnqueuer>,
         handoff_retry_sender: mpsc::Sender<DashboardTradeHandoff>,
+        revision_reload_fault: OnchainRevisionReloadFault,
+        revision_tracker: OnchainRevisionTracker,
+        publish_lock: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             sender,
             pool,
             trade_enqueuer,
             handoff_retry_sender,
+            revision_reload_fault,
+            revision_tracker,
+            publish_lock,
         }
+    }
+
+    #[cfg(test)]
+    fn fail_next_onchain_revision_load(&self, count: usize) {
+        self.revision_reload_fault.fail_next(count);
     }
 
     async fn enqueue_trade(&self, trade: Trade) -> Result<(), DashboardTradeEnqueueError> {
@@ -727,6 +1038,77 @@ impl Broadcaster {
         Ok(())
     }
 
+    async fn broadcast_onchain_trade_revision(
+        &self,
+        id: OnChainTradeId,
+    ) -> Result<(), DashboardTradeEnqueueError> {
+        let replay = {
+            let _publish_guard = self.publish_lock.lock().await;
+            if self.revision_reload_fault.should_fail() {
+                None
+            } else {
+                Some(
+                    match load_authoritative_onchain_trade(&self.pool, &id).await {
+                        Ok(Some(loaded)) => {
+                            if let Err(error) =
+                                self.sender.send(Statement::TradeUpdate(loaded.trade))
+                            {
+                                debug!(
+                                    target: "dashboard",
+                                    %id,
+                                    %error,
+                                    "No dashboard receivers for corrected onchain trade"
+                                );
+                            }
+                            Ok(())
+                        }
+                        Ok(None) => {
+                            warn!(
+                                target: "dashboard",
+                                %id,
+                                "Source-attributed onchain trade replayed to empty state"
+                            );
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    },
+                )
+            }
+        };
+
+        match replay {
+            Some(Ok(())) => self.revision_tracker.resolve(&id).await,
+            Some(Err(OnchainTradeReplayError::Replay { source, .. })) => {
+                warn!(
+                    target: "dashboard",
+                    %id,
+                    ?source,
+                    "Failed to replay source-attributed onchain trade; queued for broadcast retry"
+                );
+                self.queue_onchain_trade_revision(id).await?;
+            }
+            Some(Err(OnchainTradeReplayError::Conversion { source, .. })) => {
+                return Err(DashboardTradeEnqueueError::Quantity(source));
+            }
+            None => {
+                self.queue_onchain_trade_revision(id).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn queue_onchain_trade_revision(
+        &self,
+        id: OnChainTradeId,
+    ) -> Result<(), DashboardTradeEnqueueError> {
+        self.revision_tracker.track(id.clone()).await;
+        self.handoff_retry_sender
+            .send(DashboardTradeHandoff::ReloadOnchainTradeRevision(id))
+            .await?;
+        Ok(())
+    }
+
     fn broadcast_position(&self, position: st0x_dto::Position) {
         if let Err(error) = self.sender.send(Statement::PositionUpdate(position)) {
             debug!(target: "dashboard", %error, "Failed to broadcast position update (no receivers)");
@@ -770,24 +1152,31 @@ impl Reactor for Broadcaster {
     ) -> Result<(), Self::Error> {
         event
             .on(|id, event| async move {
-                if let OnChainTradeEvent::Filled {
-                    symbol,
-                    amount,
-                    direction,
-                    block_timestamp,
-                    ..
-                } = event
-                {
-                    self.enqueue_trade(Trade {
-                        id: id.to_string(),
-                        occurred_at: block_timestamp,
-                        venue: TradingVenue::Raindex,
-                        direction,
+                match event {
+                    OnChainTradeEvent::Filled {
+                        source,
                         symbol,
-                        shares: Positive::new(FractionalShares::new(amount))?,
-                        outcome: TradeOutcome::Filled,
-                    })
-                    .await?;
+                        amount,
+                        direction,
+                        block_timestamp,
+                        ..
+                    } => {
+                        self.enqueue_trade(Trade {
+                            id: id.to_string(),
+                            occurred_at: block_timestamp,
+                            venue: source.trading_venue(),
+                            direction,
+                            symbol,
+                            shares: Positive::new(FractionalShares::new(amount))?,
+                            outcome: TradeOutcome::Filled,
+                        })
+                        .await?;
+                    }
+                    OnChainTradeEvent::SourceAttributed { .. } => {
+                        self.broadcast_onchain_trade_revision(id).await?;
+                    }
+                    OnChainTradeEvent::Enriched { .. }
+                    | OnChainTradeEvent::Acknowledged { .. } => {}
                 }
 
                 Ok(())
@@ -868,10 +1257,13 @@ impl Reactor for Broadcaster {
 #[cfg(test)]
 mod tests {
     use apalis::prelude::Monitor;
+    use std::borrow::Cow;
+    use std::fmt::{Display, Formatter};
     use std::sync::Arc;
     use std::time::Duration;
 
-    use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
+    use st0x_dto::TradingVenue;
+    use st0x_event_sorcery::{LifecycleError, ReactorHarness, StoreBuilder};
     use st0x_execution::Symbol;
 
     use super::*;
@@ -880,8 +1272,60 @@ mod tests {
     };
     use crate::dashboard::trade_loader::load_trades;
     use crate::offchain::order::{OffchainOrderCommand, OffchainOrderEvent};
+    use crate::onchain_trade::{
+        InventoryVenue, OnChainTradeCommand, OnChainTradeError, OnChainTradeSource,
+    };
     use crate::position::{PositionCommand, PositionEvent, TradeId};
     use crate::test_utils::setup_test_pools;
+
+    #[derive(Debug)]
+    struct TestDatabaseError {
+        code: &'static str,
+    }
+
+    impl Display for TestDatabaseError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("test database error")
+        }
+    }
+
+    impl std::error::Error for TestDatabaseError {}
+
+    impl sqlx::error::DatabaseError for TestDatabaseError {
+        fn message(&self) -> &'static str {
+            "test database error"
+        }
+
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.code))
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn onchain_replay_error(source: SendError<OnChainTrade>) -> DashboardTradeHandoffAttemptError {
+        DashboardTradeHandoffAttemptError::Onchain(Box::new(OnchainTradeReplayError::Replay {
+            id: OnChainTradeId {
+                tx_hash: alloy::primitives::TxHash::ZERO,
+                log_index: 0,
+            },
+            source: Box::new(source),
+        }))
+    }
 
     fn test_broadcaster(
         pool: &SqlitePool,
@@ -1089,6 +1533,7 @@ mod tests {
                     log_index: 0,
                 },
                 OnChainTradeEvent::Filled {
+                    source: OnChainTradeSource::Raindex,
                     symbol: Symbol::new("AAPL").unwrap(),
                     amount: st0x_float_macro::float!(10),
                     direction: st0x_execution::Direction::Buy,
@@ -1130,6 +1575,7 @@ mod tests {
                     log_index: 9,
                 },
                 OnChainTradeEvent::Filled {
+                    source: OnChainTradeSource::Raindex,
                     symbol: Symbol::new("AAPL").unwrap(),
                     amount: st0x_float_macro::float!(1),
                     direction: st0x_execution::Direction::Buy,
@@ -1404,6 +1850,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saturated_revision_retry_queue_does_not_hold_the_publish_lock() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (sender, _receiver) = broadcast::channel(16);
+        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        for _ in 0..HANDOFF_RETRY_QUEUE_CAPACITY {
+            delivery
+                .broadcaster
+                .handoff_retry_sender
+                .send(DashboardTradeHandoff::ReloadOffchainOrder(
+                    OffchainOrderId::new(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let revision_id = OnChainTradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 198,
+        };
+        delivery.broadcaster.fail_next_onchain_revision_load(1);
+        let broadcaster = delivery.broadcaster.clone();
+        let revision_id_for_retry = revision_id.clone();
+        let blocked_retry = tokio::spawn(async move {
+            broadcaster
+                .broadcast_onchain_trade_revision(revision_id_for_retry)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if delivery
+                    .broadcaster
+                    .revision_tracker
+                    .pending()
+                    .await
+                    .contains(&revision_id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the source revision retry must reach the saturated queue");
+        assert!(
+            !blocked_retry.is_finished(),
+            "the revision retry must still be blocked on queue capacity"
+        );
+
+        let trade = test_trade();
+        delivery.store.register(&trade.id).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            DeliverDashboardTrade::new(trade).perform(&delivery.ctx),
+        )
+        .await
+        .expect("a saturated revision retry must not block durable publication")
+        .unwrap();
+
+        blocked_retry.abort();
+    }
+
+    #[tokio::test]
     async fn startup_reconciliation_recovers_terminal_trade_without_job() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let store = StoreBuilder::<OnChainTrade>::new(pool.clone())
@@ -1419,6 +1927,7 @@ mod tests {
             .send(
                 &id,
                 crate::onchain_trade::OnChainTradeCommand::WitnessAt {
+                    source: OnChainTradeSource::Raindex,
                     symbol: Symbol::new("AAPL").unwrap(),
                     amount: st0x_float_macro::float!(1),
                     direction: st0x_execution::Direction::Buy,
@@ -1461,6 +1970,7 @@ mod tests {
             .send(
                 &id,
                 crate::onchain_trade::OnChainTradeCommand::WitnessAt {
+                    source: OnChainTradeSource::Raindex,
                     symbol: Symbol::new("AAPL").unwrap(),
                     amount: st0x_float_macro::float!(1),
                     direction: st0x_execution::Direction::Buy,
@@ -1519,6 +2029,7 @@ mod tests {
             .send(
                 &id,
                 crate::onchain_trade::OnChainTradeCommand::WitnessAt {
+                    source: OnChainTradeSource::Raindex,
                     symbol: Symbol::new("AAPL").unwrap(),
                     amount: st0x_float_macro::float!(1),
                     direction: st0x_execution::Direction::Buy,
@@ -1749,7 +2260,11 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (broadcaster, mut receiver, queue, delivery_ctx) =
             test_broadcaster(&pool, &apalis_pool);
-        let harness = ReactorHarness::new(broadcaster);
+        let store = StoreBuilder::<OnChainTrade>::new(pool)
+            .with(broadcaster)
+            .build(())
+            .await
+            .unwrap();
 
         let now = chrono::Utc::now();
         let ingested_at = now + chrono::Duration::seconds(1);
@@ -1758,10 +2273,11 @@ mod tests {
             log_index: 0,
         };
 
-        harness
-            .receive::<OnChainTrade>(
-                id,
-                OnChainTradeEvent::Filled {
+        store
+            .send(
+                &id,
+                OnChainTradeCommand::WitnessAt {
+                    source: OnChainTradeSource::Raindex,
                     symbol: Symbol::new("AAPL").unwrap(),
                     amount: st0x_float_macro::float!(10),
                     direction: st0x_execution::Direction::Buy,
@@ -1796,6 +2312,461 @@ mod tests {
             serde_json::to_value(now).expect("timestamp should serialize")
         );
         assert!(legacy["data"].get("outcome").is_none());
+    }
+
+    #[tokio::test]
+    async fn bebop_inventory_fill_broadcasts_bebop_venue() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (broadcaster, mut receiver, queue, delivery_ctx) =
+            test_broadcaster(&pool, &apalis_pool);
+        let store = StoreBuilder::<OnChainTrade>::new(pool)
+            .with(broadcaster)
+            .build(())
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let id = OnChainTradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 194,
+        };
+
+        store
+            .send(
+                &id,
+                OnChainTradeCommand::WitnessAt {
+                    source: OnChainTradeSource::Inventory {
+                        operator: alloy::primitives::address!(
+                            "0x8b8b6e0507c125934c6129563f48e48c66f86475"
+                        ),
+                        venue: InventoryVenue::Bebop,
+                    },
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    amount: st0x_float_macro::float!(10),
+                    direction: st0x_execution::Direction::Buy,
+                    price_usdc: st0x_float_macro::float!(150),
+                    block_number: 12345,
+                    block_timestamp: now,
+                    filled_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        perform_pending_delivery(&queue, &delivery_ctx).await;
+
+        let msg = receiver.recv().await.expect("should receive fill");
+        let Statement::TradeUpdate(trade) = msg else {
+            panic!("expected TradeUpdate message");
+        };
+        assert_eq!(trade.venue, TradingVenue::Bebop);
+    }
+
+    #[tokio::test]
+    async fn pending_onchain_delivery_cannot_overwrite_a_source_correction() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (broadcaster, mut receiver, queue, delivery_ctx) =
+            test_broadcaster(&pool, &apalis_pool);
+        let store = StoreBuilder::<OnChainTrade>::new(pool)
+            .with(broadcaster)
+            .build(())
+            .await
+            .unwrap();
+        let id = OnChainTradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 195,
+        };
+        let now = chrono::Utc::now();
+        store
+            .send(
+                &id,
+                OnChainTradeCommand::WitnessAt {
+                    source: OnChainTradeSource::Legacy,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    amount: st0x_float_macro::float!(10),
+                    direction: st0x_execution::Direction::Buy,
+                    price_usdc: st0x_float_macro::float!(150),
+                    block_number: 12345,
+                    block_timestamp: now,
+                    filled_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OnChainTradeCommand::AttributeSource {
+                    source: OnChainTradeSource::Inventory {
+                        operator: alloy::primitives::Address::repeat_byte(0x8b),
+                        venue: InventoryVenue::Bebop,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        perform_pending_delivery(&queue, &delivery_ctx).await;
+
+        let updates = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter_map(|statement| match statement {
+                Statement::TradeUpdate(trade) => Some(trade),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 2);
+        assert!(
+            updates
+                .iter()
+                .all(|trade| trade.venue == TradingVenue::Bebop),
+            "the direct correction and delayed durable delivery must both use the authoritative venue"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_attribution_broadcasts_corrected_venue() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (broadcaster, mut receiver, queue, delivery_ctx) =
+            test_broadcaster(&pool, &apalis_pool);
+        let store = StoreBuilder::<OnChainTrade>::new(pool)
+            .with(broadcaster)
+            .build(())
+            .await
+            .unwrap();
+        let id = OnChainTradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 194,
+        };
+        let now = chrono::Utc::now();
+
+        store
+            .send(
+                &id,
+                OnChainTradeCommand::WitnessAt {
+                    source: OnChainTradeSource::Legacy,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    amount: st0x_float_macro::float!(10),
+                    direction: st0x_execution::Direction::Buy,
+                    price_usdc: st0x_float_macro::float!(150),
+                    block_number: 12345,
+                    block_timestamp: now,
+                    filled_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        perform_pending_delivery(&queue, &delivery_ctx).await;
+        let _legacy_update = receiver.recv().await.unwrap();
+        let _legacy_fill = receiver.recv().await.unwrap();
+
+        store
+            .send(
+                &id,
+                OnChainTradeCommand::AttributeSource {
+                    source: OnChainTradeSource::Inventory {
+                        operator: alloy::primitives::Address::repeat_byte(0x8b),
+                        venue: InventoryVenue::Bebop,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        let corrected = receiver.recv().await.expect("corrected trade update");
+        let Statement::TradeUpdate(trade) = corrected else {
+            panic!("expected corrected TradeUpdate");
+        };
+        assert_eq!(trade.id, id.to_string());
+        assert_eq!(trade.venue, TradingVenue::Bebop);
+    }
+
+    #[tokio::test]
+    async fn source_attribution_reload_failure_retries_corrected_broadcast() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let store = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let id = OnChainTradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 195,
+        };
+        let now = chrono::Utc::now();
+        let source = OnChainTradeSource::Inventory {
+            operator: alloy::primitives::Address::repeat_byte(0x8b),
+            venue: InventoryVenue::Bebop,
+        };
+        store
+            .send(
+                &id,
+                OnChainTradeCommand::WitnessAt {
+                    source: OnChainTradeSource::Legacy,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    amount: st0x_float_macro::float!(10),
+                    direction: st0x_execution::Direction::Buy,
+                    price_usdc: st0x_float_macro::float!(150),
+                    block_number: 12345,
+                    block_timestamp: now,
+                    filled_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, OnChainTradeCommand::AttributeSource { source })
+            .await
+            .unwrap();
+
+        let (sender, mut receiver) = broadcast::channel(16);
+        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let broadcaster = delivery.broadcaster;
+        let harness = ReactorHarness::new(broadcaster.clone());
+        let mut handoff_monitor = delivery.handoff_monitor;
+        let started = handoff_monitor.startup_notification();
+        let monitor = tokio::spawn(async move { handoff_monitor.run().await });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("the handoff monitor must finish startup reconciliation");
+        broadcaster.fail_next_onchain_revision_load(1);
+        harness
+            .receive::<OnChainTrade>(
+                id.clone(),
+                OnChainTradeEvent::SourceAttributed {
+                    source,
+                    attributed_at: now,
+                },
+            )
+            .await
+            .expect("the failed reload should be queued for retry");
+
+        let corrected = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("the corrected venue should be retried")
+            .unwrap();
+        let Statement::TradeUpdate(trade) = corrected else {
+            panic!("expected corrected TradeUpdate");
+        };
+        assert_eq!(trade.id, id.to_string());
+        assert_eq!(trade.venue, TradingVenue::Bebop);
+        monitor.abort();
+    }
+
+    #[tokio::test]
+    async fn source_attribution_reconciliation_runs_after_monitor_restart() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let store = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let id = OnChainTradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 196,
+        };
+        let now = chrono::Utc::now();
+        store
+            .send(
+                &id,
+                OnChainTradeCommand::WitnessAt {
+                    source: OnChainTradeSource::Legacy,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    amount: st0x_float_macro::float!(10),
+                    direction: st0x_execution::Direction::Buy,
+                    price_usdc: st0x_float_macro::float!(150),
+                    block_number: 12345,
+                    block_timestamp: now,
+                    filled_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OnChainTradeCommand::AttributeSource {
+                    source: OnChainTradeSource::Inventory {
+                        operator: alloy::primitives::Address::repeat_byte(0x8b),
+                        venue: InventoryVenue::Bebop,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        let (sender, mut receiver) = broadcast::channel(16);
+        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let broadcaster = delivery.broadcaster.clone();
+        let harness = ReactorHarness::new(broadcaster.clone());
+        let mut first_monitor = delivery.handoff_monitor.clone();
+        let started = first_monitor.startup_notification();
+        let first = tokio::spawn(async move { first_monitor.run().await });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("the first monitor must finish startup reconciliation");
+        broadcaster.fail_next_onchain_revision_load(usize::MAX);
+        harness
+            .receive::<OnChainTrade>(
+                id.clone(),
+                OnChainTradeEvent::SourceAttributed {
+                    source: OnChainTradeSource::Inventory {
+                        operator: alloy::primitives::Address::repeat_byte(0x8b),
+                        venue: InventoryVenue::Bebop,
+                    },
+                    attributed_at: now,
+                },
+            )
+            .await
+            .expect("the failed revision must be retained for monitor restart");
+        let error = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("the revision must exhaust its bounded retry budget")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<DashboardTradeHandoffMonitorError>(),
+            Some(DashboardTradeHandoffMonitorError::RevisionRetryExhausted { .. })
+        ));
+
+        broadcaster.fail_next_onchain_revision_load(0);
+        let mut restarted_monitor = delivery.handoff_monitor.clone();
+        let restarted = tokio::spawn(async move { restarted_monitor.run().await });
+        let restarted_update = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("monitor restart must reconcile the retained source attribution")
+            .unwrap();
+        assert!(matches!(
+            restarted_update,
+            Statement::TradeUpdate(Trade {
+                venue: TradingVenue::Bebop,
+                ..
+            })
+        ));
+        restarted.abort();
+    }
+
+    #[tokio::test]
+    async fn revision_retry_exhaustion_recovers_a_dropped_terminal_handoff_after_restart() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (sender, _receiver) = broadcast::channel(16);
+        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
+        let mut first_monitor = delivery.handoff_monitor.clone();
+        let started = first_monitor.startup_notification();
+        let first = tokio::spawn(async move { first_monitor.run().await });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("the first monitor must finish startup reconciliation");
+
+        let store = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let id = OnChainTradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 197,
+        };
+        let now = chrono::Utc::now();
+        store
+            .send(
+                &id,
+                OnChainTradeCommand::WitnessAt {
+                    source: OnChainTradeSource::Raindex,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    amount: st0x_float_macro::float!(10),
+                    direction: st0x_execution::Direction::Buy,
+                    price_usdc: st0x_float_macro::float!(150),
+                    block_number: 12345,
+                    block_timestamp: now,
+                    filled_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        let trade = load_entity::<OnChainTrade>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .try_into_trade(&id)
+            .unwrap();
+
+        delivery
+            .broadcaster
+            .fail_next_onchain_revision_load(usize::MAX);
+        delivery.store.fail_next_registration(usize::MAX);
+        delivery
+            .broadcaster
+            .handoff_retry_sender
+            .send(DashboardTradeHandoff::ReloadOnchainTradeRevision(
+                id.clone(),
+            ))
+            .await
+            .unwrap();
+        delivery
+            .broadcaster
+            .handoff_retry_sender
+            .send(DashboardTradeHandoff::Trade(Box::new(trade)))
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("a poison revision must exhaust instead of filling the intake forever")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<DashboardTradeHandoffMonitorError>(),
+            Some(DashboardTradeHandoffMonitorError::RevisionRetryExhausted { .. })
+        ));
+
+        delivery.broadcaster.fail_next_onchain_revision_load(0);
+        delivery.store.fail_next_registration(0);
+        let mut restarted_monitor = delivery.handoff_monitor.clone();
+        let restarted = tokio::spawn(async move { restarted_monitor.run().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let pending: i64 = sqlx_apalis::query_scalar(
+                    "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+                )
+                .bind(std::any::type_name::<DeliverDashboardTrade>())
+                .fetch_one(delivery.queue.pool())
+                .await
+                .unwrap();
+                if pending == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup reconciliation must recover the dropped terminal handoff");
+        restarted.abort();
+    }
+
+    #[test]
+    fn onchain_replay_retry_classification_matches_aggregate_error_variants() {
+        let busy = sqlx::Error::Database(Box::new(TestDatabaseError { code: "5" }));
+        assert!(
+            onchain_replay_error(AggregateError::DatabaseConnectionError(Box::new(busy)))
+                .is_retryable()
+        );
+        assert!(
+            onchain_replay_error(AggregateError::DatabaseConnectionError(Box::new(
+                sqlx::Error::PoolTimedOut,
+            )))
+            .is_retryable()
+        );
+
+        let deterministic = [
+            onchain_replay_error(AggregateError::UserError(LifecycleError::Apply(
+                OnChainTradeError::NotFilled,
+            ))),
+            onchain_replay_error(AggregateError::AggregateConflict),
+            onchain_replay_error(AggregateError::DeserializationError(Box::new(
+                std::io::Error::other("invalid persisted event"),
+            ))),
+            onchain_replay_error(AggregateError::UnexpectedError(Box::new(
+                std::io::Error::other("unexpected replay failure"),
+            ))),
+        ];
+
+        assert!(deterministic.iter().all(|error| !error.is_retryable()));
     }
 
     #[tokio::test]

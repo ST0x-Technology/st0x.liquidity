@@ -41,6 +41,13 @@ orderbook = "0x1111111111111111111111111111111111111111"
 # default): "managed" without an `inventory`, or "legacy" with one, fails at
 # startup.
 inventory_mode = "managed"
+# Public OPERATOR_ROLE holders whose inventory settlements should be attributed
+# to a named venue. These are deployment-specific and must be updated when an
+# adapter rotates or is redeployed.
+inventory_adapters = [
+  { venue = "bebop", operator = "0x4444444444444444444444444444444444444444" },
+  { venue = "uniswap_v4", operator = "0x5555555555555555555555555555555555555555" },
+]
 # Shared RaindexInventory (rainlanguage/raindex.governance) that owns the
 # Raindex orders/vaults. REQUIRED when inventory_mode = "managed" (and forbidden
 # for "legacy"). Rebalance deposits/withdrawals settle through this contract;

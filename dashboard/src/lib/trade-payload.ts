@@ -5,6 +5,7 @@ import type { Trade } from '$lib/api/Trade'
 import type { TradeOutcome } from '$lib/api/TradeOutcome'
 import type { TradingVenue } from '$lib/api/TradingVenue'
 import { tryCatch } from '$lib/fp'
+import { isTradingVenue } from '$lib/trade'
 
 type JsonRecord = Record<string, unknown>
 type CommonTradeFields = Pick<Trade, 'id' | 'venue' | 'direction' | 'symbol' | 'shares'>
@@ -17,12 +18,21 @@ export type TradeResponse = {
   hasMore: boolean
 }
 
+type TradePayloadErrorCode = 'invalid_payload' | 'unsupported_trade_venue'
+
 export class TradePayloadError extends Error {
-  constructor(path: string, expected: string) {
+  constructor(
+    readonly path: string,
+    readonly expected: string,
+    readonly code: TradePayloadErrorCode = 'invalid_payload'
+  ) {
     super(`Invalid trade payload at ${path}: expected ${expected}`)
     this.name = 'TradePayloadError'
   }
 }
+
+export const isUnsupportedTradeVenue = (error: unknown): error is TradePayloadError =>
+  error instanceof TradePayloadError && error.code === 'unsupported_trade_venue'
 
 const fieldPath = (path: string, field: string): string =>
   path === '' ? field : `${path}.${field}`
@@ -115,8 +125,9 @@ const parseTimestamp = (value: unknown, path: string): string => {
 }
 
 const parseVenue = (value: unknown, path: string): TradingVenue => {
-  if (value === 'raindex' || value === 'alpaca' || value === 'dry_run') return value
-  return invalid(path, 'a known trading venue')
+  if (isTradingVenue(value)) return value
+
+  throw new TradePayloadError(path, 'a known trading venue', 'unsupported_trade_venue')
 }
 
 const parseDirection = (value: unknown, path: string): Direction => {
@@ -288,7 +299,18 @@ export const parseTrade = (value: unknown, path = ''): Trade | LegacyTrade => {
 
 export const parseTradeEntries = (value: unknown, path = 'trades'): Array<Trade | LegacyTrade> => {
   if (!Array.isArray(value)) return invalid(path, 'an array')
-  return value.map((trade, index) => parseTrade(trade, `${path}[${String(index)}]`))
+
+  return value.flatMap((trade, index) => {
+    const parsed = tryCatch(() => parseTrade(trade, `${path}[${String(index)}]`))
+    if (parsed.tag === 'ok') return [parsed.value]
+
+    if (isUnsupportedTradeVenue(parsed.error)) {
+      console.warn(`Skipping trade with an unsupported venue at ${parsed.error.path}`)
+      return []
+    }
+
+    throw parsed.error
+  })
 }
 
 export const parseTradeResponse = (value: unknown): TradeResponse => {

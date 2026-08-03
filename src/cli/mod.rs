@@ -1913,7 +1913,7 @@ mod tests {
     use st0x_config::ExecutionThreshold;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
-    use st0x_config::{EvmCtx, IngestionCutoff, InventoryMode};
+    use st0x_config::{EvmCtx, IngestionCutoff, InventoryAdapters, InventoryMode};
     use st0x_event_sorcery::StoreBuilder;
     use st0x_float_macro::float;
     use st0x_tokenization::IssuerRequestId;
@@ -1946,6 +1946,7 @@ mod tests {
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
             },
+            inventory_adapters: InventoryAdapters::default(),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
@@ -3593,6 +3594,7 @@ mod tests {
                 [raindex]
                 orderbook = "0x1111111111111111111111111111111111111111"
                 inventory_mode = "managed"
+                inventory_adapters = []
                 inventory = "0x2222222222222222222222222222222222222222"
                 vault_owner = "0x3333333333333333333333333333333333333333"
                 deployment_block = 1

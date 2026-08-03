@@ -13,6 +13,9 @@ use st0x_finance::{FractionalShares, NonNegative, Positive, Symbol};
 #[serde(rename_all = "snake_case")]
 pub enum TradingVenue {
     Raindex,
+    Bebop,
+    UniswapV4,
+    UnknownOnchain,
     Alpaca,
     DryRun,
 }
@@ -21,8 +24,30 @@ impl TradingVenue {
     fn as_str(self) -> &'static str {
         match self {
             Self::Raindex => "raindex",
+            Self::Bebop => "bebop",
+            Self::UniswapV4 => "uniswap_v4",
+            Self::UnknownOnchain => "unknown_onchain",
             Self::Alpaca => "alpaca",
             Self::DryRun => "dry_run",
+        }
+    }
+
+    /// Whether trades from this venue settle onchain.
+    #[must_use]
+    pub const fn is_onchain(self) -> bool {
+        match self {
+            Self::Raindex | Self::Bebop | Self::UniswapV4 | Self::UnknownOnchain => true,
+            Self::Alpaca | Self::DryRun => false,
+        }
+    }
+
+    /// Venue value understood by dashboard protocols that predate adapter
+    /// attribution.
+    #[must_use]
+    pub const fn legacy_compatible(self) -> Self {
+        match self {
+            Self::Raindex | Self::Alpaca | Self::DryRun => self,
+            Self::Bebop | Self::UniswapV4 | Self::UnknownOnchain => Self::Raindex,
         }
     }
 }
@@ -39,6 +64,9 @@ impl std::str::FromStr for TradingVenue {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "raindex" => Ok(Self::Raindex),
+            "bebop" => Ok(Self::Bebop),
+            "uniswap_v4" => Ok(Self::UniswapV4),
+            "unknown_onchain" => Ok(Self::UnknownOnchain),
             "alpaca" => Ok(Self::Alpaca),
             "dry_run" => Ok(Self::DryRun),
             other => Err(InvalidTradingVenue {
@@ -538,8 +566,8 @@ pub fn sort_trades_newest_first(trades: &mut [Trade]) {
 }
 
 fn compare_trade_ids(left: &Trade, right: &Trade) -> std::cmp::Ordering {
-    if left.venue == TradingVenue::Raindex
-        && right.venue == TradingVenue::Raindex
+    if left.venue.is_onchain()
+        && right.venue.is_onchain()
         && let (Some((left_hash, left_index)), Some((right_hash, right_index))) = (
             parse_onchain_trade_id(&left.id),
             parse_onchain_trade_id(&right.id),
@@ -582,6 +610,36 @@ mod tests {
     fn direction_from_str_rejects_unknown_input() {
         let error = Direction::from_str("hold").unwrap_err();
         assert_eq!(error.direction_provided, "hold");
+    }
+
+    #[test]
+    fn venue_classifies_onchain_execution() {
+        assert!(TradingVenue::Raindex.is_onchain());
+        assert!(TradingVenue::Bebop.is_onchain());
+        assert!(TradingVenue::UniswapV4.is_onchain());
+        assert!(TradingVenue::UnknownOnchain.is_onchain());
+        assert!(!TradingVenue::Alpaca.is_onchain());
+        assert!(!TradingVenue::DryRun.is_onchain());
+    }
+
+    #[test]
+    fn legacy_venue_protocols_collapse_adapter_attribution_to_raindex() {
+        assert_eq!(
+            TradingVenue::Bebop.legacy_compatible(),
+            TradingVenue::Raindex
+        );
+        assert_eq!(
+            TradingVenue::UniswapV4.legacy_compatible(),
+            TradingVenue::Raindex
+        );
+        assert_eq!(
+            TradingVenue::UnknownOnchain.legacy_compatible(),
+            TradingVenue::Raindex
+        );
+        assert_eq!(
+            TradingVenue::Alpaca.legacy_compatible(),
+            TradingVenue::Alpaca
+        );
     }
 
     #[test]
@@ -1054,10 +1112,10 @@ mod tests {
     fn newest_first_sort_uses_numeric_log_index_for_tied_onchain_trades() {
         let timestamp = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
         let older = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let trade = |id: &str, occurred_at| Trade {
+        let trade = |id: &str, occurred_at, venue| Trade {
             id: id.to_string(),
             occurred_at,
-            venue: TradingVenue::Raindex,
+            venue,
             direction: Direction::Buy,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: positive_shares("1"),
@@ -1065,9 +1123,9 @@ mod tests {
         };
         let tx_hash = "0x0000000000000000000000000000000000000000000000000000000000000000";
         let mut trades = vec![
-            trade(&format!("{tx_hash}:2"), timestamp),
-            trade("older", older),
-            trade(&format!("{tx_hash}:10"), timestamp),
+            trade(&format!("{tx_hash}:11"), timestamp, TradingVenue::Raindex),
+            trade("older", older, TradingVenue::Raindex),
+            trade(&format!("{tx_hash}:20"), timestamp, TradingVenue::Bebop),
         ];
 
         sort_trades_newest_first(&mut trades);
@@ -1075,8 +1133,8 @@ mod tests {
         assert_eq!(
             trades.into_iter().map(|trade| trade.id).collect::<Vec<_>>(),
             [
-                format!("{tx_hash}:10"),
-                format!("{tx_hash}:2"),
+                format!("{tx_hash}:20"),
+                format!("{tx_hash}:11"),
                 "older".to_string()
             ]
         );

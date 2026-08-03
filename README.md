@@ -92,8 +92,13 @@ The `[raindex]` section requires an explicit `inventory_mode` (`"legacy"` or
 `"managed"`) and a `vault_owner` address (the on-chain owner the vaults are
 keyed by; no fallback). `"managed"` additionally requires an `inventory` address
 (the shared `RaindexInventory` the bot operates via `OPERATOR_ROLE`) and is
-forbidden from being set under `"legacy"`. See the `[raindex]` block in
-`example.config.toml` for the full field documentation.
+forbidden from being set under `"legacy"`. Its required `inventory_adapters`
+table maps public operator addresses to venues such as Bebop and Uniswap v4;
+unknown operators remain visibly unattributed. This deployment metadata belongs
+in plaintext config, not secrets or environment variables. Trade protocol v3
+preserves configured and unknown onchain venues; older protocol versions
+collapse adapter and Unknown Onchain venues to Raindex for compatibility. See
+the `[raindex]` block in `example.config.toml` for the full field documentation.
 
 Current broker support is limited to `alpaca-broker-api` and `dry-run`.
 

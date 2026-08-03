@@ -195,24 +195,29 @@ describe('createWebSocket', () => {
       expect(ws.state).toBe('connected')
     })
 
-    it('retries with v1 when the previous backend rejects v2', () => {
+    it('falls back from v3 through v2 and re-probes v3 after a connection', () => {
       const { getInstance } = setupWebSocketTest()
       const queryClient = createMockQueryClient()
       const ws = createWebSocket(WS_URL, queryClient)
 
       ws.connect()
-      expect(getInstance(0).url).toContain('trade_protocol=terminal_outcomes_v2')
+      expect(getInstance(0).url).toContain('trade_protocol=terminal_outcomes_v3')
 
       getInstance(0).simulateError()
       vi.advanceTimersByTime(1000)
 
-      expect(getInstance(1).url).toContain('trade_protocol=terminal_outcomes_v1')
+      expect(getInstance(1).url).toContain('trade_protocol=terminal_outcomes_v2')
 
-      getInstance(1).simulateOpen()
-      getInstance(1).simulateClose()
+      getInstance(1).simulateError()
       vi.advanceTimersByTime(2000)
 
-      expect(getInstance(2).url).toContain('trade_protocol=terminal_outcomes_v2')
+      expect(getInstance(2).url).toContain('trade_protocol=terminal_outcomes_v1')
+
+      getInstance(2).simulateOpen()
+      getInstance(2).simulateClose()
+      vi.advanceTimersByTime(4000)
+
+      expect(getInstance(3).url).toContain('trade_protocol=terminal_outcomes_v3')
     })
 
     it('transitions to error on close from connected', () => {
@@ -302,6 +307,31 @@ describe('createWebSocket', () => {
       expect(trades).toHaveLength(2)
       expect(trades[0]?.symbol).toBe('AAPL')
       expect(trades[1]?.symbol).toBe('TSLA')
+    })
+
+    it('skips a future trade venue without reconnecting', () => {
+      const { getInstance } = setupWebSocketTest()
+      const queryClient = createMockQueryClient()
+      const knownGood = makeTrade({ id: 'known-good' })
+      queryClient.cache.set('["trades"]', [knownGood])
+      const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      getInstance(0).simulateOpen()
+      getInstance(0).simulateRawMessage(
+        JSON.stringify({
+          type: 'trade_update',
+          data: makeTrade({ id: 'future-venue', venue: 'future_dex' as Trade['venue'] })
+        })
+      )
+
+      expect(queryClient.cache.get('["trades"]')).toEqual([knownGood])
+      expect(ws.state).toBe('connected')
+      expect(getInstance(0).closeCalls).toBe(0)
+      expect(consoleWarn).toHaveBeenCalledWith(
+        'Skipping WebSocket trade with an unsupported venue at venue'
+      )
     })
 
     it('normalizes legacy fills from an old server snapshot', () => {

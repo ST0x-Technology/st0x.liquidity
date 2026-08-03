@@ -28,6 +28,9 @@ pub(crate) use event::{
     Broadcaster, DashboardTradeDelivery, DashboardTradeDeliveryCtx, DashboardTradeDeliveryJobQueue,
     DashboardTradeHandoffMonitor, DeliverDashboardTrade,
 };
+pub(crate) use trade_loader::{
+    TradeHistoryError as DashboardTradeHistoryError, load_onchain_trades,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +39,7 @@ pub(crate) enum TradeProtocol {
     LegacyFills,
     TerminalOutcomesV1,
     TerminalOutcomesV2,
+    TerminalOutcomesV3,
 }
 
 impl TradeProtocol {
@@ -49,7 +53,7 @@ impl TradeProtocol {
                 TradeOutcome::Filled | TradeOutcome::Failed { .. } => true,
                 TradeOutcome::Cancelled { .. } => false,
             },
-            Self::TerminalOutcomesV2 => match trade.outcome {
+            Self::TerminalOutcomesV2 | Self::TerminalOutcomesV3 => match trade.outcome {
                 TradeOutcome::Filled
                 | TradeOutcome::Failed { .. }
                 | TradeOutcome::Cancelled { .. } => true,
@@ -67,15 +71,34 @@ impl TradeProtocol {
                 | Statement::InventorySnapshot(_)
                 | Statement::TransferUpdate(_) => true,
             },
-            Self::TerminalOutcomesV1 | Self::TerminalOutcomesV2 => match statement {
-                Statement::TradeFill(_) => false,
-                Statement::TradeUpdate(trade) => self.includes_trade(trade),
-                Statement::CurrentState(_)
-                | Statement::PositionUpdate(_)
-                | Statement::InventorySnapshot(_)
-                | Statement::TransferUpdate(_) => true,
-            },
+            Self::TerminalOutcomesV1 | Self::TerminalOutcomesV2 | Self::TerminalOutcomesV3 => {
+                match statement {
+                    Statement::TradeFill(_) => false,
+                    Statement::TradeUpdate(trade) => self.includes_trade(trade),
+                    Statement::CurrentState(_)
+                    | Statement::PositionUpdate(_)
+                    | Statement::InventorySnapshot(_)
+                    | Statement::TransferUpdate(_) => true,
+                }
+            }
         }
+    }
+
+    pub(crate) fn serialize_trade(
+        self,
+        trade: &Trade,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        let (mut wire, legacy_venue) = match self {
+            Self::LegacyFills | Self::TerminalOutcomesV2 => (serde_json::to_value(trade)?, true),
+            Self::TerminalOutcomesV1 => (serde_json::to_value(trade.terminal_outcomes_v1())?, true),
+            Self::TerminalOutcomesV3 => (serde_json::to_value(trade)?, false),
+        };
+
+        if legacy_venue {
+            wire["venue"] = serde_json::to_value(trade.venue.legacy_compatible())?;
+        }
+
+        Ok(wire)
     }
 }
 
@@ -104,11 +127,15 @@ fn serialize_statement(
     statement: &Statement,
     trade_protocol: TradeProtocol,
 ) -> Result<String, serde_json::Error> {
-    match trade_protocol {
-        TradeProtocol::LegacyFills | TradeProtocol::TerminalOutcomesV2 => {
-            return serde_json::to_string(statement);
-        }
-        TradeProtocol::TerminalOutcomesV1 => {}
+    if trade_protocol == TradeProtocol::TerminalOutcomesV3
+        || matches!(
+            statement,
+            Statement::PositionUpdate(_)
+                | Statement::InventorySnapshot(_)
+                | Statement::TransferUpdate(_)
+        )
+    {
+        return serde_json::to_string(statement);
     }
 
     let mut wire = serde_json::to_value(statement)?;
@@ -118,12 +145,15 @@ fn serialize_statement(
                 state
                     .trades
                     .iter()
-                    .map(|trade| serde_json::to_value(trade.terminal_outcomes_v1()))
+                    .map(|trade| trade_protocol.serialize_trade(trade))
                     .collect::<Result<Vec<_>, _>>()?,
             );
         }
         Statement::TradeUpdate(trade) => {
-            wire["data"] = serde_json::to_value(trade.terminal_outcomes_v1())?;
+            wire["data"] = trade_protocol.serialize_trade(trade)?;
+        }
+        Statement::TradeFill(trade) if trade_protocol != TradeProtocol::TerminalOutcomesV3 => {
+            wire["data"]["venue"] = serde_json::to_value(trade.venue.legacy_compatible())?;
         }
         Statement::TradeFill(_)
         | Statement::PositionUpdate(_)
@@ -481,10 +511,12 @@ mod tests {
         assert!(!TradeProtocol::TerminalOutcomesV1.includes_statement(&legacy_fill));
         assert!(TradeProtocol::TerminalOutcomesV2.includes_statement(&trade_update));
         assert!(!TradeProtocol::TerminalOutcomesV2.includes_statement(&legacy_fill));
+        assert!(TradeProtocol::TerminalOutcomesV3.includes_statement(&trade_update));
+        assert!(!TradeProtocol::TerminalOutcomesV3.includes_statement(&legacy_fill));
     }
 
     #[test]
-    fn cancelled_outcomes_are_v2_only() {
+    fn cancelled_outcomes_require_v2_or_newer() {
         let trade = Trade {
             id: "cancelled-order".to_string(),
             occurred_at: chrono::Utc::now(),
@@ -510,9 +542,50 @@ mod tests {
         assert!(!TradeProtocol::LegacyFills.includes_trade(&trade));
         assert!(!TradeProtocol::TerminalOutcomesV1.includes_trade(&trade));
         assert!(TradeProtocol::TerminalOutcomesV2.includes_trade(&trade));
+        assert!(TradeProtocol::TerminalOutcomesV3.includes_trade(&trade));
         assert!(!TradeProtocol::LegacyFills.includes_statement(&update));
         assert!(!TradeProtocol::TerminalOutcomesV1.includes_statement(&update));
         assert!(TradeProtocol::TerminalOutcomesV2.includes_statement(&update));
+        assert!(TradeProtocol::TerminalOutcomesV3.includes_statement(&update));
+    }
+
+    #[test]
+    fn adapter_venues_are_exposed_only_by_v3() {
+        let trade = Trade {
+            id: "0xadapter:1".to_string(),
+            occurred_at: chrono::Utc::now(),
+            venue: TradingVenue::Bebop,
+            direction: Direction::Buy,
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            outcome: TradeOutcome::Filled,
+        };
+
+        for protocol in [
+            TradeProtocol::LegacyFills,
+            TradeProtocol::TerminalOutcomesV1,
+            TradeProtocol::TerminalOutcomesV2,
+        ] {
+            let rest = protocol.serialize_trade(&trade).unwrap();
+            assert_eq!(rest["venue"], "raindex");
+
+            let websocket =
+                serialize_statement(&Statement::TradeUpdate(trade.clone()), protocol).unwrap();
+            let websocket: serde_json::Value = serde_json::from_str(&websocket).unwrap();
+            assert_eq!(websocket["data"]["venue"], "raindex");
+        }
+
+        let rest = TradeProtocol::TerminalOutcomesV3
+            .serialize_trade(&trade)
+            .unwrap();
+        assert_eq!(rest["venue"], "bebop");
+        let websocket = serialize_statement(
+            &Statement::TradeUpdate(trade),
+            TradeProtocol::TerminalOutcomesV3,
+        )
+        .unwrap();
+        let websocket: serde_json::Value = serde_json::from_str(&websocket).unwrap();
+        assert_eq!(websocket["data"]["venue"], "bebop");
     }
 
     fn empty_settings() -> st0x_dto::Settings {

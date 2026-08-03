@@ -4,7 +4,13 @@ import type { Statement } from '$lib/api/Statement'
 import { isStatement } from '$lib/api/StatementGuard'
 import { matcher, tryCatch } from '$lib/fp'
 import { reactive } from '$lib/frp.svelte'
-import { parseCanonicalTrade, parseLegacyTrade, parseTradeEntries } from '$lib/trade-payload'
+import { fallbackTradeProtocol, type TradeProtocol } from '$lib/trade'
+import {
+  isUnsupportedTradeVenue,
+  parseCanonicalTrade,
+  parseLegacyTrade,
+  parseTradeEntries
+} from '$lib/trade-payload'
 import { seedTrades, appendTrade } from './trades'
 import { seedInventory, updateSnapshot, upsertPosition } from './inventory'
 import { seedTransfers, upsertTransfer } from './transfers'
@@ -16,7 +22,6 @@ type ConnectionEvent = 'connect' | 'open' | 'close' | 'error' | 'disconnect'
 
 const RECONNECT_DELAY_MS = 1000
 const MAX_RECONNECT_DELAY_MS = 10000
-type TradeProtocol = 'terminal_outcomes_v2' | 'terminal_outcomes_v1'
 
 const withTradeProtocol = (url: string, tradeProtocol: TradeProtocol): string => {
   const protocolUrl = new URL(url)
@@ -35,7 +40,7 @@ export type ErrorContext = {
 
 export const createWebSocket = (url: string, queryClient: QueryClient) => {
   let socket: WebSocket | null = null
-  let tradeProtocol: TradeProtocol = 'terminal_outcomes_v2'
+  let tradeProtocol: TradeProtocol = 'terminal_outcomes_v3'
   let reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null
   let failureMessage = 'WebSocket connection error'
   const reconnectAttempts = reactive(0)
@@ -84,11 +89,12 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
 
     socket.onopen = () => {
       opened = true
-      // A v1 connection proves the fallback works, not that v2 is permanently
-      // unavailable. Probe v2 again after the next disconnect so a transient
-      // restart cannot pin this dashboard to the lower-fidelity protocol.
-      if (attemptedProtocol === 'terminal_outcomes_v1') {
-        tradeProtocol = 'terminal_outcomes_v2'
+      // A lower-version connection proves the fallback works, not that v3 is
+      // permanently unavailable. Probe v3 after the next disconnect so a
+      // transient rolling restart cannot pin this dashboard to a protocol that
+      // collapses adapter venues to Raindex.
+      if (attemptedProtocol !== 'terminal_outcomes_v3') {
+        tradeProtocol = 'terminal_outcomes_v3'
       }
       if (import.meta.env.DEV) console.log(`[ws] connected to ${protocolUrl}`)
       fsm.send('open')
@@ -119,6 +125,11 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
         markHealthy()
         return
       }
+      if (isUnsupportedTradeVenue(handled.error)) {
+        console.warn(`Skipping WebSocket trade with an unsupported venue at ${handled.error.path}`)
+        markHealthy()
+        return
+      }
 
       failureMessage =
         handled.error instanceof Error
@@ -129,8 +140,8 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
     }
 
     socket.onclose = (event) => {
-      if (!opened && attemptedProtocol === 'terminal_outcomes_v2') {
-        tradeProtocol = 'terminal_outcomes_v1'
+      if (!opened) {
+        tradeProtocol = fallbackTradeProtocol(attemptedProtocol)
       }
       if (import.meta.env.DEV)
         console.log(`[ws] closed (code=${String(event.code)}, reason="${event.reason}")`)
@@ -140,8 +151,8 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
     }
 
     socket.onerror = () => {
-      if (!opened && attemptedProtocol === 'terminal_outcomes_v2') {
-        tradeProtocol = 'terminal_outcomes_v1'
+      if (!opened) {
+        tradeProtocol = fallbackTradeProtocol(attemptedProtocol)
       }
       failureMessage = 'WebSocket connection error'
       fsm.send('error')

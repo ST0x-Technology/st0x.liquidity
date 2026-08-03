@@ -15,7 +15,7 @@ use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use st0x_config::{AssetsConfig, EvmCtx};
+use st0x_config::{AssetsConfig, EvmCtx, InventoryAdapterVenue, InventoryAdapters};
 use st0x_evm::{Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE};
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_float_serde::format_float_with_fallback;
@@ -30,7 +30,7 @@ use crate::onchain::io::{
     InputToken, OutputToken, TokenizedSymbol, TradeDetails, Usdc, WrappedTokenizedShares,
 };
 use crate::onchain::pyth::PythFeedIds;
-use crate::onchain_trade::PythPrice;
+use crate::onchain_trade::{InventoryVenue, OnChainTradeSource, PythPrice};
 
 /// Onchain trade event feeding the hedge pipeline.
 ///
@@ -82,6 +82,14 @@ impl RaindexTradeEvent {
 /// `OutputToken` guard against in `io.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BotOperator(pub(crate) Address);
+
+/// Addresses that distinguish the bot's two roles while recovering a trade
+/// from a transaction receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecoveryActors {
+    pub(crate) order_owner: Address,
+    pub(crate) bot_operator: BotOperator,
+}
 
 /// Information about a vault extracted from an order's IO specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +198,7 @@ pub(crate) fn extract_owned_vaults(
 
 #[derive(Debug, Clone)]
 pub struct OnchainTrade {
+    pub(crate) source: OnChainTradeSource,
     pub(crate) tx_hash: TxHash,
     pub(crate) log_index: u64,
     pub(crate) symbol: TokenizedSymbol<WrappedTokenizedShares>,
@@ -425,6 +434,7 @@ impl OnchainTrade {
             pyth_feed_ids,
             trade_details,
             TradeMetadata {
+                source: OnChainTradeSource::Raindex,
                 tx_hash,
                 log_index,
                 gas_used,
@@ -456,6 +466,7 @@ impl OnchainTrade {
         cache: &SymbolCache,
         evm: &EvmImpl,
         assets: &AssetsConfig,
+        inventory_adapters: &InventoryAdapters,
         trade: &InventoryTrade,
         log: Log,
         pyth_feed_ids: &PythFeedIds,
@@ -535,6 +546,9 @@ impl OnchainTrade {
             pyth_feed_ids,
             trade_details,
             TradeMetadata {
+                // Pairing quarantines settlements whose deposit and withdrawal
+                // operators differ, so either side identifies the adapter.
+                source: inventory_trade_source(trade.deposit.operator, inventory_adapters),
                 tx_hash,
                 log_index,
                 gas_used,
@@ -559,9 +573,9 @@ impl OnchainTrade {
         cache: &SymbolCache,
         ctx: &EvmCtx,
         assets: &AssetsConfig,
+        inventory_adapters: &InventoryAdapters,
         pyth_feed_ids: &PythFeedIds,
-        order_owner: Address,
-        bot_operator: BotOperator,
+        actors: RecoveryActors,
     ) -> Result<Option<Self>, OnChainError> {
         let receipt = evm
             .provider()
@@ -591,9 +605,15 @@ impl OnchainTrade {
         }
 
         for log in trades {
-            if let Some(trade) =
-                try_convert_log_to_onchain_trade(log, evm, cache, ctx, pyth_feed_ids, order_owner)
-                    .await?
+            if let Some(trade) = try_convert_log_to_onchain_trade(
+                log,
+                evm,
+                cache,
+                ctx,
+                pyth_feed_ids,
+                actors.order_owner,
+            )
+            .await?
             {
                 return Ok(Some(trade));
             }
@@ -611,6 +631,7 @@ impl OnchainTrade {
             cache,
             evm_ctx: ctx,
             assets,
+            inventory_adapters,
             pyth_feed_ids,
         };
 
@@ -618,7 +639,7 @@ impl OnchainTrade {
             tx_hash,
             evm,
             &recovery_config,
-            bot_operator,
+            actors.bot_operator,
             logs,
             receipt_metadata,
         )
@@ -677,6 +698,7 @@ impl OnchainTrade {
             config.cache,
             evm,
             config.assets,
+            config.inventory_adapters,
             &inv,
             withdraw_log,
             config.pyth_feed_ids,
@@ -692,7 +714,25 @@ struct InventoryRecoveryConfig<'config> {
     cache: &'config SymbolCache,
     evm_ctx: &'config EvmCtx,
     assets: &'config AssetsConfig,
+    inventory_adapters: &'config InventoryAdapters,
     pyth_feed_ids: &'config PythFeedIds,
+}
+
+fn inventory_trade_source(
+    operator: Address,
+    inventory_adapters: &InventoryAdapters,
+) -> OnChainTradeSource {
+    match inventory_adapters.venue_for(operator) {
+        Some(InventoryAdapterVenue::Bebop) => OnChainTradeSource::Inventory {
+            operator,
+            venue: InventoryVenue::Bebop,
+        },
+        Some(InventoryAdapterVenue::UniswapV4) => OnChainTradeSource::Inventory {
+            operator,
+            venue: InventoryVenue::UniswapV4,
+        },
+        None => OnChainTradeSource::UnrecognizedInventory { operator },
+    }
 }
 
 /// Reclassifies a Float-conversion failure surfaced by the shared
@@ -762,6 +802,7 @@ fn validate_inventory_token_addresses(
 /// needed by [`finalize_onchain_trade`] to finish constructing an
 /// [`OnchainTrade`] once `TradeDetails` has been resolved.
 struct TradeMetadata {
+    source: OnChainTradeSource,
     tx_hash: TxHash,
     log_index: u64,
     gas_used: Option<u64>,
@@ -780,6 +821,7 @@ async fn finalize_onchain_trade<P: Provider>(
     metadata: TradeMetadata,
 ) -> Result<Option<OnchainTrade>, OnChainError> {
     let TradeMetadata {
+        source,
         tx_hash,
         log_index,
         gas_used,
@@ -828,6 +870,7 @@ async fn finalize_onchain_trade<P: Provider>(
     let price = Usdc::new(price_per_share_usdc)?;
 
     Ok(Some(OnchainTrade {
+        source,
         tx_hash,
         log_index,
         symbol: equity_symbol,
@@ -1033,7 +1076,8 @@ mod tests {
     use rain_math_float::Float;
 
     use st0x_config::{
-        EquitiesConfig, EquityAssetConfig, EvmCtx, IngestionCutoff, InventoryMode, OperationMode,
+        EquitiesConfig, EquityAssetConfig, EvmCtx, IngestionCutoff, InventoryAdapter,
+        InventoryAdapterVenue, InventoryAdapters, InventoryMode, OperationMode,
     };
     use st0x_evm::IERC20::decimalsCall;
     use st0x_evm::IPyth::getPriceUnsafeCall;
@@ -1397,9 +1441,12 @@ mod tests {
             &cache,
             &ctx,
             &AssetsConfig::default(),
+            &InventoryAdapters::default(),
             &pyth_feed_ids,
-            Address::ZERO,
-            BotOperator(Address::ZERO),
+            RecoveryActors {
+                order_owner: Address::ZERO,
+                bot_operator: BotOperator(Address::ZERO),
+            },
         )
         .await;
 
@@ -1511,9 +1558,12 @@ mod tests {
             &cache,
             &ctx,
             &assets,
+            &InventoryAdapters::default(),
             &PythFeedIds::default(),
-            inventory,
-            BotOperator(bot_operator),
+            RecoveryActors {
+                order_owner: inventory,
+                bot_operator: BotOperator(bot_operator),
+            },
         )
         .await
         .unwrap()
@@ -1638,9 +1688,12 @@ mod tests {
             &cache,
             &ctx,
             &AssetsConfig::default(),
+            &InventoryAdapters::default(),
             &PythFeedIds::default(),
-            inventory,
-            BotOperator(bot_operator),
+            RecoveryActors {
+                order_owner: inventory,
+                bot_operator: BotOperator(bot_operator),
+            },
         )
         .await
         .unwrap();
@@ -1746,9 +1799,12 @@ mod tests {
             &cache,
             &ctx,
             &AssetsConfig::default(),
+            &InventoryAdapters::default(),
             &PythFeedIds::default(),
-            inventory,
-            BotOperator(bot_operator),
+            RecoveryActors {
+                order_owner: inventory,
+                bot_operator: BotOperator(bot_operator),
+            },
         )
         .await
         .unwrap();
@@ -2007,6 +2063,10 @@ mod tests {
         })
     }
 
+    fn inventory_adapters(venue: InventoryAdapterVenue, operator: Address) -> InventoryAdapters {
+        InventoryAdapters::try_new(vec![InventoryAdapter { venue, operator }]).unwrap()
+    }
+
     /// Drives `try_from_inventory_trade` with a pre-seeded symbol cache (so
     /// symbol resolution makes no RPC) and a deterministic mock queue:
     /// receipt, then the deposit-token then withdraw-token `decimals()` calls.
@@ -2040,6 +2100,7 @@ mod tests {
             &cache,
             &evm,
             &assets,
+            &InventoryAdapters::default(),
             &inv,
             log,
             &PythFeedIds::default(),
@@ -2064,6 +2125,12 @@ mod tests {
 
         assert_eq!(trade.symbol.to_string(), "wtAAPL");
         assert_eq!(trade.direction, Direction::Buy);
+        assert_eq!(
+            trade.source,
+            OnChainTradeSource::UnrecognizedInventory {
+                operator: Address::ZERO,
+            }
+        );
         assert_eq!(trade.equity_token, INVENTORY_EQUITY);
         assert_eq!(trade.amount, FractionalShares::new(float!(2)));
         assert!(trade.price.value().eq(float!(80)).unwrap());
@@ -2127,6 +2194,7 @@ mod tests {
             &cache,
             &evm,
             &assets,
+            &InventoryAdapters::default(),
             &inv,
             log,
             &PythFeedIds::default(),
@@ -2177,6 +2245,7 @@ mod tests {
             &cache,
             &evm,
             &assets,
+            &InventoryAdapters::default(),
             &inv,
             log,
             &PythFeedIds::default(),
@@ -2299,11 +2368,13 @@ mod tests {
 
         let inv = InventoryTrade { deposit, withdraw };
         let assets = assets_config_with_equity("COIN", REAL_WTCOIN_BASE);
+        let adapters = inventory_adapters(InventoryAdapterVenue::Bebop, operator);
 
         let trade = OnchainTrade::try_from_inventory_trade(
             &cache,
             &evm,
             &assets,
+            &adapters,
             &inv,
             log,
             &PythFeedIds::default(),
@@ -2315,6 +2386,13 @@ mod tests {
 
         assert_eq!(trade.symbol.to_string(), "wtCOIN");
         assert_eq!(trade.direction, Direction::Sell);
+        assert_eq!(
+            trade.source,
+            OnChainTradeSource::Inventory {
+                operator,
+                venue: InventoryVenue::Bebop,
+            }
+        );
         assert_eq!(trade.equity_token, REAL_WTCOIN_BASE);
         let expected_amount =
             Float::from_fixed_decimal(uint!(34_172_366_621_067_031_U256), 18).unwrap();
@@ -2384,11 +2462,13 @@ mod tests {
 
         let inv = InventoryTrade { deposit, withdraw };
         let assets = assets_config_with_equity("COIN", REAL_WTCOIN_BASE);
+        let adapters = inventory_adapters(InventoryAdapterVenue::UniswapV4, operator);
 
         let trade = OnchainTrade::try_from_inventory_trade(
             &cache,
             &evm,
             &assets,
+            &adapters,
             &inv,
             log,
             &PythFeedIds::default(),
@@ -2400,6 +2480,13 @@ mod tests {
 
         assert_eq!(trade.symbol.to_string(), "wtCOIN");
         assert_eq!(trade.direction, Direction::Buy);
+        assert_eq!(
+            trade.source,
+            OnChainTradeSource::Inventory {
+                operator,
+                venue: InventoryVenue::UniswapV4,
+            }
+        );
         assert_eq!(trade.equity_token, REAL_WTCOIN_BASE);
         assert!(trade.amount.inner().eq(float!(0.01)).unwrap());
         // 2 USDC / 0.01 wtCOIN = 200 USDC/share exactly.

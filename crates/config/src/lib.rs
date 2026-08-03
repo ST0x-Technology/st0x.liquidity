@@ -18,7 +18,8 @@ mod wallet;
 pub use alerts::{AlertsAssemblyError, AlertsConfig, AlertsCtx, AlertsSecrets};
 pub use bot_gas_valuation::BotGasValuationConfig;
 pub use evm::{
-    EvmConfig, EvmConfigError, EvmCtx, EvmSecrets, IngestionCutoff, InventoryMode, InventoryModeTag,
+    EvmConfig, EvmConfigError, EvmCtx, EvmSecrets, IngestionCutoff, InventoryAdapter,
+    InventoryAdapterVenue, InventoryAdapters, InventoryMode, InventoryModeTag,
 };
 pub use imbalance_threshold::{ImbalanceThreshold, InvalidImbalanceThreshold};
 pub use loader::*;

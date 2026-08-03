@@ -13,6 +13,14 @@ use crate::offchain::order::{OffchainOrder, TradeConversionError};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
 
 const MAX_TRADES: usize = 100;
+const MAX_TRADE_REPLAY_CONCURRENCY: u32 = 8;
+const RESERVED_POOL_CONNECTIONS: u32 = 1;
+
+fn trade_replay_concurrency(max_connections: u32) -> usize {
+    max_connections
+        .saturating_sub(RESERVED_POOL_CONNECTIONS)
+        .clamp(1, MAX_TRADE_REPLAY_CONCURRENCY) as usize
+}
 
 /// Load recent terminal trades from both onchain and offchain sources.
 ///
@@ -49,13 +57,15 @@ pub(crate) async fn load_all_trades(pool: &SqlitePool) -> Result<Vec<Trade>, Tra
     Ok(trades)
 }
 
-async fn load_onchain_trades(pool: &SqlitePool) -> Result<Vec<Trade>, TradeHistoryError> {
+pub(crate) async fn load_onchain_trades(
+    pool: &SqlitePool,
+) -> Result<Vec<Trade>, TradeHistoryError> {
     let ids = load_all_ids::<OnChainTrade>(pool)
         .await
         .map_err(TradeHistoryError::OnchainIds)?;
 
     Ok(stream::iter(ids)
-        .filter_map(|id| async move {
+        .map(|id| async move {
             let entity = match load_entity::<OnChainTrade>(pool, &id).await {
                 Ok(Some(entity)) => entity,
                 Ok(None) => {
@@ -82,6 +92,10 @@ async fn load_onchain_trades(pool: &SqlitePool) -> Result<Vec<Trade>, TradeHisto
                 }
             }
         })
+        .buffer_unordered(trade_replay_concurrency(
+            pool.options().get_max_connections(),
+        ))
+        .filter_map(|trade| async move { trade })
         .collect()
         .await)
 }
@@ -92,7 +106,7 @@ async fn load_offchain_trades(pool: &SqlitePool) -> Result<Vec<Trade>, TradeHist
         .map_err(TradeHistoryError::OffchainIds)?;
 
     Ok(stream::iter(ids)
-        .filter_map(|id| async move {
+        .map(|id| async move {
             let order = match load_entity::<OffchainOrder>(pool, &id).await {
                 Ok(Some(order)) => order,
                 Ok(None) => {
@@ -128,6 +142,10 @@ async fn load_offchain_trades(pool: &SqlitePool) -> Result<Vec<Trade>, TradeHist
                 }
             }
         })
+        .buffer_unordered(trade_replay_concurrency(
+            pool.options().get_max_connections(),
+        ))
+        .filter_map(|trade| async move { trade })
         .collect()
         .await)
 }
@@ -182,8 +200,19 @@ mod tests {
 
     use super::*;
     use crate::offchain::order::{CancellationReason, OffchainOrderCommand, OffchainOrderId};
-    use crate::onchain_trade::{OnChainTradeCommand, OnChainTradeId};
+    use crate::onchain_trade::{
+        InventoryVenue, OnChainTradeCommand, OnChainTradeId, OnChainTradeSource,
+    };
     use crate::test_utils::setup_test_db;
+
+    #[test]
+    fn replay_concurrency_preserves_shared_pool_capacity() {
+        assert_eq!(trade_replay_concurrency(1), 1);
+        assert_eq!(trade_replay_concurrency(2), 1);
+        assert_eq!(trade_replay_concurrency(3), 2);
+        assert_eq!(trade_replay_concurrency(10), 8);
+        assert_eq!(trade_replay_concurrency(100), 8);
+    }
 
     async fn seed_cancelled_order(
         store: &st0x_event_sorcery::Store<OffchainOrder>,
@@ -282,6 +311,7 @@ mod tests {
             .send(
                 &id,
                 OnChainTradeCommand::Witness {
+                    source: OnChainTradeSource::Raindex,
                     symbol: Symbol::new("AAPL").unwrap(),
                     amount: float!(10),
                     direction: Direction::Buy,
@@ -300,6 +330,47 @@ mod tests {
         assert_eq!(trades[0].symbol, Symbol::new("AAPL").unwrap());
         assert!(matches!(trades[0].venue, st0x_dto::TradingVenue::Raindex));
         assert!(matches!(trades[0].direction, st0x_dto::Direction::Buy));
+    }
+
+    #[tokio::test]
+    async fn load_trades_attributes_bebop_inventory_fills() {
+        let pool = setup_test_db().await;
+        let id = OnChainTradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 194,
+        };
+        let store = st0x_event_sorcery::StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &id,
+                OnChainTradeCommand::Witness {
+                    source: OnChainTradeSource::Inventory {
+                        operator: alloy::primitives::address!(
+                            "0x8b8b6e0507c125934c6129563f48e48c66f86475"
+                        ),
+                        venue: InventoryVenue::Bebop,
+                    },
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    amount: float!(10),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_number: 12345,
+                    block_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let trades = load_trades(&pool, TradeProtocol::TerminalOutcomesV2)
+            .await
+            .unwrap();
+
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].venue, TradingVenue::Bebop);
     }
 
     #[tokio::test]
@@ -391,6 +462,7 @@ mod tests {
             .send(
                 &older_id,
                 OnChainTradeCommand::WitnessAt {
+                    source: OnChainTradeSource::Raindex,
                     symbol: Symbol::new("AAPL").unwrap(),
                     amount: float!(10),
                     direction: Direction::Buy,
@@ -407,6 +479,7 @@ mod tests {
             .send(
                 &newer_id,
                 OnChainTradeCommand::WitnessAt {
+                    source: OnChainTradeSource::Raindex,
                     symbol: Symbol::new("TSLA").unwrap(),
                     amount: float!(5),
                     direction: Direction::Sell,
@@ -423,6 +496,7 @@ mod tests {
             .send(
                 &tied_id,
                 OnChainTradeCommand::WitnessAt {
+                    source: OnChainTradeSource::Raindex,
                     symbol: Symbol::new("NVDA").unwrap(),
                     amount: float!(3),
                     direction: Direction::Buy,
@@ -469,6 +543,7 @@ mod tests {
                 .send(
                     id,
                     OnChainTradeCommand::WitnessAt {
+                        source: OnChainTradeSource::Raindex,
                         symbol: Symbol::new(symbol).unwrap(),
                         amount: float!(1),
                         direction: Direction::Buy,
@@ -523,6 +598,7 @@ mod tests {
                 .send(
                     &id,
                     OnChainTradeCommand::Witness {
+                        source: OnChainTradeSource::Raindex,
                         symbol: Symbol::new("AAPL").unwrap(),
                         amount: float!(1),
                         direction: Direction::Buy,

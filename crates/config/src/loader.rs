@@ -24,8 +24,8 @@ use url::Url;
 
 use crate::{
     AlertsConfig, AlertsCtx, AlertsSecrets, BotGasValuationConfig, EvmConfig, EvmCtx, EvmSecrets,
-    ExecutionThreshold, InvalidThresholdError, RebalancingConfig, RebalancingCtx,
-    RebalancingCtxError, TelemetryConfig, TelemetryCtx,
+    ExecutionThreshold, InvalidThresholdError, InventoryAdapters, RebalancingConfig,
+    RebalancingCtx, RebalancingCtxError, TelemetryConfig, TelemetryCtx,
 };
 use st0x_float_macro::float;
 
@@ -558,6 +558,8 @@ pub struct Ctx {
     pub server_port: u16,
     pub board_port: u16,
     pub evm: EvmCtx,
+    /// Deployment-specific shared-inventory operator-to-venue attribution.
+    pub inventory_adapters: InventoryAdapters,
     pub order_polling_interval: u64,
     pub order_polling_max_jitter: u64,
     pub position_check_interval: u64,
@@ -679,6 +681,7 @@ impl std::fmt::Debug for Ctx {
             .field("server_port", &self.server_port)
             .field("board_port", &self.board_port)
             .field("evm", &self.evm)
+            .field("inventory_adapters", &self.inventory_adapters)
             .field("order_polling_interval", &self.order_polling_interval)
             .field("order_polling_max_jitter", &self.order_polling_max_jitter)
             .field("position_check_interval", &self.position_check_interval)
@@ -762,6 +765,7 @@ struct ValidatedParts {
     server_port: u16,
     board_port: u16,
     evm: EvmCtx,
+    inventory_adapters: InventoryAdapters,
     order_polling_interval: u64,
     order_polling_max_jitter: u64,
     position_check_interval: u64,
@@ -807,6 +811,24 @@ pub struct WalletMeta {
     pub organization_id: Option<String>,
 }
 
+/// Rejects extended-hours trading that its prerequisite can never reach.
+fn validate_extended_hours_counter_trading(assets: &AssetsConfig) -> Result<(), CtxError> {
+    // The hedge path gates on `trading` before it consults the extended-hours
+    // session, so enabling extended-hours counter-trading while disabling
+    // counter-trading creates a dead configuration that can never execute.
+    for (symbol, equity) in &assets.equities.symbols {
+        if equity.extended_hours_counter_trading == OperationMode::Enabled
+            && equity.trading == OperationMode::Disabled
+        {
+            return Err(CtxError::ExtendedHoursWithoutCounterTrading {
+                symbol: symbol.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Single validation path shared by [`Ctx::load_files`] and
 /// [`Ctx::validate_files`]. All config/secrets business-rule checks live
 /// here — neither caller duplicates validation logic.
@@ -832,21 +854,7 @@ fn parse_and_validate(
         });
     }
 
-    // Extended-hours counter-trading depends on counter-trading itself: the
-    // hedge path gates on `trading` before it ever consults the extended-hours
-    // session (see `check_execution_readiness`), so
-    // `extended_hours_counter_trading = enabled` with `trading = disabled` is a
-    // dead configuration that can never execute. Reject it so the invalid
-    // combination never loads and never reaches the dashboard.
-    for (symbol, equity) in &config.assets.equities.symbols {
-        if equity.extended_hours_counter_trading == OperationMode::Enabled
-            && equity.trading == OperationMode::Disabled
-        {
-            return Err(CtxError::ExtendedHoursWithoutCounterTrading {
-                symbol: symbol.clone(),
-            });
-        }
-    }
+    validate_extended_hours_counter_trading(&config.assets)?;
 
     let broker = BrokerCtx::from_parts(secrets.broker, config.broker.as_ref())?;
     let telemetry = config.telemetry.map(TelemetryCtx::from);
@@ -861,9 +869,7 @@ fn parse_and_validate(
     // Extract RPC URLs before EvmCtx consumes secrets.evm.
     let base_rpc_url = secrets.evm.base.take();
     let ethereum_rpc_url = secrets.evm.ethereum.take();
-
     let evm = EvmCtx::new(&config.raindex, secrets.evm)?;
-
     // Validate wallet config/secrets pairing and required RPC URLs.
     // Actual wallet construction (async, connects to RPC) is deferred.
     let (wallet_inputs, wallet_meta) = match (config.wallet, secrets.wallet) {
@@ -1021,6 +1027,7 @@ fn parse_and_validate(
         server_port: config.server_port,
         board_port: config.board_port,
         evm,
+        inventory_adapters: config.raindex.inventory_adapters,
         order_polling_interval,
         order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
         position_check_interval,
@@ -1160,6 +1167,7 @@ impl Ctx {
             server_port: parts.server_port,
             board_port: parts.board_port,
             evm: parts.evm,
+            inventory_adapters: parts.inventory_adapters,
             order_polling_interval: parts.order_polling_interval,
             order_polling_max_jitter: parts.order_polling_max_jitter,
             position_check_interval: parts.position_check_interval,
@@ -1382,6 +1390,7 @@ impl Ctx {
         /// of `order_owner`.
         #[builder(default = InventoryMode::Legacy)]
         inventory_mode: InventoryMode,
+        #[builder(default = InventoryAdapters::default())] inventory_adapters: InventoryAdapters,
         assets: AssetsConfig,
         #[builder(default = 2)] inventory_poll_interval: u64,
         #[builder(default = const { NonZeroU32::new(10).unwrap() })]
@@ -1440,6 +1449,7 @@ impl Ctx {
                 required_confirmations,
                 ingestion_cutoff: IngestionCutoff::Safe,
             },
+            inventory_adapters,
             order_polling_interval: 1,
             order_polling_max_jitter: 0,
             position_check_interval: 2,
@@ -1756,6 +1766,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
             required_confirmations: 1,
             ingestion_cutoff: IngestionCutoff::Safe,
         },
+        inventory_adapters: InventoryAdapters::default(),
         order_polling_interval: 15,
         order_polling_max_jitter: 5,
         position_check_interval: 60,
@@ -1893,6 +1904,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -1925,6 +1937,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -1961,6 +1974,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -2144,6 +2158,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -2194,6 +2209,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -2241,6 +2257,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -2288,6 +2305,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -2371,6 +2389,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -2462,6 +2481,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -2502,6 +2522,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
+            inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -2542,6 +2563,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
+            inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -2581,6 +2603,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -2621,6 +2644,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -2667,6 +2691,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
+            inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -2708,6 +2733,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -2752,6 +2778,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -2795,6 +2822,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -2856,6 +2884,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -2925,6 +2954,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -2983,6 +3013,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -3080,6 +3111,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -3142,6 +3174,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -3209,6 +3242,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -3280,6 +3314,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -3360,6 +3395,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
+            inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -3491,6 +3527,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
+            inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -3547,6 +3584,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -3604,6 +3642,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -3706,6 +3745,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
+            inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -3861,6 +3901,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
+            inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -3917,6 +3958,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
+            inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -3977,6 +4019,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -4035,6 +4078,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
+            inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -4094,6 +4138,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
+            inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -4479,6 +4524,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -4650,6 +4696,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -4717,6 +4764,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -4995,6 +5043,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -5032,6 +5081,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -5073,6 +5123,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -5109,6 +5160,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -5198,6 +5250,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -6113,6 +6166,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
+            inventory_adapters = []
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
             required_confirmations = 3
@@ -6157,6 +6211,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
+            inventory_adapters = []
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
             required_confirmations = 3
@@ -6197,6 +6252,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
+            inventory_adapters = []
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
             required_confirmations = 3
@@ -6239,6 +6295,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
+            inventory_adapters = []
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
             required_confirmations = 3
@@ -6284,6 +6341,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
+            inventory_adapters = []
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
             required_confirmations = 3
@@ -6320,6 +6378,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -6373,6 +6432,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -6412,6 +6472,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -6468,6 +6529,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
@@ -6560,6 +6622,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 
@@ -6606,6 +6669,7 @@ mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
            inventory_mode = "managed"
+           inventory_adapters = []
            inventory = "0x2222222222222222222222222222222222222222"
            vault_owner = "0x3333333333333333333333333333333333333333"
 

@@ -3,7 +3,8 @@ import {
   parseCanonicalTrade,
   parseTrade,
   parseTradeEntries,
-  parseTradeResponse
+  parseTradeResponse,
+  TradePayloadError
 } from './trade-payload'
 
 const validTrade = (overrides: Record<string, unknown> = {}): unknown => ({
@@ -37,6 +38,31 @@ describe('trade payload validation', () => {
       symbol: 'TSLA',
       shares: '2'
     })
+  })
+
+  it.each(['bebop', 'uniswap_v4', 'unknown_onchain'])(
+    'accepts %s as an onchain trading venue',
+    (venue) => {
+      const onchain = validTrade({
+      id: '0x28a364eaa0fc6d505ddd0702cd9949853193bb28c92cdfef68bcd5a803f1806b:194',
+        venue
+      })
+
+      expect(parseTrade(onchain)).toEqual(onchain)
+    }
+  )
+
+  it('skips only an entry whose venue is newer than this dashboard', () => {
+    const supported = validTrade({ id: 'supported' })
+    const unsupported = validTrade({ id: 'unsupported', venue: 'future_venue' })
+
+    expect(parseTradeEntries([unsupported, supported])).toEqual([supported])
+  })
+
+  it('rejects the payload when an entry has a non-venue validation error', () => {
+    const malformed = validTrade({ id: 'malformed', shares: 'not-a-number' })
+
+    expect(() => parseTradeEntries([malformed, validTrade()])).toThrow(TradePayloadError)
   })
 
   it.each([

@@ -1,5 +1,7 @@
 //! EVM configuration types: chain config, RPC secrets, and runtime context.
 
+use std::collections::HashSet;
+
 use alloy::primitives::Address;
 use serde::Deserialize;
 use thiserror::Error;
@@ -71,6 +73,69 @@ pub enum InventoryModeTag {
     Managed,
 }
 
+/// Venue identified by an inventory adapter's `operator` address.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryAdapterVenue {
+    Bebop,
+    UniswapV4,
+}
+
+/// One deployment-specific shared-inventory adapter.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryAdapter {
+    pub venue: InventoryAdapterVenue,
+    pub operator: Address,
+}
+
+/// Explicit inventory-adapter table configured for one deployment.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "Vec<InventoryAdapter>")]
+pub struct InventoryAdapters(Vec<InventoryAdapter>);
+
+impl TryFrom<Vec<InventoryAdapter>> for InventoryAdapters {
+    type Error = EvmConfigError;
+
+    fn try_from(adapters: Vec<InventoryAdapter>) -> Result<Self, Self::Error> {
+        Self::try_new(adapters)
+    }
+}
+
+impl InventoryAdapters {
+    /// Builds and validates an explicit adapter table.
+    pub fn try_new(adapters: Vec<InventoryAdapter>) -> Result<Self, EvmConfigError> {
+        let adapters = Self(adapters);
+        adapters.validate()?;
+        Ok(adapters)
+    }
+
+    /// Returns the venue configured for `operator`, if any.
+    pub fn venue_for(&self, operator: Address) -> Option<InventoryAdapterVenue> {
+        self.0
+            .iter()
+            .find(|adapter| adapter.operator == operator)
+            .map(|adapter| adapter.venue)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn validate(&self) -> Result<(), EvmConfigError> {
+        let mut operators = HashSet::new();
+        for adapter in &self.0 {
+            if !operators.insert(adapter.operator) {
+                return Err(EvmConfigError::DuplicateInventoryAdapterOperator {
+                    operator: adapter.operator,
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Errors resolving an [`EvmConfig`] into a runtime [`EvmCtx`].
 #[derive(Debug, Error)]
 pub enum EvmConfigError {
@@ -85,6 +150,16 @@ pub enum EvmConfigError {
          enable a shared inventory"
     )]
     LegacyWithInventory { inventory: Address },
+    #[error(
+        "[raindex] inventory_mode = \"legacy\" forbids inventory adapters because \
+         no shared inventory exists"
+    )]
+    LegacyWithInventoryAdapters,
+    #[error(
+        "[raindex].inventory_adapters configures operator {operator} more than once; \
+         one operator cannot identify multiple venues"
+    )]
+    DuplicateInventoryAdapterOperator { operator: Address },
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +179,9 @@ pub struct EvmConfig {
     /// events on the pooled vaults are also surfaced here as
     /// `OperatorDeposit`/`OperatorWithdraw`.
     pub inventory: Option<Address>,
+    /// Public, deployment-specific adapter operator addresses used to attribute
+    /// shared-inventory settlements to their execution venue.
+    pub inventory_adapters: InventoryAdapters,
     /// Address that owns the Raindex orders and vaults on-chain -- the key every
     /// `vaultBalance2` read, vault-registry entry, and order-owner fill match is
     /// scoped by. Required and explicit (no fallback): this parameter determines
@@ -135,6 +213,14 @@ impl EvmConfig {
             }
             (InventoryModeTag::Managed, None) => Err(EvmConfigError::ManagedWithoutInventory),
         }
+    }
+
+    fn validate_inventory_adapters(&self) -> Result<(), EvmConfigError> {
+        if self.inventory_mode == InventoryModeTag::Legacy && !self.inventory_adapters.is_empty() {
+            return Err(EvmConfigError::LegacyWithInventoryAdapters);
+        }
+
+        self.inventory_adapters.validate()
     }
 }
 
@@ -192,6 +278,8 @@ impl std::fmt::Debug for EvmCtx {
 
 impl EvmCtx {
     pub fn new(config: &EvmConfig, secrets: EvmSecrets) -> Result<Self, EvmConfigError> {
+        config.validate_inventory_adapters()?;
+
         Ok(Self {
             rpc_url: secrets.rpc,
             orderbook: config.orderbook,
@@ -248,6 +336,7 @@ mod tests {
         let result: Result<EvmConfig, _> = toml::from_str(
             "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
              inventory_mode = \"managed\"\n\
+             inventory_adapters = []\n\
              inventory = \"0x2222222222222222222222222222222222222222\"\n\
              deployment_block = 1\n\
              required_confirmations = 3\n\
@@ -262,6 +351,142 @@ mod tests {
     }
 
     #[test]
+    fn inventory_adapters_are_required() {
+        let result: Result<EvmConfig, _> = toml::from_str(
+            "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+             inventory_mode = \"managed\"\n\
+             inventory = \"0x2222222222222222222222222222222222222222\"\n\
+             vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
+             deployment_block = 1\n\
+             required_confirmations = 3\n\
+             ingestion_cutoff = \"safe\"",
+        );
+
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("inventory_adapters"),
+            "expected missing-field error for inventory_adapters, got: {error}"
+        );
+    }
+
+    #[test]
+    fn inventory_adapters_resolve_configured_operator_venues() {
+        let config: EvmConfig = toml::from_str(
+            "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+             inventory_mode = \"managed\"\n\
+             inventory_adapters = [\n\
+               { venue = \"bebop\", operator = \"0x4444444444444444444444444444444444444444\" },\n\
+               { venue = \"uniswap_v4\", operator = \"0x5555555555555555555555555555555555555555\" },\n\
+             ]\n\
+             inventory = \"0x2222222222222222222222222222222222222222\"\n\
+             vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
+             deployment_block = 1\n\
+             required_confirmations = 3\n\
+             ingestion_cutoff = \"safe\"",
+        )
+        .unwrap();
+
+        EvmCtx::new(&config, dummy_secrets()).unwrap();
+
+        assert_eq!(
+            config
+                .inventory_adapters
+                .venue_for(alloy::primitives::address!(
+                    "0x4444444444444444444444444444444444444444"
+                )),
+            Some(InventoryAdapterVenue::Bebop),
+        );
+        assert_eq!(
+            config
+                .inventory_adapters
+                .venue_for(alloy::primitives::address!(
+                    "0x5555555555555555555555555555555555555555"
+                )),
+            Some(InventoryAdapterVenue::UniswapV4),
+        );
+        assert_eq!(
+            config
+                .inventory_adapters
+                .venue_for(Address::repeat_byte(0x66)),
+            None,
+        );
+    }
+
+    #[test]
+    fn duplicate_inventory_adapter_operator_fails_during_deserialization() {
+        let error = toml::from_str::<EvmConfig>(
+            "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+             inventory_mode = \"managed\"\n\
+             inventory_adapters = [\n\
+               { venue = \"bebop\", operator = \"0x4444444444444444444444444444444444444444\" },\n\
+               { venue = \"uniswap_v4\", operator = \"0x4444444444444444444444444444444444444444\" },\n\
+             ]\n\
+             inventory = \"0x2222222222222222222222222222222222222222\"\n\
+             vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
+             deployment_block = 1\n\
+             required_confirmations = 3\n\
+             ingestion_cutoff = \"safe\"",
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains(
+                "configures operator 0x4444444444444444444444444444444444444444 more than once"
+            ),
+            "duplicate operators must fail before an EvmConfig can be constructed: {error}"
+        );
+    }
+
+    #[test]
+    fn inventory_adapters_allow_operator_rotation_for_one_venue() {
+        let config: EvmConfig = toml::from_str(
+            "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+             inventory_mode = \"managed\"\n\
+             inventory_adapters = [\n\
+               { venue = \"bebop\", operator = \"0x4444444444444444444444444444444444444444\" },\n\
+               { venue = \"bebop\", operator = \"0x5555555555555555555555555555555555555555\" },\n\
+             ]\n\
+             inventory = \"0x2222222222222222222222222222222222222222\"\n\
+             vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
+             deployment_block = 1\n\
+             required_confirmations = 3\n\
+             ingestion_cutoff = \"safe\"",
+        )
+        .unwrap();
+
+        EvmCtx::new(&config, dummy_secrets()).unwrap();
+
+        assert_eq!(
+            config
+                .inventory_adapters
+                .venue_for(alloy::primitives::address!(
+                    "0x5555555555555555555555555555555555555555"
+                )),
+            Some(InventoryAdapterVenue::Bebop),
+        );
+    }
+
+    #[test]
+    fn legacy_mode_with_inventory_adapters_fails() {
+        let config: EvmConfig = toml::from_str(
+            "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+             inventory_mode = \"legacy\"\n\
+             inventory_adapters = [\n\
+               { venue = \"bebop\", operator = \"0x4444444444444444444444444444444444444444\" },\n\
+             ]\n\
+             vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
+             deployment_block = 1\n\
+             required_confirmations = 3\n\
+             ingestion_cutoff = \"safe\"",
+        )
+        .unwrap();
+
+        let error = EvmCtx::new(&config, dummy_secrets()).unwrap_err();
+
+        assert!(matches!(error, EvmConfigError::LegacyWithInventoryAdapters));
+    }
+
+    #[test]
     fn evm_ctx_new_maps_config_fields_to_their_own_slots() {
         // Three same-typed Address fields flow through EvmCtx::new. A swap in the
         // mapping would compile silently, so assert each distinct address lands
@@ -269,6 +494,7 @@ mod tests {
         let config: EvmConfig = toml::from_str(
             "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
              inventory_mode = \"managed\"\n\
+             inventory_adapters = []\n\
              inventory = \"0x2222222222222222222222222222222222222222\"\n\
              vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
@@ -306,6 +532,7 @@ mod tests {
         let config: EvmConfig = toml::from_str(
             "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
              inventory_mode = \"managed\"\n\
+             inventory_adapters = []\n\
              vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
              required_confirmations = 3\n\
@@ -326,6 +553,7 @@ mod tests {
         let config: EvmConfig = toml::from_str(
             "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
              inventory_mode = \"legacy\"\n\
+             inventory_adapters = []\n\
              inventory = \"0x2222222222222222222222222222222222222222\"\n\
              vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
@@ -349,6 +577,7 @@ mod tests {
         let config: EvmConfig = toml::from_str(
             "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
              inventory_mode = \"legacy\"\n\
+             inventory_adapters = []\n\
              vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
              required_confirmations = 3\n\
@@ -392,6 +621,7 @@ mod tests {
         let result: Result<EvmConfig, _> = toml::from_str(
             "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
              inventory_mode = \"managed\"\n\
+             inventory_adapters = []\n\
              inventory = \"0x2222222222222222222222222222222222222222\"\n\
              vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\

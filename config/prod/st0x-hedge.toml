@@ -51,6 +51,8 @@ orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 # `vault_owner` below to that same address in the change that grants the bot
 # OPERATOR_ROLE and migrates the vaults.
 inventory_mode = "legacy"
+# Legacy mode has no shared inventory, so adapter settlements are impossible.
+inventory_adapters = []
 # REQUIRED. Owner of the Raindex orders/vaults on-chain -- the key every
 # vaultBalance2 read, vault-registry entry, and order-owner fill match is
 # scoped by. Currently the bot's Turnkey wallet (= [wallet].address below),

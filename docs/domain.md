@@ -94,11 +94,15 @@ and confusing.
 A location where trades are executed. The system operates across two types of
 venue:
 
-- **Onchain venue (Raindex)**: A decentralized exchange on Base where tokenized
-  equities and USDC are traded via limit orders placed and priced externally.
-  The bot monitors fills on those orders and manages vault balances
-  (deposits/withdrawals) for rebalancing; it does not add, remove, or reprice
-  the orders themselves.
+- **Onchain venue**: A protocol or liquidity source that executes
+  tokenized-equity trades on Base. Raindex is the onchain orderbook that holds
+  the bot's tokenized-equity orders and their backing vaults; direct fills
+  execute there. A shared-inventory adapter may execute the trade on another
+  venue, such as Bebop or Uniswap v4, before settling it through the bot's
+  pooled inventory. The adapter's onchain operator address identifies that
+  venue. An operator that is absent from the deployment's explicit adapter
+  configuration is reported as Unknown Onchain rather than being misattributed
+  to Raindex.
 - **Offchain venue (brokerage)**: A traditional equity market accessed through
   the Alpaca Broker API. The bot executes offsetting trades here to hedge
   onchain exposure.

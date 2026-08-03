@@ -120,6 +120,13 @@ explicitly per deployment via `inventory_mode` under `[raindex]`:
   clear error rather than reverting on the first rebalance; it also revokes any
   stale pre-migration allowance the bot granted the OrderBook directly.
 
+Each deployment explicitly configures its inventory adapters under `[raindex]`
+as venue/operator pairs. These public onchain addresses are deployment settings,
+not secrets or environment variables. The same venue may list more than one
+operator during a rotation, but one operator cannot name multiple venues. Legacy
+mode forbids adapter entries because it has no shared inventory through which
+they could settle.
+
 Distinct from the settlement target is `vault_owner`: the on-chain owner every
 `vaultBalance2` read, vault-registry entry, and ClearV3/TakeOrderV3 order-owner
 fill match is scoped by. It is required and explicit (no fallback). While the
@@ -4507,24 +4514,43 @@ multiple broker-specific contexts.
    reference, spread bps) and per-symbol price charts over time.
 
 4. **Trade History**: Recent trades filterable by venue (onchain/offchain/both).
-   Onchain entries are completed fills. Offchain counter-trade entries include
-   successful fills, terminal failures, and terminal cancellations; each entry
-   carries its terminal outcome timestamp. Failed entries expose the broker or
-   placement error. Failed and cancelled entries keep the requested quantity
-   distinct from the broker-accepted quantity. The accepted and actually-filled
-   quantities are nullable provenance: `null` means the persisted history does
-   not prove that fact, including legacy outcomes that predate explicit fill
-   evidence. An explicit broker-reported zero therefore distinguishes a wholly
-   unfilled cancellation from an outcome whose fill remains unknown. Remaining
-   and excess quantities are derived only when both accepted and filled
-   quantities are known. An overfill reports the complete actual fill plus its
-   excess rather than clamping the fill to the accepted quantity. Non-terminal
-   submitted, partially-filled, and cancelling orders remain excluded. Terminal
-   outcomes use the same provenance in initial history and live dashboard
-   updates. A broker-terminal failure or cancellation with a positive fill but
-   no execution price is still persisted and surfaced; the owning position
-   remains pending for manual reconciliation so the unpriced fill cannot be
-   silently applied or discarded.
+   Onchain entries are completed fills and carry their execution source:
+   `ClearV3`/`TakeOrderV3` fills are Raindex, while an `InventoryTrade` persists
+   the raw inventory `operator` and resolves it through the deployment's
+   configured adapter table. Recognized operators are reported as their venue
+   (currently Bebop or Uniswap v4). An operator absent from the table is
+   persisted and logged as unrecognized, and its trade is reported as the
+   distinct Unknown Onchain venue rather than being asserted to be Raindex.
+   Initial history and live WebSocket updates derive the venue from the same
+   persisted source, and venue filtering includes every exposed adapter venue.
+   Legacy `OnChainTradeEvent::Filled` events that predate source persistence
+   retain a legacy source marker and display as Raindex for compatibility. The
+   event store alone cannot reconstruct their discarded operator. Reprocessing
+   the transaction through the existing `process-tx` recovery path reads the
+   operator from chain and appends a source-attribution event through CQRS,
+   repairing history without repeating an already-acknowledged hedge. The same
+   repair upgrades an Unknown Onchain fill when its persisted operator is later
+   configured, but cannot replace it with an adapter carrying a different
+   operator.
+
+   Offchain counter-trade entries include successful fills, terminal failures,
+   and terminal cancellations; each entry carries its terminal outcome
+   timestamp. Failed entries expose the broker or placement error. Failed and
+   cancelled entries keep the requested quantity distinct from the
+   broker-accepted quantity. The accepted and actually-filled quantities are
+   nullable provenance: `null` means the persisted history does not prove that
+   fact, including legacy outcomes that predate explicit fill evidence. An
+   explicit broker-reported zero therefore distinguishes a wholly unfilled
+   cancellation from an outcome whose fill remains unknown. Remaining and excess
+   quantities are derived only when both accepted and filled quantities are
+   known. An overfill reports the complete actual fill plus its excess rather
+   than clamping the fill to the accepted quantity. Non-terminal submitted,
+   partially-filled, and cancelling orders remain excluded. Terminal outcomes
+   use the same provenance in initial history and live dashboard updates. A
+   broker-terminal failure or cancellation with a positive fill but no execution
+   price is still persisted and surfaced; the owning position remains pending
+   for manual reconciliation so the unpriced fill cannot be silently applied or
+   discarded.
 
    Dashboard trade messages remain compatible during rolling deploys. The
    canonical protocol sends every terminal outcome as `trade_update`. Filled
@@ -4544,13 +4570,18 @@ multiple broker-specific contexts.
    `trade_protocol=terminal_outcomes_v2`. Cancelled outcomes are also v2-only,
    because adding a new tagged outcome to v1 would break older exhaustive
    consumers; a v1 fallback therefore omits cancelled entries from history
-   rather than losing them. A newer dashboard requests v2 and retries both
-   WebSocket and HTTP history with v1 when an older backend rejects the unknown
-   protocol value, while continuing to accept v1 responses and reconstructing
-   the complete fill as the legacy filled plus excess quantity. A legacy zero
-   fill remains unknown because v1 synthesized zero when no fill evidence
-   existed. A successful v1 WebSocket fallback probes v2 again after its next
-   disconnect so a transient restart cannot pin the client to v1. Failed
+   rather than losing them. Adapter-specific venue values use
+   `trade_protocol=terminal_outcomes_v3`; legacy, v1, and v2 responses downgrade
+   every adapter or unknown-onchain venue to Raindex so an older exhaustive
+   dashboard cannot enter a parse/reconnect loop. A newer dashboard requests v3
+   and retries v2, then v1, when an older backend rejects an unknown protocol.
+   Legacy-protocol filter requests likewise collapse selected adapter venues to
+   Raindex so an old backend does not reject the venue query. The dashboard
+   continues to accept v1 responses and reconstructs the complete fill as the
+   legacy filled plus excess quantity. A legacy zero fill remains unknown
+   because v1 synthesized zero when no fill evidence existed. A successful
+   lower-version WebSocket fallback probes v3 again after its next disconnect so
+   a transient restart cannot pin the client to an older protocol. Failed
    outcomes are sent only through a terminal-outcome protocol. Trade ordering
    compares the complete RFC 3339 timestamp, including sub-millisecond
    precision, then uses the same stable trade-ID tie-breaker for initial history
@@ -4561,13 +4592,15 @@ multiple broker-specific contexts.
    the same validation rules for the canonical and legacy wire shapes:
    timestamps must be valid UTC RFC 3339 values, venues/directions/outcomes must
    be known variants, the total share quantity must be positive, and outcome
-   quantities must be non-negative decimal strings. An invalid payload is
-   reported visibly and leaves the last known-good trade state unchanged. The
-   remaining domains from an otherwise valid snapshot still refresh. An invalid
-   WebSocket payload closes the connection, shows the reconnect banner, and
-   retries with bounded exponential backoff. The Rust trade DTO encodes the
-   positive total-quantity invariant so an invalid trade cannot be constructed
-   or deserialized at the server boundary.
+   quantities must be non-negative decimal strings. A trade carrying a future,
+   unknown venue is skipped with a warning so a rolling dashboard deployment can
+   continue showing compatible trades without reconnecting. Any other invalid
+   payload is reported visibly and leaves the last known-good trade state
+   unchanged. The remaining domains from an otherwise valid snapshot still
+   refresh. Any other invalid WebSocket payload closes the connection, shows the
+   reconnect banner, and retries with bounded exponential backoff. The Rust
+   trade DTO encodes the positive total-quantity invariant so an invalid trade
+   cannot be constructed or deserialized at the server boundary.
 
    Terminal trade live updates are delivered through a persistent delivery
    ledger and job queue, not directly from the CQRS reactor. The ledger is keyed
@@ -4584,7 +4617,13 @@ multiple broker-specific contexts.
    permitted: the dashboard merges trade updates by trade ID, making a retry or
    crash replay idempotent from the operator's point of view. Publishing with no
    connected WebSocket receivers is successful because the next connection
-   obtains the same terminal outcome from its initial-state snapshot.
+   obtains the same terminal outcome from its initial-state snapshot. A later
+   source-attribution correction reloads the authoritative onchain-trade history
+   and broadcasts a replacement update. Transient reload failures receive
+   bounded retries; exhaustion restarts the handoff monitor, whose startup
+   reconciliation reloads every pending source correction retained by that
+   monitor. After a process restart, clients reconnect from the
+   already-corrected snapshot.
 
 5. **Live Events**: Real-time domain event stream (aggregate type, ID, sequence,
    event type, timestamp). Starts empty, populates via WebSocket.

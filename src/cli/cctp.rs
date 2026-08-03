@@ -247,7 +247,7 @@ mod tests {
     use st0x_config::ExecutionThreshold;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{AssetsConfig, BrokerCtx, CtxError, EquitiesConfig, LogLevel, TradingMode};
-    use st0x_config::{EvmCtx, IngestionCutoff, InventoryMode};
+    use st0x_config::{EvmCtx, IngestionCutoff, InventoryAdapters, InventoryMode};
     use st0x_evm::OpenChainErrorRegistry;
     use st0x_finance::Usdc;
 
@@ -271,6 +271,7 @@ mod tests {
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
             },
+            inventory_adapters: InventoryAdapters::default(),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,

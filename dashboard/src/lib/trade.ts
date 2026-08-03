@@ -72,6 +72,38 @@ export type TradeHistoryFilter = {
   until: string | null
 }
 
+const VENUE_IS_ONCHAIN = {
+  raindex: true,
+  bebop: true,
+  uniswap_v4: true,
+  unknown_onchain: true,
+  alpaca: false,
+  dry_run: false
+} as const satisfies Record<TradingVenue, boolean>
+
+export const TRADING_VENUES = Object.keys(VENUE_IS_ONCHAIN) as TradingVenue[]
+
+export const isTradingVenue = (value: unknown): value is TradingVenue =>
+  typeof value === 'string' && Object.hasOwn(VENUE_IS_ONCHAIN, value)
+
+export const isOnchainVenue = (venue: TradingVenue): boolean => VENUE_IS_ONCHAIN[venue]
+
+export type TradeProtocol = 'terminal_outcomes_v3' | 'terminal_outcomes_v2' | 'terminal_outcomes_v1'
+
+const TRADE_PROTOCOL_FALLBACK = {
+  terminal_outcomes_v3: 'terminal_outcomes_v2',
+  terminal_outcomes_v2: 'terminal_outcomes_v1',
+  terminal_outcomes_v1: 'terminal_outcomes_v1'
+} as const satisfies Record<TradeProtocol, TradeProtocol>
+
+export const fallbackTradeProtocol = (protocol: TradeProtocol): TradeProtocol =>
+  TRADE_PROTOCOL_FALLBACK[protocol]
+
+export const legacyCompatibleVenues = (
+  venues: ReadonlySet<TradingVenue>
+): ReadonlySet<TradingVenue> =>
+  new Set([...venues].map((venue) => (isOnchainVenue(venue) ? ('raindex' as const) : venue)))
+
 const matchesHistoryFilter = (trade: Trade, filter: TradeHistoryFilter): boolean => {
   if (!filter.venues.has(trade.venue)) return false
   if (filter.symbols.size > 0 && !filter.symbols.has(trade.symbol)) return false
@@ -137,7 +169,7 @@ const compareRfc3339Timestamps = (left: string, right: string): number => {
 }
 
 const compareTradeIds = (left: Trade, right: Trade): number => {
-  if (left.venue === 'raindex' && right.venue === 'raindex') {
+  if (isOnchainVenue(left.venue) && isOnchainVenue(right.venue)) {
     const leftId = parseOnchainTradeId(left.id)
     const rightId = parseOnchainTradeId(right.id)
     if (leftId !== null && rightId !== null && leftId.txHash === rightId.txHash) {

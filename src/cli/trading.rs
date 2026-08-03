@@ -32,7 +32,7 @@ use crate::offchain::order::{
 };
 use crate::onchain::accumulator::check_execution_readiness;
 use crate::onchain::pyth::PythFeedIds;
-use crate::onchain::trade::BotOperator;
+use crate::onchain::trade::{BotOperator, RecoveryActors};
 use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
 use crate::position::{Position, PositionCommand};
@@ -442,10 +442,14 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     let pyth_feed_ids = PythFeedIds::new(ctx.pyth_feed_ids());
     // Matches ClearV3/TakeOrderV3 fills to our Raindex orders -- owned by the
     // inventory contract post-migration, the bot EOA before it.
-    let order_owner = ctx.vault_owner();
-    // Filters the bot's own inventory rebalancing legs out of an
-    // InventoryTrade settlement recovery, same as the backfill path.
-    let bot_operator = BotOperator(ctx.order_owner());
+    let actors = RecoveryActors {
+        // Matches ClearV3/TakeOrderV3 fills to our Raindex orders -- owned by
+        // the inventory contract post-migration, the bot EOA before it.
+        order_owner: ctx.vault_owner(),
+        // Filters the bot's own inventory rebalancing legs out of an
+        // InventoryTrade settlement recovery, same as the backfill path.
+        bot_operator: BotOperator(ctx.order_owner()),
+    };
     let read_evm = ReadOnlyEvm::new(provider.clone());
 
     match OnchainTrade::try_from_tx_hash(
@@ -454,9 +458,9 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
         cache,
         evm_ctx,
         &ctx.assets,
+        &ctx.inventory_adapters,
         &pyth_feed_ids,
-        order_owner,
-        bot_operator,
+        actors,
     )
     .await
     {
@@ -1109,7 +1113,7 @@ mod tests {
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
         AssetsConfig, BrokerCtx, EquitiesConfig, EquityAssetConfig, EvmCtx, ExecutionThreshold,
-        IngestionCutoff, InventoryMode, LogLevel, OperationMode, TradingMode,
+        IngestionCutoff, InventoryAdapters, InventoryMode, LogLevel, OperationMode, TradingMode,
     };
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, CancellationOutcome,
@@ -1125,7 +1129,9 @@ mod tests {
     };
     use crate::offchain::order::{CancellationReason, PollOrderStatusJobQueue, noop_order_placer};
     use crate::onchain::trade::RaindexTradeEvent;
-    use crate::onchain_trade::{OnChainTrade as OnChainTradeCqrs, OnChainTradeCommand};
+    use crate::onchain_trade::{
+        InventoryVenue, OnChainTrade as OnChainTradeCqrs, OnChainTradeCommand, OnChainTradeSource,
+    };
     use crate::test_utils::{
         OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_order, positive_shares, setup_test_db,
         setup_test_pools,
@@ -1324,6 +1330,7 @@ mod tests {
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
             },
+            inventory_adapters: InventoryAdapters::default(),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
@@ -2155,7 +2162,11 @@ mod tests {
 
         let order_placer = create_order_placer(&ctx, &pool);
 
-        let onchain_trade = OnchainTradeBuilder::default().build();
+        let source = OnChainTradeSource::Inventory {
+            operator: Address::repeat_byte(0x8b),
+            venue: InventoryVenue::Bebop,
+        };
+        let onchain_trade = OnchainTradeBuilder::default().with_source(source).build();
         let block_timestamp = onchain_trade.block_timestamp.unwrap();
 
         let trade_id = OnChainTradeId {
@@ -2172,13 +2183,15 @@ mod tests {
         onchain_store
             .send(
                 &trade_id,
-                OnChainTradeCommand::Witness {
+                OnChainTradeCommand::WitnessAt {
+                    source: OnChainTradeSource::Legacy,
                     symbol: onchain_trade.symbol.base().clone(),
                     amount: onchain_trade.amount.inner(),
                     direction: onchain_trade.direction,
                     price_usdc: onchain_trade.price.value(),
                     block_number: 1,
                     block_timestamp,
+                    filled_at: block_timestamp,
                 },
             )
             .await
@@ -2241,6 +2254,26 @@ mod tests {
             order_count, 0,
             "re-running process-tx on an acknowledged fill must place no broker order"
         );
+
+        let repaired = onchain_store
+            .load(&trade_id)
+            .await
+            .unwrap()
+            .expect("the acknowledged legacy trade must still exist");
+        assert_eq!(
+            repaired.source, source,
+            "process-tx must append chain-backed venue attribution without re-accounting the fill"
+        );
+        let (attribution_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                .bind("OnChainTradeEvent::SourceAttributed")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            attribution_count, 1,
+            "source repair must append exactly one CQRS attribution event"
+        );
     }
 
     /// `process-tx` must resume the acknowledge step when the fill was witnessed
@@ -2272,6 +2305,7 @@ mod tests {
             .send(
                 &trade_id,
                 OnChainTradeCommand::Witness {
+                    source: onchain_trade.source,
                     symbol: onchain_trade.symbol.base().clone(),
                     amount: onchain_trade.amount.inner(),
                     direction: onchain_trade.direction,
@@ -2974,6 +3008,7 @@ mod tests {
             .send(
                 &trade_id,
                 OnChainTradeCommand::Witness {
+                    source: onchain_trade.source,
                     symbol: onchain_trade.symbol.base().clone(),
                     amount: onchain_trade.amount.inner(),
                     direction: onchain_trade.direction,
@@ -3070,6 +3105,7 @@ mod tests {
             .send(
                 &trade_id,
                 OnChainTradeCommand::Witness {
+                    source: onchain_trade.source,
                     symbol: onchain_trade.symbol.base().clone(),
                     amount: onchain_trade.amount.inner(),
                     direction: onchain_trade.direction,
@@ -3193,6 +3229,7 @@ mod tests {
             .send(
                 &trade_id_a,
                 OnChainTradeCommand::Witness {
+                    source: fill_a.source,
                     symbol: fill_a.symbol.base().clone(),
                     amount: fill_a.amount.inner(),
                     direction: fill_a.direction,
@@ -3222,6 +3259,7 @@ mod tests {
             .send(
                 &trade_id_b,
                 OnChainTradeCommand::Witness {
+                    source: fill_b.source,
                     symbol: fill_b.symbol.base().clone(),
                     amount: fill_b.amount.inner(),
                     direction: fill_b.direction,
@@ -3351,6 +3389,7 @@ mod tests {
             .send(
                 &trade_id_b,
                 OnChainTradeCommand::Witness {
+                    source: fill_b.source,
                     symbol: fill_b.symbol.base().clone(),
                     amount: fill_b.amount.inner(),
                     direction: fill_b.direction,

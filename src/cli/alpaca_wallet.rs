@@ -717,18 +717,18 @@ mod tests {
     use url::Url;
     use uuid::uuid;
 
-    use st0x_evm::NoOpErrorRegistry;
-    use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
-
-    use super::*;
-    use crate::cli::ConvertDirection;
-    use crate::inventory::ImbalanceThreshold;
     use st0x_config::ExecutionThreshold;
     use st0x_config::RebalancingCtx;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{AssetsConfig, EquitiesConfig, LogLevel, TradingMode};
-    use st0x_config::{EvmCtx, IngestionCutoff, InventoryMode};
+    use st0x_config::{EvmCtx, IngestionCutoff, InventoryAdapters, InventoryMode};
+    use st0x_evm::NoOpErrorRegistry;
+    use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
     use st0x_float_macro::float;
+
+    use super::*;
+    use crate::cli::ConvertDirection;
+    use crate::inventory::ImbalanceThreshold;
 
     fn create_ctx_without_alpaca() -> Ctx {
         Ctx {
@@ -748,6 +748,7 @@ mod tests {
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
             },
+            inventory_adapters: InventoryAdapters::default(),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
@@ -830,6 +831,7 @@ mod tests {
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
             },
+            inventory_adapters: InventoryAdapters::default(),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
