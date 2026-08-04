@@ -1676,6 +1676,31 @@ fn wrong_typed_tokenization_fee_decimals_fail_the_report() {
     ));
 }
 
+/// `TokensReceived.fees` is `Option<Float>` in the event schema ("if
+/// reported"), so persisted events legitimately carry `fees: null`. The
+/// report must treat that as a missing cost observation -- skipping the
+/// entry and counting it -- not fail wholesale, which blanks /pnl for as
+/// long as the event exists.
+#[test]
+fn null_tokenization_fees_are_missing_observations_not_fatal() {
+    let mut cost = tokenized_tokens_received(11, "mint-1", "0.25", "2026-05-15T12:02:00Z");
+    cost.payload["TokensReceived"]["fees"] = serde_json::json!(null);
+
+    let report = report_with_result(
+        Vec::new(),
+        position_rows(),
+        vec![tokenized_mint_requested(10, "mint-1", "RKLB"), cost],
+        Vec::new(),
+        query(),
+        BTreeSet::new(),
+    )
+    .unwrap();
+
+    assert_eq!(report.costs.tokenization_fees_usd, "0");
+    assert_eq!(report.cost_entries.len(), 0);
+    assert_eq!(report.costs.missing_cost_observation_count, 1);
+}
+
 #[test]
 fn missing_tokenization_fee_fields_fail_the_report() {
     let mut missing_fees = tokenized_tokens_received(11, "mint-1", "0.25", "2026-05-15T12:02:00Z");
