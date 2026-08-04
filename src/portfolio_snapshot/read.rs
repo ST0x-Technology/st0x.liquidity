@@ -83,6 +83,8 @@ pub(crate) enum ReadError {
     SampleDaysOverflow { sample_days: usize },
     #[error("portfolio snapshot date range overflowed after {day}")]
     DateRangeOverflow { day: NaiveDate },
+    #[error("portfolio snapshot evaluation worker failed: {0}")]
+    Worker(#[from] tokio::task::JoinError),
 }
 
 /// Why a day was excluded from the capital sample.
@@ -188,13 +190,40 @@ struct RawBalanceRow {
     mark_captured_at: Option<DateTime<Utc>>,
 }
 
-/// Loads every `portfolio_snapshot` row in `et_day_range` (inclusive both
-/// ends; each side `None` leaves that end of the range open), grouped and
-/// evaluated per ET day.
+#[derive(sqlx::FromRow)]
+struct PersistedBalanceRow {
+    et_day: String,
+    location: String,
+    asset: String,
+    available_balance: String,
+    inflight_balance: String,
+    usd_mark: Option<String>,
+    mark_captured_at: Option<String>,
+}
+
+pub(crate) struct PortfolioDayRows {
+    rows: Vec<PersistedBalanceRow>,
+    from: Option<NaiveDate>,
+    to: Option<NaiveDate>,
+}
+
+/// Test wrapper that loads and evaluates portfolio rows by ET day.
+#[cfg(test)]
 pub(crate) async fn load_portfolio_days(
     pool: &SqlitePool,
     et_day_range: EtDayRange,
 ) -> Result<Vec<PortfolioDay>, ReadError> {
+    let day_rows = load_portfolio_day_rows(pool, et_day_range).await?;
+
+    tokio::task::spawn_blocking(move || evaluate_portfolio_days(day_rows)).await?
+}
+
+/// Loads every `portfolio_snapshot` row in `et_day_range`. Both bounds are
+/// inclusive; `None` leaves the corresponding end of the range open.
+pub(crate) async fn load_portfolio_day_rows(
+    pool: &SqlitePool,
+    et_day_range: EtDayRange,
+) -> Result<PortfolioDayRows, ReadError> {
     let mut query = QueryBuilder::<Sqlite>::new(
         "SELECT et_day, location, asset, available_balance, inflight_balance, usd_mark, \
          mark_captured_at \
@@ -217,25 +246,33 @@ pub(crate) async fn load_portfolio_days(
     query.push(" ORDER BY et_day ASC, asset ASC");
 
     let rows = query
-        .build_query_as::<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-        )>()
+        .build_query_as::<PersistedBalanceRow>()
         .fetch_all(pool)
         .await?;
 
+    Ok(PortfolioDayRows { rows, from, to })
+}
+
+pub(crate) fn evaluate_portfolio_days(
+    day_rows: PortfolioDayRows,
+) -> Result<Vec<PortfolioDay>, ReadError> {
+    let PortfolioDayRows { rows, from, to } = day_rows;
     let mut by_day: BTreeMap<NaiveDate, Vec<RawBalanceRow>> = BTreeMap::new();
-    for (et_day, location, asset, available, inflight, usd_mark, mark_captured_at) in rows {
+    for row in rows {
+        let PersistedBalanceRow {
+            et_day,
+            location,
+            asset,
+            available_balance,
+            inflight_balance,
+            usd_mark,
+            mark_captured_at,
+        } = row;
         let et_day = parse_et_day(&et_day)?;
         parse_portfolio_location(&location)?;
         let asset = parse_portfolio_asset(&asset)?;
-        let available = parse_float_string_or_hex(&available)?;
-        let inflight = parse_float_string_or_hex(&inflight)?;
+        let available = parse_float_string_or_hex(&available_balance)?;
+        let inflight = parse_float_string_or_hex(&inflight_balance)?;
         let usd_mark = usd_mark
             .as_deref()
             .map(parse_float_string_or_hex)

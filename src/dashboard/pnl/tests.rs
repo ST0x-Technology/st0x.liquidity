@@ -1,26 +1,44 @@
 use std::collections::BTreeSet;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::mpsc::TryRecvError;
+use std::time::Duration;
 
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, B256, TxHash, U256};
 use chrono::{NaiveDate, TimeZone, Utc};
 use num_decimal::Num;
+use num_decimal::num_bigint::{BigInt, Sign};
+use num_traits::Zero;
+use proptest::prelude::*;
+use rain_math_float::Float;
 use serde_json::Value;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
 
 use st0x_execution::alpaca_broker_api::AccountActivity;
-use st0x_finance::Symbol;
+use st0x_finance::{Symbol, Usd};
+use st0x_float_macro::float;
 
 use super::builder::build_pnl_response_from_rows;
+use super::costs::{
+    AccountingBucket, AccountingEffect, CostCategory, CostEntryInternal, validated_cost_magnitude,
+};
 use super::parsing::{fmt_decimal, parse_payload_string, parse_timestamp};
 use super::query::{PnlCounterTradingFilter, PnlError, PnlMarketSessionFilter, PnlQuery};
+use super::replay::{add_summary, with_direct_symbol_costs};
 use super::response::{PnlResponse, PnlSymbolSummary, PnlWindow, PnlWindowSymbol};
-use super::state::{
-    BotGasCostRow, CostEventRow, Direction, PnlBucket, PositionEventRow, PositionViewRow, Venue,
+use super::source::{
+    MAX_CONCURRENT_PNL_REPORTS, acquire_pnl_report_permit, build_pnl_report, pnl_report_admission,
+    run_pnl_replay, run_pnl_replay_with_permit,
 };
+use super::state::{
+    BotGasCostRow, CostEventRow, Direction, PnlBucket, PositionEventRow, PositionViewRow,
+    SummaryAcc, Venue,
+};
+use super::windows::build_windows;
 use super::{
     ATTRIBUTION_WARNING, BASELINE_WARNING, CAPITAL_AVAILABLE_NOTE, CAPITAL_UNAVAILABLE_NOTE,
-    COST_WARNING, SYMBOL_FILTERED_CAPITAL_WARNING, build_pnl_report, validate_pnl_snapshot_rowid,
+    COST_WARNING, SYMBOL_FILTERED_CAPITAL_WARNING, validate_pnl_snapshot_rowid,
 };
 use crate::bot_gas::{
     BotGasChain, BotGasOperationCategory, BotGasReceiptCost, BotGasReceiptCostEvent,
@@ -256,22 +274,132 @@ fn malformed_persisted_payloads_are_rejected() {
 
 #[test]
 fn decimal_formatting_preserves_accounting_precision() {
-    assert_eq!(fmt_decimal(&Num::from_str("100").unwrap()), "100");
+    assert_eq!(fmt_decimal(float!(0)).unwrap(), "0");
+    assert_eq!(fmt_decimal(float!(-0.1)).unwrap(), "-0.1");
+    assert_eq!(fmt_decimal(float!(100)).unwrap(), "100");
+    assert_eq!(fmt_decimal(float!(0.0000000001)).unwrap(), "0.0000000001");
     assert_eq!(
-        fmt_decimal(&Num::from_str("0.0000000001").unwrap()),
-        "0.0000000001"
-    );
-    assert_eq!(
-        fmt_decimal(&Num::from_str("0.0000000000000000001").unwrap()),
+        fmt_decimal(float!(0.0000000000000000001)).unwrap(),
         "0.0000000000000000001"
     );
 
-    let high_precision_product = &Num::from_str("0.123456789012345678").unwrap()
-        * &Num::from_str("0.000000000000000001").unwrap();
+    // 18 significant digits and 36 digits after the decimal point, comfortably
+    // inside `Float`'s 224-bit coefficient, so the product is still exact.
+    // This is the property the report actually needs: enough precision that
+    // accounting values survive a multiply, not unbounded precision.
+    let high_precision_product =
+        (float!(0.123456789012345678) * float!(0.000000000000000001)).unwrap();
     assert_eq!(
-        fmt_decimal(&high_precision_product),
+        fmt_decimal(high_precision_product).unwrap(),
         "0.000000000000000000123456789012345678"
     );
+}
+
+fn decimal_text(mantissa: u64, scale: u32) -> String {
+    if scale == 0 {
+        return mantissa.to_string();
+    }
+
+    let divisor = 10_u64.pow(scale);
+    let integer_part = mantissa / divisor;
+    let fractional_part = mantissa % divisor;
+    format!(
+        "{integer_part}.{fractional_part:0>width$}",
+        width = usize::try_from(scale).unwrap()
+    )
+}
+
+fn legacy_fmt_decimal(value: &Num) -> String {
+    let (mut numerator, denominator): (BigInt, BigInt) = value.clone().into();
+    if numerator.is_zero() {
+        return "0".to_owned();
+    }
+
+    let negative = numerator.sign() == Sign::Minus;
+    if negative {
+        numerator = -numerator;
+    }
+
+    let mut denominator = denominator;
+    let twos = legacy_factor_count(&mut denominator, 2);
+    let fives = legacy_factor_count(&mut denominator, 5);
+    assert_eq!(denominator, BigInt::from(1));
+
+    let scale = twos.max(fives);
+    let scaled = legacy_multiply_factor(
+        legacy_multiply_factor(numerator, 2, scale - twos),
+        5,
+        scale - fives,
+    );
+    let mut digits = scaled.to_string();
+
+    if scale > 0 {
+        if digits.len() <= scale {
+            digits.insert_str(0, &"0".repeat(scale + 1 - digits.len()));
+        }
+        digits.insert(digits.len() - scale, '.');
+        while digits.ends_with('0') {
+            digits.pop();
+        }
+        if digits.ends_with('.') {
+            digits.pop();
+        }
+    }
+
+    if negative {
+        format!("-{digits}")
+    } else {
+        digits
+    }
+}
+
+fn legacy_factor_count(value: &mut BigInt, factor: u8) -> usize {
+    let factor = BigInt::from(factor);
+    let mut count = 0;
+    while (&*value % &factor).is_zero() {
+        *value /= &factor;
+        count += 1;
+    }
+    count
+}
+
+fn legacy_multiply_factor(mut value: BigInt, factor: u8, count: usize) -> BigInt {
+    let factor = BigInt::from(factor);
+    for _ in 0..count {
+        value *= &factor;
+    }
+    value
+}
+
+proptest! {
+    #[test]
+    fn float_pnl_arithmetic_matches_the_legacy_num_pipeline(
+        opening_mantissa in 1_u64..=1_000_000_000_000,
+        closing_mantissa in 1_u64..=1_000_000_000_000,
+        shares_mantissa in 1_u64..=1_000_000_000_000_000_000,
+        opening_scale in 0_u32..=8,
+        closing_scale in 0_u32..=8,
+        shares_scale in 0_u32..=18,
+    ) {
+        let opening = decimal_text(opening_mantissa, opening_scale);
+        let closing = decimal_text(closing_mantissa, closing_scale);
+        let shares = decimal_text(shares_mantissa, shares_scale);
+
+        let legacy_opening = Num::from_str(&opening).unwrap();
+        let legacy_closing = Num::from_str(&closing).unwrap();
+        let legacy_shares = Num::from_str(&shares).unwrap();
+        let legacy_pnl = (&legacy_closing - &legacy_opening) * &legacy_shares;
+
+        let float_opening = Float::parse(opening).unwrap();
+        let float_closing = Float::parse(closing).unwrap();
+        let float_shares = Float::parse(shares).unwrap();
+        let float_pnl = ((float_closing - float_opening).unwrap() * float_shares).unwrap();
+
+        prop_assert_eq!(
+            fmt_decimal(float_pnl).unwrap(),
+            legacy_fmt_decimal(&legacy_pnl)
+        );
+    }
 }
 
 #[test]
@@ -499,11 +627,11 @@ fn bot_gas_recorded(rowid: i64) -> CostEventRow {
         gas_used: 21_000,
         effective_gas_price_wei: 1_000_000_000,
         native_cost_wei: U256::from(21_000_000_000_000u128),
-        eth_usd_price: Num::from_str("2000").unwrap(),
+        eth_usd_price: Usd::new(float!(2000)),
         eth_usd_price_source: "eth_usd_valuation_feed".to_owned(),
         eth_usd_price_at: Utc.with_ymd_and_hms(2026, 5, 15, 14, 0, 0).unwrap(),
         eth_usd_price_block_number: Some(123),
-        usd_cost: Num::from_str("0.042").unwrap(),
+        usd_cost: Usd::new(float!(0.042)),
         operation_category: BotGasOperationCategory::VaultDeposit,
         symbol: Some(Symbol::new("RKLB").unwrap()),
         occurred_at: Utc.with_ymd_and_hms(2026, 5, 15, 14, 0, 1).unwrap(),
@@ -1116,21 +1244,26 @@ async fn source_loader_excludes_bot_gas_recorded_after_snapshot() {
 
 #[tokio::test]
 async fn source_loader_rejects_non_positive_persisted_bot_gas_cost() {
-    let mut bot_gas = bot_gas_recorded(1);
-    bot_gas.payload["Recorded"]["cost"]["usd_cost"] = serde_json::json!("0");
-    let pool = pnl_test_pool_with_costs(Vec::new(), position_rows(), vec![bot_gas]).await;
+    for usd_cost in ["0", "-0.042"] {
+        let mut bot_gas = bot_gas_recorded(1);
+        bot_gas.payload["Recorded"]["cost"]["usd_cost"] = serde_json::json!(usd_cost);
+        let pool = pnl_test_pool_with_costs(Vec::new(), position_rows(), vec![bot_gas]).await;
 
-    let error = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
-        .await
-        .unwrap_err();
+        let error = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+            .await
+            .unwrap_err();
 
-    assert!(matches!(
-        error,
-        PnlError::InvalidBotGasReceiptCost {
-            source: crate::bot_gas::BotGasReceiptCostError::NonPositiveUsdCost,
-            ..
-        }
-    ));
+        assert!(
+            matches!(
+                error,
+                PnlError::InvalidBotGasReceiptCost {
+                    source: crate::bot_gas::BotGasReceiptCostError::NonPositiveUsdCost,
+                    ..
+                }
+            ),
+            "unexpected result for persisted USD cost {usd_cost}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2156,6 +2289,73 @@ fn broker_fees_and_interest_categories_net_debits_against_credits() {
 }
 
 #[test]
+fn alpaca_net_amount_parses_the_official_account_activity_sample() {
+    // Alpaca documents `net_amount` as a signed string<number>. This is the public DIV sample
+    // from https://docs.alpaca.markets/us/docs/account-activities, not a live-account capture.
+    let activity: AccountActivity = serde_json::from_value(serde_json::json!({
+        "activity_type": "DIV",
+        "id": "20190801011955195::5f596936-6f23-4cef-bdf1-3806aae57dbf",
+        "date": "2019-08-01",
+        "net_amount": "1.02",
+        "symbol": "T",
+        "cusip": "C00206R102",
+        "qty": "2",
+        "per_share_amount": "0.51"
+    }))
+    .unwrap();
+
+    let report = report_with(
+        Vec::new(),
+        vec![position_row("T", "0")],
+        Vec::new(),
+        vec![activity],
+        PnlQuery {
+            from_date: Some("2019-08-01".to_owned()),
+            to_date: Some("2019-08-01".to_owned()),
+            ..query()
+        },
+        BTreeSet::new(),
+    );
+
+    assert_eq!(report.costs.dividend_revenue_usd, "1.02");
+    assert_eq!(report.summary.tracked_revenue_usd, "1.02");
+    assert_eq!(report.summary.net_realized_pnl_usd, "1.02");
+    assert_eq!(report.cost_entries[0].amount_usd, "1.02");
+    assert_eq!(
+        report.cost_entries[0].symbol.as_ref().map(Symbol::as_str),
+        Some("T")
+    );
+}
+
+#[test]
+fn alpaca_net_amount_deserializes_signed_cost_values() {
+    let activity: AccountActivity = serde_json::from_value(serde_json::json!({
+        "activity_type": "INT",
+        "id": "interest-1",
+        "date": "2019-08-01",
+        "net_amount": "-0.25"
+    }))
+    .unwrap();
+
+    let report = report_with(
+        Vec::new(),
+        position_rows(),
+        Vec::new(),
+        vec![activity],
+        PnlQuery {
+            from_date: Some("2019-08-01".to_owned()),
+            to_date: Some("2019-08-01".to_owned()),
+            ..query()
+        },
+        BTreeSet::new(),
+    );
+
+    assert_eq!(report.costs.margin_interest_usd, "0.25");
+    assert_eq!(report.summary.tracked_costs_usd, "0.25");
+    assert_eq!(report.summary.net_realized_pnl_usd, "-0.25");
+}
+
+#[test]
 fn matches_legacy_frontend_sql_fixture_for_stable_report_fields() {
     let report = report_with(
         vec![
@@ -2250,8 +2450,8 @@ fn assert_legacy_fixture_entries(report: &PnlResponse) {
                 entry.pnl_bucket.as_str(),
                 entry.opening_rowid,
                 entry.closing_rowid,
-                fmt_decimal(&entry.shares),
-                fmt_decimal(&entry.realized_pnl_usd),
+                fmt_decimal(entry.shares).unwrap(),
+                fmt_decimal(entry.realized_pnl_usd).unwrap(),
             ))
             .collect::<Vec<_>>(),
         vec![
@@ -2396,6 +2596,57 @@ fn includes_tokenization_and_cctp_cost_events() {
     assert_eq!(report.symbols[0].symbol, "RKLB");
     assert_eq!(report.symbols[0].tracked_costs_usd, "0.4");
     assert_eq!(report.symbols[0].net_realized_pnl_usd, "-0.4");
+}
+
+#[test]
+fn negative_persisted_fees_fail_instead_of_reversing_their_accounting_effect() {
+    let tokenization_error = report_with_result(
+        Vec::new(),
+        position_rows(),
+        vec![
+            tokenized_mint_requested(1, "mint-1", "RKLB"),
+            tokenized_tokens_received(2, "mint-1", "-0.40", "2026-05-15T14:02:00Z"),
+        ],
+        Vec::new(),
+        query(),
+        BTreeSet::new(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        tokenization_error,
+        PnlError::MalformedPayload {
+            rowid: 2,
+            aggregate_type: "TokenizedEquityMint",
+            reason: "negative cost magnitude",
+            ..
+        }
+    ));
+
+    let cctp_error = report_with_result(
+        Vec::new(),
+        position_rows(),
+        vec![usdc_bridged(
+            3,
+            "rebalance-1",
+            "-0.10",
+            "2026-05-15T14:03:00Z",
+        )],
+        Vec::new(),
+        query(),
+        BTreeSet::new(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        cctp_error,
+        PnlError::MalformedPayload {
+            rowid: 3,
+            aggregate_type: "UsdcRebalance",
+            reason: "negative cost magnitude",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -2770,6 +3021,66 @@ async fn return_uses_only_pnl_from_days_with_usable_capital() {
     assert_eq!(report.capital.excluded_days[0].et_day, "2026-05-16");
 }
 
+/// The values below are the ones observed in staging. The exact PnL product
+/// has 83 digits after the decimal point; `Float` rounds it to its coefficient
+/// width, which produces the 69-digit fractional value asserted below.
+#[tokio::test]
+async fn high_precision_derived_prices_do_not_break_the_capital_calculation() {
+    const DERIVED_PRICE: &str =
+        "67.00624805750459748856363881732286752146489897172918857984356872411";
+
+    let pool = pnl_test_pool(
+        vec![
+            onchain_fill(
+                1,
+                "RKLB",
+                "Sell",
+                DERIVED_PRICE,
+                "0.029847962456751639",
+                "2026-05-15T14:00:00Z",
+            ),
+            offchain_buy(2, "2026-05-15T14:01:00Z", "66.888", "0.029847962456751639"),
+        ],
+        position_rows(),
+    )
+    .await;
+    for et_day in ["2026-05-15", "2026-05-16"] {
+        insert_portfolio_snapshot_row(
+            &pool,
+            et_day,
+            "market_making",
+            "USDC",
+            "1000",
+            Some("1"),
+            Some("2026-05-15T04:05:00+00:00"),
+        )
+        .await;
+    }
+
+    let report = build_pnl_report(
+        &pool,
+        &PnlQuery {
+            from_date: Some("2026-05-15".to_owned()),
+            to_date: Some("2026-05-16".to_owned()),
+            ..query()
+        },
+        Vec::new(),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        report.summary.net_realized_pnl_usd,
+        "0.003529463580981034737734078937903677127959821450972181328726353205256"
+    );
+    assert_eq!(
+        report.capital.average_deployed_capital_usd.as_deref(),
+        Some("1000")
+    );
+    assert_eq!(report.capital.sample_days, 2);
+}
+
 #[tokio::test]
 async fn return_excludes_signed_cost_effects_from_days_without_usable_capital() {
     let pool = pnl_test_pool_with_costs(
@@ -3011,5 +3322,331 @@ async fn build_pnl_report_as_of_rowid_non_current_omits_capital_with_warning() {
             .warnings
             .iter()
             .any(|warning| { warning.contains("not a historical view as of rowid 1") })
+    );
+}
+
+/// Packs the recorded exponent directly because parsing a decimal string
+/// normalizes it and does not exercise the formatter's scientific fallback.
+fn extreme_exponent_float() -> Float {
+    let mut bytes = [0u8; 32];
+    bytes[..4].copy_from_slice(&(-77i32).to_be_bytes());
+    bytes[4..24].fill(0x00);
+    bytes[24..32].copy_from_slice(&9_999_999_910_959_448_i64.to_be_bytes());
+    Float::from_raw(B256::from(bytes))
+}
+
+#[test]
+fn fmt_decimal_formats_and_roundtrips_an_extreme_exponent_value() {
+    let value = extreme_exponent_float();
+
+    let formatted = fmt_decimal(value).unwrap();
+
+    assert_eq!(
+        formatted,
+        "0.00000000000000000000000000000000000000000000000000000000000009999999910959448"
+    );
+    let roundtripped = Float::parse(formatted).unwrap();
+    assert!(roundtripped.eq(value).unwrap());
+}
+
+#[test]
+fn complete_pnl_response_serializes_extreme_exponents_as_strings() {
+    let mut report = report(vec![
+        onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
+        offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
+    ]);
+    let value = extreme_exponent_float();
+    let expected = fmt_decimal(value).unwrap();
+    let entry = &mut report.entries[0];
+    entry.opening_price_usd = value;
+    entry.closing_price_usd = value;
+    entry.shares = value;
+    entry.spread_usd = value;
+    entry.realized_pnl_usd = value;
+
+    let response = serde_json::to_value(&report).unwrap();
+    let entry = &response["entries"][0];
+
+    for field in [
+        "openingPriceUsd",
+        "closingPriceUsd",
+        "shares",
+        "spreadUsd",
+        "realizedPnlUsd",
+    ] {
+        assert_eq!(entry[field], serde_json::Value::String(expected.clone()));
+    }
+}
+
+fn max_positive_float_text() -> String {
+    st0x_float_serde::format_float(&Float::max_positive_value().unwrap()).unwrap()
+}
+
+#[test]
+fn cost_summarization_surfaces_float_overflow_as_arithmetic_error() {
+    let amount = max_positive_float_text();
+    let error = report_with_result(
+        Vec::new(),
+        position_rows(),
+        Vec::new(),
+        vec![
+            account_activity("div-1", "DIV", &amount, None, "2026-05-15T14:00:00Z"),
+            account_activity("div-2", "DIV", &amount, None, "2026-05-15T14:01:00Z"),
+        ],
+        query(),
+        BTreeSet::new(),
+    )
+    .unwrap_err();
+
+    let PnlError::Arithmetic(failure) = error else {
+        panic!("expected arithmetic error, got {error:?}");
+    };
+    assert_eq!(failure.location.file(), "src/dashboard/pnl/costs.rs");
+}
+
+#[test]
+fn daily_report_aggregation_surfaces_float_overflow_as_arithmetic_error() {
+    let amount = max_positive_float_text();
+    let error = report_with_result(
+        vec![
+            onchain_sell(1, &amount, "2026-05-15T14:00:00Z"),
+            offchain_buy(2, "2026-05-15T14:01:00Z", "1", "1"),
+        ],
+        position_rows(),
+        Vec::new(),
+        vec![account_activity(
+            "div-1",
+            "DIV",
+            &amount,
+            None,
+            "2026-05-15T14:02:00Z",
+        )],
+        query(),
+        BTreeSet::new(),
+    )
+    .unwrap_err();
+
+    let PnlError::Arithmetic(failure) = error else {
+        panic!("expected arithmetic error, got {error:?}");
+    };
+    assert_eq!(failure.location.file(), "src/dashboard/pnl/builder.rs");
+}
+
+#[test]
+fn window_aggregation_surfaces_float_overflow_as_arithmetic_error() {
+    let mut report = report(vec![
+        onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
+        offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
+    ]);
+    let mut entry = report.entries.pop().unwrap();
+    entry.realized_pnl_usd = Float::max_positive_value().unwrap();
+    let entries = [entry.clone(), entry];
+    let error = build_windows(&entries, &[Symbol::new("RKLB").unwrap()]).unwrap_err();
+
+    let PnlError::Arithmetic(failure) = error else {
+        panic!("expected arithmetic error, got {error:?}");
+    };
+    assert_eq!(failure.location.file(), "src/dashboard/pnl/windows.rs");
+}
+
+/// A price and share count whose exponents sum past `i32::MAX` must surface
+/// as an arithmetic error rather than panic or produce a fabricated report.
+#[tokio::test]
+async fn float_exponent_overflow_in_the_replay_pipeline_surfaces_as_arithmetic_error() {
+    let extreme_price = "1e2147483646";
+
+    let error = report_result(vec![
+        onchain_fill(
+            1,
+            "RKLB",
+            "Sell",
+            extreme_price,
+            "1e2",
+            "2026-05-15T14:00:00Z",
+        ),
+        offchain_buy(2, "2026-05-15T14:01:00Z", extreme_price, "1e2"),
+    ])
+    .unwrap_err();
+
+    assert!(matches!(error, PnlError::Arithmetic(_)));
+}
+
+#[test]
+fn report_includes_a_replay_only_open_position_in_symbol_summaries() {
+    let report = report_with(
+        vec![offchain_buy(1, "2026-05-15T14:01:00Z", "15", "2")],
+        vec![position_row("RKLB", "2")],
+        Vec::new(),
+        Vec::new(),
+        query(),
+        BTreeSet::new(),
+    );
+
+    assert_eq!(report.symbols.len(), 1);
+    assert_eq!(report.symbols[0].symbol.as_str(), "RKLB");
+    assert_eq!(report.symbols[0].inventory_drift_shares, "2");
+    assert_eq!(report.symbols[0].inventory_drift_usd, "30");
+    assert_eq!(report.symbols[0].open_long_shares, "2");
+}
+
+#[test]
+fn non_accounting_cost_entries_do_not_create_symbol_rows() {
+    let entry = CostEntryInternal {
+        category: CostCategory::CashCredit,
+        accounting_bucket: AccountingBucket::Generic,
+        effect: AccountingEffect::None,
+        amount_usd: validated_cost_magnitude(
+            float!(0),
+            1,
+            "AlpacaAccountActivity",
+            "CSD".to_owned(),
+        )
+        .unwrap(),
+        occurred_at: "2026-05-15T14:00:00Z".to_owned(),
+        aggregate_type: "AlpacaAccountActivity".to_owned(),
+        aggregate_id: "activity-1".to_owned(),
+        event_rowid: 1,
+        symbol: Some(Symbol::new("RKLB").unwrap()),
+        detail: "non-accounting fixture".to_owned(),
+    };
+
+    let symbols = with_direct_symbol_costs(Vec::new(), &[entry]).unwrap();
+
+    assert!(symbols.is_empty());
+}
+
+/// Proves that replay work does not block a current-thread Tokio runtime.
+///
+/// The controller waits for async progress outside the runtime thread. If the
+/// replay closure runs inline, the deadline expires; the controller then
+/// releases and joins the blocked runtime before the test fails.
+#[test]
+fn pnl_replay_runs_off_the_async_runtime_worker() {
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+    let runtime_thread = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let replay = run_pnl_replay(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                });
+                let observe_async_progress = async move {
+                    loop {
+                        match started_rx.try_recv() {
+                            Ok(()) => break,
+                            Err(TryRecvError::Empty) => tokio::task::yield_now().await,
+                            Err(TryRecvError::Disconnected) => {
+                                panic!("replay worker exited before starting")
+                            }
+                        }
+                    }
+                    progress_tx.send(()).unwrap();
+                };
+
+                let (result, ()) = tokio::join!(replay, observe_async_progress);
+                result.unwrap();
+            });
+    });
+
+    let progress = progress_rx.recv_timeout(Duration::from_secs(5));
+    let release = release_tx.send(());
+    let runtime = runtime_thread.join();
+
+    assert!(
+        matches!(progress, Ok(())),
+        "async runtime made no progress before the deadline: {progress:?}"
+    );
+    release.unwrap();
+    runtime.unwrap();
+}
+
+#[tokio::test]
+async fn canceled_pnl_replay_holds_its_permit_until_blocking_work_finishes() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let replay = tokio::spawn(run_pnl_replay_with_permit(
+        semaphore.clone().acquire_owned().await.unwrap(),
+        move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok::<(), PnlError>(())
+        },
+    ));
+
+    started_rx.await.unwrap();
+    replay.abort();
+    assert!(replay.await.unwrap_err().is_cancelled());
+    let early_permit = semaphore.clone().try_acquire_owned();
+    let blocking_work_still_holds_permit =
+        matches!(&early_permit, Err(tokio::sync::TryAcquireError::NoPermits));
+    drop(early_permit);
+    release_tx.send(()).unwrap();
+    let _replacement_permit = semaphore.acquire_owned().await.unwrap();
+
+    assert!(blocking_work_still_holds_permit);
+}
+
+#[test]
+fn pnl_report_admission_rejects_excess_work_without_queuing() {
+    let admission = pnl_report_admission();
+    let mut permits = (0..MAX_CONCURRENT_PNL_REPORTS)
+        .map(|_| acquire_pnl_report_permit(&admission).unwrap())
+        .collect::<Vec<_>>();
+
+    let error = acquire_pnl_report_permit(&admission).unwrap_err();
+    assert!(matches!(error, PnlError::ReplayAdmission(_)));
+
+    drop(permits.pop().unwrap());
+    let _replacement = acquire_pnl_report_permit(&admission).unwrap();
+}
+
+#[tokio::test]
+async fn pnl_replay_releases_permits_after_errors_and_panics() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let error = run_pnl_replay_with_permit::<(), _>(
+        semaphore.clone().acquire_owned().await.unwrap(),
+        || {
+            Err(PnlError::InvalidDate {
+                field: "test",
+                value: "invalid".to_owned(),
+            })
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, PnlError::InvalidDate { .. }));
+
+    let error =
+        run_pnl_replay_with_permit::<(), _>(semaphore.clone().try_acquire_owned().unwrap(), || {
+            panic!("test worker panic")
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, PnlError::ReplayWorker(_)));
+    let _released_permit = semaphore.try_acquire_owned().unwrap();
+}
+
+/// Shared accumulators must retain the originating pipeline call site.
+#[test]
+fn shared_summary_accumulator_reports_distinguishable_locations_per_call_site() {
+    let overflowing = SummaryAcc {
+        counter_trade_pnl_usd: Float::max_positive_value().unwrap(),
+        ..SummaryAcc::default()
+    };
+
+    let first_error = add_summary(&mut overflowing.clone(), &overflowing).unwrap_err();
+    let second_error = add_summary(&mut overflowing.clone(), &overflowing).unwrap_err();
+
+    assert_ne!(
+        first_error.to_string(),
+        second_error.to_string(),
+        "two distinct call sites into the same shared accumulator must report \
+         distinguishable locations, not collapse to the helper's own internal line"
     );
 }

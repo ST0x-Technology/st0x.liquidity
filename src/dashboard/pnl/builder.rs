@@ -1,15 +1,15 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-
 use chrono::NaiveDate;
-use num_decimal::Num;
+use rain_math_float::Float;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use st0x_execution::alpaca_broker_api::AccountActivity;
 use st0x_finance::Symbol;
+use st0x_float_macro::float;
 
 use super::ATTRIBUTION_METHOD;
 use super::costs::{
     AccountingEffect, CostCategory, CostEntryInternal, build_alpaca_activity_cost_entries,
-    build_cost_entries, summarize_cost_entries, with_costs,
+    build_cost_entries, summarize_cost_entries, validated_cost_magnitude, with_costs,
 };
 use super::diagnostics::append_replay_diagnostics;
 use super::parsing::{fmt_decimal, is_safe_symbol, ordered_position_events};
@@ -18,7 +18,7 @@ use super::replay::{
     add_summary, apply_manual_position_adjustment, apply_offchain_fill, apply_offchain_placement,
     apply_onchain_fill, finalize_book, merge_symbol_replay_exposure, parse_offchain_fill,
     parse_onchain_fill, reset_symbol_costs, summary_from_entries, summary_to_dto,
-    symbol_summary_to_dto, with_direct_symbol_costs, with_replay_exposure,
+    with_direct_symbol_costs, with_replay_exposure,
 };
 use super::response::{PnlCapitalSummary, PnlCostEntry, PnlResponse};
 use super::samples::{build_available_range, build_sample_stats, parse_position_view};
@@ -30,56 +30,73 @@ use super::state::{
 };
 use super::windows::build_windows;
 
-fn tokenization_fee_overlap_key(entry: &CostEntryInternal) -> Option<(Symbol, String, String)> {
+fn tokenization_fee_overlap_key(
+    entry: &CostEntryInternal,
+) -> Result<Option<(Symbol, String, String)>, PnlError> {
     if entry.category != CostCategory::TokenizationFee || entry.effect != AccountingEffect::Cost {
-        return None;
+        return Ok(None);
     }
 
-    Some((
-        entry.symbol.clone()?,
+    let Some(symbol) = entry.symbol.clone() else {
+        return Ok(None);
+    };
+
+    Ok(Some((
+        symbol,
         date_key(&entry.occurred_at),
-        fmt_decimal(&entry.amount_usd),
-    ))
+        fmt_decimal(entry.amount_usd.inner())?,
+    )))
 }
 
-fn alpaca_fee_overlap_key(entry: &CostEntryInternal) -> Option<(Symbol, String, String)> {
+fn alpaca_fee_overlap_key(
+    entry: &CostEntryInternal,
+) -> Result<Option<(Symbol, String, String)>, PnlError> {
     if entry.category != CostCategory::BrokerFee || entry.effect != AccountingEffect::Cost {
-        return None;
+        return Ok(None);
     }
 
-    Some((
-        entry.symbol.clone()?,
+    let Some(symbol) = entry.symbol.clone() else {
+        return Ok(None);
+    };
+
+    Ok(Some((
+        symbol,
         date_key(&entry.occurred_at),
-        fmt_decimal(&entry.amount_usd),
-    ))
+        fmt_decimal(entry.amount_usd.inner())?,
+    )))
 }
 
 fn remove_tokenization_fee_overlaps(
     tokenization_entries: &[CostEntryInternal],
     alpaca_entries: Vec<CostEntryInternal>,
     warnings: &mut Vec<String>,
-) -> Vec<CostEntryInternal> {
-    let tokenization_fee_keys: HashSet<_> = tokenization_entries
+) -> Result<Vec<CostEntryInternal>, PnlError> {
+    let tokenization_fee_keys = tokenization_entries
         .iter()
-        .filter_map(tokenization_fee_overlap_key)
-        .collect();
-
-    alpaca_entries
+        .map(tokenization_fee_overlap_key)
+        .collect::<Result<Vec<_>, PnlError>>()?
         .into_iter()
-        .filter(|entry| {
-            let Some(key) = alpaca_fee_overlap_key(entry) else {
-                return true;
-            };
-            if tokenization_fee_keys.contains(&key) {
-                warnings.push(format!(
-                    "Skipped overlapping Alpaca broker fee {} because a persisted tokenization fee already covers {} on {} for {}",
-                    entry.aggregate_id, key.0, key.1, key.2
-                ));
-                return false;
-            }
-            true
-        })
-        .collect()
+        .flatten()
+        .collect::<HashSet<_>>();
+
+    let mut retained = Vec::with_capacity(alpaca_entries.len());
+    for entry in alpaca_entries {
+        let Some(key) = alpaca_fee_overlap_key(&entry)? else {
+            retained.push(entry);
+            continue;
+        };
+        if tokenization_fee_keys.contains(&key) {
+            warnings.push(format!(
+                "Skipped overlapping Alpaca broker fee {} because a persisted tokenization fee already covers {} on {} for {}",
+                entry.aggregate_id, key.0, key.1, key.2
+            ));
+            continue;
+        }
+
+        retained.push(entry);
+    }
+
+    Ok(retained)
 }
 
 /// Builds the `/pnl` response from already-loaded rows and returns net realized
@@ -93,7 +110,7 @@ pub(crate) fn build_pnl_response_from_rows(
     query: &PnlQuery,
     symbols: &BTreeSet<String>,
     mut warnings: Vec<String>,
-) -> Result<(PnlResponse, BTreeMap<NaiveDate, Num>), PnlError> {
+) -> Result<(PnlResponse, BTreeMap<NaiveDate, Float>), PnlError> {
     let event_rows = if symbols.is_empty() {
         event_rows
     } else {
@@ -131,7 +148,7 @@ pub(crate) fn build_pnl_response_from_rows(
         match row.event_type.as_str() {
             "PositionEvent::OnChainOrderFilled" => {
                 if let Some(fill) = parse_onchain_fill(&row, &mut warnings)? {
-                    apply_onchain_fill(book, &fill, &mut entries, &mut warnings);
+                    apply_onchain_fill(book, &fill, &mut entries, &mut warnings)?;
                 }
             }
             "PositionEvent::OffChainOrderPlaced" => {
@@ -145,7 +162,7 @@ pub(crate) fn build_pnl_response_from_rows(
                         &mut entries,
                         &mut warnings,
                         &mut unmatched_offchain_allocations,
-                    );
+                    )?;
                 }
             }
             "PositionEvent::ManualPositionAdjusted" => {
@@ -167,16 +184,16 @@ pub(crate) fn build_pnl_response_from_rows(
                 &position_nets,
                 &mut warnings,
                 &mut position_replay_deltas,
-            );
-            add_summary(&mut full_total, &book.summary);
-            replay_symbols.push(symbol_summary_to_dto(&symbol, &book.summary));
+            )?;
+            add_summary(&mut full_total, &book.summary)?;
+            replay_symbols.push((symbol, book.summary.clone()));
         }
     }
     append_replay_diagnostics(
         &mut warnings,
         &unmatched_offchain_allocations,
         &position_replay_deltas,
-    );
+    )?;
 
     let mut filtered_entries: Vec<_> = entries
         .into_iter()
@@ -200,7 +217,7 @@ pub(crate) fn build_pnl_response_from_rows(
         .extend(build_bot_gas_cost_entries(bot_gas_rows, &mut warnings)?);
     let alpaca_entries = build_alpaca_activity_cost_entries(alpaca_activities, &mut warnings)?;
     let alpaca_entries =
-        remove_tokenization_fee_overlaps(&cost_replay.entries, alpaca_entries, &mut warnings);
+        remove_tokenization_fee_overlaps(&cost_replay.entries, alpaca_entries, &mut warnings)?;
     cost_replay.entries.extend(alpaca_entries);
 
     let mut filtered_cost_entries: Vec<_> = cost_replay
@@ -229,35 +246,37 @@ pub(crate) fn build_pnl_response_from_rows(
     let cost_summary = summarize_cost_entries(
         &filtered_cost_entries,
         cost_replay.missing_cost_observation_count,
-    );
-    let mut daily_net_realized_pnl_usd = BTreeMap::<NaiveDate, Num>::new();
+    )?;
+    let mut daily_net_realized_pnl_usd = BTreeMap::<NaiveDate, Float>::new();
     for entry in &filtered_entries {
         let day = et_day_key(&entry.closed_at).ok_or_else(|| PnlError::InvalidDate {
             field: "closedAt",
             value: entry.closed_at.clone(),
         })?;
-        *daily_net_realized_pnl_usd.entry(day).or_default() += &entry.realized_pnl_usd;
+        let running = daily_net_realized_pnl_usd.entry(day).or_insert(float!(0));
+        *running = (*running + entry.realized_pnl_usd)?;
     }
     for entry in &filtered_cost_entries {
         let amount = match entry.effect {
-            AccountingEffect::Cost => -entry.amount_usd.clone(),
-            AccountingEffect::Revenue => entry.amount_usd.clone(),
-            AccountingEffect::None => Num::default(),
+            AccountingEffect::Cost => (float!(0) - entry.amount_usd.inner())?,
+            AccountingEffect::Revenue => entry.amount_usd.inner(),
+            AccountingEffect::None => float!(0),
         };
         let day = et_day_key(&entry.occurred_at).ok_or_else(|| PnlError::InvalidDate {
             field: "occurredAt",
             value: entry.occurred_at.clone(),
         })?;
-        *daily_net_realized_pnl_usd.entry(day).or_default() += amount;
+        let running = daily_net_realized_pnl_usd.entry(day).or_insert(float!(0));
+        *running = (*running + amount)?;
     }
-    let filtered = summary_from_entries(&filtered_entries);
-    let replay_summary = summary_to_dto(&full_total);
+    let filtered = summary_from_entries(&filtered_entries)?;
+    let replay_summary = summary_to_dto(&full_total)?;
     let (summary, _net_realized_pnl_usd) = with_costs(
         with_replay_exposure(filtered.summary, replay_summary),
         &cost_summary,
     )?;
     let symbols_with_exposure =
-        merge_symbol_replay_exposure(filtered.symbols, replay_symbols.into_iter());
+        merge_symbol_replay_exposure(filtered.symbols, replay_symbols.into_iter())?;
     let symbols_with_costs = with_direct_symbol_costs(
         reset_symbol_costs(symbols_with_exposure),
         &filtered_cost_entries,
@@ -268,11 +287,11 @@ pub(crate) fn build_pnl_response_from_rows(
     symbol_universe.extend(symbols_with_costs.iter().map(|row| row.symbol.clone()));
     let symbol_universe: Vec<_> = symbol_universe.into_iter().collect();
 
-    let windows = build_windows(&filtered_entries, &symbol_universe);
+    let windows = build_windows(&filtered_entries, &symbol_universe)?;
     let cost_entries = filtered_cost_entries
         .iter()
-        .map(PnlCostEntry::from)
-        .collect();
+        .map(PnlCostEntry::try_from)
+        .collect::<Result<Vec<_>, PnlError>>()?;
 
     Ok((
         PnlResponse {
@@ -324,6 +343,15 @@ fn build_bot_gas_cost_entries(
             let amount_usd = match super::parsing::parse_internal_decimal(
                 "bot_gas_cost.usd_cost",
                 &row.usd_cost,
+            ) {
+                Ok(amount_usd) => amount_usd,
+                Err(error) => return Some(Err(error)),
+            };
+            let amount_usd = match validated_cost_magnitude(
+                amount_usd,
+                row.rowid,
+                "BotGasCost",
+                row.operation_category.clone(),
             ) {
                 Ok(amount_usd) => amount_usd,
                 Err(error) => return Some(Err(error)),

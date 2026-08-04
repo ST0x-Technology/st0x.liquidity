@@ -161,6 +161,7 @@ pub(crate) struct AppState {
     pub(crate) settings: st0x_dto::Settings,
     pub(crate) recovery: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
     pub(crate) resume_lock: Arc<api::ResumeLock>,
+    pub(crate) pnl_report_admission: dashboard::pnl::PnlReportAdmission,
     pub(crate) metrics_handle: PrometheusHandle,
 }
 
@@ -239,6 +240,7 @@ async fn run_bot_session_inner(
         settings: dashboard::settings_from_ctx(&ctx),
         recovery: recovery_cell.clone(),
         resume_lock,
+        pnl_report_admission: dashboard::pnl::pnl_report_admission(),
         metrics_handle,
     };
     let server_supervisor = spawn_server_supervisor(state, &pools, main_listener, board_listener);

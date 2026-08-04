@@ -41,30 +41,27 @@
 //! cheap startup probe) and where to look first if Base bot-gas costs stop
 //! recording entirely.
 //!
-//! # Why `Num`, not `Float`, for this module's USD values
+//! # Persisted USD values
 //!
-//! `EthUsdPrice.price` and `BotGasReceiptCost.usd_cost` are typed
-//! `num_decimal::Num`, not `rain_math_float::Float` -- the project's usual
-//! convention for financial arithmetic (see docs/float.md). This is a
-//! deliberate exception, not an oversight: `usd_cost` (and the `Num` shape
-//! this module produces to compute it) is a *persisted* field on
-//! `BotGasReceiptCost`, serialized via `serialize_num`/`deserialize_num`
-//! (`crate::bot_gas`) into the CQRS event log. Switching the type now would
-//! change the persisted event shape for every already-recorded
-//! `BotGasReceiptCostEvent::Recorded` event, which is a migration-class
-//! change, not a local refactor -- out of scope for this fixer pass. If a
-//! future change revisits this, it needs a migration plan for existing
-//! events, not just a type swap here.
+//! `EthUsdPrice.price` and `BotGasReceiptCost.usd_cost` are `st0x_finance::Usd`
+//! (see docs/float.md), the established newtype for an offchain dollar amount.
+//! They are *persisted* fields on `BotGasReceiptCost`, serialized as decimal
+//! strings into the CQRS event log, so `usd_cost` is rounded to
+//! `PERSISTED_DECIMAL_PRECISION` when it is built rather than relying on
+//! formatting to round it. Changing that precision, or how the rounding is
+//! applied, changes what future events persist and needs a
+//! `verify-migrations` run against real events.
 
 use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::transports::{RpcError, TransportErrorKind};
 use chrono::{DateTime, TimeDelta, Utc};
-use num_decimal::Num;
-use std::str::FromStr;
-use std::sync::LazyLock;
+use rain_math_float::Float;
 use tracing::warn;
+
+use st0x_finance::Usd;
+use st0x_float_macro::float;
 
 use super::{BotGasChain, EthUsdPrice};
 use crate::onchain::pyth::{PythError, extract_pyth_price_at};
@@ -72,11 +69,9 @@ use crate::onchain::pyth::{PythError, extract_pyth_price_at};
 /// Descriptive source string persisted on every recorded cost fact.
 const PYTH_SOURCE: &str = "pyth:base:getPriceUnsafe";
 
-/// Built once and reused by `scale_price_to_num`'s exponent-scaling loop:
-/// constructed via `Num::from` (infallible integer conversion, unlike
-/// `Num::from_str`), so re-deriving them on every price read is wasted work.
-static TEN: LazyLock<Num> = LazyLock::new(|| Num::from(10_u8));
-static ONE: LazyLock<Num> = LazyLock::new(|| Num::from(1_u8));
+/// Reused by the exponent-scaling loop without runtime decimal parsing.
+const TEN: Float = float!(10);
+const ONE: Float = float!(1);
 
 /// A Pyth price older than this relative to the receipt's `occurred_at` is
 /// recorded with a warning rather than rejected (ADR 0017: record + warn, no
@@ -107,8 +102,12 @@ pub(crate) enum EthUsdValuationError {
     Decimal {
         value: String,
         #[source]
-        source: num_decimal::ParseNumError,
+        source: rain_math_float::FloatError,
     },
+    /// Scaling is bounded to 18 powers of ten over an `i64` mantissa, so
+    /// accepted Pyth inputs remain well within `Float`'s coefficient range.
+    #[error("ETH/USD valuation arithmetic failed: {0}")]
+    Arithmetic(#[from] rain_math_float::FloatError),
     #[error("invalid ETH/USD Pyth publish time {0}")]
     InvalidPublishTime(U256),
     #[error("ETH/USD Pyth price exponent {expo} outside the plausible range -18..=0")]
@@ -181,8 +180,8 @@ where
         );
     }
 
-    let value = scale_price_to_num(price.price, price.expo)?;
-    if !value.is_positive() {
+    let value = scale_price_to_float(price.price, price.expo)?;
+    if !value.gt(float!(0))? {
         return Err(EthUsdValuationError::NonPositivePrice {
             price: price.price,
             expo: price.expo,
@@ -190,41 +189,41 @@ where
     }
 
     Ok(EthUsdPrice {
-        price: value,
+        price: Usd::new(value),
         source: PYTH_SOURCE.to_owned(),
         observed_at,
         block_number: Some(block_number),
     })
 }
 
-fn parse_num(value: &str) -> Result<Num, EthUsdValuationError> {
-    Num::from_str(value).map_err(|source| EthUsdValuationError::Decimal {
+fn parse_float(value: &str) -> Result<Float, EthUsdValuationError> {
+    Float::parse(value.to_owned()).map_err(|source| EthUsdValuationError::Decimal {
         value: value.to_owned(),
         source,
     })
 }
 
-/// Scales a raw Pyth `(price, expo)` pair into a decimal `Num`, i.e.
-/// `price * 10^expo`. Exact (no floating point): `Num` is a rational type.
-fn scale_price_to_num(price: i64, expo: i32) -> Result<Num, EthUsdValuationError> {
+/// Scales a raw Pyth `(price, expo)` pair into `price * 10^expo`.
+///
+/// `Float` carries a 224-bit coefficient, so an ETH/USD price at Pyth's 10^-8
+/// exponent is represented without loss.
+fn scale_price_to_float(price: i64, expo: i32) -> Result<Float, EthUsdValuationError> {
     if !PLAUSIBLE_EXPO_RANGE.contains(&expo) {
         return Err(EthUsdValuationError::ExponentOutOfRange { expo });
     }
 
-    let mantissa = parse_num(&price.to_string())?;
+    let mantissa = parse_float(&price.to_string())?;
     if expo == 0 {
         return Ok(mantissa);
     }
 
-    let scale = (0..expo.unsigned_abs()).try_fold(ONE.clone(), |acc, _| {
-        Ok::<Num, EthUsdValuationError>(&acc * &*TEN)
-    })?;
+    let scale = (0..expo.unsigned_abs()).try_fold(ONE, |acc, _| acc * TEN)?;
 
     // `PLAUSIBLE_EXPO_RANGE` and the `expo == 0` early return above already
     // establish `expo < 0` here, so this only ever divides. Pyth's on-chain
     // prices use negative exponents (10^-8 for ETH/USD); a positive-exponent
     // feed would need `PLAUSIBLE_EXPO_RANGE` widened and this branch back.
-    Ok(&mantissa / &scale)
+    Ok((mantissa / scale)?)
 }
 
 #[cfg(test)]
@@ -240,6 +239,8 @@ mod tests {
 
     use st0x_evm::IPyth::getPriceUnsafeCall;
     use st0x_evm::PythStructs::Price;
+
+    use st0x_float_serde::format_float;
 
     use super::*;
 
@@ -290,7 +291,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.block_number, Some(123));
-        assert_eq!(result.price.to_string(), "2000");
+        assert_eq!(format_float(&result.price.inner()).unwrap(), "2000");
         assert_eq!(result.source, "pyth:base:getPriceUnsafe");
     }
 
@@ -409,7 +410,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result.price.to_string(), "1857.65949113");
+        assert_eq!(
+            format_float(&result.price.inner()).unwrap(),
+            "1857.65949113"
+        );
         assert_eq!(result.source, "pyth:base:getPriceUnsafe");
     }
 
@@ -573,14 +577,14 @@ mod tests {
     }
 
     #[test]
-    fn scale_price_to_num_accepts_the_real_eth_usd_exponent() {
-        let value = scale_price_to_num(200_000_000_000, -8).unwrap();
-        assert_eq!(value.to_string(), "2000");
+    fn scale_price_to_float_accepts_the_real_eth_usd_exponent() {
+        let value = scale_price_to_float(200_000_000_000, -8).unwrap();
+        assert_eq!(format_float(&value).unwrap(), "2000");
     }
 
     #[test]
-    fn scale_price_to_num_rejects_an_implausible_exponent() {
-        let error = scale_price_to_num(1, i32::MIN).unwrap_err();
+    fn scale_price_to_float_rejects_an_implausible_exponent() {
+        let error = scale_price_to_float(1, i32::MIN).unwrap_err();
 
         assert!(matches!(
             error,

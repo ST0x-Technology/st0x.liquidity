@@ -1,12 +1,13 @@
-use std::collections::{BTreeSet, HashMap};
-
 use chrono::{NaiveDate, SecondsFormat, TimeZone, Utc};
 use chrono_tz::America::New_York;
-use num_decimal::Num;
-use st0x_finance::Symbol;
+use std::collections::{BTreeSet, HashMap};
 use tracing::warn;
 
+use st0x_finance::Symbol;
+use st0x_float_macro::float;
+
 use super::parsing::fmt_decimal;
+use super::query::PnlError;
 use super::response::{PnlEntry, PnlWindow, PnlWindowSymbol};
 use super::sessions::{counter_trading_session_for_iso, date_key, market_session_for_iso};
 use super::state::PnlBucket;
@@ -47,7 +48,10 @@ fn et_day_boundary(date: &str, is_end: bool) -> String {
         )
 }
 
-pub(crate) fn build_windows(entries: &[PnlEntry], symbols: &[Symbol]) -> Vec<PnlWindow> {
+pub(crate) fn build_windows(
+    entries: &[PnlEntry],
+    symbols: &[Symbol],
+) -> Result<Vec<PnlWindow>, PnlError> {
     let mut by_date: HashMap<String, Vec<&PnlEntry>> = HashMap::new();
     for entry in entries {
         by_date
@@ -102,9 +106,9 @@ pub(crate) fn build_windows(entries: &[PnlEntry], symbols: &[Symbol]) -> Vec<Pnl
                         entries_by_symbol.get(symbol).map_or(&[][..], Vec::as_slice),
                     )
                 })
-                .collect();
+                .collect::<Result<Vec<_>, PnlError>>()?;
 
-            PnlWindow {
+            Ok(PnlWindow {
                 window_id: date.clone(),
                 start_at: et_day_boundary(&date, false),
                 end_at: et_day_boundary(&date, true),
@@ -114,39 +118,39 @@ pub(crate) fn build_windows(entries: &[PnlEntry], symbols: &[Symbol]) -> Vec<Pnl
                 counter_trading_session,
                 granularity: "day",
                 symbols: rows,
-            }
+            })
         })
         .collect()
 }
 
-fn window_symbol_row(symbol: &Symbol, entries: &[&PnlEntry]) -> PnlWindowSymbol {
-    let mut counter_trade = Num::default();
-    let mut onchain_netting = Num::default();
-    let directional_baseline = Num::default();
-    let mut directional_excess = Num::default();
+fn window_symbol_row(symbol: &Symbol, entries: &[&PnlEntry]) -> Result<PnlWindowSymbol, PnlError> {
+    let mut counter_trade = float!(0);
+    let mut onchain_netting = float!(0);
+    let directional_baseline = float!(0);
+    let mut directional_excess = float!(0);
 
     for entry in entries {
         if entry.symbol != *symbol {
             continue;
         }
-        let pnl = entry.realized_pnl_usd.clone();
+        let pnl = entry.realized_pnl_usd;
         match entry.pnl_bucket {
-            PnlBucket::CounterTrade => counter_trade += &pnl,
-            PnlBucket::OnchainNetting => onchain_netting += &pnl,
-            PnlBucket::DirectionalExposure => directional_excess += &pnl,
+            PnlBucket::CounterTrade => counter_trade = (counter_trade + pnl)?,
+            PnlBucket::OnchainNetting => onchain_netting = (onchain_netting + pnl)?,
+            PnlBucket::DirectionalExposure => directional_excess = (directional_excess + pnl)?,
         }
     }
 
-    let directional_exposure = &directional_baseline + &directional_excess;
+    let directional_exposure = (directional_baseline + directional_excess)?;
     let total =
-        &(&(&counter_trade + &onchain_netting) + &directional_baseline) + &directional_excess;
-    PnlWindowSymbol {
+        (((counter_trade + onchain_netting)? + directional_baseline)? + directional_excess)?;
+    Ok(PnlWindowSymbol {
         symbol: symbol.clone(),
-        counter_trade_pnl_usd: fmt_decimal(&counter_trade),
-        onchain_netting_pnl_usd: fmt_decimal(&onchain_netting),
-        directional_inventory_baseline_pnl_usd: fmt_decimal(&directional_baseline),
-        directional_imbalance_excess_pnl_usd: fmt_decimal(&directional_excess),
-        directional_exposure_pnl_usd: fmt_decimal(&directional_exposure),
-        total_pnl_usd: fmt_decimal(&total),
-    }
+        counter_trade_pnl_usd: fmt_decimal(counter_trade)?,
+        onchain_netting_pnl_usd: fmt_decimal(onchain_netting)?,
+        directional_inventory_baseline_pnl_usd: fmt_decimal(directional_baseline)?,
+        directional_imbalance_excess_pnl_usd: fmt_decimal(directional_excess)?,
+        directional_exposure_pnl_usd: fmt_decimal(directional_exposure)?,
+        total_pnl_usd: fmt_decimal(total)?,
+    })
 }

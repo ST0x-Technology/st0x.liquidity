@@ -1,4 +1,7 @@
 //! Backend PnL report builder for the dashboard.
+use rain_math_float::Float;
+
+use st0x_float_macro::float;
 
 mod builder;
 mod costs;
@@ -18,12 +21,20 @@ mod tests;
 
 pub(crate) use query::{PnlError, PnlQuery};
 pub(crate) use response::PnlResponse;
-pub(crate) use source::{build_pnl_report, validate_pnl_snapshot_rowid};
+#[cfg(test)]
+pub(crate) use source::{MAX_CONCURRENT_PNL_REPORTS, build_pnl_report};
+pub(crate) use source::{
+    PnlReportAdmission, acquire_pnl_report_permit, build_pnl_report_with_permit,
+    pnl_report_admission, validate_pnl_snapshot_rowid,
+};
 
 const ATTRIBUTION_METHOD: &str = "backend_position_fill_replay_fifo";
 const COUNTER_TRADE_THRESHOLD_SECONDS: i64 = 300;
 const SAFE_SYMBOL_CHARS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
-const EPSILON: &str = "0.000001";
+/// Tolerance for the replay's self-audit comparisons. Resolved at compile
+/// time, so a malformed literal is a build failure rather than a panic in a
+/// request handler.
+const EPSILON: Float = float!(0.000001);
 
 const ATTRIBUTION_WARNING: &str = "PnL source: realized gross replay from persisted backend fill events. Fills are ordered by \
      execution timestamp and replayed through per-symbol FIFO inventory lots for accounting and \

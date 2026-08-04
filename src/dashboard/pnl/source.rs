@@ -4,15 +4,20 @@ use chrono_tz::America::New_York;
 use rain_math_float::Float;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task;
 
 use st0x_execution::alpaca_broker_api::AccountActivity;
 use st0x_float_serde::format_float;
 
 use crate::bot_gas::BotGasReceiptCostEvent;
-use crate::portfolio_snapshot::{CAPTURE_BUFFER, EtDayRange, capital_summary, load_portfolio_days};
+use crate::portfolio_snapshot::{
+    CAPTURE_BUFFER, EtDayRange, capital_summary, evaluate_portfolio_days, load_portfolio_day_rows,
+};
 
 use super::builder::build_pnl_response_from_rows;
-use super::parsing::{fmt_decimal, parse_payload_string};
+use super::parsing::parse_payload_string;
 use super::query::{PnlError, PnlQuery};
 use super::response::{PnlCapitalSummary, PnlResponse};
 use super::state::{BotGasCostRow, CostEventRow, PositionEventRow, PositionViewRow};
@@ -21,11 +26,75 @@ use super::{
     COST_WARNING, SYMBOL_FILTERED_CAPITAL_WARNING,
 };
 
+pub(crate) const MAX_CONCURRENT_PNL_REPORTS: usize = 2;
+
+#[derive(Clone)]
+pub(crate) struct PnlReportAdmission(Arc<Semaphore>);
+
+impl PnlReportAdmission {
+    fn new() -> Self {
+        Self(Arc::new(Semaphore::new(MAX_CONCURRENT_PNL_REPORTS)))
+    }
+
+    fn try_acquire(&self) -> Result<OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+        self.0.clone().try_acquire_owned()
+    }
+}
+
+pub(crate) fn pnl_report_admission() -> PnlReportAdmission {
+    PnlReportAdmission::new()
+}
+
+pub(crate) fn acquire_pnl_report_permit(
+    admission: &PnlReportAdmission,
+) -> Result<OwnedSemaphorePermit, PnlError> {
+    Ok(admission.try_acquire()?)
+}
+
+pub(super) async fn run_pnl_replay_with_permit<T, F>(
+    permit: OwnedSemaphorePermit,
+    replay: F,
+) -> Result<(T, OwnedSemaphorePermit), PnlError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, PnlError> + Send + 'static,
+{
+    let (result, permit) = task::spawn_blocking(move || (replay(), permit)).await?;
+
+    Ok((result?, permit))
+}
+
+#[cfg(test)]
+pub(super) async fn run_pnl_replay<T, F>(replay: F) -> Result<T, PnlError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, PnlError> + Send + 'static,
+{
+    let admission = pnl_report_admission();
+    let permit = acquire_pnl_report_permit(&admission)?;
+    run_pnl_replay_with_permit(permit, replay)
+        .await
+        .map(|(result, _permit)| result)
+}
+
+#[cfg(test)]
 pub(crate) async fn build_pnl_report(
     pool: &SqlitePool,
     query: &PnlQuery,
     alpaca_activities: Vec<AccountActivity>,
     now: DateTime<Utc>,
+) -> Result<PnlResponse, PnlError> {
+    let admission = pnl_report_admission();
+    let permit = acquire_pnl_report_permit(&admission)?;
+    build_pnl_report_with_permit(pool, query, alpaca_activities, now, permit).await
+}
+
+pub(crate) async fn build_pnl_report_with_permit(
+    pool: &SqlitePool,
+    query: &PnlQuery,
+    alpaca_activities: Vec<AccountActivity>,
+    now: DateTime<Utc>,
+    permit: OwnedSemaphorePermit,
 ) -> Result<PnlResponse, PnlError> {
     let mut warnings = vec![
         ATTRIBUTION_WARNING.to_owned(),
@@ -46,16 +115,21 @@ pub(crate) async fn build_pnl_report(
     let bot_gas_rows = load_bot_gas_costs(&mut tx, resolved_rowid.resolved).await?;
     tx.commit().await?;
 
-    let (mut response, daily_net_realized_pnl_usd) = build_pnl_response_from_rows(
-        event_rows,
-        &position_rows,
-        &cost_rows,
-        &bot_gas_rows,
-        &alpaca_activities,
-        &effective_query,
-        &symbols,
-        warnings,
-    )?;
+    let replay_symbols = symbols.clone();
+    let ((mut response, daily_net_realized_pnl_usd), permit) =
+        run_pnl_replay_with_permit(permit, move || {
+            build_pnl_response_from_rows(
+                event_rows,
+                &position_rows,
+                &cost_rows,
+                &bot_gas_rows,
+                &alpaca_activities,
+                &effective_query,
+                &replay_symbols,
+                warnings,
+            )
+        })
+        .await?;
 
     apply_capital_summary(
         pool,
@@ -65,6 +139,7 @@ pub(crate) async fn build_pnl_report(
         &daily_net_realized_pnl_usd,
         &mut response,
         now,
+        permit,
     )
     .await?;
 
@@ -86,9 +161,10 @@ async fn apply_capital_summary(
     query: &PnlQuery,
     resolved_rowid: &ResolvedRowid,
     symbols: &BTreeSet<String>,
-    daily_net_realized_pnl_usd: &BTreeMap<NaiveDate, num_decimal::Num>,
+    daily_net_realized_pnl_usd: &BTreeMap<NaiveDate, Float>,
     response: &mut PnlResponse,
     now: DateTime<Utc>,
+    permit: OwnedSemaphorePermit,
 ) -> Result<(), PnlError> {
     if resolved_rowid.resolved != resolved_rowid.max {
         response.warnings.push(format!(
@@ -119,48 +195,50 @@ async fn apply_capital_summary(
         latest_capture_day(now)?,
     )
     .await?;
-    let days = load_portfolio_days(pool, et_day_range).await?;
-    let daily_net_realized_pnl_usd = daily_net_realized_pnl_usd
-        .iter()
-        .map(|(day, pnl)| Ok((*day, Float::parse(fmt_decimal(pnl))?)))
-        .collect::<Result<BTreeMap<_, _>, PnlError>>()?;
-    let capital = capital_summary(&days, &daily_net_realized_pnl_usd)?;
+    let day_rows = load_portfolio_day_rows(pool, et_day_range).await?;
+    let daily_net_realized_pnl_usd = daily_net_realized_pnl_usd.clone();
+    let (((capital_summary, capital_warnings), capital_note), _permit) =
+        run_pnl_replay_with_permit(permit, move || {
+            let days = evaluate_portfolio_days(day_rows)?;
+            let capital = capital_summary(&days, &daily_net_realized_pnl_usd)?;
+            let capital_note = if capital.average_deployed_capital_usd.is_some() {
+                CAPITAL_AVAILABLE_NOTE
+            } else {
+                CAPITAL_UNAVAILABLE_NOTE
+            };
+            let capital_response = PnlCapitalSummary {
+                average_deployed_capital_usd: capital
+                    .average_deployed_capital_usd
+                    .as_ref()
+                    .map(format_float)
+                    .transpose()?,
+                annualized_return_pct: capital
+                    .annualized_return_pct
+                    .as_ref()
+                    .map(format_float)
+                    .transpose()?,
+                coverage_days: capital.coverage_days,
+                sample_days: capital.sample_days,
+                first_snapshot_day: capital.first_snapshot_day.map(|day| day.to_string()),
+                last_snapshot_day: capital.last_snapshot_day.map(|day| day.to_string()),
+                excluded_days: capital
+                    .excluded_days
+                    .into_iter()
+                    .map(|day| super::response::PnlCapitalExcludedDay {
+                        et_day: day.et_day.to_string(),
+                        kind: day.reason.kind(),
+                        reason: day.reason.describe(),
+                    })
+                    .collect(),
+            };
 
-    response.warnings.extend(capital.warnings);
-    response.warnings.push(
-        if capital.average_deployed_capital_usd.is_some() {
-            CAPITAL_AVAILABLE_NOTE
-        } else {
-            CAPITAL_UNAVAILABLE_NOTE
-        }
-        .to_owned(),
-    );
+            Ok(((capital_response, capital.warnings), capital_note))
+        })
+        .await?;
 
-    response.capital = PnlCapitalSummary {
-        average_deployed_capital_usd: capital
-            .average_deployed_capital_usd
-            .as_ref()
-            .map(format_float)
-            .transpose()?,
-        annualized_return_pct: capital
-            .annualized_return_pct
-            .as_ref()
-            .map(format_float)
-            .transpose()?,
-        coverage_days: capital.coverage_days,
-        sample_days: capital.sample_days,
-        first_snapshot_day: capital.first_snapshot_day.map(|day| day.to_string()),
-        last_snapshot_day: capital.last_snapshot_day.map(|day| day.to_string()),
-        excluded_days: capital
-            .excluded_days
-            .into_iter()
-            .map(|day| super::response::PnlCapitalExcludedDay {
-                et_day: day.et_day.to_string(),
-                kind: day.reason.kind(),
-                reason: day.reason.describe(),
-            })
-            .collect(),
-    };
+    response.warnings.extend(capital_warnings);
+    response.warnings.push(capital_note.to_owned());
+    response.capital = capital_summary;
 
     Ok(())
 }
@@ -182,7 +260,7 @@ pub(crate) fn latest_capture_day(now: DateTime<Utc>) -> Result<NaiveDate, PnlErr
 async fn complete_capital_range(
     pool: &SqlitePool,
     mut range: EtDayRange,
-    daily_net_realized_pnl_usd: &BTreeMap<NaiveDate, num_decimal::Num>,
+    daily_net_realized_pnl_usd: &BTreeMap<NaiveDate, Float>,
     report_through: NaiveDate,
 ) -> Result<EtDayRange, PnlError> {
     if range.from.is_none() {
@@ -428,7 +506,7 @@ async fn load_bot_gas_costs(
             rowid,
             chain: cost.chain.to_string(),
             tx_hash: cost.tx_hash.to_string(),
-            usd_cost: cost.usd_cost.to_string(),
+            usd_cost: format_float(&cost.usd_cost.inner())?,
             operation_category: cost.operation_category.to_string(),
             symbol: cost.symbol.map(|symbol| symbol.to_string()),
             occurred_at: cost.occurred_at.to_rfc3339(),
