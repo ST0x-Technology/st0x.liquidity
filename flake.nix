@@ -349,6 +349,13 @@
                   datasette="while [ ! -f $db_path ]; do sleep 1; done; \
                     exec datasette serve $db_path -p $datasette_port -h 127.0.0.1"
 
+                  # Generated TS bindings are gitignored and nothing in this
+                  # flow refreshes them, so a worktree that predates a DTO
+                  # change serves stale bindings -- e.g. a Statement guard
+                  # missing newer variants makes the dashboard reject every
+                  # live WebSocket message in an endless reconnect loop.
+                  ${rust.st0x-dto}/bin/st0x-dto dashboard/src/lib/api
+
                   exec mprocs "$backend" "$dashboard" "$mockApi" "$datasette"
                 '';
               };
