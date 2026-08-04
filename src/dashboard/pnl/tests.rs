@@ -2741,6 +2741,52 @@ async fn build_pnl_report_populates_capital_when_snapshots_exist() {
     );
 }
 
+/// Fill shares and prices carry full `Float` precision, so the exact
+/// rational daily PnL (`shares x spread`) can need more significant digits
+/// than `Float` can represent at all (>76). The capital computation converts
+/// that value to `Float`; the conversion must not fail the whole report with
+/// `ParseDecimalOverflow` (surfaces as `PnlError::CapitalFloat`).
+#[tokio::test]
+async fn high_precision_daily_pnl_does_not_fail_capital_computation() {
+    let shares = "0.1234567890123456789012345678901234567891";
+    let sell_price = "150.1111111111111111111111111111111111111111";
+    let pool = pnl_test_pool(
+        vec![
+            onchain_fill(
+                1,
+                "RKLB",
+                "Sell",
+                sell_price,
+                shares,
+                "2026-05-15T14:00:00Z",
+            ),
+            offchain_fill(2, "RKLB", "Buy", "2026-05-15T14:01:00Z", "150", shares),
+        ],
+        position_rows(),
+    )
+    .await;
+    insert_portfolio_snapshot_row(
+        &pool,
+        "2026-05-15",
+        "market_making",
+        "USDC",
+        "1000",
+        Some("1"),
+        Some("2026-05-15T04:05:00+00:00"),
+    )
+    .await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.capital.average_deployed_capital_usd,
+        Some("1000".to_owned())
+    );
+    assert_eq!(report.capital.sample_days, 1);
+}
+
 #[tokio::test]
 async fn return_uses_only_pnl_from_days_with_usable_capital() {
     let pool = pnl_test_pool(
