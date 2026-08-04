@@ -7,8 +7,8 @@ use st0x_finance::{Symbol, Usd};
 use st0x_float_macro::float;
 
 use super::parsing::{
-    fmt_decimal, is_safe_symbol, nested_record, parse_internal_decimal, persisted_decimal_value,
-    text_field,
+    fmt_decimal, is_safe_symbol, nested_record, optional_persisted_decimal_value,
+    parse_internal_decimal, persisted_decimal_value, text_field,
 };
 use super::query::{PnlError, PnlFinancialFieldError};
 use super::response::{PnlCostCoverage, PnlCostSummary, PnlSummary};
@@ -525,11 +525,24 @@ fn cost_entry(
     })
 }
 
+/// One `TokenizedEquityMint` event's contribution to the cost ledger.
+enum MintCostObservation {
+    /// Event carries no fee entry: requests, intermediate steps, or a
+    /// terminal event that reported an explicit zero fee.
+    NoEntry,
+    /// Terminal event whose `fees` field (an `Option<Float>` in the event
+    /// schema, "if reported") was not reported by the provider. No entry,
+    /// but the report surfaces it via `missing_cost_observation_count`
+    /// instead of failing wholesale.
+    FeesNotReported,
+    Entry(CostEntryInternal),
+}
+
 fn parse_tokenized_equity_mint_cost_event(
     row: &CostEventRow,
     symbols_by_mint_aggregate: &mut HashMap<String, Symbol>,
     warnings: &mut Vec<String>,
-) -> Result<Option<CostEntryInternal>, PnlError> {
+) -> Result<MintCostObservation, PnlError> {
     if row.event_type == "TokenizedEquityMintEvent::MintRequested" {
         let requested = nested_record(&row.payload, "MintRequested");
         let symbol = requested.and_then(|payload| text_field(payload, "symbol"));
@@ -544,13 +557,13 @@ fn parse_tokenized_equity_mint_cost_event(
                 ));
             }
         }
-        return Ok(None);
+        return Ok(MintCostObservation::NoEntry);
     }
 
     let terminal_key = match row.event_type.as_str() {
         "TokenizedEquityMintEvent::TokensReceived" => "TokensReceived",
         "TokenizedEquityMintEvent::ProviderCompletionRecovered" => "ProviderCompletionRecovered",
-        _ => return Ok(None),
+        _ => return Ok(MintCostObservation::NoEntry),
     };
 
     let Some(terminal) = nested_record(&row.payload, terminal_key) else {
@@ -565,7 +578,10 @@ fn parse_tokenized_equity_mint_cost_event(
     } else {
         text_field(terminal, "recovered_at")
     };
-    let fees = persisted_decimal_value(
+    // `fees` is `Option<Float>` in the event schema ("if reported") with
+    // `#[serde(default)]`, so both an explicit null and an absent key are
+    // legitimate persisted shapes meaning "provider did not report fees".
+    let fees = optional_persisted_decimal_value(
         row.rowid,
         "TokenizedEquityMint",
         row.event_type.clone(),
@@ -580,11 +596,11 @@ fn parse_tokenized_equity_mint_cost_event(
     };
 
     let Some(fees) = fees else {
-        return Err(malformed_cost_payload(row, "missing tokenization fees"));
+        return Ok(MintCostObservation::FeesNotReported);
     };
 
     if fees.is_zero()? {
-        return Ok(None);
+        return Ok(MintCostObservation::NoEntry);
     }
 
     let entry = cost_entry(
@@ -594,7 +610,7 @@ fn parse_tokenized_equity_mint_cost_event(
         occurred_at,
         symbols_by_mint_aggregate.get(&row.aggregate_id).cloned(),
     )?;
-    Ok(Some(entry))
+    Ok(MintCostObservation::Entry(entry))
 }
 
 fn parse_usdc_rebalance_cost_event(
@@ -658,7 +674,8 @@ pub(crate) fn build_cost_entries(
     let mut entries = Vec::new();
     let mut symbols_by_mint_aggregate = HashMap::new();
     let mut counted_tokenization_fee_aggregates = HashSet::new();
-    let missing_cost_observation_count = 0;
+    let mut unreported_fee_aggregates = HashSet::new();
+    let mut missing_cost_observation_count = 0;
     let mut sorted = rows.to_vec();
     sorted.sort_by_key(|row| row.rowid);
 
@@ -673,19 +690,26 @@ pub(crate) fn build_cost_entries(
 
         match row.aggregate_type.as_str() {
             "TokenizedEquityMint" => {
-                let entry = parse_tokenized_equity_mint_cost_event(
+                match parse_tokenized_equity_mint_cost_event(
                     &row,
                     &mut symbols_by_mint_aggregate,
                     warnings,
-                )?;
-                if let Some(entry) = entry {
-                    if counted_tokenization_fee_aggregates.insert(row.aggregate_id.clone()) {
-                        entries.push(entry);
-                    } else {
-                        warnings.push(format!(
-                            "Skipped duplicate tokenization fee for mint aggregate {}",
-                            row.aggregate_id
-                        ));
+                )? {
+                    MintCostObservation::NoEntry => {}
+                    MintCostObservation::FeesNotReported => {
+                        if unreported_fee_aggregates.insert(row.aggregate_id.clone()) {
+                            missing_cost_observation_count += 1;
+                        }
+                    }
+                    MintCostObservation::Entry(entry) => {
+                        if counted_tokenization_fee_aggregates.insert(row.aggregate_id.clone()) {
+                            entries.push(entry);
+                        } else {
+                            warnings.push(format!(
+                                "Skipped duplicate tokenization fee for mint aggregate {}",
+                                row.aggregate_id
+                            ));
+                        }
                     }
                 }
             }
