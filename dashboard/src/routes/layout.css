@@ -5,6 +5,7 @@
 @custom-variant dark (&:is(.dark *));
 
 :root {
+  color-scheme: light;
   --radius: 0.625rem;
   --background: oklch(1 0 0);
   --foreground: oklch(0.141 0.005 285.823);
@@ -37,9 +38,25 @@
   --sidebar-accent-foreground: oklch(0.21 0.006 285.885);
   --sidebar-border: oklch(0.92 0.004 286.32);
   --sidebar-ring: oklch(0.705 0.015 286.067);
+  --chart-slate: #475569;
+  --chart-sky: #0284c7;
+  --chart-emerald: #059669;
+  --chart-red: #dc2626;
+  --chart-amber: #d97706;
+  --chart-purple: #9333ea;
+  --chart-orange: #ea580c;
+  --chart-indigo: #4f46e5;
+  --chart-pink: #db2777;
+  --chart-yellow: #ca8a04;
+  --chart-cyan: #0891b2;
+  --chart-lime: #65a30d;
+  --chart-green: #16a34a;
+  --chart-rose: #e11d48;
+  --chart-violet: #7c3aed;
 }
 
 .dark {
+  color-scheme: dark;
   --background: oklch(0.141 0.005 285.823);
   --foreground: oklch(0.985 0 0);
   --card: oklch(0.21 0.006 285.885);
@@ -71,6 +88,21 @@
   --sidebar-accent-foreground: oklch(0.985 0 0);
   --sidebar-border: oklch(1 0 0 / 10%);
   --sidebar-ring: oklch(0.552 0.016 285.938);
+  --chart-slate: #64748b;
+  --chart-sky: #38bdf8;
+  --chart-emerald: #34d399;
+  --chart-red: #f87171;
+  --chart-amber: #fbbf24;
+  --chart-purple: #c084fc;
+  --chart-orange: #fb923c;
+  --chart-indigo: #818cf8;
+  --chart-pink: #f472b6;
+  --chart-yellow: #facc15;
+  --chart-cyan: #22d3ee;
+  --chart-lime: #a3e635;
+  --chart-green: #22c55e;
+  --chart-rose: #f43f5e;
+  --chart-violet: #a78bfa;
 }
 
 @theme inline {

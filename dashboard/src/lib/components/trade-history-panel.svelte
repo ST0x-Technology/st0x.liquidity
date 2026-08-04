@@ -84,9 +84,9 @@
   const venueColor = (venue: string): string => {
     switch (venue) {
       case 'raindex':
-        return 'text-blue-400'
+        return 'text-blue-600 dark:text-blue-400'
       case 'alpaca':
-        return 'text-amber-400'
+        return 'text-amber-600 dark:text-amber-400'
       case 'dry_run':
         return 'text-muted-foreground'
       default:
@@ -649,7 +649,7 @@
                 href={getExplorerTxUrl(txHash)}
                 target="_blank"
                 rel="noopener noreferrer"
-                class="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300"
+                class="inline-flex items-center gap-1 text-blue-600 hover:text-blue-500 dark:text-blue-400 dark:hover:text-blue-300"
               >
                 {txHash.slice(0, 10)}...{txHash.slice(-8)}
                 <svg
@@ -723,7 +723,7 @@
                             href={getExplorerTxUrl(value)}
                             target="_blank"
                             rel="noopener noreferrer"
-                            class="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300"
+                            class="inline-flex items-center gap-1 text-blue-600 hover:text-blue-500 dark:text-blue-400 dark:hover:text-blue-300"
                           >
                             {value.slice(0, 10)}...{value.slice(-8)}
                             <svg
