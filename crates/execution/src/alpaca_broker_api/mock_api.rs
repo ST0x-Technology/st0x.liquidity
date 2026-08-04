@@ -2021,7 +2021,7 @@ mod tests {
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
     use crate::alpaca_broker_api::client::AlpacaBrokerApiClient;
-    use crate::alpaca_broker_api::{TimeInForce, market_hours};
+    use crate::alpaca_broker_api::{AccountActivitiesQuery, TimeInForce, market_hours};
     use crate::{MarketSession, Symbol};
     use st0x_float_macro::float;
 
@@ -2079,6 +2079,36 @@ mod tests {
             MarketSession::Closed,
             "market_session_at must return Closed when the calendar is set closed"
         );
+    }
+
+    /// The dashboard's `/pnl` endpoint fetches account activities (fees,
+    /// dividends, margin interest) live from the broker on every request, so
+    /// the mock must serve `/v1/accounts/activities` -- otherwise every PnL
+    /// report against the simulated stack fails with a 502 instead of
+    /// rendering.
+    #[tokio::test]
+    async fn pnl_activities_fetch_returns_empty_against_the_mock() {
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+
+        let ctx = AlpacaBrokerApiCtx {
+            api_key: TEST_API_KEY.to_string(),
+            api_secret: TEST_API_SECRET.to_string(),
+            account_id: AlpacaAccountId::new(Uuid::parse_str(TEST_ACCOUNT_ID).unwrap()),
+            mode: Some(AlpacaBrokerApiMode::Mock(mock.base_url())),
+            asset_cache_ttl: Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        };
+
+        let activities = ctx
+            .fetch_account_activities(&AccountActivitiesQuery::pnl(None, None))
+            .await
+            .unwrap();
+        assert_eq!(activities.len(), 0);
     }
 
     /// Places one order per rotation step and polls each to its terminal
