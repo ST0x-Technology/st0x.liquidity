@@ -14,7 +14,7 @@ use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolEvent;
 use bon::bon;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use chrono_tz::America::New_York;
 use httpmock::prelude::*;
 use serde_json::{Value, json};
@@ -190,6 +190,26 @@ struct MockWalletTransfer {
     polls_until_complete: usize,
 }
 
+/// Flat synthetic broker fee recorded per executed fill, as the signed
+/// `net_amount` the real API reports (negative = cash decrease). Obviously
+/// fake on purpose: enough for `/pnl` to classify a broker fee per fill
+/// without modeling Alpaca's real fee schedule.
+const MOCK_FILL_FEE_USD: &str = "-0.1";
+
+/// A broker account activity served by `/v1/accounts/activities`.
+///
+/// The mock records one FEE activity per executed fill so PnL reports built
+/// against the simulated stack exercise the broker-fee cost path with
+/// non-zero tracked costs; tests and simulations can seed further rows
+/// (dividends, interest) via [`AlpacaBrokerMock::push_activity`].
+struct MockActivity {
+    id: String,
+    activity_type: String,
+    net_amount: String,
+    symbol: Option<String>,
+    transaction_time: DateTime<Utc>,
+}
+
 struct MockState {
     account: MockAccount,
     orders: HashMap<String, MockOrder>,
@@ -229,6 +249,10 @@ struct MockState {
     /// session/credential expiry mid-request where the broker never
     /// processed the placement. Decrements per request until zero.
     unauthorized_placement_failures_remaining: usize,
+    /// Broker-side account-activity ledger, in ascending insertion order
+    /// (ids are monotonic and double as pagination cursors). Fills append
+    /// FEE rows; [`AlpacaBrokerMock::push_activity`] seeds arbitrary rows.
+    activities: Vec<MockActivity>,
 }
 
 /// Status of a whitelisted address.
@@ -388,6 +412,7 @@ impl AlpacaBrokerMock {
             transient_placement_failures_remaining: 0,
             calendar_failures_remaining: 0,
             unauthorized_placement_failures_remaining: 0,
+            activities: Vec::new(),
         }));
 
         let server = MockServer::start_async().await;
@@ -457,6 +482,26 @@ impl AlpacaBrokerMock {
     /// this reached zero to prove the 401 was actually served.
     pub fn unauthorized_placement_failures_remaining(&self) -> usize {
         lock(&self.state).unauthorized_placement_failures_remaining
+    }
+
+    /// Appends an arbitrary account activity to the broker-side ledger
+    /// served by `/v1/accounts/activities`. Lets tests and simulations
+    /// seed non-fee rows (dividends, margin interest) without driving
+    /// fills.
+    pub fn push_activity(
+        &self,
+        activity_type: &str,
+        net_amount: &str,
+        symbol: Option<Symbol>,
+        transaction_time: DateTime<Utc>,
+    ) {
+        push_state_activity(
+            &mut lock(&self.state),
+            activity_type,
+            net_amount,
+            symbol.map(|symbol| symbol.to_string()),
+            transaction_time,
+        );
     }
 
     /// Sets a per-symbol fill delay: the order stays "new" for
@@ -823,6 +868,7 @@ fn subtract_wallet_balance(
 /// Registers all dynamic endpoints on the mock server.
 fn register_endpoints(server: &MockServer, state: &Arc<Mutex<MockState>>) {
     register_account_endpoint(server, state);
+    register_activities_endpoint(server, state);
     register_calendar_endpoint(server, state);
     register_positions_endpoint(server, state);
     register_wallet_get_endpoint(server, state);
@@ -856,6 +902,82 @@ fn register_account_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>)
             )
         });
     });
+}
+
+/// Serves `/v1/accounts/activities` from the mock's activity ledger, honoring
+/// the query params the production client sends: `activity_types` (comma
+/// list), `after` / `until` (RFC3339, exclusive bounds on
+/// `transaction_time`), `page_size`, and `page_token` (the id of the last
+/// activity of the previous page; the next page starts strictly after it).
+/// Without this endpoint every `/pnl` request against the mock fails with a
+/// 502 instead of rendering.
+fn register_activities_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+    let state = Arc::clone(state);
+    server.mock(|when, then| {
+        when.method(GET).path("/v1/accounts/activities");
+        then.respond_with(move |request: &HttpMockRequest| {
+            let query: HashMap<_, _> =
+                url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
+                    .into_owned()
+                    .collect();
+
+            let activity_types: Option<Vec<&str>> = query
+                .get("activity_types")
+                .map(|types| types.split(',').collect());
+            let after = query.get("after").and_then(|value| parse_rfc3339(value));
+            let until = query.get("until").and_then(|value| parse_rfc3339(value));
+            let page_size = query
+                .get("page_size")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(100);
+            let page_token = query.get("page_token");
+
+            let state = lock(&state);
+            let matching: Vec<&MockActivity> = state
+                .activities
+                .iter()
+                .filter(|activity| {
+                    activity_types
+                        .as_ref()
+                        .is_none_or(|types| types.contains(&activity.activity_type.as_str()))
+                })
+                .filter(|activity| after.is_none_or(|after| activity.transaction_time > after))
+                .filter(|activity| until.is_none_or(|until| activity.transaction_time < until))
+                .collect();
+            // An unknown token yields an empty page rather than an error --
+            // matching "no activities after this cursor".
+            let page_start = page_token.map_or(0, |token| {
+                matching
+                    .iter()
+                    .position(|activity| &activity.id == token)
+                    .map_or(matching.len(), |position| position + 1)
+            });
+            let page: Vec<Value> = matching
+                .iter()
+                .skip(page_start)
+                .take(page_size)
+                .map(|activity| {
+                    json!({
+                        "id": activity.id,
+                        "activity_type": activity.activity_type,
+                        "net_amount": activity.net_amount,
+                        "symbol": activity.symbol,
+                        "transaction_time": activity.transaction_time.to_rfc3339(),
+                    })
+                })
+                .collect();
+            drop(state);
+
+            json_response(200, &Value::Array(page))
+        });
+    });
+}
+
+/// Parses an RFC3339 query-param timestamp, dropping unparseable values.
+fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|parsed| parsed.with_timezone(&Utc))
 }
 
 fn register_calendar_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
@@ -1542,6 +1664,18 @@ fn apply_fill(
         order.filled_price = Some(fill_price);
     }
 
+    // One FEE activity per executed fill (full or partial). Ledger-only: the
+    // amount is NOT deducted from mock cash, so e2e balance-convergence
+    // assertions are unaffected while /pnl still sees a broker fee to
+    // classify.
+    push_state_activity(
+        state,
+        "FEE",
+        MOCK_FILL_FEE_USD,
+        Some(symbol_key.to_string()),
+        Utc::now(),
+    );
+
     match side {
         OrderSide::Buy => {
             state.account.cash = (state.account.cash - cost)?;
@@ -1574,6 +1708,25 @@ fn apply_fill(
     }
 
     Ok(())
+}
+
+/// Appends an activity with a monotonic id; insertion order is ascending
+/// serve order, and the id doubles as the pagination cursor.
+fn push_state_activity(
+    state: &mut MockState,
+    activity_type: &str,
+    net_amount: &str,
+    symbol: Option<String>,
+    transaction_time: DateTime<Utc>,
+) {
+    let id = format!("mock-activity-{:06}", state.activities.len() + 1);
+    state.activities.push(MockActivity {
+        id,
+        activity_type: activity_type.to_string(),
+        net_amount: net_amount.to_string(),
+        symbol,
+        transaction_time,
+    });
 }
 
 fn register_whitelist_get_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
@@ -2006,7 +2159,7 @@ mod tests {
     use std::time::Duration;
 
     use alloy::primitives::{Address, U256};
-    use chrono::{NaiveTime, Utc};
+    use chrono::{NaiveTime, TimeZone, Utc};
     use chrono_tz::America::New_York;
     use uuid::Uuid;
 
@@ -2106,6 +2259,120 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(activities.len(), 0);
+    }
+
+    /// Broker-API context pointed at the given mock, for driving the
+    /// account-activities client against it.
+    fn activities_ctx(mock: &AlpacaBrokerMock) -> AlpacaBrokerApiCtx {
+        AlpacaBrokerApiCtx {
+            api_key: TEST_API_KEY.to_string(),
+            api_secret: TEST_API_SECRET.to_string(),
+            account_id: AlpacaAccountId::new(Uuid::parse_str(TEST_ACCOUNT_ID).unwrap()),
+            mode: Some(AlpacaBrokerApiMode::Mock(mock.base_url())),
+            asset_cache_ttl: Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        }
+    }
+
+    /// Every executed fill leaves a broker-fee activity in the ledger, so a
+    /// simulated PnL report classifies non-zero Alpaca fees instead of
+    /// rendering every broker cost bucket as `not_ingested`.
+    #[tokio::test]
+    async fn fill_records_a_fee_activity() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![(symbol, float!(150))])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+
+        let client = reqwest::Client::new();
+        let orders_url = format!(
+            "{}/v1/trading/accounts/{TEST_ACCOUNT_ID}/orders",
+            mock.base_url()
+        );
+        let placed: serde_json::Value = client
+            .post(&orders_url)
+            .json(&serde_json::json!({
+                "symbol": "AAPL",
+                "qty": "4",
+                "side": "buy",
+                "client_order_id": "fee-fill",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let order_id = placed["id"].as_str().unwrap();
+        // HappyPath with no configured delay fills on the first poll.
+        client
+            .get(format!("{orders_url}/{order_id}"))
+            .send()
+            .await
+            .unwrap();
+
+        let activities = activities_ctx(&mock)
+            .fetch_account_activities(&AccountActivitiesQuery::pnl(None, None))
+            .await
+            .unwrap();
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].activity_type, "FEE");
+        assert_eq!(activities[0].net_amount.as_deref(), Some("-0.1"));
+        assert_eq!(activities[0].symbol.as_deref(), Some("AAPL"));
+    }
+
+    /// The endpoint honors the filters the production client sends: only
+    /// requested `activity_types` come back, and `after` is an exclusive
+    /// bound on `transaction_time`.
+    #[tokio::test]
+    async fn activities_respect_type_and_time_filters() {
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let at = |day: u32| Utc.with_ymd_and_hms(2026, 1, day, 12, 0, 0).unwrap();
+        mock.push_activity("FEE", "-0.5", Some(symbol.clone()), at(1));
+        mock.push_activity("INT", "-2", None, at(2));
+        mock.push_activity("FEE", "-0.7", Some(symbol), at(3));
+
+        let fees = activities_ctx(&mock)
+            .fetch_account_activities(&AccountActivitiesQuery {
+                activity_types: vec!["FEE".to_string()],
+                after: Some(at(1)),
+                until: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(fees.len(), 1);
+        assert_eq!(fees[0].net_amount.as_deref(), Some("-0.7"));
+    }
+
+    /// A ledger larger than one page round-trips through the client's
+    /// `page_token` pagination without tripping its pagination-invariant
+    /// checks.
+    #[tokio::test]
+    async fn activities_paginate_beyond_one_page() {
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        for _ in 0..101 {
+            mock.push_activity("FEE", "-0.1", Some(symbol.clone()), Utc::now());
+        }
+
+        let activities = activities_ctx(&mock)
+            .fetch_account_activities(&AccountActivitiesQuery::pnl(None, None))
+            .await
+            .unwrap();
+        assert_eq!(activities.len(), 101);
+        assert_eq!(activities[100].id, "mock-activity-000101");
     }
 
     /// Places one order per rotation step and polls each to its terminal
@@ -2287,6 +2554,7 @@ mod tests {
             transient_placement_failures_remaining: 0,
             calendar_failures_remaining: 0,
             unauthorized_placement_failures_remaining: 0,
+            activities: vec![],
         };
 
         let response = handle_crypto_order(
@@ -2335,6 +2603,7 @@ mod tests {
             transient_placement_failures_remaining: 0,
             calendar_failures_remaining: 0,
             unauthorized_placement_failures_remaining: 0,
+            activities: vec![],
         };
 
         let response = handle_crypto_order(
@@ -2390,6 +2659,7 @@ mod tests {
             transient_placement_failures_remaining: 0,
             calendar_failures_remaining: 0,
             unauthorized_placement_failures_remaining: 0,
+            activities: vec![],
         };
 
         let response = handle_crypto_order(
