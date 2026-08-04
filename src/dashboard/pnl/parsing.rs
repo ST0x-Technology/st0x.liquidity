@@ -4,6 +4,7 @@ use num_decimal::Num;
 use num_decimal::num_bigint::BigInt;
 use num_traits::Zero;
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::str::FromStr;
 
 use super::SAFE_SYMBOL_CHARS;
@@ -238,6 +239,42 @@ fn multiply_factor(mut value: BigInt, factor: u8, count: usize) -> BigInt {
         value *= &factor;
     }
     value
+}
+
+/// Rounds a rational to at most `fraction_digits` decimal places,
+/// half-to-even. Used only at reporting boundaries where the exact value
+/// must fit a bounded-precision representation (see the capital conversion
+/// in `source.rs`); core PnL arithmetic stays exact.
+pub(crate) fn quantize_decimal(value: &Num, fraction_digits: u32) -> Num {
+    let (numerator, denominator): (BigInt, BigInt) = value.clone().into();
+    let scale = BigInt::from(10).pow(fraction_digits);
+    let scaled = numerator * &scale;
+
+    let mut quotient = &scaled / &denominator;
+    let remainder = &scaled % &denominator;
+
+    let negative = scaled.sign() == num_decimal::num_bigint::Sign::Minus;
+    let twice_abs_remainder = if remainder.sign() == num_decimal::num_bigint::Sign::Minus {
+        -remainder
+    } else {
+        remainder
+    } * BigInt::from(2);
+    let abs_denominator = if denominator.sign() == num_decimal::num_bigint::Sign::Minus {
+        -denominator
+    } else {
+        denominator
+    };
+
+    let rounds_away_from_zero = match twice_abs_remainder.cmp(&abs_denominator) {
+        Ordering::Greater => true,
+        Ordering::Equal => !(&quotient % BigInt::from(2)).is_zero(),
+        Ordering::Less => false,
+    };
+    if rounds_away_from_zero {
+        quotient += BigInt::from(if negative { -1 } else { 1 });
+    }
+
+    Num::new(quotient, scale)
 }
 
 pub(crate) fn abs_decimal(value: &Num) -> Num {

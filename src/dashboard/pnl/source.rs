@@ -12,7 +12,7 @@ use crate::bot_gas::BotGasReceiptCostEvent;
 use crate::portfolio_snapshot::{CAPTURE_BUFFER, EtDayRange, capital_summary, load_portfolio_days};
 
 use super::builder::build_pnl_response_from_rows;
-use super::parsing::{fmt_decimal, parse_payload_string};
+use super::parsing::{fmt_decimal, parse_payload_string, quantize_decimal};
 use super::query::{PnlError, PnlQuery};
 use super::response::{PnlCapitalSummary, PnlResponse};
 use super::state::{BotGasCostRow, CostEventRow, PositionEventRow, PositionViewRow};
@@ -20,6 +20,11 @@ use super::{
     ATTRIBUTION_WARNING, BASELINE_WARNING, CAPITAL_AVAILABLE_NOTE, CAPITAL_UNAVAILABLE_NOTE,
     COST_WARNING, SYMBOL_FILTERED_CAPITAL_WARNING,
 };
+
+/// Fractional digits kept when converting exact daily PnL rationals to
+/// `Float` for the capital computation. 18 matches the finest scale of
+/// onchain token amounts; beyond it a return percentage carries no meaning.
+const CAPITAL_PNL_FRACTION_DIGITS: u32 = 18;
 
 pub(crate) async fn build_pnl_report(
     pool: &SqlitePool,
@@ -120,9 +125,19 @@ async fn apply_capital_summary(
     )
     .await?;
     let days = load_portfolio_days(pool, et_day_range).await?;
+    // The exact rational daily PnL can need more significant digits than
+    // `Float` can represent at all (fill shares and prices multiply digit
+    // counts), which fails `Float::parse` with `ParseDecimalOverflow`.
+    // Quantize to 18 fractional digits (round-half-even) for this conversion
+    // only: the value feeds the capital/return ratios, where the bounded
+    // 5e-19 USD/day rounding error is far below meaningful resolution. Every
+    // other report figure stays exact.
     let daily_net_realized_pnl_usd = daily_net_realized_pnl_usd
         .iter()
-        .map(|(day, pnl)| Ok((*day, Float::parse(fmt_decimal(pnl))?)))
+        .map(|(day, pnl)| {
+            let quantized = quantize_decimal(pnl, CAPITAL_PNL_FRACTION_DIGITS);
+            Ok((*day, Float::parse(fmt_decimal(&quantized))?))
+        })
         .collect::<Result<BTreeMap<_, _>, PnlError>>()?;
     let capital = capital_summary(&days, &daily_net_realized_pnl_usd)?;
 

@@ -12,7 +12,7 @@ use st0x_execution::alpaca_broker_api::AccountActivity;
 use st0x_finance::Symbol;
 
 use super::builder::build_pnl_response_from_rows;
-use super::parsing::{fmt_decimal, parse_payload_string, parse_timestamp};
+use super::parsing::{fmt_decimal, parse_payload_string, parse_timestamp, quantize_decimal};
 use super::query::{PnlCounterTradingFilter, PnlError, PnlMarketSessionFilter, PnlQuery};
 use super::response::{PnlResponse, PnlSymbolSummary, PnlWindow, PnlWindowSymbol};
 use super::state::{
@@ -2785,6 +2785,26 @@ async fn high_precision_daily_pnl_does_not_fail_capital_computation() {
         Some("1000".to_owned())
     );
     assert_eq!(report.capital.sample_days, 1);
+}
+
+/// Pins the rounding the capital conversion applies: half-to-even at the
+/// requested scale, values already at or below the scale pass through
+/// losslessly, negatives mirror positives.
+#[test]
+fn quantize_decimal_rounds_half_even_at_the_requested_scale() {
+    let cases = [
+        ("0.0000000000000000015", "0.000000000000000002"),
+        ("0.0000000000000000025", "0.000000000000000002"),
+        ("-0.0000000000000000015", "-0.000000000000000002"),
+        ("-0.0000000000000000025", "-0.000000000000000002"),
+        ("0.0000000000000000005", "0"),
+        ("1.5", "1.5"),
+        ("-150.000000000000000001", "-150.000000000000000001"),
+    ];
+    for (input, expected) in cases {
+        let quantized = quantize_decimal(&Num::from_str(input).unwrap(), 18);
+        assert_eq!(fmt_decimal(&quantized), expected, "input {input}");
+    }
 }
 
 #[tokio::test]
