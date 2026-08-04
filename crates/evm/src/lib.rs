@@ -17,6 +17,7 @@
 //! human-readable revert reasons without manual wiring.
 
 use alloy::consensus::Transaction;
+use alloy::eips::BlockId;
 use alloy::primitives::{Address, Bytes, TxHash};
 use alloy::providers::Provider;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
@@ -494,7 +495,39 @@ pub trait Evm: Send + Sync + 'static {
     where
         Self: Sized,
     {
-        execute_call::<Registry, Call>(self.provider(), contract, call).await
+        execute_call::<Registry, Call>(self.provider(), contract, call, None).await
+    }
+
+    /// [`Evm::call`] pinned to a specific block.
+    ///
+    /// Use when several reads must observe one consistent chain state, or
+    /// when the caller records which block a value was read at: an unpinned
+    /// `eth_call` runs at whatever block the serving node considers latest,
+    /// which can differ between successive calls on a load-balanced RPC.
+    async fn call_at<Registry: IntoErrorRegistry, Call: SolCall + Send>(
+        &self,
+        contract: Address,
+        call: Call,
+        block_number: u64,
+    ) -> Result<Call::Return, EvmError>
+    where
+        Self: Sized,
+    {
+        execute_call::<Registry, Call>(
+            self.provider(),
+            contract,
+            call,
+            Some(BlockId::number(block_number)),
+        )
+        .await
+    }
+
+    /// Latest block number reported by the serving node.
+    async fn block_number(&self) -> Result<u64, EvmError>
+    where
+        Self: Sized,
+    {
+        Ok(self.provider().get_block_number().await?)
     }
 }
 
@@ -710,7 +743,7 @@ impl<Inner: Evm + ?Sized> Evm for Arc<Inner> {
     where
         Self: Sized,
     {
-        execute_call::<Registry, Call>(self.provider(), contract, call).await
+        execute_call::<Registry, Call>(self.provider(), contract, call, None).await
     }
 }
 
@@ -773,13 +806,19 @@ async fn execute_call<Registry: IntoErrorRegistry, Call: SolCall>(
     provider: &impl Provider,
     contract: Address,
     call: Call,
+    block: Option<BlockId>,
 ) -> Result<Call::Return, EvmError> {
     let calldata = call.abi_encode();
     let tx = TransactionRequest::default()
         .to(contract)
         .input(calldata.into());
 
-    match provider.call(tx).await {
+    let mut request = provider.call(tx);
+    if let Some(block) = block {
+        request = request.block(block);
+    }
+
+    match request.await {
         Ok(result) => Ok(Call::abi_decode_returns(result.as_ref())?),
         Err(rpc_err) => Err(decode_rpc_revert::<Registry>(rpc_err).await),
     }

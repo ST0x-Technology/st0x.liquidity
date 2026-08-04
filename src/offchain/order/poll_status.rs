@@ -1718,6 +1718,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: onchain.price.value(),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await

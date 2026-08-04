@@ -1665,15 +1665,15 @@ impl RebalancingService {
         let mut inventory = self.inventory.write().await;
 
         let updated = match &event {
-            OnchainEquity { balances, .. } => inventory.clone().apply_equity_snapshot(
+            OnchainEquity {
+                balances,
+                block_number,
+                ..
+            } => inventory.clone().apply_equity_snapshot(
                 Venue::MarketMaking,
                 balances.iter(),
                 fetched_at,
-                now,
-            ),
-
-            OnchainUsdc { usdc_balance, .. } => inventory.clone().update_usdc(
-                Inventory::on_snapshot(Venue::MarketMaking, *usdc_balance, fetched_at),
+                *block_number,
                 now,
             ),
 
@@ -1681,13 +1681,18 @@ impl RebalancingService {
                 Venue::Hedging,
                 positions.iter(),
                 fetched_at,
+                None,
                 now,
             ),
 
             // `reconcile_offchain_equity` validates busyness and the hedge
             // gate under the write lock, so the generic apply path is the
-            // correct route here too.
-            OffchainEquityReconciled { .. }
+            // correct route here too. `OnchainUsdc` also routes through it
+            // (not a direct `update_usdc`) so the view's block-watermark
+            // bookkeeping for absorbed onchain fills has a single
+            // implementation.
+            OnchainUsdc { .. }
+            | OffchainEquityReconciled { .. }
             | OffchainUsd { .. }
             | OffchainCashBuyingPower { .. }
             | OffchainCashWithdrawable { .. }
@@ -2139,25 +2144,69 @@ impl Reactor for RebalancingService {
                 use PositionEvent::*;
 
                 let timestamp = event.timestamp();
-                let mut clear_pending_offchain_order = false;
                 let (equity_update, usdc_update) = match &event {
                     OnChainOrderFilled {
                         amount,
                         direction,
                         price_usdc,
+                        block_number,
                         ..
                     } => {
                         let equity_op: Operator = (*direction).into();
                         let quantity: Float = (*amount).into();
                         let usdc_value = (*price_usdc * quantity)?;
-                        (
-                            Inventory::available(Venue::MarketMaking, equity_op, *amount),
-                            Inventory::available(
-                                Venue::MarketMaking,
-                                equity_op.inverse(),
-                                Usdc::new(usdc_value),
-                            ),
-                        )
+
+                        // Each delta leg yields to a pinned onchain snapshot
+                        // that provably already contains it: a vaultBalance2
+                        // read at block N includes every fill at a block <= N
+                        // (ADR 0018). Checked and applied under one write
+                        // lock so no snapshot can advance the watermark in
+                        // between. An absorbed leg is normal operation under
+                        // load, not an error -- the poll simply observed the
+                        // fill before this event arrived.
+                        {
+                            let mut inventory = self.inventory.write().await;
+                            let apply_equity_leg = !inventory
+                                .onchain_fill_absorbed_by_equity_snapshot(&symbol, *block_number);
+                            let apply_usdc_leg =
+                                !inventory.onchain_fill_absorbed_by_usdc_snapshot(*block_number);
+
+                            if !apply_equity_leg || !apply_usdc_leg {
+                                info!(
+                                    target: "rebalance",
+                                    %symbol,
+                                    ?block_number,
+                                    apply_equity_leg,
+                                    apply_usdc_leg,
+                                    "Skipping onchain fill delta leg(s) already \
+                                     absorbed by a pinned onchain snapshot"
+                                );
+                            }
+
+                            let mut updated = inventory.clone();
+                            if apply_equity_leg {
+                                updated = updated.update_equity(
+                                    &symbol,
+                                    Inventory::available(Venue::MarketMaking, equity_op, *amount),
+                                    timestamp,
+                                )?;
+                            }
+                            if apply_usdc_leg {
+                                updated = updated.update_usdc(
+                                    Inventory::available(
+                                        Venue::MarketMaking,
+                                        equity_op.inverse(),
+                                        Usdc::new(usdc_value),
+                                    ),
+                                    timestamp,
+                                )?;
+                            }
+                            *inventory = updated;
+                        }
+
+                        self.equity_scheduler.enqueue_check(symbol).await;
+                        self.usdc_scheduler.enqueue_check().await;
+                        return Ok(());
                     }
                     OffChainOrderFilled {
                         shares_filled,
@@ -2165,16 +2214,6 @@ impl Reactor for RebalancingService {
                         price,
                         ..
                     } => {
-                        // Always clear the gate on a Filled event, even if the
-                        // inventory update below fails. A fail-closed gate would
-                        // deadlock equity rebalancing for the symbol until the
-                        // next bot restart, because the only event that could
-                        // re-clear it (a later terminal offchain event) is
-                        // itself gated. The polling cycle is the source of
-                        // truth for the broker balance, so any local
-                        // bookkeeping miss self-heals within ~60s and is bounded
-                        // to wasted rebalances, not lost capital.
-                        clear_pending_offchain_order = true;
                         let equity_op: Operator = (*direction).into();
                         let quantity: Float = shares_filled.inner().into();
                         let price_value = price.inner();
@@ -2232,6 +2271,16 @@ impl Reactor for RebalancingService {
                     }
                 };
 
+                // Only the OffChainOrderFilled arm reaches here; every other
+                // arm returns early above. Always clear the gate on a Filled
+                // event, even if the inventory update fails. A fail-closed
+                // gate would deadlock equity rebalancing for the symbol until
+                // the next bot restart, because the only event that could
+                // re-clear it (a later terminal offchain event) is itself
+                // gated. The polling cycle is the source of truth for the
+                // broker balance, so any local bookkeeping miss self-heals
+                // within ~60s and is bounded to wasted rebalances, not lost
+                // capital.
                 let inventory_result = {
                     let mut inventory = self.inventory.write().await;
                     let result = inventory
@@ -2242,50 +2291,37 @@ impl Reactor for RebalancingService {
                         *inventory = updated.clone();
                     }
 
-                    if clear_pending_offchain_order {
-                        // Release the snapshot block in the same critical
-                        // section that applied the delta, so no snapshot can
-                        // land in between and overwrite the fill just recorded.
-                        // Stamp the local clock rather than reusing `timestamp`
-                        // (the event's `broker_timestamp`): this is compared
-                        // against snapshot `fetched_at`, which is stamped from
-                        // this host's clock.
-                        inventory
-                            .clear_offchain_order_pending(&symbol, result.is_ok().then(Utc::now));
-                    }
+                    // Release the snapshot block in the same critical
+                    // section that applied the delta, so no snapshot can
+                    // land in between and overwrite the fill just recorded.
+                    // Stamp the local clock rather than reusing `timestamp`
+                    // (the event's `broker_timestamp`): this is compared
+                    // against snapshot `fetched_at`, which is stamped from
+                    // this host's clock.
+                    inventory.clear_offchain_order_pending(&symbol, result.is_ok().then(Utc::now));
 
                     result
                 };
 
-                if clear_pending_offchain_order {
-                    // The gate was cleared above regardless of inventory
-                    // outcome. See the OffChainOrderFilled arm for the
-                    // rationale.
-                    if let Err(error) = &inventory_result {
-                        warn!(
-                            target: "rebalance",
-                            %symbol,
-                            ?error,
-                            "Inventory update failed for offchain fill; clearing gate anyway and relying on next polling snapshot"
-                        );
-                    }
-                    self.equity_scheduler.enqueue_check(symbol).await;
-                    // Only re-check USDC if the cash leg actually applied.
-                    // With and_then chaining, inventory_result == Err means
-                    // neither leg was persisted, so the USDC mirror is
-                    // unchanged from before this event -- the check would
-                    // re-evaluate identical inputs and produce no new
-                    // decision. The periodic USDC scheduler tick covers
-                    // any drift the polling snapshot picks up.
-                    if inventory_result.is_ok() {
-                        self.usdc_scheduler.enqueue_check().await;
-                    }
-                    return Ok(());
+                if let Err(error) = &inventory_result {
+                    warn!(
+                        target: "rebalance",
+                        %symbol,
+                        ?error,
+                        "Inventory update failed for offchain fill; clearing gate anyway and relying on next polling snapshot"
+                    );
                 }
-
-                inventory_result?;
                 self.equity_scheduler.enqueue_check(symbol).await;
-                self.usdc_scheduler.enqueue_check().await;
+                // Only re-check USDC if the cash leg actually applied.
+                // With and_then chaining, inventory_result == Err means
+                // neither leg was persisted, so the USDC mirror is
+                // unchanged from before this event -- the check would
+                // re-evaluate identical inputs and produce no new
+                // decision. The periodic USDC scheduler tick covers
+                // any drift the polling snapshot picks up.
+                if inventory_result.is_ok() {
+                    self.usdc_scheduler.enqueue_check().await;
+                }
                 Ok::<(), RebalancingServiceError>(())
             })
             .on(|id, event| async move { self.on_mint(id, event).await })
@@ -7636,6 +7672,26 @@ mod tests {
             direction,
             price_usdc: float!(150),
             block_timestamp,
+            block_number: None,
+            seen_at: Utc::now(),
+        }
+    }
+
+    fn make_onchain_fill_in_block(
+        amount: FractionalShares,
+        direction: Direction,
+        block_number: Option<u64>,
+    ) -> PositionEvent {
+        PositionEvent::OnChainOrderFilled {
+            trade_id: TradeId {
+                tx_hash: TxHash::random(),
+                log_index: 0,
+            },
+            amount,
+            direction,
+            price_usdc: float!(150),
+            block_timestamp: Utc::now(),
+            block_number,
             seen_at: Utc::now(),
         }
     }
@@ -8171,6 +8227,7 @@ mod tests {
             InventorySnapshotEvent::OnchainEquity {
                 balances: BTreeMap::from([(symbol.clone(), shares(50))]),
                 fetched_at: snapshot_at,
+                block_number: None,
             },
         )
         .await
@@ -8214,6 +8271,7 @@ mod tests {
             InventorySnapshotEvent::OnchainEquity {
                 balances: BTreeMap::from([(symbol.clone(), shares(80))]),
                 fetched_at: newer_snapshot_at,
+                block_number: None,
             },
         )
         .await
@@ -8228,6 +8286,7 @@ mod tests {
             InventorySnapshotEvent::OnchainEquity {
                 balances: BTreeMap::from([(symbol.clone(), shares(10))]),
                 fetched_at: older_snapshot_at,
+                block_number: None,
             },
         )
         .await
@@ -8317,6 +8376,7 @@ mod tests {
             InventorySnapshotEvent::OnchainEquity {
                 balances: BTreeMap::from([(symbol.clone(), shares(50))]),
                 fetched_at: snapshot_at,
+                block_number: None,
             },
         )
         .await
@@ -8419,6 +8479,7 @@ mod tests {
             InventorySnapshotEvent::OnchainEquity {
                 balances: BTreeMap::from([(symbol.clone(), shares(100))]),
                 fetched_at: snapshot_at,
+                block_number: None,
             },
         )
         .await
@@ -9525,6 +9586,296 @@ mod tests {
         assert_eq!(onchain_usdc, usdc(11500));
     }
 
+    /// The RAI-1500 race, closed by ADR 0018: a pinned onchain snapshot at
+    /// block N already contains a fill at a block <= N, so the fill's delta
+    /// legs must be absorbed instead of re-applied on top.
+    #[tokio::test]
+    async fn onchain_fill_covered_by_pinned_snapshot_block_is_absorbed() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(10000), usdc(10000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        // The poll pinned at block 100 already includes the buy below: 60
+        // shares and 8500 USDC are the post-fill balances.
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::OnchainEquity {
+                balances: BTreeMap::from([(symbol.clone(), shares(60))]),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id,
+            InventorySnapshotEvent::OnchainUsdc {
+                usdc_balance: usdc(8500),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The delayed fill delta arrives afterwards: buy of 10 at $150 in
+        // block 100 -- exactly what the snapshot absorbed.
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_in_block(shares(10), Direction::Buy, Some(100)),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(60)),
+            "the snapshot at block 100 already contains the fill; 70 means \
+             the equity leg was counted twice"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(8500)),
+            "the USDC snapshot at block 100 already contains the fill's cash \
+             leg; 7000 means it was counted twice"
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn onchain_fill_past_snapshot_block_applies_normally() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(10000), usdc(10000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::OnchainEquity {
+                balances: BTreeMap::from([(symbol.clone(), shares(60))]),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id,
+            InventorySnapshotEvent::OnchainUsdc {
+                usdc_balance: usdc(8500),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+
+        // A fill in block 101 postdates the pinned read, so both legs apply.
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_in_block(shares(10), Direction::Buy, Some(101)),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(70)),
+            "a fill past the snapshot block must apply its equity leg"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(7000)),
+            "a fill past the snapshot block must apply its USDC leg"
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn legacy_onchain_fill_without_block_always_applies() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(10000), usdc(10000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id,
+            InventorySnapshotEvent::OnchainEquity {
+                balances: BTreeMap::from([(symbol.clone(), shares(60))]),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+
+        // A legacy fill with no block cannot be proven absorbed, so it keeps
+        // today's behavior and applies unconditionally.
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_in_block(shares(10), Direction::Buy, None),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(70)),
+            "a fill without a block number must never be treated as absorbed"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_onchain_snapshot_without_block_absorbs_nothing() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(10000), usdc(10000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id,
+            InventorySnapshotEvent::OnchainEquity {
+                balances: BTreeMap::from([(symbol.clone(), shares(60))]),
+                fetched_at: Utc::now(),
+                block_number: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_in_block(shares(10), Direction::Buy, Some(100)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(70)),
+            "a legacy snapshot without a block advances no watermark, so the \
+             fill must still apply"
+        );
+    }
+
+    /// The two legs are judged on their own watermarks: a fill can be
+    /// absorbed on the equity side while its cash leg still applies.
+    #[tokio::test]
+    async fn onchain_fill_legs_absorb_independently_per_watermark() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(10000), usdc(10000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        // Equity pinned at block 100 (contains the fill), USDC pinned at
+        // block 90 (predates it).
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::OnchainEquity {
+                balances: BTreeMap::from([(symbol.clone(), shares(60))]),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id,
+            InventorySnapshotEvent::OnchainUsdc {
+                usdc_balance: usdc(10000),
+                fetched_at: Utc::now(),
+                block_number: Some(90),
+            },
+        )
+        .await
+        .unwrap();
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_in_block(shares(10), Direction::Buy, Some(95)),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(60)),
+            "the equity leg at block 95 is covered by the block-100 snapshot"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(8500)),
+            "the USDC leg at block 95 postdates the block-90 snapshot and \
+             must apply"
+        );
+        drop(inventory);
+    }
+
     #[tokio::test]
     async fn offchain_buy_updates_usdc_inventory() {
         let symbol = Symbol::new("AAPL").unwrap();
@@ -9626,6 +9977,7 @@ mod tests {
             InventorySnapshotEvent::OnchainEquity {
                 balances,
                 fetched_at: Utc::now(),
+                block_number: None,
             },
         )
         .await
@@ -11332,6 +11684,7 @@ mod tests {
             InventorySnapshotEvent::OnchainUsdc {
                 usdc_balance: usdc(900),
                 fetched_at: Utc::now(),
+                block_number: None,
             },
         )
         .await
@@ -19519,6 +19872,7 @@ mod tests {
         let onchain_event = InventorySnapshotEvent::OnchainEquity {
             balances,
             fetched_at: Utc::now(),
+            block_number: None,
         };
 
         // React to the onchain event - this should NOT trigger rebalancing
@@ -19587,6 +19941,7 @@ mod tests {
         let onchain_event = InventorySnapshotEvent::OnchainEquity {
             balances,
             fetched_at: Utc::now(),
+            block_number: None,
         };
 
         apply_and_dispatch_snapshot(reactor.clone(), id.clone(), onchain_event)
@@ -19666,6 +20021,7 @@ mod tests {
         let onchain_event = InventorySnapshotEvent::OnchainEquity {
             balances,
             fetched_at: Utc::now(),
+            block_number: None,
         };
 
         apply_and_dispatch_snapshot(reactor.clone(), id.clone(), onchain_event)
@@ -19732,6 +20088,7 @@ mod tests {
             InventorySnapshotEvent::OnchainEquity {
                 balances,
                 fetched_at: Utc::now(),
+                block_number: None,
             },
         )
         .await
@@ -20364,6 +20721,7 @@ mod tests {
             InventorySnapshotEvent::OnchainEquity {
                 balances,
                 fetched_at: Utc::now(),
+                block_number: None,
             },
         )
         .await
@@ -22846,6 +23204,7 @@ mod tests {
                 InventorySnapshotEvent::OnchainUsdc {
                     usdc_balance: usdc(500),
                     fetched_at: Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -23088,6 +23447,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -23159,6 +23519,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -23192,6 +23553,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -24188,6 +24550,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await

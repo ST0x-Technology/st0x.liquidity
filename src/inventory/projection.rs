@@ -189,6 +189,7 @@ mod tests {
         let event = InventorySnapshotEvent::OnchainEquity {
             balances,
             fetched_at: Utc::now(),
+            block_number: None,
         };
 
         projection.apply(&event).await.unwrap();
@@ -366,6 +367,7 @@ mod tests {
                 &InventorySnapshotEvent::OnchainUsdc {
                     usdc_balance: Usdc::from_cents(2_000_000).unwrap(),
                     fetched_at: Utc::now(),
+                    block_number: None,
                 },
                 Utc::now(),
                 reason,
@@ -403,6 +405,7 @@ mod tests {
             .apply(&InventorySnapshotEvent::OnchainUsdc {
                 usdc_balance: Usdc::from_cents(2_000_000).unwrap(),
                 fetched_at: Utc::now(),
+                block_number: None,
             })
             .await
             .unwrap();
@@ -445,7 +448,13 @@ mod tests {
         let mut balances = BTreeMap::new();
         balances.insert(symbol("RKLB"), shares(42));
         snapshot
-            .send(&id, InventorySnapshotCommand::OnchainEquity { balances })
+            .send(
+                &id,
+                InventorySnapshotCommand::OnchainEquity {
+                    balances,
+                    block_number: None,
+                },
+            )
             .await
             .unwrap();
 

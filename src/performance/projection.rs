@@ -748,6 +748,7 @@ mod tests {
             direction: Direction::Buy,
             price_usdc: float!(150),
             block_timestamp: timestamp(0),
+            block_number: None,
             seen_at: timestamp(1),
         };
 

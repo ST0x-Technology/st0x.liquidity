@@ -434,14 +434,18 @@ impl EventSourced for Position {
                 direction,
                 price_usdc,
                 block_timestamp,
+                block_number,
             } => Ok(Self::acknowledge_on_chain_fill_init_events(
                 symbol,
                 threshold,
-                trade_id,
-                amount,
-                direction,
-                price_usdc,
-                block_timestamp,
+                OnChainFillFacts {
+                    trade_id,
+                    amount,
+                    direction,
+                    price_usdc,
+                    block_timestamp,
+                    block_number,
+                },
                 Utc::now(),
             )),
 
@@ -454,15 +458,19 @@ impl EventSourced for Position {
                 direction,
                 price_usdc,
                 block_timestamp,
+                block_number,
                 seen_at,
             } => Ok(Self::acknowledge_on_chain_fill_init_events(
                 symbol,
                 threshold,
-                trade_id,
-                amount,
-                direction,
-                price_usdc,
-                block_timestamp,
+                OnChainFillFacts {
+                    trade_id,
+                    amount,
+                    direction,
+                    price_usdc,
+                    block_timestamp,
+                    block_number,
+                },
                 seen_at,
             )),
 
@@ -528,13 +536,17 @@ impl EventSourced for Position {
                 direction,
                 price_usdc,
                 block_timestamp,
+                block_number,
                 ..
             } => self.acknowledge_on_chain_fill_transition_events(
-                trade_id,
-                amount,
-                direction,
-                price_usdc,
-                block_timestamp,
+                OnChainFillFacts {
+                    trade_id,
+                    amount,
+                    direction,
+                    price_usdc,
+                    block_timestamp,
+                    block_number,
+                },
                 Utc::now(),
             ),
 
@@ -545,14 +557,18 @@ impl EventSourced for Position {
                 direction,
                 price_usdc,
                 block_timestamp,
+                block_number,
                 seen_at,
                 ..
             } => self.acknowledge_on_chain_fill_transition_events(
-                trade_id,
-                amount,
-                direction,
-                price_usdc,
-                block_timestamp,
+                OnChainFillFacts {
+                    trade_id,
+                    amount,
+                    direction,
+                    price_usdc,
+                    block_timestamp,
+                    block_number,
+                },
                 seen_at,
             ),
 
@@ -705,17 +721,35 @@ impl EventSourced for Position {
     }
 }
 
+/// The chain-side facts of one onchain fill, exactly as carried by the
+/// `AcknowledgeOnChainFill` command and recorded on `OnChainOrderFilled`.
+/// Groups what belongs together so the acknowledge helpers take one fill
+/// instead of a parade of its fields.
+struct OnChainFillFacts {
+    trade_id: TradeId,
+    amount: FractionalShares,
+    direction: Direction,
+    price_usdc: Float,
+    block_timestamp: DateTime<Utc>,
+    block_number: Option<u64>,
+}
+
 impl Position {
     fn acknowledge_on_chain_fill_init_events(
         symbol: Symbol,
         threshold: ExecutionThreshold,
-        trade_id: TradeId,
-        amount: FractionalShares,
-        direction: Direction,
-        price_usdc: Float,
-        block_timestamp: DateTime<Utc>,
+        fill: OnChainFillFacts,
         seen_at: DateTime<Utc>,
     ) -> Vec<PositionEvent> {
+        let OnChainFillFacts {
+            trade_id,
+            amount,
+            direction,
+            price_usdc,
+            block_timestamp,
+            block_number,
+        } = fill;
+
         vec![
             PositionEvent::Initialized {
                 symbol,
@@ -728,6 +762,7 @@ impl Position {
                 direction,
                 price_usdc,
                 block_timestamp,
+                block_number,
                 seen_at,
             },
             PositionEvent::OnChainFillApplied {
@@ -739,13 +774,18 @@ impl Position {
 
     fn acknowledge_on_chain_fill_transition_events(
         &self,
-        trade_id: TradeId,
-        amount: FractionalShares,
-        direction: Direction,
-        price_usdc: Float,
-        block_timestamp: DateTime<Utc>,
+        fill: OnChainFillFacts,
         seen_at: DateTime<Utc>,
     ) -> Result<Vec<PositionEvent>, PositionError> {
+        let OnChainFillFacts {
+            trade_id,
+            amount,
+            direction,
+            price_usdc,
+            block_timestamp,
+            block_number,
+        } = fill;
+
         // Dual guard (ADR 0010): the retained slot bridges a fill applied
         // under pre-set code and left unmarked at the deploy restart; the
         // set rejects an out-of-order / cross-process re-drive the single
@@ -764,6 +804,7 @@ impl Position {
                 direction,
                 price_usdc,
                 block_timestamp,
+                block_number,
                 seen_at,
             },
             PositionEvent::OnChainFillApplied {
@@ -1066,6 +1107,11 @@ pub enum PositionCommand {
         direction: Direction,
         price_usdc: Float,
         block_timestamp: DateTime<Utc>,
+        /// Block the fill's log was confirmed in. `None` only when neither
+        /// the log nor its receipt carried one; the inventory view then
+        /// applies the fill delta unconditionally instead of checking it
+        /// against the onchain snapshot block watermark (ADR 0018).
+        block_number: Option<u64>,
     },
     /// Test/fixture-only: identical to `AcknowledgeOnChainFill` but takes
     /// `seen_at` explicitly instead of stamping `Utc::now()`, so fixture
@@ -1080,6 +1126,7 @@ pub enum PositionCommand {
         direction: Direction,
         price_usdc: Float,
         block_timestamp: DateTime<Utc>,
+        block_number: Option<u64>,
         seen_at: DateTime<Utc>,
     },
     /// Prunes `trade_id` from the pending-acknowledgement set after its
@@ -1167,6 +1214,12 @@ pub enum PositionEvent {
         )]
         price_usdc: Float,
         block_timestamp: DateTime<Utc>,
+        /// Block the fill's log was confirmed in. `None` for events emitted
+        /// before this field was added (schema backward-compatibility) and
+        /// for fills whose log and receipt both lacked a block number; such
+        /// fills always apply their inventory delta (ADR 0018).
+        #[serde(default)]
+        block_number: Option<u64>,
         seen_at: DateTime<Utc>,
     },
     /// Records that `trade_id` was applied to the position, in the same
@@ -1314,6 +1367,7 @@ impl PartialEq for PositionEvent {
                     direction: d1,
                     price_usdc: p1,
                     block_timestamp: bt1,
+                    block_number: bn1,
                     seen_at: sa1,
                 },
                 Self::OnChainOrderFilled {
@@ -1322,12 +1376,14 @@ impl PartialEq for PositionEvent {
                     direction: d2,
                     price_usdc: p2,
                     block_timestamp: bt2,
+                    block_number: bn2,
                     seen_at: sa2,
                 },
             ) => {
                 t1 == t2
                     && a1 == a2
                     && d1 == d2
+                    && bn1 == bn2
                     && p1.eq(*p2).unwrap_or(false)
                     && bt1 == bt2
                     && sa1 == sa2
@@ -1548,6 +1604,7 @@ impl std::fmt::Debug for PositionCommand {
                 direction,
                 price_usdc,
                 block_timestamp,
+                block_number,
             } => f
                 .debug_struct("AcknowledgeOnChainFill")
                 .field("symbol", symbol)
@@ -1557,6 +1614,7 @@ impl std::fmt::Debug for PositionCommand {
                 .field("direction", direction)
                 .field("price_usdc", &DebugFloat(price_usdc))
                 .field("block_timestamp", block_timestamp)
+                .field("block_number", block_number)
                 .finish(),
             #[cfg(any(test, feature = "test-support"))]
             Self::AcknowledgeOnChainFillAt {
@@ -1567,6 +1625,7 @@ impl std::fmt::Debug for PositionCommand {
                 direction,
                 price_usdc,
                 block_timestamp,
+                block_number,
                 seen_at,
             } => f
                 .debug_struct("AcknowledgeOnChainFillAt")
@@ -1577,6 +1636,7 @@ impl std::fmt::Debug for PositionCommand {
                 .field("direction", direction)
                 .field("price_usdc", &DebugFloat(price_usdc))
                 .field("block_timestamp", block_timestamp)
+                .field("block_number", block_number)
                 .field("seen_at", seen_at)
                 .finish(),
             Self::SettleOnChainFill { trade_id } => f
@@ -1693,6 +1753,7 @@ impl std::fmt::Debug for PositionEvent {
                 direction,
                 price_usdc,
                 block_timestamp,
+                block_number,
                 seen_at,
             } => f
                 .debug_struct("OnChainOrderFilled")
@@ -1701,6 +1762,7 @@ impl std::fmt::Debug for PositionEvent {
                 .field("direction", direction)
                 .field("price_usdc", &DebugFloat(price_usdc))
                 .field("block_timestamp", block_timestamp)
+                .field("block_number", block_number)
                 .field("seen_at", seen_at)
                 .finish(),
             Self::OnChainFillApplied {
@@ -1858,6 +1920,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
+                block_number: None,
             })
             .await
             .events();
@@ -1899,6 +1962,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
+                block_number: None,
             })
             .await
             .events();
@@ -1939,6 +2003,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
+                block_number: None,
                 seen_at,
             })
             .await
@@ -1982,6 +2047,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                     seen_at: Utc::now(),
                 },
             ])
@@ -1993,6 +2059,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
+                block_number: None,
             })
             .await
             .then_expect_error();
@@ -2040,6 +2107,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: now,
+                    block_number: None,
                     seen_at: now,
                 },
                 PositionEvent::OnChainFillApplied {
@@ -2052,6 +2120,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: now,
+                    block_number: None,
                     seen_at: now,
                 },
                 PositionEvent::OnChainFillApplied {
@@ -2067,6 +2136,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: now,
+                block_number: None,
             })
             .await
             .then_expect_error();
@@ -2106,6 +2176,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: now,
+                block_number: None,
                 seen_at: now,
             },
             PositionEvent::OnChainOrderFilled {
@@ -2117,6 +2188,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: now,
+                block_number: None,
                 seen_at: now,
             },
         ])
@@ -2159,6 +2231,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: now,
+                block_number: None,
                 seen_at: now,
             },
             PositionEvent::OnChainFillApplied {
@@ -2175,6 +2248,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: now,
+                block_number: None,
                 seen_at: now,
             },
             PositionEvent::OnChainFillApplied {
@@ -2215,6 +2289,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: now,
+                    block_number: None,
                     seen_at: now,
                 },
                 PositionEvent::OnChainFillApplied {
@@ -2283,6 +2358,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                     seen_at: Utc::now(),
                 },
                 PositionEvent::OnChainOrderFilled {
@@ -2294,6 +2370,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(151),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                     seen_at: Utc::now(),
                 },
             ])
@@ -2335,6 +2412,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                     seen_at: Utc::now(),
                 },
             ])
@@ -2380,6 +2458,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                     seen_at: Utc::now(),
                 },
             ])
@@ -2420,6 +2499,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                     seen_at: Utc::now(),
                 },
                 PositionEvent::OffChainOrderPlaced {
@@ -2471,6 +2551,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                     seen_at: Utc::now(),
                 },
                 PositionEvent::OffChainOrderPlaced {
@@ -2520,6 +2601,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                     seen_at: Utc::now(),
                 },
                 PositionEvent::OffChainOrderPlaced {
@@ -2566,6 +2648,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                     seen_at: Utc::now(),
                 },
                 PositionEvent::OffChainOrderPlaced {
@@ -2645,6 +2728,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
+                block_number: None,
                 seen_at: Utc::now(),
             },
             placed(failed_order_id),
@@ -2759,6 +2843,7 @@ mod tests {
                     direction: Direction::Sell,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                     seen_at: Utc::now(),
                 },
             ])
@@ -2812,6 +2897,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                     seen_at: Utc::now(),
                 },
                 PositionEvent::OffChainOrderPlaced {
@@ -2864,6 +2950,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
+                block_number: None,
                 seen_at: Utc::now(),
             },
             PositionEvent::ManualPositionAdjusted {
@@ -2917,6 +3004,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
+                block_number: None,
                 seen_at: Utc::now(),
             },
         ])
@@ -2958,6 +3046,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -3114,6 +3203,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                     seen_at: Utc::now(),
                 },
             ])
@@ -3164,6 +3254,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                     seen_at: Utc::now(),
                 },
             ])
@@ -3205,6 +3296,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
+                block_number: None,
                 seen_at: Utc::now(),
             },
             PositionEvent::OffChainOrderPlaced {
@@ -3257,6 +3349,7 @@ mod tests {
                 direction: Direction::Sell,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
+                block_number: None,
                 seen_at: Utc::now(),
             },
             PositionEvent::OffChainOrderPlaced {
@@ -3311,6 +3404,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
+                block_number: None,
                 seen_at: Utc::now(),
             },
             OffChainOrderPlaced {
@@ -3369,6 +3463,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
+                block_number: None,
                 seen_at: Utc::now(),
             },
             OffChainOrderPlaced {
@@ -3439,6 +3534,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
+                block_number: None,
                 seen_at: Utc::now(),
             },
             OffChainOrderPlaced {
@@ -3510,6 +3606,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
+                block_number: None,
                 seen_at: Utc::now(),
             },
             PositionEvent::OffChainOrderPlaced {
@@ -3588,6 +3685,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp,
+                block_number: None,
                 seen_at,
             },
         ])
@@ -3627,6 +3725,7 @@ mod tests {
                 direction: Direction::Sell,
                 price_usdc: float!(150),
                 block_timestamp,
+                block_number: None,
                 seen_at,
             },
         ])
@@ -3677,6 +3776,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp,
+                block_number: None,
                 seen_at: block_timestamp,
             },
             PositionEvent::ThresholdUpdated {
@@ -3771,6 +3871,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp,
+                block_number: None,
                 seen_at: block_timestamp,
             },
             PositionEvent::ManualPositionAdjusted {
@@ -3829,6 +3930,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp,
+                block_number: None,
                 seen_at: block_timestamp,
             },
             PositionEvent::ThresholdUpdated {
@@ -3878,6 +3980,7 @@ mod tests {
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp,
+                block_number: None,
                 seen_at: block_timestamp,
             },
         ])
@@ -3917,6 +4020,7 @@ mod tests {
             amount: FractionalShares::new(float!(10)),
             price_usdc: float!(150),
             block_timestamp: Utc::now(),
+            block_number: None,
             seen_at: Utc::now(),
         }])
         .unwrap_err();
@@ -3949,6 +4053,7 @@ mod tests {
             direction: Direction::Buy,
             price_usdc: float!(150),
             block_timestamp,
+            block_number: None,
             seen_at,
         };
 
@@ -4334,6 +4439,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await

@@ -2164,6 +2164,7 @@ mod tests {
                     direction: st0x_execution::Direction::Buy,
                     price_usdc: st0x_float_macro::float!(150),
                     block_timestamp: now,
+                    block_number: None,
                 },
             )
             .await
@@ -2181,6 +2182,7 @@ mod tests {
                     direction: st0x_execution::Direction::Buy,
                     price_usdc: st0x_float_macro::float!(150),
                     block_timestamp: now,
+                    block_number: None,
                     seen_at: now,
                 },
             )
@@ -2239,6 +2241,7 @@ mod tests {
                     direction: st0x_execution::Direction::Buy,
                     price_usdc: st0x_float_macro::float!(150),
                     block_timestamp: now,
+                    block_number: None,
                 },
             )
             .await
