@@ -80,7 +80,7 @@ organization_id = "b100145e-7894-4c17-b3e7-160435f84803"
 # Also needed for CLI commands: alpaca-redeem and transfer-equity.
 # Not needed for alpaca-tokenize or alpaca-tokenization-requests.
 [tokenization]
-redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
+redemption_wallet = "0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE"
 
 # ETH/USD valuation source for bot-gas cost recording (ADR 0017). Required
 # because [rebalancing] is configured below. Both values are public (not
