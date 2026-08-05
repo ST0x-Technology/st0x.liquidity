@@ -3502,7 +3502,14 @@ know about cross-venue inventory.
   watermark at the forced block. Legacy fills or snapshots without a block
   number keep the unguarded behavior
 - `PositionEvent::OffChainOrderFilled` - Updates available balances (trading
-  activity)
+  activity): the equity delta plus a mirrored USDC delta at the Hedging venue.
+  Applying the fill stamps both the symbol's applied-fill time and the
+  venue-level applied-cash-fill time; `OffchainUsd` snapshots are skipped while
+  any hedge order is open or when fetched before that stamp, because the
+  broker's cash reading comes from the same `get_inventory()` read as the equity
+  positions and double-counts the fill in the same window the ADR 0015 equity
+  guards close (the cash balance is venue-level, so its open-order guard is
+  venue-wide rather than per-symbol)
 - `TokenizedEquityMintEvent::MintAccepted` - Moves shares to inflight (leaving
   Alpaca)
 - `TokenizedEquityMintEvent::TokensReceived` - Moves from inflight to Raindex

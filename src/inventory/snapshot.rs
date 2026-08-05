@@ -227,10 +227,11 @@ impl EventSourced for InventorySnapshot {
             OffchainUsd {
                 usd_balance_cents,
                 gross_usd_cents,
+                fetched_at,
             } => InventorySnapshotEvent::OffchainUsd {
                 usd_balance_cents,
                 gross_usd_cents,
-                fetched_at: now,
+                fetched_at,
             },
             OffchainCashBuyingPower {
                 cash_buying_power_cents,
@@ -351,6 +352,7 @@ impl EventSourced for InventorySnapshot {
             OffchainUsd {
                 usd_balance_cents,
                 gross_usd_cents,
+                fetched_at,
             } => {
                 if self.offchain_usd_cents == Some(usd_balance_cents)
                     && self.offchain_gross_usd_cents == gross_usd_cents
@@ -360,7 +362,7 @@ impl EventSourced for InventorySnapshot {
                 Ok(vec![InventorySnapshotEvent::OffchainUsd {
                     usd_balance_cents,
                     gross_usd_cents,
-                    fetched_at: now,
+                    fetched_at,
                 }])
             }
             OffchainCashBuyingPower {
@@ -755,6 +757,13 @@ pub(crate) enum InventorySnapshotCommand {
         /// Gross USD balance before reserve subtraction. `None` when no
         /// cash reserve is configured, so the dashboard hides the row.
         gross_usd_cents: Option<i64>,
+        /// Captured by the poller before issuing the broker read, so the
+        /// event's stamp lower-bounds the broker's as-of time -- the same
+        /// before-read contract as `OffchainEquity`. Stamping at
+        /// command-handling time would let a pre-fill read outrun a fill
+        /// applied in between, defeating the view's applied-cash-fill guard
+        /// (ADR 0015 guard 2, transplanted to the venue-level cash balance).
+        fetched_at: DateTime<Utc>,
     },
     OffchainCashBuyingPower {
         cash_buying_power_cents: Option<i64>,
@@ -1103,6 +1112,7 @@ mod tests {
             .when(InventorySnapshotCommand::OffchainUsd {
                 usd_balance_cents,
                 gross_usd_cents: None,
+                fetched_at: Utc::now(),
             })
             .await
             .events();
@@ -1192,6 +1202,7 @@ mod tests {
                 InventorySnapshotCommand::OffchainUsd {
                     usd_balance_cents,
                     gross_usd_cents: None,
+                    fetched_at,
                 },
             ),
         ];
@@ -2137,6 +2148,68 @@ mod tests {
         assert_eq!(
             block_number, None,
             "a legacy event without the field must deserialize to None"
+        );
+    }
+
+    /// The `OffchainUsd` event must carry the poller's before-read stamp,
+    /// not a command-handling-time stamp: a command-time stamp postdates the
+    /// broker read, so a pre-fill read handled after the fill applied would
+    /// slip past the view's applied-cash-fill guard and resurrect the
+    /// pre-fill balance (the ADR 0015 before-read-capture contract,
+    /// transplanted to the cash leg).
+    #[tokio::test]
+    async fn offchain_usd_event_carries_the_commands_before_read_stamp() {
+        let before_read = Utc::now() - chrono::Duration::seconds(5);
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given_no_previous_events()
+            .when(InventorySnapshotCommand::OffchainUsd {
+                usd_balance_cents: 500_000,
+                gross_usd_cents: None,
+                fetched_at: before_read,
+            })
+            .await
+            .events();
+
+        let [InventorySnapshotEvent::OffchainUsd { fetched_at, .. }] = events.as_slice() else {
+            panic!("expected exactly one OffchainUsd event, got {events:?}");
+        };
+        assert_eq!(
+            *fetched_at, before_read,
+            "the event must carry the command's before-read stamp verbatim"
+        );
+    }
+
+    /// Same contract on the transition path: the test above starts from an
+    /// empty aggregate, so it only pins `initialize`. A prior event routes
+    /// this one through `transition`, whose changed-value arm must also
+    /// carry the command's stamp verbatim rather than restamping at
+    /// command-handling time.
+    #[tokio::test]
+    async fn offchain_usd_transition_carries_the_commands_before_read_stamp() {
+        let before_read = Utc::now() - chrono::Duration::seconds(5);
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::OffchainUsd {
+                usd_balance_cents: 400_000,
+                gross_usd_cents: None,
+                fetched_at: Utc::now() - chrono::Duration::seconds(60),
+            }])
+            .when(InventorySnapshotCommand::OffchainUsd {
+                usd_balance_cents: 500_000,
+                gross_usd_cents: None,
+                fetched_at: before_read,
+            })
+            .await
+            .events();
+
+        let [InventorySnapshotEvent::OffchainUsd { fetched_at, .. }] = events.as_slice() else {
+            panic!("expected exactly one OffchainUsd event, got {events:?}");
+        };
+        assert_eq!(
+            *fetched_at, before_read,
+            "the transition arm must carry the command's before-read stamp \
+             verbatim"
         );
     }
 

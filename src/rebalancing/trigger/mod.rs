@@ -23067,6 +23067,278 @@ mod tests {
         );
     }
 
+    /// The cash twin of the equity race above (RAI-1499): a broker poll
+    /// inside the fill window reports cash that already includes the fill's
+    /// proceeds. The `OffchainUsd` snapshot must be skipped while the hedge
+    /// order is open so the fill's mirrored USDC delta is not applied on top
+    /// of a balance that already contains it.
+    #[tokio::test]
+    async fn offchain_cash_snapshot_absorbing_a_sell_fill_is_not_applied_twice() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        // Pre-fill: $5000 cash, 100 shares offchain.
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(100))
+            .with_usdc(usdc(5000), usdc(5000));
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
+            .await
+            .unwrap();
+
+        // The poll lands after the broker executed the sell: cash already
+        // shows the +$1500 proceeds. Must be skipped -- the order is open.
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        harness
+            .receive::<InventorySnapshot>(
+                snapshot_id.clone(),
+                InventorySnapshotEvent::OffchainUsd {
+                    usd_balance_cents: 650_000,
+                    gross_usd_cents: None,
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Only now does the fill event arrive: sell 10 @ $150.
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_offchain_fill(shares(10), Direction::Sell),
+            )
+            .await
+            .unwrap();
+
+        let hedging_usdc = trigger
+            .inventory
+            .read()
+            .await
+            .usdc_available(Venue::Hedging);
+        assert_eq!(
+            hedging_usdc,
+            Some(usdc(6500)),
+            "the snapshot already contained the sell's proceeds, so the fill \
+             delta must be the only application; 8000 means the cash leg was \
+             counted twice"
+        );
+
+        // A fresh post-fill poll confirms without changing anything.
+        harness
+            .receive::<InventorySnapshot>(
+                snapshot_id,
+                InventorySnapshotEvent::OffchainUsd {
+                    usd_balance_cents: 650_000,
+                    gross_usd_cents: None,
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_available(Venue::Hedging),
+            Some(usdc(6500)),
+            "the next unblocked poll confirms the fill-applied balance"
+        );
+    }
+
+    #[tokio::test]
+    async fn offchain_cash_snapshot_absorbing_a_buy_fill_is_not_applied_twice() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(100))
+            .with_usdc(usdc(5000), usdc(5000));
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
+            .await
+            .unwrap();
+
+        // Post-execution poll: the buy's -$1500 is already debited.
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        harness
+            .receive::<InventorySnapshot>(
+                snapshot_id,
+                InventorySnapshotEvent::OffchainUsd {
+                    usd_balance_cents: 350_000,
+                    gross_usd_cents: None,
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_offchain_fill(shares(10), Direction::Buy),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_available(Venue::Hedging),
+            Some(usdc(3500)),
+            "the snapshot already contained the buy's debit, so the fill \
+             delta must be the only application; 2000 means the cash leg was \
+             counted twice"
+        );
+    }
+
+    /// The reverse ordering for the cash leg: a poll read before the fill
+    /// whose snapshot event lands after the fill was applied must not
+    /// resurrect the pre-fill cash balance.
+    #[tokio::test]
+    async fn cash_snapshot_fetched_before_applied_fill_does_not_overwrite_it() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(100))
+            .with_usdc(usdc(5000), usdc(5000));
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
+            .await
+            .unwrap();
+
+        // Captured before the fill is applied, so it predates the
+        // local-clock stamp the fill records on the cash guard.
+        let pre_fill = Utc::now();
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_offchain_fill(shares(10), Direction::Sell),
+            )
+            .await
+            .unwrap();
+
+        // The stale poll reports the pre-fill $5000 with a pre-fill stamp.
+        // The gate is already clear, so only guard 2 can catch this.
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        harness
+            .receive::<InventorySnapshot>(
+                snapshot_id.clone(),
+                InventorySnapshotEvent::OffchainUsd {
+                    usd_balance_cents: 500_000,
+                    gross_usd_cents: None,
+                    fetched_at: pre_fill,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_available(Venue::Hedging),
+            Some(usdc(6500)),
+            "a cash snapshot fetched before the applied fill must not \
+             resurrect the pre-fill balance"
+        );
+
+        // A genuinely fresh poll applies normally. 6600 is deliberately
+        // distinct so application is observable.
+        harness
+            .receive::<InventorySnapshot>(
+                snapshot_id,
+                InventorySnapshotEvent::OffchainUsd {
+                    usd_balance_cents: 660_000,
+                    gross_usd_cents: None,
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_available(Venue::Hedging),
+            Some(usdc(6600)),
+            "a cash snapshot fetched after the applied fill must apply"
+        );
+    }
+
+    /// The cash guard is venue-level: an open hedge order on ANY symbol
+    /// makes the venue's cash reading ambiguous, because the fill that may
+    /// already be baked into it belongs to whichever symbol is trading.
+    #[tokio::test]
+    async fn open_order_on_any_symbol_blocks_the_venue_cash_snapshot() {
+        let trading = Symbol::new("TSLA").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(trading.clone(), shares(20), shares(100))
+            .with_usdc(usdc(5000), usdc(5000));
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        harness
+            .receive::<Position>(
+                trading.clone(),
+                make_offchain_placed(OffchainOrderId::new()),
+            )
+            .await
+            .unwrap();
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        harness
+            .receive::<InventorySnapshot>(
+                snapshot_id,
+                InventorySnapshotEvent::OffchainUsd {
+                    usd_balance_cents: 999_900,
+                    gross_usd_cents: None,
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_available(Venue::Hedging),
+            Some(usdc(5000)),
+            "TSLA's open hedge order must block the venue-level cash \
+             snapshot even though no other symbol is involved"
+        );
+    }
+
     /// Recovery must leave a gated symbol holding the balance the fill delta
     /// owns. The reset wipes balances and the force path skips gated
     /// symbols, so unless the delta-owned balance is carried across the

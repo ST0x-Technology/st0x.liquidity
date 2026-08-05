@@ -254,7 +254,11 @@ Out of scope here; each is its own change.
    Hedging venue, and the `OffchainUsd` snapshot comes from the _same_
    `get_inventory()` call, so it is double-counted in exactly the same window.
    Only the equity leg is guarded here. The cash balance is venue-level rather
-   than per-symbol, so it needs a different mechanism.
+   than per-symbol, so it needs a different mechanism. _Addressed by RAI-1499:
+   the `OffchainUsd` command now carries the before-read `fetched_at`, and the
+   view skips (and force-skips) the venue cash snapshot while any hedge order is
+   open or when the reading predates the venue-level applied-cash-fill stamp
+   recorded with the fill._
 3. **Parallel state elsewhere.** `InventoryView` and `RebalancingService` hold
    several other overlapping representations: `active_mints` vs `mint_tracking`,
    `active_redemptions` vs `redemption_tracking`, and `active_usdc_rebalance` vs

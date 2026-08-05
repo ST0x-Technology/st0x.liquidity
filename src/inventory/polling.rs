@@ -675,6 +675,7 @@ where
                 InventorySnapshotCommand::OffchainUsd {
                     usd_balance_cents: available_usd_cents,
                     gross_usd_cents,
+                    fetched_at,
                 },
             )
             .await?;
