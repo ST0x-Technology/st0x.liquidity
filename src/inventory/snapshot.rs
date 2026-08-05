@@ -224,6 +224,19 @@ impl EventSourced for InventorySnapshot {
                 ledger_position,
                 consecutive_polls,
             },
+            ReconcileOffchainUsd {
+                usd_balance_cents,
+                gross_usd_cents,
+                fetched_at,
+                ledger_usdc,
+                consecutive_polls,
+            } => InventorySnapshotEvent::OffchainUsdReconciled {
+                usd_balance_cents,
+                gross_usd_cents,
+                fetched_at,
+                ledger_usdc,
+                consecutive_polls,
+            },
             OffchainUsd {
                 usd_balance_cents,
                 gross_usd_cents,
@@ -347,6 +360,22 @@ impl EventSourced for InventorySnapshot {
                 position,
                 fetched_at,
                 ledger_position,
+                consecutive_polls,
+            }]),
+            // Like its equity twin: always emits, bypassing the value
+            // dedupe -- the state it corrects is "stored value already
+            // correct, view never received it".
+            ReconcileOffchainUsd {
+                usd_balance_cents,
+                gross_usd_cents,
+                fetched_at,
+                ledger_usdc,
+                consecutive_polls,
+            } => Ok(vec![InventorySnapshotEvent::OffchainUsdReconciled {
+                usd_balance_cents,
+                gross_usd_cents,
+                fetched_at,
+                ledger_usdc,
                 consecutive_polls,
             }]),
             OffchainUsd {
@@ -665,10 +694,27 @@ impl InventorySnapshot {
                 self.offchain_gross_usd_cents = *gross_usd_cents;
                 self.offchain_usd_fetched_at = Some(*fetched_at);
             }
+            // Folds like `OffchainUsd`: same fields, same monotonic
+            // `fetched_at` guard, so startup hydration replays the
+            // reconciled value.
+            InventorySnapshotEvent::OffchainUsdReconciled {
+                usd_balance_cents,
+                gross_usd_cents,
+                fetched_at,
+                ..
+            } if self
+                .offchain_usd_fetched_at
+                .is_none_or(|current| *fetched_at >= current) =>
+            {
+                self.offchain_usd_cents = Some(*usd_balance_cents);
+                self.offchain_gross_usd_cents = *gross_usd_cents;
+                self.offchain_usd_fetched_at = Some(*fetched_at);
+            }
             InventorySnapshotEvent::OnchainEquity { .. }
             | InventorySnapshotEvent::OnchainUsdc { .. }
             | InventorySnapshotEvent::OffchainEquity { .. }
             | InventorySnapshotEvent::OffchainEquityReconciled { .. }
+            | InventorySnapshotEvent::OffchainUsdReconciled { .. }
             | InventorySnapshotEvent::OffchainUsd { .. } => {}
             InventorySnapshotEvent::OffchainCashBuyingPower {
                 cash_buying_power_cents,
@@ -749,6 +795,25 @@ pub(crate) enum InventorySnapshotCommand {
         /// divergence was detected; `None` when the venue was never
         /// initialized in the view.
         ledger_position: Option<FractionalShares>,
+        /// Consecutive polls that observed the divergence.
+        consecutive_polls: u32,
+    },
+    /// The venue-level cash twin of `ReconcileOffchainEquity`: force record
+    /// the available cash the broker reported after the poller confirmed a
+    /// persistent divergence between the broker and the view. Like its
+    /// equity twin, handling this command always emits its event -- the
+    /// wedge it corrects is precisely "stored value already correct, view
+    /// never received it".
+    ReconcileOffchainUsd {
+        /// Available (post-reserve) cash the broker reported, in cents.
+        usd_balance_cents: i64,
+        /// Gross cash from the same read, before reserve subtraction.
+        gross_usd_cents: Option<i64>,
+        /// Stamped by the poller before the broker read.
+        fetched_at: DateTime<Utc>,
+        /// Hedging USDC the view held when the divergence was detected;
+        /// `None` when the venue was never initialized in the view.
+        ledger_usdc: Option<Usdc>,
         /// Consecutive polls that observed the divergence.
         consecutive_polls: u32,
     },
@@ -838,6 +903,19 @@ pub(crate) enum InventorySnapshotEvent {
         /// Consecutive polls that observed the divergence.
         consecutive_polls: u32,
     },
+    /// Forced venue-level cash reconciliation, emitted after the poller
+    /// confirmed a persistent divergence between the broker's available
+    /// cash and the view's Hedging USDC. Folds into `offchain_usd_cents`
+    /// the same way `OffchainUsd` does.
+    OffchainUsdReconciled {
+        usd_balance_cents: i64,
+        gross_usd_cents: Option<i64>,
+        fetched_at: DateTime<Utc>,
+        /// Hedging USDC the view held when the divergence was detected.
+        ledger_usdc: Option<Usdc>,
+        /// Consecutive polls that observed the divergence.
+        consecutive_polls: u32,
+    },
     #[serde(alias = "OffchainCash")]
     OffchainUsd {
         #[serde(alias = "cash_balance_cents")]
@@ -892,6 +970,7 @@ impl InventorySnapshotEvent {
             | Self::OnchainUsdc { fetched_at, .. }
             | Self::OffchainEquity { fetched_at, .. }
             | Self::OffchainEquityReconciled { fetched_at, .. }
+            | Self::OffchainUsdReconciled { fetched_at, .. }
             | Self::OffchainUsd { fetched_at, .. }
             | Self::OffchainCashBuyingPower { fetched_at, .. }
             | Self::OffchainCashWithdrawable { fetched_at, .. }
@@ -911,6 +990,9 @@ impl DomainEvent for InventorySnapshotEvent {
             Self::OnchainEquity { .. } => "InventorySnapshotEvent::OnchainEquity".to_string(),
             Self::OnchainUsdc { .. } => "InventorySnapshotEvent::OnchainUsdc".to_string(),
             Self::OffchainEquity { .. } => "InventorySnapshotEvent::OffchainEquity".to_string(),
+            Self::OffchainUsdReconciled { .. } => {
+                "InventorySnapshotEvent::OffchainUsdReconciled".to_string()
+            }
             Self::OffchainEquityReconciled { .. } => {
                 "InventorySnapshotEvent::OffchainEquityReconciled".to_string()
             }
@@ -2396,5 +2478,122 @@ mod tests {
             "a reconcile fetched before the stored snapshot must not fold"
         );
         assert_eq!(state.offchain_equity_fetched_at, Some(stored_at));
+    }
+
+    #[tokio::test]
+    async fn reconcile_offchain_usd_emits_even_when_balance_matches_stored_state() {
+        let stored_at = Utc::now();
+        let fetched_at = stored_at + chrono::Duration::seconds(60);
+
+        // The stored state already holds the correct zero, the case where
+        // the OffchainUsd dedup would emit no event.
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::OffchainUsd {
+                usd_balance_cents: 0,
+                gross_usd_cents: Some(0),
+                fetched_at: stored_at,
+            }])
+            .when(InventorySnapshotCommand::ReconcileOffchainUsd {
+                usd_balance_cents: 0,
+                gross_usd_cents: Some(0),
+                fetched_at,
+                ledger_usdc: Some(Usdc::from_str("500").unwrap()),
+                consecutive_polls: 3,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1, "cash reconcile must always emit");
+        let InventorySnapshotEvent::OffchainUsdReconciled {
+            usd_balance_cents,
+            gross_usd_cents,
+            fetched_at: event_fetched_at,
+            ledger_usdc,
+            consecutive_polls,
+        } = &events[0]
+        else {
+            panic!("Expected OffchainUsdReconciled event, got {:?}", events[0]);
+        };
+        assert_eq!(*usd_balance_cents, 0);
+        assert_eq!(*gross_usd_cents, Some(0));
+        assert_eq!(event_fetched_at, &fetched_at);
+        assert_eq!(*ledger_usdc, Some(Usdc::from_str("500").unwrap()));
+        assert_eq!(*consecutive_polls, 3);
+    }
+
+    #[test]
+    fn usd_reconciled_event_folds_into_offchain_usd_for_hydration() {
+        let stored_at = Utc::now();
+        let reconciled_at = stored_at + chrono::Duration::seconds(60);
+
+        let state = replay::<InventorySnapshot>(vec![
+            InventorySnapshotEvent::OffchainUsd {
+                usd_balance_cents: 50_000,
+                gross_usd_cents: Some(60_000),
+                fetched_at: stored_at,
+            },
+            InventorySnapshotEvent::OffchainUsdReconciled {
+                usd_balance_cents: 0,
+                gross_usd_cents: Some(0),
+                fetched_at: reconciled_at,
+                ledger_usdc: Some(Usdc::from_str("500").unwrap()),
+                consecutive_polls: 3,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            state.offchain_usd_cents,
+            Some(0),
+            "the reconciled balance must fold to the broker value"
+        );
+        assert_eq!(state.offchain_gross_usd_cents, Some(0));
+        assert_eq!(state.offchain_usd_fetched_at, Some(reconciled_at));
+
+        // Startup hydration replays the reconciled value, not the diverged one.
+        let hydrated = state
+            .hydration_events()
+            .into_iter()
+            .find(|event| matches!(event, InventorySnapshotEvent::OffchainUsd { .. }))
+            .expect("expected offchain usd hydration event");
+        let InventorySnapshotEvent::OffchainUsd {
+            usd_balance_cents, ..
+        } = hydrated
+        else {
+            panic!("Expected OffchainUsd event");
+        };
+        assert_eq!(usd_balance_cents, 0);
+    }
+
+    #[test]
+    fn stale_usd_reconciled_event_does_not_regress_offchain_usd() {
+        let stored_at = Utc::now();
+        let stale_at = stored_at - chrono::Duration::seconds(60);
+
+        let state = replay::<InventorySnapshot>(vec![
+            InventorySnapshotEvent::OffchainUsd {
+                usd_balance_cents: 50_000,
+                gross_usd_cents: Some(60_000),
+                fetched_at: stored_at,
+            },
+            InventorySnapshotEvent::OffchainUsdReconciled {
+                usd_balance_cents: 0,
+                gross_usd_cents: Some(0),
+                fetched_at: stale_at,
+                ledger_usdc: None,
+                consecutive_polls: 3,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            state.offchain_usd_cents,
+            Some(50_000),
+            "a cash reconcile fetched before the stored snapshot must not fold"
+        );
+        assert_eq!(state.offchain_gross_usd_cents, Some(60_000));
+        assert_eq!(state.offchain_usd_fetched_at, Some(stored_at));
     }
 }

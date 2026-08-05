@@ -17,7 +17,7 @@ use st0x_finance::{Usd, Usdc};
 use st0x_tokenization::IssuerRequestId;
 use st0x_wrapper::{RatioError, UnderlyingPerWrapped};
 
-use super::divergence::PersistentBrokerDivergence;
+use super::divergence::{PersistentBrokerCashDivergence, PersistentBrokerDivergence};
 use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::equity_redemption::RedemptionAggregateId;
@@ -631,6 +631,13 @@ impl PartialEq for PortfolioBalanceRow {
 
 /// Venues paired with their [`PortfolioLocation`] counterpart, in the fixed
 /// order [`InventoryView::to_portfolio_snapshot_rows`] emits them.
+/// Warn cadence for guard-starved offchain snapshots: every this many
+/// consecutive skips of a symbol's Hedging equity snapshot (or of the
+/// venue-level `OffchainUsd` snapshot), a `warn!` surfaces the starvation
+/// that ADR 0015 accepted but left invisible at production log levels.
+/// Observability only -- never changes which snapshots apply.
+const OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY: u32 = 5;
+
 const PORTFOLIO_VENUES: [(Venue, PortfolioLocation); 2] = [
     (Venue::MarketMaking, PortfolioLocation::MarketMaking),
     (Venue::Hedging, PortfolioLocation::Hedging),
@@ -743,6 +750,29 @@ pub(crate) struct InventoryView {
     /// stamps it.
     #[serde(default)]
     last_offchain_cash_fill_applied_at: Option<DateTime<Utc>>,
+    /// Consecutive skipped Hedging equity snapshots per symbol, reset when
+    /// one applies. Pure observability: ADR 0015 accepted that its guards
+    /// can starve a symbol's snapshots but noted the starvation was
+    /// invisible at production log levels; these streaks surface it as a
+    /// `warn!` every [`OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY`] consecutive
+    /// skips.
+    #[serde(default)]
+    offchain_equity_snapshot_skip_streaks: HashMap<Symbol, u32>,
+    /// Consecutive `OffchainUsd` snapshots skipped by the venue-level cash
+    /// guards, reset when one passes them.
+    #[serde(default)]
+    offchain_usd_snapshot_skip_streak: u32,
+    /// `fetched_at` of the freshest applied Hedging cash snapshot (ordinary
+    /// or reconciled) -- the venue-level cash twin of
+    /// `offchain_equity_snapshot_watermarks`. Consulted by
+    /// `reconcile_offchain_usd`: an ordinary snapshot that applied between
+    /// the escalation send and the reconcile apply owns the balance, and
+    /// the reconcile's older broker reading must not overwrite it. The
+    /// venue's other stamps cannot stand in -- the applied-cash-fill time
+    /// tracks fills, not snapshots, and `last_rebalancing` is exactly what
+    /// the reconcile's force path bypasses.
+    #[serde(default)]
+    offchain_usd_snapshot_watermark: Option<DateTime<Utc>>,
     /// Highest block number whose `OnchainEquity` snapshot has been applied,
     /// by symbol. Chain-native ordering, not a clock: a pinned vault read at
     /// block N provably contains every fill at a block <= N, so an
@@ -1094,6 +1124,9 @@ impl Default for InventoryView {
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
             last_offchain_cash_fill_applied_at: None,
+            offchain_equity_snapshot_skip_streaks: HashMap::new(),
+            offchain_usd_snapshot_skip_streak: 0,
+            offchain_usd_snapshot_watermark: None,
             buying_power_cents: None,
             withdrawable_cash_cents: None,
             offchain_gross_usd_cents: None,
@@ -1201,7 +1234,6 @@ impl InventoryView {
     }
 
     /// Returns the USDC available balance at the given venue.
-    #[cfg(test)]
     pub(crate) fn usdc_available(&self, venue: Venue) -> Option<Usdc> {
         match venue {
             Venue::MarketMaking => self.usdc.onchain.map(VenueBalance::available),
@@ -1329,6 +1361,9 @@ impl InventoryView {
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
+            offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
+            offchain_usd_snapshot_skip_streak: self.offchain_usd_snapshot_skip_streak,
+            offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
         })
     }
 
@@ -1361,6 +1396,9 @@ impl InventoryView {
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
+            offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
+            offchain_usd_snapshot_skip_streak: self.offchain_usd_snapshot_skip_streak,
+            offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
         })
     }
 
@@ -1445,6 +1483,21 @@ impl InventoryView {
             .is_none_or(|watermark| block_number > watermark);
         if advanced {
             self.onchain_usdc_snapshot_block_watermark = Some(block_number);
+        }
+
+        self
+    }
+
+    /// Records an applied Hedging cash snapshot's `fetched_at`, keeping the
+    /// watermark monotonic: unlike the equity path, the ordinary cash apply
+    /// does not gate on this watermark, so an older-but-applying reading
+    /// must not lower it.
+    fn record_offchain_usd_snapshot_watermark(mut self, fetched_at: DateTime<Utc>) -> Self {
+        let advanced = self
+            .offchain_usd_snapshot_watermark
+            .is_none_or(|watermark| fetched_at > watermark);
+        if advanced {
+            self.offchain_usd_snapshot_watermark = Some(fetched_at);
         }
 
         self
@@ -1576,6 +1629,64 @@ impl InventoryView {
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
             ..Self::default()
         }
+    }
+
+    /// Note a skipped Hedging equity snapshot for `symbol`, warning every
+    /// [`OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY`] consecutive skips. ADR 0015
+    /// accepted guard starvation but left it invisible at production log
+    /// levels; this is the missing signal. MarketMaking skips are not
+    /// tracked: that venue's snapshots are only ever skipped by transfer
+    /// inflight, which is already observable state.
+    fn note_offchain_equity_snapshot_skip(mut self, symbol: &Symbol, venue: Venue) -> Self {
+        if venue != Venue::Hedging {
+            return self;
+        }
+
+        let streak = self
+            .offchain_equity_snapshot_skip_streaks
+            .entry(symbol.clone())
+            .or_insert(0);
+        *streak += 1;
+
+        if streak.is_multiple_of(OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY) {
+            warn!(
+                target: "inventory",
+                %symbol,
+                consecutive_skips = *streak,
+                "Offchain equity snapshots for this symbol keep being \
+                 skipped; its Hedging balance is not receiving broker truth"
+            );
+        }
+
+        self
+    }
+
+    fn reset_offchain_equity_snapshot_skip(mut self, symbol: &Symbol, venue: Venue) -> Self {
+        if venue == Venue::Hedging {
+            self.offchain_equity_snapshot_skip_streaks.remove(symbol);
+        }
+        self
+    }
+
+    /// Note an `OffchainUsd` snapshot skipped by the venue-level cash
+    /// guards, warning every [`OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY`]
+    /// consecutive skips.
+    fn note_offchain_usd_snapshot_skip(mut self) -> Self {
+        self.offchain_usd_snapshot_skip_streak += 1;
+
+        if self
+            .offchain_usd_snapshot_skip_streak
+            .is_multiple_of(OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY)
+        {
+            warn!(
+                target: "inventory",
+                consecutive_skips = self.offchain_usd_snapshot_skip_streak,
+                "Offchain USD snapshots keep being skipped; the Hedging cash \
+                 balance is not receiving broker truth"
+            );
+        }
+
+        self
     }
 
     /// The Hedging cash-balance twin of the ADR 0015 guards in
@@ -1750,14 +1861,17 @@ impl InventoryView {
                 let should_record_watermark =
                     view.equity_snapshot_would_apply(symbol, venue, fetched_at)?;
                 if !should_record_watermark {
+                    let view = view.note_offchain_equity_snapshot_skip(symbol, venue);
                     return Ok::<_, InventoryViewError>((view, applied_symbols));
                 }
 
-                let view = view.update_equity(
-                    symbol,
-                    Inventory::on_snapshot(venue, *snapshot_balance, fetched_at),
-                    now,
-                )?;
+                let view = view
+                    .update_equity(
+                        symbol,
+                        Inventory::on_snapshot(venue, *snapshot_balance, fetched_at),
+                        now,
+                    )?
+                    .reset_offchain_equity_snapshot_skip(symbol, venue);
 
                 applied_symbols.push(symbol.clone());
 
@@ -1897,6 +2011,9 @@ impl InventoryView {
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
+            offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
+            offchain_usd_snapshot_skip_streak: self.offchain_usd_snapshot_skip_streak,
+            offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
         })
     }
 
@@ -1930,6 +2047,9 @@ impl InventoryView {
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
+            offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
+            offchain_usd_snapshot_skip_streak: self.offchain_usd_snapshot_skip_streak,
+            offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
         })
     }
 
@@ -2224,6 +2344,100 @@ impl InventoryView {
         Ok(view.record_equity_snapshot_watermarks(Venue::Hedging, [symbol], fetched_at))
     }
 
+    /// Why cash divergence recovery must leave the venue alone this poll --
+    /// the venue-level twin of [`Self::equity_reconciliation_busy`], shared
+    /// by detection (freezes the counter) and the forced apply (aborts) so
+    /// the two can never disagree. Reuses [`EquityReconcileBusy`]: the busy
+    /// taxonomy is identical, only the scope widens from one symbol to the
+    /// venue.
+    pub(crate) fn cash_reconciliation_busy(
+        &self,
+        fetched_at: DateTime<Utc>,
+    ) -> Result<Option<EquityReconcileBusy>, FloatError> {
+        if self.usdc.has_inflight()? || self.active_usdc_rebalance.is_some() {
+            return Ok(Some(EquityReconcileBusy::Transfer));
+        }
+
+        if !self.pending_offchain_order_symbols.is_empty() {
+            return Ok(Some(EquityReconcileBusy::PendingHedgeOrder));
+        }
+
+        if self
+            .last_offchain_cash_fill_applied_at
+            .is_some_and(|filled_at| fetched_at < filled_at)
+        {
+            return Ok(Some(EquityReconcileBusy::FillAfterFetch));
+        }
+
+        Ok(None)
+    }
+
+    /// The venue-level cash twin of [`Self::reconcile_offchain_equity`]:
+    /// force the broker's available cash over the view's Hedging USDC after
+    /// the poller confirmed a persistent divergence. Aborts while the venue
+    /// is busy; the poller re-escalates once it is quiet.
+    pub(crate) fn reconcile_offchain_usd(
+        self,
+        usd_balance_cents: i64,
+        gross_usd_cents: Option<i64>,
+        ledger_usdc: Option<Usdc>,
+        consecutive_polls: u32,
+        fetched_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        if self
+            .offchain_usd_snapshot_watermark
+            .is_some_and(|watermark| fetched_at <= watermark)
+        {
+            warn!(
+                target: "inventory",
+                "Aborting offchain USD reconcile: a fresher cash snapshot \
+                 already applied"
+            );
+            return Ok(self);
+        }
+
+        if let Some(reason) = self.cash_reconciliation_busy(fetched_at)? {
+            warn!(
+                target: "inventory",
+                ?reason,
+                "Aborting offchain USD reconcile; the poller will \
+                 re-escalate once the venue is quiet"
+            );
+            return Ok(self);
+        }
+
+        let broker_usdc = Usdc::from_cents(usd_balance_cents)
+            .ok_or(InventoryViewError::UsdBalanceConversion(usd_balance_cents))?;
+
+        error!(
+            target: "inventory",
+            ledger = ?ledger_usdc,
+            broker_cents = usd_balance_cents,
+            polls = consecutive_polls,
+            "Force-reconciling offchain USD after persistent snapshot \
+             divergence"
+        );
+
+        let witness = PersistentBrokerCashDivergence {
+            ledger_usdc,
+            broker_usd_cents: usd_balance_cents,
+            polls: consecutive_polls,
+        };
+
+        let view = self.update_usdc(
+            Inventory::force_on_snapshot(Venue::Hedging, broker_usdc, witness),
+            now,
+        )?;
+
+        Ok(Self {
+            offchain_gross_usd_cents: gross_usd_cents,
+            offchain_usd_snapshot_skip_streak: 0,
+            ..view
+        }
+        .record_offchain_usd_snapshot_watermark(fetched_at))
+    }
+
     /// Fold an [`InventorySnapshotEvent`] into this view under normal
     /// operation. Uses [`Inventory::on_snapshot`], which silently
     /// ignores stale snapshots (fetched before the last rebalancing)
@@ -2321,9 +2535,14 @@ impl InventoryView {
                 ..
             } => {
                 // Gross is skipped along with the net balance: both come
-                // from the same ambiguous broker read.
-                if !self.offchain_usd_snapshot_would_apply(fetched_at) {
-                    return Ok(self);
+                // from the same ambiguous broker read. The inventory-level
+                // predicate mirrors what `on_snapshot` would silently skip
+                // (inflight, stale), so those skips count toward the streak
+                // instead of vanishing.
+                if !self.offchain_usd_snapshot_would_apply(fetched_at)
+                    || !self.usdc.snapshot_would_apply(fetched_at)?
+                {
+                    return Ok(self.note_offchain_usd_snapshot_skip());
                 }
 
                 let usdc = Usdc::from_cents(*usd_balance_cents)
@@ -2334,9 +2553,26 @@ impl InventoryView {
                 )?;
                 Ok(Self {
                     offchain_gross_usd_cents: *gross_usd_cents,
+                    offchain_usd_snapshot_skip_streak: 0,
                     ..updated
-                })
+                }
+                .record_offchain_usd_snapshot_watermark(fetched_at))
             }
+
+            OffchainUsdReconciled {
+                usd_balance_cents,
+                gross_usd_cents,
+                ledger_usdc,
+                consecutive_polls,
+                ..
+            } => self.reconcile_offchain_usd(
+                *usd_balance_cents,
+                *gross_usd_cents,
+                *ledger_usdc,
+                *consecutive_polls,
+                fetched_at,
+                now,
+            ),
 
             OffchainCashBuyingPower {
                 cash_buying_power_cents,
@@ -2541,10 +2777,27 @@ impl InventoryView {
                 now,
             ),
 
+            // Same routing as the equity reconcile: the cash reconcile
+            // validates venue busyness itself.
+            OffchainUsdReconciled {
+                usd_balance_cents,
+                gross_usd_cents,
+                ledger_usdc,
+                consecutive_polls,
+                fetched_at,
+            } => self.reconcile_offchain_usd(
+                *usd_balance_cents,
+                *gross_usd_cents,
+                *ledger_usdc,
+                *consecutive_polls,
+                *fetched_at,
+                now,
+            ),
+
             OffchainUsd {
                 usd_balance_cents,
                 gross_usd_cents,
-                ..
+                fetched_at,
             } => {
                 // The force path bypasses the staleness guards, not the
                 // ownership one (mirrors the OffchainEquity arm above):
@@ -2571,7 +2824,8 @@ impl InventoryView {
                 Ok(Self {
                     offchain_gross_usd_cents: *gross_usd_cents,
                     ..updated
-                })
+                }
+                .record_offchain_usd_snapshot_watermark(*fetched_at))
             }
 
             OffchainCashBuyingPower {
@@ -2757,6 +3011,9 @@ mod tests {
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
             last_offchain_cash_fill_applied_at: None,
+            offchain_equity_snapshot_skip_streaks: HashMap::new(),
+            offchain_usd_snapshot_skip_streak: 0,
+            offchain_usd_snapshot_watermark: None,
         }
     }
 
@@ -2793,6 +3050,9 @@ mod tests {
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
             last_offchain_cash_fill_applied_at: None,
+            offchain_equity_snapshot_skip_streaks: HashMap::new(),
+            offchain_usd_snapshot_skip_streak: 0,
+            offchain_usd_snapshot_watermark: None,
         }
     }
 
@@ -4767,6 +5027,9 @@ mod tests {
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
             last_offchain_cash_fill_applied_at: None,
+            offchain_equity_snapshot_skip_streaks: HashMap::new(),
+            offchain_usd_snapshot_skip_streak: 0,
+            offchain_usd_snapshot_watermark: None,
         };
 
         let dto = view.to_dto();
@@ -4825,6 +5088,9 @@ mod tests {
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
             last_offchain_cash_fill_applied_at: None,
+            offchain_equity_snapshot_skip_streaks: HashMap::new(),
+            offchain_usd_snapshot_skip_streak: 0,
+            offchain_usd_snapshot_watermark: None,
         };
 
         let dto = view.to_dto();
@@ -5794,6 +6060,443 @@ mod tests {
                 .equity_reconciliation_busy(&spym, now + Duration::seconds(2))
                 .unwrap(),
             None
+        );
+    }
+
+    fn usdc_cents(cents: i64) -> Usdc {
+        Usdc::from_cents(cents).unwrap()
+    }
+
+    fn usd_reconciled_event(
+        broker_cents: i64,
+        ledger: Option<Usdc>,
+        fetched_at: DateTime<Utc>,
+    ) -> InventorySnapshotEvent {
+        InventorySnapshotEvent::OffchainUsdReconciled {
+            usd_balance_cents: broker_cents,
+            gross_usd_cents: Some(broker_cents),
+            fetched_at,
+            ledger_usdc: ledger,
+            consecutive_polls: 3,
+        }
+    }
+
+    /// A phantom Hedging cash balance protected by a freshly stamped
+    /// `last_rebalancing` that ordinary snapshots cannot pierce. The
+    /// reconcile event must force the broker value through, clear inflight,
+    /// and carry the gross reading with the net.
+    #[test]
+    fn cash_reconcile_forces_broker_value_through_guard() {
+        let now = Utc::now();
+        let view = InventoryView::default()
+            .with_usdc(Usdc::ZERO, usdc_cents(50_000))
+            .clear_usdc_inflight(Venue::Hedging, now)
+            .unwrap();
+
+        let wedged = view
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainUsd {
+                    usd_balance_cents: 0,
+                    gross_usd_cents: Some(0),
+                    fetched_at: now - Duration::seconds(1),
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            wedged.usdc_available(Venue::Hedging),
+            Some(usdc_cents(50_000)),
+            "precondition: the ordinary cash snapshot path must stay wedged"
+        );
+        assert_eq!(
+            wedged.offchain_gross_usd_cents, None,
+            "a skipped cash snapshot must not apply its gross reading either"
+        );
+
+        let healed = wedged
+            .apply_snapshot_event(
+                &usd_reconciled_event(0, Some(usdc_cents(50_000)), now + Duration::seconds(1)),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            healed.usdc_available(Venue::Hedging),
+            Some(Usdc::ZERO),
+            "the reconcile must force the broker cash value through the guard"
+        );
+        assert_eq!(
+            healed.usdc_inflight(Venue::Hedging),
+            Some(Usdc::ZERO),
+            "the force path clears Hedging cash inflight"
+        );
+        assert_eq!(
+            healed.offchain_gross_usd_cents,
+            Some(0),
+            "the reconcile applies the gross reading alongside the net"
+        );
+    }
+
+    /// The cash twin of `reconcile_aborts_when_watermark_is_newer_than_reading`:
+    /// an ordinary cash snapshot that applied between the escalation send
+    /// and the reconcile apply owns the balance, and the reconcile's older
+    /// broker reading must not overwrite it, at or below the watermark.
+    #[test]
+    fn cash_reconcile_aborts_when_watermark_is_newer_than_reading() {
+        let now = Utc::now();
+
+        let view = InventoryView::default()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainUsd {
+                    usd_balance_cents: 50_000,
+                    gross_usd_cents: Some(50_000),
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+
+        let older = view
+            .clone()
+            .apply_snapshot_event(
+                &usd_reconciled_event(0, Some(usdc_cents(50_000)), now - Duration::seconds(1)),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            older.usdc_available(Venue::Hedging),
+            Some(usdc_cents(50_000)),
+            "a cash reconcile older than the watermark must not overwrite \
+             the fresher snapshot"
+        );
+        assert_eq!(
+            older.offchain_gross_usd_cents,
+            Some(50_000),
+            "the aborted reconcile must not overwrite the fresher gross \
+             reading either"
+        );
+
+        let at_watermark = view
+            .apply_snapshot_event(&usd_reconciled_event(0, Some(usdc_cents(50_000)), now), now)
+            .unwrap();
+        assert_eq!(
+            at_watermark.usdc_available(Venue::Hedging),
+            Some(usdc_cents(50_000)),
+            "a cash reconcile at the watermark must be rejected like the \
+             ordinary path"
+        );
+    }
+
+    /// An applied cash reconcile stamps the watermark itself: redelivering
+    /// the same reconcile event (same `fetched_at`) must be rejected by the
+    /// freshness guard instead of force-writing again.
+    #[test]
+    fn cash_reconcile_stamps_the_watermark_it_checks() {
+        let now = Utc::now();
+
+        let healed = InventoryView::default()
+            .with_usdc(Usdc::ZERO, usdc_cents(50_000))
+            .apply_snapshot_event(&usd_reconciled_event(0, Some(usdc_cents(50_000)), now), now)
+            .unwrap();
+        assert_eq!(
+            healed.usdc_available(Venue::Hedging),
+            Some(Usdc::ZERO),
+            "precondition: the first reconcile must apply"
+        );
+
+        // A fill delta lands after the heal; a replay of the same reconcile
+        // reading must not overwrite it with the pre-fill broker value.
+        let after_fill = healed
+            .update_usdc(
+                Inventory::available(Venue::Hedging, Operator::Add, usdc_cents(1_000)),
+                now,
+            )
+            .unwrap()
+            .apply_snapshot_event(&usd_reconciled_event(0, Some(usdc_cents(50_000)), now), now)
+            .unwrap();
+        assert_eq!(
+            after_fill.usdc_available(Venue::Hedging),
+            Some(usdc_cents(1_000)),
+            "a replayed reconcile at its own watermark must be rejected"
+        );
+    }
+
+    #[test]
+    fn cash_reconcile_aborts_while_usdc_inflight() {
+        let now = Utc::now();
+        let view = InventoryView::default().with_usdc_inflight(
+            Usdc::ZERO,
+            Usdc::ZERO,
+            usdc_cents(50_000),
+            usdc_cents(10_000),
+        );
+
+        let result = view
+            .apply_snapshot_event(&usd_reconciled_event(0, Some(usdc_cents(50_000)), now), now)
+            .unwrap();
+
+        assert_eq!(
+            result.usdc_available(Venue::Hedging),
+            Some(usdc_cents(50_000)),
+            "the reconcile must abort while a USDC transfer owns the balance"
+        );
+        assert_eq!(
+            result.usdc_inflight(Venue::Hedging),
+            Some(usdc_cents(10_000)),
+            "the aborted reconcile must not clear the live inflight"
+        );
+    }
+
+    #[test]
+    fn cash_reconcile_aborts_while_usdc_rebalance_active() {
+        let now = Utc::now();
+        let view = InventoryView::default()
+            .with_usdc(Usdc::ZERO, usdc_cents(50_000))
+            .set_active_usdc_rebalance(UsdcRebalanceId(Uuid::new_v4()));
+
+        let result = view
+            .apply_snapshot_event(&usd_reconciled_event(0, Some(usdc_cents(50_000)), now), now)
+            .unwrap();
+
+        assert_eq!(
+            result.usdc_available(Venue::Hedging),
+            Some(usdc_cents(50_000)),
+            "the reconcile must abort while a USDC rebalance aggregate is live"
+        );
+    }
+
+    /// The venue-level twin of `reconcile_respects_open_hedge_gate`: an open
+    /// hedge order on ANY symbol makes the venue's cash reading ambiguous,
+    /// and the aborted reconcile must not burn the watermark.
+    #[test]
+    fn cash_reconcile_aborts_while_any_hedge_order_open() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+
+        let mut view = InventoryView::default().with_usdc(Usdc::ZERO, usdc_cents(50_000));
+        view.mark_offchain_order_pending(spym.clone());
+
+        let gated = view
+            .apply_snapshot_event(&usd_reconciled_event(0, None, now), now)
+            .unwrap();
+        assert_eq!(
+            gated.usdc_available(Venue::Hedging),
+            Some(usdc_cents(50_000)),
+            "an open hedge order owns the cash balance; the reconcile must abort"
+        );
+
+        let mut released = gated;
+        released.clear_offchain_order_pending(&spym, None);
+        let healed = released
+            .apply_snapshot_event(&usd_reconciled_event(0, None, now), now)
+            .unwrap();
+        assert_eq!(
+            healed.usdc_available(Venue::Hedging),
+            Some(Usdc::ZERO),
+            "the reconcile must apply once the hedge order terminated"
+        );
+    }
+
+    #[test]
+    fn cash_reconcile_aborts_when_reading_predates_last_applied_cash_fill() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let fetched_at = Utc::now();
+        let fill_applied_at = fetched_at + Duration::seconds(1);
+
+        let mut view = InventoryView::default().with_usdc(Usdc::ZERO, usdc_cents(40_000));
+        view.clear_offchain_order_pending(&spym, Some(fill_applied_at));
+
+        let result = view
+            .apply_snapshot_event(
+                &usd_reconciled_event(0, Some(usdc_cents(40_000)), fetched_at),
+                fill_applied_at,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.usdc_available(Venue::Hedging),
+            Some(usdc_cents(40_000)),
+            "the reconcile must abort when a cash fill applied after the \
+             reading was fetched"
+        );
+    }
+
+    #[test]
+    fn cash_reconciliation_busy_covers_each_busy_source() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+
+        let not_busy = InventoryView::default().with_usdc(Usdc::ZERO, usdc_cents(50_000));
+        assert_eq!(not_busy.cash_reconciliation_busy(now).unwrap(), None);
+
+        let inflight = not_busy.clone().with_usdc_inflight(
+            Usdc::ZERO,
+            Usdc::ZERO,
+            usdc_cents(50_000),
+            usdc_cents(1_000),
+        );
+        assert_eq!(
+            inflight.cash_reconciliation_busy(now).unwrap(),
+            Some(EquityReconcileBusy::Transfer)
+        );
+
+        let rebalancing = not_busy
+            .clone()
+            .set_active_usdc_rebalance(UsdcRebalanceId(Uuid::new_v4()));
+        assert_eq!(
+            rebalancing.cash_reconciliation_busy(now).unwrap(),
+            Some(EquityReconcileBusy::Transfer)
+        );
+
+        let mut hedging = not_busy.clone();
+        hedging.mark_offchain_order_pending(spym.clone());
+        assert_eq!(
+            hedging.cash_reconciliation_busy(now).unwrap(),
+            Some(EquityReconcileBusy::PendingHedgeOrder)
+        );
+
+        let mut fill_applied_after_reading = not_busy;
+        fill_applied_after_reading
+            .clear_offchain_order_pending(&spym, Some(now + Duration::seconds(1)));
+        assert_eq!(
+            fill_applied_after_reading
+                .cash_reconciliation_busy(now)
+                .unwrap(),
+            Some(EquityReconcileBusy::FillAfterFetch)
+        );
+        assert_eq!(
+            fill_applied_after_reading
+                .cash_reconciliation_busy(now + Duration::seconds(2))
+                .unwrap(),
+            None
+        );
+    }
+
+    /// ADR 0015 accepted guard starvation but left it invisible at
+    /// production log levels; the skip streak is the missing signal. The
+    /// warn must fire only at the cadence, not on every skip.
+    #[test]
+    #[tracing_test::traced_test]
+    fn offchain_usd_snapshot_skip_streak_warns_at_cadence() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+
+        let mut view = InventoryView::default().with_usdc(Usdc::ZERO, usdc_cents(50_000));
+        view.mark_offchain_order_pending(spym);
+
+        let snapshot = InventorySnapshotEvent::OffchainUsd {
+            usd_balance_cents: 0,
+            gross_usd_cents: Some(0),
+            fetched_at: now,
+        };
+
+        for _ in 0..(OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY - 1) {
+            view = view.apply_snapshot_event(&snapshot, now).unwrap();
+        }
+        assert_eq!(
+            view.offchain_usd_snapshot_skip_streak,
+            OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY - 1
+        );
+        assert!(
+            !logs_contain("Offchain USD snapshots keep being skipped"),
+            "below the cadence no starvation warning may fire"
+        );
+
+        let view = view.apply_snapshot_event(&snapshot, now).unwrap();
+        assert_eq!(
+            view.offchain_usd_snapshot_skip_streak,
+            OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY
+        );
+        assert!(
+            logs_contain("Offchain USD snapshots keep being skipped"),
+            "the warn must fire once the streak reaches the cadence"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn offchain_usd_snapshot_skip_streak_resets_on_apply() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+
+        let mut view = InventoryView::default().with_usdc(Usdc::ZERO, usdc_cents(50_000));
+        view.mark_offchain_order_pending(spym.clone());
+
+        let snapshot = InventorySnapshotEvent::OffchainUsd {
+            usd_balance_cents: 0,
+            gross_usd_cents: Some(0),
+            fetched_at: now,
+        };
+
+        for _ in 0..(OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY - 1) {
+            view = view.apply_snapshot_event(&snapshot, now).unwrap();
+        }
+
+        // An applied snapshot ends the starvation streak: the guard lifted
+        // and broker truth reached the balance.
+        view.clear_offchain_order_pending(&spym, None);
+        view = view.apply_snapshot_event(&snapshot, now).unwrap();
+        assert_eq!(
+            view.offchain_usd_snapshot_skip_streak, 0,
+            "an applied snapshot must reset the skip streak"
+        );
+
+        view.mark_offchain_order_pending(spym);
+        for _ in 0..(OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY - 1) {
+            view = view.apply_snapshot_event(&snapshot, now).unwrap();
+        }
+        assert!(
+            !logs_contain("Offchain USD snapshots keep being skipped"),
+            "interrupted streaks must not accumulate across an apply"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn offchain_equity_snapshot_skip_streak_warns_at_cadence() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+
+        let mut view = InventoryView::default().with_equity(spym.clone(), shares(0), shares(10));
+        view.mark_offchain_order_pending(spym.clone());
+
+        let snapshot = InventorySnapshotEvent::OffchainEquity {
+            positions: BTreeMap::from([(spym.clone(), shares(0))]),
+            fetched_at: now,
+        };
+
+        for _ in 0..(OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY - 1) {
+            view = view.apply_snapshot_event(&snapshot, now).unwrap();
+        }
+        assert!(
+            !logs_contain("Offchain equity snapshots for this symbol keep being"),
+            "below the cadence no starvation warning may fire"
+        );
+
+        view = view.apply_snapshot_event(&snapshot, now).unwrap();
+        assert_eq!(
+            view.offchain_equity_snapshot_skip_streaks.get(&spym),
+            Some(&OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY)
+        );
+        assert!(
+            logs_contain("Offchain equity snapshots for this symbol keep being"),
+            "the warn must fire once the symbol's streak reaches the cadence"
+        );
+
+        // An applied snapshot drops the symbol's streak entirely.
+        view.clear_offchain_order_pending(&spym, None);
+        let view = view
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(spym.clone(), shares(0))]),
+                    fetched_at: now + Duration::seconds(1),
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            view.offchain_equity_snapshot_skip_streaks.get(&spym),
+            None,
+            "an applied snapshot must clear the symbol's skip streak"
         );
     }
 }

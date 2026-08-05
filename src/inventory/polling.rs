@@ -134,6 +134,28 @@ struct InventoryDivergenceEscalation {
     consecutive_polls: u32,
 }
 
+/// How the view's Hedging cash balance relates to the broker's available
+/// cash -- the venue-level twin of [`ObservedLedgerState`].
+enum ObservedCashLedgerState {
+    /// USDC inflight, an active USDC rebalance, an open hedge order, or a
+    /// reading fetched before the last applied cash fill: the comparison is
+    /// ambiguous, freeze the counter.
+    Busy,
+    Match,
+    Divergence {
+        /// The view's Hedging USDC; `None` when the venue was never
+        /// initialized.
+        ledger: Option<Usdc>,
+    },
+}
+
+/// The venue-level cash divergence counter reached the configured
+/// threshold.
+struct CashDivergenceEscalation {
+    ledger: Option<Usdc>,
+    consecutive_polls: u32,
+}
+
 /// Service that polls actual inventory from onchain vaults and offchain brokers.
 pub(crate) struct InventoryPollingService<Chain, Exe>
 where
@@ -168,6 +190,9 @@ where
     /// Consecutive diverging polls per symbol. Kept in memory on purpose: a
     /// restart resets the count, and restart hydration restores the view.
     divergence_counters: Mutex<HashMap<Symbol, u32>>,
+    /// Consecutive polls that observed a Hedging cash divergence. One
+    /// counter, venue-level: the cash balance is one number per venue.
+    cash_divergence_counter: Mutex<u32>,
     /// Stamped on every successful sub-poll fetch this run, so the
     /// daily portfolio snapshot capture can gate on FRESHNESS in addition to
     /// presence. Defaults to a fresh, empty tracker; production wiring passes
@@ -214,6 +239,7 @@ where
             reserved_cash,
             divergence_recovery: None,
             divergence_counters: Mutex::new(HashMap::new()),
+            cash_divergence_counter: Mutex::new(0),
             poll_freshness,
         }
     }
@@ -716,10 +742,207 @@ where
         // so a poll the pipeline accepted has already reached the view here
         // and reads back as a match. Whatever still diverges from the view at
         // this point was suppressed or skipped.
-        self.detect_offchain_divergences(snapshot_id, &positions, fetched_at)
+        //
+        // The two detectors are independent concerns: a failed equity
+        // escalation must not skip the cash comparison for the tick (the
+        // cash counter would neither increment nor reset), so both run and
+        // the first error is reported -- the same attempt-everything policy
+        // the equity detector applies to its per-symbol escalations.
+        let equity_result = self
+            .detect_offchain_divergences(snapshot_id, &positions, fetched_at)
+            .await;
+        let cash_result = self
+            .detect_offchain_cash_divergence(
+                snapshot_id,
+                available_usd_cents,
+                gross_usd_cents,
+                fetched_at,
+            )
+            .await;
+
+        equity_result.and(cash_result)
+    }
+
+    /// The venue-level cash twin of [`Self::detect_offchain_divergences`]:
+    /// compares the broker's available cash against the view's Hedging USDC
+    /// across consecutive polls and escalates a forced reconcile at the
+    /// same threshold. Runs independently of event emission, so it is the
+    /// bounded path back to broker truth even when the aggregate's
+    /// unchanged-value dedupe or the view's cash guards suppress the
+    /// ordinary snapshot.
+    async fn detect_offchain_cash_divergence(
+        &self,
+        snapshot_id: &InventorySnapshotId,
+        usd_balance_cents: i64,
+        gross_usd_cents: Option<i64>,
+        fetched_at: DateTime<Utc>,
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        // The equity detector already warns when recovery is unconfigured;
+        // a second warning per poll would only add noise.
+        let Some(recovery) = &self.divergence_recovery else {
+            return Ok(());
+        };
+
+        let Some(broker_usdc) = Usdc::from_cents(usd_balance_cents) else {
+            warn!(
+                target: "inventory",
+                usd_balance_cents,
+                "Skipping cash divergence detection: broker cents not \
+                 representable as USDC"
+            );
+            return Ok(());
+        };
+
+        let view = recovery.inventory.read().await;
+        let state = if view.cash_reconciliation_busy(fetched_at)?.is_some() {
+            ObservedCashLedgerState::Busy
+        } else {
+            let ledger = view.usdc_available(Venue::Hedging);
+            let matches = match ledger {
+                Some(ledger_usdc) => ledger_usdc.eq(&broker_usdc)?,
+                // Nothing in the view and nothing at the broker is
+                // agreement; a nonzero broker reading against an
+                // uninitialized venue counts.
+                None => broker_usdc.eq(&Usdc::ZERO)?,
+            };
+
+            if matches {
+                ObservedCashLedgerState::Match
+            } else {
+                ObservedCashLedgerState::Divergence { ledger }
+            }
+        };
+        drop(view);
+
+        let Some(escalation) =
+            self.record_cash_divergence_observation(recovery, &state, usd_balance_cents)
+        else {
+            return Ok(());
+        };
+
+        self.escalate_cash_divergence(
+            recovery,
+            snapshot_id,
+            usd_balance_cents,
+            gross_usd_cents,
+            broker_usdc,
+            escalation,
+            fetched_at,
+        )
+        .await
+    }
+
+    /// Folds one poll's cash observation into the counter and the dispatch
+    /// gate. Synchronous on purpose: the counter guard must never be held
+    /// across an await.
+    fn record_cash_divergence_observation(
+        &self,
+        recovery: &InventoryDivergenceRecoveryCtx,
+        state: &ObservedCashLedgerState,
+        broker_cents: i64,
+    ) -> Option<CashDivergenceEscalation> {
+        let mut counter = self.lock_cash_divergence_counter();
+
+        match state {
+            ObservedCashLedgerState::Busy => None,
+            ObservedCashLedgerState::Match => {
+                if *counter != 0 {
+                    *counter = 0;
+                    recovery.gate.release_cash();
+                }
+                None
+            }
+            ObservedCashLedgerState::Divergence { ledger } => {
+                *counter += 1;
+                recovery.gate.engage_cash();
+
+                warn!(
+                    target: "inventory",
+                    ?ledger,
+                    broker_cents,
+                    consecutive_polls = *counter,
+                    threshold = recovery.threshold.get(),
+                    "Offchain USD snapshot diverges from the inventory view"
+                );
+
+                (*counter >= recovery.threshold.get()).then_some(CashDivergenceEscalation {
+                    ledger: *ledger,
+                    consecutive_polls: *counter,
+                })
+            }
+        }
+    }
+
+    /// Sends one `ReconcileOffchainUsd` escalation and settles its counter
+    /// and gate: released when the view reads back the broker value, kept
+    /// engaged when the apply aborted.
+    async fn escalate_cash_divergence(
+        &self,
+        recovery: &InventoryDivergenceRecoveryCtx,
+        snapshot_id: &InventorySnapshotId,
+        usd_balance_cents: i64,
+        gross_usd_cents: Option<i64>,
+        broker_usdc: Usdc,
+        escalation: CashDivergenceEscalation,
+        fetched_at: DateTime<Utc>,
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        self.snapshot
+            .send(
+                snapshot_id,
+                InventorySnapshotCommand::ReconcileOffchainUsd {
+                    usd_balance_cents,
+                    gross_usd_cents,
+                    fetched_at,
+                    ledger_usdc: escalation.ledger,
+                    consecutive_polls: escalation.consecutive_polls,
+                },
+            )
             .await?;
 
+        let healed = {
+            let view = recovery.inventory.read().await;
+            match view.usdc_available(Venue::Hedging) {
+                Some(ledger) => ledger.eq(&broker_usdc)?,
+                None => false,
+            }
+        };
+
+        if healed {
+            *self.lock_cash_divergence_counter() = 0;
+            recovery.gate.release_cash();
+        } else if escalation.consecutive_polls >= recovery.threshold.get().saturating_mul(2) {
+            // A full extra threshold window of escalations has failed to
+            // heal: past transient busyness, and every failed attempt
+            // appends another reconcile event. Needs an operator.
+            error!(
+                target: "inventory",
+                broker_cents = usd_balance_cents,
+                consecutive_polls = escalation.consecutive_polls,
+                "Cash reconcile escalations persistently fail to heal the \
+                 view"
+            );
+        } else {
+            warn!(
+                target: "inventory",
+                broker_cents = usd_balance_cents,
+                "Cash reconcile escalation did not heal the view; keeping \
+                 the dispatch gate engaged and the counter at the threshold"
+            );
+        }
+
         Ok(())
+    }
+
+    fn lock_cash_divergence_counter(&self) -> MutexGuard<'_, u32> {
+        self.cash_divergence_counter
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                warn!(
+                    target: "inventory",
+                    "Cash divergence counter was poisoned; recovering state"
+                );
+                poisoned.into_inner()
+            })
     }
 
     /// Compare each fetched broker position against the view's Hedging
@@ -1366,6 +1589,7 @@ mod tests {
         BroadcastingInventory, InventoryDivergenceGate, InventoryProjection, InventoryView,
     };
     use crate::test_utils::setup_test_db;
+    use crate::usdc_rebalance::UsdcRebalanceId;
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
 
     #[derive(Clone, Default)]
@@ -5092,6 +5316,436 @@ mod tests {
         assert!(
             !gate.is_engaged(&spym),
             "the sent escalation must lift the transfer gate"
+        );
+    }
+
+    async fn cash_reconciled_events(
+        pool: &SqlitePool,
+        orderbook: Address,
+        order_owner: Address,
+    ) -> Vec<InventorySnapshotEvent> {
+        load_snapshot_events(pool, orderbook, order_owner)
+            .await
+            .into_iter()
+            .filter(|event| matches!(event, InventorySnapshotEvent::OffchainUsdReconciled { .. }))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn cash_divergence_escalates_at_exactly_threshold_polls() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let phantom = Usdc::from_cents(50_000).unwrap();
+
+        // Phantom $500 at Hedging while the broker reports zero cash. No
+        // reactor is wired, so the view never changes and every poll
+        // diverges.
+        let inventory =
+            broadcasting_inventory(InventoryView::default().with_usdc(Usdc::ZERO, phantom));
+        let gate = Arc::new(InventoryDivergenceGate::default());
+        let service = reconciling_service(
+            &pool,
+            Arc::new(test_store(pool.clone(), ())),
+            inventory.clone(),
+            gate.clone(),
+            3,
+        );
+
+        service.poll_and_record().await.unwrap();
+        assert!(
+            gate.is_cash_engaged(),
+            "the first diverging poll must engage the cash dispatch gate"
+        );
+
+        service.poll_and_record().await.unwrap();
+        assert!(
+            cash_reconciled_events(&pool, orderbook, order_owner)
+                .await
+                .is_empty(),
+            "below the threshold no cash escalation may fire"
+        );
+
+        service.poll_and_record().await.unwrap();
+        let events = cash_reconciled_events(&pool, orderbook, order_owner).await;
+        let [event] = events.as_slice() else {
+            panic!("Expected exactly one cash reconcile escalation, got {events:?}");
+        };
+        let InventorySnapshotEvent::OffchainUsdReconciled {
+            usd_balance_cents,
+            ledger_usdc,
+            consecutive_polls,
+            ..
+        } = event
+        else {
+            panic!("Expected OffchainUsdReconciled, got {event:?}");
+        };
+        assert_eq!(*usd_balance_cents, 0);
+        assert_eq!(*ledger_usdc, Some(phantom));
+        assert_eq!(*consecutive_polls, 3);
+        assert!(
+            gate.is_cash_engaged(),
+            "an escalation that did not heal the view must keep the gate engaged"
+        );
+
+        // The counter survives an unhealed escalation: the next diverging
+        // poll re-escalates immediately instead of starting a fresh count.
+        service.poll_and_record().await.unwrap();
+        let events = cash_reconciled_events(&pool, orderbook, order_owner).await;
+        assert_eq!(
+            events.len(),
+            2,
+            "an unhealed cash escalation must re-escalate on the next diverging poll"
+        );
+        let InventorySnapshotEvent::OffchainUsdReconciled {
+            consecutive_polls, ..
+        } = &events[1]
+        else {
+            panic!("Expected OffchainUsdReconciled, got {:?}", events[1]);
+        };
+        assert_eq!(
+            *consecutive_polls, 4,
+            "the kept counter must keep counting, not restart from one"
+        );
+        assert!(
+            gate.is_cash_engaged(),
+            "the gate must stay engaged while the view remains diverged"
+        );
+    }
+
+    #[tokio::test]
+    async fn cash_divergence_counter_resets_on_matching_poll() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let phantom = Usdc::from_cents(50_000).unwrap();
+
+        let inventory =
+            broadcasting_inventory(InventoryView::default().with_usdc(Usdc::ZERO, phantom));
+        let gate = Arc::new(InventoryDivergenceGate::default());
+        let service = reconciling_service(
+            &pool,
+            Arc::new(test_store(pool.clone(), ())),
+            inventory.clone(),
+            gate.clone(),
+            2,
+        );
+
+        service.poll_and_record().await.unwrap();
+        assert!(gate.is_cash_engaged());
+
+        // The view catches up to the broker: the next poll matches,
+        // resetting the counter and lifting the gate.
+        {
+            let mut view = inventory.write().await;
+            *view = InventoryView::default().with_usdc(Usdc::ZERO, Usdc::ZERO);
+        }
+        service.poll_and_record().await.unwrap();
+        assert!(
+            !gate.is_cash_engaged(),
+            "a matching poll must reset the counter and lift the cash gate"
+        );
+
+        // The phantom returns: with the counter reset, the next poll is
+        // count 1 (no escalation at threshold 2) and only the one after
+        // escalates.
+        {
+            let mut view = inventory.write().await;
+            *view = InventoryView::default().with_usdc(Usdc::ZERO, phantom);
+        }
+        service.poll_and_record().await.unwrap();
+        assert!(
+            cash_reconciled_events(&pool, orderbook, order_owner)
+                .await
+                .is_empty(),
+            "the reset counter must restart from one, not resume at two"
+        );
+
+        service.poll_and_record().await.unwrap();
+        assert_eq!(
+            cash_reconciled_events(&pool, orderbook, order_owner)
+                .await
+                .len(),
+            1,
+            "the second consecutive divergence after the reset escalates"
+        );
+    }
+
+    /// The cash twin of [`assert_counter_frozen_while_busy`]: one diverging
+    /// poll (count 1), busy polls that must neither count nor escalate while
+    /// keeping the gate engaged, then release and a final diverging poll
+    /// that escalates with `consecutive_polls == 2`.
+    async fn assert_cash_counter_frozen_while_busy(
+        make_busy: impl Fn(InventoryView) -> InventoryView,
+        clear_busy: impl Fn(InventoryView) -> InventoryView,
+    ) {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let phantom = Usdc::from_cents(50_000).unwrap();
+
+        let inventory =
+            broadcasting_inventory(InventoryView::default().with_usdc(Usdc::ZERO, phantom));
+        let gate = Arc::new(InventoryDivergenceGate::default());
+        let service = reconciling_service(
+            &pool,
+            Arc::new(test_store(pool.clone(), ())),
+            inventory.clone(),
+            gate.clone(),
+            2,
+        );
+
+        service.poll_and_record().await.unwrap();
+        assert!(gate.is_cash_engaged());
+
+        {
+            let mut view = inventory.write().await;
+            *view = make_busy(view.clone());
+        }
+        service.poll_and_record().await.unwrap();
+        service.poll_and_record().await.unwrap();
+        assert!(
+            cash_reconciled_events(&pool, orderbook, order_owner)
+                .await
+                .is_empty(),
+            "busy polls must not count toward the threshold"
+        );
+        assert!(
+            gate.is_cash_engaged(),
+            "the gate must stay engaged while the counter is frozen"
+        );
+
+        {
+            let mut view = inventory.write().await;
+            *view = clear_busy(view.clone());
+        }
+        service.poll_and_record().await.unwrap();
+        let events = cash_reconciled_events(&pool, orderbook, order_owner).await;
+        let [
+            InventorySnapshotEvent::OffchainUsdReconciled {
+                consecutive_polls, ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("Expected exactly one cash reconcile escalation, got {events:?}");
+        };
+        assert_eq!(
+            *consecutive_polls, 2,
+            "the busy window must freeze the counter, not reset it"
+        );
+    }
+
+    #[tokio::test]
+    async fn cash_divergence_counter_frozen_while_usdc_inflight() {
+        assert_cash_counter_frozen_while_busy(
+            |view| {
+                view.update_usdc(
+                    crate::inventory::Inventory::set_inflight(
+                        Venue::Hedging,
+                        Usdc::from_cents(1_000).unwrap(),
+                    ),
+                    Utc::now(),
+                )
+                .unwrap()
+            },
+            |view| {
+                view.update_usdc(
+                    crate::inventory::Inventory::set_inflight(Venue::Hedging, Usdc::ZERO),
+                    Utc::now(),
+                )
+                .unwrap()
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cash_divergence_counter_frozen_while_usdc_rebalance_active() {
+        assert_cash_counter_frozen_while_busy(
+            |view| view.set_active_usdc_rebalance(UsdcRebalanceId(Uuid::new_v4())),
+            InventoryView::clear_active_usdc_rebalance,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cash_divergence_counter_frozen_while_hedge_order_pending() {
+        assert_cash_counter_frozen_while_busy(
+            |mut view| {
+                view.mark_offchain_order_pending(test_symbol("SPYM"));
+                view
+            },
+            |mut view| {
+                view.clear_offchain_order_pending(&test_symbol("SPYM"), None);
+                view
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cash_divergence_counter_frozen_while_cash_fill_applied_after_reading() {
+        // A cash-fill stamp in the future stands in for a fill whose cash
+        // leg applied between the broker read and the comparison: every
+        // poll's fetched_at predates it, so the reading is stale and must
+        // freeze the counter. Moving the stamp into the past releases it.
+        assert_cash_counter_frozen_while_busy(
+            |mut view| {
+                view.clear_offchain_order_pending(
+                    &test_symbol("SPYM"),
+                    Some(Utc::now() + chrono::Duration::hours(1)),
+                );
+                view
+            },
+            |mut view| {
+                view.clear_offchain_order_pending(
+                    &test_symbol("SPYM"),
+                    Some(Utc::now() - chrono::Duration::hours(1)),
+                );
+                view
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn uninitialized_cash_venue_with_zero_broker_reading_does_not_diverge() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+
+        // No USDC entry in the view and zero cash at the broker: the
+        // comparison must read as a match, not count toward escalation.
+        let inventory = broadcasting_inventory(InventoryView::default());
+        let gate = Arc::new(InventoryDivergenceGate::default());
+        let service = reconciling_service(
+            &pool,
+            Arc::new(test_store(pool.clone(), ())),
+            inventory,
+            gate.clone(),
+            1,
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        assert!(
+            cash_reconciled_events(&pool, orderbook, order_owner)
+                .await
+                .is_empty(),
+            "an uninitialized cash venue with a zero broker reading must not escalate"
+        );
+        assert!(
+            !gate.is_cash_engaged(),
+            "an uninitialized cash venue with a zero broker reading must not engage the gate"
+        );
+    }
+
+    /// The cash twin of `phantom_hedging_credit_self_heals_within_threshold_polls`:
+    /// a transfer cleanup credited Hedging cash the broker never received and
+    /// stamped `last_rebalancing`; the aggregate already stores the true
+    /// zero, so every identical poll dedups to no event. The view must
+    /// converge to the broker's zero within the configured number of polls,
+    /// with the USDC dispatch gate engaged until the divergence resolves.
+    #[tokio::test]
+    async fn phantom_hedging_cash_self_heals_within_threshold_polls() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let phantom = Usdc::from_cents(50_000).unwrap();
+        let threshold = 3u32;
+        let now = Utc::now();
+
+        // Phantom cash at Hedging, guard armed by clear_usdc_inflight.
+        let view = InventoryView::default()
+            .with_usdc(Usdc::ZERO, phantom)
+            .clear_usdc_inflight(Venue::Hedging, now)
+            .unwrap();
+        let inventory = broadcasting_inventory(view);
+        let gate = Arc::new(InventoryDivergenceGate::default());
+
+        let snapshot_store = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+            .with(Arc::new(InventoryProjection::new(inventory.clone())))
+            .build(())
+            .await
+            .unwrap();
+
+        // The aggregate already stores the true zero, recorded by a poll
+        // that predates the guard stamp (the view skipped it as stale), so
+        // every later identical poll dedups to no event.
+        snapshot_store
+            .send(
+                &InventorySnapshotId {
+                    orderbook,
+                    owner: order_owner,
+                },
+                InventorySnapshotCommand::OffchainUsd {
+                    usd_balance_cents: 0,
+                    gross_usd_cents: None,
+                    fetched_at: now - chrono::Duration::seconds(60),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            inventory.read().await.usdc_available(Venue::Hedging),
+            Some(phantom),
+            "precondition: the staleness guard must keep the phantom cash in the view"
+        );
+
+        let service = reconciling_service(
+            &pool,
+            snapshot_store,
+            inventory.clone(),
+            gate.clone(),
+            threshold,
+        );
+
+        service.poll_and_record().await.unwrap();
+        assert_eq!(
+            inventory.read().await.usdc_available(Venue::Hedging),
+            Some(phantom),
+            "one diverging poll must not yet reconcile"
+        );
+        assert!(
+            gate.is_cash_engaged(),
+            "an unresolved cash divergence must gate USDC dispatch"
+        );
+
+        // A failed cleanup stamps last_rebalancing again between polls.
+        {
+            let mut view = inventory.write().await;
+            *view = view
+                .clone()
+                .clear_usdc_inflight(Venue::Hedging, Utc::now())
+                .unwrap();
+        }
+
+        service.poll_and_record().await.unwrap();
+        assert_eq!(
+            inventory.read().await.usdc_available(Venue::Hedging),
+            Some(phantom),
+            "two diverging polls must not yet reconcile"
+        );
+        assert!(gate.is_cash_engaged());
+
+        // The final poll reaches the threshold and escalates.
+        service.poll_and_record().await.unwrap();
+
+        assert_eq!(
+            inventory.read().await.usdc_available(Venue::Hedging),
+            Some(Usdc::ZERO),
+            "the view must converge to the broker cash value within threshold polls"
+        );
+        assert_eq!(
+            inventory.read().await.usdc_inflight(Venue::Hedging),
+            Some(Usdc::ZERO),
+            "the reconcile leaves no residual cash inflight"
+        );
+        assert!(
+            !gate.is_cash_engaged(),
+            "the healed escalation must lift the USDC dispatch gate"
+        );
+
+        let events = cash_reconciled_events(&pool, orderbook, order_owner).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one cash escalation must have been persisted"
         );
     }
 

@@ -12,10 +12,12 @@
 
 use std::collections::HashSet;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::warn;
 
 use st0x_execution::{FractionalShares, Symbol};
+use st0x_finance::Usdc;
 
 use super::BroadcastingInventory;
 
@@ -32,6 +34,13 @@ use super::BroadcastingInventory;
 #[derive(Debug, Default)]
 pub(crate) struct InventoryDivergenceGate {
     symbols: RwLock<HashSet<Symbol>>,
+    /// Venue-level flag for a detected but unresolved `OffchainUsd`
+    /// divergence. One flag, not a set: the Hedging cash balance is one
+    /// number. While engaged, the USDC rebalancing trigger skips dispatch
+    /// -- a bridge sized off a diverged cash balance moves the wrong
+    /// amount and marks the venue busy, freezing the very counter that
+    /// resolves the divergence.
+    cash: AtomicBool,
 }
 
 impl InventoryDivergenceGate {
@@ -45,6 +54,18 @@ impl InventoryDivergenceGate {
 
     pub(crate) fn is_engaged(&self, symbol: &Symbol) -> bool {
         self.read_symbols().contains(symbol)
+    }
+
+    pub(crate) fn engage_cash(&self) {
+        self.cash.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn release_cash(&self) {
+        self.cash.store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_cash_engaged(&self) -> bool {
+        self.cash.load(Ordering::SeqCst)
     }
 
     fn read_symbols(&self) -> std::sync::RwLockReadGuard<'_, HashSet<Symbol>> {
@@ -111,6 +132,34 @@ impl std::fmt::Debug for PersistentBrokerDivergence {
             .field("symbol", symbol)
             .field("ledger_value", ledger_value)
             .field("broker_value", broker_value)
+            .field("polls", polls)
+            .finish()
+    }
+}
+
+/// The venue-level cash twin of [`PersistentBrokerDivergence`]: witness for
+/// forcing the broker's available cash over the view's Hedging USDC.
+pub(crate) struct PersistentBrokerCashDivergence {
+    /// Hedging USDC the view held; `None` when the venue was never
+    /// initialized.
+    pub(crate) ledger_usdc: Option<Usdc>,
+    pub(crate) broker_usd_cents: i64,
+    pub(crate) polls: u32,
+}
+
+// Hand-written for the same reason as `PersistentBrokerDivergence`.
+impl std::fmt::Debug for PersistentBrokerCashDivergence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            ledger_usdc,
+            broker_usd_cents,
+            polls,
+        } = self;
+
+        formatter
+            .debug_struct("PersistentBrokerCashDivergence")
+            .field("ledger_usdc", ledger_usdc)
+            .field("broker_usd_cents", broker_usd_cents)
             .field("polls", polls)
             .finish()
     }

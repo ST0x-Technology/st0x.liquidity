@@ -3702,6 +3702,39 @@ intervals:
   across cycles. The cost on a transient mismatch is at most one poll interval
   of delayed rebalancing.
 
+The Hedging cash balance has the same wedge and the same venue-level recovery
+(the `OffchainUsd` snapshot dedupes on unchanged values, the view's cash guards
+skip the events that arrive, and failed USDC-transfer cleanups stamp
+`last_rebalancing`):
+
+- **Detection**: after the equity comparison, the poller compares the broker's
+  available cash against the view's Hedging USDC and drives a single venue-level
+  counter at the same `inventory_divergence_threshold`. The venue is busy --
+  counter frozen, not reset -- while USDC is inflight, a USDC rebalance
+  aggregate is live, any hedge order is open (the cash balance is venue-level,
+  so an open order on any symbol makes the reading ambiguous), or the reading
+  was fetched before the last applied hedge fill's cash leg. The counter is
+  in-memory, so a restart resets it; startup hydration heals the view anyway.
+- **Escalation**: at the threshold the poller sends `ReconcileOffchainUsd`,
+  which always emits `OffchainUsdReconciled` carrying the broker balance (net
+  and gross), the view's diverging ledger value, and the poll count; the event
+  folds into the aggregate's offchain USD state for startup hydration.
+- **Forced reconcile on apply**: the apply re-validates the same busy taxonomy
+  under the view write lock and aborts unapplied if the venue turned busy; a
+  verified heal resets the counter and releases the gate, an aborted one keeps
+  both so the next quiet poll re-escalates immediately.
+- **Dispatch gating**: while engaged, the venue-level cash gate suppresses the
+  USDC rebalancing trigger (checked before the guard claim and again immediately
+  before dispatch) -- a bridge sized off a diverged cash balance would move the
+  wrong amount and mark the venue busy, freezing the very counter that resolves
+  the divergence.
+
+Guard-skip starvation is observable: the view tracks consecutive guard-skipped
+Hedging snapshots (per symbol for equity, venue-level for cash) and logs a
+warning every five consecutive skips, so an ADR 0015 guard that starves a
+balance of broker truth surfaces at production log levels before the divergence
+machinery escalates. An applied snapshot resets the streak.
+
 ### InventoryView
 
 `InventoryView` aggregates inventory across onchain and offchain venues and
