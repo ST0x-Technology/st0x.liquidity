@@ -2263,7 +2263,11 @@ impl Reactor for RebalancingService {
                         // the symbol's pending-offchain-order gate; nudge an
                         // immediate equity check rather than waiting a poll cycle.
                         // No fill was applied, so nothing bars the next snapshot
-                        // from taking the balance back over.
+                        // from taking the balance back over. A restart taint
+                        // deliberately survives this arm: the pre-restart
+                        // portion of the order may have partially filled, so
+                        // the balance stays ambiguous until the poller
+                        // re-bases it from broker truth.
                         self.inventory
                             .write_without_broadcast()
                             .await
@@ -2289,14 +2293,49 @@ impl Reactor for RebalancingService {
                 };
 
                 // Only the OffChainOrderFilled arm reaches here; every other
-                // arm returns early above. Always clear the gate on a Filled
-                // event, even if the inventory update fails. A fail-closed
-                // gate would deadlock equity rebalancing for the symbol until
-                // the next bot restart, because the only event that could
-                // re-clear it (a later terminal offchain event) is itself
-                // gated. The polling cycle is the source of truth for the
-                // broker balance, so any local bookkeeping miss self-heals
-                // within ~60s and is bounded to wasted rebalances, not lost
+                // arm returns early above.
+                //
+                // A restart-tainted symbol's hydrated balance may already
+                // contain this fill (the aggregate recorded mid-order polls
+                // the pre-restart view refused, and the guard state that
+                // refused them did not survive the restart), so applying the
+                // delta risks double-counting it. Skip both legs and clear
+                // the gate with no fill stamp -- nothing was applied, so
+                // nothing bars the next snapshot. The taint itself stays:
+                // the poller resolves it by re-basing from broker truth (a
+                // matching poll or an immediate reconcile escalation),
+                // bounding the drift to the next successful quiet broker
+                // poll during market hours. The check-here,
+                // apply-below split is race-free: taint is only ever seeded
+                // at boot (before reactors run), so it cannot appear between
+                // this check and the apply, and while it is set the open
+                // order marks the symbol busy, which keeps the poller from
+                // resolving it before this handler clears the gate.
+                {
+                    let mut inventory = self.inventory.write().await;
+                    if inventory.is_restart_tainted(&symbol) {
+                        warn!(
+                            target: "rebalance",
+                            %symbol,
+                            "Skipping offchain fill deltas for restart-tainted \
+                             symbol; the poller re-bases the balance from \
+                             broker truth"
+                        );
+                        inventory.clear_offchain_order_pending(&symbol, None);
+                        drop(inventory);
+                        self.equity_scheduler.enqueue_check(symbol).await;
+                        return Ok(());
+                    }
+                }
+
+                // Always clear the gate on a Filled event, even if the
+                // inventory update fails. A fail-closed gate would deadlock
+                // equity rebalancing for the symbol until the next bot
+                // restart, because the only event that could re-clear it (a
+                // later terminal offchain event) is itself gated. The
+                // polling cycle is the source of truth for the broker
+                // balance, so any local bookkeeping miss self-heals within
+                // ~60s and is bounded to wasted rebalances, not lost
                 // capital.
                 let inventory_result = {
                     let mut inventory = self.inventory.write().await;
@@ -2450,6 +2489,14 @@ impl RebalancingService {
             .read()
             .await
             .has_pending_offchain_order(symbol)
+    }
+
+    async fn is_restart_tainted(&self, symbol: &Symbol) -> bool {
+        self.inventory.read().await.is_restart_tainted(symbol)
+    }
+
+    async fn is_restart_cash_tainted(&self) -> bool {
+        self.inventory.read().await.is_restart_cash_tainted()
     }
 
     async fn build_equity_operation(
@@ -2850,6 +2897,20 @@ impl RebalancingService {
             return Ok(());
         }
 
+        // A restart-tainted balance is suspect for the same reason -- the
+        // hydrated number may or may not contain the straddling order's
+        // fill -- so it must not size a transfer until the poller re-bases
+        // it from broker truth (the next successful quiet broker poll).
+        if self.is_restart_tainted(symbol).await {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                "Skipped equity trigger: balance is restart-tainted pending \
+                 broker re-base"
+            );
+            return Ok(());
+        }
+
         let Some(guard) = self.try_claim_equity_guard_for_transfer(symbol) else {
             debug!(target: "rebalance", %symbol, "Skipped equity trigger: already in progress");
             return Ok(());
@@ -2895,6 +2956,8 @@ impl RebalancingService {
             return Ok(());
         }
 
+        // The restart taint needs no matching re-check: it is only seeded
+        // at boot, so it cannot appear during the build.
         if self.divergence_gate.is_engaged(symbol) {
             warn!(
                 target: "rebalance",
@@ -2964,12 +3027,23 @@ impl RebalancingService {
         // A pending cash divergence means the Hedging USDC balance the
         // imbalance math reads is suspect: a bridge sized off it moves the
         // wrong amount and marks the venue busy, freezing the very counter
-        // that resolves the divergence. Skip until the poller clears it.
+        // that resolves the divergence. Skip until the poller clears it. A
+        // restart-tainted cash balance is suspect for the same reason (the
+        // hydrated number may or may not contain a straddling fill's cash
+        // leg), with the same resolution path.
         if self.divergence_gate.is_cash_engaged() {
             warn!(
                 target: "rebalance",
                 "Skipped USDC trigger: unresolved cash snapshot divergence \
                  pending reconciliation"
+            );
+            return;
+        }
+        if self.is_restart_cash_tainted().await {
+            warn!(
+                target: "rebalance",
+                "Skipped USDC trigger: cash balance is restart-tainted \
+                 pending broker re-base"
             );
             return;
         }
@@ -2992,7 +3066,9 @@ impl RebalancingService {
 
         // Re-check immediately before dispatch: the poller may have engaged
         // the cash gate during the awaits in the imbalance build (mirrors
-        // the equity trigger's pre-dispatch re-checks).
+        // the equity trigger's pre-dispatch re-checks). The restart taint
+        // needs no re-check: it is only seeded at boot, so it cannot appear
+        // during the build.
         if self.divergence_gate.is_cash_engaged() {
             warn!(
                 target: "rebalance",
@@ -23982,6 +24058,300 @@ mod tests {
             "a symbol with an open hedge order must still hydrate its \
              offchain balance from the persisted snapshot; None means the \
              seeded gate blocked hydration"
+        );
+        assert!(
+            trigger.is_restart_tainted(&symbol).await,
+            "a symbol whose hedge order straddled the restart must boot \
+             restart-tainted: its hydrated balance may already contain the \
+             order's fill"
+        );
+        assert!(
+            trigger.is_restart_cash_tainted().await,
+            "an open hedge order at boot must taint the venue-level cash \
+             balance too"
+        );
+    }
+
+    /// A boot with no open hedge orders must leave nothing tainted: the
+    /// taint exists only for the restart-straddling-order ambiguity.
+    #[tokio::test]
+    async fn boot_without_open_orders_seeds_no_restart_taint() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let pool = crate::test_utils::setup_test_db().await;
+
+        let projection = Projection::<Position>::sqlite(pool.clone());
+        projection.catch_up().await.unwrap();
+
+        crate::conductor::restore_inventory_at_boot(
+            &pool,
+            &trigger.inventory,
+            Some(&trigger),
+            &projection,
+        )
+        .await
+        .unwrap();
+
+        assert!(!trigger.is_restart_tainted(&symbol).await);
+        assert!(!trigger.is_restart_cash_tainted().await);
+    }
+
+    /// The headline RAI-1501 race: a hedge order straddles a restart, and
+    /// the persisted snapshot already recorded the mid-order broker number
+    /// (the aggregate records every poll; the guard state that refused the
+    /// ambiguous apply did not survive the restart). When the still-open
+    /// order's fill is discovered after boot, applying the delta on top of
+    /// the hydrated number would double-count it. The tainted fill must
+    /// skip its deltas, clear the gate, and leave the taint for the poller
+    /// to resolve against broker truth.
+    #[tokio::test]
+    async fn restart_across_open_order_does_not_double_apply_fill() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let pool = crate::test_utils::setup_test_db().await;
+
+        // Persisted state from the previous run: the snapshot recorded 90 --
+        // the post-fill broker reading for a Sell 10 from 100 (the broker's
+        // qty_available moves at order acceptance, before we observe the
+        // fill) -- while the order was still open.
+        let snapshot_store = test_store::<InventorySnapshot>(pool.clone(), ());
+        snapshot_store
+            .send(
+                &InventorySnapshotId {
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+                InventorySnapshotCommand::OffchainEquity {
+                    positions: BTreeMap::from([(symbol.clone(), shares(90))]),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let position_store = test_store::<Position>(pool.clone(), ());
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: shares(10),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: OffchainOrderId::new(),
+                    shares: Positive::new(shares(10)).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        let projection = Projection::<Position>::sqlite(pool.clone());
+        projection.catch_up().await.unwrap();
+
+        crate::conductor::restore_inventory_at_boot(
+            &pool,
+            &trigger.inventory,
+            Some(&trigger),
+            &projection,
+        )
+        .await
+        .unwrap();
+
+        // The still-open order's fill is discovered after boot.
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_offchain_fill(shares(10), Direction::Sell),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(shares(90)),
+            "the tainted fill's delta must be skipped; 80 means it was \
+             double-applied on top of a hydrated number that already \
+             contained it"
+        );
+        assert!(
+            !trigger.has_pending_offchain_order(&symbol).await,
+            "the terminal fill must still clear the hedge-order gate"
+        );
+        assert!(
+            trigger.is_restart_tainted(&symbol).await,
+            "the taint must survive the fill so the poller re-bases the \
+             balance from broker truth"
+        );
+        let processed = equity::drain_pending_equity_jobs(&trigger).await.unwrap();
+        assert_eq!(
+            processed, 1,
+            "the skipped fill still enqueues an equity recheck (dispatch is \
+             gated on the taint, not the check)"
+        );
+    }
+
+    /// The tainted-fill skip must not disturb the untainted cash mirror
+    /// either, and Failed/Cancelled must leave the taint for the poller
+    /// (the pre-restart portion of the order may have partially filled).
+    #[tokio::test]
+    async fn restart_tainted_fill_skips_both_legs_and_failed_keeps_taint() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        let mut view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(60))
+            .with_usdc(usdc(500), usdc(500));
+        view.set_pending_offchain_order_symbols(HashSet::from([symbol.clone()]));
+
+        let trigger = make_trigger_with_inventory_and_registry(view, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_offchain_fill(shares(10), Direction::Sell),
+            )
+            .await
+            .unwrap();
+
+        {
+            let view = trigger.inventory.read().await;
+            assert_eq!(
+                view.equity_available(&symbol, Venue::Hedging),
+                Some(shares(60)),
+                "the tainted fill's equity leg must be skipped"
+            );
+            assert_eq!(
+                view.usdc_available(Venue::Hedging),
+                Some(usdc(500)),
+                "the tainted fill's mirrored cash leg must be skipped with it"
+            );
+            assert!(!view.has_pending_offchain_order(&symbol));
+            assert!(view.is_restart_tainted(&symbol));
+            drop(view);
+        }
+
+        // A later order on the same still-tainted symbol fails: the gate
+        // clears but the taint stays until the poller re-bases.
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
+            .await
+            .unwrap();
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_failed(offchain_order_id))
+            .await
+            .unwrap();
+
+        let view = trigger.inventory.read().await;
+        assert!(!view.has_pending_offchain_order(&symbol));
+        assert!(
+            view.is_restart_tainted(&symbol),
+            "a failed order must not resolve the taint; only broker truth \
+             (the poller) can"
+        );
+        drop(view);
+    }
+
+    /// A restart-tainted balance must not size an equity transfer: the
+    /// hydrated number may or may not contain the straddling order's fill.
+    #[tokio::test]
+    async fn restart_taint_suppresses_equity_transfer_dispatch() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        // Taint without an open order: the state a tainted fill leaves
+        // behind (gate cleared, taint pending poller resolution).
+        view.set_pending_offchain_order_symbols(HashSet::from([symbol.clone()]));
+        view.clear_offchain_order_pending(&symbol, None);
+
+        let reactor = make_trigger_with_inventory_and_registry(view, &symbol).await;
+        let trigger = reactor.clone();
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "a restart-tainted symbol must not dispatch an equity transfer"
+        );
+
+        // The poller re-based the balance and resolved the taint.
+        trigger
+            .inventory
+            .write_without_broadcast()
+            .await
+            .clear_restart_taint(&symbol);
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+        let dispatched = take_pending_equity_mint_jobs(&trigger).await;
+        let [job] = dispatched.as_slice() else {
+            panic!("Expected exactly one mint job after taint resolution, got {dispatched:?}");
+        };
+        assert_eq!(job.symbol, symbol);
+    }
+
+    /// The cash twin: a restart-tainted Hedging cash balance must not size
+    /// a USDC bridge.
+    #[tokio::test]
+    async fn restart_cash_taint_suppresses_usdc_transfer_dispatch() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // 900 onchain, 100 offchain -> TooMuchOnchain would dispatch.
+        let mut view = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        view.set_pending_offchain_order_symbols(HashSet::from([symbol.clone()]));
+        view.clear_offchain_order_pending(&symbol, None);
+
+        let reactor = make_trigger_with_inventory(view).await;
+        let trigger = reactor.clone();
+
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "a restart-tainted cash balance must not dispatch a USDC transfer"
+        );
+
+        trigger
+            .inventory
+            .write_without_broadcast()
+            .await
+            .clear_restart_cash_taint();
+
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1,
+            "resolving the cash taint must restore USDC dispatch"
         );
     }
 

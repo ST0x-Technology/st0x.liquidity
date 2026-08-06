@@ -784,6 +784,26 @@ pub(crate) struct InventoryView {
     /// Venue-level: the USDC balance is one number per venue.
     #[serde(default)]
     onchain_usdc_snapshot_block_watermark: Option<u64>,
+    /// Symbols whose hydrated Hedging balance is ambiguous because a hedge
+    /// order was open across the restart. The aggregate records every poll
+    /// -- including mid-order reads the live view's guards refused -- and
+    /// the guard state that refused them (`last_offchain_fill_applied_at`,
+    /// a local-clock reading) does not survive restart, so at boot there is
+    /// no way to know whether the hydrated number already absorbed the
+    /// order's fill. While tainted: the fill's deltas are skipped (they may
+    /// already be in the hydrated number) and equity dispatch for the
+    /// symbol is suppressed; the poller re-bases the balance from broker
+    /// truth (a matching poll, an applied snapshot, or an immediate
+    /// reconcile escalation) and clears the taint.
+    #[serde(default)]
+    restart_tainted_offchain_symbols: HashSet<Symbol>,
+    /// Venue-level cash analogue of `restart_tainted_offchain_symbols`: an
+    /// open hedge order at boot makes the hydrated Hedging cash balance
+    /// equally ambiguous (the fill's mirrored USDC delta may or may not be
+    /// in it). While set, USDC dispatch is suppressed and the poller
+    /// re-bases the cash balance the same way.
+    #[serde(default)]
+    restart_tainted_offchain_cash: bool,
 }
 
 impl InventoryView {
@@ -1142,6 +1162,8 @@ impl Default for InventoryView {
             offchain_equity_snapshot_watermarks: HashMap::new(),
             pending_offchain_order_symbols: HashSet::new(),
             last_offchain_fill_applied_at: HashMap::new(),
+            restart_tainted_offchain_symbols: HashSet::new(),
+            restart_tainted_offchain_cash: false,
         }
     }
 }
@@ -1364,6 +1386,8 @@ impl InventoryView {
             offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
             offchain_usd_snapshot_skip_streak: self.offchain_usd_snapshot_skip_streak,
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
+            restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
+            restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
         })
     }
 
@@ -1399,6 +1423,8 @@ impl InventoryView {
             offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
             offchain_usd_snapshot_skip_streak: self.offchain_usd_snapshot_skip_streak,
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
+            restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
+            restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
         })
     }
 
@@ -1548,8 +1574,41 @@ impl InventoryView {
 
     /// Replaces the set of symbols with an open offchain order, for rebuilding
     /// it from the `Position` projection at startup.
+    ///
+    /// Also stamps the restart taint from the same set: a symbol whose hedge
+    /// order straddled the restart has an ambiguous hydrated Hedging balance
+    /// (see `restart_tainted_offchain_symbols`), and any open order taints
+    /// the venue-level cash balance. One entry point keeps the gate and the
+    /// taint impossible to desynchronize -- this setter is only called from
+    /// the boot seam (`restore_inventory_at_boot`), where the taint is
+    /// definitionally "the gate as of boot".
     pub(crate) fn set_pending_offchain_order_symbols(&mut self, symbols: HashSet<Symbol>) {
+        self.restart_tainted_offchain_cash = !symbols.is_empty();
+        self.restart_tainted_offchain_symbols.clone_from(&symbols);
         self.pending_offchain_order_symbols = symbols;
+    }
+
+    /// Whether `symbol`'s Hedging balance is restart-tainted (hydrated while
+    /// its hedge order was open, so the order's fill may already be in it).
+    pub(crate) fn is_restart_tainted(&self, symbol: &Symbol) -> bool {
+        self.restart_tainted_offchain_symbols.contains(symbol)
+    }
+
+    /// Whether the Hedging cash balance is restart-tainted.
+    pub(crate) fn is_restart_cash_tainted(&self) -> bool {
+        self.restart_tainted_offchain_cash
+    }
+
+    /// Resolves a symbol's restart taint: the poller observed the view in
+    /// agreement with the broker, or a forced reconcile verifiably re-based
+    /// the balance from broker truth.
+    pub(crate) fn clear_restart_taint(&mut self, symbol: &Symbol) {
+        self.restart_tainted_offchain_symbols.remove(symbol);
+    }
+
+    /// Resolves the venue-level cash restart taint.
+    pub(crate) fn clear_restart_cash_taint(&mut self) {
+        self.restart_tainted_offchain_cash = false;
     }
 
     /// Releases the snapshot block for a symbol whose offchain order reached a
@@ -1627,6 +1686,8 @@ impl InventoryView {
             pending_offchain_order_symbols: self.pending_offchain_order_symbols.clone(),
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at.clone(),
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
+            restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols.clone(),
+            restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
             ..Self::default()
         }
     }
@@ -2014,6 +2075,8 @@ impl InventoryView {
             offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
             offchain_usd_snapshot_skip_streak: self.offchain_usd_snapshot_skip_streak,
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
+            restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
+            restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
         })
     }
 
@@ -2050,6 +2113,8 @@ impl InventoryView {
             offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
             offchain_usd_snapshot_skip_streak: self.offchain_usd_snapshot_skip_streak,
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
+            restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
+            restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
         })
     }
 
@@ -3014,6 +3079,8 @@ mod tests {
             offchain_equity_snapshot_skip_streaks: HashMap::new(),
             offchain_usd_snapshot_skip_streak: 0,
             offchain_usd_snapshot_watermark: None,
+            restart_tainted_offchain_symbols: HashSet::new(),
+            restart_tainted_offchain_cash: false,
         }
     }
 
@@ -3053,6 +3120,8 @@ mod tests {
             offchain_equity_snapshot_skip_streaks: HashMap::new(),
             offchain_usd_snapshot_skip_streak: 0,
             offchain_usd_snapshot_watermark: None,
+            restart_tainted_offchain_symbols: HashSet::new(),
+            restart_tainted_offchain_cash: false,
         }
     }
 
@@ -5030,6 +5099,8 @@ mod tests {
             offchain_equity_snapshot_skip_streaks: HashMap::new(),
             offchain_usd_snapshot_skip_streak: 0,
             offchain_usd_snapshot_watermark: None,
+            restart_tainted_offchain_symbols: HashSet::new(),
+            restart_tainted_offchain_cash: false,
         };
 
         let dto = view.to_dto();
@@ -5091,6 +5162,8 @@ mod tests {
             offchain_equity_snapshot_skip_streaks: HashMap::new(),
             offchain_usd_snapshot_skip_streak: 0,
             offchain_usd_snapshot_watermark: None,
+            restart_tainted_offchain_symbols: HashSet::new(),
+            restart_tainted_offchain_cash: false,
         };
 
         let dto = view.to_dto();
@@ -6497,6 +6570,57 @@ mod tests {
             view.offchain_equity_snapshot_skip_streaks.get(&spym),
             None,
             "an applied snapshot must clear the symbol's skip streak"
+        );
+    }
+
+    /// The boot seeding entry point stamps the restart taint together with
+    /// the gate, and the seam's entry clear (empty set) drops both.
+    #[test]
+    fn set_pending_offchain_order_symbols_stamps_restart_taint() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let aapl = Symbol::new("AAPL").unwrap();
+
+        let mut view = InventoryView::default();
+        view.set_pending_offchain_order_symbols(HashSet::from([spym.clone()]));
+
+        assert!(view.is_restart_tainted(&spym));
+        assert!(
+            !view.is_restart_tainted(&aapl),
+            "a symbol without an open order at boot must not be tainted"
+        );
+        assert!(
+            view.is_restart_cash_tainted(),
+            "any open order at boot taints the venue-level cash balance"
+        );
+
+        view.set_pending_offchain_order_symbols(HashSet::new());
+        assert!(
+            !view.is_restart_tainted(&spym),
+            "the seam's entry clear must drop the taint with the gate"
+        );
+        assert!(!view.is_restart_cash_tainted());
+    }
+
+    /// Snapshot-error recovery resets the view; like the gate state it is
+    /// seeded with, the restart taint is derived from boot-time Position
+    /// state and nothing re-seeds it, so it must survive the reset.
+    #[test]
+    fn reset_preserves_restart_taint() {
+        let spym = Symbol::new("SPYM").unwrap();
+
+        let mut view = InventoryView::default().with_equity(spym.clone(), shares(0), shares(136));
+        view.set_pending_offchain_order_symbols(HashSet::from([spym.clone()]));
+        view.clear_offchain_order_pending(&spym, None);
+
+        let reset = view.reset_preserving_offchain_order_state();
+
+        assert!(
+            reset.is_restart_tainted(&spym),
+            "the recovery reset must preserve the restart taint"
+        );
+        assert!(
+            reset.is_restart_cash_tainted(),
+            "the recovery reset must preserve the cash restart taint"
         );
     }
 }
