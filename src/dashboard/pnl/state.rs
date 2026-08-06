@@ -1,6 +1,5 @@
 //! Internal reporting state for the backend PnL replay ledger.
 use rain_math_float::Float;
-use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use st0x_finance::Symbol;
@@ -172,12 +171,89 @@ pub(crate) struct PositionReplayDelta {
     pub(crate) position_net: Float,
 }
 
+/// One replay-input row loaded from the PnL ledger: one of the four position
+/// row kinds, already typed at ingestion (ADR 0018). Decimal fields stay as
+/// the canonical strings the ledger stores so the replay's parse/validation
+/// layer and the response's verbatim timestamp passthrough are unchanged.
 #[derive(Debug, Clone)]
-pub(crate) struct PositionEventRow {
-    pub(crate) rowid: i64,
+pub(crate) enum PositionLedgerRow {
+    OnchainFill(OnchainFillRow),
+    OffchainFill(OffchainFillRow),
+    OffchainPlacement(OffchainPlacementRow),
+    ManualAdjustment(ManualAdjustmentRow),
+}
+
+impl PositionLedgerRow {
+    pub(crate) fn event_rowid(&self) -> i64 {
+        match self {
+            Self::OnchainFill(row) => row.event_rowid,
+            Self::OffchainFill(row) => row.event_rowid,
+            Self::OffchainPlacement(row) => row.event_rowid,
+            Self::ManualAdjustment(row) => row.event_rowid,
+        }
+    }
+
+    pub(crate) fn symbol(&self) -> &str {
+        match self {
+            Self::OnchainFill(row) => &row.symbol,
+            Self::OffchainFill(row) => &row.symbol,
+            Self::OffchainPlacement(row) => &row.symbol,
+            Self::ManualAdjustment(row) => &row.symbol,
+        }
+    }
+
+    /// The execution timestamp the replay orders by: `block_timestamp` for
+    /// onchain fills, `broker_timestamp` for offchain fills, `placed_at` /
+    /// `adjusted_at` for the rest -- the same per-kind choice
+    /// `position_event_replay_timestamp` made against raw payloads.
+    pub(crate) fn replay_timestamp(&self) -> &str {
+        match self {
+            Self::OnchainFill(row) => &row.executed_at,
+            Self::OffchainFill(row) => &row.executed_at,
+            Self::OffchainPlacement(row) => &row.placed_at,
+            Self::ManualAdjustment(row) => &row.adjusted_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OnchainFillRow {
+    pub(crate) event_rowid: i64,
     pub(crate) symbol: String,
-    pub(crate) event_type: String,
-    pub(crate) payload: Value,
+    pub(crate) tx_hash: String,
+    pub(crate) log_index: i64,
+    pub(crate) shares: String,
+    pub(crate) direction: Direction,
+    pub(crate) price_usd: String,
+    pub(crate) executed_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OffchainFillRow {
+    pub(crate) event_rowid: i64,
+    pub(crate) symbol: String,
+    pub(crate) offchain_order_id: String,
+    pub(crate) shares: String,
+    pub(crate) direction: Direction,
+    pub(crate) price_usd: String,
+    pub(crate) executed_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OffchainPlacementRow {
+    pub(crate) event_rowid: i64,
+    pub(crate) symbol: String,
+    pub(crate) offchain_order_id: String,
+    pub(crate) placed_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ManualAdjustmentRow {
+    pub(crate) event_rowid: i64,
+    pub(crate) symbol: String,
+    pub(crate) target_net: String,
+    pub(crate) price_usd: Option<String>,
+    pub(crate) adjusted_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -186,13 +262,24 @@ pub(crate) struct PositionViewRow {
     pub(crate) net_position: Option<String>,
 }
 
+/// Which fee stream a ledger cost row came from (`pnl_cost_entry.source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CostSource {
+    TokenizationFee,
+    CctpFee,
+}
+
+/// One `pnl_cost_entry` row. `amount_usd` `None` is the persisted "provider
+/// did not report fees" observation (tokenization only): counted into
+/// `missing_cost_observation_count` instead of producing a cost entry.
 #[derive(Debug, Clone)]
-pub(crate) struct CostEventRow {
-    pub(crate) rowid: i64,
-    pub(crate) aggregate_type: String,
+pub(crate) struct CostLedgerRow {
+    pub(crate) event_rowid: i64,
+    pub(crate) source: CostSource,
     pub(crate) aggregate_id: String,
-    pub(crate) event_type: String,
-    pub(crate) payload: Value,
+    pub(crate) symbol: Option<String>,
+    pub(crate) amount_usd: Option<String>,
+    pub(crate) occurred_at: String,
 }
 
 #[derive(Debug, Clone)]

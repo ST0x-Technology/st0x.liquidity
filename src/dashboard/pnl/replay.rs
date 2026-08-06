@@ -5,16 +5,14 @@ use st0x_finance::Symbol;
 use st0x_float_macro::float;
 
 use super::costs::{AccountingEffect, CostEntryInternal};
-use super::parsing::{
-    direction_field, fmt_decimal, nested_record, number_text_field,
-    optional_persisted_decimal_field, parse_internal_decimal, persisted_decimal_field, text_field,
-};
+use super::parsing::{fmt_decimal, parse_internal_decimal, parse_ledger_decimal};
 use super::query::PnlError;
 use super::response::{PnlEntry, PnlSummary, PnlSymbolSummary};
 use super::sessions::seconds_between;
 use super::state::{
-    Direction, Fill, Lot, LotSide, PnlBucket, PositionEventRow, PositionReplayDelta, SummaryAcc,
-    SummaryAndSymbols, SymbolBook, UnmatchedOffchainAllocation, Venue,
+    Direction, Fill, Lot, LotSide, ManualAdjustmentRow, OffchainFillRow, OffchainPlacementRow,
+    OnchainFillRow, PnlBucket, PositionReplayDelta, SummaryAcc, SummaryAndSymbols, SymbolBook,
+    UnmatchedOffchainAllocation, Venue,
 };
 use super::{ATTRIBUTION_METHOD, COUNTER_TRADE_THRESHOLD_SECONDS, EPSILON};
 
@@ -75,145 +73,93 @@ fn add_realized_pnl(
     Ok(())
 }
 
-fn malformed_position_payload(row: &PositionEventRow, reason: &'static str) -> PnlError {
-    PnlError::MalformedPayload {
-        rowid: row.rowid,
-        aggregate_type: "Position",
-        event_type: row.event_type.clone(),
+fn corrupt_ledger_row(table: &'static str, rowid: i64, reason: &'static str) -> PnlError {
+    PnlError::InvalidLedgerRow {
+        table,
+        rowid,
         reason,
     }
 }
 
 fn ensure_positive_fill_decimal(
-    row: &PositionEventRow,
+    table: &'static str,
+    rowid: i64,
     value: &Float,
     reason: &'static str,
 ) -> Result<(), PnlError> {
     if value.is_zero()? || value.lt(float!(0))? {
-        return Err(malformed_position_payload(row, reason));
+        return Err(corrupt_ledger_row(table, rowid, reason));
     }
 
     Ok(())
 }
 
-pub(crate) fn parse_onchain_fill(
-    row: &PositionEventRow,
-    _warnings: &mut Vec<String>,
-) -> Result<Option<Fill>, PnlError> {
-    let Some(filled) = nested_record(&row.payload, "OnChainOrderFilled") else {
-        return Err(malformed_position_payload(
-            row,
-            "missing OnChainOrderFilled",
-        ));
-    };
+pub(crate) fn parse_onchain_fill(row: &OnchainFillRow) -> Result<Fill, PnlError> {
+    const TABLE: &str = "pnl_onchain_fill";
+    let shares = parse_ledger_decimal(TABLE, row.event_rowid, "shares", &row.shares)?;
+    let price = parse_ledger_decimal(TABLE, row.event_rowid, "price_usd", &row.price_usd)?;
+    ensure_positive_fill_decimal(
+        TABLE,
+        row.event_rowid,
+        &shares,
+        "non-positive onchain fill shares",
+    )?;
+    ensure_positive_fill_decimal(
+        TABLE,
+        row.event_rowid,
+        &price,
+        "non-positive onchain fill price",
+    )?;
 
-    let amount = persisted_decimal_field(row, filled, "amount")?;
-    let direction = direction_field(filled, "direction");
-    let price = persisted_decimal_field(row, filled, "price_usdc")?;
-    let executed_at = text_field(filled, "block_timestamp");
-    let trade_id = nested_record(filled, "trade_id");
-    let tx_hash = trade_id.and_then(|id| text_field(id, "tx_hash"));
-    let log_index = trade_id.and_then(|id| number_text_field(id, "log_index"));
-
-    let (
-        Some(amount),
-        Some(direction),
-        Some(price),
-        Some(executed_at),
-        Some(tx_hash),
-        Some(log_index),
-    ) = (amount, direction, price, executed_at, tx_hash, log_index)
-    else {
-        return Err(malformed_position_payload(
-            row,
-            "incomplete OnChainOrderFilled payload",
-        ));
-    };
-
-    ensure_positive_fill_decimal(row, &amount, "non-positive OnChainOrderFilled amount")?;
-    ensure_positive_fill_decimal(row, &price, "non-positive OnChainOrderFilled price_usdc")?;
-
-    Ok(Some(Fill {
-        rowid: row.rowid,
-        id: format!("{tx_hash}:{log_index}"),
+    Ok(Fill {
+        rowid: row.event_rowid,
+        id: format!("{}:{}", row.tx_hash, row.log_index),
         symbol: Symbol::new(row.symbol.clone())
-            .map_err(|_| malformed_position_payload(row, "invalid OnChainOrderFilled symbol"))?,
-        shares: amount,
-        direction,
+            .map_err(|_| corrupt_ledger_row(TABLE, row.event_rowid, "invalid symbol"))?,
+        shares,
+        direction: row.direction,
         price,
-        executed_at,
+        executed_at: row.executed_at.clone(),
         venue: Venue::Onchain,
-    }))
+    })
 }
 
-pub(crate) fn parse_offchain_fill(
-    row: &PositionEventRow,
-    _warnings: &mut Vec<String>,
-) -> Result<Option<Fill>, PnlError> {
-    let Some(filled) = nested_record(&row.payload, "OffChainOrderFilled") else {
-        return Err(malformed_position_payload(
-            row,
-            "missing OffChainOrderFilled",
-        ));
-    };
-
-    let order_id = text_field(filled, "offchain_order_id");
-    let shares = persisted_decimal_field(row, filled, "shares_filled")?;
-    let direction = direction_field(filled, "direction");
-    let price = persisted_decimal_field(row, filled, "price")?;
-    let executed_at = text_field(filled, "broker_timestamp");
-
-    let (Some(order_id), Some(shares), Some(direction), Some(price), Some(executed_at)) =
-        (order_id, shares, direction, price, executed_at)
-    else {
-        return Err(malformed_position_payload(
-            row,
-            "incomplete OffChainOrderFilled payload",
-        ));
-    };
-
+pub(crate) fn parse_offchain_fill(row: &OffchainFillRow) -> Result<Fill, PnlError> {
+    const TABLE: &str = "pnl_offchain_fill";
+    let shares = parse_ledger_decimal(TABLE, row.event_rowid, "shares", &row.shares)?;
+    let price = parse_ledger_decimal(TABLE, row.event_rowid, "price_usd", &row.price_usd)?;
     ensure_positive_fill_decimal(
-        row,
+        TABLE,
+        row.event_rowid,
         &shares,
-        "non-positive OffChainOrderFilled shares_filled",
+        "non-positive offchain fill shares",
     )?;
-    ensure_positive_fill_decimal(row, &price, "non-positive OffChainOrderFilled price")?;
+    ensure_positive_fill_decimal(
+        TABLE,
+        row.event_rowid,
+        &price,
+        "non-positive offchain fill price",
+    )?;
 
-    Ok(Some(Fill {
-        rowid: row.rowid,
-        id: order_id,
+    Ok(Fill {
+        rowid: row.event_rowid,
+        id: row.offchain_order_id.clone(),
         symbol: Symbol::new(row.symbol.clone())
-            .map_err(|_| malformed_position_payload(row, "invalid OffChainOrderFilled symbol"))?,
+            .map_err(|_| corrupt_ledger_row(TABLE, row.event_rowid, "invalid symbol"))?,
         shares,
-        direction,
+        direction: row.direction,
         price,
-        executed_at,
+        executed_at: row.executed_at.clone(),
         venue: Venue::Offchain,
-    }))
+    })
 }
 
 pub(crate) fn apply_manual_position_adjustment(
     book: &mut SymbolBook,
-    row: &PositionEventRow,
-    warnings: &mut Vec<String>,
+    row: &ManualAdjustmentRow,
 ) -> Result<(), PnlError> {
-    let Some(adjusted) = nested_record(&row.payload, "ManualPositionAdjusted") else {
-        warnings.push(format!(
-            "Skipped malformed manual position adjustment {}: missing ManualPositionAdjusted",
-            row.symbol
-        ));
-        return Ok(());
-    };
-
-    let target_net = persisted_decimal_field(row, adjusted, "target_net")?;
-    let adjusted_at = text_field(adjusted, "adjusted_at");
-    let (Some(target_net), Some(adjusted_at)) = (target_net, adjusted_at) else {
-        warnings.push(format!(
-            "Skipped malformed manual position adjustment {}: incomplete payload",
-            row.symbol
-        ));
-        return Ok(());
-    };
+    const TABLE: &str = "pnl_manual_adjustment";
+    let target_net = parse_ledger_decimal(TABLE, row.event_rowid, "target_net", &row.target_net)?;
 
     book.long_lots.clear();
     book.short_lots.clear();
@@ -224,12 +170,17 @@ pub(crate) fn apply_manual_position_adjustment(
         return Ok(());
     }
 
-    let event_price = optional_persisted_decimal_field(row, adjusted, "price_usdc")?;
+    let event_price = row
+        .price_usd
+        .as_deref()
+        .map(|price| parse_ledger_decimal(TABLE, row.event_rowid, "price_usd", price))
+        .transpose()?;
     let price = event_price.or(book.last_price_usdc);
     let Some(price) = price else {
-        return Err(malformed_position_payload(
-            row,
-            "nonzero ManualPositionAdjusted missing price_usdc and no prior replay price",
+        return Err(corrupt_ledger_row(
+            TABLE,
+            row.event_rowid,
+            "nonzero manual adjustment missing price_usd and no prior replay price",
         ));
     };
     if let Some(event_price) = event_price {
@@ -242,12 +193,12 @@ pub(crate) fn apply_manual_position_adjustment(
         LotSide::Long
     };
     let lot = Lot {
-        trade_id: format!("manual-position-adjustment:{}", row.rowid),
+        trade_id: format!("manual-position-adjustment:{}", row.event_rowid),
         side,
         remaining_shares: target_net.abs()?,
         price,
-        opened_at: adjusted_at,
-        opened_rowid: row.rowid,
+        opened_at: row.adjusted_at.clone(),
+        opened_rowid: row.event_rowid,
         opened_venue: Venue::Manual,
     };
 
@@ -257,21 +208,6 @@ pub(crate) fn apply_manual_position_adjustment(
     }
 
     Ok(())
-}
-
-fn parse_offchain_placement_id(
-    row: &PositionEventRow,
-    warnings: &mut Vec<String>,
-) -> Option<String> {
-    let placed = nested_record(&row.payload, "OffChainOrderPlaced");
-    let order_id = placed.and_then(|value| text_field(value, "offchain_order_id"));
-    if order_id.is_none() {
-        warnings.push(format!(
-            "Skipped malformed position offchain placement {}: incomplete payload",
-            row.symbol
-        ));
-    }
-    order_id
 }
 
 fn open_residual_lot(book: &mut SymbolBook, fill: &Fill, remaining: Float) {
@@ -342,22 +278,22 @@ pub(crate) fn apply_onchain_fill(
 
 pub(crate) fn apply_offchain_placement(
     book: &mut SymbolBook,
-    row: &PositionEventRow,
+    row: &OffchainPlacementRow,
     warnings: &mut Vec<String>,
 ) {
-    let Some(order_id) = parse_offchain_placement_id(row, warnings) else {
-        return;
-    };
-
-    if book.seen_offchain_placement_ids.contains(&order_id) {
+    if book
+        .seen_offchain_placement_ids
+        .contains(&row.offchain_order_id)
+    {
         warnings.push(format!(
             "PnL audit error: duplicate offchain placement {} for {} was skipped",
-            order_id, row.symbol
+            row.offchain_order_id, row.symbol
         ));
         return;
     }
 
-    book.seen_offchain_placement_ids.insert(order_id);
+    book.seen_offchain_placement_ids
+        .insert(row.offchain_order_id.clone());
 }
 
 pub(crate) fn apply_offchain_fill(

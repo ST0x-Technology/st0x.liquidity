@@ -1,15 +1,10 @@
-//! Parsing helpers for persisted PnL event payloads and report decimals.
+//! Parsing helpers for ledger-row decimals, timestamps, and report output.
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
-use serde_json::Value;
 
 use super::SAFE_SYMBOL_CHARS;
-use super::query::{PnlError, PnlFinancialFieldError};
-use super::state::{Direction, PositionEventRow};
-
-pub(crate) fn parse_payload_string(payload: &str) -> Result<Value, serde_json::Error> {
-    serde_json::from_str(payload)
-}
+use super::query::{LEDGER_ROW_EVENT_TYPE, PnlError, PnlFinancialFieldError};
+use super::state::PositionLedgerRow;
 
 pub(crate) fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
@@ -24,146 +19,44 @@ pub(crate) fn is_safe_symbol(symbol: &str) -> bool {
             .all(|character| SAFE_SYMBOL_CHARS.contains(character))
 }
 
-pub(crate) fn nested_record<'a>(payload: &'a Value, key: &str) -> Option<&'a Value> {
-    payload.get(key).filter(|value| value.is_object())
-}
-
-pub(crate) fn text_field(payload: &Value, key: &str) -> Option<String> {
-    payload.get(key).and_then(|value| match value {
-        Value::String(text) => Some(text.clone()),
-        _ => None,
+/// Parses a canonical decimal string stored in a ledger column. Failure
+/// means the ledger row is corrupt (the ingester only writes `format_float`
+/// output), so the report fails closed with the row's provenance.
+pub(crate) fn parse_ledger_decimal(
+    table: &'static str,
+    rowid: i64,
+    field: &'static str,
+    value: &str,
+) -> Result<Float, PnlError> {
+    Float::parse(value.to_owned()).map_err(|error| PnlError::InvalidFinancialField {
+        rowid,
+        aggregate_type: table,
+        event_type: LEDGER_ROW_EVENT_TYPE.to_owned(),
+        field,
+        value: value.to_owned(),
+        source: PnlFinancialFieldError::InvalidDecimal(Box::new(error)),
     })
 }
 
-pub(crate) fn number_text_field(payload: &Value, key: &str) -> Option<String> {
-    payload.get(key).and_then(|value| match value {
-        Value::String(text) => Some(text.clone()),
-        Value::Number(number) => Some(number.to_string()),
-        _ => None,
-    })
-}
-
-pub(crate) fn persisted_decimal_field(
-    row: &PositionEventRow,
-    payload: &Value,
-    key: &'static str,
-) -> Result<Option<Float>, PnlError> {
-    persisted_decimal_value(row.rowid, "Position", row.event_type.clone(), payload, key)
-}
-
-pub(crate) fn optional_persisted_decimal_field(
-    row: &PositionEventRow,
-    payload: &Value,
-    key: &'static str,
-) -> Result<Option<Float>, PnlError> {
-    optional_persisted_decimal_value(row.rowid, "Position", row.event_type.clone(), payload, key)
-}
-
-pub(crate) fn persisted_decimal_value(
-    rowid: i64,
-    aggregate_type: &'static str,
-    event_type: String,
-    payload: &Value,
-    key: &'static str,
-) -> Result<Option<Float>, PnlError> {
-    persisted_decimal_value_with_null_policy(rowid, aggregate_type, event_type, payload, key, false)
-}
-
-pub(crate) fn optional_persisted_decimal_value(
-    rowid: i64,
-    aggregate_type: &'static str,
-    event_type: String,
-    payload: &Value,
-    key: &'static str,
-) -> Result<Option<Float>, PnlError> {
-    persisted_decimal_value_with_null_policy(rowid, aggregate_type, event_type, payload, key, true)
-}
-
-fn persisted_decimal_value_with_null_policy(
-    rowid: i64,
-    aggregate_type: &'static str,
-    event_type: String,
-    payload: &Value,
-    key: &'static str,
-    null_allowed: bool,
-) -> Result<Option<Float>, PnlError> {
-    let value = match payload.get(key) {
-        None => return Ok(None),
-        Some(Value::Null) if null_allowed => return Ok(None),
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Number(number)) => number.to_string(),
-        Some(value) => {
-            return Err(PnlError::InvalidFinancialField {
-                rowid,
-                aggregate_type,
-                event_type,
-                field: key,
-                value: value.to_string(),
-                source: PnlFinancialFieldError::InvalidJsonType,
-            });
-        }
-    };
-
-    Float::parse(value.clone())
-        .map(Some)
-        .map_err(|error| PnlError::InvalidFinancialField {
-            rowid,
-            aggregate_type,
-            event_type,
-            field: key,
-            value,
-            source: PnlFinancialFieldError::InvalidDecimal(Box::new(error)),
-        })
-}
-
-pub(crate) fn direction_field(payload: &Value, key: &str) -> Option<Direction> {
-    match text_field(payload, key)?.as_str() {
-        "Buy" | "buy" => Some(Direction::Buy),
-        "Sell" | "sell" => Some(Direction::Sell),
-        _ => None,
-    }
-}
-
-pub(crate) fn position_event_replay_timestamp(row: &PositionEventRow) -> Option<String> {
-    match row.event_type.as_str() {
-        "PositionEvent::OnChainOrderFilled" => nested_record(&row.payload, "OnChainOrderFilled")
-            .and_then(|filled| text_field(filled, "block_timestamp")),
-        "PositionEvent::OffChainOrderFilled" => nested_record(&row.payload, "OffChainOrderFilled")
-            .and_then(|filled| text_field(filled, "broker_timestamp")),
-        "PositionEvent::OffChainOrderPlaced" => nested_record(&row.payload, "OffChainOrderPlaced")
-            .and_then(|placed| text_field(placed, "placed_at")),
-        "PositionEvent::ManualPositionAdjusted" => {
-            nested_record(&row.payload, "ManualPositionAdjusted")
-                .and_then(|adjusted| text_field(adjusted, "adjusted_at"))
-        }
-        _ => None,
-    }
-}
-
+/// Sorts the ledger rows into replay order: execution timestamp first, event
+/// rowid as the deterministic tie-breaker. Timestamps are always present on
+/// ledger rows (typed at ingestion); an unparseable one means a corrupt row
+/// and fails the report with its provenance.
 pub(crate) fn ordered_position_events(
-    rows: Vec<PositionEventRow>,
-) -> Result<Vec<PositionEventRow>, PnlError> {
+    rows: Vec<PositionLedgerRow>,
+) -> Result<Vec<PositionLedgerRow>, PnlError> {
     let mut sortable: Vec<_> = rows
         .into_iter()
         .map(|row| {
-            let timestamp = position_event_replay_timestamp(&row).ok_or_else(|| {
-                PnlError::MalformedPayload {
-                    rowid: row.rowid,
-                    aggregate_type: "Position",
-                    event_type: row.event_type.clone(),
-                    reason: "missing replay timestamp",
-                }
-            })?;
-            let timestamp_ms = parse_timestamp(&timestamp)
+            let timestamp_ms = parse_timestamp(row.replay_timestamp())
                 .map(|parsed| parsed.timestamp_millis())
-                .ok_or_else(|| PnlError::MalformedPayload {
-                    rowid: row.rowid,
-                    aggregate_type: "Position",
-                    event_type: row.event_type.clone(),
+                .ok_or_else(|| PnlError::InvalidLedgerRow {
+                    table: "pnl position rows",
+                    rowid: row.event_rowid(),
                     reason: "invalid replay timestamp",
                 })?;
 
-            Ok((timestamp_ms, row.rowid, row))
+            Ok((timestamp_ms, row.event_rowid(), row))
         })
         .collect::<Result<Vec<_>, PnlError>>()?;
 
