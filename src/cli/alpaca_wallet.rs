@@ -777,6 +777,7 @@ mod tests {
             issuance: create_test_issuance_ctx(),
             redemption_wallet: None,
             bot_gas_valuation: None,
+            orchestrator: None,
         }
     }
 
@@ -882,6 +883,7 @@ mod tests {
             issuance: create_test_issuance_ctx(),
             redemption_wallet: Some(Address::ZERO),
             bot_gas_valuation: None,
+            orchestrator: None,
         }
     }
 
