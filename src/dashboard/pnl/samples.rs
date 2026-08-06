@@ -3,11 +3,11 @@ use std::collections::{BTreeSet, HashMap};
 
 use st0x_finance::Symbol;
 
-use super::parsing::{is_safe_symbol, position_event_replay_timestamp};
+use super::parsing::is_safe_symbol;
 use super::query::{PnlError, PnlFinancialFieldError, PnlQuery};
 use super::response::{PnlAvailableRange, PnlSampleStats, PnlSampleSymbolStats};
 use super::sessions::{date_key, matches_date_bounds_for_iso, matches_trade_filters};
-use super::state::{PositionEventRow, PositionViewRow, SampleStatsAcc};
+use super::state::{PositionLedgerRow, PositionViewRow, SampleStatsAcc, Venue};
 
 pub(crate) fn parse_position_view(
     rows: &[PositionViewRow],
@@ -52,11 +52,25 @@ pub(crate) fn parse_position_view(
     Ok((position_nets, symbols.into_iter().collect()))
 }
 
-fn add_sample_fill(sample: &mut SampleStatsAcc, event_type: &str, timestamp: &str) {
-    if event_type == "PositionEvent::OnChainOrderFilled" {
-        sample.onchain_fill_count += 1;
-    } else if event_type == "PositionEvent::OffChainOrderFilled" {
-        sample.offchain_fill_count += 1;
+/// The fill venue and execution timestamp of a ledger row, or `None` for the
+/// non-fill kinds (placements, manual adjustments) that sample stats and the
+/// available range ignore.
+fn fill_timestamp(row: &PositionLedgerRow) -> Option<(Venue, &str)> {
+    match row {
+        PositionLedgerRow::OnchainFill(fill) => Some((Venue::Onchain, fill.executed_at.as_str())),
+        PositionLedgerRow::OffchainFill(fill) => Some((Venue::Offchain, fill.executed_at.as_str())),
+        PositionLedgerRow::OffchainPlacement(_) | PositionLedgerRow::ManualAdjustment(_) => None,
+    }
+}
+
+fn add_sample_fill(sample: &mut SampleStatsAcc, venue: Venue, timestamp: &str) {
+    match venue {
+        Venue::Onchain => sample.onchain_fill_count += 1,
+        Venue::Offchain => sample.offchain_fill_count += 1,
+        // `fill_timestamp` yields fills only, and manual adjustments are not
+        // fills; a manual venue can only mean a future caller bug, and it
+        // must not count into either fill bucket.
+        Venue::Manual => {}
     }
 
     if sample
@@ -76,44 +90,39 @@ fn add_sample_fill(sample: &mut SampleStatsAcc, event_type: &str, timestamp: &st
 }
 
 pub(crate) fn build_sample_stats(
-    rows: &[PositionEventRow],
+    rows: &[PositionLedgerRow],
     query: &PnlQuery,
     warnings: &mut Vec<String>,
 ) -> PnlSampleStats {
     let mut by_symbol: HashMap<Symbol, SampleStatsAcc> = HashMap::new();
     for row in rows {
-        if row.event_type != "PositionEvent::OnChainOrderFilled"
-            && row.event_type != "PositionEvent::OffChainOrderFilled"
-        {
-            continue;
-        }
-
-        if !is_safe_symbol(&row.symbol) {
-            warnings.push(format!(
-                "Skipped unsafe sample stats symbol in backend PnL response: {}",
-                row.symbol
-            ));
-            continue;
-        }
-
-        let Some(timestamp) = position_event_replay_timestamp(row) else {
-            warnings.push(format!(
-                "Skipped sample stats row {} for {}: missing fill timestamp",
-                row.rowid, row.symbol
-            ));
+        let Some((venue, timestamp)) = fill_timestamp(row) else {
             continue;
         };
-        if !matches_date_bounds_for_iso(&timestamp, query)
-            || !matches_trade_filters(&timestamp, query)
+
+        if !is_safe_symbol(row.symbol()) {
+            warnings.push(format!(
+                "Skipped unsafe sample stats symbol in backend PnL response: {}",
+                row.symbol()
+            ));
+            continue;
+        }
+
+        if !matches_date_bounds_for_iso(timestamp, query)
+            || !matches_trade_filters(timestamp, query)
         {
             continue;
         }
 
-        let Ok(symbol) = Symbol::new(row.symbol.clone()) else {
+        let Ok(symbol) = Symbol::new(row.symbol().to_owned()) else {
+            warnings.push(format!(
+                "Skipped invalid sample stats symbol in backend PnL response: {}",
+                row.symbol()
+            ));
             continue;
         };
         let sample = by_symbol.entry(symbol).or_default();
-        add_sample_fill(sample, &row.event_type, &timestamp);
+        add_sample_fill(sample, venue, timestamp);
     }
 
     let mut symbols: Vec<_> = by_symbol.into_iter().collect();
@@ -147,46 +156,33 @@ pub(crate) fn build_sample_stats(
 }
 
 pub(crate) fn build_available_range(
-    rows: &[PositionEventRow],
+    rows: &[PositionLedgerRow],
     warnings: &mut Vec<String>,
 ) -> PnlAvailableRange {
     let mut first_at: Option<String> = None;
     let mut last_at: Option<String> = None;
 
     for row in rows {
-        if row.event_type != "PositionEvent::OnChainOrderFilled"
-            && row.event_type != "PositionEvent::OffChainOrderFilled"
-        {
-            continue;
-        }
-
-        if !is_safe_symbol(&row.symbol) {
-            warnings.push(format!(
-                "Skipped unsafe available range symbol in backend PnL response: {}",
-                row.symbol
-            ));
-            continue;
-        }
-
-        let Some(timestamp) = position_event_replay_timestamp(row) else {
-            warnings.push(format!(
-                "Skipped available range row {} for {}: missing fill timestamp",
-                row.rowid, row.symbol
-            ));
+        let Some((_, timestamp)) = fill_timestamp(row) else {
             continue;
         };
 
+        if !is_safe_symbol(row.symbol()) {
+            warnings.push(format!(
+                "Skipped unsafe available range symbol in backend PnL response: {}",
+                row.symbol()
+            ));
+            continue;
+        }
+
         if first_at
             .as_deref()
-            .is_none_or(|current| timestamp.as_str() < current)
+            .is_none_or(|current| timestamp < current)
         {
-            first_at = Some(timestamp.clone());
+            first_at = Some(timestamp.to_owned());
         }
-        if last_at
-            .as_deref()
-            .is_none_or(|current| timestamp.as_str() > current)
-        {
-            last_at = Some(timestamp);
+        if last_at.as_deref().is_none_or(|current| timestamp > current) {
+            last_at = Some(timestamp.to_owned());
         }
     }
 

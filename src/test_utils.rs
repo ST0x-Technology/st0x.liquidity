@@ -16,6 +16,7 @@ use std::sync::{Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
 use st0x_config::{EquitiesConfig, EquityAssetConfig, OperationMode};
+use st0x_event_sorcery::{DomainEvent, EventSourced};
 use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
 
 use crate::bindings::IRaindexV6::{EvaluableV4, IOV2, OrderV4};
@@ -323,6 +324,38 @@ pub(crate) async fn setup_test_apalis_pool() -> apalis_sqlite::SqlitePool {
 /// Creates an in-memory SQLite database with all migrations applied.
 pub(crate) async fn setup_test_db() -> SqlitePool {
     setup_test_pools().await.0
+}
+
+/// Persists a typed event directly into the `events` table.
+///
+/// Deliberate, fixture-only deviation from the "never write the events table
+/// directly" rule: the PnL ledger ingester's input contract is the persisted
+/// event log itself, and its tests need exact control over rowids,
+/// per-aggregate sequences, and cross-stream interleavings that command
+/// choreography cannot express (multi-batch paging, historical event shapes,
+/// a single event whose command would emit siblings). The command path is
+/// covered end-to-end by the registered-reactor and manifest wiring tests,
+/// which seed through `Store::send`. Production code must never do this.
+pub(crate) async fn persist_event<Entity: EventSourced>(
+    pool: &SqlitePool,
+    aggregate_id: &str,
+    sequence: i64,
+    event: &Entity::Event,
+) {
+    sqlx::query(
+        "INSERT INTO events (aggregate_type, aggregate_id, sequence, \
+         event_type, event_version, payload, metadata) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}')",
+    )
+    .bind(Entity::AGGREGATE_TYPE)
+    .bind(aggregate_id)
+    .bind(sequence)
+    .bind(event.event_type())
+    .bind(event.event_version())
+    .bind(serde_json::to_string(event).unwrap())
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 /// File-backed variant of [`setup_test_db`] with production-shaped pool

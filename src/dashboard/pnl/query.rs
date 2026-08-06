@@ -11,8 +11,6 @@ const ALPACA_ACTIVITY_FETCH_PADDING_DAYS: i64 = 7;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PnlFinancialFieldError {
-    #[error("expected string or number")]
-    InvalidJsonType,
     // Boxed: `FloatError` embeds revm's `EVMError`/`HaltReason`, which makes
     // it far larger than every other payload here, and this error is returned
     // from most of the module's functions.
@@ -20,25 +18,24 @@ pub(crate) enum PnlFinancialFieldError {
     InvalidDecimal(#[source] Box<rain_math_float::FloatError>),
 }
 
+/// Sentinel `event_type` for errors raised from typed ledger rows, which --
+/// unlike the raw payloads the pre-ADR-0018 path parsed -- carry no
+/// per-event type string of their own.
+pub(crate) const LEDGER_ROW_EVENT_TYPE: &str = "ledger_row";
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PnlError {
     #[error("invalid {field}: {value}")]
     InvalidDate { field: &'static str, value: String },
     #[error("invalid asOfRowid: {value}")]
     InvalidSnapshotRowid { value: i64 },
-    #[error("failed to parse persisted PnL payload at row {rowid} ({aggregate_type}/{event_type})")]
-    InvalidPayload {
+    #[error("PnL ledger ingestion failed: {0}")]
+    Ledger(#[from] super::ledger::PnlLedgerError),
+    #[error("invalid PnL ledger row in {table} at event row {rowid}: {reason}")]
+    InvalidLedgerRow {
+        table: &'static str,
         rowid: i64,
-        aggregate_type: String,
-        event_type: String,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("invalid bot gas receipt cost at event row {rowid}")]
-    InvalidBotGasReceiptCost {
-        rowid: i64,
-        #[source]
-        source: crate::bot_gas::BotGasReceiptCostError,
+        reason: &'static str,
     },
     #[error(
         "malformed persisted PnL payload at row {rowid} ({aggregate_type}/{event_type}): {reason}"
