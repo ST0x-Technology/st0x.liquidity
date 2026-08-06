@@ -465,3 +465,48 @@ extended_hours_counter_trading = "disabled"
 vault_id = "0xfab"
 tokenized_equity = "0xb6021810971714cD48572af527307Acc324ecF61"
 tokenized_equity_derivative = "0xb6D779A79E7493ed821a65D52bA419F0F6D5dD0a"
+
+[assets.equities.HOOD]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x5cEfd886dD05001c2Fc32c313E05360D07f37d8f"
+tokenized_equity_derivative = "0xd50f561322fe3235DBc9Ec8b3aB7693383d8A425"
+
+[assets.equities.ORCL]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x57573351f3fdD20a57dEE4a7f836de1cE9900d4B"
+tokenized_equity_derivative = "0xCB9571aB96aA47374eF30D8E9ACCC1cD51064726"
+
+[assets.equities.SMCI]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x8518931497d2A8f07Bc607D1D3295b398D065A65"
+tokenized_equity_derivative = "0xA759FAbbD866e6DB8bF76613C35825dC2e380bf0"
+
+[assets.equities.BABA]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x6B8fa7288dBEc7C1c62BfE59Cbd7Bec7EBF846C5"
+tokenized_equity_derivative = "0x7e5cc7eAe0455A07Ab4abf354E0f5657BA2888BD"
+
+[assets.equities.TQQQ]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0xcA1A378F9a250131A2fE51c10f120FeF7EDCa56E"
+tokenized_equity_derivative = "0x295e9eCAb319006900a53b3f8D6Fcb0C131F4ada"
