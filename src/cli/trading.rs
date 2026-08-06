@@ -15,8 +15,8 @@ use st0x_evm::ReadOnlyEvm;
 use st0x_execution::alpaca_broker_api::{AlpacaLimitOrder, AlpacaLimitPrice};
 use st0x_execution::{
     ClientOrderId, Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder,
-    MockExecutor, MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce,
-    TryIntoExecutor,
+    MockExecutor, MockExecutorCtx, OrderFailureTerminality, OrderPlacement, OrderState, Positive,
+    Symbol, TimeInForce, TryIntoExecutor,
 };
 use st0x_float_serde::format_float_with_fallback;
 
@@ -35,7 +35,7 @@ use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::{BotOperator, RecoveryActors};
 use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
-use crate::position::{Position, PositionCommand};
+use crate::position::{AnchorDisposition, Position, PositionCommand};
 use st0x_registry::SymbolCache;
 
 /// OrderPlacer for the CLI that delegates to the broker-specific executor
@@ -233,6 +233,7 @@ fn write_order_status<W: Write>(stdout: &mut W, state: OrderState) -> anyhow::Re
             error_reason,
             shares_filled,
             avg_price,
+            terminality,
         } => {
             writeln!(stdout, "❌ Order Status: FAILED")?;
             writeln!(stdout, "   Failed At: {failed_at}")?;
@@ -244,6 +245,18 @@ fn write_order_status<W: Write>(stdout: &mut W, state: OrderState) -> anyhow::Re
             }
             if let Some(avg_price) = avg_price {
                 writeln!(stdout, "   Avg Fill Price: ${avg_price}")?;
+            }
+            match terminality {
+                OrderFailureTerminality::Terminal => writeln!(
+                    stdout,
+                    "   Terminality: TERMINAL -- the broker order cannot resume; \
+                     a fresh order is needed"
+                )?,
+                OrderFailureTerminality::NotTerminal => writeln!(
+                    stdout,
+                    "   Terminality: NOT TERMINAL -- the broker order may still \
+                     resume or fill"
+                )?,
             }
         }
     }
@@ -951,12 +964,15 @@ async fn reconcile_loaded_post_place_state<W: Write>(
         Some(OffchainOrder::Failed { error, .. }) => {
             // Broker placement failed: clear pending_offchain_order_id so the
             // position is not permanently stuck and the normal pipeline can retry.
+            // No broker terminality classification available here; fail-safe
+            // preserves.
             position_store
                 .send(
                     symbol,
                     PositionCommand::FailOffChainOrder {
                         offchain_order_id,
                         error,
+                        anchor: AnchorDisposition::Preserve,
                     },
                 )
                 .await?;
@@ -984,6 +1000,7 @@ async fn reconcile_loaded_post_place_state<W: Write>(
                     PositionCommand::FailOffChainOrder {
                         offchain_order_id,
                         error: "Offchain order missing after Place".to_owned(),
+                        anchor: AnchorDisposition::Preserve,
                     },
                 )
                 .await?;
@@ -1901,6 +1918,7 @@ mod tests {
             error_reason: Some("rejected".to_string()),
             shares_filled: None,
             avg_price: None,
+            terminality: st0x_execution::OrderFailureTerminality::Terminal,
         });
         let order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -2726,6 +2744,96 @@ mod tests {
             !output.contains("normal pipeline"),
             "existing pending cleanup should not imply re-hedging waits for the normal pipeline, \
              got: {output}"
+        );
+
+        let position = position_store
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(offchain_order_id),
+            "a fresh placement failure with no broker order id must preserve \
+             the anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_loaded_post_place_state_failed_with_executor_id_preserves_the_anchor() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        let block_timestamp = Utc::now();
+
+        let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let onchain_trade = OnchainTradeBuilder::default()
+            .with_block_number(42)
+            .with_block_timestamp(Some(block_timestamp))
+            .build();
+
+        execute_acknowledge_fill(
+            &position_store,
+            &onchain_trade,
+            ExecutionThreshold::whole_share(),
+            block_timestamp,
+        )
+        .await
+        .unwrap();
+
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares: positive_shares("1"),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let failed_order = OffchainOrder::Failed {
+            symbol: symbol.clone(),
+            shares: positive_shares("1"),
+            requested_shares: None,
+            direction: Direction::Sell,
+            executor: SupportedExecutor::DryRun,
+            retained_fill: None,
+            filled_shares: None,
+            executor_order_id: Some(ExecutorOrderId::new("already-poll-failed")),
+            error: "previous placement failed".to_string(),
+            placed_at: block_timestamp,
+            failed_at: block_timestamp,
+        };
+
+        let mut stdout = Vec::new();
+        reconcile_loaded_post_place_state(
+            Some(failed_order),
+            &position_store,
+            &symbol,
+            offchain_order_id,
+            CliPendingClearNextStep::ContinueThisRun,
+            &mut stdout,
+        )
+        .await
+        .unwrap();
+
+        let position = position_store
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(offchain_order_id),
+            "this path has no broker-terminality classification to derive \
+             from, so a broker order id alone must not release the anchor"
         );
     }
 
@@ -3659,6 +3767,65 @@ mod tests {
         assert!(
             output.contains("some-broker-order-id"),
             "status output must include the broker order id, got: {output}"
+        );
+    }
+
+    #[test]
+    fn write_order_status_displays_terminal_failure() {
+        let mut stdout = Vec::new();
+
+        write_order_status(
+            &mut stdout,
+            OrderState::Failed {
+                failed_at: Utc::now(),
+                error_reason: Some("order expired".to_string()),
+                shares_filled: None,
+                avg_price: None,
+                terminality: OrderFailureTerminality::Terminal,
+            },
+        )
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("TERMINAL"),
+            "a Terminal failure must be labeled TERMINAL, got: {output}"
+        );
+        assert!(
+            !output.contains("NOT TERMINAL"),
+            "a Terminal failure must not also read NOT TERMINAL, got: {output}"
+        );
+        assert!(
+            output.contains("fresh order is needed"),
+            "a Terminal failure must tell the operator to place a fresh order, got: {output}"
+        );
+    }
+
+    #[test]
+    fn write_order_status_displays_not_terminal_failure() {
+        let mut stdout = Vec::new();
+
+        write_order_status(
+            &mut stdout,
+            OrderState::Failed {
+                failed_at: Utc::now(),
+                error_reason: Some("order suspended".to_string()),
+                shares_filled: None,
+                avg_price: None,
+                terminality: OrderFailureTerminality::NotTerminal,
+            },
+        )
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("NOT TERMINAL"),
+            "a NotTerminal failure must be labeled NOT TERMINAL, got: {output}"
+        );
+        assert!(
+            output.contains("may still resume or fill"),
+            "a NotTerminal failure must tell the operator the order may still \
+             resolve, got: {output}"
         );
     }
 }

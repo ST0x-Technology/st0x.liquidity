@@ -491,7 +491,17 @@ resume hedging — once the cancellation confirms.
 
 - Orders carry a broker-side `client_order_id` idempotency key so a retry after
   a lost placement response is deduped by the broker rather than
-  double-submitted.
+  double-submitted. The key anchors retries only while the broker order under it
+  can still become the placement's outcome: a broker-documented terminal failure
+  (expired, rejected, or done-for-day -- terminal only because every order this
+  bot places is Day time-in-force and so cannot resume in a later session)
+  releases the anchor so the next hedge derives a fresh key. A broker status
+  that can still resume or continue (suspended, replaced, calculated) does NOT
+  release the anchor -- doing so would let a fresh retry double-hedge alongside
+  an order that can still fill. A placement failure with unknown broker state
+  also keeps the anchor, since that is the window a lost response can still
+  land. Intentional cancellation and manual adjustment already release the
+  anchor.
 - Broker `PartiallyFilled` status is preserved through the executor boundary
   (cumulative fills are not collapsed into `Submitted`), and broker-confirmed
   `Cancelled` is represented distinctly from `Failed`.

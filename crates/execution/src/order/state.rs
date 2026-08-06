@@ -1,8 +1,23 @@
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::{ExecutorOrderId, FractionalShares, Usd};
 
 use super::OrderStatus;
+
+/// Whether a broker-reported order failure is documented as final, or whether the
+/// order may still resume or fill after this status.
+///
+/// Treating a non-final failure as final releases a broker-idempotency key while
+/// the original order can still fill, which lets a retry hedge the same position
+/// twice.
+///
+/// See Alpaca's order lifecycle (https://docs.alpaca.markets/docs/orders-at-alpaca).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderFailureTerminality {
+    Terminal,
+    NotTerminal,
+}
 
 /// Runtime representation of an offchain order's lifecycle state.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +52,7 @@ pub enum OrderState {
         error_reason: Option<String>,
         shares_filled: Option<FractionalShares>,
         avg_price: Option<Usd>,
+        terminality: OrderFailureTerminality,
     },
 }
 
@@ -113,6 +129,7 @@ mod tests {
                 error_reason: None,
                 shares_filled: None,
                 avg_price: None,
+                terminality: OrderFailureTerminality::Terminal,
             }
             .status(),
             OrderStatus::Failed

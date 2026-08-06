@@ -515,7 +515,7 @@ pub(super) mod test_helpers {
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
     use st0x_float_macro::float;
 
-    use crate::position::{Position, PositionEvent, TradeId, TriggerReason};
+    use crate::position::{AnchorDisposition, Position, PositionEvent, TradeId, TriggerReason};
     use crate::test_utils::setup_test_db;
 
     use super::projection::HedgeLatencyProjection;
@@ -567,6 +567,7 @@ pub(super) mod test_helpers {
             offchain_order_id: order_id,
             error: "broker rejected".to_string(),
             failed_at: timestamp(failed_offset),
+            anchor: AnchorDisposition::Preserve,
         }
     }
 

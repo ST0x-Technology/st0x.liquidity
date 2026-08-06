@@ -16,7 +16,8 @@ use tracing::{debug, error, info, warn};
 
 use st0x_event_sorcery::{Projection, Store};
 use st0x_execution::{
-    Executor, ExecutorOrderId, FractionalShares, OrderState, Positive, SupportedExecutor, Symbol,
+    Executor, ExecutorOrderId, FractionalShares, OrderFailureTerminality, OrderState, Positive,
+    SupportedExecutor, Symbol,
 };
 use st0x_finance::{NonNegative, Usd};
 
@@ -282,6 +283,7 @@ impl PollOrderStatus {
                 shares_filled: Some(shares_filled),
                 avg_price: Some(avg_price),
                 failed_at,
+                terminality,
             } => {
                 self.record_partial_fill(ctx, symbol, shares_filled, Some(avg_price), failed_at)
                     .await?;
@@ -291,6 +293,7 @@ impl PollOrderStatus {
                     error_reason,
                     Some(shares_filled),
                     Some(failed_at),
+                    Some(terminality),
                 )
                 .await
             }
@@ -308,6 +311,7 @@ impl PollOrderStatus {
                 shares_filled: Some(shares_filled),
                 avg_price: None,
                 failed_at,
+                ..
             } if Positive::new(shares_filled).is_ok() => {
                 error!(
                     target: "broker",
@@ -325,10 +329,18 @@ impl PollOrderStatus {
                 error_reason,
                 shares_filled,
                 failed_at,
+                terminality,
                 ..
             } => {
-                self.enqueue_rejection(ctx, symbol, error_reason, shares_filled, Some(failed_at))
-                    .await
+                self.enqueue_rejection(
+                    ctx,
+                    symbol,
+                    error_reason,
+                    shares_filled,
+                    Some(failed_at),
+                    Some(terminality),
+                )
+                .await
             }
 
             Cancelled {
@@ -560,6 +572,11 @@ impl PollOrderStatus {
     /// rejection stems from a broker `Failed` state; `None` when no broker
     /// timestamp exists for the rejection (the job then stamps its own
     /// observation time).
+    ///
+    /// `broker_terminality` is the broker-terminality classification
+    /// carried by that same `Failed` state; `None` when this rejection has
+    /// no broker-terminality evidence at all (e.g. cleanup paths), which
+    /// must never release the idempotency anchor.
     async fn enqueue_rejection<E>(
         &self,
         ctx: &PollOrderStatusCtx<E>,
@@ -567,6 +584,7 @@ impl PollOrderStatus {
         error_reason: Option<String>,
         broker_filled_shares: Option<FractionalShares>,
         broker_failed_at: Option<DateTime<Utc>>,
+        broker_terminality: Option<OrderFailureTerminality>,
     ) -> Result<(), JobError>
     where
         E: Executor + Clone + Send + Sync + 'static,
@@ -588,6 +606,7 @@ impl PollOrderStatus {
                 error: error_message,
                 broker_filled_shares,
                 broker_failed_at,
+                broker_terminality,
             })
             .await?;
 
@@ -670,6 +689,7 @@ impl PollOrderStatus {
                     ctx,
                     symbol,
                     Some("Broker reported Cancelled before local cancellation request".to_string()),
+                    None,
                     None,
                     None,
                 )
@@ -2387,6 +2407,7 @@ mod tests {
             error_reason: Some("broker rejected".to_string()),
             shares_filled: None,
             avg_price: None,
+            terminality: OrderFailureTerminality::Terminal,
         });
         let infra = build_test_infra(executor).await;
         let symbol = Symbol::new("AAPL").unwrap();
@@ -2420,6 +2441,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_with_expired_broker_order_enqueues_rejection_with_broker_time() {
+        let failed_at = Utc::now();
+        let executor = MockExecutor::new().with_order_status(OrderState::Failed {
+            failed_at,
+            error_reason: Some("expired".to_string()),
+            shares_filled: Some(FractionalShares::ZERO),
+            avg_price: None,
+            terminality: OrderFailureTerminality::Terminal,
+        });
+        let infra = build_test_infra(executor).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+
+        PollOrderStatus {
+            offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, handle_order_rejection_job_type()).await,
+            1,
+            "an expired broker order must enqueue exactly one HandleOrderRejection"
+        );
+
+        let extracted: String = sqlx_apalis::query_scalar(
+            "SELECT json_extract(CAST(job AS TEXT), '$.broker_failed_at') FROM Jobs \
+             WHERE job_type = ?",
+        )
+        .bind(handle_order_rejection_job_type())
+        .fetch_one(&infra.apalis_pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            extracted,
+            serde_json::to_value(failed_at)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string(),
+            "the enqueued rejection must carry the broker's own failure \
+             time, not a None/observation-time fallback"
+        );
+
+        let extracted_terminality: String = sqlx_apalis::query_scalar(
+            "SELECT json_extract(CAST(job AS TEXT), '$.broker_terminality') FROM Jobs \
+             WHERE job_type = ?",
+        )
+        .bind(handle_order_rejection_job_type())
+        .fetch_one(&infra.apalis_pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            extracted_terminality, "Terminal",
+            "the enqueued rejection must carry the broker's terminality \
+             classification, not drop it"
+        );
+    }
+
+    /// The classification must survive into the enqueued job, not be silently dropped.
+    #[tokio::test]
+    async fn poll_with_suspended_broker_order_enqueues_rejection_as_not_terminal() {
+        let executor = MockExecutor::new().with_order_status(OrderState::Failed {
+            failed_at: Utc::now(),
+            error_reason: Some("suspended".to_string()),
+            shares_filled: Some(FractionalShares::ZERO),
+            avg_price: None,
+            terminality: OrderFailureTerminality::NotTerminal,
+        });
+        let infra = build_test_infra(executor).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtAAPL", shares, Direction::Sell).await;
+
+        PollOrderStatus {
+            offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, handle_order_rejection_job_type()).await,
+            1,
+            "a suspended broker order must still enqueue exactly one HandleOrderRejection"
+        );
+
+        let extracted_terminality: String = sqlx_apalis::query_scalar(
+            "SELECT json_extract(CAST(job AS TEXT), '$.broker_terminality') FROM Jobs \
+             WHERE job_type = ?",
+        )
+        .bind(handle_order_rejection_job_type())
+        .fetch_one(&infra.apalis_pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            extracted_terminality, "NotTerminal",
+            "a suspended broker order must be enqueued as NotTerminal so the \
+             anchor is preserved rather than released"
+        );
+    }
+
+    #[tokio::test]
     async fn poll_with_failed_partial_fill_records_fill_before_rejection() {
         let shares_filled = FractionalShares::new(float!(1));
         let avg_price = Usd::new(float!(150.0));
@@ -2428,6 +2561,7 @@ mod tests {
             error_reason: Some("broker rejected after partial fill".to_string()),
             shares_filled: Some(shares_filled),
             avg_price: Some(avg_price),
+            terminality: OrderFailureTerminality::Terminal,
         });
         let infra = build_test_infra(executor).await;
         let symbol = Symbol::new("AAPL").unwrap();
@@ -2815,6 +2949,7 @@ mod tests {
             error_reason: Some("broker rejected after partial fill".to_string()),
             shares_filled: Some(FractionalShares::new(float!(50))),
             avg_price: None,
+            terminality: OrderFailureTerminality::Terminal,
         });
         let infra = build_test_infra(executor).await;
         let symbol = Symbol::new("AAPL").unwrap();
@@ -2867,6 +3002,7 @@ mod tests {
             error_reason: Some("broker rejected remainder".to_string()),
             shares_filled: Some(FractionalShares::new(float!(50))),
             avg_price: None,
+            terminality: OrderFailureTerminality::Terminal,
         });
         let infra = build_test_infra(executor).await;
         let symbol = Symbol::new("AAPL").unwrap();
@@ -2917,6 +3053,7 @@ mod tests {
             error_reason: Some("broker rejected remainder".to_string()),
             shares_filled: Some(FractionalShares::new(float!(50))),
             avg_price: None,
+            terminality: OrderFailureTerminality::Terminal,
         });
         let infra = build_test_infra(executor).await;
         let symbol = Symbol::new("AAPL").unwrap();

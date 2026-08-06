@@ -34,7 +34,7 @@ use crate::offchain::order::{
     finalize_cancelled_position_or_log_unpriced, place_offchain_order_at_broker,
     push_poll_job_if_absent,
 };
-use crate::position::{Position, PositionCommand, PositionError};
+use crate::position::{AnchorDisposition, Position, PositionCommand, PositionError};
 use crate::trading::offchain::close_flatten::{CloseFlattenPolicy, preflight_skip_reason_label};
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
 
@@ -546,6 +546,9 @@ async fn route_placement_outcome(
                     PositionCommand::FailOffChainOrder {
                         offchain_order_id,
                         error,
+                        // No broker terminality classification available
+                        // here; fail-safe preserves.
+                        anchor: AnchorDisposition::Preserve,
                     },
                 )
                 .await?;
@@ -570,6 +573,7 @@ async fn route_placement_outcome(
                     PositionCommand::FailOffChainOrder {
                         offchain_order_id,
                         error: "Offchain order missing after Place".to_string(),
+                        anchor: AnchorDisposition::Preserve,
                     },
                 )
                 .await?;
@@ -862,7 +866,7 @@ mod tests {
     use crate::offchain::order::{
         OffchainOrder, OffchainOrderCommand, OrderPlacementResult, OrderPlacer,
     };
-    use crate::position::{Position, PositionCommand, TradeId};
+    use crate::position::{AnchorDisposition, Position, PositionCommand, TradeId};
     use crate::test_utils::TEST_POLL_INTERVAL;
 
     /// Builds an [`AssetsConfig`] with a single equity whose extended-hours
@@ -939,6 +943,59 @@ mod tests {
         }
 
         Arc::new(SucceedingPlacer)
+    }
+
+    /// Succeeds like [`succeeding_order_placer`], but records every
+    /// `client_order_id` submitted with `place_market_order`, letting a test
+    /// assert on the key the real placement path actually derived.
+    fn capturing_order_placer() -> (Arc<dyn OrderPlacer>, Arc<StdMutex<Vec<ClientOrderId>>>) {
+        struct CapturingPlacer {
+            captured_client_order_ids: Arc<StdMutex<Vec<ClientOrderId>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for CapturingPlacer {
+            async fn place_market_order(
+                &self,
+                order: st0x_execution::MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                self.captured_client_order_ids
+                    .lock()
+                    .unwrap()
+                    .push(order.client_order_id);
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("test-order-123"),
+                    placed_shares: order.shares,
+                    is_extended_hours: false,
+                    limit_price: None,
+                })
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("regular-session test must not place a limit order".into())
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
+            }
+        }
+
+        let captured_client_order_ids = Arc::new(StdMutex::new(Vec::new()));
+        (
+            Arc::new(CapturingPlacer {
+                captured_client_order_ids: captured_client_order_ids.clone(),
+            }),
+            captured_client_order_ids,
+        )
     }
 
     fn rejecting_order_placer() -> Arc<dyn OrderPlacer> {
@@ -1702,6 +1759,162 @@ mod tests {
         assert_eq!(
             position.pending_offchain_order_id, None,
             "a missing order after Place must clear the position claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_failure_without_executor_id_preserves_the_anchor() {
+        let TestInfra {
+            ctx,
+            position_projection,
+            ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2.0))).unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let failed = OffchainOrder::Failed {
+            symbol: symbol.clone(),
+            shares,
+            requested_shares: Some(shares),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::DryRun,
+            retained_fill: None,
+            filled_shares: None,
+            executor_order_id: None,
+            error: "broker unreachable".to_string(),
+            placed_at: chrono::Utc::now(),
+            failed_at: chrono::Utc::now(),
+        };
+
+        route_placement_outcome(&ctx, &symbol, offchain_order_id, Some(failed))
+            .await
+            .unwrap();
+
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(offchain_order_id),
+            "no broker order id is the lost-2xx window the anchor exists \
+             for; the failed order's own id must be stashed"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_failed_retry_with_executor_id_preserves_the_anchor() {
+        let TestInfra {
+            ctx,
+            position_projection,
+            ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2.0))).unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let first_order_id = OffchainOrderId::new();
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: first_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id: first_order_id,
+                    error: "first attempt lost in flight".to_string(),
+                    anchor: AnchorDisposition::Preserve,
+                },
+            )
+            .await
+            .unwrap();
+
+        let second_order_id = OffchainOrderId::new();
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: second_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let failed = OffchainOrder::Failed {
+            symbol: symbol.clone(),
+            shares,
+            requested_shares: Some(shares),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::DryRun,
+            retained_fill: None,
+            filled_shares: Some(FractionalShares::ZERO),
+            executor_order_id: Some(ExecutorOrderId::new("expired-order")),
+            error: "expired".to_string(),
+            placed_at: chrono::Utc::now(),
+            failed_at: chrono::Utc::now(),
+        };
+
+        route_placement_outcome(&ctx, &symbol, second_order_id, Some(failed))
+            .await
+            .unwrap();
+
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(first_order_id),
+            "route_placement_outcome has no broker-terminality classification \
+             to derive from, so it always preserves; a broker order id alone \
+             is not evidence of terminality, and Preserve keeps the original \
+             anchor across the retry chain"
         );
     }
 
@@ -3442,6 +3655,76 @@ mod tests {
             position.pending_offchain_order_id,
             Some(job.offchain_order_id),
             "placement proceeds once the lock is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_order_id_for_placement_derives_fresh_key_after_release() {
+        let (placer, captured_client_order_ids) = capturing_order_placer();
+        let TestInfra {
+            ctx,
+            position_projection,
+            ..
+        } = create_hedge_ctx(placer).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2.0))).unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let expired_order_id = OffchainOrderId::new();
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: expired_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id: expired_order_id,
+                    error: "expired".to_string(),
+                    anchor: AnchorDisposition::Release,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Drive `PlaceHedge::perform_body`, not a hand re-derivation: this proves
+        // the live wiring reads the cleared anchor.
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+        job.perform(&ctx).await.unwrap();
+
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.last_failed_offchain_order_id, None,
+            "a successful placement must not leave a stale anchor behind"
+        );
+
+        let captured = captured_client_order_ids.lock().unwrap().clone();
+        assert_eq!(
+            captured,
+            [ClientOrderId::from_uuid(job.offchain_order_id.as_uuid())],
+            "after a Release failure clears the anchor, the real placement \
+             path must derive a fresh client_order_id from its own id, not \
+             the dead expired order's key"
         );
     }
 

@@ -24,7 +24,7 @@ use crate::offchain::order::{
 use crate::portfolio_snapshot::{
     PortfolioSnapshot, PortfolioSnapshotCommand, PortfolioSnapshotId, PortfolioSnapshotProjection,
 };
-use crate::position::{Position, PositionCommand};
+use crate::position::{AnchorDisposition, Position, PositionCommand};
 
 pub(super) async fn set_portfolio_snapshot_mark_command<W: Write>(
     stdout: &mut W,
@@ -247,6 +247,11 @@ pub(super) async fn fail_pending_offchain_order_command<W: Write>(
             PositionCommand::FailOffChainOrder {
                 offchain_order_id,
                 error: reason.clone(),
+                // The repaired order is typically still live at the broker
+                // (this command force-fails stuck Pending/Submitted orders,
+                // not confirmed broker-terminal ones); releasing here would
+                // re-arm the double-hedge the anchor exists to prevent.
+                anchor: AnchorDisposition::Preserve,
             },
         )
         .await
@@ -863,6 +868,42 @@ mod tests {
         );
     }
 
+    /// `seed_offchain_order` seeds a broker `executor_order_id`, which is not
+    /// terminality evidence and must not flip the disposition to `Release`.
+    /// Guards against a refactor that derives the disposition from it instead
+    /// of the hardcoded `Preserve`.
+    #[tokio::test]
+    async fn fail_pending_preserves_anchor_despite_executor_order_id_evidence() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("MSTR").unwrap();
+        let order_id = OffchainOrderId::new();
+        seed_pending_position(&pool, &symbol, order_id).await;
+        seed_offchain_order(&pool, order_id, &symbol).await;
+
+        fail_pending_offchain_order_command(
+            &mut Vec::new(),
+            &pool,
+            &symbol,
+            order_id,
+            "operator repair".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let view = projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            view.last_failed_offchain_order_id,
+            Some(order_id),
+            "repair must preserve the anchor: a force-failed order is typically \
+             still live at the broker, and an executor_order_id proves nothing \
+             about terminality"
+        );
+    }
+
     /// A Filled order with the pointer still set means the fill was never
     /// accounted: the repair must refuse and leave the pointer for the fill
     /// reconciliation path.
@@ -1142,6 +1183,7 @@ mod tests {
                 PositionCommand::FailOffChainOrder {
                     offchain_order_id: order_id,
                     error: "partial prior run".to_string(),
+                    anchor: AnchorDisposition::Preserve,
                 },
             )
             .await
@@ -1314,6 +1356,7 @@ mod tests {
                 PositionCommand::FailOffChainOrder {
                     offchain_order_id: order_id,
                     error: "partial prior run".to_string(),
+                    anchor: AnchorDisposition::Preserve,
                 },
             )
             .await
@@ -1392,6 +1435,7 @@ mod tests {
                 PositionCommand::FailOffChainOrder {
                     offchain_order_id: pointed,
                     error: "clears the pointer".to_string(),
+                    anchor: AnchorDisposition::Preserve,
                 },
             )
             .await
@@ -1509,6 +1553,7 @@ mod tests {
                 PositionCommand::FailOffChainOrder {
                     offchain_order_id: order_id,
                     error: "clears the pointer".to_string(),
+                    anchor: AnchorDisposition::Preserve,
                 },
             )
             .await

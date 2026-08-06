@@ -14,14 +14,16 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use st0x_event_sorcery::Store;
-use st0x_execution::{Direction, ExecutorOrderId, FractionalShares, Positive};
+use st0x_execution::{
+    Direction, ExecutorOrderId, FractionalShares, OrderFailureTerminality, Positive,
+};
 
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::offchain::order::{
     JobError, NoFillOutcome, OffchainOrder, OffchainOrderCommand, OffchainOrderId, RetainedFill,
     TerminalPositionFinalization, terminal_position_finalization,
 };
-use crate::position::{Position, PositionCommand};
+use crate::position::{AnchorDisposition, Position, PositionCommand};
 
 pub(crate) type HandleOrderRejectionJobQueue = JobQueue<HandleOrderRejection>;
 
@@ -43,10 +45,17 @@ pub(crate) struct HandleOrderRejection {
     /// Broker-reported failure time, when the enqueuing poll observed a
     /// broker `Failed` state. `None` when the rejection has no broker
     /// timestamp (the job then stamps its own observation time).
+    /// `#[serde(default)]` so payloads already in the queue without it still deserialize.
+    #[serde(default)]
+    pub(crate) broker_failed_at: Option<DateTime<Utc>>,
+    /// Broker-terminality classification, when the enqueuing poll observed a
+    /// broker `Failed` state carrying one. `None` when this rejection has no
+    /// broker-terminality evidence (e.g. cleanup paths) -- `AnchorDisposition`
+    /// must never release the idempotency anchor on `None`.
     /// `#[serde(default)]` so jobs queued before this field existed still
     /// deserialize.
     #[serde(default)]
-    pub(crate) broker_failed_at: Option<DateTime<Utc>>,
+    pub(crate) broker_terminality: Option<OrderFailureTerminality>,
 }
 
 impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
@@ -182,6 +191,7 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
                 *avg_price,
                 *partially_filled_at,
                 self.error.clone(),
+                self.broker_terminality,
             ),
 
             // A locally-`Cancelled` order is already terminal and must NOT be
@@ -227,21 +237,19 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
                     | None => PositionCommand::FailOffChainOrder {
                         offchain_order_id: self.offchain_order_id,
                         error: self.error.clone(),
+                        anchor: AnchorDisposition::Preserve,
                     },
                 }
             }
 
-            Pending { .. }
-            | Submitted { .. }
-            | Cancelling { .. }
-            | Failed {
-                executor_order_id: None,
-                ..
+            Pending { .. } | Submitted { .. } | Cancelling { .. } | Failed { .. } => {
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id: self.offchain_order_id,
+                    error: self.error.clone(),
+                    anchor: AnchorDisposition::from_broker_terminality(self.broker_terminality),
+                }
             }
-            | Failed { .. } => PositionCommand::FailOffChainOrder {
-                offchain_order_id: self.offchain_order_id,
-                error: self.error.clone(),
-            },
+
             Filled { .. } => unreachable!("filled orders return before position update"),
         };
 
@@ -259,11 +267,29 @@ fn position_command_for_retained_fill(
     avg_price: st0x_finance::Usd,
     broker_timestamp: chrono::DateTime<chrono::Utc>,
     fallback_error: String,
+    broker_terminality: Option<OrderFailureTerminality>,
 ) -> PositionCommand {
+    let anchor = AnchorDisposition::from_broker_terminality(broker_terminality);
+
+    // Only a confirmed-Terminal broker failure may finalize the position off a
+    // retained partial fill. `NotTerminal` and `None` (no evidence, e.g. a
+    // legacy job payload from before this field existed) both mean the broker
+    // order may still resume and fill the remainder -- completing the
+    // position here would lock in the partial quantity as final and lose any
+    // later fill once this order is retried under a fresh id.
+    if broker_terminality != Some(OrderFailureTerminality::Terminal) {
+        return PositionCommand::FailOffChainOrder {
+            offchain_order_id,
+            error: fallback_error,
+            anchor,
+        };
+    }
+
     Positive::new(shares_filled).map_or_else(
         |_| PositionCommand::FailOffChainOrder {
             offchain_order_id,
             error: fallback_error,
+            anchor,
         },
         |positive_filled| PositionCommand::CompleteOffChainOrder {
             offchain_order_id,
@@ -444,6 +470,7 @@ mod tests {
             error: error_message.clone(),
             broker_filled_shares: Some(FractionalShares::ZERO),
             broker_failed_at: None,
+            broker_terminality: None,
         }
         .perform(&infra.ctx)
         .await
@@ -480,15 +507,29 @@ mod tests {
         );
     }
 
+    /// Without terminal broker evidence, a partial fill's rejection must NOT
+    /// finalize the position at the partial quantity: the broker order may
+    /// still be suspended/live rather than genuinely done, and completing
+    /// here would lock in the partial as final and lose any later fill. Only
+    /// `Some(OrderFailureTerminality::Terminal)` may complete off a retained
+    /// partial (see `rejection_with_terminal_broker_terminality_releases_the_anchor`
+    /// for that path).
     #[tokio::test]
-    async fn partial_fill_rejection_retains_executed_quantity_on_position() {
+    async fn partial_fill_rejection_without_terminal_evidence_does_not_complete_the_position() {
         let infra = build_test_infra().await;
         let symbol = Symbol::new("TSLA").unwrap();
         let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
         let order_id =
             submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
-        let broker_timestamp = Utc::now();
         mark_order_accepted(&infra, order_id, shares).await;
+
+        let position_before = infra
+            .ctx
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
 
         infra
             .ctx
@@ -498,7 +539,7 @@ mod tests {
                 OffchainOrderCommand::UpdatePartialFill {
                     shares_filled: FractionalShares::new(float!(0.75)),
                     avg_price: Usd::new(float!(150.25)),
-                    partially_filled_at: broker_timestamp,
+                    partially_filled_at: Utc::now(),
                 },
             )
             .await
@@ -509,6 +550,7 @@ mod tests {
             error: "broker cancelled after partial fill".to_string(),
             broker_filled_shares: None,
             broker_failed_at: None,
+            broker_terminality: None,
         }
         .perform(&infra.ctx)
         .await
@@ -523,7 +565,7 @@ mod tests {
             .expect("offchain order should exist");
         assert!(
             matches!(offchain, OffchainOrder::Failed { .. }),
-            "terminal partial rejection must still mark the offchain order failed"
+            "the rejection must still mark the offchain order failed locally"
         );
 
         let position = infra
@@ -534,23 +576,90 @@ mod tests {
             .unwrap()
             .expect("position should exist");
         assert_eq!(
-            position.net,
-            FractionalShares::new(float!(1.25)),
-            "position must retain the partially executed sell quantity"
+            position.net, position_before.net,
+            "without terminal broker evidence, the retained partial fill must \
+             NOT be applied to net -- the broker order may still resume and \
+             fill the remainder under a fresh retry"
         );
         assert_eq!(
             position.pending_offchain_order_id, None,
-            "partial fill completion must clear pending state"
+            "the rejection must still clear the pending slot"
         );
         assert_eq!(
-            position.last_failed_offchain_order_id, None,
-            "retained partial fills are completed, not marked as no-fill failures"
+            position.last_failed_offchain_order_id,
+            Some(order_id),
+            "with no terminal evidence, the anchor must be preserved rather \
+             than released"
         );
-        assert!(
-            position
-                .last_updated
-                .is_some_and(|updated| updated >= broker_timestamp),
-            "position timestamp should reflect the retained broker fill"
+    }
+
+    /// An order partially fills, then the broker suspends it (`NotTerminal`).
+    /// The suspended order may still resume and fill the remainder, so this
+    /// rejection must NOT complete the position off the partial quantity,
+    /// and must preserve the anchor.
+    #[tokio::test]
+    async fn suspended_partial_fill_rejection_does_not_complete_the_position() {
+        let infra = build_test_infra().await;
+        let symbol = Symbol::new("TSLA").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
+        mark_order_accepted(&infra, order_id, shares).await;
+
+        let position_before = infra
+            .ctx
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        infra
+            .ctx
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(0.75)),
+                    avg_price: Usd::new(float!(150.25)),
+                    partially_filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        HandleOrderRejection {
+            offchain_order_id: order_id,
+            error: "broker suspended the order".to_string(),
+            broker_filled_shares: Some(FractionalShares::new(float!(0.75))),
+            broker_failed_at: Some(Utc::now()),
+            broker_terminality: Some(OrderFailureTerminality::NotTerminal),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let position = infra
+            .ctx
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.net, position_before.net,
+            "a NotTerminal broker failure must NOT complete the position off \
+             the partial fill -- the broker order may still resume and fill \
+             the remainder"
+        );
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "the rejection must still clear the pending slot"
+        );
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(order_id),
+            "a NotTerminal classification must preserve the anchor"
         );
     }
 
@@ -603,6 +712,7 @@ mod tests {
             error: original_error,
             broker_filled_shares: None,
             broker_failed_at: None,
+            broker_terminality: None,
         }
         .perform(&infra.ctx)
         .await
@@ -619,16 +729,112 @@ mod tests {
             position_after.pending_offchain_order_id, None,
             "Retry must clear the position's pending state by running step 2"
         );
+        assert_eq!(
+            position_after.last_failed_offchain_order_id,
+            Some(order_id),
+            "the order's own executor_order_id (recorded by the earlier \
+             attempt's step 1) is not broker-terminality evidence, so with \
+             no broker_terminality classification the anchor must preserve"
+        );
     }
 
+    /// A retry that lands after step 1 already committed (order `Failed`,
+    /// `executor_order_id` recorded) but whose `broker_terminality` is
+    /// `Some(NotTerminal)` -- the enqueuing poll observed the broker order
+    /// as suspended/replaced, i.e. still able to resume or fill. The
+    /// explicit `NotTerminal` classification must win over the
+    /// `executor_order_id` presence and preserve the anchor; releasing it
+    /// would let a fresh retry double-hedge alongside an order the broker
+    /// says can still fill.
     #[tokio::test]
-    async fn retry_after_failed_partial_fill_completes_position_fill() {
+    async fn retry_of_suspended_order_rejection_preserves_the_anchor() {
+        let infra = build_test_infra().await;
+        let symbol = Symbol::new("TSLA").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
+
+        let original_error = "broker suspended the order".to_string();
+        infra
+            .ctx
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::MarkFailed {
+                    error: original_error.clone(),
+                    filled_shares: None,
+                    failed_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let position_before = infra
+            .ctx
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position_before.pending_offchain_order_id,
+            Some(order_id),
+            "test setup: position must still be expecting this order"
+        );
+
+        HandleOrderRejection {
+            offchain_order_id: order_id,
+            error: original_error,
+            broker_filled_shares: None,
+            broker_failed_at: None,
+            broker_terminality: Some(OrderFailureTerminality::NotTerminal),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let position_after = infra
+            .ctx
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position_after.pending_offchain_order_id, None,
+            "Retry must clear the position's pending state by running step 2"
+        );
+        assert_eq!(
+            position_after.last_failed_offchain_order_id,
+            Some(order_id),
+            "an explicit NotTerminal classification must be authoritative and \
+             preserve the anchor even though the order carries an \
+             executor_order_id from the earlier attempt's step 1"
+        );
+    }
+
+    /// Simulates a retry landing after step 1 (`MarkFailed`) already
+    /// committed a retained partial fill, but with no broker-terminality
+    /// evidence carried on the job (`None`, e.g. a legacy payload or a
+    /// cleanup path). Release now depends only on `broker_terminality`, so
+    /// this must preserve the anchor and NOT complete the position off the
+    /// retained partial -- the broker order may still resume.
+    #[tokio::test]
+    async fn retry_of_failed_partial_fill_without_terminal_evidence_preserves_the_anchor() {
         let infra = build_test_infra().await;
         let symbol = Symbol::new("TSLA").unwrap();
         let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
         let order_id =
             submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
         mark_order_accepted(&infra, order_id, shares).await;
+
+        let position_before = infra
+            .ctx
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
 
         infra
             .ctx
@@ -662,6 +868,7 @@ mod tests {
             error: "broker failed after partial fill".to_string(),
             broker_filled_shares: None,
             broker_failed_at: None,
+            broker_terminality: None,
         }
         .perform(&infra.ctx)
         .await
@@ -676,7 +883,17 @@ mod tests {
             .expect("position should exist");
         assert_eq!(
             position_after.pending_offchain_order_id, None,
-            "Retry must clear pending by completing the retained partial fill"
+            "Retry must clear pending state regardless of anchor disposition"
+        );
+        assert_eq!(
+            position_after.net, position_before.net,
+            "without terminal evidence, the retained partial fill must NOT be \
+             applied to net"
+        );
+        assert_eq!(
+            position_after.last_failed_offchain_order_id,
+            Some(order_id),
+            "with no broker-terminality evidence, the anchor must be preserved"
         );
     }
 
@@ -699,6 +916,7 @@ mod tests {
             error: error_message.clone(),
             broker_filled_shares: None,
             broker_failed_at: None,
+            broker_terminality: None,
         }
         .perform(&infra.ctx)
         .await
@@ -710,6 +928,7 @@ mod tests {
             error: error_message,
             broker_filled_shares: None,
             broker_failed_at: None,
+            broker_terminality: None,
         }
         .perform(&infra.ctx)
         .await
@@ -746,6 +965,7 @@ mod tests {
             error: "broker rejected".to_string(),
             broker_filled_shares: None,
             broker_failed_at: Some(broker_failed_at),
+            broker_terminality: Some(OrderFailureTerminality::Terminal),
         }
         .perform(&infra.ctx)
         .await
@@ -767,10 +987,298 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rejection_with_terminal_broker_terminality_releases_the_anchor() {
+        let infra = build_test_infra().await;
+        let symbol = Symbol::new("TSLA").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
+
+        let first_order_id =
+            submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
+        infra
+            .ctx
+            .position
+            .send(
+                &symbol,
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id: first_order_id,
+                    error: "first attempt lost in flight".to_string(),
+                    anchor: AnchorDisposition::Preserve,
+                },
+            )
+            .await
+            .unwrap();
+
+        // A second order under the same net position (already at threshold
+        // from the first fill) rather than a second onchain fill, since
+        // `submit_offchain_order`'s fixed trade id would collide on reuse.
+        let second_order_id = OffchainOrderId::new();
+        infra
+            .ctx
+            .position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: second_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        infra
+            .ctx
+            .offchain_order
+            .send(
+                &second_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    client_order_id: ClientOrderId::from_uuid(second_order_id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        mark_order_accepted(&infra, second_order_id, shares).await;
+
+        HandleOrderRejection {
+            offchain_order_id: second_order_id,
+            error: "order expired".to_string(),
+            broker_filled_shares: None,
+            broker_failed_at: Some(Utc::now()),
+            broker_terminality: Some(OrderFailureTerminality::Terminal),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let position = infra
+            .ctx
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "rejection must clear the pending slot"
+        );
+        assert_eq!(
+            position.last_failed_offchain_order_id, None,
+            "a broker-observed terminal failure must release the anchor, \
+             even one stashed by an earlier attempt"
+        );
+    }
+
+    /// An `executor_order_id` proves nothing about broker terminality by
+    /// itself; only direct `broker_terminality` evidence from the enqueuing
+    /// poll may release the anchor here.
+    #[tokio::test]
+    async fn rejection_of_submitted_order_without_broker_terminality_preserves_the_anchor() {
+        let infra = build_test_infra().await;
+        let symbol = Symbol::new("TSLA").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
+
+        let offchain = infra
+            .ctx
+            .offchain_order
+            .load(&order_id)
+            .await
+            .unwrap()
+            .expect("offchain order should exist");
+        let OffchainOrder::Submitted { .. } = offchain else {
+            panic!(
+                "expected OffchainOrder::Submitted carrying an executor_order_id, \
+                 got {offchain:?}"
+            );
+        };
+
+        HandleOrderRejection {
+            offchain_order_id: order_id,
+            error: "broker rejected: insufficient buying power".to_string(),
+            broker_filled_shares: None,
+            broker_failed_at: None,
+            broker_terminality: None,
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let position = infra
+            .ctx
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(order_id),
+            "with no broker-terminality evidence, the Submitted order's own \
+             executor_order_id must NOT release the anchor -- the broker order \
+             may still be live"
+        );
+    }
+
+    /// A `Submitted` order's rejection with an explicit `NotTerminal`
+    /// classification must preserve the anchor.
+    #[tokio::test]
+    async fn rejection_of_submitted_order_with_not_terminal_evidence_preserves_the_anchor() {
+        let infra = build_test_infra().await;
+        let symbol = Symbol::new("TSLA").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
+
+        HandleOrderRejection {
+            offchain_order_id: order_id,
+            error: "broker suspended the order".to_string(),
+            broker_filled_shares: None,
+            broker_failed_at: None,
+            broker_terminality: Some(OrderFailureTerminality::NotTerminal),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let position = infra
+            .ctx
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(order_id),
+            "a NotTerminal classification must preserve the anchor -- the \
+             broker order may still resume or fill"
+        );
+    }
+
+    /// A `Cancelling` order with no retained fill must route through the
+    /// same `Submitted | Cancelling` arm as a plain `Submitted` rejection
+    /// (not the retained-fill arm), so the anchor disposition depends only
+    /// on broker-terminality evidence.
+    #[tokio::test]
+    async fn cancelling_without_retained_fill_preserves_the_anchor() {
+        let infra = build_test_infra().await;
+        let symbol = Symbol::new("TSLA").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
+
+        infra
+            .ctx
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::CancelOrder {
+                    reason: crate::offchain::order::CancellationReason::MarketOpenReplacement,
+                },
+            )
+            .await
+            .unwrap();
+
+        let offchain = infra
+            .ctx
+            .offchain_order
+            .load(&order_id)
+            .await
+            .unwrap()
+            .expect("offchain order should exist");
+        let OffchainOrder::Cancelling { retained_fill, .. } = offchain else {
+            panic!("expected OffchainOrder::Cancelling, got {offchain:?}");
+        };
+        assert_eq!(
+            retained_fill, None,
+            "test setup: this order must carry no retained fill so the \
+             rejection routes through the Submitted | Cancelling arm"
+        );
+
+        HandleOrderRejection {
+            offchain_order_id: order_id,
+            error: "broker rejected during cancellation".to_string(),
+            broker_filled_shares: None,
+            broker_failed_at: None,
+            broker_terminality: None,
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let position = infra
+            .ctx
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "rejection must still clear the pending slot"
+        );
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(order_id),
+            "with no retained fill and no broker-terminality evidence, the \
+             anchor must be preserved rather than released"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_order_rejection_releases_anchor_and_pending() {
+        let infra = build_test_infra().await;
+        let symbol = Symbol::new("TSLA").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
+
+        HandleOrderRejection {
+            offchain_order_id: order_id,
+            error: "expired".to_string(),
+            broker_filled_shares: Some(FractionalShares::ZERO),
+            broker_failed_at: Some(Utc::now()),
+            broker_terminality: Some(OrderFailureTerminality::Terminal),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let position = infra
+            .ctx
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "an expired order's rejection must clear the pending slot"
+        );
+        assert_eq!(
+            position.last_failed_offchain_order_id, None,
+            "an expired order's rejection must release the idempotency \
+             anchor so the next hedge derives a fresh key"
+        );
+    }
+
     /// A rejection that lands while the order is `Cancelling` with a retained
-    /// fill must finalize the position with the fill's broker timestamp (the
+    /// fill, carrying `Some(Terminal)` broker-terminality evidence, must
+    /// finalize the position with the fill's broker timestamp (the
     /// `partially_filled_at` carried onto the Cancelling state), not the
-    /// local cancel-request wall clock.
+    /// local cancel-request wall clock. Terminal evidence is required here:
+    /// completing the position off a retained partial is only correct once
+    /// the broker order is confirmed done (see
+    /// `partial_fill_rejection_without_terminal_evidence_does_not_complete_the_position`
+    /// for the non-terminal/no-evidence case).
     #[tokio::test]
     async fn cancelling_rejection_finalizes_position_with_fill_broker_time() {
         let infra = build_test_infra().await;
@@ -811,6 +1319,7 @@ mod tests {
             error: "broker rejected during cancellation".to_string(),
             broker_filled_shares: None,
             broker_failed_at: None,
+            broker_terminality: Some(OrderFailureTerminality::Terminal),
         }
         .perform(&infra.ctx)
         .await
@@ -832,6 +1341,55 @@ mod tests {
             Some(broker_fill_time),
             "Position must be stamped with the fill's broker time, not the \
              cancel-request wall clock"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_partial_fill_rejection_without_broker_terminality_preserves_the_anchor() {
+        let infra = build_test_infra().await;
+        let symbol = Symbol::new("TSLA").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
+
+        infra
+            .ctx
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::ZERO,
+                    avg_price: Usd::new(float!(150)),
+                    partially_filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        HandleOrderRejection {
+            offchain_order_id: order_id,
+            error: "broker rejected".to_string(),
+            broker_filled_shares: None,
+            broker_failed_at: None,
+            broker_terminality: None,
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let position = infra
+            .ctx
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(order_id),
+            "the order's own executor_order_id is not broker-terminality \
+             evidence, so with no broker_terminality classification the \
+             anchor must preserve"
         );
     }
 }

@@ -201,12 +201,33 @@ impl Executor for AlpacaBrokerApi {
             // filled_qty, which the retained-fill path records; an absent
             // field remains unknown downstream rather than being treated as
             // proof of a zero fill.
-            OrderStatus::Failed => Ok(OrderState::Failed {
-                failed_at: order_update.updated_at,
-                error_reason: None,
-                shares_filled: order_update.shares_filled,
-                avg_price: order_update.price.map(Usd::new),
-            }),
+            OrderStatus::Failed => {
+                // `classify_broker_status` is a single exhaustive match that
+                // sets `status` and `failure_terminality` together, so a
+                // `Failed` status can no longer be classified without also
+                // supplying terminality -- unlike the two-independent-matches
+                // shape this replaced, where a status added to one match's
+                // arm list without the other could silently leave this
+                // `None`. `OrderUpdate` still types the field as `Option`
+                // (it's meaningful only for this one status), so the pairing
+                // isn't provable by the compiler at this call site; fail fast
+                // rather than silently defaulting a caller's idempotency
+                // decision if it were ever violated.
+                let terminality = order_update.failure_terminality.ok_or_else(|| {
+                    AlpacaBrokerApiError::IncompleteOrder {
+                        order_id: ExecutorOrderId::new(order_id),
+                        field: MissingOrderField::FailureTerminality,
+                    }
+                })?;
+
+                Ok(OrderState::Failed {
+                    failed_at: order_update.updated_at,
+                    error_reason: None,
+                    shares_filled: order_update.shares_filled,
+                    avg_price: order_update.price.map(Usd::new),
+                    terminality,
+                })
+            }
         }
     }
 
@@ -523,7 +544,7 @@ mod tests {
     use crate::alpaca_broker_api::order::AlpacaLimitPrice;
     use crate::{
         ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
-        Direction, FractionalShares, LimitOrder, Positive, Usd,
+        Direction, FractionalShares, LimitOrder, OrderFailureTerminality, Positive, Usd,
     };
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
@@ -1747,6 +1768,88 @@ mod tests {
         };
         assert_eq!(shares_filled, None);
         assert_eq!(avg_price, None);
+    }
+
+    #[tokio::test]
+    async fn get_order_status_expired_order_is_terminal() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d".to_string();
+
+        let status_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": order_id,
+                    "client_order_id": "33333333-3333-4333-8333-333333333333",
+                    "symbol": "AAPL",
+                    "asset_class": "us_equity",
+                    "qty": "100",
+                    "filled_qty": "0",
+                    "side": "buy",
+                    "type": "market",
+                    "time_in_force": "day",
+                    "status": "expired",
+                    "submitted_at": "2025-01-06T14:30:00.000000Z",
+                    "updated_at": "2025-01-06T21:00:00.000000Z"
+                }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let state = executor.get_order_status(&order_id).await.unwrap();
+
+        status_mock.assert();
+        let OrderState::Failed { terminality, .. } = state else {
+            panic!("expected OrderState::Failed, got {state:?}");
+        };
+        assert_eq!(terminality, OrderFailureTerminality::Terminal);
+    }
+
+    #[tokio::test]
+    async fn get_order_status_suspended_order_is_not_terminal() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d".to_string();
+
+        let status_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": order_id,
+                    "client_order_id": "44444444-4444-4444-8444-444444444444",
+                    "symbol": "AAPL",
+                    "asset_class": "us_equity",
+                    "qty": "100",
+                    "filled_qty": "0",
+                    "side": "buy",
+                    "type": "market",
+                    "time_in_force": "day",
+                    "status": "suspended",
+                    "submitted_at": "2025-01-06T14:30:00.000000Z",
+                    "updated_at": "2025-01-06T14:30:05.000000Z"
+                }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let state = executor.get_order_status(&order_id).await.unwrap();
+
+        status_mock.assert();
+        let OrderState::Failed { terminality, .. } = state else {
+            panic!("expected OrderState::Failed, got {state:?}");
+        };
+        assert_eq!(terminality, OrderFailureTerminality::NotTerminal);
     }
 
     #[tokio::test]

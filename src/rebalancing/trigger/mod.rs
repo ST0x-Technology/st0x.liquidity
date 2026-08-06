@@ -5447,7 +5447,9 @@ mod tests {
     use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
     use crate::offchain::order::OffchainOrderId;
     use crate::onchain::mock::MockRaindex;
-    use crate::position::{Position, PositionCommand, PositionEvent, TradeId, TriggerReason};
+    use crate::position::{
+        AnchorDisposition, Position, PositionCommand, PositionEvent, TradeId, TriggerReason,
+    };
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::test_utils::rebalancing_enabled_equities;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
@@ -7852,6 +7854,7 @@ mod tests {
             offchain_order_id,
             error: "test failure".to_string(),
             failed_at: Utc::now(),
+            anchor: AnchorDisposition::Preserve,
         }
     }
 
