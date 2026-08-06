@@ -24,8 +24,8 @@ use url::Url;
 
 use crate::{
     AlertsConfig, AlertsCtx, AlertsSecrets, BotGasValuationConfig, EvmConfig, EvmCtx, EvmSecrets,
-    ExecutionThreshold, InvalidThresholdError, InventoryAdapters, RebalancingConfig,
-    RebalancingCtx, RebalancingCtxError, TelemetryConfig, TelemetryCtx,
+    ExecutionThreshold, InvalidThresholdError, InventoryAdapters, OrchestratorConfig,
+    RebalancingConfig, RebalancingCtx, RebalancingCtxError, TelemetryConfig, TelemetryCtx,
 };
 use st0x_float_macro::float;
 
@@ -243,6 +243,8 @@ struct Config {
     /// ETH/USD valuation source for bot-gas cost recording. See
     /// [`Ctx::bot_gas_valuation`] for when this is required.
     bot_gas_valuation: Option<BotGasValuationConfig>,
+    /// ST0xOrchestrator contract address. See [`Ctx::orchestrator`].
+    orchestrator: Option<OrchestratorConfig>,
 }
 
 /// Plaintext REST API settings (URL only). Credentials live in secrets.
@@ -609,6 +611,13 @@ pub struct Ctx {
     /// including in Standalone mode, where an operator may still configure it
     /// even though no rebalancing path will ever enqueue to it.
     pub bot_gas_valuation: Option<BotGasValuationConfig>,
+    /// ST0xOrchestrator contract address from `[orchestrator]`, needed to
+    /// sign `MintAuthV1` recipient authorizations for orchestrator-mode
+    /// mints. `Some` when the config includes an `[orchestrator]` section.
+    /// Optional so the bot runs unchanged while every asset is
+    /// vault-direct; a mint that discovers an orchestrator-mode asset with
+    /// this absent must fail loudly, never guess an address.
+    pub orchestrator: Option<OrchestratorConfig>,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
@@ -716,7 +725,8 @@ impl std::fmt::Debug for Ctx {
             .field("redemption_wallet", &self.redemption_wallet)
             .field("rest_api", &self.rest_api)
             .field("issuance", &self.issuance)
-            .field("bot_gas_valuation", &self.bot_gas_valuation);
+            .field("bot_gas_valuation", &self.bot_gas_valuation)
+            .field("orchestrator", &self.orchestrator);
 
         debug_struct.finish()
     }
@@ -786,6 +796,7 @@ struct ValidatedParts {
     issuance: IssuanceStatusCtx,
     redemption_wallet: Option<Address>,
     bot_gas_valuation: Option<BotGasValuationConfig>,
+    orchestrator: Option<OrchestratorConfig>,
     /// Wallet construction inputs. Always present — `parse_and_validate`
     /// returns `WalletNotConfigured` when both config and secrets lack
     /// a `[wallet]` section. Actual async wallet construction is deferred
@@ -832,6 +843,7 @@ fn validate_extended_hours_counter_trading(assets: &AssetsConfig) -> Result<(), 
 /// Single validation path shared by [`Ctx::load_files`] and
 /// [`Ctx::validate_files`]. All config/secrets business-rule checks live
 /// here — neither caller duplicates validation logic.
+#[allow(clippy::too_many_lines)]
 fn parse_and_validate(
     config_str: &str,
     config_path: &Path,
@@ -1069,6 +1081,7 @@ fn parse_and_validate(
         )?,
         redemption_wallet,
         bot_gas_valuation: config.bot_gas_valuation,
+        orchestrator: config.orchestrator,
         wallet_inputs,
         wallet_meta,
     })
@@ -1193,6 +1206,7 @@ impl Ctx {
             issuance: parts.issuance,
             redemption_wallet: parts.redemption_wallet,
             bot_gas_valuation: parts.bot_gas_valuation,
+            orchestrator: parts.orchestrator,
         })
     }
 
@@ -1404,6 +1418,7 @@ impl Ctx {
         #[builder(default = create_test_issuance_ctx())] issuance: IssuanceStatusCtx,
         redemption_wallet: Option<Address>,
         bot_gas_valuation: Option<BotGasValuationConfig>,
+        orchestrator: Option<OrchestratorConfig>,
     ) -> Result<Self, CtxError> {
         let execution_threshold = match execution_threshold_override {
             Some(threshold) => threshold,
@@ -1473,6 +1488,7 @@ impl Ctx {
             issuance,
             redemption_wallet,
             bot_gas_valuation,
+            orchestrator,
         })
     }
 }
@@ -1793,6 +1809,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         issuance: create_test_issuance_ctx(),
         redemption_wallet: None,
         bot_gas_valuation: None,
+        orchestrator: None,
     }
 }
 
@@ -3510,6 +3527,100 @@ mod tests {
         assert_eq!(
             bot_gas_valuation.eth_usd_feed_id,
             b256!("0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace")
+        );
+    }
+
+    /// The full bot-gas section plus the section under test -- the splice
+    /// hole in [`rebalancing_toml_with_bot_gas_valuation`] is plain TOML
+    /// text, and section order is insignificant, so appending
+    /// `[orchestrator]` there exercises the complete real config shape.
+    fn bot_gas_and_orchestrator_sections(orchestrator_section: &str) -> String {
+        format!(
+            r#"[bot_gas_valuation]
+            pyth_contract = "0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a"
+            eth_usd_feed_id = "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"
+
+            {orchestrator_section}"#
+        )
+    }
+
+    #[test]
+    fn orchestrator_section_flows_into_parts() {
+        let config_str =
+            rebalancing_toml_with_bot_gas_valuation(&bot_gas_and_orchestrator_sections(
+                r#"[orchestrator]
+            address = "0x4444444444444444444444444444444444444444""#,
+            ));
+        let secrets = rebalancing_secrets_toml();
+        let secrets_str = std::fs::read_to_string(secrets.path()).unwrap();
+
+        let parts = parse_and_validate(
+            &config_str,
+            Path::new("config.toml"),
+            &secrets_str,
+            Path::new("secrets.toml"),
+        )
+        .unwrap();
+
+        let orchestrator = parts
+            .orchestrator
+            .expect("orchestrator should be Some when configured");
+        assert_eq!(
+            orchestrator.address,
+            address!("0x4444444444444444444444444444444444444444")
+        );
+    }
+
+    /// Absence of `[orchestrator]` is the dark default: every asset is
+    /// vault-direct and the bot must run unchanged without the section.
+    #[test]
+    fn missing_orchestrator_section_parses_as_none() {
+        let config_str =
+            rebalancing_toml_with_bot_gas_valuation(&bot_gas_and_orchestrator_sections(""));
+        let secrets = rebalancing_secrets_toml();
+        let secrets_str = std::fs::read_to_string(secrets.path()).unwrap();
+
+        let parts = parse_and_validate(
+            &config_str,
+            Path::new("config.toml"),
+            &secrets_str,
+            Path::new("secrets.toml"),
+        )
+        .unwrap();
+
+        assert_eq!(parts.orchestrator, None);
+    }
+
+    /// A zero orchestrator address is a placeholder that slipped through;
+    /// it must fail the whole config parse (and thus `validate-config`)
+    /// even while no asset is orchestrator-mode.
+    #[test]
+    fn zero_orchestrator_address_fails_config_parse() {
+        let config_str =
+            rebalancing_toml_with_bot_gas_valuation(&bot_gas_and_orchestrator_sections(
+                r#"[orchestrator]
+            address = "0x0000000000000000000000000000000000000000""#,
+            ));
+        let secrets = rebalancing_secrets_toml();
+        let secrets_str = std::fs::read_to_string(secrets.path()).unwrap();
+
+        let result = parse_and_validate(
+            &config_str,
+            Path::new("config.toml"),
+            &secrets_str,
+            Path::new("secrets.toml"),
+        );
+
+        let source = match result {
+            Err(CtxError::ConfigToml { source, .. }) => source,
+            Err(other) => panic!("expected ConfigToml error, got {other:?}"),
+            Ok(_) => panic!("zero orchestrator address must fail config parse"),
+        };
+        assert!(
+            source
+                .to_string()
+                .contains("address must not be the zero address"),
+            "expected zero-address rejection, got: {source}"
         );
     }
 
