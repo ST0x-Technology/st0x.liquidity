@@ -1,10 +1,9 @@
 # ADR 0018: Back /pnl with a CQRS read model instead of raw SQL over the events table
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-05
-- **Related:** ADR 0016 (event row ID as the shared immutable ingestion cursor);
-  RAI-1072 / RAI-990 / RAI-1127 (performance and reliability stacks moved to
-  view-backed read models); found while working on RAI-1457
+- **Linear:** RAI-1506
+- **Related:** ADR 0016 (event row ID as the shared immutable ingestion cursor)
 
 ## Context
 
@@ -67,12 +66,13 @@ events table                          PnlLedgerReactor
       | typed stream API                           |  nudge only
       | (st0x-event-sorcery):                      |  (payload ignored)
       |   events_since::<E>(pool, after)           v
-      |     -> Vec<Sequenced<E>>          PnlLedger::catch_up()
+      |     -> Vec<Sequenced<E>>          PnlLedger::catch_up()  [the ingester]
       |   head_rowid(pool) -> i64           - serialized by async Mutex
       +------------------------------.      - loads typed events with
                                      |        rowid > checkpoint, per entity
                                      |      - exhaustive match on event enums
-                                     '----> - INSERT OR IGNORE ledger rows
+                                     '----> - insert ledger rows (duplicate
+                                              rowids no-op via ON CONFLICT)
                                             - checkpoint advance, same tx
                                                    |
                                                    v
@@ -133,13 +133,18 @@ id, sequence, typed event, filtered on `Entity::AGGREGATE_TYPE`) and
 `PnlLedger::catch_up()` (mutex-serialized): read `head_rowid`; if the checkpoint
 is at head, return; otherwise ingest `checkpoint..head` for each source entity
 via an exhaustive `match` on the typed event enum (a new or renamed variant is a
-compile error), `INSERT OR IGNORE` the rows, and advance the checkpoint in the
-same transaction -- rows and progress marker commit atomically, so every
-committed state satisfies "the ledger contains exactly the events at or below
-`last_rowid`". Large gaps (first-deploy backfill, rebuilds) are ingested in
-bounded batches, each batch's rows and checkpoint bump in their own transaction:
-peak memory stays flat and a mid-backfill crash resumes from the last batch
-instead of starting over.
+compile error), insert the rows with `ON CONFLICT(event_rowid) DO NOTHING` (only
+a duplicate rowid is a no-op; a `NOT NULL`/`CHECK` violation aborts the batch so
+the checkpoint can never advance past a row the ledger failed to ingest --
+`INSERT OR IGNORE` would silently swallow those too), and advance the checkpoint
+in the same transaction -- rows and progress marker commit atomically, so every
+committed state satisfies "every event at or below `last_rowid` that maps to a
+ledger row has that row committed". Event variants that carry no replay input --
+no share movement, no fee, no gas cost (the empty arms of the per-entity
+`match`es) -- map to no row and are absent by design. Large gaps (first-deploy
+backfill, rebuilds) are ingested in bounded batches, each batch's rows and
+checkpoint bump in their own transaction: peak memory stays flat and a
+mid-backfill crash resumes from the last batch instead of starting over.
 
 `PnlLedgerReactor`
 (`deps!: [Position, TokenizedEquityMint, UsdcRebalance,
