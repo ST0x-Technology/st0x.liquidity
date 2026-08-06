@@ -21,6 +21,7 @@ use st0x_event_sorcery::{Projection, RetryOnBusy, Store, StoreBuilder};
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::dashboard::Broadcaster;
+use crate::dashboard::pnl::PnlLedgerReactor;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::InventorySnapshot;
 use crate::performance::HedgeLatencyProjection;
@@ -44,6 +45,9 @@ pub(super) struct QueryManifest {
     rebalance_timing: Arc<RetryOnBusy<RebalanceTimingProjection>>,
     equity_timing: Arc<RetryOnBusy<EquityTimingProjection>>,
     lifecycle_failure: Arc<RetryOnBusy<LifecycleFailureProjection>>,
+    /// No `RetryOnBusy` wrap: a failed nudge is repaired by the ledger's own
+    /// checkpoint on the next trigger, so retrying it inline buys nothing.
+    pnl_ledger: Arc<PnlLedgerReactor>,
 }
 
 /// Built CQRS frameworks from the wiring process.
@@ -68,6 +72,7 @@ impl QueryManifest {
         rebalance_timing: RebalanceTimingProjection,
         equity_timing: EquityTimingProjection,
         lifecycle_failure: LifecycleFailureProjection,
+        pnl_ledger: Arc<PnlLedgerReactor>,
     ) -> Self {
         Self {
             rebalancing_service,
@@ -84,6 +89,7 @@ impl QueryManifest {
             lifecycle_failure: Arc::new(RetryOnBusy {
                 inner: lifecycle_failure,
             }),
+            pnl_ledger,
         }
     }
 
@@ -104,12 +110,14 @@ impl QueryManifest {
             rebalance_timing,
             equity_timing,
             lifecycle_failure,
+            pnl_ledger,
         } = self;
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .with(rebalancing_service.clone())
             .with(broadcaster.clone())
             .with(hedge_latency)
+            .with(pnl_ledger.clone())
             .build(())
             .await?;
 
@@ -118,6 +126,7 @@ impl QueryManifest {
             .with(broadcaster.clone())
             .with(equity_timing.clone())
             .with(lifecycle_failure.clone())
+            .with(pnl_ledger.clone())
             .build(services.clone())
             .await?;
 
@@ -134,6 +143,7 @@ impl QueryManifest {
             .with(broadcaster)
             .with(rebalance_timing)
             .with(lifecycle_failure)
+            .with(pnl_ledger)
             .build(())
             .await?;
 
@@ -171,6 +181,7 @@ mod tests {
     use st0x_wrapper::MockWrapper;
 
     use super::*;
+    use crate::dashboard::pnl::PnlLedger;
     use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
     use crate::inventory::{
         BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Operator, Venue,
@@ -243,6 +254,9 @@ mod tests {
             rebalance_timing,
             equity_timing,
             lifecycle_failure,
+            Arc::new(PnlLedgerReactor::new(Arc::new(PnlLedger::new(
+                pool.clone(),
+            )))),
         );
 
         let services = EquityTransferServices {
@@ -308,6 +322,9 @@ mod tests {
             rebalance_timing,
             equity_timing,
             lifecycle_failure,
+            Arc::new(PnlLedgerReactor::new(Arc::new(PnlLedger::new(
+                pool.clone(),
+            )))),
         );
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
@@ -435,6 +452,9 @@ mod tests {
             rebalance_timing,
             equity_timing,
             lifecycle_failure,
+            Arc::new(PnlLedgerReactor::new(Arc::new(PnlLedger::new(
+                pool.clone(),
+            )))),
         );
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
@@ -465,6 +485,17 @@ mod tests {
             )
             .await
             .unwrap();
+
+        let ledger_fill: (String, String, String) =
+            sqlx::query_as("SELECT symbol, shares, direction FROM pnl_onchain_fill")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            ledger_fill,
+            (symbol.to_string(), "2".to_owned(), "Buy".to_owned()),
+            "manifest-registered PnlLedgerReactor should ingest the fill into the ledger"
+        );
 
         let message = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
