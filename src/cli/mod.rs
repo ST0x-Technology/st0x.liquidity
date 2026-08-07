@@ -144,6 +144,20 @@ pub enum CctpChain {
     Base,
 }
 
+/// Target network for Alpaca tokenization mint/redeem commands.
+///
+/// Selects both the Alpaca ITN `network` wire value and the bot wallet
+/// (and therefore the chain) used for onchain legs of the flow; the pairing
+/// is produced by a single match in `rebalancing::tokenization_network_context`
+/// so the two cannot diverge.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum TokenizationNetwork {
+    /// Base mainnet
+    Base,
+    /// Ethereum mainnet
+    Ethereum,
+}
+
 /// Manual position-recovery operations for stuck local CQRS state.
 #[derive(Debug, Subcommand)]
 pub enum PositionRecoveryCommand {
@@ -631,6 +645,14 @@ pub enum Commands {
         /// Recipient wallet address (defaults to configured wallet address)
         #[arg(short = 'r', long = "recipient")]
         recipient: Option<Address>,
+        /// Target network for the mint (selects the Alpaca `network` wire
+        /// value and the wallet used to observe token arrival)
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
+        /// Tokenized equity (tStock) address override. Required for
+        /// non-base networks -- `[assets.equities]` holds Base addresses
+        #[arg(long = "token")]
+        token: Option<Address>,
     },
 
     /// Request redemption of tokenized shares via Alpaca (isolated test command)
@@ -649,6 +671,14 @@ pub enum Commands {
         /// Alpaca redemption wallet (overrides [tokenization] config)
         #[arg(long = "redemption-wallet")]
         redemption_wallet: Option<Address>,
+        /// Target network for the redemption (selects the wallet that sends
+        /// the tokens and therefore the chain the transfer lands on)
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
+        /// Tokenized equity (tStock) address override. Required for
+        /// non-base networks -- `[assets.equities]` holds Base addresses
+        #[arg(long = "token")]
+        token: Option<Address>,
     },
 
     /// Convert USDC to/from USD on Alpaca
@@ -1182,11 +1212,15 @@ enum ProviderCommand {
         symbol: Symbol,
         quantity: FractionalShares,
         recipient: Option<Address>,
+        network: TokenizationNetwork,
+        token: Option<Address>,
     },
     AlpacaRedeem {
         symbol: Symbol,
         quantity: FractionalShares,
         redemption_wallet: Option<Address>,
+        network: TokenizationNetwork,
+        token: Option<Address>,
     },
     DividendBump {
         symbol: Symbol,
@@ -1358,19 +1392,27 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             symbol,
             quantity,
             recipient,
+            network,
+            token,
         } => Err(ProviderCommand::AlpacaTokenize {
             symbol,
             quantity,
             recipient,
+            network,
+            token,
         }),
         Commands::AlpacaRedeem {
             symbol,
             quantity,
             redemption_wallet,
+            network,
+            token,
         } => Err(ProviderCommand::AlpacaRedeem {
             symbol,
             quantity,
             redemption_wallet,
+            network,
+            token,
         }),
         Commands::DividendBump { symbol, quantity } => {
             Err(ProviderCommand::DividendBump { symbol, quantity })
@@ -1882,20 +1924,34 @@ async fn run_provider_command<W: Write>(
             symbol,
             quantity,
             recipient,
+            network,
+            token,
         } => {
-            rebalancing::alpaca_tokenize_command(stdout, symbol, quantity, recipient, ctx, provider)
-                .await
+            rebalancing::alpaca_tokenize_command(
+                stdout, symbol, quantity, recipient, network, token, ctx,
+            )
+            .await
         }
         ProviderCommand::AlpacaRedeem {
             symbol,
             quantity,
             redemption_wallet,
+            network,
+            token,
         } => {
-            rebalancing::alpaca_redeem_command(stdout, symbol, quantity, redemption_wallet, ctx)
-                .await
+            rebalancing::alpaca_redeem_command(
+                stdout,
+                symbol,
+                quantity,
+                redemption_wallet,
+                network,
+                token,
+                ctx,
+            )
+            .await
         }
         ProviderCommand::DividendBump { symbol, quantity } => {
-            dividend::dividend_bump_command(stdout, symbol, quantity, ctx, provider).await
+            dividend::dividend_bump_command(stdout, symbol, quantity, ctx).await
         }
         ProviderCommand::AlpacaTokenizationRequests => {
             rebalancing::alpaca_tokenization_requests_command(stdout, ctx).await

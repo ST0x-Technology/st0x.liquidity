@@ -11,7 +11,7 @@ use uuid::uuid;
 
 use st0x_evm::Wallet;
 use st0x_evm::local::RawPrivateKeyWallet;
-use st0x_execution::{AlpacaAccountId, PollingConfig};
+use st0x_execution::{AlpacaAccountId, Network, PollingConfig};
 use st0x_tokenization::{AlpacaTokenizationService, IssuerRequestId};
 
 pub(crate) const TEST_ACCOUNT_ID: AlpacaAccountId =
@@ -46,6 +46,7 @@ pub(crate) async fn create_test_service_from_mock(
         "test_api_key".to_string(),
         "test_api_secret".to_string(),
         wallet,
+        Network::new("base"),
         Some(redemption_wallet),
     )
     .with_polling_config(PollingConfig {

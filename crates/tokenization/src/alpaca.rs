@@ -66,6 +66,7 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
         api_key: String,
         api_secret: String,
         wallet: W,
+        network: Network,
         redemption_wallet: Option<Address>,
     ) -> Self {
         let client = AlpacaTokenizationClient::new(
@@ -74,6 +75,7 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
             api_key,
             api_secret,
             wallet,
+            network,
             redemption_wallet,
         );
 
@@ -102,7 +104,7 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
             underlying_symbol,
             quantity,
             issuer: Issuer::new("st0x"),
-            network: Network::new("base"),
+            network: self.client.network.clone(),
             wallet,
             issuer_request_id,
         };
@@ -585,6 +587,7 @@ struct AlpacaTokenizationClient<W: Wallet> {
     api_key: String,
     api_secret: String,
     wallet: W,
+    network: Network,
     redemption_wallet: Option<Address>,
 }
 
@@ -595,6 +598,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         api_key: String,
         api_secret: String,
         wallet: W,
+        network: Network,
         redemption_wallet: Option<Address>,
     ) -> Self {
         Self {
@@ -604,6 +608,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             api_key,
             api_secret,
             wallet,
+            network,
             redemption_wallet,
         }
     }
@@ -1195,6 +1200,7 @@ pub(crate) mod tests {
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
             wallet,
+            Network::new("base"),
             Some(redemption_wallet),
         )
     }
@@ -1293,6 +1299,63 @@ pub(crate) mod tests {
         assert!(logs_contain("tok_req_123"));
         assert!(logs_contain("pending"));
 
+        mint_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn service_mint_request_carries_configured_network() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let provider = ProviderBuilder::new().connect(&endpoint).await.unwrap();
+        let wallet = RawPrivateKeyWallet::new(&key, provider, 1).unwrap();
+
+        let client = AlpacaTokenizationClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_api_key".to_string(),
+            "test_api_secret".to_string(),
+            wallet,
+            Network::new("ethereum"),
+            Some(TEST_REDEMPTION_WALLET),
+        );
+        let service = create_test_service(client);
+
+        let recipient = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let issuer_id = issuer_request_id("test-ethereum-mint");
+        let issuer_id_str = issuer_id.to_string();
+
+        let mint_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path(tokenization_mint_path())
+                .json_body_includes(r#"{"network":"ethereum"}"#);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "tokenization_request_id": "tok_req_eth_1",
+                    "type": "mint",
+                    "status": "pending",
+                    "underlying_symbol": "RKLB",
+                    "token_symbol": "tRKLB",
+                    "qty": "1",
+                    "issuer": "st0x",
+                    "network": "ethereum",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "issuer_request_id": issuer_id_str,
+                    "created_at": "2026-08-02T10:30:00Z"
+                }));
+        });
+
+        let result = service
+            .request_mint(
+                Symbol::new("RKLB").unwrap(),
+                FractionalShares::new(float!(1.0)),
+                recipient,
+                issuer_id,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.id, tokenization_request_id("tok_req_eth_1"));
         mint_mock.assert();
     }
 
@@ -1721,6 +1784,7 @@ pub(crate) mod tests {
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
             wallet,
+            Network::new("base"),
             Some(TEST_REDEMPTION_WALLET),
         );
 
@@ -1762,6 +1826,7 @@ pub(crate) mod tests {
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
             wallet,
+            Network::new("base"),
             Some(TEST_REDEMPTION_WALLET),
         );
 
@@ -1791,6 +1856,7 @@ pub(crate) mod tests {
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
             wallet,
+            Network::new("base"),
             Some(TEST_REDEMPTION_WALLET),
         );
 
