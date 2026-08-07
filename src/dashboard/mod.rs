@@ -702,6 +702,7 @@ mod tests {
             ctx: create_test_ctx_with_order_owner(address!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             )),
+            pnl_ledger: Arc::new(pnl::PnlLedger::new(pool.clone())),
             pool,
             event_sender: sender.clone(),
             inventory: Arc::new(BroadcastingInventory::new(

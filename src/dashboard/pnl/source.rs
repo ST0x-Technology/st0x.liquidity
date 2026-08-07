@@ -1,8 +1,14 @@
-//! SQLite and broker-backed source loading for backend PnL reports.
+//! Ledger and broker-backed source loading for backend PnL reports.
+//!
+//! Replay inputs come from the typed, append-only `pnl_*` ledger tables
+//! maintained by [`super::ledger::PnlLedger`] (ADR 0018) -- never from the
+//! `events` table. Freshness is guaranteed by running the ledger's
+//! `catch_up()` before resolving the `asOfRowid` watermark, outside the
+//! replay admission permit.
 use chrono::{DateTime, Days, NaiveDate, NaiveTime, Utc};
 use chrono_tz::America::New_York;
 use rain_math_float::Float;
-use sqlx::{QueryBuilder, Sqlite, SqlitePool, Transaction};
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -11,16 +17,20 @@ use tokio::task;
 use st0x_execution::alpaca_broker_api::AccountActivity;
 use st0x_float_serde::format_float;
 
-use crate::bot_gas::BotGasReceiptCostEvent;
 use crate::portfolio_snapshot::{
     CAPTURE_BUFFER, EtDayRange, capital_summary, evaluate_portfolio_days, load_portfolio_day_rows,
 };
 
 use super::builder::build_pnl_response_from_rows;
-use super::parsing::parse_payload_string;
+use super::ledger::{
+    CCTP_FEE_SOURCE, DIRECTION_BUY_TEXT, DIRECTION_SELL_TEXT, LedgerHead, TOKENIZATION_FEE_SOURCE,
+};
 use super::query::{PnlError, PnlQuery};
 use super::response::{PnlCapitalSummary, PnlResponse};
-use super::state::{BotGasCostRow, CostEventRow, PositionEventRow, PositionViewRow};
+use super::state::{
+    BotGasCostRow, CostLedgerRow, CostSource, Direction, ManualAdjustmentRow, OffchainFillRow,
+    OffchainPlacementRow, OnchainFillRow, PositionLedgerRow, PositionViewRow,
+};
 use super::{
     ATTRIBUTION_WARNING, BASELINE_WARNING, CAPITAL_AVAILABLE_NOTE, CAPITAL_UNAVAILABLE_NOTE,
     COST_WARNING, SYMBOL_FILTERED_CAPITAL_WARNING,
@@ -84,17 +94,25 @@ pub(crate) async fn build_pnl_report(
     alpaca_activities: Vec<AccountActivity>,
     now: DateTime<Utc>,
 ) -> Result<PnlResponse, PnlError> {
+    let ledger = super::ledger::PnlLedger::new(pool.clone());
+    let head = ledger.catch_up().await?;
     let admission = pnl_report_admission();
     let permit = acquire_pnl_report_permit(&admission)?;
-    build_pnl_report_with_permit(pool, query, alpaca_activities, now, permit).await
+    build_pnl_report_with_permit(pool, query, alpaca_activities, now, permit, head).await
 }
 
+/// `head` is the event-log head returned by the ledger's `catch_up()`, which
+/// the caller MUST have run before acquiring the replay permit: freshness is
+/// async I/O and must not burn a blocking-replay slot, and the resolved
+/// `asOfRowid` watermark is only meaningful once the ledger contains
+/// everything at or below it.
 pub(crate) async fn build_pnl_report_with_permit(
     pool: &SqlitePool,
     query: &PnlQuery,
     alpaca_activities: Vec<AccountActivity>,
     now: DateTime<Utc>,
     permit: OwnedSemaphorePermit,
+    head: LedgerHead,
 ) -> Result<PnlResponse, PnlError> {
     let mut warnings = vec![
         ATTRIBUTION_WARNING.to_owned(),
@@ -102,18 +120,16 @@ pub(crate) async fn build_pnl_report_with_permit(
         COST_WARNING.to_owned(),
     ];
     let symbols = query.symbol_filter(&mut warnings)?;
-    let mut tx = pool.begin().await?;
-    let resolved_rowid = effective_as_of_rowid(&mut tx, query).await?;
+    let resolved_rowid = resolve_as_of_rowid(query, head)?;
     let effective_query = PnlQuery {
         as_of_rowid: Some(resolved_rowid.resolved),
         ..query.clone()
     };
 
-    let event_rows = load_position_events(&mut tx, &symbols, resolved_rowid.resolved).await?;
-    let position_rows = load_position_view(&mut tx).await?;
-    let cost_rows = load_cost_events(&mut tx, resolved_rowid.resolved).await?;
-    let bot_gas_rows = load_bot_gas_costs(&mut tx, resolved_rowid.resolved).await?;
-    tx.commit().await?;
+    let event_rows = load_position_rows(pool, &symbols, resolved_rowid.resolved).await?;
+    let position_rows = load_position_view(pool).await?;
+    let cost_rows = load_cost_rows(pool, resolved_rowid.resolved).await?;
+    let bot_gas_rows = load_bot_gas_rows(pool, resolved_rowid.resolved).await?;
 
     let replay_symbols = symbols.clone();
     let ((mut response, daily_net_realized_pnl_usd), permit) =
@@ -286,48 +302,42 @@ async fn complete_capital_range(
     Ok(range)
 }
 
-pub(crate) async fn validate_pnl_snapshot_rowid(
-    pool: &SqlitePool,
+/// Validates a user-supplied `asOfRowid` against the ledger head returned by
+/// `catch_up()`.
+pub(crate) fn validate_pnl_snapshot_rowid(
+    LedgerHead(head): LedgerHead,
     query: &PnlQuery,
 ) -> Result<(), PnlError> {
-    let Some(as_of_rowid) = query.as_of_rowid else {
-        return Ok(());
-    };
-
-    let mut tx = pool.begin().await?;
-    let max_rowid = max_event_rowid(&mut tx).await?;
-    tx.commit().await?;
-
-    check_as_of_rowid(as_of_rowid, max_rowid)
+    query
+        .as_of_rowid
+        .map_or(Ok(()), |as_of_rowid| check_as_of_rowid(as_of_rowid, head))
 }
 
-/// The effective `as_of_rowid` alongside the current max event rowid, so
-/// callers can tell whether the resolved value is the live head (needed for
-/// the capital as-of-rowid caveat). A named pair rather than a bare
-/// `(i64, i64)` prevents the two rowids from being transposed at a call site.
+/// The effective `as_of_rowid` alongside the current head, so callers can
+/// tell whether the resolved value is the live head (needed for the capital
+/// as-of-rowid caveat). A named pair rather than a bare `(i64, i64)`
+/// prevents the two rowids from being transposed at a call site.
 struct ResolvedRowid {
     resolved: i64,
     max: i64,
 }
 
-/// Resolves the effective `as_of_rowid`.
-async fn effective_as_of_rowid(
-    tx: &mut Transaction<'_, Sqlite>,
+/// Resolves the effective `as_of_rowid` against the caught-up ledger head.
+fn resolve_as_of_rowid(
     query: &PnlQuery,
+    LedgerHead(head): LedgerHead,
 ) -> Result<ResolvedRowid, PnlError> {
-    let max_rowid = max_event_rowid(tx).await?;
-
     if let Some(as_of_rowid) = query.as_of_rowid {
-        check_as_of_rowid(as_of_rowid, max_rowid)?;
+        check_as_of_rowid(as_of_rowid, head)?;
         return Ok(ResolvedRowid {
             resolved: as_of_rowid,
-            max: max_rowid,
+            max: head,
         });
     }
 
     Ok(ResolvedRowid {
-        resolved: max_rowid,
-        max: max_rowid,
+        resolved: head,
+        max: head,
     })
 }
 
@@ -339,77 +349,143 @@ fn check_as_of_rowid(as_of_rowid: i64, max_rowid: i64) -> Result<(), PnlError> {
     Ok(())
 }
 
-async fn max_event_rowid(tx: &mut Transaction<'_, Sqlite>) -> Result<i64, PnlError> {
-    let (max_rowid,) = sqlx::query_as::<_, (Option<i64>,)>("SELECT MAX(rowid) FROM events")
-        .fetch_one(&mut **tx)
-        .await?;
+fn push_symbol_filter(query: &mut QueryBuilder<Sqlite>, symbols: &BTreeSet<String>) {
+    if symbols.is_empty() {
+        return;
+    }
 
-    Ok(max_rowid.unwrap_or(0))
+    query.push(" AND symbol IN (");
+    let mut separated = query.separated(", ");
+    for symbol in symbols {
+        separated.push_bind(symbol.clone());
+    }
+    separated.push_unseparated(")");
 }
 
-async fn load_position_events(
-    tx: &mut Transaction<'_, Sqlite>,
+fn ledger_direction(
+    table: &'static str,
+    rowid: i64,
+    direction: &str,
+) -> Result<Direction, PnlError> {
+    match direction {
+        DIRECTION_BUY_TEXT => Ok(Direction::Buy),
+        DIRECTION_SELL_TEXT => Ok(Direction::Sell),
+        _ => Err(PnlError::InvalidLedgerRow {
+            table,
+            rowid,
+            reason: "unknown direction",
+        }),
+    }
+}
+
+/// Loads all four position row kinds from the ledger at or below the
+/// watermark, merged in global rowid order -- the same stream shape the raw
+/// events query produced, already typed.
+async fn load_position_rows(
+    pool: &SqlitePool,
     symbols: &BTreeSet<String>,
     as_of_rowid: i64,
-) -> Result<Vec<PositionEventRow>, PnlError> {
-    let mut query = QueryBuilder::<Sqlite>::new(
-        "SELECT rowid, aggregate_id AS symbol, event_type, payload \
-         FROM events \
-         WHERE aggregate_type = 'Position' \
-           AND event_type IN ( \
-             'PositionEvent::OnChainOrderFilled', \
-             'PositionEvent::OffChainOrderPlaced', \
-             'PositionEvent::OffChainOrderFilled', \
-             'PositionEvent::ManualPositionAdjusted' \
-           ) \
-           AND rowid <= ",
+) -> Result<Vec<PositionLedgerRow>, PnlError> {
+    let mut rows = Vec::new();
+
+    let mut onchain = QueryBuilder::<Sqlite>::new(
+        "SELECT event_rowid, symbol, tx_hash, log_index, shares, direction, price_usd, \
+         executed_at FROM pnl_onchain_fill WHERE event_rowid <= ",
     );
-    query.push_bind(as_of_rowid);
-    if !symbols.is_empty() {
-        query.push(" AND aggregate_id IN (");
-        let mut separated = query.separated(", ");
-        for symbol in symbols {
-            separated.push_bind(symbol);
-        }
-        separated.push_unseparated(")");
-    }
-    query.push(" ORDER BY rowid ASC");
-
-    let rows = query
-        .build_query_as::<(i64, String, String, String)>()
-        .fetch_all(&mut **tx)
-        .await?;
-
-    let mut events = Vec::with_capacity(rows.len());
-    for (rowid, symbol, event_type, payload) in rows {
-        let payload =
-            parse_payload_string(&payload).map_err(|source| PnlError::InvalidPayload {
-                rowid,
-                aggregate_type: "Position".to_owned(),
-                event_type: event_type.clone(),
-                source,
-            })?;
-        events.push(PositionEventRow {
-            rowid,
+    onchain.push_bind(as_of_rowid);
+    push_symbol_filter(&mut onchain, symbols);
+    for (event_rowid, symbol, tx_hash, log_index, shares, direction, price_usd, executed_at) in
+        onchain
+            .build_query_as::<(i64, String, String, i64, String, String, String, String)>()
+            .fetch_all(pool)
+            .await?
+    {
+        rows.push(PositionLedgerRow::OnchainFill(OnchainFillRow {
+            event_rowid,
             symbol,
-            event_type,
-            payload,
-        });
+            tx_hash,
+            log_index,
+            shares,
+            direction: ledger_direction("pnl_onchain_fill", event_rowid, &direction)?,
+            price_usd,
+            executed_at,
+        }));
     }
 
-    Ok(events)
+    let mut offchain = QueryBuilder::<Sqlite>::new(
+        "SELECT event_rowid, symbol, offchain_order_id, shares, direction, price_usd, \
+         executed_at FROM pnl_offchain_fill WHERE event_rowid <= ",
+    );
+    offchain.push_bind(as_of_rowid);
+    push_symbol_filter(&mut offchain, symbols);
+    for (event_rowid, symbol, offchain_order_id, shares, direction, price_usd, executed_at) in
+        offchain
+            .build_query_as::<(i64, String, String, String, String, String, String)>()
+            .fetch_all(pool)
+            .await?
+    {
+        rows.push(PositionLedgerRow::OffchainFill(OffchainFillRow {
+            event_rowid,
+            symbol,
+            offchain_order_id,
+            shares,
+            direction: ledger_direction("pnl_offchain_fill", event_rowid, &direction)?,
+            price_usd,
+            executed_at,
+        }));
+    }
+
+    let mut placements = QueryBuilder::<Sqlite>::new(
+        "SELECT event_rowid, symbol, offchain_order_id, placed_at \
+         FROM pnl_offchain_placement WHERE event_rowid <= ",
+    );
+    placements.push_bind(as_of_rowid);
+    push_symbol_filter(&mut placements, symbols);
+    for (event_rowid, symbol, offchain_order_id, placed_at) in placements
+        .build_query_as::<(i64, String, String, String)>()
+        .fetch_all(pool)
+        .await?
+    {
+        rows.push(PositionLedgerRow::OffchainPlacement(OffchainPlacementRow {
+            event_rowid,
+            symbol,
+            offchain_order_id,
+            placed_at,
+        }));
+    }
+
+    let mut adjustments = QueryBuilder::<Sqlite>::new(
+        "SELECT event_rowid, symbol, target_net, price_usd, adjusted_at \
+         FROM pnl_manual_adjustment WHERE event_rowid <= ",
+    );
+    adjustments.push_bind(as_of_rowid);
+    push_symbol_filter(&mut adjustments, symbols);
+    for (event_rowid, symbol, target_net, price_usd, adjusted_at) in adjustments
+        .build_query_as::<(i64, String, String, Option<String>, String)>()
+        .fetch_all(pool)
+        .await?
+    {
+        rows.push(PositionLedgerRow::ManualAdjustment(ManualAdjustmentRow {
+            event_rowid,
+            symbol,
+            target_net,
+            price_usd,
+            adjusted_at,
+        }));
+    }
+
+    rows.sort_by_key(PositionLedgerRow::event_rowid);
+    Ok(rows)
 }
 
-async fn load_position_view(
-    tx: &mut Transaction<'_, Sqlite>,
-) -> Result<Vec<PositionViewRow>, PnlError> {
+async fn load_position_view(pool: &SqlitePool) -> Result<Vec<PositionViewRow>, PnlError> {
     let rows = sqlx::query_as::<_, (String, Option<String>)>(
         "SELECT symbol, net_position \
          FROM position_view \
          WHERE symbol IS NOT NULL \
          ORDER BY symbol ASC",
     )
-    .fetch_all(&mut **tx)
+    .fetch_all(pool)
     .await?;
 
     Ok(rows
@@ -421,97 +497,76 @@ async fn load_position_view(
         .collect())
 }
 
-async fn load_cost_events(
-    tx: &mut Transaction<'_, Sqlite>,
+async fn load_cost_rows(
+    pool: &SqlitePool,
     as_of_rowid: i64,
-) -> Result<Vec<CostEventRow>, PnlError> {
-    let rows = sqlx::query_as::<_, (i64, String, String, String, String)>(
-        "SELECT rowid, aggregate_type, aggregate_id, event_type, payload \
-         FROM events \
-         WHERE rowid <= ? \
-           AND ( \
-             ( \
-               aggregate_type = 'TokenizedEquityMint' \
-               AND event_type IN ( \
-                 'TokenizedEquityMintEvent::MintRequested', \
-                 'TokenizedEquityMintEvent::TokensReceived', \
-                 'TokenizedEquityMintEvent::ProviderCompletionRecovered' \
-               ) \
-             ) \
-             OR ( \
-               aggregate_type = 'UsdcRebalance' \
-               AND event_type IN ( \
-                 'UsdcRebalanceEvent::Bridged', \
-                 'UsdcRebalanceEvent::BridgingCompletionRecovered' \
-               ) \
-             ) \
-           ) \
-         ORDER BY rowid ASC",
+) -> Result<Vec<CostLedgerRow>, PnlError> {
+    let rows = sqlx::query_as::<_, (i64, String, String, Option<String>, Option<String>, String)>(
+        "SELECT event_rowid, source, aggregate_id, symbol, amount_usd, occurred_at \
+         FROM pnl_cost_entry \
+         WHERE event_rowid <= ? \
+         ORDER BY event_rowid ASC",
     )
     .bind(as_of_rowid)
-    .fetch_all(&mut **tx)
+    .fetch_all(pool)
     .await?;
 
-    let mut events = Vec::with_capacity(rows.len());
-    for (rowid, aggregate_type, aggregate_id, event_type, payload) in rows {
-        let payload =
-            parse_payload_string(&payload).map_err(|source| PnlError::InvalidPayload {
-                rowid,
-                aggregate_type: aggregate_type.clone(),
-                event_type: event_type.clone(),
-                source,
-            })?;
-        events.push(CostEventRow {
-            rowid,
-            aggregate_type,
-            aggregate_id,
-            event_type,
-            payload,
-        });
-    }
+    rows.into_iter()
+        .map(
+            |(event_rowid, source, aggregate_id, symbol, amount_usd, occurred_at)| {
+                let source = match source.as_str() {
+                    TOKENIZATION_FEE_SOURCE => CostSource::TokenizationFee,
+                    CCTP_FEE_SOURCE => CostSource::CctpFee,
+                    _ => {
+                        return Err(PnlError::InvalidLedgerRow {
+                            table: "pnl_cost_entry",
+                            rowid: event_rowid,
+                            reason: "unknown cost source",
+                        });
+                    }
+                };
 
-    Ok(events)
+                Ok(CostLedgerRow {
+                    event_rowid,
+                    source,
+                    aggregate_id,
+                    symbol,
+                    amount_usd,
+                    occurred_at,
+                })
+            },
+        )
+        .collect()
 }
 
-async fn load_bot_gas_costs(
-    tx: &mut Transaction<'_, Sqlite>,
+async fn load_bot_gas_rows(
+    pool: &SqlitePool,
     as_of_rowid: i64,
 ) -> Result<Vec<BotGasCostRow>, PnlError> {
-    let rows = sqlx::query_as::<_, (i64, String)>(
-        "SELECT rowid, payload \
-         FROM events \
-         WHERE aggregate_type = 'BotGasReceiptCost' \
-           AND event_type = 'BotGasReceiptCostEvent::Recorded' \
-           AND rowid <= ? \
-         ORDER BY rowid ASC",
+    let rows = sqlx::query_as::<_, (i64, String, String, String, String, Option<String>, String)>(
+        "SELECT event_rowid, chain, tx_hash, usd_cost, operation_category, symbol, occurred_at \
+         FROM pnl_bot_gas_cost \
+         WHERE event_rowid <= ? \
+         ORDER BY event_rowid ASC",
     )
     .bind(as_of_rowid)
-    .fetch_all(&mut **tx)
+    .fetch_all(pool)
     .await?;
 
-    let mut costs = Vec::with_capacity(rows.len());
-    for (rowid, payload) in rows {
-        let event = parse_payload_string(&payload)
-            .and_then(serde_json::from_value::<BotGasReceiptCostEvent>)
-            .map_err(|source| PnlError::InvalidPayload {
-                rowid,
-                aggregate_type: "BotGasReceiptCost".to_owned(),
-                event_type: "BotGasReceiptCostEvent::Recorded".to_owned(),
-                source,
-            })?;
-        let BotGasReceiptCostEvent::Recorded { cost } = event;
-        cost.validate()
-            .map_err(|source| PnlError::InvalidBotGasReceiptCost { rowid, source })?;
-        costs.push(BotGasCostRow {
-            rowid,
-            chain: cost.chain.to_string(),
-            tx_hash: cost.tx_hash.to_string(),
-            usd_cost: format_float(&cost.usd_cost.inner())?,
-            operation_category: cost.operation_category.to_string(),
-            symbol: cost.symbol.map(|symbol| symbol.to_string()),
-            occurred_at: cost.occurred_at.to_rfc3339(),
-        });
-    }
-
-    Ok(costs)
+    Ok(rows
+        .into_iter()
+        .map(
+            |(rowid, chain, tx_hash, usd_cost, operation_category, symbol, occurred_at)| {
+                BotGasCostRow {
+                    rowid,
+                    chain,
+                    tx_hash,
+                    usd_cost,
+                    operation_category,
+                    symbol,
+                    occurred_at,
+                }
+            },
+        )
+        .collect())
 }
