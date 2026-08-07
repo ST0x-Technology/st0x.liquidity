@@ -20,7 +20,7 @@ use apalis_core::error::BoxDynError;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use sqlx_apalis::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::TryFromIntError;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -1470,12 +1470,26 @@ async fn compact_inventory_snapshot_events(pool: &SqlitePool) -> Result<u64, sql
 /// still empty. Seeding the gate first would skip hydration for every symbol
 /// with an open hedge order, booting it with an uninitialized offchain
 /// balance that imbalance detection could then misread.
+///
+/// The gate is cleared on entry rather than assumed empty: any gate write
+/// that lands before this seam (an earlier startup step seeding it "for
+/// safety") would otherwise silently starve hydration for its symbols, and
+/// nothing at the call sites can enforce that no such write exists. Clearing
+/// here makes the hydrate-before-seed order structural instead of an
+/// ordering convention every caller must know about. Safe because the gate's
+/// only authoritative source at boot is the `Position` projection seeded
+/// below, and no reactors or workers run concurrently with this seam.
 pub(crate) async fn restore_inventory_at_boot(
     pool: &SqlitePool,
     inventory: &Arc<BroadcastingInventory>,
     rebalancing_service: Option<&Arc<RebalancingService>>,
     position_projection: &Projection<Position>,
 ) -> Result<(), ProjectionError<Position>> {
+    inventory
+        .write_without_broadcast()
+        .await
+        .set_pending_offchain_order_symbols(HashSet::new());
+
     hydrate_inventory_from_snapshot(pool, inventory).await;
 
     if let Some(service) = rebalancing_service {
@@ -2084,10 +2098,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             equity_transfer_services,
         )
         .await?;
-
-        rebalancing_service
-            .recover_pending_offchain_order_symbols(&built.position_projection)
-            .await?;
 
         rebalancing_service
             .set_stores(
