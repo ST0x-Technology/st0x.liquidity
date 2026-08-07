@@ -46,6 +46,7 @@ use st0x_wrapper::{
 
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
+use crate::mint_authorization::ConfiguredMintAuthorizer;
 use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::rebalancing::equity::EquityTransferServices;
@@ -1050,6 +1051,7 @@ pub async fn seed_simulated_equity_redemption_history(
                 day,
             )),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let redemption = StoreBuilder::<EquityRedemption>::new(pool.clone())

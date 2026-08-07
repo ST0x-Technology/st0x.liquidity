@@ -161,6 +161,7 @@ mod tests {
     use crate::equity_redemption::{
         EquityRedemption, EquityRedemptionCommand, redemption_aggregate_id,
     };
+    use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
@@ -200,6 +201,7 @@ mod tests {
             tokenizer: tokenizer.clone(),
             wrapper: wrapper.clone(),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
@@ -513,6 +515,7 @@ mod tests {
             tokenizer: tokenizer.clone(),
             wrapper: wrapper.clone(),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(bot_gas_queue.clone()),
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
         let redemption_store = Arc::new(test_store(pool, transfer_services));

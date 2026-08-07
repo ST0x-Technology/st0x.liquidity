@@ -1110,7 +1110,9 @@ fn stuck_mint_info(rows: &[(String, String, i64)]) -> Option<StuckTransferInfo> 
             | TokensReceived { .. }
             | WrapSubmitted { .. }
             | TokensWrapped { .. }
-            | VaultDepositSubmitted { .. } => {}
+            | VaultDepositSubmitted { .. }
+            | MintAuthorizationSigned { .. }
+            | MintAuthorizationDelivered { .. } => {}
         }
     }
 
