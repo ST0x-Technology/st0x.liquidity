@@ -284,19 +284,19 @@
   const WATERFALL_CHART_CONFIG = {
     unhedged: {
       label: 'unhedged (fill -> placed)',
-      color: '#64748b'
+      color: 'var(--chart-slate)'
     },
     submission: {
       label: 'submission (placed -> accepted)',
-      color: '#38bdf8'
+      color: 'var(--chart-sky)'
     },
     executionOk: {
       label: 'execution (accepted -> filled)',
-      color: '#34d399'
+      color: 'var(--chart-emerald)'
     },
     executionFailed: {
       label: 'execution (failed)',
-      color: '#f87171'
+      color: 'var(--chart-red)'
     }
   } satisfies Chart.ChartConfig
 
@@ -330,15 +330,15 @@
   const PERCENTILE_CHART_CONFIG = {
     p50Ms: {
       label: 'p50',
-      color: '#34d399'
+      color: 'var(--chart-emerald)'
     },
     p90Ms: {
       label: 'p90',
-      color: '#fbbf24'
+      color: 'var(--chart-amber)'
     },
     p99Ms: {
       label: 'p99',
-      color: '#f87171'
+      color: 'var(--chart-red)'
     }
   } satisfies Chart.ChartConfig
 
@@ -369,27 +369,27 @@
   const ATTESTATION_CHART_CONFIG = {
     durationMs: {
       label: 'Attestation time',
-      color: '#fbbf24'
+      color: 'var(--chart-amber)'
     }
   } satisfies Chart.ChartConfig
 
   const BLOCK_LAG_CHART_CONFIG = {
     maxLagBlocks: {
       label: 'Block lag',
-      color: '#38bdf8'
+      color: 'var(--chart-sky)'
     }
   } satisfies Chart.ChartConfig
 
   const STAGE_COLORS: Record<RebalanceStageName, string> = {
-    conversion: '#c084fc',
-    withdrawal: '#38bdf8',
-    burn: '#fb923c',
-    attestation: '#fbbf24',
-    mint: '#34d399',
-    deposit: '#818cf8'
+    conversion: 'var(--chart-purple)',
+    withdrawal: 'var(--chart-sky)',
+    burn: 'var(--chart-orange)',
+    attestation: 'var(--chart-amber)',
+    mint: 'var(--chart-emerald)',
+    deposit: 'var(--chart-indigo)'
   }
 
-  const REBALANCE_FAILED_COLOR = '#f87171'
+  const REBALANCE_FAILED_COLOR = 'var(--chart-red)'
 
   // Segment order is fixed (conversion -> withdrawal -> burn -> attestation ->
   // mint -> deposit) and matches AlpacaToBase's chronological pipeline, but
@@ -453,7 +453,7 @@
     // invisible or shorter-than-real bar.
     unmeasuredMs: {
       label: 'unaccounted elapsed',
-      color: '#64748b'
+      color: 'var(--chart-slate)'
     }
   } satisfies Chart.ChartConfig
 
@@ -501,18 +501,18 @@
   const EQUITY_ROW_HEIGHT_PX = 28
 
   const EQUITY_STAGE_COLORS: Record<EquityStageName, string> = {
-    mint_acceptance: '#c084fc',
-    mint_receipt: '#38bdf8',
-    mint_wrap: '#fb923c',
-    mint_deposit: '#34d399',
-    redemption_withdraw: '#818cf8',
-    redemption_unwrap: '#f472b6',
-    redemption_send: '#facc15',
-    redemption_detection: '#22d3ee',
-    redemption_completion: '#a3e635'
+    mint_acceptance: 'var(--chart-purple)',
+    mint_receipt: 'var(--chart-sky)',
+    mint_wrap: 'var(--chart-orange)',
+    mint_deposit: 'var(--chart-emerald)',
+    redemption_withdraw: 'var(--chart-indigo)',
+    redemption_unwrap: 'var(--chart-pink)',
+    redemption_send: 'var(--chart-yellow)',
+    redemption_detection: 'var(--chart-cyan)',
+    redemption_completion: 'var(--chart-lime)'
   }
 
-  const EQUITY_FAILED_COLOR = '#f87171'
+  const EQUITY_FAILED_COLOR = 'var(--chart-red)'
 
   const EQUITY_CHART_CONFIG = {
     mintAcceptanceOk: {
@@ -591,7 +591,7 @@
     // -- covers both in-progress and completed-but-recovered operations.
     unmeasuredMs: {
       label: 'unaccounted elapsed',
-      color: '#64748b'
+      color: 'var(--chart-slate)'
     }
   } satisfies Chart.ChartConfig
 
@@ -873,7 +873,7 @@
           {#each reliability.current?.logTargets ?? [] as row (`${row.target}:${row.level}`)}
             <div class="flex items-center gap-2 text-xs">
               <span
-                class={`w-12 shrink-0 font-semibold ${row.level === 'ERROR' ? 'text-red-400' : 'text-amber-400'}`}
+                class={`w-12 shrink-0 font-semibold ${row.level === 'ERROR' ? 'text-red-600 dark:text-red-400' : 'text-amber-600 dark:text-amber-400'}`}
               >
                 {row.level}
               </span>
@@ -889,7 +889,7 @@
                     y={14 - (bucketCount / Math.max(1, ...row.sparkline)) * 12 - 1}
                     width="4"
                     height={(bucketCount / Math.max(1, ...row.sparkline)) * 12 + 1}
-                    fill={row.level === 'ERROR' ? '#f87171' : '#fbbf24'}
+                    style:fill={row.level === 'ERROR' ? 'var(--chart-red)' : 'var(--chart-amber)'}
                     opacity={bucketCount === 0 ? 0.15 : 0.9}
                   />
                 {/each}
@@ -911,7 +911,7 @@
 
       {#if reliability.current !== null && reliability.current.failureEvents.length > 0}
         <div class="mt-4 border-t pt-2">
-          <p class="mb-1 text-xs font-medium text-red-400">Lifecycle failures (money-at-risk)</p>
+          <p class="mb-1 text-xs font-medium text-red-600 dark:text-red-400">Lifecycle failures (money-at-risk)</p>
           {#each reliability.current.failureEvents as failure (failure.eventType)}
             <div class="flex items-center gap-2 text-xs">
               <span class="w-72 shrink-0 truncate font-mono">{failure.eventType}</span>
@@ -940,7 +940,7 @@
     </Card.Header>
     <Card.Content>
       {#if (chartRebalances.current?.skippedOperations ?? 0) > 0}
-        <p class="mb-2 text-xs text-amber-400">
+        <p class="mb-2 text-xs text-amber-600 dark:text-amber-400">
           {chartRebalances.current?.skippedOperations} operations excluded (unparseable timing).
         </p>
       {/if}
@@ -1069,7 +1069,7 @@
     </Card.Header>
     <Card.Content>
       {#if (chartEquityTimings.current?.skippedOperations ?? 0) > 0}
-        <p class="mb-2 text-xs text-amber-400">
+        <p class="mb-2 text-xs text-amber-600 dark:text-amber-400">
           {chartEquityTimings.current?.skippedOperations} operations excluded (unparseable timing).
         </p>
       {/if}
@@ -1182,10 +1182,10 @@
           class="mt-4 flex flex-wrap gap-x-4 gap-y-1 border-t pt-2 text-xs text-muted-foreground"
         >
           <span>{poll.cycles} poll cycles</span>
-          <span class={poll.errors > 0 ? 'text-red-400' : ''}>
+          <span class={poll.errors > 0 ? 'text-red-600 dark:text-red-400' : ''}>
             {poll.errors} errors
           </span>
-          <span class={poll.skippedTicks > 0 ? 'text-amber-400' : ''}>
+          <span class={poll.skippedTicks > 0 ? 'text-amber-600 dark:text-amber-400' : ''}>
             {poll.skippedTicks} skipped ticks
           </span>
           {#if poll.duration}
@@ -1233,7 +1233,7 @@
                     y={14 - bar.height - 1}
                     width="4"
                     height={bar.height + 1}
-                    fill={bar.hasErrors ? '#f87171' : '#38bdf8'}
+                    style:fill={bar.hasErrors ? 'var(--chart-red)' : 'var(--chart-sky)'}
                     opacity="0.9"
                   />
                 {/each}
@@ -1242,7 +1242,7 @@
                 {row.calls} calls
               </span>
               <span
-                class={`w-16 shrink-0 text-right tabular-nums ${row.errors > 0 ? 'text-red-400' : 'text-muted-foreground'}`}
+                class={`w-16 shrink-0 text-right tabular-nums ${row.errors > 0 ? 'text-red-600 dark:text-red-400' : 'text-muted-foreground'}`}
               >
                 {row.errors} err
               </span>
