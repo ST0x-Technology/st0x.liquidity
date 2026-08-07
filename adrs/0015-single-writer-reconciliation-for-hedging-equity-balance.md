@@ -185,7 +185,10 @@ pending set from the events table and hydration re-bases.
 at `debug!`, so a symbol being persistently blocked produces no signal at
 production log levels. If unbounded starvation is the accepted risk, it should
 at least be observable — a `warn!` after N consecutive skips for the same symbol
-would surface it. Not implemented here.
+would surface it. Not implemented here. _Addressed by RAI-1502: the view now
+tracks consecutive guard-skipped Hedging snapshots (per symbol for equity,
+venue-level for cash) and warns every five consecutive skips; an applied
+snapshot resets the streak._
 
 **Scope.** `src/inventory/view.rs` and `src/rebalancing/trigger/mod.rs`, plus
 tests. No migration, no event-schema change, no persisted state.

@@ -1685,14 +1685,14 @@ impl RebalancingService {
                 now,
             ),
 
-            // `reconcile_offchain_equity` validates busyness and the hedge
-            // gate under the write lock, so the generic apply path is the
-            // correct route here too. `OnchainUsdc` also routes through it
-            // (not a direct `update_usdc`) so the view's block-watermark
-            // bookkeeping for absorbed onchain fills has a single
-            // implementation.
+            // The reconcile arms validate busyness themselves under the
+            // write lock, so the generic apply path is the correct route
+            // here too. `OnchainUsdc` also routes through it (not a direct
+            // `update_usdc`) so the view's block-watermark bookkeeping for
+            // absorbed onchain fills has a single implementation.
             OnchainUsdc { .. }
             | OffchainEquityReconciled { .. }
+            | OffchainUsdReconciled { .. }
             | OffchainUsd { .. }
             | OffchainCashBuyingPower { .. }
             | OffchainCashWithdrawable { .. }
@@ -1757,16 +1757,24 @@ impl RebalancingService {
         };
 
         // The recovery reset below drops the active mints/redemptions and
-        // inflight state that `reconcile_offchain_equity` revalidates, so a
-        // forced retry would pass vacuously against empty state. Drop the
-        // event instead: the poller's read-back keeps the gate and counter,
-        // and the next quiet poll re-escalates with a fresh reading.
+        // inflight state that the reconcile arms revalidate, so a forced
+        // retry would pass vacuously against empty state. Drop the event
+        // instead: the poller's read-back keeps the gate and counter, and
+        // the next quiet poll re-escalates with a fresh reading.
         if let OffchainEquityReconciled { symbol, .. } = &event {
             warn!(
                 target: "rebalance",
                 %symbol,
                 ?inventory_error,
                 "Skipping force-apply recovery for a reconcile event"
+            );
+            return Ok(());
+        }
+        if let OffchainUsdReconciled { .. } = &event {
+            warn!(
+                target: "rebalance",
+                ?inventory_error,
+                "Skipping force-apply recovery for a cash reconcile event"
             );
             return Ok(());
         }
@@ -1819,12 +1827,13 @@ impl RebalancingService {
                 now,
             ),
 
-            // `OffchainEquityReconciled` never reaches here at runtime -- the
-            // early return above drops it before this match. It is listed only
-            // to keep the match exhaustive.
+            // The reconcile events never reach here at runtime -- the early
+            // return above drops them before this match. They are listed
+            // only to keep the match exhaustive.
             OnchainEquity { .. }
             | OffchainEquity { .. }
             | OffchainEquityReconciled { .. }
+            | OffchainUsdReconciled { .. }
             | OffchainUsd { .. }
             | OffchainCashBuyingPower { .. }
             | OffchainCashWithdrawable { .. }
@@ -1896,6 +1905,11 @@ impl RebalancingService {
             }
             // Global USDC snapshots: one USDC check.
             //
+            // OffchainUsdReconciled: a healed venue-level cash reconcile
+            // changes USDC imbalance math the same way an ordinary cash
+            // snapshot does; an aborted one enqueues a check that reads
+            // the unchanged view and triggers nothing.
+            //
             // OffchainCashWithdrawable feeds the Alpaca-to-Base capacity
             // gate (`withdrawable_cash_cents - reserved`). After the
             // trigger skips with `MissingWithdrawableCash` because the
@@ -1903,7 +1917,10 @@ impl RebalancingService {
             // brings rebalancing back online — without scheduling on it,
             // the imbalance would remain unresolved until some unrelated
             // USDC balance event happened to arrive.
-            OnchainUsdc { .. } | OffchainUsd { .. } | OffchainCashWithdrawable { .. } => {
+            OnchainUsdc { .. }
+            | OffchainUsd { .. }
+            | OffchainUsdReconciled { .. }
+            | OffchainCashWithdrawable { .. } => {
                 self.usdc_scheduler.enqueue_check().await;
             }
             // Wrapped equity in the bot wallet (outside Raindex) triggers
@@ -2944,6 +2961,19 @@ impl RebalancingService {
             return;
         };
 
+        // A pending cash divergence means the Hedging USDC balance the
+        // imbalance math reads is suspect: a bridge sized off it moves the
+        // wrong amount and marks the venue busy, freezing the very counter
+        // that resolves the divergence. Skip until the poller clears it.
+        if self.divergence_gate.is_cash_engaged() {
+            warn!(
+                target: "rebalance",
+                "Skipped USDC trigger: unresolved cash snapshot divergence \
+                 pending reconciliation"
+            );
+            return;
+        }
+
         let Some(guard) = self.try_claim_usdc_guard() else {
             debug!(target: "rebalance", "Skipped USDC trigger: already in progress");
             return;
@@ -2959,6 +2989,18 @@ impl RebalancingService {
         .inspect_err(|skip| debug!(target: "rebalance", ?skip, "Skipped USDC trigger")) else {
             return;
         };
+
+        // Re-check immediately before dispatch: the poller may have engaged
+        // the cash gate during the awaits in the imbalance build (mirrors
+        // the equity trigger's pre-dispatch re-checks).
+        if self.divergence_gate.is_cash_engaged() {
+            warn!(
+                target: "rebalance",
+                "Skipped USDC trigger before dispatch: cash snapshot \
+                 divergence detected during operation sizing"
+            );
+            return;
+        }
 
         let dispatched = match operation {
             UsdcRebalanceOperation::BaseToAlpaca { amount } => {
@@ -22531,6 +22573,183 @@ mod tests {
             busy,
             Some(EquityReconcileBusy::Transfer),
             "the active mint must survive the skipped recovery"
+        );
+    }
+
+    /// The cash twin of `divergence_gate_suppresses_equity_transfer_dispatch`:
+    /// an engaged cash gate must suppress USDC dispatch (a bridge sized off
+    /// a diverged balance moves the wrong amount and freezes the divergence
+    /// counter), and releasing it restores dispatch.
+    #[tokio::test]
+    async fn cash_divergence_gate_suppresses_usdc_transfer_dispatch() {
+        // 900 onchain, 100 offchain = 90% ratio -> TooMuchOnchain would
+        // dispatch a TransferUsdcToHedging job.
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let reactor = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+
+        trigger.divergence_gate().engage_cash();
+
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "an engaged cash gate must not dispatch a USDC transfer"
+        );
+
+        trigger.divergence_gate().release_cash();
+
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1,
+            "releasing the cash gate must restore USDC dispatch"
+        );
+    }
+
+    /// With rebalancing enabled, `OffchainUsdReconciled` reaches the view
+    /// through the reactor's `on_snapshot` arm. The stuck cash state must
+    /// recover through that route and enqueue one follow-up USDC check.
+    #[tokio::test]
+    async fn usd_reconcile_event_via_reactor_heals_stuck_view_and_enqueues_usdc_check() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        // Phantom cash at Hedging with last_rebalancing stamped: ordinary
+        // cash snapshots fetched before the stamp are rejected.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(500), usdc(500))
+            .clear_usdc_inflight(Venue::Hedging, now)
+            .unwrap();
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        let pool = trigger.usdc_scheduler.queue().pool().clone();
+
+        // Precondition: the ordinary arm stays rejected through the reactor.
+        apply_and_dispatch_snapshot(
+            reactor.clone(),
+            id.clone(),
+            InventorySnapshotEvent::OffchainUsd {
+                usd_balance_cents: 0,
+                gross_usd_cents: None,
+                fetched_at: now - chrono::Duration::seconds(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_available(Venue::Hedging),
+            Some(usdc(500)),
+            "precondition: the ordinary cash snapshot must still be rejected"
+        );
+
+        let pending_before: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type LIKE '%UsdcRebalancingCheck'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count pending usdc-check jobs before reconcile");
+
+        apply_and_dispatch_snapshot(
+            reactor.clone(),
+            id,
+            InventorySnapshotEvent::OffchainUsdReconciled {
+                usd_balance_cents: 0,
+                gross_usd_cents: Some(0),
+                fetched_at: now + chrono::Duration::seconds(1),
+                ledger_usdc: Some(usdc(500)),
+                consecutive_polls: 3,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (available, inflight) = {
+            let view = trigger.inventory.read().await;
+            (
+                view.usdc_available(Venue::Hedging),
+                view.usdc_inflight(Venue::Hedging),
+            )
+        };
+        assert_eq!(
+            available,
+            Some(Usdc::ZERO),
+            "the reconcile must apply the broker cash value through the reactor route"
+        );
+        assert_eq!(
+            inflight,
+            Some(Usdc::ZERO),
+            "the reconcile clears Hedging cash inflight"
+        );
+
+        let pending_after: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type LIKE '%UsdcRebalancingCheck'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count pending usdc-check jobs after reconcile");
+        assert!(
+            pending_after > pending_before,
+            "a cash reconcile must enqueue a follow-up USDC check (before: \
+             {pending_before}, after: {pending_after})"
+        );
+    }
+
+    /// The cash twin of
+    /// `snapshot_recovery_skips_reconcile_event_leaving_view_untouched`:
+    /// the force-apply recovery resets the view, dropping exactly the busy
+    /// state `reconcile_offchain_usd` revalidates, so recovery must skip the
+    /// event; the poller re-escalates on its own.
+    #[tokio::test]
+    async fn snapshot_recovery_skips_usd_reconcile_event_leaving_view_untouched() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(0), usdc(500))
+            .set_active_usdc_rebalance(UsdcRebalanceId(Uuid::new_v4()));
+
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+
+        trigger
+            .on_snapshot_recovery(
+                RebalancingServiceError::Inventory(InventoryViewError::UsdBalanceConversion(
+                    i64::MAX,
+                )),
+                InventorySnapshotEvent::OffchainUsdReconciled {
+                    usd_balance_cents: 0,
+                    gross_usd_cents: Some(0),
+                    fetched_at: Utc::now(),
+                    ledger_usdc: Some(usdc(500)),
+                    consecutive_polls: 3,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (available, busy) = {
+            let view = trigger.inventory.read().await;
+            (
+                view.usdc_available(Venue::Hedging),
+                view.cash_reconciliation_busy(Utc::now()).unwrap(),
+            )
+        };
+        assert_eq!(
+            available,
+            Some(usdc(500)),
+            "recovery must not force-apply a cash reconcile against the reset view"
+        );
+        assert_eq!(
+            busy,
+            Some(EquityReconcileBusy::Transfer),
+            "the active USDC rebalance must survive the skipped recovery"
         );
     }
 
