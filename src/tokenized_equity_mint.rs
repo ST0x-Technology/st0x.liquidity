@@ -1388,14 +1388,42 @@ pub(crate) async fn interrupted_mint_ids(
 /// Our tokenized equity tokens use 18 decimals.
 pub(crate) const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 
-fn quantity_to_u256_18_decimals(value: Float) -> Result<U256, TokenizedEquityMintError> {
+/// Why a share quantity cannot convert to 18-decimal share-wei.
+///
+/// Narrower than [`TokenizedEquityMintError`] so consumers outside the
+/// aggregate (the recipient-authorization signer) can carry it in their
+/// public error types without exposing the aggregate's whole error surface.
+/// `pub` (re-exported by `crate::mint_authorization`) for exactly that.
+#[derive(Debug, thiserror::Error)]
+pub enum QuantityScalingError {
+    /// Negative quantity is invalid for minting.
+    #[error("negative quantity: {value:?}")]
+    Negative { value: Float },
+    /// The quantity does not scale losslessly (sub-atto precision) or its
+    /// share-wei overflow `U256`.
+    #[error(transparent)]
+    Float(#[from] FloatError),
+}
+
+impl From<QuantityScalingError> for TokenizedEquityMintError {
+    fn from(error: QuantityScalingError) -> Self {
+        match error {
+            QuantityScalingError::Negative { value } => Self::NegativeQuantity { value },
+            QuantityScalingError::Float(float_error) => float_error.into(),
+        }
+    }
+}
+
+/// Scales a share quantity to 18-decimal share-wei, rejecting negatives and
+/// precision loss. Also the single conversion the recipient-authorization
+/// signer (`crate::mint_authorization`) uses, so the signed `MintAuth`
+/// amount can never diverge from the amount the mint itself computes.
+pub(crate) fn quantity_to_u256_18_decimals(value: Float) -> Result<U256, QuantityScalingError> {
     if value.lt(Float::zero()?)? {
-        return Err(TokenizedEquityMintError::NegativeQuantity { value });
+        return Err(QuantityScalingError::Negative { value });
     }
 
-    value
-        .to_fixed_decimal(TOKENIZED_EQUITY_DECIMALS)
-        .map_err(TokenizedEquityMintError::from)
+    Ok(value.to_fixed_decimal(TOKENIZED_EQUITY_DECIMALS)?)
 }
 
 #[async_trait]
@@ -2689,8 +2717,8 @@ mod tests {
     fn quantity_to_u256_18_decimals_rejects_negative() {
         let error = quantity_to_u256_18_decimals(float!(-5)).unwrap_err();
         assert!(
-            matches!(error, TokenizedEquityMintError::NegativeQuantity { .. }),
-            "Expected NegativeQuantity, got: {error:?}"
+            matches!(error, QuantityScalingError::Negative { .. }),
+            "Expected Negative, got: {error:?}"
         );
     }
 

@@ -74,7 +74,7 @@ let
           src = pkgs.fetchgit {
             url = "https://github.com/ST0x-Technology/st0x.issuance.git";
             rev = issuanceRev;
-            hash = "sha256-r3U9nZ0y8u1kLM4BJO11aHR/O1t6OsZefc9VcfcUpuA=";
+            hash = "sha256-9800S/vD14OwNslI26XgofB2IYzPb04Vonqmk1kOF+g=";
             fetchSubmodules = false;
             fetchLFS = true;
           };

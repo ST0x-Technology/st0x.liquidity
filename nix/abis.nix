@@ -2,6 +2,7 @@
   pkgs,
   mkAbi,
   sources,
+  mkSoldeerAbi,
 }:
 
 # Aggregator for the per-feature ABI derivations and the merged env-var map
@@ -28,6 +29,10 @@ let
     raindexGovernance = import ./raindex-governance.nix {
       inherit pkgs mkAbi;
       src = sources.raindex-governance;
+    };
+    st0x-deploy = import ./st0x-deploy.nix {
+      inherit mkSoldeerAbi;
+      src = sources.st0x-deploy;
     };
     pyth = import ./pyth.nix { inherit pkgs; };
   };
