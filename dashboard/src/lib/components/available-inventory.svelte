@@ -488,7 +488,7 @@
                     ? 'bg-green-500'
                     : dev?.style === 'low'
                       ? 'bg-red-500'
-                      : 'bg-blue-400'}"
+                      : 'bg-blue-500 dark:bg-blue-400'}"
                   style="width: {String(Math.min(cashCells.ratio * 100, 100))}%"
                 ></div>
               </div>
@@ -739,7 +739,7 @@
                     ? 'bg-green-500'
                     : dev?.style === 'low'
                       ? 'bg-red-500'
-                      : 'bg-blue-400'}"
+                      : 'bg-blue-500 dark:bg-blue-400'}"
                   style="width: {String(Math.min(row.ratio * 100, 100))}%"
                 ></div>
               </div>

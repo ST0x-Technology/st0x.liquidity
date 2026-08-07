@@ -2,6 +2,7 @@
   import { onMount } from 'svelte'
   import { Badge } from '$lib/components/ui/badge'
   import RecoveryGuide from '$lib/components/recovery-guide.svelte'
+  import ThemeSwitcher from '$lib/components/theme-switcher.svelte'
   import type { ConnectionState } from '$lib/websocket'
   import {
     getApiBaseUrl,
@@ -172,6 +173,8 @@
       <Badge variant={statusVariant}>
         {statusLabel}
       </Badge>
+
+      <ThemeSwitcher />
     </div>
   </div>
 </header>
