@@ -3492,7 +3492,22 @@ know about cross-venue inventory.
 **InventoryView** listens to:
 
 - `PositionEvent::OnChainOrderFilled` - Updates available balances (trading
-  activity)
+  activity). Each delta leg (equity, USDC) is skipped when the fill's
+  `block_number` is at or below the leg's onchain snapshot block watermark: the
+  poller pins its `vaultBalance2` reads to a block and records it on the
+  `OnchainEquity`/`OnchainUsdc` snapshot events, so a snapshot at block N
+  provably already contains every fill at a block <= N and applying the delta on
+  top would double-count (ADR 0018). The equity watermark is per symbol (two
+  symbols advance independently); the USDC watermark is venue-level, because the
+  USDC balance is one number per venue. Two invariants, both enforced by
+  `InventoryView` with dedicated tests: a skipped snapshot (inflight, or stale
+  against the last rebalancing) never advances a watermark, since a fill it
+  never contained would otherwise read as absorbed; and block ordering is
+  authoritative for onchain reads, so a snapshot pinned below an established
+  watermark is rejected outright rather than lowering it -- only the recovery
+  force path may move a balance below the watermark, and it re-points the
+  watermark at the forced block. Legacy fills or snapshots without a block
+  number keep the unguarded behavior
 - `PositionEvent::OffChainOrderFilled` - Updates available balances (trading
   activity)
 - `TokenizedEquityMintEvent::MintAccepted` - Moves shares to inflight (leaving
@@ -3630,8 +3645,11 @@ balances and emitting them as events the system can react to:
   a positive balance, so stranded funds are visible without sending new
   rebalancing transfers to the retired vault.
 - **Polling runs on a 60-second interval** during market hours as a background
-  conductor task. Onchain polling uses the `vaultBalance2` contract call;
-  offchain polling uses the `Executor::get_inventory()` trait method.
+  conductor task. Onchain polling fetches the latest block number once per cycle
+  and pins every `vaultBalance2` contract call to it, so multi-vault sums cannot
+  straddle a block boundary and the emitted snapshot events carry the exact
+  block their balances were read at (ADR 0018); offchain polling uses the
+  `Executor::get_inventory()` trait method.
 
 ##### Broker Divergence Recovery
 

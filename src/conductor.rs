@@ -3040,6 +3040,7 @@ pub(crate) async fn execute_acknowledge_fill(
         direction: trade.direction,
         price_usdc,
         block_timestamp,
+        block_number: trade.block_number,
     };
 
     match position.send(base_symbol, command).await {
@@ -6290,6 +6291,7 @@ mod tests {
                     direction,
                     price_usdc: float!(150),
                     block_timestamp: chrono::Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -6694,6 +6696,7 @@ mod tests {
             direction: Direction::Buy,
             price_usdc: float!(100),
             block_timestamp: Utc::now(),
+            block_number: None,
             seen_at: Utc::now(),
         };
 
@@ -7608,6 +7611,57 @@ mod tests {
         assert!(
             position.net.inner().eq(float!(1.5)).unwrap(),
             "the re-drive must not double-count the fill"
+        );
+    }
+
+    /// The block number is the causal key for onchain fill absorption (ADR
+    /// 0018): `execute_acknowledge_fill` must carry the trade's pinned
+    /// block through to the persisted `OnChainOrderFilled` event verbatim.
+    #[tokio::test]
+    async fn acknowledge_fill_persists_the_trades_block_number() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+        let trade = OnchainTradeBuilder::default()
+            .with_symbol("wtAAPL")
+            .with_equity_token(TEST_EQUITY_TOKEN)
+            .with_amount(float!(1.5))
+            .with_log_index(60)
+            .with_block_number(4242)
+            .build();
+        let block_timestamp = trade
+            .block_timestamp
+            .expect("test trade carries a block timestamp");
+
+        execute_acknowledge_fill(
+            &cqrs.position,
+            &trade,
+            cqrs.execution_threshold,
+            block_timestamp,
+        )
+        .await
+        .unwrap();
+
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload FROM events \
+             WHERE event_type = 'PositionEvent::OnChainOrderFilled'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let event: PositionEvent = serde_json::from_str(&payload).unwrap();
+        let PositionEvent::OnChainOrderFilled { block_number, .. } = event else {
+            panic!("expected OnChainOrderFilled, got {event:?}");
+        };
+        assert_eq!(
+            block_number,
+            Some(4242),
+            "the persisted fill event must retain the trade's block number"
         );
     }
 
@@ -8994,6 +9048,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150.0),
                     block_timestamp: chrono::Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -9105,6 +9160,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150.0),
                     block_timestamp: chrono::Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -9226,6 +9282,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150.0),
                     block_timestamp: chrono::Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -9380,6 +9437,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150.0),
                     block_timestamp: chrono::Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -9416,6 +9474,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150.0),
                     block_timestamp: chrono::Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -9445,6 +9504,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150.0),
                     block_timestamp: chrono::Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -9486,6 +9546,7 @@ mod tests {
                         direction: Direction::Buy,
                         price_usdc: float!(150.0),
                         block_timestamp: chrono::Utc::now(),
+                        block_number: None,
                     },
                 )
                 .await
@@ -9551,6 +9612,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: chrono::Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -9630,6 +9692,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: chrono::Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -9835,6 +9898,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: chrono::Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -10008,6 +10072,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(78),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -10136,6 +10201,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(420),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -10258,6 +10324,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(100),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -10361,6 +10428,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(100),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -10507,6 +10575,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(100),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -10607,6 +10676,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(400),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -10714,6 +10784,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(120),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -10861,6 +10932,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(120),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -10986,6 +11058,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(95),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -11201,6 +11274,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: onchain.price.value(),
                     block_timestamp: Utc::now(),
+                    block_number: None,
                 },
             )
             .await

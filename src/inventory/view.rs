@@ -172,6 +172,30 @@ where
         Ok(onchain_inflight || offchain_inflight)
     }
 
+    /// The skip conditions of [`Self::on_snapshot`], exposed so callers that
+    /// track per-snapshot bookkeeping (the onchain USDC block watermark) can
+    /// tell whether the closure will apply or silently skip. Single source
+    /// of truth: the closure consults this same predicate.
+    fn snapshot_would_apply(&self, fetched_at: DateTime<Utc>) -> Result<bool, FloatError> {
+        if self.has_inflight()? {
+            return Ok(false);
+        }
+
+        if let Some(last_rebalancing) = self.last_rebalancing
+            && fetched_at < last_rebalancing
+        {
+            debug!(
+                target: "inventory",
+                ?fetched_at,
+                ?last_rebalancing,
+                "Rejecting stale snapshot that predates last rebalancing"
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
     fn get_venue(&self, venue: Venue) -> Option<VenueBalance<T>> {
         match venue {
             Venue::MarketMaking => self.onchain,
@@ -444,19 +468,7 @@ where
         fetched_at: DateTime<Utc>,
     ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
         Box::new(move |inventory| {
-            if inventory.has_inflight()? {
-                return Ok(inventory);
-            }
-
-            if let Some(last_rebalancing) = inventory.last_rebalancing
-                && fetched_at < last_rebalancing
-            {
-                debug!(
-                    target: "inventory",
-                    ?fetched_at,
-                    ?last_rebalancing,
-                    "Rejecting stale snapshot that predates last rebalancing"
-                );
+            if !inventory.snapshot_would_apply(fetched_at)? {
                 return Ok(inventory);
             }
 
@@ -721,6 +733,17 @@ pub(crate) struct InventoryView {
     /// overwriting a correctly decremented balance with a pre-fill number.
     #[serde(default)]
     last_offchain_fill_applied_at: HashMap<Symbol, DateTime<Utc>>,
+    /// Highest block number whose `OnchainEquity` snapshot has been applied,
+    /// by symbol. Chain-native ordering, not a clock: a pinned vault read at
+    /// block N provably contains every fill at a block <= N, so an
+    /// `OnChainOrderFilled` delta covered by this watermark is already in
+    /// the balance and must be skipped (ADR 0018).
+    #[serde(default)]
+    onchain_equity_snapshot_block_watermarks: HashMap<Symbol, u64>,
+    /// Highest block number whose `OnchainUsdc` snapshot has been applied.
+    /// Venue-level: the USDC balance is one number per venue.
+    #[serde(default)]
+    onchain_usdc_snapshot_block_watermark: Option<u64>,
 }
 
 impl InventoryView {
@@ -1058,6 +1081,8 @@ impl Default for InventoryView {
             usdc: Inventory::default(),
             equities: HashMap::new(),
             last_updated: Utc::now(),
+            onchain_equity_snapshot_block_watermarks: HashMap::new(),
+            onchain_usdc_snapshot_block_watermark: None,
             buying_power_cents: None,
             withdrawable_cash_cents: None,
             offchain_gross_usd_cents: None,
@@ -1290,6 +1315,8 @@ impl InventoryView {
             offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
             pending_offchain_order_symbols: self.pending_offchain_order_symbols,
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
+            onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
+            onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
         })
     }
 
@@ -1319,6 +1346,8 @@ impl InventoryView {
             offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
             pending_offchain_order_symbols: self.pending_offchain_order_symbols,
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
+            onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
+            onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
         })
     }
 
@@ -1341,6 +1370,99 @@ impl InventoryView {
         }
 
         self
+    }
+
+    /// Advance the per-symbol onchain block watermarks after an equity
+    /// snapshot applied. A no-op for the Hedging venue (broker reads have no
+    /// block) and for legacy snapshots without a block number.
+    fn record_onchain_equity_block_watermarks<'a>(
+        mut self,
+        venue: Venue,
+        symbols: impl IntoIterator<Item = &'a Symbol>,
+        block_number: Option<u64>,
+    ) -> Self {
+        let (Venue::MarketMaking, Some(block_number)) = (venue, block_number) else {
+            return self;
+        };
+
+        for symbol in symbols {
+            let watermark = self
+                .onchain_equity_snapshot_block_watermarks
+                .entry(symbol.clone())
+                .or_insert(block_number);
+            if block_number > *watermark {
+                *watermark = block_number;
+            }
+        }
+
+        self
+    }
+
+    /// Force-set the per-symbol onchain block watermarks to a forced read's
+    /// block. Unlike [`Self::record_onchain_equity_block_watermarks`], this
+    /// bypasses the monotonic maximum: the forced balance is authoritative,
+    /// so a watermark left above the forced block would keep absorbing
+    /// fills the forced balance does not contain.
+    fn force_onchain_equity_block_watermarks<'a>(
+        mut self,
+        symbols: impl IntoIterator<Item = &'a Symbol>,
+        block_number: Option<u64>,
+    ) -> Self {
+        let Some(block_number) = block_number else {
+            return self;
+        };
+
+        for symbol in symbols {
+            self.onchain_equity_snapshot_block_watermarks
+                .insert(symbol.clone(), block_number);
+        }
+
+        self
+    }
+
+    /// Advance the venue-level onchain USDC block watermark after an
+    /// `OnchainUsdc` snapshot applied.
+    fn record_onchain_usdc_block_watermark(mut self, block_number: Option<u64>) -> Self {
+        let Some(block_number) = block_number else {
+            return self;
+        };
+
+        let advanced = self
+            .onchain_usdc_snapshot_block_watermark
+            .is_none_or(|watermark| block_number > watermark);
+        if advanced {
+            self.onchain_usdc_snapshot_block_watermark = Some(block_number);
+        }
+
+        self
+    }
+
+    /// Whether a MarketMaking equity fill delta at `block_number` is already
+    /// contained in an applied onchain snapshot (ADR 0018). Legacy fills
+    /// without a block are never treated as absorbed.
+    pub(crate) fn onchain_fill_absorbed_by_equity_snapshot(
+        &self,
+        symbol: &Symbol,
+        block_number: Option<u64>,
+    ) -> bool {
+        let Some(block_number) = block_number else {
+            return false;
+        };
+
+        self.onchain_equity_snapshot_block_watermarks
+            .get(symbol)
+            .is_some_and(|watermark| block_number <= *watermark)
+    }
+
+    /// Whether a MarketMaking USDC fill delta at `block_number` is already
+    /// contained in an applied onchain USDC snapshot (ADR 0018).
+    pub(crate) fn onchain_fill_absorbed_by_usdc_snapshot(&self, block_number: Option<u64>) -> bool {
+        let Some(block_number) = block_number else {
+            return false;
+        };
+
+        self.onchain_usdc_snapshot_block_watermark
+            .is_some_and(|watermark| block_number <= watermark)
     }
 
     /// Marks a symbol as having an open offchain order, so offchain equity
@@ -1457,10 +1579,15 @@ impl InventoryView {
             return Ok(false);
         }
 
-        // The offchain venue has a second writer (the fill delta) that the
-        // onchain venue does not; yield to it while it owns the balance.
-        // Exhaustive so a new venue forces a decision on whether it has a
-        // second writer of its own.
+        // Both venues have a second writer (the fill delta), but they are
+        // reconciled in opposite directions. Offchain: no causal signal ties
+        // a broker read to a fill, so the snapshot yields to the delta while
+        // a hedge order owns the balance (the guards below). Onchain: both
+        // writers derive from the same chain, so the DELTA yields instead --
+        // a fill covered by an applied snapshot's block watermark is skipped
+        // at the source (`onchain_fill_absorbed_by_*`, ADR 0018) and
+        // snapshots here are never blocked. Exhaustive so a new venue forces
+        // a decision on how its second writer is reconciled.
         match venue {
             Venue::MarketMaking => {}
             Venue::Hedging => {
@@ -1512,6 +1639,7 @@ impl InventoryView {
         venue: Venue,
         balances: impl IntoIterator<Item = (&'a Symbol, &'a FractionalShares)>,
         fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
         let snapshot: Vec<(Symbol, FractionalShares)> = balances
@@ -1540,6 +1668,28 @@ impl InventoryView {
         let (view, applied_symbols) = snapshot.iter().chain(absent_zeroes.iter()).try_fold(
             (self, Vec::new()),
             |(view, mut applied_symbols), (symbol, snapshot_balance)| {
+                // Block ordering is authoritative for onchain reads (ADR
+                // 0018): a read pinned below the symbol's applied watermark
+                // would set a balance missing fills the watermark already
+                // absorbs. Per symbol, mirroring the `OnchainUsdc` arm's
+                // venue-level check.
+                if venue == Venue::MarketMaking
+                    && let Some(block) = block_number
+                    && view
+                        .onchain_equity_snapshot_block_watermarks
+                        .get(symbol)
+                        .is_some_and(|watermark| block < *watermark)
+                {
+                    warn!(
+                        target: "inventory",
+                        %symbol,
+                        block,
+                        "Rejecting onchain equity snapshot pinned below the \
+                         symbol's applied block watermark"
+                    );
+                    return Ok((view, applied_symbols));
+                }
+
                 let should_record_watermark =
                     view.equity_snapshot_would_apply(symbol, venue, fetched_at)?;
                 if !should_record_watermark {
@@ -1558,7 +1708,9 @@ impl InventoryView {
             },
         )?;
 
-        Ok(view.record_equity_snapshot_watermarks(venue, applied_symbols.iter(), fetched_at))
+        Ok(view
+            .record_equity_snapshot_watermarks(venue, applied_symbols.iter(), fetched_at)
+            .record_onchain_equity_block_watermarks(venue, applied_symbols.iter(), block_number))
     }
 
     /// Record the latest wallet-read USDC balance at an intermediate location.
@@ -1685,6 +1837,8 @@ impl InventoryView {
             offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
             pending_offchain_order_symbols: self.pending_offchain_order_symbols,
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
+            onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
+            onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
         })
     }
 
@@ -1715,6 +1869,8 @@ impl InventoryView {
             offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
             pending_offchain_order_symbols: self.pending_offchain_order_symbols,
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
+            onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
+            onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
         })
     }
 
@@ -2029,17 +2185,60 @@ impl InventoryView {
 
         let fetched_at = event.timestamp();
         match event {
-            OnchainEquity { balances, .. } => {
-                self.apply_equity_snapshot(Venue::MarketMaking, balances.iter(), fetched_at, now)
-            }
-
-            OnchainUsdc { usdc_balance, .. } => self.update_usdc(
-                Inventory::on_snapshot(Venue::MarketMaking, *usdc_balance, fetched_at),
+            OnchainEquity {
+                balances,
+                block_number,
+                ..
+            } => self.apply_equity_snapshot(
+                Venue::MarketMaking,
+                balances.iter(),
+                fetched_at,
+                *block_number,
                 now,
             ),
 
+            OnchainUsdc {
+                usdc_balance,
+                block_number,
+                ..
+            } => {
+                // Block ordering is authoritative for onchain reads (ADR
+                // 0018): a read pinned below the applied watermark would set
+                // a balance that does not contain fills the watermark
+                // already absorbs, understating USDC until the next poll.
+                if let (Some(block_number), Some(watermark)) =
+                    (*block_number, self.onchain_usdc_snapshot_block_watermark)
+                    && block_number < watermark
+                {
+                    warn!(
+                        target: "inventory",
+                        block_number,
+                        watermark,
+                        "Rejecting onchain USDC snapshot pinned below the \
+                         applied block watermark"
+                    );
+                    return Ok(self);
+                }
+
+                // The closure silently skips when the snapshot cannot apply
+                // (inflight, stale), so consult the same predicate first: the
+                // block watermark must only advance for balances the view
+                // actually took.
+                let applies = self.usdc.snapshot_would_apply(fetched_at)?;
+                let block_number = *block_number;
+                let view = self.update_usdc(
+                    Inventory::on_snapshot(Venue::MarketMaking, *usdc_balance, fetched_at),
+                    now,
+                )?;
+                Ok(if applies {
+                    view.record_onchain_usdc_block_watermark(block_number)
+                } else {
+                    view
+                })
+            }
+
             OffchainEquity { positions, .. } => {
-                self.apply_equity_snapshot(Venue::Hedging, positions.iter(), fetched_at, now)
+                self.apply_equity_snapshot(Venue::Hedging, positions.iter(), fetched_at, None, now)
             }
 
             OffchainEquityReconciled {
@@ -2177,6 +2376,7 @@ impl InventoryView {
             OnchainEquity {
                 balances,
                 fetched_at,
+                block_number,
             } => balances
                 .iter()
                 .try_fold(self, |view, (symbol, snapshot_balance)| {
@@ -2191,17 +2391,38 @@ impl InventoryView {
                     )
                 })
                 .map(|view| {
+                    // The forced balance is authoritative, so the block
+                    // watermark must follow it exactly instead of retaining
+                    // a higher block whose fills this balance does not
+                    // contain.
                     view.record_equity_snapshot_watermarks(
                         Venue::MarketMaking,
                         balances.keys(),
                         *fetched_at,
                     )
+                    .force_onchain_equity_block_watermarks(balances.keys(), *block_number)
                 }),
 
-            OnchainUsdc { usdc_balance, .. } => self.update_usdc(
-                Inventory::force_on_snapshot(Venue::MarketMaking, *usdc_balance, reason),
-                now,
-            ),
+            OnchainUsdc {
+                usdc_balance,
+                block_number,
+                ..
+            } => {
+                let block_number = *block_number;
+                self.update_usdc(
+                    Inventory::force_on_snapshot(Venue::MarketMaking, *usdc_balance, reason),
+                    now,
+                )
+                // Same as the equity arm above: the forced balance is
+                // authoritative, so the watermark follows it exactly rather
+                // than keeping the monotonic maximum.
+                .map(|mut view| {
+                    if let Some(block_number) = block_number {
+                        view.onchain_usdc_snapshot_block_watermark = Some(block_number);
+                    }
+                    view
+                })
+            }
 
             OffchainEquity {
                 positions,
@@ -2452,6 +2673,8 @@ mod tests {
             offchain_equity_snapshot_watermarks: HashMap::new(),
             pending_offchain_order_symbols: HashSet::new(),
             last_offchain_fill_applied_at: HashMap::new(),
+            onchain_equity_snapshot_block_watermarks: HashMap::new(),
+            onchain_usdc_snapshot_block_watermark: None,
         }
     }
 
@@ -2485,6 +2708,8 @@ mod tests {
             offchain_equity_snapshot_watermarks: HashMap::new(),
             pending_offchain_order_symbols: HashSet::new(),
             last_offchain_fill_applied_at: HashMap::new(),
+            onchain_equity_snapshot_block_watermarks: HashMap::new(),
+            onchain_usdc_snapshot_block_watermark: None,
         }
     }
 
@@ -3621,6 +3846,7 @@ mod tests {
                 &InventorySnapshotEvent::OnchainEquity {
                     balances,
                     fetched_at: now - Duration::seconds(1),
+                    block_number: None,
                 },
                 now,
             )
@@ -3628,12 +3854,303 @@ mod tests {
         assert_eq!(
             view.equity_available(&aapl, Venue::MarketMaking),
             Some(shares(60)),
-            "MarketMaking snapshots must ignore the offchain-order guards",
+            "MarketMaking snapshots must ignore the offchain-order guards: \
+             the onchain venue's second writer is reconciled by absorbing \
+             the fill delta (ADR 0018), never by blocking snapshots",
         );
         assert_eq!(
             view.equity_available(&aapl, Venue::Hedging),
             Some(shares(100)),
             "the offchain balance is untouched by an onchain snapshot",
+        );
+    }
+
+    /// The hydration path replays persisted snapshot events through
+    /// `apply_snapshot_event`, so applying onchain events with blocks must
+    /// re-establish the absorption watermarks -- this is what closes the
+    /// restart window for the onchain venue (blocks are durable, unlike the
+    /// offchain guards' local-clock state).
+    #[test]
+    fn replayed_onchain_snapshots_restore_block_watermarks() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let view = InventoryView::default()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    balances: BTreeMap::from([(aapl.clone(), shares(60))]),
+                    fetched_at: now,
+                    block_number: Some(100),
+                },
+                now,
+            )
+            .unwrap()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainUsdc {
+                    usdc_balance: Usdc::new(float!(8500)),
+                    fetched_at: now,
+                    block_number: Some(100),
+                },
+                now,
+            )
+            .unwrap();
+
+        assert!(
+            view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(100)),
+            "a fill at the snapshot's block is absorbed"
+        );
+        assert!(
+            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(101)),
+            "a fill past the snapshot's block is not absorbed"
+        );
+        assert!(
+            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, None),
+            "a legacy fill without a block is never absorbed"
+        );
+        assert!(
+            view.onchain_fill_absorbed_by_usdc_snapshot(Some(100)),
+            "the USDC leg mirrors the equity behavior at the venue level"
+        );
+    }
+
+    /// A skipped snapshot must not advance the block watermarks: the balance
+    /// it carried was never taken, so a fill it contains is NOT yet in the
+    /// view and its delta must still apply.
+    #[test]
+    fn skipped_onchain_snapshots_advance_no_block_watermarks() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        // Inflight at the equity inventory blocks the equity snapshot;
+        // inflight at the USDC inventory blocks the USDC snapshot.
+        let view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(50), shares(50))
+            .update_equity(
+                &aapl,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, shares(5)),
+                now,
+            )
+            .unwrap()
+            .with_usdc_inflight(
+                Usdc::new(float!(1000)),
+                Usdc::new(float!(400)),
+                Usdc::new(float!(1000)),
+                Usdc::ZERO,
+            );
+
+        let view = view
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    balances: BTreeMap::from([(aapl.clone(), shares(60))]),
+                    fetched_at: now,
+                    block_number: Some(100),
+                },
+                now,
+            )
+            .unwrap()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainUsdc {
+                    usdc_balance: Usdc::new(float!(8500)),
+                    fetched_at: now,
+                    block_number: Some(100),
+                },
+                now,
+            )
+            .unwrap();
+
+        assert!(
+            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(100)),
+            "an inflight-skipped equity snapshot must not mark fills absorbed"
+        );
+        assert!(
+            !view.onchain_fill_absorbed_by_usdc_snapshot(Some(100)),
+            "an inflight-skipped USDC snapshot must not mark fills absorbed"
+        );
+    }
+
+    /// Snapshots can be delivered out of order (load-balanced RPC nodes can
+    /// serve a later request from a lagging node). An older block must never
+    /// lower an established watermark, or a fill between the two blocks
+    /// would be absorbed twice.
+    #[test]
+    fn out_of_order_onchain_snapshots_never_lower_block_watermarks() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let apply = |view: InventoryView, block: u64, balance: i64, fetched_at: DateTime<Utc>| {
+            view.apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    balances: BTreeMap::from([(aapl.clone(), shares(balance))]),
+                    fetched_at,
+                    block_number: Some(block),
+                },
+                now,
+            )
+            .unwrap()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainUsdc {
+                    usdc_balance: Usdc::new(float!(&balance.to_string())),
+                    fetched_at,
+                    block_number: Some(block),
+                },
+                now,
+            )
+            .unwrap()
+        };
+
+        // Block 200 lands first, then a late snapshot from block 100 with a
+        // fresher fetched_at. Block ordering is authoritative for onchain
+        // reads: the late lower-block snapshot must be rejected outright --
+        // its balance is missing fills the watermark already absorbs.
+        let view = apply(InventoryView::default(), 200, 60, now);
+        let view = apply(view, 100, 30, now + Duration::seconds(1));
+
+        assert_eq!(
+            view.equity_available(&aapl, Venue::MarketMaking),
+            Some(shares(60)),
+            "a below-watermark equity snapshot must not replace the balance"
+        );
+        assert_eq!(
+            view.usdc_available(Venue::MarketMaking),
+            Some(Usdc::new(float!(60))),
+            "a below-watermark USDC snapshot must not replace the balance"
+        );
+        assert!(
+            view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(150)),
+            "the equity watermark must stay at the highest applied block"
+        );
+        assert!(
+            view.onchain_fill_absorbed_by_usdc_snapshot(Some(150)),
+            "the USDC watermark must stay at the highest applied block"
+        );
+        assert!(
+            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(201)),
+            "a fill past the highest applied block is still not absorbed"
+        );
+    }
+
+    /// The recovery force path is the one writer allowed to move a balance
+    /// BELOW the block watermark, so the watermark must follow the forced
+    /// block exactly: keeping the monotonic maximum would leave fills
+    /// between the forced block and the old watermark absorbed while the
+    /// forced balance does not contain them.
+    #[test]
+    fn force_apply_resets_block_watermarks_to_the_forced_block() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let reason = Arc::new(InventoryViewError::UsdBalanceConversion(i64::MAX));
+
+        let view = InventoryView::default()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    balances: BTreeMap::from([(aapl.clone(), shares(60))]),
+                    fetched_at: now,
+                    block_number: Some(200),
+                },
+                now,
+            )
+            .unwrap()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainUsdc {
+                    usdc_balance: Usdc::new(float!(8500)),
+                    fetched_at: now,
+                    block_number: Some(200),
+                },
+                now,
+            )
+            .unwrap();
+
+        let forced = view
+            .force_apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    balances: BTreeMap::from([(aapl.clone(), shares(30))]),
+                    fetched_at: now + Duration::seconds(1),
+                    block_number: Some(100),
+                },
+                now,
+                reason.clone(),
+            )
+            .unwrap()
+            .force_apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainUsdc {
+                    usdc_balance: Usdc::new(float!(4000)),
+                    fetched_at: now + Duration::seconds(1),
+                    block_number: Some(100),
+                },
+                now,
+                reason,
+            )
+            .unwrap();
+
+        assert_eq!(
+            forced.equity_available(&aapl, Venue::MarketMaking),
+            Some(shares(30)),
+            "the force path always writes the balance"
+        );
+        assert!(
+            !forced.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(150)),
+            "the equity watermark must drop to the forced block; a fill \
+             above it is not absorbed by the forced balance"
+        );
+        assert!(
+            forced.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(100)),
+            "fills at or below the forced block are absorbed"
+        );
+        assert!(
+            !forced.onchain_fill_absorbed_by_usdc_snapshot(Some(150)),
+            "the USDC watermark must drop to the forced block"
+        );
+        assert!(forced.onchain_fill_absorbed_by_usdc_snapshot(Some(100)));
+    }
+
+    /// `#[serde(default)]` on the two block-watermark fields is what keeps
+    /// a view payload persisted before this change loadable; legacy state
+    /// must deserialize with empty watermarks and absorb nothing.
+    #[test]
+    fn legacy_view_payload_without_watermark_fields_absorbs_nothing() {
+        let aapl = Symbol::new("AAPL").unwrap();
+
+        let mut payload = serde_json::to_value(InventoryView::default()).unwrap();
+        let map = payload.as_object_mut().unwrap();
+        assert!(
+            map.remove("onchain_equity_snapshot_block_watermarks")
+                .is_some(),
+            "field name drifted; this test no longer removes anything"
+        );
+        assert!(
+            map.remove("onchain_usdc_snapshot_block_watermark")
+                .is_some(),
+            "field name drifted; this test no longer removes anything"
+        );
+
+        let view: InventoryView = serde_json::from_value(payload).unwrap();
+
+        assert!(
+            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(1)),
+            "legacy state without watermark fields must absorb no equity fills"
+        );
+        assert!(
+            !view.onchain_fill_absorbed_by_usdc_snapshot(Some(1)),
+            "legacy state without watermark fields must absorb no USDC fills"
+        );
+    }
+
+    /// The Hedging arm of the recorder must stay inert even if a future
+    /// call site passes a block for a broker read: chain blocks order
+    /// onchain reads only.
+    #[test]
+    fn hedging_venue_records_no_block_watermark() {
+        let aapl = Symbol::new("AAPL").unwrap();
+
+        let view = InventoryView::default().record_onchain_equity_block_watermarks(
+            Venue::Hedging,
+            [&aapl],
+            Some(100),
+        );
+
+        assert!(
+            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(100)),
+            "a Hedging recording must not create an onchain block watermark"
         );
     }
 
@@ -3759,6 +4276,7 @@ mod tests {
                 &InventorySnapshotEvent::OnchainEquity {
                     balances,
                     fetched_at: now,
+                    block_number: None,
                 },
                 now,
             )
@@ -4078,6 +4596,8 @@ mod tests {
             offchain_equity_snapshot_watermarks: HashMap::new(),
             pending_offchain_order_symbols: HashSet::new(),
             last_offchain_fill_applied_at: HashMap::new(),
+            onchain_equity_snapshot_block_watermarks: HashMap::new(),
+            onchain_usdc_snapshot_block_watermark: None,
         };
 
         let dto = view.to_dto();
@@ -4133,6 +4653,8 @@ mod tests {
             offchain_equity_snapshot_watermarks: HashMap::new(),
             pending_offchain_order_symbols: HashSet::new(),
             last_offchain_fill_applied_at: HashMap::new(),
+            onchain_equity_snapshot_block_watermarks: HashMap::new(),
+            onchain_usdc_snapshot_block_watermark: None,
         };
 
         let dto = view.to_dto();

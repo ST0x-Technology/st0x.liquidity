@@ -2973,6 +2973,7 @@ mod tests {
                     direction: Direction::Sell,
                     price_usdc: float!(10),
                     block_timestamp,
+                    block_number: None,
                     seen_at: block_timestamp,
                 },
             )
@@ -3691,6 +3692,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: block_ts,
+                    block_number: None,
                     seen_at: seen_ts,
                 },
             )

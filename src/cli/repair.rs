@@ -746,6 +746,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(420),
                     block_timestamp: chrono::Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -1670,6 +1671,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(420),
                     block_timestamp: chrono::Utc::now(),
+                    block_number: None,
                 },
             )
             .await
@@ -1749,6 +1751,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(420),
                     block_timestamp: chrono::Utc::now(),
+                    block_number: None,
                 },
             )
             .await

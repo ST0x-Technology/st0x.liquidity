@@ -1044,6 +1044,7 @@ mod tests {
                     direction,
                     price_usdc: float!(150.0),
                     block_timestamp: chrono::Utc::now(),
+                    block_number: None,
                 },
             )
             .await

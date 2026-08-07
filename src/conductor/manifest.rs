@@ -332,7 +332,13 @@ mod tests {
         );
         built
             .snapshot
-            .send(&id, InventorySnapshotCommand::OnchainEquity { balances })
+            .send(
+                &id,
+                InventorySnapshotCommand::OnchainEquity {
+                    balances,
+                    block_number: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -454,6 +460,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: chrono::Utc::now(),
+                    block_number: None,
                 },
             )
             .await

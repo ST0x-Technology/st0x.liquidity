@@ -306,8 +306,16 @@ where
             return Ok(());
         };
 
-        self.poll_onchain_equity(snapshot_id, &registry).await?;
-        self.poll_onchain_usdc(snapshot_id, &registry).await?;
+        // One pinned block for the whole onchain cycle: every vaultBalance2
+        // read below observes this exact chain state, and the snapshot
+        // events record it so the view's block watermarks can absorb fill
+        // deltas the balances already contain.
+        let block_number = self.raindex_service.latest_block_number().await?;
+
+        self.poll_onchain_equity(snapshot_id, &registry, block_number)
+            .await?;
+        self.poll_onchain_usdc(snapshot_id, &registry, block_number)
+            .await?;
 
         Ok(())
     }
@@ -327,6 +335,7 @@ where
         &self,
         snapshot_id: &InventorySnapshotId,
         registry: &VaultRegistry,
+        block_number: u64,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         if registry.equity_vaults.is_empty() {
             debug!(target: "inventory", "No equity vaults discovered, skipping onchain equity polling");
@@ -352,6 +361,7 @@ where
                             self.vault_owner,
                             vault.token,
                             RaindexVaultId(vault.vault_id),
+                            block_number,
                         )
                 });
 
@@ -395,7 +405,10 @@ where
         self.snapshot
             .send(
                 snapshot_id,
-                InventorySnapshotCommand::OnchainEquity { balances },
+                InventorySnapshotCommand::OnchainEquity {
+                    balances,
+                    block_number: Some(block_number),
+                },
             )
             .await?;
 
@@ -415,6 +428,7 @@ where
         &self,
         snapshot_id: &InventorySnapshotId,
         registry: &VaultRegistry,
+        block_number: u64,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         if registry.usdc_vaults.is_empty() {
             debug!(target: "inventory", "No USDC vaults discovered, skipping onchain cash polling");
@@ -426,6 +440,7 @@ where
                 .get_usdc_balance::<OpenChainErrorRegistry>(
                     self.vault_owner,
                     RaindexVaultId(vault.vault_id),
+                    block_number,
                 )
         });
 
@@ -443,7 +458,10 @@ where
         self.snapshot
             .send(
                 snapshot_id,
-                InventorySnapshotCommand::OnchainUsdc { usdc_balance },
+                InventorySnapshotCommand::OnchainUsdc {
+                    usdc_balance,
+                    block_number: Some(block_number),
+                },
             )
             .await?;
 
@@ -2377,6 +2395,7 @@ mod tests {
         discover_usdc_vault(&pool, orderbook, order_owner, TEST_VAULT_ID).await;
 
         let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::from(100u64)); // eth_blockNumber (pinned poll block)
         asserter.push_success(&ZERO_FLOAT_HEX); // vaultBalance2 for USDC vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let raindex_service = create_test_raindex_service(provider);
@@ -2433,6 +2452,7 @@ mod tests {
         .await;
 
         let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::from(100u64)); // eth_blockNumber (pinned poll block)
         asserter.push_success(&ZERO_FLOAT_HEX); // vaultBalance2 for equity vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let raindex_service = create_test_raindex_service(provider);
@@ -2499,6 +2519,7 @@ mod tests {
         .await;
 
         let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::from(100u64)); // eth_blockNumber (pinned poll block)
         asserter.push_success(&vault_balance_hex(float!(7))); // vaultBalance2 for the equity vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let raindex_service = create_test_raindex_service(provider);
@@ -2551,6 +2572,7 @@ mod tests {
         .await;
 
         let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::from(100u64)); // eth_blockNumber (pinned poll block)
         asserter.push_failure_msg("RPC failure"); // vaultBalance2 for equity vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let raindex_service = create_test_raindex_service(provider);
@@ -2593,6 +2615,7 @@ mod tests {
         discover_usdc_vault(&pool, orderbook, order_owner, TEST_VAULT_ID).await;
 
         let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::from(100u64)); // eth_blockNumber (pinned poll block)
         asserter.push_failure_msg("RPC failure"); // vaultBalance2 for USDC vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let raindex_service = create_test_raindex_service(provider);
@@ -2657,6 +2680,7 @@ mod tests {
 
         let retired_balance = vault_balance_hex(float!(5));
         let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::from(100u64)); // eth_blockNumber (pinned poll block)
         asserter.push_success(&retired_balance);
         asserter.push_success(&ZERO_FLOAT_HEX);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -2710,6 +2734,7 @@ mod tests {
 
         let retired_balance = vault_balance_hex(float!(125));
         let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::from(100u64)); // eth_blockNumber (pinned poll block)
         asserter.push_success(&retired_balance);
         asserter.push_success(&ZERO_FLOAT_HEX);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -5113,7 +5138,9 @@ mod tests {
         .await;
 
         let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::from(100u64)); // tick 1 eth_blockNumber
         asserter.push_success(&vault_balance_hex(float!(7))); // tick 1
+        asserter.push_success(&serde_json::Value::from(101u64)); // tick 2 eth_blockNumber
         asserter.push_success(&vault_balance_hex(float!(7))); // tick 2, unchanged
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let raindex_service = create_test_raindex_service(provider);
@@ -5302,6 +5329,7 @@ mod tests {
         .await;
 
         let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::from(100u64)); // eth_blockNumber (pinned poll block)
         asserter.push_failure_msg("RPC failure"); // vaultBalance2 for equity vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let raindex_service = create_test_raindex_service(provider);
@@ -5428,6 +5456,7 @@ mod tests {
         discover_usdc_vault(&pool, orderbook, order_owner, TEST_VAULT_ID).await;
 
         let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::from(100u64)); // eth_blockNumber (pinned poll block)
         asserter.push_success(&vault_balance_hex(float!(7))); // equity vaultBalance2
         asserter.push_success(&vault_balance_hex(float!(3))); // usdc vaultBalance2
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);

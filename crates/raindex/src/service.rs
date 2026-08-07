@@ -325,26 +325,41 @@ impl<W: Wallet> RaindexService<W> {
 
 /// Read operations that only need chain access (no signing).
 impl<E: Evm> RaindexService<E> {
+    /// Latest block number reported by the serving node. Callers pin their
+    /// subsequent balance reads to it so a multi-vault poll observes one
+    /// consistent chain state and can record which block it read at.
+    pub async fn latest_block_number(&self) -> Result<u64, RaindexError> {
+        Ok(self.evm.block_number().await?)
+    }
+
+    /// Gets the equity balance of a vault, pinned to `block_number`.
+    ///
+    /// Pinned rather than read at latest: the inventory poller sums several
+    /// vaults per token, and unpinned reads on a load-balanced RPC can
+    /// straddle a block boundary between calls. The pin also gives the
+    /// caller an exact as-of block to record alongside the balance.
     pub async fn get_equity_balance<Registry: IntoErrorRegistry>(
         &self,
         owner: Address,
         token: Address,
         vault_id: RaindexVaultId,
+        block_number: u64,
     ) -> Result<FractionalShares, RaindexError> {
         let exact = self
-            .get_vault_balance::<Registry>(owner, token, vault_id)
+            .get_vault_balance::<Registry>(owner, token, vault_id, block_number)
             .await?;
         Ok(FractionalShares::new(exact))
     }
 
-    /// Gets the USDC balance of a vault on Base.
+    /// Gets the USDC balance of a vault on Base, pinned to `block_number`.
     pub async fn get_usdc_balance<Registry: IntoErrorRegistry>(
         &self,
         owner: Address,
         vault_id: RaindexVaultId,
+        block_number: u64,
     ) -> Result<Usdc, RaindexError> {
         let exact = self
-            .get_vault_balance::<Registry>(owner, USDC_BASE, vault_id)
+            .get_vault_balance::<Registry>(owner, USDC_BASE, vault_id, block_number)
             .await?;
         Ok(Usdc::new(exact))
     }
@@ -571,16 +586,18 @@ impl<E: Evm> RaindexService<E> {
         owner: Address,
         token: Address,
         vault_id: RaindexVaultId,
+        block_number: u64,
     ) -> Result<Float, RaindexError> {
         let balance_float = self
             .evm
-            .call::<Registry, _>(
+            .call_at::<Registry, _>(
                 self.orderbook_address,
                 IRaindexV6::vaultBalance2Call {
                     owner,
                     token,
                     vaultId: vault_id.0,
                 },
+                block_number,
             )
             .await?;
 
@@ -1943,11 +1960,13 @@ mod tests {
         let local_evm = LocalEvm::new().await.unwrap();
         let service = create_test_raindex_service(&local_evm);
 
+        let block_number = service.latest_block_number().await.unwrap();
         let balance = service
             .get_equity_balance::<NoOpErrorRegistry>(
                 local_evm.wallet.address(),
                 local_evm.token_address,
                 TEST_VAULT_ID,
+                block_number,
             )
             .await
             .unwrap();
@@ -1982,11 +2001,13 @@ mod tests {
             .await
             .unwrap();
 
+        let block_number = service.latest_block_number().await.unwrap();
         let balance = service
             .get_equity_balance::<NoOpErrorRegistry>(
                 local_evm.wallet.address(),
                 local_evm.token_address,
                 TEST_VAULT_ID,
+                block_number,
             )
             .await
             .unwrap();
@@ -2036,17 +2057,83 @@ mod tests {
             .await
             .unwrap();
 
+        let block_number = service.latest_block_number().await.unwrap();
         let balance = service
             .get_equity_balance::<NoOpErrorRegistry>(
                 local_evm.wallet.address(),
                 local_evm.token_address,
                 TEST_VAULT_ID,
+                block_number,
             )
             .await
             .unwrap();
 
         let expected = FractionalShares::new(Float::parse("700".to_string()).unwrap());
         assert_eq!(balance, expected, "Expected 700 shares but got {balance:?}");
+    }
+
+    /// The pin is real, not advisory: a read pinned to a block before a
+    /// deposit must see the pre-deposit balance even though the latest state
+    /// already includes it. This is what lets the poller's recorded block
+    /// exactly bound which fills a snapshot contains (ADR 0018).
+    #[tokio::test]
+    async fn get_equity_balance_pinned_block_sees_that_blocks_state() {
+        let local_evm = LocalEvm::new().await.unwrap();
+
+        let deposit_amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
+
+        local_evm
+            .approve_tokens(
+                local_evm.token_address,
+                local_evm.orderbook_address,
+                deposit_amount,
+            )
+            .await
+            .unwrap();
+
+        let service = create_test_raindex_service(&local_evm);
+        let pre_deposit_block = service.latest_block_number().await.unwrap();
+
+        service
+            .deposit::<NoOpErrorRegistry>(
+                local_evm.token_address,
+                TEST_VAULT_ID,
+                deposit_amount,
+                TEST_TOKEN_DECIMALS,
+            )
+            .await
+            .unwrap();
+
+        let post_deposit_block = service.latest_block_number().await.unwrap();
+        let balance_now = service
+            .get_equity_balance::<NoOpErrorRegistry>(
+                local_evm.wallet.address(),
+                local_evm.token_address,
+                TEST_VAULT_ID,
+                post_deposit_block,
+            )
+            .await
+            .unwrap();
+        let balance_before = service
+            .get_equity_balance::<NoOpErrorRegistry>(
+                local_evm.wallet.address(),
+                local_evm.token_address,
+                TEST_VAULT_ID,
+                pre_deposit_block,
+            )
+            .await
+            .unwrap();
+
+        let expected_now = FractionalShares::new(Float::parse("1000".to_string()).unwrap());
+        assert_eq!(
+            balance_now, expected_now,
+            "the post-deposit block must include the deposit"
+        );
+        assert_eq!(
+            balance_before,
+            FractionalShares::ZERO,
+            "a read pinned before the deposit must not include it"
+        );
     }
 
     /// Values with large exponents produce scientific notation from

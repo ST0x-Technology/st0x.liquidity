@@ -2017,6 +2017,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp,
+                    block_number: None,
                     seen_at: block_timestamp,
                 },
             )
@@ -2088,6 +2089,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp,
+                    block_number: None,
                     seen_at: block_timestamp,
                 },
             )
@@ -2166,6 +2168,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp,
+                    block_number: None,
                     seen_at,
                 },
             )

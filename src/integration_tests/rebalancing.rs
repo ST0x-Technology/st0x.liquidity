@@ -400,6 +400,7 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
                         direction: Direction::Buy,
                         price_usdc: float!(150.0),
                         block_timestamp: Utc::now(),
+                        block_number: None,
                     },
                 )
                 .await
@@ -635,6 +636,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
                 direction: Direction::Sell,
                 price_usdc: float!(150.0),
                 block_timestamp: Utc::now(),
+                block_number: None,
             },
         )
         .await
@@ -906,6 +908,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
                 direction: Direction::Buy,
                 price_usdc: float!(150.0),
                 block_timestamp: Utc::now(),
+                block_number: None,
             },
         )
         .await
@@ -1329,6 +1332,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
             &snapshot_id,
             InventorySnapshotCommand::OnchainUsdc {
                 usdc_balance: Usdc::new(float!(500)),
+                block_number: None,
             },
         )
         .await
@@ -1638,6 +1642,7 @@ async fn mint_api_failure_produces_rejected_event() {
                 direction: Direction::Sell,
                 price_usdc: float!(150.0),
                 block_timestamp: Utc::now(),
+                block_number: None,
             },
         )
         .await
@@ -2191,6 +2196,7 @@ async fn mint_accepted_sets_offchain_inflight() {
                 direction: Direction::Sell,
                 price_usdc: float!("150.0"),
                 block_timestamp: Utc::now(),
+                block_number: None,
             },
         )
         .await
@@ -2398,6 +2404,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
                 direction: Direction::Sell,
                 price_usdc: float!("150.0"),
                 block_timestamp: Utc::now(),
+                block_number: None,
             },
         )
         .await
