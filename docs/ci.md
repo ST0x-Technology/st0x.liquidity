@@ -13,10 +13,24 @@ commit. A skipped or stale duplicate could then hide the result that branch
 protection was meant to require.
 
 Retargeting a PR emits an `edited` event and reruns CI against the new base.
-GitHub emits the same event for title and body edits, which change no code.
-Those runs stand the real jobs down through the optimizer `skip` output, and
-they use a separate concurrency group so they cannot cancel a live run and
-report its required checks as skipped.
+GitHub emits the same event for title and body edits, which change no code. All
+subscribed events for a pull request share one concurrency group, so a later
+event cancels and replaces an older run. The replacement performs the same
+validation even when only PR metadata changed. This avoids a race where a head
+or base update is cancelled and the surviving run reports the required jobs as
+skipped, which GitHub treats as successful.
+
+The required checks are never gated by the Graphite CI optimizer. In particular,
+middle-of-stack PRs run their own backend validation rather than relying on a
+different stack branch. Only a confirmed docs-only diff short-circuits the
+backend and dashboard toolchains; their required gate jobs still execute, and
+pre-commit hooks continue to validate the documentation.
+
+The backend build and test matrix, dashboard build, and pre-commit hooks run in
+cancellable work jobs. Separate `backend`, `dashboard`, and `hooks` gate jobs
+use `always()` to inspect their results and fail on skipped, failed, or
+cancelled work. This keeps replacement runs responsive without allowing an
+obsolete run to publish a successful required check.
 
 Pull requests with at least 3,000 changed files always run full CI because
 GitHub's pull request files API truncates responses at that boundary.
@@ -33,7 +47,6 @@ read access. Dependabot runs receive the same restrictions despite using an
 in-repository branch. The workflow treats either case as an explicit trust
 boundary:
 
-- the Graphite optimizer does not run;
 - Cachix gets no auth token and cannot push;
 - Nix and Rust caches restore but do not save.
 
