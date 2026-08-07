@@ -42,9 +42,9 @@ use crate::inventory::projection::InventoryProjectionError;
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
-    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryDivergenceGate, InventoryView,
-    InventoryViewError, Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot,
-    TransferOp, Venue,
+    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryDivergenceGate, InventoryError,
+    InventoryView, InventoryViewError, Operator, PendingRequestOwnership,
+    PendingRequestOwnershipSnapshot, TransferOp, Venue,
 };
 use crate::position::{Position, PositionEvent};
 use crate::rebalancing::equity::{
@@ -469,6 +469,33 @@ pub(crate) enum TriggeredOperation {
     },
 }
 
+/// Marker left behind by a transfer timeout cleanup. Records when the
+/// cleanup ran and which symbol's inflight it cleared, so a late completion
+/// event for the tombstoned aggregate can release the symbol's inflight
+/// suppression without any tracking context (cleanup drops the tracking
+/// entry, and completion events do not carry the symbol).
+#[derive(Debug, Clone)]
+struct TimeoutTombstone {
+    symbol: Symbol,
+    timed_out_at: DateTime<Utc>,
+}
+
+/// Whether a terminal equity transfer event reconciled the in-memory
+/// inventory ledger. Mirrors [`usdc::UsdcSettlementOutcome`]:
+/// `DeferredToSnapshot` means the durable event was accepted as authoritative
+/// (the transfer genuinely completed or cancelled) but the in-memory
+/// available bookkeeping was skipped because the inflight reservation it
+/// would confirm or cancel is missing -- snapshot-error recovery or a restart
+/// wiped it while the transfer saga kept running. The residual inflight is
+/// zeroed so `has_inflight()` clears and the next venue snapshot polls heal
+/// the available balances. Callers must not act on `self.inventory` as if it
+/// reflects this settlement until the next snapshot poll heals it.
+#[derive(Debug, Clone, Copy)]
+enum EquitySettlementOutcome {
+    Reconciled,
+    DeferredToSnapshot,
+}
+
 /// Service that folds CQRS events into rebalancing state and
 /// schedules follow-up imbalance checks. Also serves as the apalis
 /// `Ctx` for the rebalancing-check workers.
@@ -518,8 +545,8 @@ pub(crate) struct RebalancingService {
     /// terminal events with the actual amount received.
     usdc_tracking: Arc<RwLock<HashMap<UsdcRebalanceId, usdc::UsdcRebalanceTracking>>>,
     suppressed_inflight_symbols: Arc<RwLock<HashMap<Symbol, DateTime<Utc>>>>,
-    timed_out_mints: Arc<RwLock<HashMap<IssuerRequestId, DateTime<Utc>>>>,
-    timed_out_redemptions: Arc<RwLock<HashMap<RedemptionAggregateId, DateTime<Utc>>>>,
+    timed_out_mints: Arc<RwLock<HashMap<IssuerRequestId, TimeoutTombstone>>>,
+    timed_out_redemptions: Arc<RwLock<HashMap<RedemptionAggregateId, TimeoutTombstone>>>,
     timed_out_usdc_rebalances: Arc<RwLock<HashMap<UsdcRebalanceId, DateTime<Utc>>>>,
     /// Ids of post-burn-stuck USDC rebalances already logged by the timeout
     /// sweep. A preserved post-burn entry is intentionally never removed from
@@ -765,11 +792,11 @@ impl RebalancingService {
         self.timed_out_mints
             .write()
             .await
-            .retain(|_, timed_out_at| !Self::timeout_marker_expired(*timed_out_at, now));
+            .retain(|_, tombstone| !Self::timeout_marker_expired(tombstone.timed_out_at, now));
         self.timed_out_redemptions
             .write()
             .await
-            .retain(|_, timed_out_at| !Self::timeout_marker_expired(*timed_out_at, now));
+            .retain(|_, tombstone| !Self::timeout_marker_expired(tombstone.timed_out_at, now));
         self.timed_out_usdc_rebalances
             .write()
             .await
@@ -1315,7 +1342,13 @@ impl RebalancingService {
             .clear_active_mint(&tracking.symbol);
         drop(inventory);
 
-        self.timed_out_mints.write().await.insert(id.clone(), now);
+        self.timed_out_mints.write().await.insert(
+            id.clone(),
+            TimeoutTombstone {
+                symbol: tracking.symbol.clone(),
+                timed_out_at: now,
+            },
+        );
         self.suppressed_inflight_symbols
             .write()
             .await
@@ -1353,10 +1386,13 @@ impl RebalancingService {
             .clear_active_redemption(&tracking.symbol);
         drop(inventory);
 
-        self.timed_out_redemptions
-            .write()
-            .await
-            .insert(id.clone(), now);
+        self.timed_out_redemptions.write().await.insert(
+            id.clone(),
+            TimeoutTombstone {
+                symbol: tracking.symbol.clone(),
+                timed_out_at: now,
+            },
+        );
         self.suppressed_inflight_symbols
             .write()
             .await
@@ -1560,14 +1596,6 @@ impl RebalancingService {
         drop(tracking_guard);
 
         Ok(Some(UsdcTimeoutCleanup::Cleared { tracking, elapsed }))
-    }
-
-    async fn mint_timed_out(&self, id: &IssuerRequestId) -> bool {
-        self.timed_out_mints.read().await.contains_key(id)
-    }
-
-    async fn redemption_timed_out(&self, id: &RedemptionAggregateId) -> bool {
-        self.timed_out_redemptions.read().await.contains_key(id)
     }
 
     async fn track_mint_progress(&self, id: &IssuerRequestId, event: &TokenizedEquityMintEvent) {
@@ -2515,6 +2543,64 @@ impl RebalancingService {
         *inventory = inventory.clone().update_equity(symbol, update, now)?;
         drop(inventory);
         Ok(())
+    }
+
+    /// Applies a mint/redemption lifecycle update, degrading an inflight
+    /// underflow to [`EquitySettlementOutcome::DeferredToSnapshot`] instead of
+    /// erroring. Mirrors the USDC terminal-settlement underflow handling
+    /// (`cancel_tracked_usdc_rebalance` / `complete_usdc_rebalance`): the
+    /// durable event proves the transfer completed or cancelled, but
+    /// snapshot-error recovery or a restart wiped the inflight reservation the
+    /// update would confirm or cancel while the transfer saga kept running.
+    /// Erroring here would strand the movement unrecorded AND abort the rest
+    /// of the reactor arm, leaving tracking and the in-progress guard latched
+    /// until restart. Instead the durable event is treated as authoritative:
+    /// the residual inflight is zeroed (a no-op when already zero) so
+    /// `has_inflight()` clears, the immediate available bookkeeping is
+    /// skipped, and the next venue snapshot polls heal both sides.
+    ///
+    /// Only [`InventoryError::InsufficientInflight`] defers -- it is the shape
+    /// recovery creates and only `Complete`/`Cancel` updates can produce it.
+    /// Every other error (e.g. `InsufficientAvailable` from a `Start`) still
+    /// propagates.
+    async fn apply_equity_update_or_defer(
+        &self,
+        symbol: &Symbol,
+        venue: Venue,
+        update: EquityInventoryUpdate,
+    ) -> Result<EquitySettlementOutcome, RebalancingServiceError> {
+        let now = Utc::now();
+        let mut inventory = self.inventory.write().await;
+        let outcome = match inventory.clone().update_equity(symbol, update, now) {
+            Ok(updated) => {
+                *inventory = updated;
+                EquitySettlementOutcome::Reconciled
+            }
+            Err(InventoryViewError::Equity(InventoryError::InsufficientInflight {
+                requested,
+                inflight,
+            })) => {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    ?venue,
+                    requested_release = ?requested,
+                    actual_inflight = ?inflight,
+                    "Equity inflight underflow on transfer settlement; treating \
+                     the durable event as authoritative, zeroing residual \
+                     inflight so snapshots can heal, and skipping in-memory \
+                     available reconciliation (heals on next snapshot poll)"
+                );
+                *inventory = inventory
+                    .clone()
+                    .clear_equity_inflight(symbol, venue, now)?;
+                EquitySettlementOutcome::DeferredToSnapshot
+            }
+            Err(error) => return Err(error.into()),
+        };
+        drop(inventory);
+
+        Ok(outcome)
     }
 
     /// Sets `active_mints[symbol] = id` while the aggregate is alive,
@@ -4354,7 +4440,12 @@ impl RebalancingService {
         // fallible inventory update below leaves them intact -- a failed rebuild
         // does not run the caller's rollback, so consuming them up front would
         // lose the tombstone permanently.
-        let timed_out_at = self.timed_out_mints.read().await.get(id).copied();
+        let timed_out_at = self
+            .timed_out_mints
+            .read()
+            .await
+            .get(id)
+            .map(|tombstone| tombstone.timed_out_at);
 
         // A third shape the timeout/explicit branches below do not cover: the
         // failure left the in-flight already established (a `Start` ran but the
@@ -4475,10 +4566,13 @@ impl RebalancingService {
                         .clone()
                         .clear_equity_inflight(symbol, Venue::Hedging, Utc::now())?;
                 drop(inventory);
-                self.timed_out_mints
-                    .write()
-                    .await
-                    .insert(id.clone(), timed_out_at);
+                self.timed_out_mints.write().await.insert(
+                    id.clone(),
+                    TimeoutTombstone {
+                        symbol: symbol.clone(),
+                        timed_out_at,
+                    },
+                );
                 if let Some(suppressed_at) = suppressed_at {
                     self.suppressed_inflight_symbols
                         .write()
@@ -4532,7 +4626,12 @@ impl RebalancingService {
         // Peek (don't yet remove) the timeout markers so a failure in the
         // fallible inventory update below leaves them intact -- a failed rebuild
         // does not run the caller's rollback.
-        let timed_out_at = self.timed_out_redemptions.read().await.get(id).copied();
+        let timed_out_at = self
+            .timed_out_redemptions
+            .read()
+            .await
+            .get(id)
+            .map(|tombstone| tombstone.timed_out_at);
         let suppressed_at = if timed_out_at.is_some() {
             self.suppressed_inflight_symbols
                 .read()
@@ -4623,10 +4722,13 @@ impl RebalancingService {
                     Utc::now(),
                 )?;
                 drop(inventory);
-                self.timed_out_redemptions
-                    .write()
-                    .await
-                    .insert(id.clone(), timed_out_at);
+                self.timed_out_redemptions.write().await.insert(
+                    id.clone(),
+                    TimeoutTombstone {
+                        symbol: symbol.clone(),
+                        timed_out_at,
+                    },
+                );
                 if let Some(suppressed_at) = suppressed_at {
                     self.suppressed_inflight_symbols
                         .write()
@@ -4775,8 +4877,38 @@ impl RebalancingService {
     ) -> Result<(), RebalancingServiceError> {
         let event_sync_guard = self.mint_event_sync.lock().await;
 
-        if self.mint_timed_out(&id).await {
-            warn!(target: "rebalance", id = %id, "Ignoring late mint event after timeout cleanup");
+        // Bind before the `if let` so the map's read guard drops here -- the
+        // escalation arm below re-locks the same map for writing.
+        let tombstone = self.timed_out_mints.read().await.get(&id).cloned();
+        if let Some(tombstone) = tombstone {
+            let completed = matches!(
+                event,
+                TokenizedEquityMintEvent::TokensReceived { .. }
+                    | TokenizedEquityMintEvent::ProviderCompletionRecovered { .. }
+                    | TokenizedEquityMintEvent::DepositedIntoRaindex { .. }
+            );
+            if !completed {
+                warn!(target: "rebalance", id = %id, "Ignoring late mint event after timeout cleanup");
+                return Ok(());
+            }
+
+            self.timed_out_mints.write().await.remove(&id);
+            self.suppressed_inflight_symbols
+                .write()
+                .await
+                .remove(&tombstone.symbol);
+            warn!(
+                target: "rebalance",
+                id = %id,
+                symbol = %tombstone.symbol,
+                ?event,
+                "Late mint completion after timeout cleanup: the transfer was \
+                 genuinely in progress. Clearing the timeout tombstone and \
+                 inflight suppression so snapshot polls resume recording the \
+                 symbol; balances heal on the next poll"
+            );
+            drop(event_sync_guard);
+            self.equity_scheduler.enqueue_check(tombstone.symbol).await;
             return Ok(());
         }
 
@@ -4787,10 +4919,14 @@ impl RebalancingService {
         };
         let symbol = tracking.symbol;
 
-        if let Some(update) = Self::mint_inventory_update(&event, tracking.quantity, tracking.stage)
-        {
-            self.apply_equity_update(&symbol, update).await?;
-        }
+        let settlement =
+            match Self::mint_inventory_update(&event, tracking.quantity, tracking.stage) {
+                Some(update) => {
+                    self.apply_equity_update_or_defer(&symbol, Venue::Hedging, update)
+                        .await?
+                }
+                None => EquitySettlementOutcome::Reconciled,
+            };
 
         // Defense-in-depth: a recovered mint must clear its Hedging in-flight via
         // the completion above. A residual in-flight means recovery double-counted
@@ -4850,7 +4986,20 @@ impl RebalancingService {
         if is_terminal {
             self.equity_scheduler.cancel_pending().await;
             self.usdc_scheduler.cancel_pending().await;
-            self.usdc_scheduler.enqueue_check().await;
+            match settlement {
+                EquitySettlementOutcome::Reconciled => {
+                    self.usdc_scheduler.enqueue_check().await;
+                }
+                EquitySettlementOutcome::DeferredToSnapshot => {
+                    debug!(
+                        target: "rebalance",
+                        id = %id,
+                        "Deferring fresh USDC imbalance check to next snapshot \
+                         poll: in-memory inventory was not reconciled by this \
+                         terminal mint event"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -4863,8 +5012,37 @@ impl RebalancingService {
     ) -> Result<(), RebalancingServiceError> {
         let event_sync_guard = self.redemption_event_sync.lock().await;
 
-        if self.redemption_timed_out(&id).await {
-            warn!(target: "rebalance", id = %id, "Ignoring late redemption event after timeout cleanup");
+        // Bind before the `if let` so the map's read guard drops here -- the
+        // escalation arm below re-locks the same map for writing.
+        let tombstone = self.timed_out_redemptions.read().await.get(&id).cloned();
+        if let Some(tombstone) = tombstone {
+            let completed = matches!(
+                event,
+                EquityRedemptionEvent::Completed { .. }
+                    | EquityRedemptionEvent::ProviderCompletionRecovered { .. }
+            );
+            if !completed {
+                warn!(target: "rebalance", id = %id, "Ignoring late redemption event after timeout cleanup");
+                return Ok(());
+            }
+
+            self.timed_out_redemptions.write().await.remove(&id);
+            self.suppressed_inflight_symbols
+                .write()
+                .await
+                .remove(&tombstone.symbol);
+            warn!(
+                target: "rebalance",
+                id = %id,
+                symbol = %tombstone.symbol,
+                ?event,
+                "Late redemption completion after timeout cleanup: the transfer \
+                 was genuinely in progress. Clearing the timeout tombstone and \
+                 inflight suppression so snapshot polls resume recording the \
+                 symbol; balances heal on the next poll"
+            );
+            drop(event_sync_guard);
+            self.equity_scheduler.enqueue_check(tombstone.symbol).await;
             return Ok(());
         }
 
@@ -4873,8 +5051,9 @@ impl RebalancingService {
         {
             if actual_quantity.inner().lt(existing.quantity.inner())? {
                 let shortfall = (existing.quantity - actual_quantity)?;
-                self.apply_equity_update(
+                self.apply_equity_update_or_defer(
                     &existing.symbol,
+                    Venue::MarketMaking,
                     Self::cancel_equity_transfer_update(Venue::MarketMaking, shortfall),
                 )
                 .await?;
@@ -4911,9 +5090,13 @@ impl RebalancingService {
         };
         let symbol = tracking.symbol;
 
-        if let Some(update) = Self::redemption_inventory_update(&event, tracking.quantity) {
-            self.apply_equity_update(&symbol, update).await?;
-        }
+        let settlement = match Self::redemption_inventory_update(&event, tracking.quantity) {
+            Some(update) => {
+                self.apply_equity_update_or_defer(&symbol, Venue::MarketMaking, update)
+                    .await?
+            }
+            None => EquitySettlementOutcome::Reconciled,
+        };
 
         // When a new redemption transfer starts, clear the previous poll
         // marker so the next inflight poll won't incorrectly zero the new
@@ -4948,7 +5131,20 @@ impl RebalancingService {
         if is_terminal {
             self.equity_scheduler.cancel_pending().await;
             self.usdc_scheduler.cancel_pending().await;
-            self.usdc_scheduler.enqueue_check().await;
+            match settlement {
+                EquitySettlementOutcome::Reconciled => {
+                    self.usdc_scheduler.enqueue_check().await;
+                }
+                EquitySettlementOutcome::DeferredToSnapshot => {
+                    debug!(
+                        target: "rebalance",
+                        id = %id,
+                        "Deferring fresh USDC imbalance check to next snapshot \
+                         poll: in-memory inventory was not reconciled by this \
+                         terminal redemption event"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -5809,11 +6005,13 @@ mod tests {
         // so the reactor ignores late events.
         *trigger.inventory.write().await =
             InventoryView::default().with_equity(symbol.clone(), shares(0), shares(90));
-        trigger
-            .timed_out_mints
-            .write()
-            .await
-            .insert(mint_id.clone(), Utc::now());
+        trigger.timed_out_mints.write().await.insert(
+            mint_id.clone(),
+            TimeoutTombstone {
+                symbol: symbol.clone(),
+                timed_out_at: Utc::now(),
+            },
+        );
 
         let failed = TokenizedEquityMint::Failed {
             symbol: symbol.clone(),
@@ -5926,11 +6124,13 @@ mod tests {
         // aggregate; available stays debited at 90.
         *trigger.inventory.write().await =
             InventoryView::default().with_equity(symbol.clone(), shares(90), shares(0));
-        trigger
-            .timed_out_redemptions
-            .write()
-            .await
-            .insert(redemption_id.clone(), Utc::now());
+        trigger.timed_out_redemptions.write().await.insert(
+            redemption_id.clone(),
+            TimeoutTombstone {
+                symbol: symbol.clone(),
+                timed_out_at: Utc::now(),
+            },
+        );
 
         let failed = EquityRedemption::Failed {
             symbol: symbol.clone(),
@@ -6140,11 +6340,13 @@ mod tests {
         *trigger.inventory.write().await = InventoryView::default()
             .with_equity(symbol.clone(), shares(90), shares(0))
             .set_active_redemption(symbol.clone(), other.clone());
-        trigger
-            .timed_out_redemptions
-            .write()
-            .await
-            .insert(recovering.clone(), tombstone_at);
+        trigger.timed_out_redemptions.write().await.insert(
+            recovering.clone(),
+            TimeoutTombstone {
+                symbol: symbol.clone(),
+                timed_out_at: tombstone_at,
+            },
+        );
 
         let failed = EquityRedemption::Failed {
             symbol: symbol.clone(),
@@ -6205,11 +6407,13 @@ mod tests {
         *trigger.inventory.write().await = InventoryView::default()
             .with_equity(symbol.clone(), shares(90), shares(0))
             .set_active_redemption(symbol.clone(), recovering.clone());
-        trigger
-            .timed_out_redemptions
-            .write()
-            .await
-            .insert(recovering.clone(), tombstone_at);
+        trigger.timed_out_redemptions.write().await.insert(
+            recovering.clone(),
+            TimeoutTombstone {
+                symbol: symbol.clone(),
+                timed_out_at: tombstone_at,
+            },
+        );
 
         let failed = EquityRedemption::Failed {
             symbol: symbol.clone(),
@@ -6343,11 +6547,13 @@ mod tests {
         // Timeout shape: available debited to 90, in-flight cleared, tombstoned.
         *trigger.inventory.write().await =
             InventoryView::default().with_equity(symbol.clone(), shares(0), shares(90));
-        trigger
-            .timed_out_mints
-            .write()
-            .await
-            .insert(mint_id.clone(), tombstone_at);
+        trigger.timed_out_mints.write().await.insert(
+            mint_id.clone(),
+            TimeoutTombstone {
+                symbol: symbol.clone(),
+                timed_out_at: tombstone_at,
+            },
+        );
         trigger
             .suppressed_inflight_symbols
             .write()
@@ -6392,8 +6598,13 @@ mod tests {
         // The tombstone + suppressed marker are restored and the in-flight is
         // re-cleared without crediting available (it stays debited at 90).
         assert_eq!(
-            trigger.timed_out_mints.read().await.get(&mint_id),
-            Some(&tombstone_at)
+            trigger
+                .timed_out_mints
+                .read()
+                .await
+                .get(&mint_id)
+                .map(|tombstone| tombstone.timed_out_at),
+            Some(tombstone_at)
         );
         assert!(
             trigger
@@ -6432,11 +6643,13 @@ mod tests {
         // Timeout cleared the MarketMaking in-flight and tombstoned; 90/0.
         *trigger.inventory.write().await =
             InventoryView::default().with_equity(symbol.clone(), shares(90), shares(0));
-        trigger
-            .timed_out_redemptions
-            .write()
-            .await
-            .insert(redemption_id.clone(), tombstone_at);
+        trigger.timed_out_redemptions.write().await.insert(
+            redemption_id.clone(),
+            TimeoutTombstone {
+                symbol: symbol.clone(),
+                timed_out_at: tombstone_at,
+            },
+        );
         trigger
             .suppressed_inflight_symbols
             .write()
@@ -6486,8 +6699,9 @@ mod tests {
                 .timed_out_redemptions
                 .read()
                 .await
-                .get(&redemption_id),
-            Some(&tombstone_at)
+                .get(&redemption_id)
+                .map(|tombstone| tombstone.timed_out_at),
+            Some(tombstone_at)
         );
         let inventory = trigger.inventory.read().await;
         assert_eq!(
@@ -20515,12 +20729,13 @@ mod tests {
         let mut redemptions = BTreeMap::new();
         redemptions.insert(symbol.clone(), shares(10));
 
-        let stale_snapshot_time = *trigger
+        let stale_snapshot_time = trigger
             .timed_out_redemptions
             .read()
             .await
             .get(&id)
-            .expect("timeout should record a cleanup timestamp");
+            .expect("timeout should record a cleanup timestamp")
+            .timed_out_at;
 
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -20553,6 +20768,7 @@ mod tests {
             .await
             .get(&id)
             .expect("timeout should record a cleanup timestamp")
+            .timed_out_at
             .checked_add_signed(ChronoDuration::seconds(1))
             .expect("timestamp arithmetic should succeed");
 
@@ -20637,12 +20853,13 @@ mod tests {
             "timeout cleanup should still allow the next redemption trigger"
         );
 
-        let cleared_at = *trigger
+        let cleared_at = trigger
             .timed_out_redemptions
             .read()
             .await
             .get(&id)
-            .expect("timeout cleanup should record a tombstone timestamp");
+            .expect("timeout cleanup should record a tombstone timestamp")
+            .timed_out_at;
 
         let snapshot_id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
@@ -20963,11 +21180,13 @@ mod tests {
                 .await
         });
 
-        trigger
-            .timed_out_mints
-            .write()
-            .await
-            .insert(id.clone(), Utc::now());
+        trigger.timed_out_mints.write().await.insert(
+            id.clone(),
+            TimeoutTombstone {
+                symbol: symbol.clone(),
+                timed_out_at: Utc::now(),
+            },
+        );
         drop(sync_guard);
 
         event_task.await.unwrap().unwrap();
@@ -21139,11 +21358,13 @@ mod tests {
                 .await
         });
 
-        trigger
-            .timed_out_redemptions
-            .write()
-            .await
-            .insert(id.clone(), Utc::now());
+        trigger.timed_out_redemptions.write().await.insert(
+            id.clone(),
+            TimeoutTombstone {
+                symbol: symbol.clone(),
+                timed_out_at: Utc::now(),
+            },
+        );
         drop(sync_guard);
 
         event_task.await.unwrap().unwrap();
@@ -21464,16 +21685,20 @@ mod tests {
             .write()
             .await
             .insert(symbol.clone(), stale_time);
-        trigger
-            .timed_out_mints
-            .write()
-            .await
-            .insert(mint_id, stale_time);
-        trigger
-            .timed_out_redemptions
-            .write()
-            .await
-            .insert(redemption_id, stale_time);
+        trigger.timed_out_mints.write().await.insert(
+            mint_id,
+            TimeoutTombstone {
+                symbol: symbol.clone(),
+                timed_out_at: stale_time,
+            },
+        );
+        trigger.timed_out_redemptions.write().await.insert(
+            redemption_id,
+            TimeoutTombstone {
+                symbol: symbol.clone(),
+                timed_out_at: stale_time,
+            },
+        );
         trigger
             .timed_out_usdc_rebalances
             .write()
@@ -24014,5 +24239,581 @@ mod tests {
             "a gate seeded before the boot seam must not starve hydration; \
              None means guard 1 was live while the snapshot replayed"
         );
+    }
+
+    #[tokio::test]
+    async fn mint_completion_with_wiped_inflight_defers_to_snapshot() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // Post-recovery shape: the mint's Hedging inflight reservation was
+        // wiped by a snapshot-error reset while the saga kept running --
+        // available already debited, inflight zero.
+        let reactor = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(0), shares(90)),
+            &symbol,
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = issuer_request_id("mint-deferred-completion");
+
+        trigger.mint_tracking.write().await.insert(
+            id.clone(),
+            MintTracking {
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                tokenization_request_id: None,
+                stage: MintTrackingStage::Accepted,
+                last_progress_at: Utc::now(),
+            },
+        );
+
+        trigger
+            .on_mint(id.clone(), make_tokens_received())
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(0)),
+            "a deferred completion must skip the immediate destination credit; \
+             the next onchain snapshot poll records the arrival"
+        );
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(90)),
+            "a deferred completion must leave the source available untouched"
+        );
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+            "a deferred completion must leave no residual inflight so \
+             snapshot polls resume healing"
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn mint_completion_with_partial_inflight_defers_and_zeroes_residual() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let reactor = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(0), shares(90)),
+            &symbol,
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = issuer_request_id("mint-partial-inflight-completion");
+
+        // An InflightEquity poll partially re-established the reservation
+        // (3 of the 10 being minted) after recovery wiped it.
+        {
+            let mut inventory = trigger.inventory.write().await;
+            *inventory = inventory
+                .clone()
+                .update_equity(
+                    &symbol,
+                    Inventory::set_inflight(Venue::Hedging, shares(3)),
+                    Utc::now(),
+                )
+                .unwrap();
+        }
+
+        trigger.mint_tracking.write().await.insert(
+            id.clone(),
+            MintTracking {
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                tokenization_request_id: None,
+                stage: MintTrackingStage::Accepted,
+                last_progress_at: Utc::now(),
+            },
+        );
+
+        trigger
+            .on_mint(id.clone(), make_tokens_received())
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+            "an under-reserved completion must zero the residual inflight so \
+             has_inflight clears and snapshot polls resume"
+        );
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(0)),
+            "an under-reserved completion must not credit the destination"
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn mint_completion_with_destination_overflow_hard_fails_and_leaves_guard_latched() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let id = issuer_request_id("mint-destination-overflow");
+        let max_positive = FractionalShares::new(Float::max_positive_value().unwrap());
+
+        // Canonical mid-mint shape except at Float's ceiling: Hedging
+        // available already debited, the full quantity reserved as Hedging
+        // inflight (so the inflight debit succeeds and only the destination
+        // credit overflows).
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), max_positive, FractionalShares::ZERO)
+            .update_equity(
+                &symbol,
+                Inventory::set_inflight(Venue::Hedging, max_positive),
+                Utc::now(),
+            )
+            .unwrap()
+            .set_active_mint(symbol.clone(), id.clone());
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+
+        {
+            let mut guard = trigger.equity_in_progress.write().unwrap();
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
+        }
+        trigger.mint_tracking.write().await.insert(
+            id.clone(),
+            MintTracking {
+                symbol: symbol.clone(),
+                quantity: max_positive,
+                tokenization_request_id: None,
+                stage: MintTrackingStage::Accepted,
+                last_progress_at: Utc::now(),
+            },
+        );
+
+        let error = trigger
+            .on_mint(id.clone(), make_tokens_received())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RebalancingServiceError::Inventory(InventoryViewError::Equity(
+                    InventoryError::Arithmetic(_)
+                ))
+            ),
+            "expected a generic Arithmetic InventoryError from destination \
+             overflow, got {error:?}"
+        );
+        assert!(
+            trigger.mint_tracking.read().await.contains_key(&id),
+            "a hard failure outside InsufficientInflight must leave tracking \
+             context in place for investigation"
+        );
+        assert_eq!(
+            trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .get(&symbol)
+                .cloned(),
+            Some(equity::GuardState::ActiveTransfer { generation: 0 }),
+            "a hard failure outside InsufficientInflight must leave the \
+             in-progress guard latched, not silently clear it"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.active_mint(&symbol),
+            Some(&id),
+            "a hard failure outside InsufficientInflight must leave the \
+             active mint in place"
+        );
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(max_positive),
+            "the failed update must apply nothing: the Hedging inflight \
+             debit must not land without its destination credit"
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn redemption_completion_with_wiped_inflight_defers_and_skips_usdc_recheck() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let reactor = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(90), shares(0)),
+            &symbol,
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = redemption_aggregate_id("redemption-deferred-completion");
+
+        {
+            let mut guard = trigger.equity_in_progress.write().unwrap();
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer { generation: 0 },
+            );
+        }
+        trigger.redemption_tracking.write().await.insert(
+            id.clone(),
+            RedemptionTracking {
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                tokenization_request_id: None,
+                redemption_tx: Some(TxHash::random()),
+                stage: RedemptionTrackingStage::TokensSent,
+                last_progress_at: Utc::now(),
+            },
+        );
+
+        trigger
+            .on_redemption(id.clone(), make_redemption_completed())
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(0)),
+            "a deferred completion must skip the immediate Hedging credit; \
+             the next offchain snapshot poll records the arrival"
+        );
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::ZERO),
+            "a deferred completion must leave no residual inflight so \
+             snapshot polls resume healing"
+        );
+        drop(inventory);
+
+        assert!(
+            !trigger.redemption_tracking.read().await.contains_key(&id),
+            "the terminal event must still drop tracking despite the deferred \
+             settlement"
+        );
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
+            "the terminal event must still clear the in-progress guard \
+             despite the deferred settlement"
+        );
+
+        let pending_usdc_checks = sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<UsdcRebalancingCheck>())
+        .fetch_one(trigger.usdc_scheduler.queue().pool())
+        .await
+        .expect("count pending USDC-check jobs");
+        assert_eq!(
+            pending_usdc_checks, 0,
+            "a deferred settlement must skip the immediate USDC recheck: the \
+             view does not reflect the settlement until the next snapshot poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_shortfall_cancel_with_wiped_inflight_defers() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let reactor = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(90), shares(0)),
+            &symbol,
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = redemption_aggregate_id("redemption-deferred-shortfall");
+
+        trigger.redemption_tracking.write().await.insert(
+            id.clone(),
+            RedemptionTracking {
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                tokenization_request_id: None,
+                redemption_tx: Some(TxHash::random()),
+                stage: RedemptionTrackingStage::TokensSent,
+                last_progress_at: Utc::now(),
+            },
+        );
+
+        let unwrapped_less_than_tracked = EquityRedemptionEvent::TokensUnwrapped {
+            quantity: Some(float!(8)),
+            underlying_token: Address::random(),
+            unwrap_tx_hash: TxHash::random(),
+            unwrapped_amount: U256::from(8_000_000_000_000_000_000_u128),
+            unwrap_block: None,
+            unwrapped_at: Utc::now(),
+        };
+
+        trigger
+            .on_redemption(id.clone(), unwrapped_less_than_tracked)
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::ZERO),
+            "a shortfall cancel against a wiped reservation must defer and \
+             leave inflight at zero instead of erroring"
+        );
+        drop(inventory);
+
+        assert!(
+            trigger.redemption_tracking.read().await.contains_key(&id),
+            "a deferred shortfall cancel must not abort the reactor arm; \
+             tracking survives the non-terminal event"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_mint_completion_after_timeout_clears_tombstone_and_requeues_check() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let reactor = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = issuer_request_id("late-mint-completion");
+
+        trigger.timed_out_mints.write().await.insert(
+            id.clone(),
+            TimeoutTombstone {
+                symbol: symbol.clone(),
+                timed_out_at: Utc::now(),
+            },
+        );
+        trigger
+            .suppressed_inflight_symbols
+            .write()
+            .await
+            .insert(symbol.clone(), Utc::now());
+
+        trigger
+            .on_mint(id.clone(), make_tokens_received())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.timed_out_mints.read().await.contains_key(&id),
+            "a late completion proves the transfer was genuinely live; the \
+             tombstone must clear"
+        );
+        assert!(
+            !trigger
+                .suppressed_inflight_symbols
+                .read()
+                .await
+                .contains_key(&symbol),
+            "inflight suppression must lift so snapshot polls resume \
+             recording the symbol"
+        );
+
+        let pending_equity_checks = sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<EquityRebalancingCheck>())
+        .fetch_one(trigger.equity_scheduler.queue().pool())
+        .await
+        .expect("count pending equity-check jobs");
+        assert_eq!(
+            pending_equity_checks, 1,
+            "a late completion must requeue an equity recheck for the symbol"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_mint_progress_event_after_timeout_stays_ignored() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let reactor = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = issuer_request_id("late-mint-progress");
+
+        trigger.timed_out_mints.write().await.insert(
+            id.clone(),
+            TimeoutTombstone {
+                symbol: symbol.clone(),
+                timed_out_at: Utc::now(),
+            },
+        );
+        trigger
+            .suppressed_inflight_symbols
+            .write()
+            .await
+            .insert(symbol.clone(), Utc::now());
+
+        trigger
+            .on_mint(id.clone(), make_mint_accepted())
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.timed_out_mints.read().await.contains_key(&id),
+            "a late non-completion event must leave the tombstone in place"
+        );
+        assert!(
+            trigger
+                .suppressed_inflight_symbols
+                .read()
+                .await
+                .contains_key(&symbol),
+            "a late non-completion event must leave inflight suppression \
+             in place"
+        );
+        assert!(
+            !trigger.mint_tracking.read().await.contains_key(&id),
+            "a late non-completion event must not recreate tracking"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_redemption_completion_after_timeout_clears_tombstone_and_requeues_check() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let reactor = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = redemption_aggregate_id("late-redemption-completion");
+
+        trigger.timed_out_redemptions.write().await.insert(
+            id.clone(),
+            TimeoutTombstone {
+                symbol: symbol.clone(),
+                timed_out_at: Utc::now(),
+            },
+        );
+        trigger
+            .suppressed_inflight_symbols
+            .write()
+            .await
+            .insert(symbol.clone(), Utc::now());
+
+        trigger
+            .on_redemption(id.clone(), make_redemption_completed())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.timed_out_redemptions.read().await.contains_key(&id),
+            "a late completion proves the transfer was genuinely live; the \
+             tombstone must clear"
+        );
+        assert!(
+            !trigger
+                .suppressed_inflight_symbols
+                .read()
+                .await
+                .contains_key(&symbol),
+            "inflight suppression must lift so snapshot polls resume \
+             recording the symbol"
+        );
+
+        let pending_equity_checks = sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<EquityRebalancingCheck>())
+        .fetch_one(trigger.equity_scheduler.queue().pool())
+        .await
+        .expect("count pending equity-check jobs");
+        assert_eq!(
+            pending_equity_checks, 1,
+            "a late completion must requeue an equity recheck for the symbol"
+        );
+    }
+
+    /// End-to-end shape of the RAI-1503 hazard: a live mint's inflight
+    /// reservation is wiped by real snapshot-error recovery (not a hand-built
+    /// post-reset state) while the saga keeps running, and the completion
+    /// that follows must defer instead of erroring and stranding the
+    /// movement unrecorded.
+    #[tokio::test]
+    async fn recovery_reset_then_mint_completion_defers_instead_of_stranding() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let reactor = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(0), shares(100)),
+            &symbol,
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = issuer_request_id("recovery-then-completion");
+
+        // A live mint: tracking at Accepted, with the Hedging available moved
+        // into inflight exactly as MintAccepted's reactor arm does.
+        trigger.mint_tracking.write().await.insert(
+            id.clone(),
+            MintTracking {
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                tokenization_request_id: None,
+                stage: MintTrackingStage::Accepted,
+                last_progress_at: Utc::now(),
+            },
+        );
+        {
+            let mut inventory = trigger.inventory.write().await;
+            *inventory = inventory
+                .clone()
+                .update_equity(
+                    &symbol,
+                    Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(10)),
+                    Utc::now(),
+                )
+                .unwrap();
+        }
+
+        // Snapshot-error recovery resets the view -- deliberately dropping the
+        // inflight reservation -- and force-applies the failed snapshot.
+        let error = RebalancingServiceError::Inventory(InventoryViewError::Equity(
+            InventoryError::InsufficientAvailable {
+                requested: shares(1),
+                available: shares(0),
+            },
+        ));
+        trigger
+            .on_snapshot_recovery(
+                error,
+                InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(symbol.clone(), shares(90))]),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The mint saga completes in the real world.
+        trigger
+            .on_mint(id.clone(), make_tokens_received())
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(90)),
+            "the deferred completion must leave the force-applied broker \
+             value untouched"
+        );
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            None,
+            "the deferred completion must not conjure a destination credit; \
+             the next onchain snapshot poll records the arrival"
+        );
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+            "no residual inflight may survive, so has_inflight clears and \
+             later snapshot polls keep healing"
+        );
+        drop(inventory);
     }
 }
