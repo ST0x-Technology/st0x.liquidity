@@ -11,7 +11,7 @@ use alloy::consensus::{SignableTransaction, TxEnvelope};
 use alloy::eips::eip2718::{Decodable2718, Eip2718Error};
 use alloy::network::{Ethereum, EthereumWallet, TxSigner};
 use alloy::primitives::{
-    Address, B256, Bytes, ChainId, Signature, SignatureError, TxHash, hex, keccak256,
+    Address, B256, Bytes, ChainId, Signature, SignatureError, TxHash, U256, hex, keccak256,
 };
 use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
@@ -29,9 +29,10 @@ use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 use tracing::{info, trace};
 use turnkey_api_key_stamper::{Stamp, StampHeader, TurnkeyP256ApiKey};
 use turnkey_client::generated::{
-    Activity, ActivityResponse, ActivityStatus, SignTransactionIntentV2, SignTransactionRequest,
-    immutable::activity::v1::{SignTransactionResult, result},
-    immutable::common::v1::TransactionType,
+    Activity, ActivityResponse, ActivityStatus, SignRawPayloadIntentV2, SignRawPayloadRequest,
+    SignTransactionIntentV2, SignTransactionRequest,
+    immutable::activity::v1::{SignRawPayloadResult, SignTransactionResult, result},
+    immutable::common::v1::{HashFunction, PayloadEncoding, TransactionType},
 };
 use turnkey_client::{RetryConfig, TurnkeyClientError};
 
@@ -100,6 +101,16 @@ pub enum TracingTurnkeySignerError {
     MissingTxChainId,
     #[error("system time is before UNIX epoch: {source}")]
     SystemTime { source: SystemTimeError },
+    #[error(
+        "Turnkey raw-payload signature component `{component}` is not a valid \
+         32-byte scalar"
+    )]
+    InvalidRawSignatureScalar { component: &'static str },
+    #[error(
+        "Turnkey raw-payload recovery id `{value}` is not a recognized parity \
+         (expected 00/01 or 1b/1c)"
+    )]
+    InvalidRecoveryId { value: String },
 }
 
 /// Non-secret Turnkey configuration: wallet address and organization ID.
@@ -171,6 +182,11 @@ pub struct TurnkeyWallet<P: Provider> {
     /// build two transactions at the same nonce. Shared across clones so
     /// every handle to the same address contends on one lock.
     send_lock: Arc<Mutex<()>>,
+    /// Second handle to the signer (sharing the transaction signer's HTTP
+    /// client via `Arc`) for detached-digest signing
+    /// ([`Wallet::sign_digest`]) -- the transaction copy is consumed by
+    /// the `EthereumWallet` inside `signing_provider`.
+    digest_signer: TracingTurnkeySigner,
     address: Address,
     required_confirmations: u64,
 }
@@ -212,6 +228,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
         )
         .map_err(TurnkeyError::from)?;
 
+        let digest_signer = signer.clone();
         let eth_wallet = EthereumWallet::from(signer);
 
         let base_provider = ctx.provider.clone();
@@ -236,6 +253,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
             nonce_manager,
             in_flight: InFlightNonces::default(),
             send_lock: Arc::new(Mutex::new(())),
+            digest_signer,
             address,
             required_confirmations,
         })
@@ -257,6 +275,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
 
         let signer = TracingTurnkeySigner::new(client, organization_id, address, Some(chain_id));
 
+        let digest_signer = signer.clone();
         let eth_wallet = EthereumWallet::from(signer);
 
         let base_provider = provider.clone();
@@ -277,6 +296,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
             nonce_manager,
             in_flight: InFlightNonces::default(),
             send_lock: Arc::new(Mutex::new(())),
+            digest_signer,
             address,
             required_confirmations,
         })
@@ -377,6 +397,36 @@ impl TracingTurnkeyClient {
 
         match inner {
             result::Inner::SignTransactionResult(result) => Ok(result),
+            other => Err(TurnkeyClientError::UnexpectedInnerActivityResult(
+                serde_json::to_string(&other)?,
+            )),
+        }
+    }
+
+    async fn sign_raw_payload(
+        &self,
+        organization_id: TurnkeyOrganizationId,
+        timestamp_ms: u128,
+        params: SignRawPayloadIntentV2,
+    ) -> Result<SignRawPayloadResult, TurnkeyClientError> {
+        let TurnkeyOrganizationId(organization_id) = organization_id;
+        let request = SignRawPayloadRequest {
+            r#type: "ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2".to_string(),
+            timestamp_ms: timestamp_ms.to_string(),
+            parameters: Some(params),
+            organization_id,
+        };
+        let activity = self
+            .process_activity(&request, "/public/v1/submit/sign_raw_payload")
+            .await?;
+        let inner = activity
+            .result
+            .ok_or(TurnkeyClientError::MissingResult)?
+            .inner
+            .ok_or(TurnkeyClientError::MissingInnerResult)?;
+
+        match inner {
+            result::Inner::SignRawPayloadResult(result) => Ok(result),
             other => Err(TurnkeyClientError::UnexpectedInnerActivityResult(
                 serde_json::to_string(&other)?,
             )),
@@ -509,8 +559,13 @@ impl TracingTurnkeyClient {
     }
 }
 
+/// `Clone` (via the `Arc`'d client) so [`TurnkeyWallet`] can keep one copy
+/// for detached-digest signing while a second lives inside the
+/// `EthereumWallet` for transaction signing -- both share the same HTTP
+/// client and credentials.
+#[derive(Clone)]
 struct TracingTurnkeySigner {
-    client: TracingTurnkeyClient,
+    client: Arc<TracingTurnkeyClient>,
     organization_id: TurnkeyOrganizationId,
     address: Address,
     chain_id: Option<ChainId>,
@@ -535,7 +590,7 @@ impl TracingTurnkeySigner {
         chain_id: Option<ChainId>,
     ) -> Self {
         Self {
-            client,
+            client: Arc::new(client),
             organization_id,
             address,
             chain_id,
@@ -582,6 +637,94 @@ impl TracingTurnkeySigner {
         }
 
         Ok(signature)
+    }
+
+    /// Signs a precomputed 32-byte digest via Turnkey's raw-payload
+    /// activity. The payload is transmitted as the bare digest hex with
+    /// `HASH_FUNCTION_NO_OP`: the digest already IS the final hash (e.g.
+    /// an EIP-712 signing hash), so Turnkey must sign it as-is rather
+    /// than hashing again.
+    async fn sign_digest(&self, digest: B256) -> Result<Signature, TracingTurnkeySignerError> {
+        let response = self
+            .client
+            .sign_raw_payload(
+                self.organization_id.clone(),
+                TracingTurnkeyClient::current_timestamp()?,
+                SignRawPayloadIntentV2 {
+                    sign_with: self.address.to_string(),
+                    payload: hex::encode(digest),
+                    encoding: PayloadEncoding::Hexadecimal,
+                    hash_function: HashFunction::NoOp,
+                },
+            )
+            .await?;
+
+        Self::parse_raw_signature(&response, digest, self.address)
+    }
+
+    /// Assembles Turnkey's raw-payload `r`/`s`/`v` components into a
+    /// [`Signature`], verifying it actually recovers to `expected_signer`
+    /// over `digest` -- the same defensive check
+    /// [`parse_signature`](Self::parse_signature) performs for
+    /// transactions, turning "trust Turnkey's components" into
+    /// "cryptographically verify they sign what we asked, by us". The
+    /// check also fails closed on any mis-parse of the components
+    /// themselves.
+    fn parse_raw_signature(
+        response: &SignRawPayloadResult,
+        digest: B256,
+        expected_signer: Address,
+    ) -> Result<Signature, TracingTurnkeySignerError> {
+        let r = Self::parse_signature_scalar(&response.r, "r")?;
+        let s = Self::parse_signature_scalar(&response.s, "s")?;
+        let parity = Self::parse_recovery_parity(&response.v)?;
+
+        let signature = Signature::new(r, s, parity);
+        let recovered = signature.recover_address_from_prehash(&digest)?;
+
+        if recovered != expected_signer {
+            return Err(TracingTurnkeySignerError::SignerAddressMismatch {
+                expected: expected_signer,
+                recovered,
+            });
+        }
+
+        Ok(signature)
+    }
+
+    /// Turnkey returns `r`/`s` as full 32-byte big-endian hex; anything
+    /// shorter or longer is malformed and rejected here with a precise
+    /// error rather than being zero-extended into a signature that only
+    /// fails later at the recovered-address check.
+    fn parse_signature_scalar(
+        hex_scalar: &str,
+        component: &'static str,
+    ) -> Result<U256, TracingTurnkeySignerError> {
+        let bytes = hex::decode(hex_scalar)?;
+        let scalar: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| TracingTurnkeySignerError::InvalidRawSignatureScalar { component })?;
+
+        Ok(U256::from_be_bytes(scalar))
+    }
+
+    /// Turnkey documents `v` as the recovery id (`00`/`01`); the
+    /// Ethereum-style `1b`/`1c` (27/28) spelling is accepted too so a
+    /// provider-side representation change cannot silently flip parity.
+    /// Only these four one-byte encodings are accepted: anything else --
+    /// including an empty value, which `hex::decode` happily produces from
+    /// an empty or missing field -- fails loudly rather than guessing.
+    fn parse_recovery_parity(hex_value: &str) -> Result<bool, TracingTurnkeySignerError> {
+        let bytes = hex::decode(hex_value)?;
+
+        match bytes.as_slice() {
+            [0x00 | 0x1b] => Ok(false),
+            [0x01 | 0x1c] => Ok(true),
+            _ => Err(TracingTurnkeySignerError::InvalidRecoveryId {
+                value: hex_value.to_string(),
+            }),
+        }
     }
 }
 
@@ -664,6 +807,14 @@ where
         self.address
     }
 
+    async fn sign_digest(&self, digest: B256) -> Result<Signature, EvmError> {
+        Ok(self
+            .digest_signer
+            .sign_digest(digest)
+            .await
+            .map_err(TurnkeyError::from)?)
+    }
+
     async fn send_pending(
         &self,
         contract: Address,
@@ -732,6 +883,7 @@ mod tests {
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::{TxKind, U256};
     use alloy::providers::ext::AnvilApi;
+    use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
     use httpmock::MockServer;
 
@@ -820,6 +972,28 @@ mod tests {
                 "fingerprint": "fingerprint",
                 "result": {
                     "signTransactionResult": { "signedTransaction": signed_transaction_hex }
+                }
+            }
+        })
+    }
+
+    /// JSON body for a COMPLETED `sign_raw_payload` activity carrying the
+    /// given signature's r/s/v components, shaped like a real Turnkey
+    /// response (`v` is the recovery id, `00`/`01`).
+    fn completed_sign_raw_payload_body(signature: &Signature) -> serde_json::Value {
+        serde_json::json!({
+            "activity": {
+                "id": "activity-id",
+                "organizationId": "org-test",
+                "status": "ACTIVITY_STATUS_COMPLETED",
+                "type": "ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2",
+                "fingerprint": "fingerprint",
+                "result": {
+                    "signRawPayloadResult": {
+                        "r": hex::encode(signature.r().to_be_bytes::<32>()),
+                        "s": hex::encode(signature.s().to_be_bytes::<32>()),
+                        "v": if signature.v() { "01" } else { "00" },
+                    }
                 }
             }
         })
@@ -999,6 +1173,264 @@ mod tests {
             TracingTurnkeySignerError::SignerAddressMismatch { expected, recovered }
                 if expected == key_signer.address() && recovered != key_signer.address()
         ));
+    }
+
+    /// The full raw-payload round trip: the request must carry the bare
+    /// digest hex with `HASH_FUNCTION_NO_OP` (the digest is already the
+    /// final hash -- re-hashing would sign the wrong message), and the
+    /// r/s/v response must assemble into exactly the signature the
+    /// "enclave" key produced.
+    #[tokio::test]
+    async fn sign_digest_returns_signature_from_completed_activity() {
+        let key_signer = PrivateKeySigner::random();
+        let address = key_signer.address();
+        let digest = keccak256(b"detached digest");
+        let expected_signature = key_signer.sign_hash(&digest).await.unwrap();
+
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method("POST")
+                .path("/public/v1/submit/sign_raw_payload")
+                .json_body_includes(
+                    serde_json::json!({
+                        "type": "ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2",
+                        "parameters": {
+                            "signWith": address.to_string(),
+                            "payload": hex::encode(digest),
+                            "encoding": "PAYLOAD_ENCODING_HEXADECIMAL",
+                            "hashFunction": "HASH_FUNCTION_NO_OP",
+                        }
+                    })
+                    .to_string(),
+                );
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(completed_sign_raw_payload_body(&expected_signature));
+        });
+
+        let signer = TracingTurnkeySigner::new(
+            mock_client(&server),
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            address,
+            Some(8453),
+        );
+
+        let signature = signer.sign_digest(digest).await.unwrap();
+
+        mock.assert();
+        assert_eq!(signature, expected_signature);
+        assert_eq!(
+            signature.recover_address_from_prehash(&digest).unwrap(),
+            address
+        );
+    }
+
+    /// The same trust boundary as transaction signing: components that
+    /// recover to someone else's key -- however well-formed -- must be
+    /// rejected, never returned.
+    #[tokio::test]
+    async fn sign_digest_rejects_signature_from_wrong_signer() {
+        let configured_signer = PrivateKeySigner::random();
+        let different_signer = PrivateKeySigner::random();
+        let digest = keccak256(b"detached digest");
+        let foreign_signature = different_signer.sign_hash(&digest).await.unwrap();
+
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method("POST")
+                .path("/public/v1/submit/sign_raw_payload");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(completed_sign_raw_payload_body(&foreign_signature));
+        });
+
+        let signer = TracingTurnkeySigner::new(
+            mock_client(&server),
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            configured_signer.address(),
+            Some(8453),
+        );
+
+        let error = signer.sign_digest(digest).await.unwrap_err();
+
+        mock.assert();
+        assert!(matches!(
+            error,
+            TracingTurnkeySignerError::SignerAddressMismatch { expected, recovered }
+                if expected == configured_signer.address()
+                    && recovered == different_signer.address()
+        ));
+    }
+
+    /// Turnkey documents `v` as the recovery id (`00`/`01`), but the
+    /// Ethereum-style 27/28 spelling must assemble to the same parity --
+    /// a provider-side representation change must not flip signatures.
+    #[tokio::test]
+    async fn parse_raw_signature_accepts_ethereum_style_recovery_id() {
+        let key_signer = PrivateKeySigner::random();
+        let digest = keccak256(b"detached digest");
+        let signature = key_signer.sign_hash(&digest).await.unwrap();
+
+        let response = SignRawPayloadResult {
+            r: hex::encode(signature.r().to_be_bytes::<32>()),
+            s: hex::encode(signature.s().to_be_bytes::<32>()),
+            v: if signature.v() { "1c" } else { "1b" }.to_string(),
+        };
+
+        let parsed =
+            TracingTurnkeySigner::parse_raw_signature(&response, digest, key_signer.address())
+                .unwrap();
+
+        assert_eq!(parsed, signature);
+    }
+
+    #[tokio::test]
+    async fn parse_raw_signature_rejects_unknown_recovery_id() {
+        let key_signer = PrivateKeySigner::random();
+        let digest = keccak256(b"detached digest");
+        let signature = key_signer.sign_hash(&digest).await.unwrap();
+
+        let response = SignRawPayloadResult {
+            r: hex::encode(signature.r().to_be_bytes::<32>()),
+            s: hex::encode(signature.s().to_be_bytes::<32>()),
+            v: "05".to_string(),
+        };
+
+        let error =
+            TracingTurnkeySigner::parse_raw_signature(&response, digest, key_signer.address())
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TracingTurnkeySignerError::InvalidRecoveryId { value } if value == "05"
+        ));
+    }
+
+    /// `hex::decode("")` succeeds with an empty vector, so a response with
+    /// a missing or empty `v` field must be rejected explicitly -- not
+    /// silently parsed as parity 0.
+    #[tokio::test]
+    async fn parse_raw_signature_rejects_empty_recovery_id() {
+        let key_signer = PrivateKeySigner::random();
+        let digest = keccak256(b"detached digest");
+        let signature = key_signer.sign_hash(&digest).await.unwrap();
+
+        let response = SignRawPayloadResult {
+            r: hex::encode(signature.r().to_be_bytes::<32>()),
+            s: hex::encode(signature.s().to_be_bytes::<32>()),
+            v: String::new(),
+        };
+
+        let error =
+            TracingTurnkeySigner::parse_raw_signature(&response, digest, key_signer.address())
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TracingTurnkeySignerError::InvalidRecoveryId { value } if value.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn parse_raw_signature_rejects_oversized_scalar() {
+        let key_signer = PrivateKeySigner::random();
+        let digest = keccak256(b"detached digest");
+        let signature = key_signer.sign_hash(&digest).await.unwrap();
+
+        // 33 bytes: one more than a 32-byte scalar can hold.
+        let response = SignRawPayloadResult {
+            r: hex::encode([0x11u8; 33]),
+            s: hex::encode(signature.s().to_be_bytes::<32>()),
+            v: "00".to_string(),
+        };
+
+        let error =
+            TracingTurnkeySigner::parse_raw_signature(&response, digest, key_signer.address())
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TracingTurnkeySignerError::InvalidRawSignatureScalar { component: "r" }
+        ));
+    }
+
+    /// Turnkey pads scalars to 32 bytes; a short component must be
+    /// rejected with a precise error, not zero-extended into a signature
+    /// that only fails later at the recovered-address check.
+    #[tokio::test]
+    async fn parse_raw_signature_rejects_short_scalar() {
+        let key_signer = PrivateKeySigner::random();
+        let digest = keccak256(b"detached digest");
+        let signature = key_signer.sign_hash(&digest).await.unwrap();
+
+        // 31 bytes: one short of a full scalar.
+        let response = SignRawPayloadResult {
+            r: hex::encode(signature.r().to_be_bytes::<32>()),
+            s: hex::encode([0x22u8; 31]),
+            v: "00".to_string(),
+        };
+
+        let error =
+            TracingTurnkeySigner::parse_raw_signature(&response, digest, key_signer.address())
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TracingTurnkeySignerError::InvalidRawSignatureScalar { component: "s" }
+        ));
+    }
+
+    #[test]
+    fn parse_raw_signature_rejects_invalid_hex_component() {
+        let response = SignRawPayloadResult {
+            r: "not-hex".to_string(),
+            s: hex::encode([0x22u8; 32]),
+            v: "00".to_string(),
+        };
+
+        let error =
+            TracingTurnkeySigner::parse_raw_signature(&response, B256::ZERO, Address::random())
+                .unwrap_err();
+
+        assert!(matches!(error, TracingTurnkeySignerError::Hex(_)));
+    }
+
+    /// Wallet-level wiring: `TurnkeyWallet::sign_digest` must route through
+    /// the stored `digest_signer` (the clone sharing the transaction
+    /// signer's client), not panic or hit the transaction path.
+    #[tokio::test]
+    async fn turnkey_wallet_signs_digest_via_raw_payload_activity() {
+        let key_signer = PrivateKeySigner::random();
+        let address = key_signer.address();
+        let digest = keccak256(b"wallet-level digest");
+        let expected_signature = key_signer.sign_hash(&digest).await.unwrap();
+
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method("POST")
+                .path("/public/v1/submit/sign_raw_payload");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(completed_sign_raw_payload_body(&expected_signature));
+        });
+
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+
+        let wallet = TurnkeyWallet::from_client(
+            mock_client(&server),
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            address,
+            provider,
+            1,
+        )
+        .await
+        .unwrap();
+
+        let signature = wallet.sign_digest(digest).await.unwrap();
+
+        mock.assert();
+        assert_eq!(signature, expected_signature);
     }
 
     #[tokio::test]
@@ -1407,6 +1839,38 @@ mod tests {
         .expect("failed to construct TurnkeyWallet from env vars");
 
         (wallet, anvil)
+    }
+
+    /// Proves the raw-payload activity against the REAL Turnkey API: the
+    /// request shape, the org's policy allowance for `SIGN_RAW_PAYLOAD`
+    /// (a separate policy surface from transaction signing), and the
+    /// payload encoding -- the digest is sent as unprefixed lowercase hex
+    /// (matching the prod-proven transaction path), and only the real
+    /// endpoint can prove `PAYLOAD_ENCODING_HEXADECIMAL` accepts it, since
+    /// the mocked tests pin whatever we send. Run this before any
+    /// production cutover that depends on digest signing -- it is the
+    /// preflight for a path whose routine tests all use the private-key
+    /// backend.
+    #[ignore = "requires TURNKEY_* env vars -- run with `cargo test -- --ignored`"]
+    #[tokio::test]
+    async fn turnkey_digest_signing_integration() {
+        let (api_key, org_id, address) = turnkey_env()
+            .expect("TURNKEY_API_PRIVATE_KEY, TURNKEY_ORG_ID, and TURNKEY_ADDRESS must be set");
+
+        let (wallet, _anvil) = integration_wallet(api_key, org_id, address).await;
+
+        let digest = keccak256(b"st0x digest-signing integration test");
+
+        let signature = wallet
+            .sign_digest(digest)
+            .await
+            .expect("Turnkey raw-payload signing should succeed (policy must allow it)");
+
+        assert_eq!(
+            signature.recover_address_from_prehash(&digest).unwrap(),
+            address,
+            "signature must recover to the Turnkey-managed address"
+        );
     }
 
     #[ignore = "requires TURNKEY_* env vars -- run with `cargo test -- --ignored`"]
