@@ -1,8 +1,24 @@
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script>
+      // Pre-paint theme application: must stay in sync with the storage key
+      // and JSON encoding used by src/lib/theme.svelte.ts.
+      ;(() => {
+        let mode = null
+        try {
+          mode = JSON.parse(localStorage.getItem('theme-mode') ?? 'null')
+        } catch {
+          mode = null
+        }
+        const dark =
+          mode === 'dark' ||
+          (mode !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches)
+        document.documentElement.classList.toggle('dark', dark)
+      })()
+    </script>
     %sveltekit.head%
   </head>
   <body data-sveltekit-preload-data="hover">
