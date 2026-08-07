@@ -1767,7 +1767,7 @@ mod tests {
         AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, LogLevel, OperationMode,
         TradingMode,
     };
-    use st0x_config::{EvmCtx, IngestionCutoff, InventoryMode};
+    use st0x_config::{EvmCtx, IngestionCutoff, InventoryAdapters, InventoryMode};
     use st0x_event_sorcery::LifecycleError;
     #[cfg(feature = "test-support")]
     use st0x_evm::StubWallet;
@@ -2185,6 +2185,7 @@ mod tests {
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
             },
+            inventory_adapters: InventoryAdapters::default(),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
@@ -2256,6 +2257,7 @@ mod tests {
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
             },
+            inventory_adapters: InventoryAdapters::default(),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,

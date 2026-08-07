@@ -21,7 +21,16 @@
   import { formatDecimal } from '$lib/decimal'
   import { equityUsdTooltip } from '$lib/inventory-value'
   import { tradeRecoveryCommands } from '$lib/transfer'
-  import { mergeTradeHistory, normalizeTrade, type TradeHistoryFilter } from '$lib/trade'
+  import {
+    TRADING_VENUES,
+    fallbackTradeProtocol,
+    isOnchainVenue,
+    legacyCompatibleVenues,
+    mergeTradeHistory,
+    normalizeTrade,
+    type TradeProtocol,
+    type TradeHistoryFilter
+  } from '$lib/trade'
   import { parseTradeResponse } from '$lib/trade-payload'
 
   type TradeEvent = {
@@ -34,7 +43,7 @@
 
   const PAGE_SIZE = 100
   const POLL_INTERVAL_MS = 10_000
-  const ALL_VENUES = ['raindex', 'alpaca', 'dry_run'] as const
+  const V3_REPROBE_INTERVAL_MS = 60_000
 
   const entries = reactive<TradeEntry[]>([])
   const loading = reactive(false)
@@ -43,7 +52,7 @@
   const offset = reactive(0)
   const total = reactive(0)
   const hasMore = reactive(false)
-  const selectedVenues = reactive<Set<TradingVenue>>(new Set(ALL_VENUES))
+  const selectedVenues = reactive<Set<TradingVenue>>(new Set(TRADING_VENUES))
   const selectedSymbols = reactive<Set<string>>(new Set())
   const allSymbols = reactive<string[]>([])
   const since = reactive('')
@@ -52,6 +61,9 @@
   let sinceInput: HTMLInputElement | undefined
   let untilInput: HTMLInputElement | undefined
   let historyRequestVersion = 0
+  let preferredTradeProtocol: TradeProtocol = 'terminal_outcomes_v3'
+  let nextV3ProbeAt = 0
+  let historyTradeProtocol: TradeProtocol = 'terminal_outcomes_v3'
 
   const positionsQuery = createQuery<Position[]>(() => ({
     queryKey: ['positions'],
@@ -68,39 +80,34 @@
     )
   )
 
-  const venueLabel = (venue: string): string => {
-    switch (venue) {
-      case 'raindex':
-        return 'Raindex'
-      case 'alpaca':
-        return 'Alpaca'
-      case 'dry_run':
-        return 'DryRun'
-      default:
-        return venue
-    }
-  }
+  const venueLabels = {
+    raindex: 'Raindex',
+    bebop: 'Bebop',
+    uniswap_v4: 'Uniswap v4',
+    unknown_onchain: 'Unknown Onchain',
+    alpaca: 'Alpaca',
+    dry_run: 'DryRun'
+  } as const satisfies Record<TradingVenue, string>
 
-  const venueColor = (venue: string): string => {
-    switch (venue) {
-      case 'raindex':
-        return 'text-blue-400'
-      case 'alpaca':
-        return 'text-amber-400'
-      case 'dry_run':
-        return 'text-muted-foreground'
-      default:
-        return ''
-    }
-  }
+  const venueColors = {
+    raindex: 'text-blue-400',
+    bebop: 'text-violet-400',
+    uniswap_v4: 'text-pink-400',
+    unknown_onchain: 'text-slate-400',
+    alpaca: 'text-amber-400',
+    dry_run: 'text-muted-foreground'
+  } as const satisfies Record<TradingVenue, string>
 
-  const venueOptions = ALL_VENUES.map((venue) => ({ value: venue, label: venueLabel(venue) }))
+  const venueLabel = (venue: TradingVenue): string => venueLabels[venue]
+  const venueColor = (venue: TradingVenue): string => venueColors[venue]
+
+  const venueOptions = TRADING_VENUES.map((venue) => ({ value: venue, label: venueLabel(venue) }))
   const symbolOptions = $derived(allSymbols.current.map((sym) => ({ value: sym, label: sym })))
 
   const buildParams = (
     limit = PAGE_SIZE,
     requestOffset = offset.current,
-    protocol: 'terminal_outcomes_v2' | 'terminal_outcomes_v1' = 'terminal_outcomes_v2'
+    protocol: TradeProtocol = 'terminal_outcomes_v3'
   ): URLSearchParams => {
     const params = new URLSearchParams({
       limit: String(limit),
@@ -108,8 +115,12 @@
       trade_protocol: protocol
     })
 
-    if (selectedVenues.current.size > 0 && selectedVenues.current.size < ALL_VENUES.length) {
-      params.set('venue', [...selectedVenues.current].join(','))
+    if (selectedVenues.current.size > 0 && selectedVenues.current.size < TRADING_VENUES.length) {
+      const protocolVenues =
+        protocol === 'terminal_outcomes_v3'
+          ? selectedVenues.current
+          : legacyCompatibleVenues(selectedVenues.current)
+      params.set('venue', [...protocolVenues].join(','))
     }
 
     if (selectedSymbols.current.size > 0) {
@@ -122,15 +133,20 @@
     return params
   }
 
-  const historyFilter = (): TradeHistoryFilter => ({
-    venues: selectedVenues.current,
+  const historyFilter = (protocol: TradeProtocol = historyTradeProtocol): TradeHistoryFilter => ({
+    venues:
+      protocol === 'terminal_outcomes_v3'
+        ? selectedVenues.current
+        : legacyCompatibleVenues(selectedVenues.current),
     symbols: selectedSymbols.current,
     since: since.current ? toRfc3339(since.current) : null,
     until: until.current ? toRfc3339(until.current) : null
   })
 
-  const mergeLiveTrades = (current: TradeEntry[]): TradeEntry[] =>
-    mergeTradeHistory(current, tradesQuery.data ?? [], historyFilter())
+  const mergeLiveTrades = (
+    current: TradeEntry[],
+    protocol: TradeProtocol = historyTradeProtocol
+  ): TradeEntry[] => mergeTradeHistory(current, tradesQuery.data ?? [], historyFilter(protocol))
 
   const resetHistoryForFilter = () => {
     entries.update(() => [])
@@ -180,13 +196,18 @@
 
     try {
       const baseUrl = getApiBaseUrl()
-      const fetchWithProtocol = (protocol: 'terminal_outcomes_v2' | 'terminal_outcomes_v1') =>
+      const fetchWithProtocol = (protocol: TradeProtocol) =>
         fetch(`${baseUrl}/trades?${buildParams(PAGE_SIZE, requestOffset, protocol).toString()}`, {
           signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
         })
-      let response = await fetchWithProtocol('terminal_outcomes_v2')
-      if (response.status === 400) {
-        response = await fetchWithProtocol('terminal_outcomes_v1')
+      let protocol: TradeProtocol =
+        preferredTradeProtocol === 'terminal_outcomes_v3' || Date.now() >= nextV3ProbeAt
+          ? 'terminal_outcomes_v3'
+          : preferredTradeProtocol
+      let response = await fetchWithProtocol(protocol)
+      while (response.status === 400 && protocol !== 'terminal_outcomes_v1') {
+        protocol = fallbackTradeProtocol(protocol)
+        response = await fetchWithProtocol(protocol)
       }
 
       if (!response.ok) {
@@ -200,8 +221,12 @@
       const data = { ...wireData, entries: wireData.entries.map(normalizeTrade) }
       if (requestVersion !== historyRequestVersion) return
 
+      preferredTradeProtocol = protocol
+      nextV3ProbeAt = protocol === 'terminal_outcomes_v3' ? 0 : Date.now() + V3_REPROBE_INTERVAL_MS
+      historyTradeProtocol = protocol
+
       const merged = isLoadMore ? [...entries.current, ...data.entries] : data.entries
-      const nextEntries = mergeLiveTrades(merged)
+      const nextEntries = mergeLiveTrades(merged, protocol)
       // A replace is an authoritative snapshot: trust the server total and add
       // back only the live trades the snapshot has not caught up with yet.
       const liveExtras = Math.max(0, nextEntries.length - merged.length)
@@ -258,7 +283,7 @@
   const jumpToLatest = () => {
     since.update(() => '')
     until.update(() => '')
-    selectedVenues.update(() => new Set(ALL_VENUES))
+    selectedVenues.update(() => new Set(TRADING_VENUES))
     selectedSymbols.update(() => new Set())
     if (sinceInput) sinceInput.value = ''
     if (untilInput) untilInput.value = ''
@@ -268,7 +293,7 @@
   const hasFilters = $derived(
     since.current !== '' ||
       until.current !== '' ||
-      selectedVenues.current.size < ALL_VENUES.length ||
+      selectedVenues.current.size < TRADING_VENUES.length ||
       selectedSymbols.current.size > 0
   )
   onMount(() => {
@@ -420,7 +445,7 @@
       <span class="flex items-center gap-1.5">
         Trade History
         <HoverTooltip
-          tooltip="Onchain fills from Raindex orders and the corresponding Alpaca hedge trades placed to offset exposure."
+          tooltip="Direct Raindex fills, fills routed through supported adapters such as Bebop, and the corresponding Alpaca hedge trades placed to offset exposure."
           class="cursor-help text-muted-foreground"
         >
           <svg
@@ -642,7 +667,7 @@
         <div class="mb-4 space-y-1.5 text-xs">
           <div class="flex items-center gap-2 font-mono">
             <span class="shrink-0 text-muted-foreground">ID</span>
-            {#if trade.venue === 'raindex'}
+            {#if isOnchainVenue(trade.venue)}
               {@const txHash = trade.id.slice(0, trade.id.lastIndexOf(':'))}
               {@const logIndex = trade.id.slice(trade.id.lastIndexOf(':') + 1)}
               <a

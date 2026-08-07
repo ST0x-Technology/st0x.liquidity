@@ -46,6 +46,12 @@ orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 # Staging settles through its dedicated shared inventory. The Turnkey wallet
 # holds OPERATOR_ROLE on this contract; startup fails closed if that changes.
 inventory_mode = "managed"
+# Public OPERATOR_ROLE holders for venue attribution. Captured Base settlement
+# fixtures pin both addresses in src/onchain/trade.rs.
+inventory_adapters = [
+  { venue = "bebop", operator = "0x8b8b6e0507c125934c6129563f48e48c66f86475" },
+  { venue = "uniswap_v4", operator = "0x36ebb1e5149c60111dd035f0417a4b00d39caa88" },
+]
 inventory = "0x5FE36e6b6c320f8FD0B6109B2315253387DbdeF2"
 # REQUIRED. Owner of the Raindex orders/vaults on-chain (vaultBalance2 /
 # registry / fill match key). Managed mode scopes all three to the inventory

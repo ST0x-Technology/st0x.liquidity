@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { LegacyTrade } from '$lib/api/LegacyTrade'
 import type { Statement } from '$lib/api/Statement'
 import type { Trade } from '$lib/api/Trade'
+import { getExplorerTxUrl } from '$lib/env'
 import { createWebSocket } from '$lib/websocket'
 import TradeHistoryPanelHarness from './trade-history-panel.test-harness.svelte'
 
@@ -85,6 +86,12 @@ const tradeResponse = (
     headers: { 'content-type': 'application/json' }
   })
 
+const requestUrl = (input: RequestInfo | URL): string => {
+  if (typeof input === 'string') return input
+  if (input instanceof URL) return input.href
+  return input.url
+}
+
 const mountedPanels: ReturnType<typeof mount>[] = []
 
 const mountPanel = () => {
@@ -141,7 +148,107 @@ describe('TradeHistoryPanel', () => {
     target.remove()
   })
 
-  it('retries trade history with v1 when the previous backend rejects v2', async () => {
+  it('renders Bebop fills and removes Bebop from the v3 venue filter', async () => {
+    const bebopTrade: Trade = {
+      id: '0x28a364eaa0fc6d505ddd0702cd9949853193bb28c92cdfef68bcd5a803f1806b:194',
+      occurredAt: '2026-07-31T12:00:00Z',
+      venue: 'bebop',
+      direction: 'buy',
+      symbol: 'COIN',
+      shares: '1',
+      outcome: { status: 'filled' }
+    }
+    const fetchMock = vi.fn((_input: RequestInfo | URL) =>
+      Promise.resolve(tradeResponse([bebopTrade], 1))
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { target } = mountPanel()
+
+    await vi.waitFor(() => {
+      expect(target.textContent).toContain('COIN')
+      expect(target.textContent).toContain('Bebop')
+      expect(target.textContent).toContain('1 of 1')
+    })
+
+    const venues = [...target.querySelectorAll('button')].find((button) =>
+      button.textContent.includes('Venues')
+    )
+    venues?.click()
+    await tick()
+    const bebopOption = [...target.querySelectorAll('button')].find((button) =>
+      button.textContent.trim().endsWith('Bebop')
+    )
+    bebopOption?.click()
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    const filteredInput = fetchMock.mock.calls[1]?.[0]
+    if (filteredInput === undefined) throw new Error('filtered trade request was not captured')
+    const filteredUrl = new URL(requestUrl(filteredInput))
+    expect(filteredUrl.searchParams.get('trade_protocol')).toBe('terminal_outcomes_v3')
+    const venueParam = filteredUrl.searchParams.get('venue')
+    expect(venueParam).not.toBeNull()
+    expect(venueParam?.split(',')).not.toContain('bebop')
+
+    target.remove()
+  })
+
+  it('keeps downgraded Raindex rows visible for a Bebop-only fallback filter', async () => {
+    const downgradedBebop: Trade = {
+      id: `0x${'b'.repeat(64)}:194`,
+      occurredAt: '2026-07-31T12:00:00Z',
+      venue: 'raindex',
+      direction: 'buy',
+      symbol: 'DOWNGRADED',
+      shares: '1',
+      outcome: { status: 'filled' }
+    }
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = new URL(requestUrl(input))
+      const protocol = url.searchParams.get('trade_protocol')
+      const venue = url.searchParams.get('venue')
+      if (protocol === 'terminal_outcomes_v3' && venue === 'bebop') {
+        return Promise.resolve(new Response(null, { status: 400 }))
+      }
+      if (protocol === 'terminal_outcomes_v2' && venue === 'raindex') {
+        return Promise.resolve(tradeResponse([downgradedBebop], 1))
+      }
+      return Promise.resolve(tradeResponse([], 0))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { target } = mountPanel()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled())
+
+    const venues = [...target.querySelectorAll('button')].find((button) =>
+      button.textContent.includes('Venues')
+    )
+    venues?.click()
+    await tick()
+
+    for (const label of ['Raindex', 'Uniswap v4', 'Unknown Onchain', 'Alpaca', 'DryRun']) {
+      const option = [...target.querySelectorAll('button')].find((button) =>
+        button.textContent.trim().endsWith(label)
+      )
+      option?.click()
+      await tick()
+    }
+
+    await vi.waitFor(() => expect(target.textContent).toContain('DOWNGRADED'))
+    expect(
+      fetchMock.mock.calls.some(([input]) => {
+        const url = new URL(requestUrl(input))
+        return (
+          url.searchParams.get('trade_protocol') === 'terminal_outcomes_v2' &&
+          url.searchParams.get('venue') === 'raindex'
+        )
+      })
+    ).toBe(true)
+
+    target.remove()
+  })
+
+  it('retries trade history with v2 when the previous backend rejects v3', async () => {
     const fetchMock = vi
       .fn<() => Promise<Response>>()
       .mockResolvedValueOnce(new Response(null, { status: 400 }))
@@ -153,14 +260,76 @@ describe('TradeHistoryPanel', () => {
     await vi.waitFor(() => expect(target.textContent).toContain('1 of 1'))
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      expect.stringContaining('trade_protocol=terminal_outcomes_v2'),
+      expect.stringContaining('trade_protocol=terminal_outcomes_v3'),
       expect.any(Object)
     )
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      expect.stringContaining('trade_protocol=terminal_outcomes_v1'),
+      expect.stringContaining('trade_protocol=terminal_outcomes_v2'),
       expect.any(Object)
     )
+
+    target.remove()
+  })
+
+  it('links a Bebop trade detail ID to its transaction explorer', async () => {
+    const txHash = `0x${'a'.repeat(64)}`
+    const bebopTrade: Trade = {
+      id: `${txHash}:194`,
+      occurredAt: '2026-07-31T12:00:00Z',
+      venue: 'bebop',
+      direction: 'buy',
+      symbol: 'COIN',
+      shares: '1',
+      outcome: { status: 'filled' }
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: string | URL | Request) =>
+        Promise.resolve(
+          requestUrl(input).includes('/events')
+            ? new Response(JSON.stringify({ events: [] }), { status: 200 })
+            : tradeResponse([bebopTrade], 1)
+        )
+      )
+    )
+
+    const { target } = mountPanel()
+    await vi.waitFor(() => expect(target.textContent).toContain('COIN'))
+    const details = target.querySelector<HTMLButtonElement>('button[title="View trade details"]')
+    details?.click()
+
+    await vi.waitFor(() => {
+      const explorer = target.querySelector<HTMLAnchorElement>(
+        `a[href="${getExplorerTxUrl(txHash)}"]`
+      )
+      expect(explorer).not.toBeNull()
+    })
+
+    target.remove()
+  })
+
+  it('renders an offchain trade detail ID without an explorer link', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: string | URL | Request) =>
+        Promise.resolve(
+          requestUrl(input).includes('/events')
+            ? new Response(JSON.stringify({ events: [] }), { status: 200 })
+            : tradeResponse([staleTrade], 1)
+        )
+      )
+    )
+
+    const { target } = mountPanel()
+    await vi.waitFor(() => expect(target.textContent).toContain('SPCX'))
+    const details = target.querySelector<HTMLButtonElement>('button[title="View trade details"]')
+    details?.click()
+
+    await vi.waitFor(() => {
+      expect(target.textContent).toContain(staleTrade.id)
+      expect(target.querySelector('dialog a')).toBeNull()
+    })
 
     target.remove()
   })
@@ -169,14 +338,15 @@ describe('TradeHistoryPanel', () => {
     const fetchMock = vi
       .fn<() => Promise<Response>>()
       .mockResolvedValueOnce(new Response(null, { status: 400 }))
+      .mockResolvedValueOnce(new Response(null, { status: 400 }))
       .mockResolvedValueOnce(tradeResponse([failedTrade('v1-failure')], 1))
     vi.stubGlobal('fetch', fetchMock)
 
     const { target } = mountPanel()
 
     await vi.waitFor(() => expect(target.textContent).toContain('1 of 1'))
-    const quantityTooltip = Array.from(target.querySelectorAll('button')).find((button) =>
-      button.getAttribute('aria-label')?.startsWith('Order quantity.') === true
+    const quantityTooltip = Array.from(target.querySelectorAll('button')).find(
+      (button) => button.getAttribute('aria-label')?.startsWith('Order quantity.') === true
     )
     expect(quantityTooltip).toBeDefined()
     expect(quantityTooltip?.getAttribute('aria-label')).not.toContain('Requested quantity')
@@ -184,8 +354,10 @@ describe('TradeHistoryPanel', () => {
     target.remove()
   })
 
-  it('re-probes v2 on the next refresh after a v1 fallback', async () => {
+  it('caches a fallback protocol and periodically re-probes v3', async () => {
     let poll: (() => void) | undefined
+    let now = Date.now()
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
     vi.spyOn(globalThis, 'setInterval').mockImplementation((handler) => {
       poll = handler as () => void
       return {} as ReturnType<typeof setInterval>
@@ -193,11 +365,13 @@ describe('TradeHistoryPanel', () => {
     const fetchMock = vi
       .fn<() => Promise<Response>>()
       .mockResolvedValueOnce(new Response(null, { status: 400 }))
+      .mockResolvedValueOnce(new Response(null, { status: 400 }))
       .mockResolvedValueOnce(tradeResponse([failedTrade('v1-failure')], 1))
+      .mockResolvedValueOnce(tradeResponse([failedTrade('cached-v1')], 1))
       .mockResolvedValueOnce(
         tradeResponse(
           [
-            failedTrade('v2-failure', {
+            failedTrade('v3-failure', {
               symbol: 'UPGRADED',
               outcome: {
                 status: 'failed',
@@ -215,14 +389,24 @@ describe('TradeHistoryPanel', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     const { target } = mountPanel()
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
 
     poll?.()
 
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4))
     expect(fetchMock).toHaveBeenNthCalledWith(
-      3,
-      expect.stringContaining('trade_protocol=terminal_outcomes_v2'),
+      4,
+      expect.stringContaining('trade_protocol=terminal_outcomes_v1'),
+      expect.any(Object)
+    )
+
+    now += 60_000
+    poll?.()
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5))
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      5,
+      expect.stringContaining('trade_protocol=terminal_outcomes_v3'),
       expect.any(Object)
     )
     await vi.waitFor(() => expect(target.textContent).toContain('UPGRADED'))
@@ -230,7 +414,7 @@ describe('TradeHistoryPanel', () => {
     target.remove()
   })
 
-  it('retries each concurrent v2 history request independently', async () => {
+  it('retries each concurrent v3 history request independently', async () => {
     let poll: (() => void) | undefined
     vi.spyOn(globalThis, 'setInterval').mockImplementation((handler) => {
       poll = handler as () => void
@@ -254,17 +438,17 @@ describe('TradeHistoryPanel', () => {
     poll?.()
     await vi.waitFor(() => expect(pendingRequests).toHaveLength(2))
 
-    expect(pendingRequests[0]?.url).toContain('trade_protocol=terminal_outcomes_v2')
-    expect(pendingRequests[1]?.url).toContain('trade_protocol=terminal_outcomes_v2')
+    expect(pendingRequests[0]?.url).toContain('trade_protocol=terminal_outcomes_v3')
+    expect(pendingRequests[1]?.url).toContain('trade_protocol=terminal_outcomes_v3')
 
     pendingRequests[0]?.resolve(new Response(null, { status: 400 }))
     await vi.waitFor(() => expect(pendingRequests).toHaveLength(3))
-    expect(pendingRequests[2]?.url).toContain('trade_protocol=terminal_outcomes_v1')
+    expect(pendingRequests[2]?.url).toContain('trade_protocol=terminal_outcomes_v2')
     pendingRequests[2]?.resolve(tradeResponse([staleTrade], 1))
 
     pendingRequests[1]?.resolve(new Response(null, { status: 400 }))
     await vi.waitFor(() => expect(pendingRequests).toHaveLength(4))
-    expect(pendingRequests[3]?.url).toContain('trade_protocol=terminal_outcomes_v1')
+    expect(pendingRequests[3]?.url).toContain('trade_protocol=terminal_outcomes_v2')
     pendingRequests[3]?.resolve(
       tradeResponse([failedTrade('current-request', { symbol: 'CURR' })], 1)
     )
@@ -348,7 +532,7 @@ describe('TradeHistoryPanel', () => {
 
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('limit=100'), expect.any(Object))
     expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining('trade_protocol=terminal_outcomes_v2'),
+      expect.stringContaining('trade_protocol=terminal_outcomes_v3'),
       expect.any(Object)
     )
     expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -581,7 +765,7 @@ describe('TradeHistoryPanel', () => {
     venues?.click()
     await tick()
 
-    for (const label of ['Raindex', 'Alpaca', 'DryRun']) {
+    for (const label of ['Raindex', 'Bebop', 'Uniswap v4', 'Unknown Onchain', 'Alpaca', 'DryRun']) {
       const option = [...target.querySelectorAll('button')].find((button) =>
         button.textContent.trim().endsWith(label)
       )
@@ -595,7 +779,7 @@ describe('TradeHistoryPanel', () => {
       expect(target.textContent).toContain('No trades yet')
       expect(target.textContent).toContain('0 of 0')
       expect(target.textContent).not.toContain('Loading...')
-      expect(fetchMock).toHaveBeenCalledTimes(4)
+      expect(fetchMock).toHaveBeenCalledTimes(7)
     })
 
     for (const resolve of pendingResponses) {

@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest'
 import type { LegacyTrade } from '$lib/api/LegacyTrade'
 import type { Trade } from '$lib/api/Trade'
 import {
+  fallbackTradeProtocol,
+  isOnchainVenue,
+  legacyCompatibleVenues,
   mergeTradeHistory,
   normalizeTrade,
   tradeFailureReason,
@@ -9,6 +12,14 @@ import {
   tradeOutcomeClass,
   tradeOutcomeLabel
 } from './trade'
+
+describe('trade protocol fallback', () => {
+  it('steps through each supported protocol and remains at v1', () => {
+    expect(fallbackTradeProtocol('terminal_outcomes_v3')).toBe('terminal_outcomes_v2')
+    expect(fallbackTradeProtocol('terminal_outcomes_v2')).toBe('terminal_outcomes_v1')
+    expect(fallbackTradeProtocol('terminal_outcomes_v1')).toBe('terminal_outcomes_v1')
+  })
+})
 
 describe('trade outcome presentation', () => {
   it('renders filled outcomes as successful', () => {
@@ -209,6 +220,36 @@ describe('live trade history', () => {
         until: null
       })
     ).toEqual([log10, log2])
+  })
+
+  it('sorts tied Raindex and Bebop trades by numeric log index', () => {
+    const txHash = `0x${'0'.repeat(64)}`
+    const raindexLog11 = trade({ id: `${txHash}:11`, venue: 'raindex' })
+    const bebopLog20 = trade({ id: `${txHash}:20`, venue: 'bebop' })
+
+    expect(
+      mergeTradeHistory([raindexLog11], [bebopLog20], {
+        venues: new Set(['raindex', 'bebop']),
+        symbols: new Set(),
+        since: null,
+        until: null
+      })
+    ).toEqual([bebopLog20, raindexLog11])
+  })
+
+  it('classifies every adapter and unknown inventory venue as onchain', () => {
+    expect(isOnchainVenue('raindex')).toBe(true)
+    expect(isOnchainVenue('bebop')).toBe(true)
+    expect(isOnchainVenue('uniswap_v4')).toBe(true)
+    expect(isOnchainVenue('unknown_onchain')).toBe(true)
+    expect(isOnchainVenue('alpaca')).toBe(false)
+    expect(isOnchainVenue('dry_run')).toBe(false)
+  })
+
+  it('collapses adapter venue filters for pre-v3 backends', () => {
+    expect(legacyCompatibleVenues(new Set(['bebop', 'uniswap_v4', 'alpaca']))).toEqual(
+      new Set(['raindex', 'alpaca'])
+    )
   })
 
   it('preserves sub-millisecond RFC 3339 ordering', () => {

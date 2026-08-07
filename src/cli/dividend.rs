@@ -59,7 +59,7 @@ mod tests {
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
         AssetsConfig, BrokerCtx, EquitiesConfig, EvmCtx, ExecutionThreshold, IngestionCutoff,
-        InventoryMode, LogLevel, TradingMode,
+        InventoryAdapters, InventoryMode, LogLevel, TradingMode,
     };
 
     use super::*;
@@ -83,6 +83,7 @@ mod tests {
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
             },
+            inventory_adapters: InventoryAdapters::default(),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,

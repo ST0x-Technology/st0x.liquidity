@@ -21,6 +21,7 @@ use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
 use crate::bindings::IRaindexV6::{EvaluableV4, IOV2, OrderV4};
 use crate::onchain::OnchainTrade;
 use crate::onchain::io::{TokenizedSymbol, Usdc, WrappedTokenizedShares};
+use crate::onchain_trade::OnChainTradeSource;
 
 const MAX_CONCURRENT_TEST_ANVILS: usize = 4;
 
@@ -397,6 +398,7 @@ impl OnchainTradeBuilder {
     pub(crate) fn new() -> Self {
         Self {
             trade: OnchainTrade {
+                source: OnChainTradeSource::Raindex,
                 tx_hash: fixed_bytes!(
                     "0x1111111111111111111111111111111111111111111111111111111111111111"
                 ),
@@ -428,6 +430,12 @@ impl OnchainTradeBuilder {
     #[must_use]
     pub(crate) fn with_equity_token(mut self, token: Address) -> Self {
         self.trade.equity_token = token;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_source(mut self, source: OnChainTradeSource) -> Self {
+        self.trade.source = source;
         self
     }
 

@@ -84,7 +84,10 @@ use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
 use crate::onchain::approvals::{build_approval_targets, grant_startup_approvals};
 use crate::onchain::backfill::BackfillJobQueue;
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
-use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId};
+use crate::onchain_trade::{
+    OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId, OnChainTradeSource,
+    SourceAttributionDecision,
+};
 use crate::performance::HedgeLatencyProjection;
 use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
@@ -2881,6 +2884,7 @@ pub(crate) async fn execute_witness_trade(
     let price_usdc = trade.price.value();
 
     let command = OnChainTradeCommand::Witness {
+        source: trade.source,
         symbol: trade.symbol.base().clone(),
         amount,
         direction: trade.direction,
@@ -2910,6 +2914,39 @@ pub(crate) async fn execute_witness_trade(
                 "OnChainTrade::Witness rejected as duplicate: already filled"
             );
             Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Appends source attribution reconstructed from chain. A concurrent repair is
+/// safe because both jobs derive the same source from the same transaction
+/// receipt.
+async fn execute_attribute_trade_source(
+    onchain_trade: &Store<OnChainTrade>,
+    trade_id: &OnChainTradeId,
+    source: OnChainTradeSource,
+) -> Result<(), SendError<OnChainTrade>> {
+    match onchain_trade
+        .send(trade_id, OnChainTradeCommand::AttributeSource { source })
+        .await
+    {
+        Ok(()) => {
+            info!(
+                ?trade_id,
+                ?source,
+                "Attributed onchain trade source from chain"
+            );
+            Ok(())
+        }
+        Err(AggregateError::UserError(LifecycleError::Apply(
+            OnChainTradeError::SourceAlreadyAttributed,
+        ))) => {
+            debug!(
+                ?trade_id,
+                "Onchain trade source was attributed concurrently"
+            );
+            Ok(())
         }
         Err(error) => Err(error),
     }
@@ -3151,20 +3188,29 @@ pub(crate) async fn account_for_onchain_fill(
     };
 
     match onchain_trade.load(&trade_id).await {
-        Ok(Some(state)) if state.is_acknowledged() => {
-            debug!(
-                ?trade_id,
-                symbol = %trade.symbol,
-                "Trade already processed (duplicate event), skipping"
-            );
-            // Self-heal a marker-without-settle leak (ADR 0010): a crash
-            // between MARK and SETTLE leaves the trade marked but still in
-            // the pending set. The marker is durable, so prune it now. A
-            // no-op when already pruned.
-            execute_settle_fill(position, trade).await?;
-            return Ok(FillAccountingOutcome::AlreadyAcknowledged);
-        }
         Ok(Some(state)) => {
+            match state.source.attribution_decision(trade.source) {
+                SourceAttributionDecision::Apply => {
+                    execute_attribute_trade_source(onchain_trade, &trade_id, trade.source).await?;
+                }
+                SourceAttributionDecision::AlreadyAttributed
+                | SourceAttributionDecision::InvalidLegacyMarker => {}
+            }
+
+            if state.is_acknowledged() {
+                debug!(
+                    ?trade_id,
+                    symbol = %trade.symbol,
+                    "Trade already processed (duplicate event), skipping"
+                );
+                // Self-heal a marker-without-settle leak (ADR 0010): a crash
+                // between MARK and SETTLE leaves the trade marked but still in
+                // the pending set. The marker is durable, so prune it now. A
+                // no-op when already pruned.
+                execute_settle_fill(position, trade).await?;
+                return Ok(FillAccountingOutcome::AlreadyAcknowledged);
+            }
+
             info!(
                 ?trade_id,
                 symbol = %trade.symbol,
@@ -4349,6 +4395,7 @@ mod tests {
             .send(
                 &id,
                 crate::onchain_trade::OnChainTradeCommand::Witness {
+                    source: OnChainTradeSource::Raindex,
                     symbol: Symbol::new("AAPL").unwrap(),
                     amount: float!(1),
                     direction: Direction::Buy,

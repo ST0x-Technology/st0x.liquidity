@@ -153,6 +153,7 @@ where
                     &ctx.cache,
                     &ctx.evm,
                     &ctx.ctx.assets,
+                    &ctx.ctx.inventory_adapters,
                     inv.as_ref(),
                     reconstructed_log,
                     &ctx.pyth_feed_ids,

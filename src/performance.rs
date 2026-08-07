@@ -65,7 +65,7 @@ use crate::offchain::order::{
     OrderPlacementResult, OrderPlacer,
 };
 #[cfg(any(test, feature = "test-support"))]
-use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
+use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId, OnChainTradeSource};
 #[cfg(any(test, feature = "test-support"))]
 use crate::position::{Position, PositionCommand, TradeId};
 
@@ -238,6 +238,7 @@ pub async fn seed_simulated_hedge_latency_history(
                 .send(
                     &OnChainTradeId { tx_hash, log_index },
                     OnChainTradeCommand::WitnessAt {
+                        source: OnChainTradeSource::Raindex,
                         symbol: symbol.clone(),
                         amount: amount.inner().inner(),
                         direction: Direction::Buy,
