@@ -9,9 +9,13 @@
 //! - **Market-Making -> Hedging** (redemption): withdraws tokenized equity
 //!   from a Raindex vault and sends it to Alpaca for redemption.
 
+mod authorization_job;
 mod job;
 mod resume_job;
 
+pub(crate) use authorization_job::{
+    DeliverMintAuthorization, DeliverMintAuthorizationCtx, DeliverMintAuthorizationJobQueue,
+};
 #[cfg(test)]
 pub(crate) use job::{
     ResumeEquityToHedging, ResumeEquityToMarketMaking, TransferEquityToMarketMakingJobError,
@@ -31,6 +35,7 @@ use alloy::primitives::{Address, TxHash, U256};
 use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn};
@@ -38,6 +43,7 @@ use tracing::{debug, error, info, instrument, warn};
 use st0x_event_sorcery::{AggregateError, LifecycleError, SendError, Store};
 use st0x_evm::EvmError;
 use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
+use st0x_issuance_dto::VaultModeTag;
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
 use st0x_tokenization::{
     AlpacaTokenizationError, IssuerRequestId, MintVerificationError, TokenizationRequest,
@@ -55,10 +61,12 @@ use crate::bot_gas::{
     BotGasEnqueueFailure, BotGasOperationCategory, BotGasReceiptCostEnqueuer,
     RecordBotGasReceiptCost,
 };
+use crate::conductor::job::QueuePushError;
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, EquityRedemptionError,
     RedemptionAggregateId,
 };
+use crate::mint_authorization::{ConfiguredMintAuthorizer, VaultModeCheckError, VaultModeReader};
 use crate::tokenized_equity_mint::{
     TOKENIZED_EQUITY_DECIMALS, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
@@ -207,6 +215,11 @@ pub(crate) struct EquityTransferServices {
     /// `TokenizedEquityMint`'s confirmations go through
     /// `CrossVenueEquityTransfer`'s own field instead (see that struct).
     pub(crate) bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
+    /// Signs MintAuthV1 recipient authorizations for orchestrator-mode
+    /// mints (RAI-1243). `Disabled` while the config has no
+    /// `[orchestrator]` section; `SignMintAuthorization` then fails
+    /// loudly instead of guessing an orchestrator address.
+    pub(crate) mint_authorizer: ConfiguredMintAuthorizer,
 }
 
 impl EquityTransferServices {
@@ -224,6 +237,7 @@ impl EquityTransferServices {
             tokenizer: Arc::new(PanickingTokenizer),
             wrapper: Arc::new(PanickingWrapper),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         }
     }
 }
@@ -469,6 +483,22 @@ pub(crate) enum MintError {
     /// needs to re-surface it -- see [`crate::bot_gas::redrive`].
     #[error("Failed to enqueue bot-gas receipt cost recording: {0}")]
     BotGasEnqueue(BotGasEnqueueFailure),
+    /// The asset's `vault_mode` could not be determined from issuance. The
+    /// saga must not guess: assuming vault-direct would skip a required
+    /// authorization and stall the mint at issuance's on-chain step. The
+    /// mint stays `MintAccepted`; the resume path retries the check.
+    #[error("Vault-mode check failed: {0}")]
+    VaultModeCheck(#[from] VaultModeCheckError),
+    /// `vault_mode` reads orchestrator but the symbol has no
+    /// `[assets.equities.<symbol>] tokenized_equity` config entry to bind
+    /// the authorization to.
+    #[error("No tokenized-equity address configured for {symbol}")]
+    UnknownTokenizedEquity { symbol: Symbol },
+    /// Enqueueing the authorization delivery job failed -- a local SQLite
+    /// write. The signed authorization is already persisted on the
+    /// aggregate, so the resume path re-enqueues without re-signing.
+    #[error("Failed to enqueue mint-authorization delivery: {0}")]
+    AuthorizationEnqueue(#[from] QueuePushError),
 }
 
 /// Selector for `ERC20InsufficientBalance(address,uint256,uint256)`.
@@ -517,7 +547,10 @@ impl BotGasFailureClassifier for MintError {
             | Self::VaultLookup(_)
             | Self::Verification(_)
             | Self::EntityNotFound { .. }
-            | Self::UnexpectedState { .. } => false,
+            | Self::UnexpectedState { .. }
+            | Self::VaultModeCheck(_)
+            | Self::UnknownTokenizedEquity { .. }
+            | Self::AuthorizationEnqueue(_) => false,
         }
     }
 }
@@ -649,6 +682,44 @@ pub(crate) struct CrossVenueEquityTransfer {
     /// confirmations succeed (ADR 0017). Defaults to `Disabled`;
     /// production wiring opts in via [`Self::with_bot_gas_enqueuer`].
     bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
+    /// Mint-authorization capability for orchestrator-mode assets
+    /// (RAI-1243). Defaults to [`ConfiguredMintAuthorization::VaultDirectOnly`]
+    /// (an explicit assertion, mirroring `BotGasReceiptCostEnqueuer`'s
+    /// explicit-absence shape); production opts into
+    /// [`ConfiguredMintAuthorization::Wired`] via
+    /// [`Self::with_mint_authorization`].
+    mint_authorization: ConfiguredMintAuthorization,
+}
+
+/// Whether this transfer can produce and deliver MintAuthV1 recipient
+/// authorizations. Absence is a stated capability, not an inferred one: a
+/// construction site choosing `VaultDirectOnly` asserts that every asset it
+/// mints is vault-direct, rather than silently defaulting there.
+pub(crate) enum ConfiguredMintAuthorization {
+    /// Full orchestrator-mode wiring -- the server path, which always has
+    /// the issuance client and job queue to build it.
+    Wired(Box<MintAuthorizationWiring>),
+    /// No wiring: the caller (CLI transfer subcommands, recovery jobs,
+    /// tests) asserts the assets it mints are vault-direct. Without the
+    /// wiring `vault_mode` cannot be read at all, so an orchestrator-mode
+    /// mint through such a path proceeds unauthorized and stalls at
+    /// polling -- surfaced by a warning per mint.
+    VaultDirectOnly,
+}
+
+/// Everything the mint saga needs to produce and deliver a MintAuthV1
+/// recipient authorization for orchestrator-mode assets (RAI-1243).
+pub(crate) struct MintAuthorizationWiring {
+    /// Reads each asset's `vault_mode` from issuance -- the single source
+    /// of truth for which assets need an authorization; the bot keeps no
+    /// asset-mode list of its own.
+    pub(crate) vault_mode_reader: Arc<dyn VaultModeReader>,
+    /// Tokenized-equity ERC-20 per symbol, from
+    /// `[assets.equities.<SYM>] tokenized_equity` config -- the `token`
+    /// the EIP-712 MintAuth binds.
+    pub(crate) token_addresses: HashMap<Symbol, Address>,
+    /// Delivery job queue; enqueued idempotently per issuer request id.
+    pub(crate) delivery_queue: DeliverMintAuthorizationJobQueue,
 }
 
 impl CrossVenueEquityTransfer {
@@ -670,6 +741,7 @@ impl CrossVenueEquityTransfer {
             mint_store,
             redemption_store,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorization: ConfiguredMintAuthorization::VaultDirectOnly,
         }
     }
 
@@ -679,6 +751,117 @@ impl CrossVenueEquityTransfer {
     pub(crate) fn with_bot_gas_enqueuer(mut self, enqueuer: BotGasReceiptCostEnqueuer) -> Self {
         self.bot_gas_enqueuer = enqueuer;
         self
+    }
+
+    /// Opts this transfer into orchestrator-mode mint authorization.
+    /// Called at the production wiring site only.
+    pub(crate) fn with_mint_authorization(mut self, wiring: MintAuthorizationWiring) -> Self {
+        self.mint_authorization = ConfiguredMintAuthorization::Wired(Box::new(wiring));
+        self
+    }
+
+    /// Ensures an orchestrator-mode mint has its recipient authorization
+    /// signed and its delivery enqueued before polling begins; a no-op for
+    /// vault-direct assets. Idempotent end to end: signing no-ops once an
+    /// authorization exists (the nonce is the mint's on-chain idempotency
+    /// key and must never be re-minted), and the delivery enqueue is keyed
+    /// on the issuer request id.
+    async fn ensure_mint_authorization(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        symbol: &Symbol,
+    ) -> Result<(), MintError> {
+        let wiring = match &self.mint_authorization {
+            ConfiguredMintAuthorization::Wired(wiring) => wiring,
+            // The construction site asserted vault-direct-only; without the
+            // wiring `vault_mode` cannot be read, so the assertion cannot
+            // be verified -- surface it per mint.
+            ConfiguredMintAuthorization::VaultDirectOnly => {
+                warn!(
+                    target: "rebalance",
+                    %issuer_request_id,
+                    %symbol,
+                    "Transfer constructed VaultDirectOnly; minting without a \
+                     vault-mode check (an orchestrator-mode asset would \
+                     stall at polling -- such mints must run through the \
+                     server, which always wires authorization)"
+                );
+                return Ok(());
+            }
+        };
+
+        // Fails closed: an indeterminate mode must not be guessed as
+        // vault-direct, or a required authorization would be skipped and
+        // the mint would stall at issuance's on-chain step.
+        match wiring.vault_mode_reader.vault_mode(symbol).await? {
+            VaultModeTag::VaultDirect => Ok(()),
+            VaultModeTag::Orchestrator => {
+                let token = wiring.token_addresses.get(symbol).copied().ok_or_else(|| {
+                    MintError::UnknownTokenizedEquity {
+                        symbol: symbol.clone(),
+                    }
+                })?;
+
+                self.mint_store
+                    .send(
+                        issuer_request_id,
+                        TokenizedEquityMintCommand::SignMintAuthorization { token },
+                    )
+                    .await?;
+
+                // Bounds delivery to ONE live chain per mint: redrive
+                // successors carry no idempotency key, so without this
+                // check a resume during a delayed-redrive window would
+                // start a second chain. Fails open on a guard read error
+                // (warn + push): a duplicate chain delivers byte-identical
+                // payloads and is benign, while a skipped push would stall
+                // the delivery.
+                let delivery_live = authorization_job::has_live_delivery_job(
+                    &wiring.delivery_queue,
+                    issuer_request_id,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    warn!(
+                        target: "rebalance",
+                        %issuer_request_id,
+                        ?error,
+                        "Live-delivery guard read failed; enqueueing anyway \
+                         (duplicate chains are benign)"
+                    );
+                    false
+                });
+                if delivery_live {
+                    info!(
+                        target: "rebalance",
+                        %issuer_request_id,
+                        %symbol,
+                        "Mint authorization delivery already live; not \
+                         enqueueing another"
+                    );
+                    return Ok(());
+                }
+
+                let mut delivery_queue = wiring.delivery_queue.clone();
+                delivery_queue
+                    .push_idempotent(
+                        &issuer_request_id.to_string(),
+                        DeliverMintAuthorization {
+                            issuer_request_id: issuer_request_id.clone(),
+                            redrive_attempts: 0,
+                        },
+                    )
+                    .await?;
+
+                info!(
+                    target: "rebalance",
+                    %issuer_request_id,
+                    %symbol,
+                    "Mint authorization signed and delivery enqueued"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Enqueues bot-gas cost recording for a confirmed mint-side tx (vault
@@ -985,8 +1168,15 @@ impl CrossVenueEquityTransfer {
     ) -> Result<(), MintError> {
         loop {
             match self.load_mint_entity(issuer_request_id).await? {
-                TokenizedEquityMint::MintAccepted { .. } => {
+                TokenizedEquityMint::MintAccepted { symbol, .. } => {
                     info!(%issuer_request_id, "Resuming accepted mint");
+                    // Idempotent: signing no-ops once an authorization
+                    // exists and the delivery enqueue is keyed on the
+                    // issuer request id, so a resumed orchestrator-mode
+                    // mint re-delivers its PERSISTED authorization rather
+                    // than minting a fresh nonce.
+                    self.ensure_mint_authorization(issuer_request_id, &symbol)
+                        .await?;
                     self.mint_store
                         .send(issuer_request_id, TokenizedEquityMintCommand::Poll)
                         .await?;
@@ -1762,6 +1952,14 @@ impl CrossVenueEquityTransfer {
             .await
             .map_err(|error| MintTransferError::PreReceipt(error.into()))?;
 
+        // Orchestrator-mode assets need the recipient authorization signed
+        // and on its way to issuance BEFORE polling: issuance will not mint
+        // (and the poll cannot complete) until the authorization arrives.
+        // Still pre-receipt -- a failure here leaves the mint resumable.
+        self.ensure_mint_authorization(issuer_request_id, symbol)
+            .await
+            .map_err(MintTransferError::PreReceipt)?;
+
         info!(target: "rebalance", "Mint request accepted, polling for completion");
 
         self.mint_store
@@ -1863,6 +2061,7 @@ mod tests {
     use crate::inventory::{
         BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Venue,
     };
+    use crate::mint_authorization::{MockMintAuthorizer, StubVaultModeReader};
     use crate::onchain::mock::{DepositBehavior, MockRaindex};
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
     use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
@@ -1884,6 +2083,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         }
     }
 
@@ -2831,6 +3031,297 @@ mod tests {
         );
     }
 
+    /// Builds a transfer with full mint-authorization wiring: a stubbed
+    /// vault-mode reader, a token map for AAPL, an Enabled mock authorizer
+    /// in the aggregate services, and a real (in-memory) delivery queue.
+    /// Returns the event pool and the apalis pool for assertions.
+    async fn create_authorization_wired_transfer(
+        mode: VaultModeTag,
+    ) -> (
+        CrossVenueEquityTransfer,
+        SqlitePool,
+        apalis_sqlite::SqlitePool,
+    ) {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let services = EquityTransferServices {
+            mint_authorizer: ConfiguredMintAuthorizer::Enabled(Arc::new(MockMintAuthorizer)),
+            ..mock_services()
+        };
+
+        let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
+        let redemption_store = Arc::new(test_store(pool.clone(), services));
+
+        let mut token_addresses = HashMap::new();
+        token_addresses.insert(Symbol::new("AAPL").unwrap(), Address::repeat_byte(0x11));
+
+        let transfer = CrossVenueEquityTransfer::new(
+            Arc::new(MockRaindex::new()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockWrapper::new()),
+            Address::random(),
+            mint_store,
+            redemption_store,
+        )
+        .with_mint_authorization(MintAuthorizationWiring {
+            vault_mode_reader: Arc::new(StubVaultModeReader(mode)),
+            token_addresses,
+            delivery_queue: DeliverMintAuthorizationJobQueue::new(&apalis_pool),
+        });
+
+        (transfer, pool, apalis_pool)
+    }
+
+    async fn count_events(pool: &SqlitePool, event_type: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE event_type = ?")
+            .bind(event_type)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn count_delivery_jobs(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<DeliverMintAuthorization>())
+            .fetch_one(apalis_pool)
+            .await
+            .unwrap()
+    }
+
+    /// An orchestrator-mode mint resumed from `MintAccepted` signs its
+    /// authorization, enqueues exactly one delivery, and still completes
+    /// the workflow -- and a SECOND resume never signs a fresh nonce or
+    /// duplicates the delivery job (the resume idempotency invariant).
+    #[tokio::test]
+    async fn resume_of_orchestrator_mint_signs_once_and_enqueues_delivery() {
+        let (transfer, pool, apalis_pool) =
+            create_authorization_wired_transfer(VaultModeTag::Orchestrator).await;
+
+        let id = issuer_request_id("ISS-ORCH-RESUME");
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::DepositedIntoRaindex { .. }),
+            "Expected deposited mint after resume, got: {entity:?}"
+        );
+        assert_eq!(
+            count_events(&pool, "TokenizedEquityMintEvent::MintAuthorizationSigned").await,
+            1
+        );
+        assert_eq!(count_delivery_jobs(&apalis_pool).await, 1);
+
+        // Second resume: the mint is DepositedIntoRaindex, so resume_mint
+        // short-circuits on the terminal state before ever reaching
+        // authorization -- the unchanged counts pin that short-circuit.
+        // (Signing idempotency itself is pinned by
+        // `re_signing_keeps_the_original_nonce` in tokenized_equity_mint.)
+        transfer.resume_mint(&id).await.unwrap();
+        assert_eq!(
+            count_events(&pool, "TokenizedEquityMintEvent::MintAuthorizationSigned").await,
+            1
+        );
+        assert_eq!(count_delivery_jobs(&apalis_pool).await, 1);
+    }
+
+    /// A restart during a delayed-redrive window leaves an UNKEYED pending
+    /// successor row (`push_with_delay` records no idempotency key), which
+    /// `push_idempotent` alone cannot see. The live-delivery guard must
+    /// bound the mint to one chain: re-ensuring the authorization enqueues
+    /// nothing while that successor is live.
+    #[tokio::test]
+    async fn ensure_does_not_start_a_second_delivery_chain_over_a_redrive_successor() {
+        let (transfer, _pool, apalis_pool) =
+            create_authorization_wired_transfer(VaultModeTag::Orchestrator).await;
+
+        let id = issuer_request_id("ISS-ORCH-REDRIVE");
+        let symbol = Symbol::new("AAPL").unwrap();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SignMintAuthorization {
+                    token: Address::repeat_byte(0x11),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The state a crash mid-redrive leaves behind: one delayed,
+        // UNKEYED successor row.
+        let mut queue = DeliverMintAuthorizationJobQueue::new(&apalis_pool);
+        queue
+            .push_with_delay(
+                DeliverMintAuthorization {
+                    issuer_request_id: id.clone(),
+                    redrive_attempts: 3,
+                },
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count_delivery_jobs(&apalis_pool).await, 1);
+
+        transfer
+            .ensure_mint_authorization(&id, &symbol)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count_delivery_jobs(&apalis_pool).await,
+            1,
+            "the live-delivery guard must not start a second chain over a \
+             pending redrive successor"
+        );
+    }
+
+    /// A vault-direct asset takes the pre-authorization path untouched: no
+    /// signing event, no delivery job.
+    #[tokio::test]
+    async fn resume_of_vault_direct_mint_signs_nothing() {
+        let (transfer, pool, apalis_pool) =
+            create_authorization_wired_transfer(VaultModeTag::VaultDirect).await;
+
+        let id = issuer_request_id("ISS-DIRECT-RESUME");
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::DepositedIntoRaindex { .. }),
+            "Expected deposited mint after resume, got: {entity:?}"
+        );
+        assert_eq!(
+            count_events(&pool, "TokenizedEquityMintEvent::MintAuthorizationSigned").await,
+            0
+        );
+        assert_eq!(count_delivery_jobs(&apalis_pool).await, 0);
+    }
+
+    /// An orchestrator-mode asset with no `[assets.equities.<SYM>]`
+    /// tokenized-equity entry cannot bind the EIP-712 MintAuth to a token:
+    /// the mint must fail with the exact variant, never proceed
+    /// unauthorized.
+    #[tokio::test]
+    async fn orchestrator_asset_without_token_address_fails_before_signing() {
+        let (transfer, pool, apalis_pool) =
+            create_authorization_wired_transfer(VaultModeTag::Orchestrator).await;
+
+        // TSLA is absent from the helper's AAPL-only token map.
+        let tsla = Symbol::new("TSLA").unwrap();
+        let error = transfer
+            .ensure_mint_authorization(&issuer_request_id("ISS-NO-TOKEN"), &tsla)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                MintError::UnknownTokenizedEquity { symbol } if symbol == tsla
+            ),
+            "expected UnknownTokenizedEquity for the unmapped symbol"
+        );
+        assert_eq!(
+            count_events(&pool, "TokenizedEquityMintEvent::MintAuthorizationSigned").await,
+            0,
+            "the failed lookup must precede any signing"
+        );
+        assert_eq!(count_delivery_jobs(&apalis_pool).await, 0);
+    }
+
+    /// A transfer built without `with_mint_authorization` carries the
+    /// explicit `VaultDirectOnly` assertion: `ensure_mint_authorization`
+    /// cannot read `vault_mode` at all, so it must sign nothing and
+    /// enqueue nothing -- pinned so the assertion stays a stated
+    /// capability rather than drifting into silent behavior.
+    #[tokio::test]
+    async fn vault_direct_only_transfer_signs_nothing_and_enqueues_nothing() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let services = EquityTransferServices {
+            mint_authorizer: ConfiguredMintAuthorizer::Enabled(Arc::new(MockMintAuthorizer)),
+            ..mock_services()
+        };
+        let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
+        let redemption_store = Arc::new(test_store(pool.clone(), services));
+        let transfer = CrossVenueEquityTransfer::new(
+            Arc::new(MockRaindex::new()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockWrapper::new()),
+            Address::random(),
+            mint_store,
+            redemption_store,
+        );
+
+        let id = issuer_request_id("ISS-VAULT-DIRECT-ONLY");
+        let symbol = Symbol::new("AAPL").unwrap();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .ensure_mint_authorization(&id, &symbol)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count_events(&pool, "TokenizedEquityMintEvent::MintAuthorizationSigned").await,
+            0,
+            "a VaultDirectOnly transfer must never sign an authorization"
+        );
+        assert_eq!(count_delivery_jobs(&apalis_pool).await, 0);
+    }
+
     /// Re-running the job entry point with an id whose aggregate already
     /// exists must resume from the persisted state (the crash-recovery path)
     /// rather than re-requesting the mint from Alpaca.
@@ -3006,6 +3497,7 @@ mod tests {
             tokenizer: tokenizer.clone(),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(queue),
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
         let redemption_store = Arc::new(test_store(pool, services));
@@ -3066,6 +3558,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(queue),
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let redemption_store = Arc::new(test_store::<EquityRedemption>(pool, services));
 

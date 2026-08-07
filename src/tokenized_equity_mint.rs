@@ -38,7 +38,7 @@
 //! - Terminal states (DepositedIntoRaindex, Failed) reject all state-changing commands
 //! - All state transitions are captured as events for complete audit trail
 
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
@@ -54,6 +54,7 @@ use st0x_tokenization::{IssuerRequestId, TokenizationRequestId, TokenizationRequ
 
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
+use crate::mint_authorization::SignedMintAuthorization;
 use crate::rebalancing::equity::EquityTransferServices;
 
 /// Errors that can occur during tokenized equity mint operations.
@@ -134,6 +135,17 @@ pub(crate) enum TokenizedEquityMintError {
     /// Vault deposit transaction failed
     #[error("Vault deposit failed")]
     VaultDepositFailed,
+    /// Mint-authorization signing failed. Like `RequestFailed`, the source
+    /// (`MintAuthorizationError`) wraps non-serde types (EVM transport),
+    /// which the DomainError serde bound forbids embedding, so only the
+    /// rendered message is carried.
+    #[error("Mint authorization signing failed: {error_message}")]
+    AuthorizationSigningFailed { error_message: String },
+    /// Attempted to record an authorization delivery before any
+    /// authorization was signed -- the delivery job only fires after
+    /// `MintAuthorizationSigned` is persisted, so this is a caller bug.
+    #[error("Cannot record authorization delivery: no authorization signed")]
+    AuthorizationNotSigned,
 }
 
 impl PartialEq for TokenizedEquityMintError {
@@ -150,10 +162,15 @@ impl PartialEq for TokenizedEquityMintError {
             | (Self::AlreadyReconciled, Self::AlreadyReconciled)
             | (Self::ReconcileReasonRequired, Self::ReconcileReasonRequired)
             | (Self::MissingTxHash, Self::MissingTxHash)
-            | (Self::VaultDepositFailed, Self::VaultDepositFailed) => true,
+            | (Self::VaultDepositFailed, Self::VaultDepositFailed)
+            | (Self::AuthorizationNotSigned, Self::AuthorizationNotSigned) => true,
             (
                 Self::RequestFailed { error_message: a },
                 Self::RequestFailed { error_message: b },
+            )
+            | (
+                Self::AuthorizationSigningFailed { error_message: a },
+                Self::AuthorizationSigningFailed { error_message: b },
             )
             | (Self::Float(a), Self::Float(b)) => a == b,
             (Self::VaultLookupFailed(a), Self::VaultLookupFailed(b))
@@ -229,6 +246,34 @@ pub(crate) enum TokenizedEquityMintCommand {
     PollAt {
         received_at: DateTime<Utc>,
     },
+    /// Signs and persists the recipient authorization for an
+    /// orchestrator-mode mint (the asset's `vault_mode` on issuance's
+    /// status endpoint reads `"orchestrator"`). Generates the mint's nonce,
+    /// signs via the mint-authorizer service, and emits
+    /// `MintAuthorizationSigned` -- persisted BEFORE any delivery attempt.
+    /// No-op when an authorization is already signed or delivered: the
+    /// nonce is this mint's on-chain idempotency key, so at-least-once saga
+    /// re-drives must reuse the persisted one, never mint a fresh one.
+    ///
+    /// Emits MintAuthorizationSigned (or nothing when already signed).
+    SignMintAuthorization {
+        /// The asset's tokenized-equity ERC-20 address -- the `token` the
+        /// EIP-712 MintAuth binds; issuance mints exactly this token.
+        token: Address,
+    },
+    /// Records issuance's acknowledgement (`200`) that the delivered
+    /// authorization was validated and recorded. Dispatched by the durable
+    /// delivery job. Usually lands AFTER the mint advanced past
+    /// `MintAccepted` (the in-flight `Poll` holds the aggregate until
+    /// Alpaca completes, which requires the delivery) -- still recorded
+    /// there as an audit fact. No-op when already delivered or terminal.
+    /// Post-advance the aggregate keeps no delivered marker (the progress
+    /// is dropped with the authorization's purpose), so a re-driven
+    /// acknowledgement there may record more than once; each is an
+    /// independent audit fact, deliberately not deduplicated.
+    ///
+    /// Emits MintAuthorizationDelivered (or nothing).
+    RecordMintAuthorizationDelivered,
     /// Record that a wrap transaction has been submitted (before confirmation).
     SubmitWrap {
         wrap_tx_hash: TxHash,
@@ -328,6 +373,19 @@ pub(crate) enum TokenizedEquityMintEvent {
         tokenization_request_id: TokenizationRequestId,
         accepted_at: DateTime<Utc>,
     },
+    /// Recipient authorization signed for an orchestrator-mode mint,
+    /// persisted before the first delivery attempt so a crash cannot lose
+    /// the nonce: the nonce is this mint's on-chain idempotency key, and
+    /// every delivery retry must reuse it (and the signature)
+    /// byte-identically.
+    MintAuthorizationSigned {
+        nonce: B256,
+        signature: Bytes,
+        signed_at: DateTime<Utc>,
+    },
+    /// Issuance validated and recorded the delivered authorization
+    /// (idempotent `200` on the internal mint-authorization call).
+    MintAuthorizationDelivered { delivered_at: DateTime<Utc> },
     /// Mint failed before tokens were received. Two cases:
     /// - failed after `MintAccepted`: shares were moved to inflight (Hedging),
     ///   so the inventory reactor restores them to offchain available (Cancel).
@@ -426,6 +484,7 @@ pub(crate) enum TokenizedEquityMintEvent {
 }
 
 impl PartialEq for TokenizedEquityMintEvent {
+    #[allow(clippy::too_many_lines)]
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -499,6 +558,26 @@ impl PartialEq for TokenizedEquityMintEvent {
                     accepted_at: acc_b,
                 },
             ) => iss_a == iss_b && tok_a == tok_b && acc_a == acc_b,
+            (
+                Self::MintAuthorizationSigned {
+                    nonce,
+                    signature,
+                    signed_at,
+                },
+                Self::MintAuthorizationSigned {
+                    nonce: nonce_b,
+                    signature: sig_b,
+                    signed_at: time_b,
+                },
+            ) => (nonce, signature, signed_at) == (nonce_b, sig_b, time_b),
+            (
+                Self::MintAuthorizationDelivered {
+                    delivered_at: time_a,
+                },
+                Self::MintAuthorizationDelivered {
+                    delivered_at: time_b,
+                },
+            ) => time_a == time_b,
             (
                 Self::TokensReceived {
                     tx_hash: hash_a,
@@ -630,6 +709,12 @@ impl DomainEvent for TokenizedEquityMintEvent {
             Self::MintRequested { .. } => "TokenizedEquityMintEvent::MintRequested".to_string(),
             Self::MintRejected { .. } => "TokenizedEquityMintEvent::MintRejected".to_string(),
             Self::MintAccepted { .. } => "TokenizedEquityMintEvent::MintAccepted".to_string(),
+            Self::MintAuthorizationSigned { .. } => {
+                "TokenizedEquityMintEvent::MintAuthorizationSigned".to_string()
+            }
+            Self::MintAuthorizationDelivered { .. } => {
+                "TokenizedEquityMintEvent::MintAuthorizationDelivered".to_string()
+            }
             Self::MintAcceptanceFailed { .. } => {
                 "TokenizedEquityMintEvent::MintAcceptanceFailed".to_string()
             }
@@ -658,6 +743,26 @@ impl DomainEvent for TokenizedEquityMintEvent {
     fn event_version(&self) -> String {
         "1.0".to_string()
     }
+}
+
+/// Recipient-authorization progress for an orchestrator-mode mint sitting
+/// in `MintAccepted`.
+///
+/// Defaults to `NotSigned` so event streams and snapshots from before this
+/// field existed replay unchanged -- and a vault-direct mint's progress
+/// simply never leaves `NotSigned`. The progress is dropped once tokens
+/// arrive: from `TokensReceived` on, the authorization has served its
+/// purpose (issuance minted with it) and is no longer actionable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum MintAuthorizationProgress {
+    /// No authorization signed -- vault-direct mint, or signing has not
+    /// happened yet.
+    #[default]
+    NotSigned,
+    /// Signed and persisted; issuance has not yet acknowledged receipt.
+    Signed(SignedMintAuthorization),
+    /// Issuance acknowledged recording the authorization.
+    Delivered(SignedMintAuthorization),
 }
 
 /// Tokenized equity mint aggregate state machine.
@@ -692,6 +797,10 @@ pub(crate) enum TokenizedEquityMint {
         tokenization_request_id: TokenizationRequestId,
         requested_at: DateTime<Utc>,
         accepted_at: DateTime<Utc>,
+        /// Orchestrator-mode recipient-authorization progress; stays
+        /// `NotSigned` for vault-direct mints.
+        #[serde(default)]
+        authorization: MintAuthorizationProgress,
     },
 
     /// Onchain token transfer detected with transaction details
@@ -876,6 +985,7 @@ impl PartialEq for TokenizedEquityMint {
                     tokenization_request_id: tok_a,
                     requested_at: req_a,
                     accepted_at: acc_a,
+                    authorization: auth_a,
                 },
                 Self::MintAccepted {
                     symbol: sym_b,
@@ -885,6 +995,7 @@ impl PartialEq for TokenizedEquityMint {
                     tokenization_request_id: tok_b,
                     requested_at: req_b,
                     accepted_at: acc_b,
+                    authorization: auth_b,
                 },
             ) => {
                 sym_a == sym_b
@@ -894,6 +1005,7 @@ impl PartialEq for TokenizedEquityMint {
                     && tok_a == tok_b
                     && req_a == req_b
                     && acc_a == acc_b
+                    && auth_a == auth_b
             }
             (
                 Self::TokensReceived {
@@ -1348,6 +1460,16 @@ impl TokenizedEquityMint {
 
 /// Returns mint aggregate IDs whose latest event is non-terminal and should be
 /// resumed after restart.
+///
+/// The delivery acknowledgement normally trails the whole mint (the ack is
+/// recorded as an audit fact after `DepositedIntoRaindex`), so a completed
+/// mint's LATEST event is `MintAuthorizationDelivered` -- latest-event
+/// membership alone would resume every completed orchestrator-mode mint on
+/// every boot, forever. The `NOT EXISTS` clause excludes any aggregate that
+/// deposited: a deposit anywhere in the stream means the mint is complete
+/// regardless of trailing acknowledgements, while a `Delivered` latest
+/// WITHOUT a deposit (the ack landed while still `MintAccepted`) is a
+/// genuine interruption and stays included.
 pub(crate) async fn interrupted_mint_ids(
     pool: &SqlitePool,
 ) -> Result<Vec<IssuerRequestId>, sqlx::Error> {
@@ -1366,11 +1488,20 @@ pub(crate) async fn interrupted_mint_ids(
          WHERE last_ev.aggregate_type = 'TokenizedEquityMint' \
            AND last_ev.event_type IN ( \
                'TokenizedEquityMintEvent::MintAccepted', \
+               'TokenizedEquityMintEvent::MintAuthorizationSigned', \
+               'TokenizedEquityMintEvent::MintAuthorizationDelivered', \
                'TokenizedEquityMintEvent::ProviderCompletionRecovered', \
                'TokenizedEquityMintEvent::TokensReceived', \
                'TokenizedEquityMintEvent::WrapSubmitted', \
                'TokenizedEquityMintEvent::TokensWrapped', \
                'TokenizedEquityMintEvent::VaultDepositSubmitted' \
+           ) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM events deposited \
+               WHERE deposited.aggregate_type = 'TokenizedEquityMint' \
+                 AND deposited.aggregate_id = last_ev.aggregate_id \
+                 AND deposited.event_type = \
+                     'TokenizedEquityMintEvent::DepositedIntoRaindex' \
            ) \
          ORDER BY latest.aggregate_id",
     )
@@ -1443,7 +1574,12 @@ impl EventSourced for TokenizedEquityMint {
     // event for operator reconciliation of stuck `Failed` mints. Additive only;
     // bumped to clear stale snapshots so they rebuild from events under the new
     // schema (existing events replay unchanged).
-    const SCHEMA_VERSION: u64 = 4;
+    // v5: added the `authorization` field on `MintAccepted` plus the
+    // `MintAuthorizationSigned`/`MintAuthorizationDelivered` events for
+    // orchestrator-mode recipient authorizations (RAI-1243). Additive only;
+    // bumped to clear stale snapshots (existing events replay unchanged --
+    // the field is `#[serde(default)]`).
+    const SCHEMA_VERSION: u64 = 5;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use TokenizedEquityMintEvent::*;
@@ -1531,8 +1667,75 @@ impl EventSourced for TokenizedEquityMint {
                     tokenization_request_id: tokenization_request_id.clone(),
                     requested_at: *requested_at,
                     accepted_at: *accepted_at,
+                    authorization: MintAuthorizationProgress::default(),
                 })
             }
+
+            MintAuthorizationSigned {
+                nonce, signature, ..
+            } => {
+                let Self::MintAccepted {
+                    symbol,
+                    quantity,
+                    wallet,
+                    issuer_request_id,
+                    tokenization_request_id,
+                    requested_at,
+                    accepted_at,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::MintAccepted {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    wallet: *wallet,
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    requested_at: *requested_at,
+                    accepted_at: *accepted_at,
+                    authorization: MintAuthorizationProgress::Signed(SignedMintAuthorization {
+                        nonce: *nonce,
+                        signature: signature.clone(),
+                    }),
+                })
+            }
+
+            MintAuthorizationDelivered { .. } => match entity {
+                Self::MintAccepted {
+                    symbol,
+                    quantity,
+                    wallet,
+                    issuer_request_id,
+                    tokenization_request_id,
+                    requested_at,
+                    accepted_at,
+                    authorization: MintAuthorizationProgress::Signed(signed),
+                } => Some(Self::MintAccepted {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    wallet: *wallet,
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    requested_at: *requested_at,
+                    accepted_at: *accepted_at,
+                    authorization: MintAuthorizationProgress::Delivered(signed.clone()),
+                }),
+                // The acknowledgement was recorded after the mint advanced
+                // (the usual ordering -- `Poll` holds the aggregate for the
+                // whole Alpaca wait): an audit marker only, no state change.
+                Self::TokensReceived { .. }
+                | Self::WrapSubmitted { .. }
+                | Self::TokensWrapped { .. }
+                | Self::VaultDepositSubmitted { .. }
+                | Self::DepositedIntoRaindex { .. } => Some(entity.clone()),
+                Self::MintRequested { .. }
+                | Self::MintAccepted { .. }
+                | Self::Failed { .. }
+                | Self::Reconciled { .. } => return Ok(None),
+            },
 
             MintAcceptanceFailed { reason, failed_at } => {
                 // Emitted from `MintAccepted` (post-acceptance failure) or
@@ -1577,6 +1780,9 @@ impl EventSourced for TokenizedEquityMint {
                     tokenization_request_id,
                     requested_at,
                     accepted_at,
+                    // The authorization served its purpose once tokens
+                    // arrive; later states deliberately do not carry it.
+                    authorization: _,
                 } = entity
                 else {
                     return Ok(None);
@@ -1962,6 +2168,14 @@ impl EventSourced for TokenizedEquityMint {
                 self.transition_poll(services, Some(received_at)).await
             }
 
+            TokenizedEquityMintCommand::SignMintAuthorization { token } => {
+                self.transition_sign_authorization(services, token).await
+            }
+
+            TokenizedEquityMintCommand::RecordMintAuthorizationDelivered => {
+                self.transition_record_authorization_delivered()
+            }
+
             TokenizedEquityMintCommand::SubmitWrap { wrap_tx_hash } => match self {
                 Self::TokensReceived { .. } => Ok(vec![WrapSubmitted {
                     wrap_tx_hash,
@@ -2137,6 +2351,175 @@ impl EventSourced for TokenizedEquityMint {
 }
 
 impl TokenizedEquityMint {
+    /// Human-readable state label for logs: `Debug` on the aggregate dumps
+    /// every field, and `std::mem::discriminant` prints an opaque token
+    /// that does not identify the state.
+    const fn state_name(&self) -> &'static str {
+        match self {
+            Self::MintRequested { .. } => "MintRequested",
+            Self::MintAccepted { .. } => "MintAccepted",
+            Self::TokensReceived { .. } => "TokensReceived",
+            Self::WrapSubmitted { .. } => "WrapSubmitted",
+            Self::TokensWrapped { .. } => "TokensWrapped",
+            Self::VaultDepositSubmitted { .. } => "VaultDepositSubmitted",
+            Self::DepositedIntoRaindex { .. } => "DepositedIntoRaindex",
+            Self::Failed { .. } => "Failed",
+            Self::Reconciled { .. } => "Reconciled",
+        }
+    }
+
+    /// Signs the recipient authorization exactly once per mint: the nonce
+    /// minted here is the mint's on-chain idempotency key, so a re-drive
+    /// finding one already signed emits nothing rather than re-signing.
+    async fn transition_sign_authorization(
+        &self,
+        services: &EquityTransferServices,
+        token: Address,
+    ) -> Result<Vec<TokenizedEquityMintEvent>, TokenizedEquityMintError> {
+        use TokenizedEquityMintEvent::*;
+        match self {
+            Self::MintAccepted {
+                authorization: MintAuthorizationProgress::NotSigned,
+                symbol,
+                quantity,
+                issuer_request_id,
+                ..
+            } => {
+                let nonce = B256::random();
+                let signed = services
+                    .mint_authorizer
+                    .sign(token, *quantity, nonce)
+                    .await
+                    .map_err(
+                        |error| TokenizedEquityMintError::AuthorizationSigningFailed {
+                            error_message: error.to_string(),
+                        },
+                    )?;
+
+                info!(
+                    target: "tokenization",
+                    %issuer_request_id,
+                    %symbol,
+                    %token,
+                    nonce = %signed.nonce,
+                    "Signed mint recipient authorization"
+                );
+
+                Ok(vec![MintAuthorizationSigned {
+                    nonce: signed.nonce,
+                    signature: signed.signature,
+                    signed_at: Utc::now(),
+                }])
+            }
+            Self::MintAccepted {
+                authorization:
+                    MintAuthorizationProgress::Signed(_) | MintAuthorizationProgress::Delivered(_),
+                issuer_request_id,
+                ..
+            } => {
+                info!(
+                    target: "tokenization",
+                    %issuer_request_id,
+                    "Mint authorization already signed; re-drive is a no-op"
+                );
+                Ok(vec![])
+            }
+            Self::MintRequested { .. } => Err(TokenizedEquityMintError::NotAccepted),
+            // Tokens already arrived: issuance has consumed the
+            // authorization (or never needed one), so a late signing
+            // attempt is a benign race, not an error the saga must handle.
+            Self::TokensReceived { .. }
+            | Self::WrapSubmitted { .. }
+            | Self::TokensWrapped { .. }
+            | Self::VaultDepositSubmitted { .. }
+            | Self::DepositedIntoRaindex { .. } => {
+                warn!(
+                    target: "tokenization",
+                    state = self.state_name(),
+                    "Ignoring authorization signing for a mint past acceptance"
+                );
+                Ok(vec![])
+            }
+            Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+            Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
+        }
+    }
+
+    /// Records issuance's delivery acknowledgement. The acknowledgement
+    /// normally lands AFTER the mint has advanced past `MintAccepted`:
+    /// `Poll` holds the per-aggregate lock for the whole Alpaca wait, and
+    /// issuance only completes the mint once the authorization arrived, so
+    /// this command queues behind `Poll` and runs against `TokensReceived`
+    /// or later. The event is still recorded there -- the acknowledgement
+    /// is a fact regardless of mint progress. Terminal states are no-ops;
+    /// only delivery before signing is a hard error (the job loads the
+    /// signed authorization from this aggregate, so its absence is a
+    /// caller bug).
+    fn transition_record_authorization_delivered(
+        &self,
+    ) -> Result<Vec<TokenizedEquityMintEvent>, TokenizedEquityMintError> {
+        use TokenizedEquityMintEvent::*;
+        match self {
+            Self::MintAccepted {
+                authorization: MintAuthorizationProgress::Signed(_),
+                issuer_request_id,
+                ..
+            } => {
+                info!(
+                    target: "tokenization",
+                    %issuer_request_id,
+                    "Mint authorization delivery acknowledged by issuance"
+                );
+                Ok(vec![MintAuthorizationDelivered {
+                    delivered_at: Utc::now(),
+                }])
+            }
+            Self::MintAccepted {
+                authorization: MintAuthorizationProgress::Delivered(_),
+                ..
+            } => Ok(vec![]),
+            Self::MintAccepted {
+                authorization: MintAuthorizationProgress::NotSigned,
+                ..
+            } => Err(TokenizedEquityMintError::AuthorizationNotSigned),
+            Self::MintRequested { .. } => Err(TokenizedEquityMintError::NotAccepted),
+            Self::TokensReceived {
+                issuer_request_id, ..
+            }
+            | Self::WrapSubmitted {
+                issuer_request_id, ..
+            }
+            | Self::TokensWrapped {
+                issuer_request_id, ..
+            }
+            | Self::VaultDepositSubmitted {
+                issuer_request_id, ..
+            }
+            | Self::DepositedIntoRaindex {
+                issuer_request_id, ..
+            } => {
+                info!(
+                    target: "tokenization",
+                    %issuer_request_id,
+                    "Mint authorization delivery acknowledged by issuance \
+                     after the mint advanced"
+                );
+                Ok(vec![MintAuthorizationDelivered {
+                    delivered_at: Utc::now(),
+                }])
+            }
+            Self::Failed { .. } | Self::Reconciled { .. } => {
+                warn!(
+                    target: "tokenization",
+                    state = self.state_name(),
+                    "Ignoring authorization-delivery acknowledgement for a \
+                     terminal mint"
+                );
+                Ok(vec![])
+            }
+        }
+    }
+
     /// Shared body for `WrapTokens`/`WrapTokensAt`.
     fn transition_wrap_tokens(
         &self,
@@ -2312,6 +2695,7 @@ mod tests {
     use st0x_wrapper::MockWrapper;
 
     use super::*;
+    use crate::mint_authorization::{ConfiguredMintAuthorizer, MockMintAuthorizer};
     use crate::onchain::mock::MockRaindex;
     use crate::vault_lookup::MockVaultLookup;
 
@@ -2326,6 +2710,16 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        }
+    }
+
+    /// Like [`mint_services`] but with a working (mock) mint authorizer, for
+    /// tests exercising the orchestrator-mode signing path.
+    fn mint_services_with_authorizer(tokenizer: MockTokenizer) -> EquityTransferServices {
+        EquityTransferServices {
+            mint_authorizer: ConfiguredMintAuthorizer::Enabled(Arc::new(MockMintAuthorizer)),
+            ..mint_services(tokenizer)
         }
     }
 
@@ -2621,6 +3015,7 @@ mod tests {
             tokenization_request_id: tokenization_request_id("TOK456"),
             requested_at: Utc::now(),
             accepted_at: Utc::now(),
+            authorization: crate::tokenized_equity_mint::MintAuthorizationProgress::default(),
         };
 
         let event = TokenizedEquityMintEvent::MintRejected {
@@ -2702,6 +3097,7 @@ mod tests {
             tokenization_request_id: tokenization_request_id("TOK456"),
             requested_at: Utc::now(),
             accepted_at: Utc::now(),
+            authorization: crate::tokenized_equity_mint::MintAuthorizationProgress::default(),
         };
 
         let event = TokenizedEquityMintEvent::DepositedIntoRaindex {
@@ -2751,6 +3147,7 @@ mod tests {
             tokenization_request_id: tokenization_request_id("TOK456"),
             requested_at: Utc::now(),
             accepted_at: Utc::now(),
+            authorization: crate::tokenized_equity_mint::MintAuthorizationProgress::default(),
         };
 
         let event = TokenizedEquityMintEvent::TokensWrapped {
@@ -2846,6 +3243,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         });
         let id = issuer_request_id("ISS001");
 
@@ -3138,6 +3536,610 @@ mod tests {
         assert_eq!(result, vec![mint_accepted_id]);
     }
 
+    /// Raw persisted payload for `MintAuthorizationSigned`, pinning the hex
+    /// wire format events must keep forever (65-byte `0x42` signature).
+    fn mint_authorization_signed_payload() -> String {
+        format!(
+            r#"{{"MintAuthorizationSigned":{{"nonce":"0x{}","signature":"0x{}","signed_at":"2026-01-01T00:00:00Z"}}}}"#,
+            "07".repeat(32),
+            "42".repeat(65),
+        )
+    }
+
+    /// The acknowledgement normally trails the whole mint, so a completed
+    /// stream ends `DepositedIntoRaindex` -> `MintAuthorizationDelivered`.
+    /// Latest-event membership alone would resume that mint on every boot
+    /// forever; the deposit anywhere in the stream must exclude it. The
+    /// inverse case -- `Delivered` latest with NO deposit (the ack landed
+    /// while still `MintAccepted`) -- is a genuine interruption and must
+    /// stay included.
+    #[tokio::test]
+    async fn interrupted_mint_ids_excludes_completed_mint_with_trailing_ack() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        let completed_id = issuer_request_id("mint-completed-trailing-ack");
+        for (sequence, event_type, payload) in [
+            (
+                0,
+                "TokenizedEquityMintEvent::MintRequested",
+                mint_requested_payload("RKLB"),
+            ),
+            (
+                1,
+                "TokenizedEquityMintEvent::MintAccepted",
+                mint_accepted_payload(&completed_id),
+            ),
+            (
+                2,
+                "TokenizedEquityMintEvent::MintAuthorizationSigned",
+                mint_authorization_signed_payload(),
+            ),
+            (
+                3,
+                "TokenizedEquityMintEvent::DepositedIntoRaindex",
+                r#"{"DepositedIntoRaindex":{"vault_deposit_tx_hash":"0x0000000000000000000000000000000000000000000000000000000000000002","deposited_at":"2026-01-01T00:00:00Z"}}"#.to_string(),
+            ),
+            (
+                4,
+                "TokenizedEquityMintEvent::MintAuthorizationDelivered",
+                r#"{"MintAuthorizationDelivered":{"delivered_at":"2026-01-01T00:00:01Z"}}"#
+                    .to_string(),
+            ),
+        ] {
+            insert_event(
+                &pool,
+                &completed_id.to_string(),
+                sequence,
+                event_type,
+                &payload,
+            )
+            .await;
+        }
+
+        let interrupted_id = issuer_request_id("mint-acked-while-accepted");
+        for (sequence, event_type, payload) in [
+            (
+                0,
+                "TokenizedEquityMintEvent::MintRequested",
+                mint_requested_payload("RKLB"),
+            ),
+            (
+                1,
+                "TokenizedEquityMintEvent::MintAccepted",
+                mint_accepted_payload(&interrupted_id),
+            ),
+            (
+                2,
+                "TokenizedEquityMintEvent::MintAuthorizationSigned",
+                mint_authorization_signed_payload(),
+            ),
+            (
+                3,
+                "TokenizedEquityMintEvent::MintAuthorizationDelivered",
+                r#"{"MintAuthorizationDelivered":{"delivered_at":"2026-01-01T00:00:01Z"}}"#
+                    .to_string(),
+            ),
+        ] {
+            insert_event(
+                &pool,
+                &interrupted_id.to_string(),
+                sequence,
+                event_type,
+                &payload,
+            )
+            .await;
+        }
+
+        let result = interrupted_mint_ids(&pool).await.unwrap();
+        assert_eq!(
+            result,
+            vec![interrupted_id],
+            "the completed mint's trailing ack must not make it interrupted, \
+             while the still-accepted acked mint must stay resumable"
+        );
+    }
+
+    /// A mint whose LATEST event is `MintAuthorizationSigned` is still
+    /// mid-flight (state `MintAccepted`): startup recovery must resume it,
+    /// or an orchestrator-mode mint interrupted between signing and
+    /// delivery would strand until manual intervention.
+    #[tokio::test]
+    async fn interrupted_mint_ids_includes_mint_awaiting_authorization_delivery() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        let signed_id = issuer_request_id("mint-auth-signed");
+        insert_event(
+            &pool,
+            &signed_id.to_string(),
+            0,
+            "TokenizedEquityMintEvent::MintRequested",
+            &mint_requested_payload("RKLB"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            &signed_id.to_string(),
+            1,
+            "TokenizedEquityMintEvent::MintAccepted",
+            &mint_accepted_payload(&signed_id),
+        )
+        .await;
+        insert_event(
+            &pool,
+            &signed_id.to_string(),
+            2,
+            "TokenizedEquityMintEvent::MintAuthorizationSigned",
+            &mint_authorization_signed_payload(),
+        )
+        .await;
+
+        let result = interrupted_mint_ids(&pool).await.unwrap();
+        assert_eq!(result, vec![signed_id]);
+    }
+
+    /// Replays a raw persisted stream through the store: the pinned hex
+    /// payload must materialize as `Signed` progress carrying the exact
+    /// nonce and signature bytes -- this is the read-side half of the
+    /// permanent wire-format contract.
+    #[tokio::test]
+    async fn persisted_authorization_stream_replays_to_signed_progress() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let id = issuer_request_id("mint-auth-replay");
+
+        insert_event(
+            &pool,
+            &id.to_string(),
+            1,
+            "TokenizedEquityMintEvent::MintRequested",
+            &mint_requested_payload("RKLB"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            &id.to_string(),
+            2,
+            "TokenizedEquityMintEvent::MintAccepted",
+            &mint_accepted_payload(&id),
+        )
+        .await;
+        insert_event(
+            &pool,
+            &id.to_string(),
+            3,
+            "TokenizedEquityMintEvent::MintAuthorizationSigned",
+            &mint_authorization_signed_payload(),
+        )
+        .await;
+
+        let store = st0x_event_sorcery::test_store(
+            pool,
+            mint_services_with_authorizer(MockTokenizer::new()),
+        );
+        let entity = store.load(&id).await.unwrap().unwrap();
+
+        let TokenizedEquityMint::MintAccepted {
+            authorization: MintAuthorizationProgress::Signed(signed),
+            ..
+        } = entity
+        else {
+            panic!("expected Signed authorization after replay, got: {entity:?}");
+        };
+        assert_eq!(signed.nonce, B256::repeat_byte(0x07));
+        assert_eq!(
+            signed.signature,
+            alloy::primitives::Bytes::from(vec![0x42; 65])
+        );
+    }
+
+    /// A pre-authorization event stream (no authorization events, as every
+    /// stream persisted before this feature) must still replay -- landing on
+    /// `NotSigned`, the truthful default for a vault-direct mint.
+    #[tokio::test]
+    async fn pre_authorization_stream_replays_with_not_signed_default() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let id = issuer_request_id("mint-pre-auth");
+
+        insert_event(
+            &pool,
+            &id.to_string(),
+            1,
+            "TokenizedEquityMintEvent::MintRequested",
+            &mint_requested_payload("AAPL"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            &id.to_string(),
+            2,
+            "TokenizedEquityMintEvent::MintAccepted",
+            &mint_accepted_payload(&id),
+        )
+        .await;
+
+        let store = st0x_event_sorcery::test_store(pool, mint_services(MockTokenizer::new()));
+        let entity = store.load(&id).await.unwrap().unwrap();
+
+        assert!(
+            matches!(
+                entity,
+                TokenizedEquityMint::MintAccepted {
+                    authorization: MintAuthorizationProgress::NotSigned,
+                    ..
+                }
+            ),
+            "expected NotSigned default after legacy replay, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_authorization_persists_signed_progress() {
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services_with_authorizer(
+            MockTokenizer::new(),
+        ));
+        let id = issuer_request_id("ISS001");
+        store.send(&id, mint_command()).await.unwrap();
+
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SignMintAuthorization {
+                    token: Address::repeat_byte(0x11),
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        let TokenizedEquityMint::MintAccepted {
+            authorization: MintAuthorizationProgress::Signed(signed),
+            ..
+        } = entity
+        else {
+            panic!("expected Signed authorization, got: {entity:?}");
+        };
+        assert_eq!(
+            signed.signature,
+            alloy::primitives::Bytes::from(vec![0x42; 65])
+        );
+        assert_ne!(signed.nonce, B256::ZERO);
+    }
+
+    /// THE nonce-fixity guarantee: a re-driven signing command must emit
+    /// nothing and keep the original nonce -- the nonce is the mint's
+    /// on-chain idempotency key, and a fresh one on retry could double-mint.
+    #[tokio::test]
+    async fn re_signing_keeps_the_original_nonce() {
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services_with_authorizer(
+            MockTokenizer::new(),
+        ));
+        let id = issuer_request_id("ISS001");
+        store.send(&id, mint_command()).await.unwrap();
+
+        let sign_command = TokenizedEquityMintCommand::SignMintAuthorization {
+            token: Address::repeat_byte(0x11),
+        };
+        store.send(&id, sign_command.clone()).await.unwrap();
+        let first = store.load(&id).await.unwrap().unwrap();
+
+        store.send(&id, sign_command).await.unwrap();
+        let second = store.load(&id).await.unwrap().unwrap();
+
+        let (
+            TokenizedEquityMint::MintAccepted {
+                authorization: MintAuthorizationProgress::Signed(first_signed),
+                ..
+            },
+            TokenizedEquityMint::MintAccepted {
+                authorization: MintAuthorizationProgress::Signed(second_signed),
+                ..
+            },
+        ) = (first, second)
+        else {
+            panic!("expected both loads to be Signed");
+        };
+        assert_eq!(first_signed.nonce, second_signed.nonce);
+        assert_eq!(first_signed.signature, second_signed.signature);
+    }
+
+    /// Each mint owns its own random nonce: two aggregates must never share
+    /// one (a replacement mint gets a fresh nonce by construction).
+    #[tokio::test]
+    async fn distinct_mints_generate_independent_nonces() {
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services_with_authorizer(
+            MockTokenizer::new(),
+        ));
+        let sign_command = TokenizedEquityMintCommand::SignMintAuthorization {
+            token: Address::repeat_byte(0x11),
+        };
+
+        let mut nonces = Vec::new();
+        for id_str in ["ISS-NONCE-A", "ISS-NONCE-B"] {
+            let id = issuer_request_id(id_str);
+            store
+                .send(
+                    &id,
+                    TokenizedEquityMintCommand::RequestMint {
+                        issuer_request_id: id.clone(),
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        quantity: float!(10),
+                        wallet: Address::ZERO,
+                    },
+                )
+                .await
+                .unwrap();
+            store.send(&id, sign_command.clone()).await.unwrap();
+
+            let entity = store.load(&id).await.unwrap().unwrap();
+            let TokenizedEquityMint::MintAccepted {
+                authorization: MintAuthorizationProgress::Signed(signed),
+                ..
+            } = entity
+            else {
+                panic!("expected Signed authorization, got: {entity:?}");
+            };
+            nonces.push(signed.nonce);
+        }
+
+        assert_ne!(nonces[0], nonces[1]);
+    }
+
+    /// An orchestrator-mode mint reaching signing with no `[orchestrator]`
+    /// config must fail loudly, never guess an address or sign nothing.
+    #[tokio::test]
+    async fn signing_with_disabled_authorizer_fails_loudly() {
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
+        let id = issuer_request_id("ISS001");
+        store.send(&id, mint_command()).await.unwrap();
+
+        let error = store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SignMintAuthorization {
+                    token: Address::repeat_byte(0x11),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    TokenizedEquityMintError::AuthorizationSigningFailed { .. }
+                ))
+            ),
+            "expected AuthorizationSigningFailed, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_delivery_transitions_to_delivered_and_is_idempotent() {
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services_with_authorizer(
+            MockTokenizer::new(),
+        ));
+        let id = issuer_request_id("ISS001");
+        store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SignMintAuthorization {
+                    token: Address::repeat_byte(0x11),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RecordMintAuthorizationDelivered,
+            )
+            .await
+            .unwrap();
+        // Idempotent: the at-least-once delivery job may acknowledge twice.
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RecordMintAuthorizationDelivered,
+            )
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                entity,
+                TokenizedEquityMint::MintAccepted {
+                    authorization: MintAuthorizationProgress::Delivered(_),
+                    ..
+                }
+            ),
+            "expected Delivered authorization, got: {entity:?}"
+        );
+    }
+
+    /// The usual production ordering: `Poll` holds the aggregate for the
+    /// whole Alpaca wait and issuance completes the mint only after the
+    /// authorization arrived, so the acknowledgement lands after the mint
+    /// advanced past `MintAccepted`. It must still be recorded, and the
+    /// aggregate must replay through the trailing event.
+    #[tokio::test]
+    async fn recording_delivery_after_mint_advanced_still_records() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = st0x_event_sorcery::test_store(
+            pool.clone(),
+            mint_services_with_authorizer(MockTokenizer::new()),
+        );
+        let id = issuer_request_id("ISS001");
+        store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SignMintAuthorization {
+                    token: Address::repeat_byte(0x11),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RecordMintAuthorizationDelivered,
+            )
+            .await
+            .unwrap();
+
+        // The audit fact must actually persist: an advanced-state
+        // acknowledgement that quietly emitted no event would leave the
+        // state assertion below passing while recording nothing.
+        let delivered_events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                .bind("TokenizedEquityMintEvent::MintAuthorizationDelivered")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            delivered_events, 1,
+            "the trailing acknowledgement must persist its audit event"
+        );
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::TokensReceived { .. }),
+            "state must stay TokensReceived after the trailing \
+             acknowledgement, got: {entity:?}"
+        );
+    }
+
+    /// Replays a raw persisted stream where the acknowledgement landed
+    /// after `TokensReceived` (the usual production ordering): the trailing
+    /// `MintAuthorizationDelivered` must apply as a no-op, not fail the
+    /// lifecycle as an unexpected event.
+    #[tokio::test]
+    async fn persisted_stream_with_delivery_after_tokens_received_replays() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let id = issuer_request_id("mint-auth-late-ack");
+
+        insert_event(
+            &pool,
+            &id.to_string(),
+            1,
+            "TokenizedEquityMintEvent::MintRequested",
+            &mint_requested_payload("RKLB"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            &id.to_string(),
+            2,
+            "TokenizedEquityMintEvent::MintAccepted",
+            &mint_accepted_payload(&id),
+        )
+        .await;
+        insert_event(
+            &pool,
+            &id.to_string(),
+            3,
+            "TokenizedEquityMintEvent::MintAuthorizationSigned",
+            &mint_authorization_signed_payload(),
+        )
+        .await;
+        insert_event(
+            &pool,
+            &id.to_string(),
+            4,
+            "TokenizedEquityMintEvent::TokensReceived",
+            r#"{"TokensReceived":{"tx_hash":"0x0000000000000000000000000000000000000000000000000000000000000001","shares_minted":"0xde0b6b3a7640000","fees":null,"received_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+        insert_event(
+            &pool,
+            &id.to_string(),
+            5,
+            "TokenizedEquityMintEvent::MintAuthorizationDelivered",
+            r#"{"MintAuthorizationDelivered":{"delivered_at":"2026-01-01T00:00:01Z"}}"#,
+        )
+        .await;
+
+        let store = st0x_event_sorcery::test_store(
+            pool,
+            mint_services_with_authorizer(MockTokenizer::new()),
+        );
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::TokensReceived { .. }),
+            "expected TokensReceived after replay with a trailing \
+             acknowledgement, got: {entity:?}"
+        );
+    }
+
+    /// The delivery job only fires after `MintAuthorizationSigned` persists,
+    /// so an acknowledgement with nothing signed is a caller bug.
+    #[tokio::test]
+    async fn recording_delivery_without_signed_authorization_errors() {
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services_with_authorizer(
+            MockTokenizer::new(),
+        ));
+        let id = issuer_request_id("ISS001");
+        store.send(&id, mint_command()).await.unwrap();
+
+        let error = store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RecordMintAuthorizationDelivered,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    TokenizedEquityMintError::AuthorizationNotSigned
+                ))
+            ),
+            "expected AuthorizationNotSigned, got: {error:?}"
+        );
+    }
+
+    /// The on-disk shape of the new events is permanent -- pin it against
+    /// literal JSON (hex-encoded nonce/signature), not just a round-trip.
+    #[test]
+    fn authorization_events_pin_hex_wire_format() {
+        let signed = TokenizedEquityMintEvent::MintAuthorizationSigned {
+            nonce: B256::repeat_byte(0x07),
+            signature: alloy::primitives::Bytes::from(vec![0xab, 0xcd]),
+            signed_at: "2026-01-02T03:04:05Z".parse().unwrap(),
+        };
+        assert_eq!(
+            serde_json::to_value(&signed).unwrap(),
+            serde_json::json!({
+                "MintAuthorizationSigned": {
+                    "nonce": "0x0707070707070707070707070707070707070707070707070707070707070707",
+                    "signature": "0xabcd",
+                    "signed_at": "2026-01-02T03:04:05Z"
+                }
+            })
+        );
+
+        let delivered = TokenizedEquityMintEvent::MintAuthorizationDelivered {
+            delivered_at: "2026-01-02T03:04:05Z".parse().unwrap(),
+        };
+        assert_eq!(
+            serde_json::to_value(&delivered).unwrap(),
+            serde_json::json!({
+                "MintAuthorizationDelivered": {
+                    "delivered_at": "2026-01-02T03:04:05Z"
+                }
+            })
+        );
+    }
+
     #[test]
     fn evolve_full_happy_path_with_event_helpers() {
         let mut state: Option<TokenizedEquityMint> = None;
@@ -3202,6 +4204,7 @@ mod tests {
             tokenization_request_id: tokenization_request_id("TOK001"),
             requested_at: now,
             accepted_at: later,
+            authorization: crate::tokenized_equity_mint::MintAuthorizationProgress::default(),
         };
         let TransferOperation::EquityMint(op) = accepted.to_dto(&id) else {
             panic!("Expected EquityMint");
@@ -3907,6 +4910,7 @@ mod tests {
                 tokenization_request_id: tok.clone(),
                 requested_at: now,
                 accepted_at: now,
+                authorization: crate::tokenized_equity_mint::MintAuthorizationProgress::default(),
             }
             .is_terminal(),
         );
