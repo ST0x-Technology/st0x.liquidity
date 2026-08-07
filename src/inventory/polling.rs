@@ -14,7 +14,7 @@ use futures_util::future::try_join_all;
 use rain_math_float::{Float, FloatError};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE, USDC_ETHEREUM, Wallet};
@@ -111,6 +111,11 @@ struct InventoryDivergenceObservation {
     /// Position the broker reported, normalized (explicit zero when absent).
     fetched: FractionalShares,
     state: ObservedLedgerState,
+    /// The symbol's hydrated balance is restart-tainted: a hedge order was
+    /// open across the boot, so a confirmed divergence escalates on this
+    /// very poll instead of waiting out the threshold, and a match resolves
+    /// the taint.
+    tainted: bool,
 }
 
 /// How the view's Hedging balance relates to the broker reading.
@@ -794,6 +799,7 @@ where
         };
 
         let view = recovery.inventory.read().await;
+        let tainted = view.is_restart_cash_tainted();
         let state = if view.cash_reconciliation_busy(fetched_at)?.is_some() {
             ObservedCashLedgerState::Busy
         } else {
@@ -814,8 +820,10 @@ where
         };
         drop(view);
 
+        Self::resolve_matching_cash_taint(recovery, &state, tainted).await;
+
         let Some(escalation) =
-            self.record_cash_divergence_observation(recovery, &state, usd_balance_cents)
+            self.record_cash_divergence_observation(recovery, &state, usd_balance_cents, tainted)
         else {
             return Ok(());
         };
@@ -832,6 +840,41 @@ where
         .await
     }
 
+    /// Mirrors the equity taint resolution: a matching reading proves the
+    /// hydrated cash balance agrees with the broker, so the restart taint
+    /// lifts without an escalation. The diverging case resolves through
+    /// the escalation's verified heal instead.
+    async fn resolve_matching_cash_taint(
+        recovery: &InventoryDivergenceRecoveryCtx,
+        state: &ObservedCashLedgerState,
+        tainted: bool,
+    ) {
+        if !tainted {
+            return;
+        }
+
+        // Exhaustive so a new observed state forces a decision on whether
+        // it proves the hydrated balance: Busy is ambiguous and Divergence
+        // resolves through the escalation's verified heal.
+        match state {
+            ObservedCashLedgerState::Match => {}
+            ObservedCashLedgerState::Busy | ObservedCashLedgerState::Divergence { .. } => {
+                return;
+            }
+        }
+
+        info!(
+            target: "inventory",
+            "Restart cash taint resolved: the hydrated balance matches \
+             the broker"
+        );
+        recovery
+            .inventory
+            .write_without_broadcast()
+            .await
+            .clear_restart_cash_taint();
+    }
+
     /// Folds one poll's cash observation into the counter and the dispatch
     /// gate. Synchronous on purpose: the counter guard must never be held
     /// across an await.
@@ -840,6 +883,7 @@ where
         recovery: &InventoryDivergenceRecoveryCtx,
         state: &ObservedCashLedgerState,
         broker_cents: i64,
+        tainted: bool,
     ) -> Option<CashDivergenceEscalation> {
         let mut counter = self.lock_cash_divergence_counter();
 
@@ -862,13 +906,19 @@ where
                     broker_cents,
                     consecutive_polls = *counter,
                     threshold = recovery.threshold.get(),
+                    tainted,
                     "Offchain USD snapshot diverges from the inventory view"
                 );
 
-                (*counter >= recovery.threshold.get()).then_some(CashDivergenceEscalation {
-                    ledger: *ledger,
-                    consecutive_polls: *counter,
-                })
+                // A restart-tainted cash divergence is already confirmed
+                // (the ambiguity came from the boot, not a transient race),
+                // so it escalates on the first quiet diverging poll.
+                (*counter >= recovery.threshold.get() || tainted).then_some(
+                    CashDivergenceEscalation {
+                        ledger: *ledger,
+                        consecutive_polls: *counter,
+                    },
+                )
             }
         }
     }
@@ -910,6 +960,11 @@ where
         if healed {
             *self.lock_cash_divergence_counter() = 0;
             recovery.gate.release_cash();
+            recovery
+                .inventory
+                .write_without_broadcast()
+                .await
+                .clear_restart_cash_taint();
         } else if escalation.consecutive_polls >= recovery.threshold.get().saturating_mul(2) {
             // A full extra threshold window of escalations has failed to
             // heal: past transient busyness, and every failed attempt
@@ -1009,10 +1064,13 @@ where
                         symbol: symbol.clone(),
                         fetched: *fetched,
                         state,
+                        tainted: view.is_restart_tainted(symbol),
                     })
                 })
                 .collect::<Result<_, FloatError>>()?
         };
+
+        Self::resolve_matching_equity_taints(recovery, &observations).await;
 
         let escalations = self.record_divergence_observations(recovery, observations);
 
@@ -1038,6 +1096,44 @@ where
         }
 
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// Lifts the restart taint for every symbol whose reading matched the
+    /// view: the hydrated number turns out to agree with broker truth, so
+    /// no escalation is needed. The diverging case resolves through the
+    /// escalation's verified heal instead.
+    async fn resolve_matching_equity_taints(
+        recovery: &InventoryDivergenceRecoveryCtx,
+        observations: &[InventoryDivergenceObservation],
+    ) {
+        // Exhaustive so a new observed state forces a decision on whether
+        // it proves the hydrated balance: Busy is ambiguous and Divergence
+        // resolves through the escalation's verified heal.
+        let resolved: Vec<&Symbol> = observations
+            .iter()
+            .filter(|observation| {
+                observation.tainted
+                    && match observation.state {
+                        ObservedLedgerState::Match => true,
+                        ObservedLedgerState::Busy | ObservedLedgerState::Divergence { .. } => false,
+                    }
+            })
+            .map(|observation| &observation.symbol)
+            .collect();
+        if resolved.is_empty() {
+            return;
+        }
+
+        let mut view = recovery.inventory.write_without_broadcast().await;
+        for symbol in resolved {
+            info!(
+                target: "inventory",
+                %symbol,
+                "Restart taint resolved: the hydrated balance matches \
+                 the broker"
+            );
+            view.clear_restart_taint(symbol);
+        }
     }
 
     /// Sends one `ReconcileOffchainEquity` escalation and settles its
@@ -1074,6 +1170,11 @@ where
         if healed {
             self.lock_divergence_counters().remove(&escalation.symbol);
             recovery.gate.release(&escalation.symbol);
+            recovery
+                .inventory
+                .write_without_broadcast()
+                .await
+                .clear_restart_taint(&escalation.symbol);
         } else if escalation.consecutive_polls >= recovery.threshold.get().saturating_mul(2) {
             // A full extra threshold window of escalations has failed to
             // heal: past transient busyness, and every failed attempt
@@ -1115,6 +1216,7 @@ where
                 symbol,
                 fetched,
                 state,
+                tainted,
             } = observation;
 
             match state {
@@ -1136,10 +1238,15 @@ where
                         broker = %fetched,
                         consecutive_polls = *count,
                         threshold = recovery.threshold.get(),
+                        tainted,
                         "Offchain snapshot diverges from the inventory view"
                     );
 
-                    if *count >= recovery.threshold.get() {
+                    // A restart-tainted divergence is already confirmed --
+                    // the ambiguity was created by the boot, not by a
+                    // transient race the threshold exists to filter -- so
+                    // it escalates on the first quiet diverging poll.
+                    if *count >= recovery.threshold.get() || tainted {
                         escalations.push(InventoryDivergenceEscalation {
                             symbol,
                             fetched,
@@ -5747,6 +5854,461 @@ mod tests {
             1,
             "exactly one cash escalation must have been persisted"
         );
+    }
+
+    /// Marks `symbol` restart-tainted the way the boot seam does, then
+    /// clears its order gate the way a terminal fill does -- the exact
+    /// state a restart-straddling order leaves for the poller.
+    fn taint_from_restart(view: &mut InventoryView, symbol: &Symbol) {
+        view.set_pending_offchain_order_symbols(HashSet::from([symbol.clone()]));
+        view.clear_offchain_order_pending(symbol, None);
+    }
+
+    /// A restart-tainted divergence is already confirmed, so it must not
+    /// wait out the threshold: the first quiet diverging poll escalates
+    /// with `consecutive_polls == 1`, and an unhealed escalation keeps the
+    /// taint for the next attempt.
+    #[tokio::test]
+    async fn restart_tainted_divergence_escalates_on_first_quiet_poll() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let spym = test_symbol("SPYM");
+
+        let mut view =
+            InventoryView::default().with_equity(spym.clone(), test_shares(0), test_shares(136));
+        taint_from_restart(&mut view, &spym);
+        let inventory = broadcasting_inventory(view);
+        let gate = Arc::new(InventoryDivergenceGate::default());
+        // Threshold 3: an untainted divergence would need three polls.
+        let service = reconciling_service(
+            &pool,
+            Arc::new(test_store(pool.clone(), ())),
+            inventory.clone(),
+            gate.clone(),
+            3,
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        let events = reconciled_events(&pool, orderbook, order_owner).await;
+        let [
+            InventorySnapshotEvent::OffchainEquityReconciled {
+                consecutive_polls, ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("Expected exactly one reconcile escalation, got {events:?}");
+        };
+        assert_eq!(
+            *consecutive_polls, 1,
+            "a tainted divergence must escalate on the first poll, not at \
+             the threshold"
+        );
+        assert!(gate.is_engaged(&spym));
+        // No reactor is wired, so the escalation could not heal the view:
+        // the taint must survive for the next poll's re-escalation.
+        assert!(
+            inventory.read().await.is_restart_tainted(&spym),
+            "an unhealed escalation must keep the restart taint"
+        );
+    }
+
+    /// The taint bypasses the escalation threshold, never the busy freeze:
+    /// a busy symbol's comparison is ambiguous regardless of why the taint
+    /// was seeded, so a tainted busy symbol must not escalate even at
+    /// threshold 1.
+    #[tokio::test]
+    async fn restart_tainted_busy_symbol_does_not_escalate() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let spym = test_symbol("SPYM");
+
+        let mut view =
+            InventoryView::default().with_equity(spym.clone(), test_shares(0), test_shares(136));
+        taint_from_restart(&mut view, &spym);
+        let view = view.set_active_mint(spym.clone(), issuer_request_id("tainted-busy"));
+        let inventory = broadcasting_inventory(view);
+        let gate = Arc::new(InventoryDivergenceGate::default());
+        let service = reconciling_service(
+            &pool,
+            Arc::new(test_store(pool.clone(), ())),
+            inventory.clone(),
+            gate.clone(),
+            1,
+        );
+
+        service.poll_and_record().await.unwrap();
+        service.poll_and_record().await.unwrap();
+
+        assert!(
+            reconciled_events(&pool, orderbook, order_owner)
+                .await
+                .is_empty(),
+            "a tainted busy symbol must stay frozen, not escalate against \
+             an ambiguous balance"
+        );
+        assert!(
+            inventory.read().await.is_restart_tainted(&spym),
+            "the frozen taint must survive for resolution once the symbol \
+             is quiet"
+        );
+    }
+
+    /// The cash twin: `record_cash_divergence_observation` has the same
+    /// Busy-before-tainted arm ordering, and a tainted busy venue must not
+    /// escalate either.
+    #[tokio::test]
+    async fn restart_tainted_busy_cash_venue_does_not_escalate() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let spym = test_symbol("SPYM");
+
+        let mut view =
+            InventoryView::default().with_usdc(Usdc::ZERO, Usdc::from_cents(50_000).unwrap());
+        taint_from_restart(&mut view, &spym);
+        let view = view.set_active_usdc_rebalance(UsdcRebalanceId(Uuid::new_v4()));
+        let inventory = broadcasting_inventory(view);
+        let gate = Arc::new(InventoryDivergenceGate::default());
+        let service = reconciling_service(
+            &pool,
+            Arc::new(test_store(pool.clone(), ())),
+            inventory.clone(),
+            gate.clone(),
+            1,
+        );
+
+        service.poll_and_record().await.unwrap();
+        service.poll_and_record().await.unwrap();
+
+        assert!(
+            cash_reconciled_events(&pool, orderbook, order_owner)
+                .await
+                .is_empty(),
+            "a tainted busy cash venue must stay frozen, not escalate \
+             against an ambiguous balance"
+        );
+        assert!(
+            inventory.read().await.is_restart_cash_tainted(),
+            "the frozen cash taint must survive for resolution once the \
+             venue is quiet"
+        );
+    }
+
+    /// Taint resolution is per symbol: with two tainted symbols where one
+    /// matches the broker and one diverges, only the matching symbol's
+    /// taint lifts, only the diverging symbol escalates, and the diverging
+    /// symbol's taint survives its unhealed escalation.
+    #[tokio::test]
+    async fn restart_taint_resolves_per_symbol_not_wholesale() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let spym = test_symbol("SPYM");
+        let aapl = test_symbol("AAPL");
+
+        // SPYM's hydrated balance agrees with the zero-position broker;
+        // AAPL holds a phantom 136.
+        let mut view = InventoryView::default()
+            .with_equity(spym.clone(), test_shares(0), test_shares(0))
+            .with_equity(aapl.clone(), test_shares(0), test_shares(136));
+        view.set_pending_offchain_order_symbols(HashSet::from([spym.clone(), aapl.clone()]));
+        view.clear_offchain_order_pending(&spym, None);
+        view.clear_offchain_order_pending(&aapl, None);
+        let inventory = broadcasting_inventory(view);
+        let gate = Arc::new(InventoryDivergenceGate::default());
+        let service = reconciling_service(
+            &pool,
+            Arc::new(test_store(pool.clone(), ())),
+            inventory.clone(),
+            gate.clone(),
+            3,
+        )
+        .with_configured_equity_symbols(configured_symbols(&["SPYM", "AAPL"]));
+
+        service.poll_and_record().await.unwrap();
+
+        let events = reconciled_events(&pool, orderbook, order_owner).await;
+        let [InventorySnapshotEvent::OffchainEquityReconciled { symbol, .. }] = events.as_slice()
+        else {
+            panic!("Expected exactly one reconcile escalation, got {events:?}");
+        };
+        assert_eq!(
+            symbol, &aapl,
+            "only the diverging symbol may escalate; a SPYM event means the \
+             matching symbol was escalated wholesale"
+        );
+
+        let view = inventory.read().await;
+        assert!(
+            !view.is_restart_tainted(&spym),
+            "the matching symbol's taint must resolve"
+        );
+        assert!(
+            view.is_restart_tainted(&aapl),
+            "the diverging symbol's taint must survive its unhealed \
+             escalation, not be cleared alongside the matching symbol's"
+        );
+        drop(view);
+        assert!(!gate.is_engaged(&spym));
+        assert!(gate.is_engaged(&aapl));
+    }
+
+    /// The full post-restart resolution: the aggregate already stores the
+    /// broker value (recorded mid-order before the restart), so the
+    /// ordinary poll dedupes to no event and only the taint-driven
+    /// escalation can re-base the view -- within a single poll.
+    #[tokio::test]
+    async fn restart_tainted_divergence_heals_and_clears_taint_within_one_poll() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let spym = test_symbol("SPYM");
+        let now = Utc::now();
+
+        // Hydration outcome: the view holds the pre-fill 136 while the
+        // aggregate (and the broker) hold zero.
+        let mut view =
+            InventoryView::default().with_equity(spym.clone(), test_shares(0), test_shares(136));
+        taint_from_restart(&mut view, &spym);
+        let inventory = broadcasting_inventory(view);
+        let gate = Arc::new(InventoryDivergenceGate::default());
+
+        // The pre-restart poll recorded the broker's zero in the aggregate
+        // (persisted via a plain store: pre-restart events do not replay
+        // through the live projection), so the post-boot poll dedupes to no
+        // event.
+        test_store::<InventorySnapshot>(pool.clone(), ())
+            .send(
+                &InventorySnapshotId {
+                    orderbook,
+                    owner: order_owner,
+                },
+                InventorySnapshotCommand::OffchainEquity {
+                    positions: BTreeMap::from([(spym.clone(), FractionalShares::ZERO)]),
+                    fetched_at: now - chrono::Duration::seconds(60),
+                },
+            )
+            .await
+            .unwrap();
+
+        let snapshot_store = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+            .with(Arc::new(InventoryProjection::new(inventory.clone())))
+            .build(())
+            .await
+            .unwrap();
+
+        let service =
+            reconciling_service(&pool, snapshot_store, inventory.clone(), gate.clone(), 3);
+
+        service.poll_and_record().await.unwrap();
+
+        assert_eq!(
+            inventory
+                .read()
+                .await
+                .equity_available(&spym, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+            "the tainted balance must converge to broker truth within one poll"
+        );
+        assert!(
+            !inventory.read().await.is_restart_tainted(&spym),
+            "a verified heal must resolve the restart taint"
+        );
+        assert!(
+            !gate.is_engaged(&spym),
+            "the healed escalation must lift the transfer gate"
+        );
+        assert_eq!(
+            reconciled_events(&pool, orderbook, order_owner).await.len(),
+            1,
+            "exactly one escalation must have been needed"
+        );
+    }
+
+    /// The hydrated number can also turn out correct (the persisted
+    /// snapshot had absorbed the fill): a matching poll must resolve the
+    /// taint without escalating anything.
+    #[tokio::test]
+    async fn restart_taint_resolves_on_matching_poll_without_escalation() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let spym = test_symbol("SPYM");
+
+        let mut view =
+            InventoryView::default().with_equity(spym.clone(), test_shares(0), test_shares(0));
+        taint_from_restart(&mut view, &spym);
+        let inventory = broadcasting_inventory(view);
+        let gate = Arc::new(InventoryDivergenceGate::default());
+        let service = reconciling_service(
+            &pool,
+            Arc::new(test_store(pool.clone(), ())),
+            inventory.clone(),
+            gate.clone(),
+            3,
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        assert!(
+            reconciled_events(&pool, orderbook, order_owner)
+                .await
+                .is_empty(),
+            "a matching tainted poll must not escalate"
+        );
+        assert!(
+            !inventory.read().await.is_restart_tainted(&spym),
+            "a matching poll proves the hydrated balance and must resolve \
+             the taint"
+        );
+        assert!(!gate.is_engaged(&spym));
+    }
+
+    /// The cash twin of the unhealed-escalation persistence assertion in
+    /// `restart_tainted_divergence_escalates_on_first_quiet_poll`: the
+    /// escalation fires on the first quiet poll, but with no reactor wired
+    /// it cannot heal the view, and an unhealed escalation must keep the
+    /// cash taint -- clearing it is reserved for a verified heal.
+    #[tokio::test]
+    async fn restart_tainted_cash_divergence_keeps_taint_when_unhealed() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let spym = test_symbol("SPYM");
+
+        let mut view =
+            InventoryView::default().with_usdc(Usdc::ZERO, Usdc::from_cents(50_000).unwrap());
+        taint_from_restart(&mut view, &spym);
+        let inventory = broadcasting_inventory(view);
+        let gate = Arc::new(InventoryDivergenceGate::default());
+        // Threshold 3: an untainted divergence would need three polls.
+        let service = reconciling_service(
+            &pool,
+            Arc::new(test_store(pool.clone(), ())),
+            inventory.clone(),
+            gate.clone(),
+            3,
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        let events = cash_reconciled_events(&pool, orderbook, order_owner).await;
+        let [
+            InventorySnapshotEvent::OffchainUsdReconciled {
+                consecutive_polls, ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("Expected exactly one cash reconcile escalation, got {events:?}");
+        };
+        assert_eq!(
+            *consecutive_polls, 1,
+            "a tainted cash divergence must escalate on the first poll, not \
+             at the threshold"
+        );
+        assert!(gate.is_cash_engaged());
+        assert!(
+            inventory.read().await.is_restart_cash_tainted(),
+            "an unhealed cash escalation must keep the restart cash taint"
+        );
+    }
+
+    /// Cash twin of the one-poll heal: the hydrated Hedging cash diverges
+    /// from the broker, the aggregate dedupes the ordinary snapshot, and
+    /// the cash taint escalates immediately instead of waiting out the
+    /// threshold.
+    #[tokio::test]
+    async fn restart_tainted_cash_divergence_heals_within_one_poll() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let spym = test_symbol("SPYM");
+        let phantom = Usdc::from_cents(50_000).unwrap();
+        let now = Utc::now();
+
+        let mut view = InventoryView::default().with_usdc(Usdc::ZERO, phantom);
+        taint_from_restart(&mut view, &spym);
+        let inventory = broadcasting_inventory(view);
+        let gate = Arc::new(InventoryDivergenceGate::default());
+
+        // Pre-restart aggregate state, persisted without the projection so
+        // the view keeps its hydrated phantom (see the equity twin above).
+        test_store::<InventorySnapshot>(pool.clone(), ())
+            .send(
+                &InventorySnapshotId {
+                    orderbook,
+                    owner: order_owner,
+                },
+                InventorySnapshotCommand::OffchainUsd {
+                    usd_balance_cents: 0,
+                    gross_usd_cents: None,
+                    fetched_at: now - chrono::Duration::seconds(60),
+                },
+            )
+            .await
+            .unwrap();
+
+        let snapshot_store = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+            .with(Arc::new(InventoryProjection::new(inventory.clone())))
+            .build(())
+            .await
+            .unwrap();
+
+        let service =
+            reconciling_service(&pool, snapshot_store, inventory.clone(), gate.clone(), 3);
+
+        service.poll_and_record().await.unwrap();
+
+        assert_eq!(
+            inventory.read().await.usdc_available(Venue::Hedging),
+            Some(Usdc::ZERO),
+            "the tainted cash balance must converge to broker truth within \
+             one poll"
+        );
+        assert!(
+            !inventory.read().await.is_restart_cash_tainted(),
+            "a verified cash heal must resolve the restart cash taint"
+        );
+        assert!(!gate.is_cash_engaged());
+        let events = cash_reconciled_events(&pool, orderbook, order_owner).await;
+        let [
+            InventorySnapshotEvent::OffchainUsdReconciled {
+                consecutive_polls, ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("Expected exactly one cash escalation, got {events:?}");
+        };
+        assert_eq!(*consecutive_polls, 1);
+    }
+
+    #[tokio::test]
+    async fn restart_cash_taint_resolves_on_matching_poll() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let spym = test_symbol("SPYM");
+
+        let mut view = InventoryView::default().with_usdc(Usdc::ZERO, Usdc::ZERO);
+        taint_from_restart(&mut view, &spym);
+        let inventory = broadcasting_inventory(view);
+        let gate = Arc::new(InventoryDivergenceGate::default());
+        let service = reconciling_service(
+            &pool,
+            Arc::new(test_store(pool.clone(), ())),
+            inventory.clone(),
+            gate.clone(),
+            3,
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        assert!(
+            cash_reconciled_events(&pool, orderbook, order_owner)
+                .await
+                .is_empty(),
+            "a matching tainted cash poll must not escalate"
+        );
+        assert!(
+            !inventory.read().await.is_restart_cash_tainted(),
+            "a matching poll proves the hydrated cash balance and must \
+             resolve the cash taint"
+        );
+        assert!(!gate.is_cash_engaged());
     }
 
     // PollFreshness stamping. The constructor requires a caller-owned handle

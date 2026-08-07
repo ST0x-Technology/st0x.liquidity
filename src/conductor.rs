@@ -1479,6 +1479,11 @@ async fn compact_inventory_snapshot_events(pool: &SqlitePool) -> Result<u64, sql
 /// ordering convention every caller must know about. Safe because the gate's
 /// only authoritative source at boot is the `Position` projection seeded
 /// below, and no reactors or workers run concurrently with this seam.
+///
+/// The same setter also stamps the restart taint (symbols whose hedge order
+/// straddled the restart, whose hydrated Hedging balances are therefore
+/// ambiguous): cleared with the gate on entry, seeded with the gate below.
+/// See `InventoryView::set_pending_offchain_order_symbols`.
 pub(crate) async fn restore_inventory_at_boot(
     pool: &SqlitePool,
     inventory: &Arc<BroadcastingInventory>,

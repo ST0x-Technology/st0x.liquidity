@@ -171,7 +171,12 @@ unchanged-value dedupe suppresses subsequent polls, so the drift persists until
 the broker value changes or the next restart re-hydrates. Bounding this window
 needs the descoped retry mechanism (Follow-up work); closing it entirely would
 require the snapshot to record which fills it absorbed — the same missing
-broker-side ordering as alternative C.
+broker-side ordering as alternative C. _Addressed by RAI-1501: boot marks every
+gated symbol (and the venue cash balance) restart-tainted; a tainted fill skips
+its deltas instead of guessing, and the divergence machinery re-bases the
+balance from broker truth on the first quiet poll (taint bypasses the escalation
+threshold), bounding the drift to the next successful quiet poll during market
+hours._
 
 **It extends the lifetime of pre-existing drift.** The guard rejects the
 symbol's whole snapshot, not just the contested fill, so unrelated drift loses

@@ -3742,6 +3742,34 @@ warning every five consecutive skips, so an ADR 0015 guard that starves a
 balance of broker truth surfaces at production log levels before the divergence
 machinery escalates. An applied snapshot resets the streak.
 
+The same machinery closes the restart-across-an-open-order window. The aggregate
+records every poll -- including mid-order broker readings the live view's guards
+refused -- and the guard state that refused them (local-clock applied-fill
+stamps) does not survive a restart, so a hydrated balance for a symbol whose
+hedge order straddled the boot may or may not already contain the order's fill.
+Rather than guess, boot marks every gated symbol (and, because any open order
+moves Hedging cash, the venue cash balance) **restart-tainted**, seeded together
+with the open-order gate from the Position projection:
+
+- A tainted symbol's fill skips both delta legs (equity and mirrored USDC) and
+  clears the order gate without stamping an applied-fill time; a failed or
+  cancelled order leaves the taint in place, since the pre-restart portion may
+  have partially filled.
+- While tainted, equity dispatch for the symbol and USDC dispatch for the venue
+  are suppressed, exactly as under an engaged divergence gate.
+- The poller resolves the taint against broker truth: a matching quiet poll
+  proves the hydrated value and lifts the taint; a diverging quiet poll
+  escalates the forced reconcile immediately (the taint bypasses the N-poll
+  confirmation threshold -- the ambiguity was created by the boot, not a
+  transient race), and a verified heal lifts the taint. A busy symbol or venue
+  neither resolves nor escalates: the comparison is ambiguous, so the taint
+  survives until the balance is quiet.
+
+The accepted cost is that a fill during the tainted window is reflected only
+after the re-base lands -- the next successful quiet poll during market hours (a
+closed market, a failed broker poll, or a busy venue defers it), for at most the
+orders that straddled the restart -- replacing an unbounded double-count drift.
+
 ### InventoryView
 
 `InventoryView` aggregates inventory across onchain and offchain venues and
