@@ -733,6 +733,16 @@ pub(crate) struct InventoryView {
     /// overwriting a correctly decremented balance with a pre-fill number.
     #[serde(default)]
     last_offchain_fill_applied_at: HashMap<Symbol, DateTime<Utc>>,
+    /// Local-clock time at which the most recent offchain fill's mirrored
+    /// USDC delta was applied to this view -- the venue-level cash analogue
+    /// of `last_offchain_fill_applied_at`. Venue-level because the Hedging
+    /// cash balance is one number, not per-symbol: a hedge fill on ANY
+    /// symbol moves it, so the guard keying on this field must be equally
+    /// broad. Same clock contract as the equity map: compared against
+    /// snapshot `fetched_at`, so it must be read from the host clock that
+    /// stamps it.
+    #[serde(default)]
+    last_offchain_cash_fill_applied_at: Option<DateTime<Utc>>,
     /// Highest block number whose `OnchainEquity` snapshot has been applied,
     /// by symbol. Chain-native ordering, not a clock: a pinned vault read at
     /// block N provably contains every fill at a block <= N, so an
@@ -1083,6 +1093,7 @@ impl Default for InventoryView {
             last_updated: Utc::now(),
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
+            last_offchain_cash_fill_applied_at: None,
             buying_power_cents: None,
             withdrawable_cash_cents: None,
             offchain_gross_usd_cents: None,
@@ -1317,6 +1328,7 @@ impl InventoryView {
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
+            last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
         })
     }
 
@@ -1348,6 +1360,7 @@ impl InventoryView {
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
+            last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
         })
     }
 
@@ -1495,6 +1508,12 @@ impl InventoryView {
     /// reading, never the event's `broker_timestamp`: it is compared against
     /// snapshot `fetched_at`, which the snapshot aggregate stamps from this
     /// host's clock, so mixing the two would compare two unsynchronized clocks.
+    /// `applied_fill_at` being `Some` records the fill application time on
+    /// BOTH the symbol's equity guard and the venue-level cash guard: the
+    /// fill's equity and mirrored-USDC legs apply atomically (`and_then`
+    /// chaining in the reactor), so a stamped equity fill always implies a
+    /// stamped cash fill. One entry point keeps the two stamps impossible to
+    /// desynchronize.
     pub(crate) fn clear_offchain_order_pending(
         &mut self,
         symbol: &Symbol,
@@ -1505,6 +1524,7 @@ impl InventoryView {
         if let Some(applied_fill_at) = applied_fill_at {
             self.last_offchain_fill_applied_at
                 .insert(symbol.clone(), applied_fill_at);
+            self.last_offchain_cash_fill_applied_at = Some(applied_fill_at);
         }
     }
 
@@ -1553,8 +1573,45 @@ impl InventoryView {
             equities,
             pending_offchain_order_symbols: self.pending_offchain_order_symbols.clone(),
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at.clone(),
+            last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
             ..Self::default()
         }
+    }
+
+    /// The Hedging cash-balance twin of the ADR 0015 guards in
+    /// [`Self::equity_snapshot_would_apply`]: the hedge fill applies a
+    /// mirrored USDC delta at the Hedging venue, and the `OffchainUsd`
+    /// snapshot comes from the same broker read as the equity positions, so
+    /// the cash leg double-counts in exactly the window the equity guards
+    /// close. The cash balance is venue-level, so guard 1 broadens from
+    /// per-symbol membership to "any hedge order open" -- an open order on
+    /// ANY symbol makes the venue's cash reading ambiguous.
+    fn offchain_usd_snapshot_would_apply(&self, fetched_at: DateTime<Utc>) -> bool {
+        if !self.pending_offchain_order_symbols.is_empty() {
+            debug!(
+                target: "inventory",
+                pending_symbols = ?self.pending_offchain_order_symbols,
+                ?fetched_at,
+                "Skipping offchain USD snapshot: a hedge order is still open",
+            );
+            return false;
+        }
+
+        if self
+            .last_offchain_cash_fill_applied_at
+            .is_some_and(|applied_at| fetched_at < applied_at)
+        {
+            debug!(
+                target: "inventory",
+                ?fetched_at,
+                last_cash_fill_applied_at = ?self.last_offchain_cash_fill_applied_at,
+                "Skipping offchain USD snapshot fetched before the last \
+                 applied hedge fill's cash leg",
+            );
+            return false;
+        }
+
+        true
     }
 
     fn equity_snapshot_watermark(&self, symbol: &Symbol, venue: Venue) -> Option<DateTime<Utc>> {
@@ -1839,6 +1896,7 @@ impl InventoryView {
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
+            last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
         })
     }
 
@@ -1871,6 +1929,7 @@ impl InventoryView {
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
+            last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
         })
     }
 
@@ -2261,6 +2320,12 @@ impl InventoryView {
                 gross_usd_cents,
                 ..
             } => {
+                // Gross is skipped along with the net balance: both come
+                // from the same ambiguous broker read.
+                if !self.offchain_usd_snapshot_would_apply(fetched_at) {
+                    return Ok(self);
+                }
+
                 let usdc = Usdc::from_cents(*usd_balance_cents)
                     .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
                 let updated = self.update_usdc(
@@ -2481,6 +2546,22 @@ impl InventoryView {
                 gross_usd_cents,
                 ..
             } => {
+                // The force path bypasses the staleness guards, not the
+                // ownership one (mirrors the OffchainEquity arm above):
+                // while any hedge order is open, the fill delta owns the
+                // venue cash balance, and force-writing the ambiguous
+                // mid-order reading would re-open the double-count on the
+                // recovery path.
+                if !self.pending_offchain_order_symbols.is_empty() {
+                    warn!(
+                        target: "inventory",
+                        pending_symbols = ?self.pending_offchain_order_symbols,
+                        "Skipping forced offchain USD snapshot: a hedge \
+                         order is still open",
+                    );
+                    return Ok(self);
+                }
+
                 let usdc = Usdc::from_cents(*usd_balance_cents)
                     .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
                 let updated = self.update_usdc(
@@ -2675,6 +2756,7 @@ mod tests {
             last_offchain_fill_applied_at: HashMap::new(),
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
+            last_offchain_cash_fill_applied_at: None,
         }
     }
 
@@ -2710,6 +2792,7 @@ mod tests {
             last_offchain_fill_applied_at: HashMap::new(),
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
+            last_offchain_cash_fill_applied_at: None,
         }
     }
 
@@ -4255,6 +4338,91 @@ mod tests {
         );
     }
 
+    /// The cash twin of the force-path gate above: while any hedge order is
+    /// open, `force_apply_snapshot_event` must not write the venue-level
+    /// `OffchainUsd` reading -- the fill delta owns the cash balance and the
+    /// mid-order reading is ambiguous.
+    #[test]
+    fn force_apply_offchain_usd_respects_open_hedge_gate() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let mut view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(20), shares(100))
+            .with_usdc(Usdc::new(float!(5000)), Usdc::new(float!(5000)));
+        view.mark_offchain_order_pending(aapl.clone());
+
+        let reason = Arc::new(InventoryViewError::UsdBalanceConversion(0));
+        let event = InventorySnapshotEvent::OffchainUsd {
+            usd_balance_cents: 999_900,
+            gross_usd_cents: Some(999_900),
+            fetched_at: now,
+        };
+
+        let gated = view
+            .clone()
+            .force_apply_snapshot_event(&event, now, reason.clone())
+            .unwrap();
+        assert_eq!(
+            gated.usdc_available(Venue::Hedging),
+            Some(Usdc::new(float!(5000))),
+            "the force path must not write the venue cash while a hedge \
+             order is open"
+        );
+        assert_eq!(
+            gated.offchain_gross_usd_cents, None,
+            "the gross reading comes from the same ambiguous read and must \
+             be skipped with it"
+        );
+
+        view.clear_offchain_order_pending(&aapl, None);
+        let ungated = view
+            .force_apply_snapshot_event(&event, now, reason)
+            .unwrap();
+        assert_eq!(
+            ungated.usdc_available(Venue::Hedging),
+            Some(Usdc::new(float!(9999))),
+            "with no order open the force path applies normally"
+        );
+    }
+
+    /// The venue-level cash guard state must survive the recovery reset the
+    /// same way the equity guard state does: it is fed by Position events
+    /// and nothing re-seeds it after startup.
+    #[test]
+    fn reset_preserves_cash_fill_guard() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let applied_at = Utc::now();
+
+        let mut view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(20), shares(100))
+            .with_usdc(Usdc::new(float!(5000)), Usdc::new(float!(5000)));
+        view.clear_offchain_order_pending(&aapl, Some(applied_at));
+
+        let reset = view.reset_preserving_offchain_order_state();
+
+        // With no order open, only the preserved cash-fill time can reject
+        // this pre-fill reading. Had the reset dropped it, the snapshot
+        // would initialize the wiped venue to the stale value.
+        let healed = reset
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainUsd {
+                    usd_balance_cents: 500_000,
+                    gross_usd_cents: None,
+                    fetched_at: applied_at - Duration::seconds(1),
+                },
+                applied_at,
+            )
+            .unwrap();
+        assert_eq!(
+            healed.usdc_available(Venue::Hedging),
+            None,
+            "a cash snapshot predating the preserved applied-fill time must \
+             still be rejected after the reset; Some means the guard was \
+             wiped"
+        );
+    }
+
     #[test]
     fn onchain_snapshot_zeroes_symbol_absent_from_complete_snapshot() {
         // The same complete-snapshot semantics apply to the onchain venue: a
@@ -4598,6 +4766,7 @@ mod tests {
             last_offchain_fill_applied_at: HashMap::new(),
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
+            last_offchain_cash_fill_applied_at: None,
         };
 
         let dto = view.to_dto();
@@ -4655,6 +4824,7 @@ mod tests {
             last_offchain_fill_applied_at: HashMap::new(),
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
+            last_offchain_cash_fill_applied_at: None,
         };
 
         let dto = view.to_dto();
