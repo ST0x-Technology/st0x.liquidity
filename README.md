@@ -35,6 +35,11 @@ markets by providing continuous two-sided liquidity.
   directional exposure from onchain fills
 - **Operator Vault Controls**: CLI supports generic ERC20 deposits to and
   withdrawals from Raindex vaults, with a USDC-specific withdrawal shortcut
+- **Orchestrator-Mode Mint Authorization**: For assets issuance serves through
+  an `ST0xOrchestrator` vault, signs an EIP-712 MintAuthV1 recipient
+  authorization (nonce persisted before delivery, byte-identical retries) and
+  delivers it to issuance before the mint can complete; vault-direct assets are
+  untouched (see SPEC.md "Mint Recipient Authorization")
 
 ## Getting Started
 

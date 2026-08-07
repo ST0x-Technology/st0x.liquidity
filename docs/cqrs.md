@@ -135,6 +135,35 @@ store.send(&symbol, PositionCommand::AcknowledgeFill { /* ... */ }).await?;
 - Live -> `Entity::transition`
 - Failed -> returns the stored error
 
+### Per-Aggregate Command Serialization
+
+`Store::send()` serializes per aggregate ID, and the lock is held for the ENTIRE
+command execution -- including every `await` inside the handler. A
+same-aggregate `send()` issued from within a command's own await-chain fails
+fast with `LifecycleError::ReentrantCommand`.
+
+Consequences that have bitten us:
+
+- A long-running handler blocks every other `send()` to that aggregate until it
+  returns. `TokenizedEquityMint::Poll` awaits `poll_mint_until_complete()` for
+  the whole Alpaca wait (up to the 30-minute poll timeout), so a command
+  dispatched mid-mint (e.g. `RecordMintAuthorizationDelivered` from the delivery
+  job) queues behind it and executes against the POST-transition state, not the
+  state at dispatch time. Handlers for such commands must accept the states the
+  aggregate can have advanced to meanwhile -- and `evolve` must apply the
+  resulting event in those states too, because `Ok(None)` from `evolve` is
+  `LifecycleError::UnexpectedEvent` and poisons every future replay of that
+  aggregate.
+- A worker whose job dispatches a command to a busy aggregate holds its
+  (single-concurrency) worker slot until the lock frees. Acceptable when the
+  wait is bounded and nothing else queues behind it; otherwise decouple.
+
+`Store::load()` does NOT take the lock -- it replays persisted events -- so
+reads never block behind an in-flight command. While the handler is still
+executing (events not yet persisted), a `load()` sees the pre-transition state;
+once the command's events persist -- momentarily before `send()` returns and
+releases the lock -- a concurrent `load()` already observes them.
+
 ## Reading State via Projections
 
 Production code reads entity state through `Projection`, never by loading
