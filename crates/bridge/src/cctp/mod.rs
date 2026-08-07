@@ -1747,6 +1747,13 @@ mod tests {
             self.inner.address()
         }
 
+        async fn sign_digest(
+            &self,
+            digest: alloy::primitives::B256,
+        ) -> Result<alloy::primitives::Signature, EvmError> {
+            self.inner.sign_digest(digest).await
+        }
+
         async fn send_pending(
             &self,
             contract: Address,

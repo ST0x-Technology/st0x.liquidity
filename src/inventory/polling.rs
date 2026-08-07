@@ -1783,6 +1783,13 @@ mod tests {
             self.address
         }
 
+        async fn sign_digest(
+            &self,
+            _digest: alloy::primitives::B256,
+        ) -> Result<alloy::primitives::Signature, EvmError> {
+            panic!("MockEthereumWallet::sign_digest should not be called in polling tests")
+        }
+
         async fn send_pending(
             &self,
             _contract: Address,
@@ -1819,6 +1826,13 @@ mod tests {
     impl Wallet for MockBaseWallet {
         fn address(&self) -> Address {
             self.address
+        }
+
+        async fn sign_digest(
+            &self,
+            _digest: alloy::primitives::B256,
+        ) -> Result<alloy::primitives::Signature, EvmError> {
+            panic!("MockBaseWallet::sign_digest should not be called in polling tests")
         }
 
         async fn send_pending(

@@ -1212,6 +1212,27 @@ The main crate forwards these as `wallet-turnkey` and `wallet-private-key`
 features. Domain logic is decoupled from the signing backend. See
 [crates/evm/](crates/evm/) for implementation details.
 
+#### Detached Digest Signing
+
+Beyond transaction submission, the `Wallet` trait exposes `sign_digest`: it
+signs a caller-supplied, precomputed 32-byte digest (e.g. an EIP-712 signing
+hash) exactly as given -- no EIP-191 message prefix and no further hashing --
+and returns the detached secp256k1 signature. Nothing is broadcast and no
+transaction nonce is consumed. The caller is responsible for supplying the exact
+digest the verifier expects, typically by reading it from the verifying contract
+itself rather than reconstructing it locally.
+
+Backend expectations:
+
+- **Turnkey**: signs via the raw-payload activity
+  (`ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2`) with hexadecimal payload encoding and
+  the no-op hash function, so the enclave signs the digest bytes as-is. The
+  returned `r`/`s`/`v` components are strictly parsed (exact 32-byte scalars;
+  only the `00`/`01`/`1b`/`1c` recovery-id encodings are accepted), and the
+  assembled signature must recover to the wallet address over the requested
+  digest -- any mismatch fails closed.
+- **Raw private key**: signs the prehash directly with the local key.
+
 ## Crate Architecture
 
 The codebase is organized into multiple Rust crates to achieve:

@@ -18,6 +18,7 @@ use alloy::providers::fillers::{
 use alloy::providers::{Identity, ProviderBuilder, RootProvider};
 use alloy::rpc::client::RpcClient;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
+use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use rain_math_float::Float;
@@ -75,6 +76,7 @@ pub(crate) struct TestWallet {
     address: Address,
     read_provider: RootProvider,
     signing_provider: SigningProvider,
+    signer: PrivateKeySigner,
     required_confirmations: u64,
 }
 
@@ -86,7 +88,7 @@ impl TestWallet {
     ) -> anyhow::Result<Self> {
         let signer = PrivateKeySigner::from_bytes(private_key)?;
         let address = signer.address();
-        let eth_wallet = EthereumWallet::from(signer);
+        let eth_wallet = EthereumWallet::from(signer.clone());
 
         let read_provider = RootProvider::new(RpcClient::builder().http(rpc_url.clone()));
         let signing_provider = ProviderBuilder::new()
@@ -97,6 +99,7 @@ impl TestWallet {
             address,
             read_provider,
             signing_provider,
+            signer,
             required_confirmations,
         })
     }
@@ -115,6 +118,10 @@ impl Evm for TestWallet {
 impl Wallet for TestWallet {
     fn address(&self) -> Address {
         self.address
+    }
+
+    async fn sign_digest(&self, digest: B256) -> Result<alloy::primitives::Signature, EvmError> {
+        Ok(self.signer.sign_hash(&digest).await?)
     }
 
     async fn send_pending(
