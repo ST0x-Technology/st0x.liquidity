@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use alloy::primitives::{Address, Bytes, TxHash};
+use alloy::primitives::{Address, B256, Bytes, Signature, TxHash};
 use alloy::providers::RootProvider;
 use alloy::rpc::client::RpcClient;
 use alloy::rpc::types::TransactionReceipt;
@@ -46,6 +46,10 @@ impl Evm for StubWallet {
 impl Wallet for StubWallet {
     fn address(&self) -> Address {
         self.address
+    }
+
+    async fn sign_digest(&self, _digest: B256) -> Result<Signature, EvmError> {
+        panic!("StubWallet::sign_digest called - use a real wallet in tests that need signing")
     }
 
     async fn send_pending(

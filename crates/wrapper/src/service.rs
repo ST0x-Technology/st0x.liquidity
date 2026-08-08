@@ -462,6 +462,13 @@ mod tests {
             self.address
         }
 
+        async fn sign_digest(
+            &self,
+            _digest: alloy::primitives::B256,
+        ) -> Result<alloy::primitives::Signature, EvmError> {
+            panic!("StubWallet::sign_digest called - use a real wallet in tests that need signing")
+        }
+
         async fn send_pending(
             &self,
             _contract: Address,
@@ -692,6 +699,13 @@ mod tests {
     impl<P: Provider + Clone + Send + Sync + 'static> Wallet for MockedWallet<P> {
         fn address(&self) -> Address {
             self.address
+        }
+
+        async fn sign_digest(
+            &self,
+            _digest: alloy::primitives::B256,
+        ) -> Result<alloy::primitives::Signature, EvmError> {
+            panic!("MockedWallet::sign_digest should not be called in wrapper tests")
         }
 
         async fn send_pending(
