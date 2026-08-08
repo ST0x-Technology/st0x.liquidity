@@ -207,3 +207,16 @@ equities:
 
 Both operations provide an immutable audit trail, tracked as CQRS event-sourced
 aggregates (`TokenizedEquityMint`, `EquityRedemption`).
+
+### Mint Recipient Authorization
+
+For assets issuance serves through an `ST0xOrchestrator` vault
+(`vault_mode: "orchestrator"` on issuance's status endpoint), issuance will not
+mint until the recipient signs an EIP-712
+`MintAuth(token, recipient, amount, nonce)` authorization over the digest read
+from the orchestrator contract. This bot is the recipient of rebalancing mints,
+so it signs (`MintAuthorizationService`, wallet seam `Wallet::sign_digest`) and
+delivers the authorization to issuance (`DeliverMintAuthorization` job). The
+nonce is generated once per mint, persisted before delivery, and reused
+byte-identically on retries. See SPEC.md "Mint Recipient Authorization
+(Orchestrator Mode)".
