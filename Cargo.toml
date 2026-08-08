@@ -240,8 +240,11 @@ sqlx-apalis = { version = "0.8.6", package = "sqlx", features = [
   "chrono",
   "runtime-tokio-rustls",
 ] }
-st0x-issuance-client = { git = "https://github.com/ST0x-Technology/st0x.issuance.git", tag = "0.2.0", version = "0.1.0" }
-st0x-issuance-dto = { git = "https://github.com/ST0x-Technology/st0x.issuance.git", tag = "0.2.0", version = "0.1.0" }
+# Branch pin (RAI-1243): the mint-authorization delivery method is on the
+# issuance stack, not yet in a tag. Swap to the next tag once that stack
+# merges to issuance main.
+st0x-issuance-client = { git = "https://github.com/ST0x-Technology/st0x.issuance.git", branch = "2026-08-06-mint-authorization-client-dto", version = "0.1.0" }
+st0x-issuance-dto = { git = "https://github.com/ST0x-Technology/st0x.issuance.git", branch = "2026-08-06-mint-authorization-client-dto", version = "0.1.0" }
 tower = { version = "0.5.3", features = ["util"] }
 tempfile.workspace = true
 

@@ -13,6 +13,8 @@ use st0x_execution::Symbol;
 use st0x_issuance_client::{ClientError, IssuanceClient};
 use st0x_issuance_dto::{TokenizedAssetStatus, UnderlyingSymbol};
 
+use crate::issuance::IssuanceClientFailure;
+
 /// Reads an asset's dividend freeze status so the rebalancing trigger can skip
 /// frozen assets before starting a flow.
 #[async_trait]
@@ -36,59 +38,31 @@ pub(crate) enum FreezeCheckError {
     /// rebalances, so the bot cannot confirm the asset is not frozen.
     #[error("issuance does not recognize asset {symbol}")]
     AssetUnknown { symbol: Symbol },
-    /// The status request itself failed (transport error, unexpected status).
+    /// The status request itself failed (transport error, unexpected
+    /// status), reduced to the endpoint-free classification shared by every
+    /// issuance-client consumer -- the trigger logs freeze-check errors, and
+    /// the raw [`ClientError`] embeds the secret endpoint URL.
     #[error("issuance freeze-status request failed: {0}")]
-    Client(FreezeClientFailure),
-}
-
-/// Coarse, endpoint-free classification of a failed issuance status request.
-///
-/// The issuance endpoint lives in the encrypted secrets (issuance is not on
-/// the internal network), and [`ClientError`] embeds the request URL and
-/// socket address in both `Debug` and `Display`. The trigger logs freeze-check
-/// errors, so the raw client error is reduced to this classification at the
-/// boundary and never reaches logs.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum FreezeClientFailure {
-    #[error("HTTP client could not be built")]
-    Build,
-    #[error("configured base URL is not a valid base")]
-    InvalidBaseUrl,
-    #[error("request timed out")]
-    Timeout,
-    #[error("connection failed")]
-    Connect,
-    #[error("transport error")]
-    Transport,
-    #[error("failed to parse the response body")]
-    ParseResponse,
-    /// Raw status code: the client does not re-export its `StatusCode` type,
-    /// and naming either of the workspace's two reqwest majors here would tie
-    /// this enum to the client's private dependency version.
-    #[error("unexpected status {0}")]
-    UnexpectedStatus(u16),
+    Client(#[source] IssuanceClientFailure),
 }
 
 impl From<ClientError> for FreezeCheckError {
     fn from(error: ClientError) -> Self {
-        Self::Client(match error {
-            ClientError::Build(_) => FreezeClientFailure::Build,
-            ClientError::NotABase { .. } => FreezeClientFailure::InvalidBaseUrl,
-            ClientError::Http(http) if http.is_timeout() => FreezeClientFailure::Timeout,
-            ClientError::Http(http) if http.is_connect() => FreezeClientFailure::Connect,
-            ClientError::Http(_) => FreezeClientFailure::Transport,
-            ClientError::ParseResponse(_) => FreezeClientFailure::ParseResponse,
-            ClientError::Status { status, .. } => {
-                FreezeClientFailure::UnexpectedStatus(status.as_u16())
-            }
-        })
+        Self::Client(error.into())
     }
 }
 
 #[async_trait]
 impl FreezeStatusReader for IssuanceClient {
     async fn is_frozen(&self, symbol: &Symbol) -> Result<bool, FreezeCheckError> {
-        let underlying = UnderlyingSymbol::new(symbol.to_string());
+        // `UnderlyingSymbol::new` rejects empty symbols; such a symbol can
+        // never be a known asset, so it classifies as unknown -- the caller
+        // fails closed either way.
+        let underlying = UnderlyingSymbol::new(symbol.to_string()).map_err(|_| {
+            FreezeCheckError::AssetUnknown {
+                symbol: symbol.clone(),
+            }
+        })?;
         match self.tokenized_asset_status(&underlying).await? {
             Some(response) => Ok(match response.status {
                 TokenizedAssetStatus::Frozen => true,
