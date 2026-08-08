@@ -3182,3 +3182,257 @@ async fn interrupted_usdc_base_to_alpaca_resumes_after_restart() -> anyhow::Resu
     let _ = bot2.await;
     Ok(())
 }
+
+/// Runtime bytecode that returns the given 32-byte word for ANY call.
+///
+/// Stands in for the orchestrator's `mintAuthDigest` view on the e2e chain
+/// (no ST0xOrchestrator artifact is available to deploy here): the
+/// mint-authorization service reads the digest from the configured
+/// orchestrator address and signs whatever it returns, so a constant is
+/// enough to drive the full sign-and-deliver path.
+///
+/// Assembly: `PUSH32 <digest> PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN`.
+fn digest_stub_bytecode(digest: [u8; 32]) -> Vec<u8> {
+    let mut code = Vec::with_capacity(41);
+    code.push(0x7f);
+    code.extend_from_slice(&digest);
+    code.extend_from_slice(&[0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    code
+}
+
+/// Test-owned issuance mock reporting `vault_mode` for every asset, so each
+/// mint-authorization flow controls the minting path (the shared infra mock
+/// is always vault-direct). The caller registers its own POST-authorization
+/// mock on the returned server BEFORE driving the flow -- mock matching is
+/// server-side, handles are only needed for call-count assertions.
+///
+/// Sync on purpose: httpmock's `When`/`Then` builders are `Rc`-based, so an
+/// async fn touching them is `!Send` (`clippy::future_not_send`); the
+/// blocking httpmock API manages its own runtime and is safe inside tokio
+/// tests (the turnkey suite's established pattern).
+fn issuance_mock_with_vault_mode(vault_mode: &'static str) -> httpmock::MockServer {
+    let issuance = httpmock::MockServer::start();
+    issuance.mock(move |when, then| {
+        when.method(httpmock::Method::GET)
+            .path_prefix("/tokenized-assets/")
+            .path_suffix("/status");
+        then.status(200).json_body(serde_json::json!({
+            "underlying": "AAPL",
+            "status": "enabled",
+            "vault_mode": vault_mode,
+        }));
+    });
+    issuance
+}
+
+/// Shared driver for the two mint-authorization flows: starts the infra,
+/// deploys the digest-stub orchestrator, prepares and takes three
+/// sell-equity orders against a bot configured with `[orchestrator]`
+/// pointing at that stub and `[issuance]` at the given mock, and waits for
+/// the first mint to complete end to end. Which path the mint takes is
+/// decided solely by the mock's `vault_mode` -- the orchestrator config is
+/// deliberately present in BOTH flows.
+async fn drive_mint_with_orchestrator_configured(
+    issuance: &httpmock::MockServer,
+) -> anyhow::Result<(
+    TestInfra<impl alloy::providers::Provider + Clone>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+)> {
+    use alloy::providers::ext::AnvilApi as _;
+
+    let infra = TestInfra::start(vec![("AAPL", float!(110))], vec![("AAPL", float!(7.5))]).await?;
+
+    // Stand-in orchestrator contract: any call returns a constant digest.
+    let orchestrator_address = Address::repeat_byte(0x77);
+    infra
+        .base_chain
+        .provider
+        .anvil_set_code(
+            orchestrator_address,
+            digest_stub_bytecode([0xd1; 32]).into(),
+        )
+        .await?;
+
+    let mut prepared_orders = Vec::new();
+    for _ in 0..3 {
+        prepared_orders.push(
+            infra
+                .base_chain
+                .setup_order()
+                .symbol("AAPL")
+                .amount(float!(7.5))
+                .price(float!(112))
+                .direction(TakeDirection::SellEquity)
+                .call()
+                .await?,
+        );
+    }
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let cash_vault_id = prepared_orders[0].input_vault_id;
+    let equity_vault_ids = HashMap::from([("AAPL".to_owned(), prepared_orders[0].output_vault_id)]);
+    let ctx = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Disabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .issuance_base_url(issuance.base_url().parse()?)
+        .orchestrator(st0x_config::OrchestratorConfig {
+            address: orchestrator_address,
+        })
+        .call()?;
+    let mut bot = spawn_bot(ctx);
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    for prepared in &prepared_orders {
+        infra.base_chain.take_prepared_order(prepared).await?;
+    }
+
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "TokenizedEquityMintEvent::DepositedIntoRaindex",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    Ok((infra, bot))
+}
+
+/// Orchestrator-mode mint (RAI-1243): the bot must sign a MintAuthV1 over
+/// the orchestrator-reported digest BEFORE tokens arrive, deliver it to
+/// issuance exactly once with its acknowledgement recorded, and the mint
+/// must still complete end to end.
+#[test_log::test(tokio::test)]
+async fn equity_mint_orchestrator_mode_delivers_exactly_one_authorization() -> anyhow::Result<()> {
+    let issuance = issuance_mock_with_vault_mode("orchestrator");
+    let authorization_deliveries = issuance
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path_prefix("/internal/mints/")
+                .path_suffix("/authorization")
+                // The delivered authorization must carry the hex-encoded
+                // 32-byte nonce and 65-byte signature (the exact wire shape
+                // is pinned by the mint_authorization unit tests; this
+                // guards the e2e request against an empty/garbage body).
+                .body_includes(r#""nonce":"0x"#)
+                .body_includes(r#""signature":"0x"#);
+            then.status(200).json_body(serde_json::json!({
+                "issuer_request_id": "e2e-issuer-id",
+                "status": "authorized",
+            }));
+        })
+        .await;
+
+    let (infra, mut bot) = drive_mint_with_orchestrator_configured(&issuance).await?;
+
+    // The acknowledgement always trails the mint: the saga's `Poll` holds
+    // the per-aggregate lock for the whole Alpaca wait, so the delivery
+    // job's `RecordMintAuthorizationDelivered` queues behind it and lands
+    // after `TokensReceived`. Wait for it instead of asserting it already
+    // happened.
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "TokenizedEquityMintEvent::MintAuthorizationDelivered",
+        1,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    // Exactly one delivery reached issuance so far (retries would redeliver
+    // byte-identically, but the happy path must not retry at all). Checked
+    // right after the first mint's acknowledgement: the saga starts any
+    // follow-up mint only well after the first completes.
+    authorization_deliveries.assert_calls_async(1).await;
+
+    // Scope event assertions to the completed mint: with three takes the
+    // saga legitimately starts further mints after the first completes, so
+    // global counts would race against their authorization events.
+    let pool = connect_db(&infra.db_path).await?;
+    let events = fetch_events_by_type(&pool, "TokenizedEquityMint").await?;
+    let completed_mint_id = events
+        .iter()
+        .find(|event| event.event_type == "TokenizedEquityMintEvent::DepositedIntoRaindex")
+        .map(|event| event.aggregate_id.clone())
+        .expect("DepositedIntoRaindex must be persisted");
+    let mint_events: Vec<_> = events
+        .iter()
+        .filter(|event| event.aggregate_id == completed_mint_id)
+        .collect();
+    let position_of = |event_type: &str| {
+        mint_events
+            .iter()
+            .position(|event| event.event_type == event_type)
+    };
+
+    // Signing is the deterministic gate: the saga signs before it starts
+    // polling Alpaca, so the signed event must precede token receipt.
+    let signed = position_of("TokenizedEquityMintEvent::MintAuthorizationSigned")
+        .expect("MintAuthorizationSigned must be persisted");
+    let received = position_of("TokenizedEquityMintEvent::TokensReceived")
+        .expect("TokensReceived must be persisted");
+    assert!(
+        signed < received,
+        "authorization must be signed before tokens arrive; \
+         got signed={signed}, received={received}"
+    );
+    position_of("TokenizedEquityMintEvent::MintAuthorizationDelivered")
+        .expect("the completed mint must carry its delivery acknowledgement");
+    let signed_count = mint_events
+        .iter()
+        .filter(|event| event.event_type == "TokenizedEquityMintEvent::MintAuthorizationSigned")
+        .count();
+    assert_eq!(
+        signed_count, 1,
+        "exactly one authorization may be signed per mint"
+    );
+
+    bot.abort();
+    Ok(())
+}
+
+/// Vault-direct assets take the pre-authorization path untouched even when
+/// an `[orchestrator]` section is configured and the contract is live: the
+/// per-asset `vault_mode` from issuance -- not the config's presence -- is
+/// what gates signing. No authorization is signed or delivered.
+#[test_log::test(tokio::test)]
+async fn equity_mint_vault_direct_mode_delivers_no_authorization() -> anyhow::Result<()> {
+    let issuance = issuance_mock_with_vault_mode("vault_direct");
+    let authorization_deliveries = issuance
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path_prefix("/internal/mints/")
+                .path_suffix("/authorization");
+            then.status(200).json_body(serde_json::json!({
+                "issuer_request_id": "e2e-issuer-id",
+                "status": "authorized",
+            }));
+        })
+        .await;
+
+    let (infra, bot) = drive_mint_with_orchestrator_configured(&issuance).await?;
+
+    authorization_deliveries.assert_calls_async(0).await;
+
+    let pool = connect_db(&infra.db_path).await?;
+    let events = fetch_events_by_type(&pool, "TokenizedEquityMint").await?;
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.event_type == "TokenizedEquityMintEvent::MintAuthorizationSigned"),
+        "a vault-direct mint must never sign an authorization"
+    );
+
+    bot.abort();
+    Ok(())
+}

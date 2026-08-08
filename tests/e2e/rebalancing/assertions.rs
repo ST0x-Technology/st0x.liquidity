@@ -225,6 +225,10 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     /// Base URL of the mock issuance service (`TestInfra::issuance_base_url`) so
     /// the rebalancing freeze guard reaches a reachable, not-frozen endpoint.
     issuance_base_url: url::Url,
+    /// `[orchestrator]` config for orchestrator-mode mint-authorization
+    /// tests (RAI-1243). Omitted by default: most flows exercise
+    /// vault-direct minting, which needs no orchestrator address.
+    orchestrator: Option<st0x_config::OrchestratorConfig>,
 ) -> anyhow::Result<Ctx> {
     let alpaca_auth = AlpacaBrokerApiCtx {
         api_key: TEST_API_KEY.to_owned(),
@@ -299,6 +303,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         .issuance(st0x_config::test_issuance_status_ctx(issuance_base_url))
         .redemption_wallet(redemption_wallet)
         .bot_gas_valuation(mock_bot_gas_valuation(chain.mock_pyth))
+        .maybe_orchestrator(orchestrator)
         .call()?;
     Ok(ctx)
 }
