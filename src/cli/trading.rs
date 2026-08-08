@@ -1374,6 +1374,7 @@ mod tests {
             issuance: create_test_issuance_ctx(),
             redemption_wallet: None,
             bot_gas_valuation: None,
+            orchestrator: None,
         }
     }
 
