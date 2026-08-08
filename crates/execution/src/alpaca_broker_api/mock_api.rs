@@ -1093,10 +1093,7 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                     .any(|order| order.client_order_id.as_deref() == Some(client_id));
                 if already_recorded {
                     drop(state);
-                    return json_response(
-                        422,
-                        &json!({"message": "client_order_id must be unique"}),
-                    );
+                    return json_response(422, &super::duplicate_client_order_id_body());
                 }
             }
 

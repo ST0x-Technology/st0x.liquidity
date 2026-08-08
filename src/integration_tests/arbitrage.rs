@@ -27,7 +27,8 @@ use st0x_config::{
 use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
 use st0x_evm::{ReadOnlyEvm, USDC_BASE};
 use st0x_execution::{
-    Direction, ExecutorOrderId, FractionalShares, MockExecutor, OrderState, Positive, Symbol,
+    Direction, ExecutorOrderId, FractionalShares, MockExecutor, OrderFailureTerminality,
+    OrderState, Positive, Symbol,
 };
 use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
@@ -38,17 +39,21 @@ use crate::bindings::IRaindexV6::{self, TakeOrderV3};
 use crate::bindings::{
     DeployableERC20, Deployer, Interpreter, Parser, RaindexV6, Store as RainStore,
 };
+use crate::conductor::job::{BackpressureStreak, Job};
 use crate::conductor::{
     AccumulatedPositionExecutionCtx, TradeProcessingCqrs, VaultDiscoveryCtx,
     check_and_execute_accumulated_positions, discover_vaults_for_trade, process_queued_trade,
 };
+use crate::offchain::order::handle_rejection::HandleOrderRejectionCtx;
+use crate::offchain::order::poll_status::PollOrderStatusCtx;
 use crate::offchain::order::{
-    ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId,
+    ExecutorOrderPlacer, HandleOrderRejection, HandleOrderRejectionJobQueue, OffchainOrder,
+    OffchainOrderCommand, OffchainOrderId, PollOrderStatus, ReconcileOrderFillJobQueue,
 };
 use crate::onchain::OnchainTrade;
 use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::RaindexTradeEvent;
-use crate::position::{Position, PositionCommand};
+use crate::position::{AnchorDisposition, Position, PositionCommand};
 use crate::test_utils::{
     TEST_POLL_INTERVAL, TestAnvilInstance, deploy_tofu_singleton, setup_test_pools, spawn_anvil,
 };
@@ -237,6 +242,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                 shares_filled,
                 avg_price,
                 failed_at,
+                ..
             } => {
                 let error =
                     error_reason.unwrap_or_else(|| "Order failed with no error reason".to_string());
@@ -290,6 +296,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                             PositionCommand::FailOffChainOrder {
                                 offchain_order_id: order_id,
                                 error,
+                                anchor: AnchorDisposition::Preserve,
                             },
                         )
                         .await?;
@@ -381,6 +388,88 @@ async fn record_poll_partial_fill(
         price: avg_price,
         broker_timestamp,
     }))
+}
+
+/// Drives a simulated broker terminal failure through the real
+/// `PollOrderStatus` -> `HandleOrderRejection` job chain (unlike
+/// `poll_submitted_orders`, which hand-replays the CQRS commands and
+/// hardcodes `AnchorDisposition::Preserve`, bypassing the anchor-release
+/// decision entirely). Runs each job's real `perform` directly against a
+/// freshly-built ctx rather than through an apalis worker loop, mirroring
+/// `drain_one_poll_job_for_order` (`src/position_check.rs`).
+async fn poll_and_reject_via_real_jobs<E>(
+    executor: &E,
+    apalis_pool: &apalis_sqlite::SqlitePool,
+    offchain_order_projection: &Arc<Projection<OffchainOrder>>,
+    offchain_order: &Arc<Store<OffchainOrder>>,
+    position: &Arc<Store<Position>>,
+    poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue,
+    offchain_order_id: OffchainOrderId,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    E: st0x_execution::Executor + Clone + Send + Sync + 'static,
+    crate::offchain::order::JobError: From<E::Error>,
+{
+    let poll_ctx = PollOrderStatusCtx {
+        executor: executor.clone(),
+        offchain_order_projection: offchain_order_projection.clone(),
+        offchain_order_store: offchain_order.clone(),
+        position_store: position.clone(),
+        poll_status_queue,
+        reconcile_queue: ReconcileOrderFillJobQueue::new(apalis_pool),
+        rejection_queue: HandleOrderRejectionJobQueue::new(apalis_pool),
+        poll_interval: TEST_POLL_INTERVAL,
+    };
+
+    PollOrderStatus {
+        offchain_order_id,
+        backpressure_streak: BackpressureStreak::default(),
+    }
+    .perform(&poll_ctx)
+    .await?;
+
+    let rejection_row: Option<(String, Vec<u8>)> = sqlx_apalis::query_as(
+        "SELECT id, job FROM Jobs \
+         WHERE job_type = ? \
+           AND status IN ('Pending', 'Queued', 'Running') \
+         ORDER BY run_at ASC LIMIT 1",
+    )
+    .bind(std::any::type_name::<HandleOrderRejection>())
+    .fetch_optional(apalis_pool)
+    .await?;
+
+    let Some((job_id, payload)) = rejection_row else {
+        return Err(format!(
+            "expected PollOrderStatus to enqueue a HandleOrderRejection job for \
+             order {offchain_order_id}, found none"
+        )
+        .into());
+    };
+
+    let rejection_job: HandleOrderRejection = serde_json::from_slice(&payload)
+        .map_err(|error| format!("deserialize HandleOrderRejection payload: {error}"))?;
+
+    if rejection_job.offchain_order_id != offchain_order_id {
+        return Err(format!(
+            "expected the dequeued HandleOrderRejection job to be for order \
+             {offchain_order_id}, but found job {job_id} for order {}",
+            rejection_job.offchain_order_id
+        )
+        .into());
+    }
+
+    let rejection_ctx = HandleOrderRejectionCtx {
+        offchain_order: offchain_order.clone(),
+        position: position.clone(),
+    };
+    rejection_job.perform(&rejection_ctx).await?;
+
+    sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+        .bind(&job_id)
+        .execute(apalis_pool)
+        .await?;
+
+    Ok(())
 }
 
 /// Holds a deployed Rain OrderBook on a local Anvil node, ready to create real take-order events.
@@ -1099,12 +1188,21 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         error_reason: Some("Broker rejected order".to_string()),
         shares_filled: None,
         avg_price: None,
+        terminality: OrderFailureTerminality::Terminal,
     });
-    poll_submitted_orders(
+    // Drives the real PollOrderStatus -> HandleOrderRejection job chain
+    // (rather than `poll_submitted_orders`'s hand-replay, which hardcodes
+    // AnchorDisposition::Preserve and so cannot catch an anchor-release
+    // regression) so the terminal broker failure's release decision is
+    // exercised end to end.
+    poll_and_reject_via_real_jobs(
         &failed_executor,
-        offchain_order_projection.as_ref(),
+        &apalis_pool,
+        &offchain_order_projection,
         &offchain_order,
         &position,
+        cqrs.poll_status_queue.clone(),
+        order_id,
     )
     .await?;
 
@@ -1119,6 +1217,16 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         .last_price_usdc(float!(&AAPL_PRICE.to_string()))
         .call()
         .await;
+
+    let position_after_terminal_failure = position_query
+        .load(&symbol)
+        .await?
+        .expect("position should exist");
+    assert_eq!(
+        position_after_terminal_failure.last_failed_offchain_order_id, None,
+        "a broker-documented terminal failure must release the idempotency \
+         anchor so the retry below derives a fresh key"
+    );
 
     let mut expected = vec![
         ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
@@ -1273,6 +1381,7 @@ async fn retains_failed_terminal_partial_fill() -> Result<(), Box<dyn std::error
         error_reason: Some("broker rejected after partial fill".to_string()),
         shares_filled: Some(FractionalShares::new(float!(0.4))),
         avg_price: Some(st0x_finance::Usd::new(float!(100.25))),
+        terminality: OrderFailureTerminality::Terminal,
     });
     poll_submitted_orders(
         &failed_executor,
@@ -2863,6 +2972,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         error_reason: Some("Broker rejected".to_string()),
         shares_filled: None,
         avg_price: None,
+        terminality: OrderFailureTerminality::Terminal,
     });
     poll_submitted_orders(
         &failed_executor,

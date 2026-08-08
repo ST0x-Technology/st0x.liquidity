@@ -9,9 +9,10 @@ use uuid::Uuid;
 use super::client::AlpacaBrokerApiClient;
 use super::{AlpacaBrokerApiError, CryptoOrderFailureReason, MissingOrderField, TimeInForce};
 use crate::{
-    ClientOrderId, Direction, ExecutorOrderId, FractionalShares, MarketOrder, OrderPlacement,
-    OrderStatus, OrderUpdate, Positive, Symbol, Usd, deserialize_float_from_number_or_string,
-    deserialize_option_float_from_number_or_string, serialize_float_as_string,
+    ClientOrderId, Direction, ExecutorOrderId, FractionalShares, MarketOrder,
+    OrderFailureTerminality, OrderPlacement, OrderStatus, OrderUpdate, Positive, Symbol, Usd,
+    deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
+    serialize_float_as_string,
 };
 
 const ALPACA_CRYPTO_MAX_DECIMAL_PLACES: u8 = 6;
@@ -297,7 +298,7 @@ impl CryptoOrderResponse {
     }
 
     /// Classifies the order's current status into a fill/pending/failed outcome,
-    /// consistent with the terminal mapping in `map_broker_status_to_order_status`.
+    /// consistent with the terminal mapping in `classify_broker_status`.
     ///
     /// The match is exhaustive (no wildcard) so a newly added Alpaca status forces
     /// a compile error here rather than silently mapping to `Pending` and retrying
@@ -401,7 +402,8 @@ pub(super) async fn place_market_order(
     let (order_id, shares, extended_hours, limit_price) = match client.place_order(&request).await {
         Ok(response) => (response.id, placed_shares, false, None),
         Err(error) if is_duplicate_client_order_id(&error) => {
-            debug!(
+            warn!(
+                %error,
                 client_order_id = %market_order.client_order_id,
                 "Broker rejected duplicate client_order_id; reconciling the order it already accepted"
             );
@@ -541,7 +543,8 @@ pub(super) async fn place_limit_order(
             Some(*limit_order.limit_price.as_price()),
         ),
         Err(error) if is_duplicate_client_order_id(&error) => {
-            debug!(
+            warn!(
+                %error,
                 client_order_id = %limit_order.client_order_id,
                 "Broker rejected duplicate client_order_id; reconciling the order it already accepted"
             );
@@ -597,7 +600,7 @@ pub(super) async fn get_order_status(
         OrderSide::Sell => Direction::Sell,
     };
 
-    let status = map_broker_status_to_order_status(response.status);
+    let (status, failure_terminality) = classify_broker_status(response.status);
     let price = response.filled_average_price;
     let shares_filled = response.filled_quantity.map(FractionalShares::new);
 
@@ -654,6 +657,7 @@ pub(super) async fn get_order_status(
         updated_at,
         price,
         shares_filled,
+        failure_terminality,
     })
 }
 
@@ -699,34 +703,48 @@ fn broker_time_or_observation(broker_time: Option<DateTime<Utc>>, order_id: &str
     })
 }
 
-fn map_broker_status_to_order_status(status: BrokerOrderStatus) -> OrderStatus {
+/// Classifies a broker status into the `OrderStatus` it maps to, and --
+/// whenever that status is `OrderStatus::Failed` -- the failure's
+/// terminality per Alpaca's order lifecycle
+/// (https://docs.alpaca.markets/docs/orders-at-alpaca). `DoneForDay` is
+/// terminal only because every order this bot places is Day time-in-force,
+/// so it cannot resume in a later session.
+///
+/// A single exhaustive match producing both classifications together, rather
+/// than two independent matches over `BrokerOrderStatus`: the previous shape
+/// let a status be added to one match's `Failed`/terminal arm without the
+/// other match being updated to agree, which only surfaced as a runtime
+/// `MissingOrderField::FailureTerminality` error. Here, a newly added status
+/// must be classified for both dimensions in the same arm or the match is
+/// non-exhaustive and the crate fails to compile.
+fn classify_broker_status(
+    status: BrokerOrderStatus,
+) -> (OrderStatus, Option<OrderFailureTerminality>) {
+    use BrokerOrderStatus::*;
+    use OrderFailureTerminality::{NotTerminal, Terminal};
+
     match status {
-        // Submitted to broker and in progress
-        BrokerOrderStatus::New
-        | BrokerOrderStatus::Accepted
-        | BrokerOrderStatus::PendingNew
-        | BrokerOrderStatus::AcceptedForBidding
-        | BrokerOrderStatus::PendingCancel
-        | BrokerOrderStatus::PendingReplace
-        | BrokerOrderStatus::Stopped => OrderStatus::Submitted,
+        // Submitted to broker and in progress.
+        New | Accepted | PendingNew | AcceptedForBidding | PendingCancel | PendingReplace
+        | Stopped => (OrderStatus::Submitted, None),
 
         // Partially filled -- distinct from Submitted so the poll loop can
         // drive `UpdatePartialFill` on the aggregate before any cancel.
-        BrokerOrderStatus::PartiallyFilled => OrderStatus::PartiallyFilled,
+        PartiallyFilled => (OrderStatus::PartiallyFilled, None),
 
-        // Successfully filled
-        BrokerOrderStatus::Filled => OrderStatus::Filled,
+        // Successfully filled.
+        Filled => (OrderStatus::Filled, None),
 
         // Cancelled by the broker after a cancel request was accepted.
-        BrokerOrderStatus::Canceled => OrderStatus::Cancelled,
+        Canceled => (OrderStatus::Cancelled, None),
 
-        // Failed/terminal statuses
-        BrokerOrderStatus::Expired
-        | BrokerOrderStatus::DoneForDay
-        | BrokerOrderStatus::Rejected
-        | BrokerOrderStatus::Replaced
-        | BrokerOrderStatus::Suspended
-        | BrokerOrderStatus::Calculated => OrderStatus::Failed,
+        // Failed/terminal statuses: the order will never resume or fill
+        // further, so a caller may release its idempotency key.
+        Expired | Rejected | DoneForDay => (OrderStatus::Failed, Some(Terminal)),
+
+        // Failed statuses the order may still resume or fill from: a caller
+        // must NOT release its idempotency key on these.
+        Replaced | Suspended | Calculated => (OrderStatus::Failed, Some(NotTerminal)),
     }
 }
 
@@ -860,6 +878,7 @@ mod tests {
     use crate::alpaca_broker_api::auth::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
+    use crate::alpaca_broker_api::duplicate_client_order_id_body;
     use st0x_float_macro::float;
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
@@ -1053,7 +1072,7 @@ mod tests {
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
             then.status(422)
                 .header("content-type", "application/json")
-                .json_body(json!({"message": "client_order_id must be unique"}));
+                .json_body(duplicate_client_order_id_body());
         });
 
         // We reconcile by adopting the order the broker actually accepted.
@@ -1102,6 +1121,52 @@ mod tests {
         assert_eq!(placement.limit_price, None);
     }
 
+    /// The duplicate-422 warn log includes the Alpaca-reported numeric code
+    /// alongside the message. `place_market_order`'s reconciliation swallows
+    /// the intermediate `ApiError` on success, so this drives `place_order`
+    /// directly against a realistic duplicate-client_order_id body to prove
+    /// `code` is actually parsed into `alpaca_code`, not just `message`.
+    #[tokio::test]
+    async fn place_order_parses_alpaca_code_from_duplicate_client_order_id_body() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(422)
+                .header("content-type", "application/json")
+                .json_body(duplicate_client_order_id_body());
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let request = OrderRequest {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            side: OrderSide::Buy,
+            order_type: "market",
+            time_in_force: TimeInForce::Day.as_api_str(),
+            extended_hours: false,
+            client_order_id: ClientOrderId::from_uuid(uuid!(
+                "77777777-7777-4777-8777-777777777777"
+            )),
+        };
+
+        let error = client.place_order(&request).await.unwrap_err();
+
+        mock.assert();
+        let AlpacaBrokerApiError::ApiError {
+            alpaca_code,
+            message,
+            ..
+        } = error
+        else {
+            panic!("expected ApiError, got {error:?}");
+        };
+        assert_eq!(alpaca_code, Some(40_010_001));
+        assert_eq!(message, "client_order_id must be unique");
+    }
+
     #[tokio::test]
     async fn place_market_order_adoption_reports_adopted_extended_hours_terms() {
         // Lost-response scenario the convergence sweep depends on: an
@@ -1122,7 +1187,7 @@ mod tests {
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
             then.status(422)
                 .header("content-type", "application/json")
-                .json_body(json!({"message": "client_order_id must be unique"}));
+                .json_body(duplicate_client_order_id_body());
         });
 
         let lookup_mock = server.mock(|when, then| {
@@ -1184,7 +1249,7 @@ mod tests {
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
             then.status(422)
                 .header("content-type", "application/json")
-                .json_body(json!({"message": "client_order_id must be unique"}));
+                .json_body(duplicate_client_order_id_body());
         });
 
         let lookup_mock = server.mock(|when, then| {
@@ -1244,7 +1309,7 @@ mod tests {
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
             then.status(422)
                 .header("content-type", "application/json")
-                .json_body(json!({"message": "client_order_id must be unique"}));
+                .json_body(duplicate_client_order_id_body());
         });
 
         let lookup_mock = server.mock(|when, then| {
@@ -1314,7 +1379,7 @@ mod tests {
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
             then.status(422)
                 .header("content-type", "application/json")
-                .json_body(json!({"message": "client_order_id must be unique"}));
+                .json_body(duplicate_client_order_id_body());
         });
 
         let lookup_mock = server.mock(|when, then| {
@@ -1416,7 +1481,7 @@ mod tests {
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
             then.status(422)
                 .header("content-type", "application/json")
-                .json_body(json!({"message": "client_order_id must be unique"}));
+                .json_body(duplicate_client_order_id_body());
         });
 
         // The broker reported a duplicate but the lookup finds nothing -- an
@@ -2274,43 +2339,129 @@ mod tests {
     }
 
     #[test]
-    fn test_map_broker_status_new() {
+    fn classify_broker_status_new_is_submitted_with_no_terminality() {
         assert_eq!(
-            map_broker_status_to_order_status(BrokerOrderStatus::New),
-            OrderStatus::Submitted
+            classify_broker_status(BrokerOrderStatus::New),
+            (OrderStatus::Submitted, None)
         );
     }
 
     #[test]
-    fn test_map_broker_status_filled() {
+    fn classify_broker_status_filled_has_no_terminality() {
         assert_eq!(
-            map_broker_status_to_order_status(BrokerOrderStatus::Filled),
-            OrderStatus::Filled
+            classify_broker_status(BrokerOrderStatus::Filled),
+            (OrderStatus::Filled, None)
         );
     }
 
     #[test]
-    fn test_map_broker_status_rejected() {
+    fn classify_broker_status_partially_filled_has_no_terminality() {
         assert_eq!(
-            map_broker_status_to_order_status(BrokerOrderStatus::Rejected),
-            OrderStatus::Failed
+            classify_broker_status(BrokerOrderStatus::PartiallyFilled),
+            (OrderStatus::PartiallyFilled, None)
         );
     }
 
     #[test]
-    fn test_map_broker_status_partially_filled() {
+    fn classify_broker_status_cancelled_has_no_terminality() {
         assert_eq!(
-            map_broker_status_to_order_status(BrokerOrderStatus::PartiallyFilled),
-            OrderStatus::PartiallyFilled
+            classify_broker_status(BrokerOrderStatus::Canceled),
+            (OrderStatus::Cancelled, None)
         );
     }
 
     #[test]
-    fn test_map_broker_status_cancelled() {
+    fn classify_broker_status_rejected_is_failed_and_terminal() {
         assert_eq!(
-            map_broker_status_to_order_status(BrokerOrderStatus::Canceled),
-            OrderStatus::Cancelled
+            classify_broker_status(BrokerOrderStatus::Rejected),
+            (OrderStatus::Failed, Some(OrderFailureTerminality::Terminal))
         );
+    }
+
+    #[test]
+    fn classify_broker_status_expired_is_failed_and_terminal() {
+        assert_eq!(
+            classify_broker_status(BrokerOrderStatus::Expired),
+            (OrderStatus::Failed, Some(OrderFailureTerminality::Terminal))
+        );
+    }
+
+    #[test]
+    fn classify_broker_status_done_for_day_is_failed_and_terminal() {
+        assert_eq!(
+            classify_broker_status(BrokerOrderStatus::DoneForDay),
+            (OrderStatus::Failed, Some(OrderFailureTerminality::Terminal))
+        );
+    }
+
+    #[test]
+    fn classify_broker_status_suspended_is_failed_and_not_terminal() {
+        assert_eq!(
+            classify_broker_status(BrokerOrderStatus::Suspended),
+            (
+                OrderStatus::Failed,
+                Some(OrderFailureTerminality::NotTerminal)
+            )
+        );
+    }
+
+    #[test]
+    fn classify_broker_status_replaced_is_failed_and_not_terminal() {
+        assert_eq!(
+            classify_broker_status(BrokerOrderStatus::Replaced),
+            (
+                OrderStatus::Failed,
+                Some(OrderFailureTerminality::NotTerminal)
+            )
+        );
+    }
+
+    #[test]
+    fn classify_broker_status_calculated_is_failed_and_not_terminal() {
+        assert_eq!(
+            classify_broker_status(BrokerOrderStatus::Calculated),
+            (
+                OrderStatus::Failed,
+                Some(OrderFailureTerminality::NotTerminal)
+            )
+        );
+    }
+
+    /// Pins the whole mapping, one row per `BrokerOrderStatus`. Asserting the
+    /// exact pair rather than only the Failed-implies-terminality invariant
+    /// also catches a status routed to the wrong non-failure `OrderStatus`,
+    /// which carries `None` either way.
+    #[test]
+    fn classify_broker_status_maps_every_status_to_its_expected_pair() {
+        use BrokerOrderStatus::*;
+        use OrderFailureTerminality::{NotTerminal, Terminal};
+
+        let expected = [
+            (New, OrderStatus::Submitted, None),
+            (PendingNew, OrderStatus::Submitted, None),
+            (Accepted, OrderStatus::Submitted, None),
+            (AcceptedForBidding, OrderStatus::Submitted, None),
+            (PendingCancel, OrderStatus::Submitted, None),
+            (PendingReplace, OrderStatus::Submitted, None),
+            (Stopped, OrderStatus::Submitted, None),
+            (PartiallyFilled, OrderStatus::PartiallyFilled, None),
+            (Filled, OrderStatus::Filled, None),
+            (Canceled, OrderStatus::Cancelled, None),
+            (Expired, OrderStatus::Failed, Some(Terminal)),
+            (Rejected, OrderStatus::Failed, Some(Terminal)),
+            (DoneForDay, OrderStatus::Failed, Some(Terminal)),
+            (Replaced, OrderStatus::Failed, Some(NotTerminal)),
+            (Suspended, OrderStatus::Failed, Some(NotTerminal)),
+            (Calculated, OrderStatus::Failed, Some(NotTerminal)),
+        ];
+
+        for (status, expected_status, expected_terminality) in expected {
+            assert_eq!(
+                classify_broker_status(status),
+                (expected_status, expected_terminality),
+                "unexpected classification for {status:?}"
+            );
+        }
     }
 
     #[tokio::test]

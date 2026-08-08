@@ -42,7 +42,7 @@ pub use error::PersistenceError;
 pub use mock::{MockExecutor, MockExecutorCtx};
 pub use order::{
     CancellationOutcome, ClientOrderId, ClientOrderIdError, LimitOrder, MarketOrder,
-    OrderPlacement, OrderState, OrderStatus, OrderUpdate,
+    OrderFailureTerminality, OrderPlacement, OrderState, OrderStatus, OrderUpdate,
 };
 pub use rate_limit::retry_after_from_response_headers;
 

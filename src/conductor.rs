@@ -93,7 +93,9 @@ use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::performance::reliability::LifecycleFailureProjection;
 use crate::portfolio_snapshot::{PortfolioSnapshot, PortfolioSnapshotProjection};
-use crate::position::{Position, PositionCommand, PositionError, PositionEvent, TradeId};
+use crate::position::{
+    AnchorDisposition, Position, PositionCommand, PositionError, PositionEvent, TradeId,
+};
 use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, ResumeTokenizationAggregate,
     ResumeTokenizationCtx, ResumeTokenizationJobQueue, ResumeTokenizationTarget,
@@ -2650,6 +2652,9 @@ async fn recover_single_orphaned_order(
                         PositionCommand::FailOffChainOrder {
                             offchain_order_id: order_id,
                             error,
+                            // No broker terminality classification available
+                            // here; fail-safe preserves.
+                            anchor: AnchorDisposition::Preserve,
                         },
                     )
                     .await?;
@@ -2696,6 +2701,7 @@ async fn resolve_terminal_claimed_order(
                 PositionCommand::FailOffChainOrder {
                     offchain_order_id: order_id,
                     error: "pending offchain order has no offchain order aggregate".to_string(),
+                    anchor: AnchorDisposition::Preserve,
                 },
             )
             .await?;
@@ -3832,6 +3838,9 @@ async fn dispatch_post_place_state(
                     PositionCommand::FailOffChainOrder {
                         offchain_order_id,
                         error,
+                        // No broker terminality classification available
+                        // here; fail-safe preserves.
+                        anchor: AnchorDisposition::Preserve,
                     },
                 )
                 .await?;
@@ -3869,6 +3878,7 @@ async fn dispatch_post_place_state(
                     PositionCommand::FailOffChainOrder {
                         offchain_order_id,
                         error: "Offchain order missing after Place".to_string(),
+                        anchor: AnchorDisposition::Preserve,
                     },
                 )
                 .await?;
@@ -4150,6 +4160,9 @@ where
                         PositionCommand::FailOffChainOrder {
                             offchain_order_id,
                             error: error.clone(),
+                            // No broker terminality classification available
+                            // here; fail-safe preserves.
+                            anchor: AnchorDisposition::Preserve,
                         },
                     )
                     .await?;
@@ -4188,7 +4201,7 @@ mod tests {
     use sqlx::{ConnectOptions, SqlitePool};
     use std::future::pending;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, RwLock};
+    use std::sync::{Arc, Mutex as StdMutex, RwLock};
     use task_supervisor::SupervisorBuilder;
     use tokio::sync::broadcast;
     use url::Url;
@@ -9727,24 +9740,28 @@ mod tests {
 
     #[tokio::test]
     async fn broker_rejection_does_not_leave_position_stuck() {
-        fn failing_order_placer() -> Arc<dyn OrderPlacer> {
-            struct RejectingOrderPlacer;
+        fn failing_order_placer() -> (Arc<dyn OrderPlacer>, Arc<StdMutex<Option<ClientOrderId>>>) {
+            struct RejectingOrderPlacer {
+                captured_client_order_id: Arc<StdMutex<Option<ClientOrderId>>>,
+            }
 
             #[async_trait::async_trait]
             impl OrderPlacer for RejectingOrderPlacer {
                 async fn place_market_order(
                     &self,
-                    _order: MarketOrder,
+                    order: MarketOrder,
                 ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
                 {
+                    *self.captured_client_order_id.lock().unwrap() = Some(order.client_order_id);
                     Err("API error (403 Forbidden): trade denied due to pattern day trading protection".into())
                 }
 
                 async fn place_limit_order(
                     &self,
-                    _order: st0x_execution::LimitOrder,
+                    order: st0x_execution::LimitOrder,
                 ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
                 {
+                    *self.captured_client_order_id.lock().unwrap() = Some(order.client_order_id);
                     Err("API error (403 Forbidden): trade denied due to pattern day trading protection".into())
                 }
 
@@ -9759,7 +9776,13 @@ mod tests {
                 }
             }
 
-            Arc::new(RejectingOrderPlacer)
+            let captured_client_order_id = Arc::new(StdMutex::new(None));
+            (
+                Arc::new(RejectingOrderPlacer {
+                    captured_client_order_id: captured_client_order_id.clone(),
+                }),
+                captured_client_order_id,
+            )
         }
 
         let (pool, apalis_pool) = setup_test_pools().await;
@@ -9770,7 +9793,8 @@ mod tests {
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
-        cqrs.order_placer = failing_order_placer();
+        let (order_placer, captured_client_order_id) = failing_order_placer();
+        cqrs.order_placer = order_placer;
 
         let trade_event = make_trade_event(70);
         let trade = test_trade_with_amount(float!(1.5), 70);
@@ -9793,6 +9817,18 @@ mod tests {
             "Position should not have a pending order after broker rejection, \
              but got {:?}. This leaves the position permanently stuck.",
             position.pending_offchain_order_id
+        );
+
+        let ClientOrderId::Automated(rejected_uuid) =
+            captured_client_order_id.lock().unwrap().clone().unwrap()
+        else {
+            panic!("expected an automated client_order_id");
+        };
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(OffchainOrderId::from_uuid(rejected_uuid)),
+            "a fresh placement failure with no broker order id must preserve \
+             the anchor"
         );
 
         // After clearing the stuck state, the periodic position checker should
@@ -9835,6 +9871,120 @@ mod tests {
         assert!(
             position.pending_offchain_order_id.is_some(),
             "Periodic checker should retry execution after broker rejection is cleared"
+        );
+    }
+
+    /// Recovers the target order id from the placement's own `client_order_id`,
+    /// matching how both placement paths derive it.
+    fn already_poll_failed_order_placer(
+        offchain_order: Arc<Store<OffchainOrder>>,
+    ) -> Arc<dyn OrderPlacer> {
+        struct AlreadyPollFailedPlacer {
+            offchain_order: Arc<Store<OffchainOrder>>,
+        }
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for AlreadyPollFailedPlacer {
+            async fn place_market_order(
+                &self,
+                order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                let ClientOrderId::Automated(uuid) = order.client_order_id else {
+                    panic!("expected an automated client_order_id");
+                };
+                let offchain_order_id = OffchainOrderId::from_uuid(uuid);
+
+                self.offchain_order
+                    .send(
+                        &offchain_order_id,
+                        OffchainOrderCommand::MarkAccepted {
+                            executor_order_id: ExecutorOrderId::new("already-poll-failed"),
+                            placed_shares: order.shares,
+                            submitted_at: Utc::now(),
+                            market_session: MarketSession::Regular,
+                            limit_price: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                self.offchain_order
+                    .send(
+                        &offchain_order_id,
+                        OffchainOrderCommand::MarkFailed {
+                            error: "broker observed terminal failure".to_string(),
+                            filled_shares: None,
+                            failed_at: Utc::now(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+
+                Err("this attempt's own broker outcome is moot: the order is already Failed".into())
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("test must not place a limit order".into())
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
+            }
+        }
+
+        Arc::new(AlreadyPollFailedPlacer { offchain_order })
+    }
+
+    #[tokio::test]
+    async fn execute_create_offchain_order_failed_with_executor_id_preserves_the_anchor() {
+        // A concurrent poll closes this order out between this attempt's
+        // `Pending` load and its broker call landing, so `MarkPlacementFailed`
+        // no-ops. `dispatch_post_place_state` has no broker-terminality
+        // classification for this path, so it must preserve regardless of the
+        // broker order id the concurrent poll recorded.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let mut cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+        cqrs.order_placer = already_poll_failed_order_placer(cqrs.offchain_order.clone());
+
+        let trade_event = make_trade_event(70);
+        let trade = test_trade_with_amount(float!(1.5), 70);
+
+        let offchain_order_id =
+            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
+                .await
+                .unwrap()
+                .expect("a failed placement still reports the order id");
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "the position must not be left stuck behind the already-failed order"
+        );
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(offchain_order_id),
+            "dispatch_post_place_state has no broker-terminality classification \
+             to derive from, so a broker order id alone must not release the anchor"
         );
     }
 
@@ -10642,6 +10792,116 @@ mod tests {
         assert_eq!(
             pos.pending_offchain_order_id, None,
             "a rejected re-drive must clear the position claim so hedging can retry"
+        );
+        assert_eq!(
+            pos.last_failed_offchain_order_id,
+            Some(offchain_order_id),
+            "a fresh re-drive failure with no broker order id must preserve \
+             the anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_orphaned_pending_redrives_and_preserves_the_anchor_on_already_poll_failed_order()
+     {
+        // Same broker-terminal race, replayed through the orphan-recovery
+        // sweep's re-drive rather than the original placement attempt. This
+        // path has no broker-terminality classification to derive from, so
+        // it must preserve regardless of the broker order id the concurrent
+        // poll recorded.
+        let pool = setup_test_db().await;
+
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let (offchain_order, _offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(noop_order_placer())
+                .await
+                .unwrap();
+
+        let symbol = Symbol::new("SGOV").unwrap();
+        let threshold = ExecutionThreshold::whole_share();
+        let offchain_order_id = OffchainOrderId::new();
+        let shares = Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap();
+        let order_placer = already_poll_failed_order_placer(offchain_order.clone());
+
+        position
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        tx_hash: fixed_bytes!(
+                            "0000000000000000000000000000000000000000000000000000000000000005"
+                        ),
+                        log_index: 0,
+                    },
+                    amount: st0x_execution::FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(100),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    threshold,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Leave the order in Pending: a crash during placement persists `Placed`
+        // (Pending) but never records the broker outcome.
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: st0x_execution::ClientOrderId::from_uuid(
+                        offchain_order_id.as_uuid(),
+                    ),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+
+        recover_orphaned_pending_offchain_orders(
+            &position,
+            &position_projection,
+            &offchain_order,
+            order_placer.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        let pos = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            pos.pending_offchain_order_id, None,
+            "the sweep must clear the position claim behind the already-failed order"
+        );
+        assert_eq!(
+            pos.last_failed_offchain_order_id,
+            Some(offchain_order_id),
+            "this path has no broker-terminality classification to derive \
+             from, so a broker order id alone must not release the anchor"
         );
     }
 
@@ -11931,6 +12191,59 @@ mod tests {
         assert_eq!(
             position.pending_offchain_order_id, None,
             "Failed state must clear the position's pending offchain order id"
+        );
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(offchain_order_id),
+            "a fresh placement failure with no broker order id must preserve \
+             the anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_post_place_state_failed_with_executor_id_preserves_the_anchor() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let offchain_order_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
+
+        let failed_state = OffchainOrder::Failed {
+            symbol: symbol.clone(),
+            shares,
+            requested_shares: None,
+            direction: Direction::Sell,
+            executor: st0x_execution::SupportedExecutor::DryRun,
+            retained_fill: None,
+            filled_shares: None,
+            executor_order_id: Some(ExecutorOrderId::new("already-poll-failed")),
+            error: "broker rejected".to_string(),
+            placed_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        dispatch_post_place_state(Some(failed_state), &symbol, &cqrs, offchain_order_id)
+            .await
+            .unwrap();
+
+        let position = frameworks
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(offchain_order_id),
+            "this path has no broker-terminality classification to derive \
+             from, so a broker order id alone must not release the anchor"
         );
     }
 

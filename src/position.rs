@@ -18,7 +18,8 @@ use tracing::{debug, info, warn};
 use st0x_config::ExecutionThreshold;
 use st0x_event_sorcery::{DomainEvent, EventSourced, Projection, ProjectionError, Table};
 use st0x_execution::{
-    Direction, ExecutorOrderId, FractionalShares, HasZero, Positive, SupportedExecutor, Symbol,
+    Direction, ExecutorOrderId, FractionalShares, HasZero, OrderFailureTerminality, Positive,
+    SupportedExecutor, Symbol,
 };
 use st0x_finance::{Usd, Usdc};
 use st0x_float_macro::float;
@@ -43,6 +44,33 @@ impl std::fmt::Debug for PriceObservation {
             .field("price", &DebugFloat(&self.price))
             .field("observed_at", &self.observed_at)
             .finish()
+    }
+}
+
+/// Whether an offchain order failure releases the position's
+/// broker-idempotency anchor (`last_failed_offchain_order_id`) or preserves
+/// it. `Release` requires `Some(OrderFailureTerminality::Terminal)`: positive,
+/// broker-documented evidence that the order under the failed placement's
+/// `client_order_id` reached a state the broker will never advance further,
+/// so the key is spent and no retry can usefully dedupe against it.
+/// `Preserve` is the fail-safe default for everything else, including
+/// `None` -- unknown terminality must never release, and the presence of an
+/// `executor_order_id` is not evidence of terminality on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AnchorDisposition {
+    #[default]
+    Preserve,
+    Release,
+}
+
+impl AnchorDisposition {
+    /// Only a direct `Terminal` classification releases. `NotTerminal` and
+    /// `None` both preserve.
+    pub fn from_broker_terminality(broker_terminality: Option<OrderFailureTerminality>) -> Self {
+        match broker_terminality {
+            Some(OrderFailureTerminality::Terminal) => Self::Release,
+            Some(OrderFailureTerminality::NotTerminal) | None => Self::Preserve,
+        }
     }
 }
 
@@ -173,7 +201,7 @@ impl EventSourced for Position {
 
     const AGGREGATE_TYPE: &'static str = "Position";
     const PROJECTION: Table = Table("position_view");
-    const SCHEMA_VERSION: u64 = 6;
+    const SCHEMA_VERSION: u64 = 7;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use PositionEvent::*;
@@ -340,25 +368,33 @@ impl EventSourced for Position {
             OffChainOrderFailed {
                 offchain_order_id,
                 failed_at,
+                anchor,
                 ..
-            } => Ok(Some(Self {
-                pending_offchain_order_id: None,
-                // Stash the failed OID so the next placement attempt can
-                // reuse it as `client_order_id` and let the broker dedupe.
-                //
-                // Preserve the *first* failed anchor across a chain of
-                // failures: the broker recorded the original attempt under
-                // that key, so a later attempt whose own response was also
-                // lost must keep deduping against the original key. Overwriting
-                // with each new OID would point the next retry at a key the
-                // broker never saw, double-submitting the order. Cleared only
-                // by a successful fill.
-                last_failed_offchain_order_id: entity
-                    .last_failed_offchain_order_id
-                    .or(Some(*offchain_order_id)),
-                last_updated: Some(*failed_at),
-                ..entity.clone()
-            })),
+            } => {
+                let last_failed_offchain_order_id = match anchor {
+                    // Stash the failed OID so the next placement attempt can
+                    // reuse it as `client_order_id` and let the broker
+                    // dedupe.
+                    //
+                    // Preserve the *first* failed anchor across a chain of
+                    // failures: the broker recorded the original attempt
+                    // under that key, so a later attempt whose own response
+                    // was also lost must keep deduping against the original
+                    // key. Overwriting with each new OID would point the
+                    // next retry at a key the broker never saw,
+                    // double-submitting the order.
+                    AnchorDisposition::Preserve => entity
+                        .last_failed_offchain_order_id
+                        .or(Some(*offchain_order_id)),
+                    AnchorDisposition::Release => None,
+                };
+                Ok(Some(Self {
+                    pending_offchain_order_id: None,
+                    last_failed_offchain_order_id,
+                    last_updated: Some(*failed_at),
+                    ..entity.clone()
+                }))
+            }
 
             OffChainOrderCancelled {
                 offchain_order_id, ..
@@ -636,12 +672,13 @@ impl EventSourced for Position {
             FailOffChainOrder {
                 offchain_order_id,
                 error,
+                anchor,
             } => {
                 self.validate_pending_execution(offchain_order_id)?;
 
                 warn!(
                     target: "hedge",
-                    %offchain_order_id, symbol = %self.symbol, %error,
+                    %offchain_order_id, symbol = %self.symbol, %error, ?anchor,
                     "Offchain venue rejected"
                 );
 
@@ -649,6 +686,7 @@ impl EventSourced for Position {
                     offchain_order_id,
                     error,
                     failed_at: Utc::now(),
+                    anchor,
                 }])
             }
 
@@ -1166,6 +1204,12 @@ pub enum PositionCommand {
     FailOffChainOrder {
         offchain_order_id: OffchainOrderId,
         error: String,
+        /// Whether this failure releases or preserves the position's
+        /// broker-idempotency anchor (`last_failed_offchain_order_id`).
+        /// Callers derive this from evidence that the broker order under
+        /// the failed placement's key reached a terminal state; see
+        /// `AnchorDisposition`.
+        anchor: AnchorDisposition,
     },
     /// Clear a pending offchain order that was intentionally cancelled (e.g.
     /// the extended-hours -> regular cancel-and-replace), distinct from a broker
@@ -1257,6 +1301,8 @@ pub enum PositionEvent {
         offchain_order_id: OffchainOrderId,
         error: String,
         failed_at: DateTime<Utc>,
+        #[serde(default)]
+        anchor: AnchorDisposition,
     },
     /// A pending offchain order was intentionally cancelled (not a failure), so
     /// failure-rate analytics can tell the two apart. Clears the pending
@@ -1449,13 +1495,15 @@ impl PartialEq for PositionEvent {
                     offchain_order_id: o1,
                     error: e1,
                     failed_at: f1,
+                    anchor: a1,
                 },
                 Self::OffChainOrderFailed {
                     offchain_order_id: o2,
                     error: e2,
                     failed_at: f2,
+                    anchor: a2,
                 },
-            ) => o1 == o2 && e1 == e2 && f1 == f2,
+            ) => o1 == o2 && e1 == e2 && f1 == f2 && a1 == a2,
             (
                 Self::OffChainOrderCancelled {
                     offchain_order_id: o1,
@@ -1693,10 +1741,12 @@ impl std::fmt::Debug for PositionCommand {
             Self::FailOffChainOrder {
                 offchain_order_id,
                 error,
+                anchor,
             } => f
                 .debug_struct("FailOffChainOrder")
                 .field("offchain_order_id", offchain_order_id)
                 .field("error", error)
+                .field("anchor", anchor)
                 .finish(),
             Self::CancelOffChainOrder {
                 offchain_order_id,
@@ -1817,11 +1867,13 @@ impl std::fmt::Debug for PositionEvent {
                 offchain_order_id,
                 error,
                 failed_at,
+                anchor,
             } => f
                 .debug_struct("OffChainOrderFailed")
                 .field("offchain_order_id", offchain_order_id)
                 .field("error", error)
                 .field("failed_at", failed_at)
+                .field("anchor", anchor)
                 .finish(),
             Self::OffChainOrderCancelled {
                 offchain_order_id,
@@ -1892,6 +1944,7 @@ impl std::fmt::Debug for TriggerReason {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use st0x_execution::Positive;
 
     use st0x_event_sorcery::{LifecycleError, StoreBuilder, TestHarness, replay};
@@ -1903,6 +1956,37 @@ mod tests {
 
     fn one_share_threshold() -> ExecutionThreshold {
         ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(1))).unwrap())
+    }
+
+    #[test]
+    fn broker_evidence_terminal_releases_the_anchor() {
+        assert_eq!(
+            AnchorDisposition::from_broker_terminality(Some(OrderFailureTerminality::Terminal)),
+            AnchorDisposition::Release
+        );
+    }
+
+    #[test]
+    fn broker_evidence_not_terminal_preserves_the_anchor() {
+        // A suspended/replaced/calculated broker status is NOT positive
+        // evidence: the broker order can still resume or continue, so
+        // releasing here would let a fresh retry double-hedge alongside it.
+        assert_eq!(
+            AnchorDisposition::from_broker_terminality(Some(OrderFailureTerminality::NotTerminal)),
+            AnchorDisposition::Preserve
+        );
+    }
+
+    #[test]
+    fn broker_evidence_none_preserves_even_with_executor_order_id_present() {
+        // An executor_order_id existing on the position is irrelevant: the
+        // constructor takes terminality alone, so unknown terminality always
+        // preserves regardless of what else is known about the order.
+        let _executor_order_id = ExecutorOrderId::new("test-order-id");
+        assert_eq!(
+            AnchorDisposition::from_broker_terminality(None),
+            AnchorDisposition::Preserve
+        );
     }
 
     #[tokio::test]
@@ -2619,6 +2703,7 @@ mod tests {
             .when(PositionCommand::FailOffChainOrder {
                 offchain_order_id,
                 error: "Broker API timeout".to_string(),
+                anchor: AnchorDisposition::Preserve,
             })
             .await
             .events();
@@ -2736,6 +2821,7 @@ mod tests {
                 offchain_order_id: failed_order_id,
                 error: "broker rejected".to_string(),
                 failed_at: Utc::now(),
+                anchor: AnchorDisposition::Preserve,
             },
             placed(cancelled_order_id),
             PositionEvent::OffChainOrderCancelled {
@@ -3422,6 +3508,7 @@ mod tests {
                 offchain_order_id,
                 error: "Market closed".to_string(),
                 failed_at: Utc::now(),
+                anchor: AnchorDisposition::Preserve,
             },
         ])
         .unwrap()
@@ -3481,6 +3568,7 @@ mod tests {
                 offchain_order_id: first_order_id,
                 error: "Market closed".to_string(),
                 failed_at: Utc::now(),
+                anchor: AnchorDisposition::Preserve,
             },
             OffChainOrderPlaced {
                 offchain_order_id: second_order_id,
@@ -3497,6 +3585,7 @@ mod tests {
                 offchain_order_id: second_order_id,
                 error: "Market closed".to_string(),
                 failed_at: Utc::now(),
+                anchor: AnchorDisposition::Preserve,
             },
         ])
         .unwrap()
@@ -3510,6 +3599,154 @@ mod tests {
              must keep deduping against it rather than a key the broker \
              never saw"
         );
+    }
+
+    #[test]
+    fn off_chain_order_failed_with_release_clears_the_anchor() {
+        use PositionEvent::*;
+
+        let first_order_id = OffchainOrderId::new();
+        let second_order_id = OffchainOrderId::new();
+
+        let position = replay::<Position>(vec![
+            Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: Utc::now(),
+            },
+            OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(1.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: Utc::now(),
+                block_number: None,
+                seen_at: Utc::now(),
+            },
+            OffChainOrderPlaced {
+                offchain_order_id: first_order_id,
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                trigger_reason: TriggerReason::SharesThreshold {
+                    net_position_shares: float!(1.5),
+                    threshold_shares: float!(1),
+                },
+                placed_at: Utc::now(),
+            },
+            OffChainOrderFailed {
+                offchain_order_id: first_order_id,
+                error: "Market closed".to_string(),
+                failed_at: Utc::now(),
+                anchor: AnchorDisposition::Preserve,
+            },
+            OffChainOrderPlaced {
+                offchain_order_id: second_order_id,
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                trigger_reason: TriggerReason::SharesThreshold {
+                    net_position_shares: float!(1.5),
+                    threshold_shares: float!(1),
+                },
+                placed_at: Utc::now(),
+            },
+            OffChainOrderFailed {
+                offchain_order_id: second_order_id,
+                error: "expired".to_string(),
+                failed_at: Utc::now(),
+                anchor: AnchorDisposition::Release,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            position.last_failed_offchain_order_id, None,
+            "a Release failure must clear a pre-existing Preserve-stashed \
+             anchor: the broker order under that key reached a terminal \
+             state, so the key is spent and no retry can dedupe against it"
+        );
+    }
+
+    #[test]
+    fn off_chain_order_failed_with_release_does_not_stash_its_own_id() {
+        use PositionEvent::*;
+
+        let offchain_order_id = OffchainOrderId::new();
+
+        let position = replay::<Position>(vec![
+            Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: Utc::now(),
+            },
+            OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(1.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: Utc::now(),
+                block_number: None,
+                seen_at: Utc::now(),
+            },
+            OffChainOrderPlaced {
+                offchain_order_id,
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                trigger_reason: TriggerReason::SharesThreshold {
+                    net_position_shares: float!(1.5),
+                    threshold_shares: float!(1),
+                },
+                placed_at: Utc::now(),
+            },
+            OffChainOrderFailed {
+                offchain_order_id,
+                error: "expired".to_string(),
+                failed_at: Utc::now(),
+                anchor: AnchorDisposition::Release,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            position.last_failed_offchain_order_id, None,
+            "with no pre-existing anchor, a Release failure must not stash \
+             its own order id either"
+        );
+    }
+
+    /// Replay-parity contract (verify-migrations): a `PositionEvent::OffChainOrderFailed`
+    /// payload persisted before `anchor` existed has no `anchor` key at all. It must still
+    /// deserialize, defaulting to `Preserve` so replaying prod history reproduces the
+    /// pre-change anchor behavior exactly.
+    #[test]
+    fn legacy_off_chain_order_failed_event_defaults_to_preserve() {
+        // A literal, not re-serialized from the current type: a change to the wire
+        // format must break this test rather than move both sides together.
+        let payload = json!({
+            "OffChainOrderFailed": {
+                "offchain_order_id": "946fba4e-28d6-4454-b311-02e3f42340b7",
+                "error": "Order failed with no error reason",
+                "failed_at": "2026-08-05T14:15:25.926147Z"
+            }
+        });
+
+        let legacy: PositionEvent = serde_json::from_value(payload)
+            .expect("a pre-anchor event (missing the new field) must still deserialize");
+
+        let PositionEvent::OffChainOrderFailed { anchor, .. } = legacy else {
+            panic!("expected OffChainOrderFailed, got: {legacy:?}");
+        };
+        assert_eq!(anchor, AnchorDisposition::Preserve);
     }
 
     #[test]
@@ -3552,6 +3789,7 @@ mod tests {
                 offchain_order_id: failed_order_id,
                 error: "Market closed".to_string(),
                 failed_at: Utc::now(),
+                anchor: AnchorDisposition::Preserve,
             },
             OffChainOrderPlaced {
                 offchain_order_id: retry_order_id,
@@ -3624,6 +3862,7 @@ mod tests {
                 offchain_order_id,
                 error: "Market closed".to_string(),
                 failed_at: Utc::now(),
+                anchor: AnchorDisposition::Preserve,
             },
             PositionEvent::ManualPositionAdjusted {
                 previous_net: FractionalShares::new(float!(1.5)),
@@ -4100,6 +4339,7 @@ mod tests {
             offchain_order_id: OffchainOrderId::new(),
             error: "Market closed".to_string(),
             failed_at: timestamp,
+            anchor: AnchorDisposition::Preserve,
         };
 
         assert_eq!(event.timestamp(), timestamp);

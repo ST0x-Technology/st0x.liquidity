@@ -13,7 +13,7 @@ use crate::{Direction, FractionalShares, Positive, Symbol, Usd};
 pub mod state;
 pub mod status;
 
-pub use state::OrderState;
+pub use state::{OrderFailureTerminality, OrderState};
 pub use status::OrderStatus;
 
 /// Caller-supplied idempotency key forwarded to the broker so retries of
@@ -124,6 +124,12 @@ pub struct OrderUpdate<OrderId> {
     /// `OrderStatus::PartiallyFilled` so the caller can reconcile the local
     /// aggregate via `UpdatePartialFill`.
     pub shares_filled: Option<FractionalShares>,
+    /// Broker-terminality classification of the failure, populated only when
+    /// `status` is `OrderStatus::Failed`. Carries the evidence executor
+    /// implementations need to build `OrderState::Failed`'s `terminality`
+    /// field without leaking their broker-specific status enum across the
+    /// `Executor` boundary.
+    pub failure_terminality: Option<OrderFailureTerminality>,
 }
 
 impl<OrderId: Debug> Debug for OrderUpdate<OrderId> {
@@ -137,6 +143,7 @@ impl<OrderId: Debug> Debug for OrderUpdate<OrderId> {
             .field("updated_at", &self.updated_at)
             .field("price", &DebugOptionFloat(&self.price))
             .field("shares_filled", &self.shares_filled)
+            .field("failure_terminality", &self.failure_terminality)
             .finish()
     }
 }

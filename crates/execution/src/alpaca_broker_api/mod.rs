@@ -147,6 +147,22 @@ pub enum MissingOrderField {
     Price,
     FilledAt,
     CanceledAt,
+    FailureTerminality,
+}
+
+/// The real Alpaca 422 body for a re-used `client_order_id`: a numeric
+/// `code` alongside the message. Shared by `order.rs`'s unit tests and the
+/// `mock_api` E2E mock so both speak this exact shape instead of two
+/// fixtures drifting apart (a code-less mock would let an `alpaca_code`
+/// parsing regression pass unnoticed). `#[cfg(any(test, feature = "mock"))]`
+/// covers both consumers: `order.rs`'s tests compile under plain `cfg(test)`,
+/// `mock_api` only under the `mock` feature.
+#[cfg(any(test, feature = "mock"))]
+pub(crate) fn duplicate_client_order_id_body() -> serde_json::Value {
+    serde_json::json!({
+        "code": 40_010_001,
+        "message": "client_order_id must be unique",
+    })
 }
 
 #[derive(Debug, Error)]

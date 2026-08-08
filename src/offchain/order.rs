@@ -46,14 +46,14 @@ use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
 use st0x_execution::{
     AlpacaBrokerApiError, CancellationOutcome, ClientOrderId, CounterTradePreflight,
     ExecutionError, Executor, ExecutorOrderId, FractionalShares, LatestQuote, LimitOrder,
-    MarketOrder, MarketSession, MarketSessionStatus, OrderState, PersistenceError, Positive,
-    SupportedExecutor, Symbol,
+    MarketOrder, MarketSession, MarketSessionStatus, OrderFailureTerminality, OrderState,
+    PersistenceError, Positive, SupportedExecutor, Symbol,
 };
 use st0x_finance::{NonNegative, NotNonNegative, Usd};
 
 use crate::conductor::job::{QueuePushError, find_backpressure};
 use crate::onchain::OnChainError;
-use crate::position::{Position, PositionCommand};
+use crate::position::{AnchorDisposition, Position, PositionCommand};
 
 /// Errors surfaced by the per-order job pipeline.
 ///
@@ -1957,9 +1957,11 @@ pub(crate) enum NoFillOutcome {
         reason: CancellationReason,
         cancelled_at: DateTime<Utc>,
     },
-    /// Broker rejection/failure: issue `PositionCommand::FailOffChainOrder`,
-    /// which sets the failure anchor for the next attempt's idempotency key.
-    Failed { error: String },
+    /// Broker rejection/failure: issue `PositionCommand::FailOffChainOrder`.
+    Failed {
+        error: String,
+        anchor: AnchorDisposition,
+    },
 }
 
 /// Maps a [`TerminalPositionFinalization`] onto the [`PositionCommand`] that
@@ -1993,10 +1995,11 @@ pub(crate) fn position_command_for_finalization(
             reason,
             cancelled_at,
         }),
-        TerminalPositionFinalization::NoFill(NoFillOutcome::Failed { error }) => {
+        TerminalPositionFinalization::NoFill(NoFillOutcome::Failed { error, anchor }) => {
             Some(PositionCommand::FailOffChainOrder {
                 offchain_order_id,
                 error,
+                anchor,
             })
         }
         TerminalPositionFinalization::UnpricedFill { .. } => None,
@@ -2077,8 +2080,12 @@ pub(crate) fn terminal_position_finalization(
             *retained_fill,
             *direction,
             executor_order_id.clone(),
+            // The aggregate does not persist broker terminality here, so
+            // there is no positive evidence to release on; fail-safe
+            // preserves.
             NoFillOutcome::Failed {
                 error: error.clone(),
+                anchor: AnchorDisposition::Preserve,
             },
         )),
 
@@ -2086,6 +2093,7 @@ pub(crate) fn terminal_position_finalization(
         OffchainOrder::Failed { error, .. } => Some(TerminalPositionFinalization::NoFill(
             NoFillOutcome::Failed {
                 error: error.clone(),
+                anchor: AnchorDisposition::Preserve,
             },
         )),
 
@@ -2204,58 +2212,13 @@ async fn reconcile_pre_cancel(
             avg_price,
             partially_filled_at,
             ..
-        } => {
-            if Positive::new(broker_filled).is_err() {
-                if broker_filled == FractionalShares::ZERO {
-                    return Ok(Vec::new());
-                }
-
-                return Err(OffchainOrderError::InvalidTerminalFillQuantity {
-                    executor_order_id: executor_order_id.clone(),
-                    shares_filled: broker_filled,
-                });
-            }
-
-            // Only emit when the broker reports STRICTLY MORE fills than
-            // the local aggregate already records. Equal => no-op (the
-            // local state is already up to date). LESS => stale broker
-            // read (the poll loop recorded fresher data); never regress
-            // the recorded cumulative quantity. A comparison failure
-            // propagates (fail closed, like the status-fetch failure above)
-            // so the cancel retries instead of proceeding blind and
-            // dropping the broker-reported fill.
-            if let Some(local) = local_filled
-                && !broker_fill_exceeds_local(broker_filled, local)?
-            {
-                tracing::debug!(
-                    %executor_order_id,
-                    "Broker partial-fill <= local; skipping pre-cancel reconcile"
-                );
-                return Ok(Vec::new());
-            }
-
-            // We need an avg_price for the event. If the broker did not
-            // return one, drop the reconciliation -- without a price we
-            // can't record the fill correctly. The position would be left
-            // unhedged for the partial quantity, but that's safer than
-            // recording a zero-price fill.
-            let Some(price) = avg_price else {
-                tracing::warn!(
-                    %executor_order_id,
-                    "Broker reports PartiallyFilled but no avg_price; will retry without cancelling"
-                );
-                return Err(OffchainOrderError::PreCancelPartialFillMissingAvgPrice {
-                    executor_order_id: executor_order_id.clone(),
-                    shares_filled: broker_filled,
-                });
-            };
-
-            Ok(vec![OffchainOrderEvent::PartiallyFilled {
-                shares_filled: broker_filled,
-                avg_price: price,
-                partially_filled_at,
-            }])
-        }
+        } => reconcile_partial_fill_event(
+            executor_order_id,
+            local_filled,
+            broker_filled,
+            avg_price,
+            partially_filled_at,
+        ),
 
         OrderState::Filled {
             price, executed_at, ..
@@ -2279,6 +2242,7 @@ async fn reconcile_pre_cancel(
             failed_at,
             shares_filled,
             avg_price,
+            terminality: OrderFailureTerminality::Terminal,
         } => {
             // Order terminally failed at the broker between our last poll
             // and the cancel attempt. Emit Failed (which short-circuits
@@ -2303,6 +2267,35 @@ async fn reconcile_pre_cancel(
                     filled_shares: shares_filled,
                     failed_at,
                 },
+            )
+        }
+
+        // A NotTerminal broker failure (suspended/replaced/calculated) means
+        // the order may still resume or fill at the broker -- it must NOT
+        // short-circuit the DELETE with a terminal Failed event, or a live
+        // order gets orphaned from polling while the broker can still fill
+        // it. Reconcile any newer fill the broker already reported, then let
+        // the cancel proceed as normal (mirrors the Pending/Submitted arm).
+        OrderState::Failed {
+            error_reason,
+            failed_at,
+            shares_filled,
+            avg_price,
+            terminality: OrderFailureTerminality::NotTerminal,
+        } => {
+            tracing::info!(
+                %executor_order_id,
+                ?error_reason,
+                "Broker reports order Failed-but-NotTerminal at cancel time; \
+                 proceeding with the cancel instead of terminalizing locally"
+            );
+
+            reconcile_partial_fill_event(
+                executor_order_id,
+                local_filled,
+                shares_filled.unwrap_or(FractionalShares::ZERO),
+                avg_price,
+                failed_at,
             )
         }
 
@@ -2333,6 +2326,72 @@ async fn reconcile_pre_cancel(
 
         OrderState::Pending | OrderState::Submitted { .. } => Ok(Vec::new()),
     }
+}
+
+/// Reconciles a possibly-newer broker-reported fill into a `PartiallyFilled`
+/// event ahead of a pending cancel attempt, without any terminal event --
+/// the caller proceeds with the real cancel DELETE afterward regardless of
+/// what this returns. Shared by [`reconcile_pre_cancel`]'s `PartiallyFilled`
+/// arm and its `Failed`-but-`NotTerminal` arm, which both need "record any
+/// newer fill, then let the cancel proceed" and must not drift apart.
+///
+/// Returns an empty vec when there is nothing new to record: no fill, or a
+/// stale/equal broker read the local aggregate already covers.
+fn reconcile_partial_fill_event(
+    executor_order_id: &ExecutorOrderId,
+    local_filled: Option<FractionalShares>,
+    broker_filled: FractionalShares,
+    avg_price: Option<Usd>,
+    partially_filled_at: DateTime<Utc>,
+) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
+    if Positive::new(broker_filled).is_err() {
+        if broker_filled == FractionalShares::ZERO {
+            return Ok(Vec::new());
+        }
+
+        return Err(OffchainOrderError::InvalidTerminalFillQuantity {
+            executor_order_id: executor_order_id.clone(),
+            shares_filled: broker_filled,
+        });
+    }
+
+    // Only emit when the broker reports STRICTLY MORE fills than the local
+    // aggregate already records. Equal => no-op (the local state is already
+    // up to date). LESS => stale broker read (the poll loop recorded fresher
+    // data); never regress the recorded cumulative quantity. A comparison
+    // failure propagates (fail closed, like the status-fetch failure above)
+    // so the cancel retries instead of proceeding blind and dropping the
+    // broker-reported fill.
+    if let Some(local) = local_filled
+        && !broker_fill_exceeds_local(broker_filled, local)?
+    {
+        tracing::debug!(
+            %executor_order_id,
+            "Broker fill <= local; skipping pre-cancel reconcile"
+        );
+        return Ok(Vec::new());
+    }
+
+    // We need an avg_price for the event. If the broker did not return one,
+    // drop the reconciliation -- without a price we can't record the fill
+    // correctly. The position would be left unhedged for the partial
+    // quantity, but that's safer than recording a zero-price fill.
+    let Some(price) = avg_price else {
+        tracing::warn!(
+            %executor_order_id,
+            "Broker reports filled shares but no avg_price; will retry without cancelling"
+        );
+        return Err(OffchainOrderError::PreCancelPartialFillMissingAvgPrice {
+            executor_order_id: executor_order_id.clone(),
+            shares_filled: broker_filled,
+        });
+    };
+
+    Ok(vec![OffchainOrderEvent::PartiallyFilled {
+        shares_filled: broker_filled,
+        avg_price: price,
+        partially_filled_at,
+    }])
 }
 
 /// Shared tail of the `Failed`/`Cancelled` arms of [`reconcile_pre_cancel`]:
@@ -3283,6 +3342,64 @@ mod tests {
         assert_eq!(
             broker_timestamp, fill_time,
             "finalization must stamp the broker fill time, not the failure time"
+        );
+    }
+
+    #[test]
+    fn zero_fill_failed_with_executor_order_id_preserves_the_anchor() {
+        // executor_order_id presence alone is not broker-terminality evidence;
+        // this aggregate does not persist terminality, so it always preserves.
+        let failure_time = "2026-01-06T14:32:01Z".parse::<DateTime<Utc>>().unwrap();
+        let order = OffchainOrder::Failed {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            requested_shares: Some(Positive::new(FractionalShares::new(float!(1))).unwrap()),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::DryRun,
+            retained_fill: None,
+            filled_shares: Some(FractionalShares::ZERO),
+            executor_order_id: Some(ExecutorOrderId::new("expired-order")),
+            error: "expired".to_string(),
+            placed_at: failure_time,
+            failed_at: failure_time,
+        };
+
+        let finalization =
+            terminal_position_finalization(&order).expect("terminal Failed order must classify");
+        assert_eq!(
+            finalization,
+            TerminalPositionFinalization::NoFill(NoFillOutcome::Failed {
+                error: "expired".to_string(),
+                anchor: AnchorDisposition::Preserve,
+            })
+        );
+    }
+
+    #[test]
+    fn zero_fill_failed_without_executor_order_id_preserves_the_anchor() {
+        let failure_time = "2026-01-06T14:32:01Z".parse::<DateTime<Utc>>().unwrap();
+        let order = OffchainOrder::Failed {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            requested_shares: Some(Positive::new(FractionalShares::new(float!(1))).unwrap()),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::DryRun,
+            retained_fill: None,
+            filled_shares: None,
+            executor_order_id: None,
+            error: "broker unreachable".to_string(),
+            placed_at: failure_time,
+            failed_at: failure_time,
+        };
+
+        let finalization =
+            terminal_position_finalization(&order).expect("terminal Failed order must classify");
+        assert_eq!(
+            finalization,
+            TerminalPositionFinalization::NoFill(NoFillOutcome::Failed {
+                error: "broker unreachable".to_string(),
+                anchor: AnchorDisposition::Preserve,
+            })
         );
     }
 
@@ -5941,6 +6058,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_order_with_not_terminal_broker_failure_proceeds_with_cancel() {
+        // A NotTerminal Failed state (suspended/replaced/calculated) means
+        // the broker order may still resume. CancelOrder must NOT emit a
+        // bare Failed event here -- that would terminalize an order the
+        // broker itself has not given up on. It must proceed with the real
+        // cancel DELETE instead.
+        fn not_terminal_failure_placer() -> Arc<dyn OrderPlacer> {
+            struct Placer;
+
+            #[async_trait]
+            impl OrderPlacer for Placer {
+                async fn place_market_order(
+                    &self,
+                    order: MarketOrder,
+                ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    Ok(OrderPlacementResult {
+                        executor_order_id: ExecutorOrderId::new("ORD-OK"),
+                        placed_shares: noop_placed_shares(order.shares),
+                        is_extended_hours: false,
+                        limit_price: None,
+                    })
+                }
+
+                async fn place_limit_order(
+                    &self,
+                    _order: LimitOrder,
+                ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    unimplemented!()
+                }
+
+                async fn cancel_order(
+                    &self,
+                    _executor_order_id: &ExecutorOrderId,
+                ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    Ok(CancellationOutcome::Requested)
+                }
+
+                async fn get_order_status(
+                    &self,
+                    _executor_order_id: &ExecutorOrderId,
+                ) -> Result<st0x_execution::OrderState, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    Ok(st0x_execution::OrderState::Failed {
+                        failed_at: Utc::now(),
+                        error_reason: Some("order suspended".to_string()),
+                        shares_filled: None,
+                        avg_price: None,
+                        terminality: OrderFailureTerminality::NotTerminal,
+                    })
+                }
+            }
+
+            Arc::new(Placer)
+        }
+
+        let store = TestStore::<OffchainOrder>::new(not_terminal_failure_placer());
+        let id = OffchainOrderId::new();
+        place_and_submit(&store, &id).await;
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::CancelOrder {
+                    reason: CancellationReason::MarketOpenReplacement,
+                },
+            )
+            .await
+            .unwrap();
+
+        let inner = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(inner, OffchainOrder::Cancelling { .. }),
+            "Expected the cancel to proceed to Cancelling rather than \
+             terminalizing on a NotTerminal broker failure, got: {inner:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_order_with_not_terminal_broker_failure_reconciles_newer_partial_fill() {
+        // Same NotTerminal case as above, but the broker also reports a
+        // newer fill than the local aggregate knows about. That fill must
+        // still be reconciled (mirrors the plain PartiallyFilled arm) even
+        // though the state carries a Failed status wrapper.
+        fn not_terminal_failure_with_fill_placer() -> Arc<dyn OrderPlacer> {
+            struct Placer;
+
+            #[async_trait]
+            impl OrderPlacer for Placer {
+                async fn place_market_order(
+                    &self,
+                    order: MarketOrder,
+                ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    Ok(OrderPlacementResult {
+                        executor_order_id: ExecutorOrderId::new("ORD-OK"),
+                        placed_shares: noop_placed_shares(order.shares),
+                        is_extended_hours: false,
+                        limit_price: None,
+                    })
+                }
+
+                async fn place_limit_order(
+                    &self,
+                    _order: LimitOrder,
+                ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    unimplemented!()
+                }
+
+                async fn cancel_order(
+                    &self,
+                    _executor_order_id: &ExecutorOrderId,
+                ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    Ok(CancellationOutcome::Requested)
+                }
+
+                async fn get_order_status(
+                    &self,
+                    _executor_order_id: &ExecutorOrderId,
+                ) -> Result<st0x_execution::OrderState, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    Ok(st0x_execution::OrderState::Failed {
+                        failed_at: Utc::now(),
+                        error_reason: Some("order suspended".to_string()),
+                        shares_filled: Some(FractionalShares::new(float!(50))),
+                        avg_price: Some(Usd::new(float!(150.0))),
+                        terminality: OrderFailureTerminality::NotTerminal,
+                    })
+                }
+            }
+
+            Arc::new(Placer)
+        }
+
+        let store = TestStore::<OffchainOrder>::new(not_terminal_failure_with_fill_placer());
+        let id = OffchainOrderId::new();
+        place_and_submit(&store, &id).await;
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::CancelOrder {
+                    reason: CancellationReason::MarketOpenReplacement,
+                },
+            )
+            .await
+            .unwrap();
+
+        let inner = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                inner,
+                OffchainOrder::Cancelling {
+                    retained_fill:
+                        Some(RetainedFill::Priced {
+                            shares_filled,
+                            ..
+                        }),
+                    ..
+                } if shares_filled == FractionalShares::new(float!(50))
+            ),
+            "Expected Cancelling with the NotTerminal-reported fill reconciled, \
+             got: {inner:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn cancel_order_blocks_when_broker_failed_with_unpriced_fill() {
         // If the broker reports the order Failed with filled shares but no
         // avg_price at cancel time, CancelOrder must NOT emit a bare Failed
@@ -5995,6 +6283,7 @@ mod tests {
                         error_reason: Some("broker failed".to_string()),
                         shares_filled: Some(FractionalShares::new(float!(50))),
                         avg_price: None,
+                        terminality: st0x_execution::OrderFailureTerminality::Terminal,
                     })
                 }
             }
