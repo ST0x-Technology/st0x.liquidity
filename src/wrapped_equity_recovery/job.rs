@@ -592,6 +592,7 @@ mod tests {
     use super::*;
     use crate::inventory::BroadcastingInventory;
     use crate::inventory::view::InventoryView;
+    use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
     use crate::vault_lookup::{MockVaultLookup, VaultLookup};
@@ -626,6 +627,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
         let redemption_store = Arc::new(test_store(pool.clone(), transfer_services));
@@ -757,6 +759,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
         let redemption_store = Arc::new(test_store(pool.clone(), transfer_services));

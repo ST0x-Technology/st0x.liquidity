@@ -2884,6 +2884,7 @@ mod tests {
     use st0x_wrapper::MockWrapper;
 
     use super::*;
+    use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::onchain::mock::{ConfirmTxBehavior, MockRaindex};
     use crate::vault_lookup::MockVaultLookup;
 
@@ -2898,6 +2899,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         }
     }
 
@@ -3449,6 +3451,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new().with_tokenized_shares(underlying_token)),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
@@ -3532,6 +3535,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(queue),
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let underlying_token = Address::random();
@@ -3577,6 +3581,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let store = TestStore::<EquityRedemption>::new(services);
         let id = redemption_aggregate_id("partial-withdraw");
@@ -3626,6 +3631,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let store = TestStore::<EquityRedemption>::new(services);
         let id = redemption_aggregate_id("unwrap-partial-withdraw");
@@ -3686,6 +3692,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let store = TestStore::<EquityRedemption>::new(services);
         let id = redemption_aggregate_id("missing-withdraw-transfer");
@@ -3742,6 +3749,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let store = TestStore::<EquityRedemption>::new(services);
         let id = redemption_aggregate_id("no-block-number");
@@ -4215,6 +4223,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new().with_send_failure()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
@@ -4283,6 +4292,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new().with_no_redemption_wallet()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
@@ -4351,6 +4361,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::failing_unwrap()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         // UnwrapTokens is now pure (emits UnwrapPending).
@@ -4378,6 +4389,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::failing_lookup()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         // UnwrapTokens now emits UnwrapSubmitted (no lookup yet).
@@ -5441,6 +5453,7 @@ mod tests {
             tokenizer: mock_tokenizer.clone(),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let events = TestHarness::<EquityRedemption>::with(services)
@@ -5495,6 +5508,7 @@ mod tests {
             tokenizer: mock_tokenizer.clone(),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let events = TestHarness::<EquityRedemption>::with(services)
@@ -5546,6 +5560,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new().failing_wait_for_block()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let error = TestHarness::<EquityRedemption>::with(services)
@@ -5591,6 +5606,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: mock_wrapper.clone(),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let token = Address::ZERO;
@@ -5641,6 +5657,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: mock_wrapper.clone(),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let token = Address::ZERO;
@@ -5695,6 +5712,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::failing_wait_for_block()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let error = TestHarness::<EquityRedemption>::with(services)

@@ -36,6 +36,7 @@ use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
 };
+use crate::mint_authorization::ConfiguredMintAuthorizer;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
 use crate::rebalancing::to_wrapped_equities;
 use crate::rebalancing::usdc::{CrossVenueCashTransfer, UsdcSettlementParams, UsdcTransferError};
@@ -136,6 +137,17 @@ async fn build_equity_transfer_services(
         tokenizer: tokenization_service.clone(),
         wrapper: wrapper.clone(),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        // The CLI transfer path never signs mint authorizations:
+        // orchestrator-mode mints run through the server, where the
+        // authorizer AND the vault-mode wiring come from `[orchestrator]`
+        // config. The CLI transfer also skips `with_mint_authorization`,
+        // so the saga cannot read `vault_mode` and treats every asset as
+        // vault-direct (with a warning) -- a CLI mint of an
+        // orchestrator-mode asset therefore proceeds unauthorized and
+        // stalls at polling until the authorization is delivered by the
+        // server's resume path. This `Disabled` value is only consulted if
+        // signing is ever reached, which the missing wiring prevents.
+        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
 
     let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
@@ -4064,6 +4076,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         }
     }
 

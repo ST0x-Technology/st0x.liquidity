@@ -138,8 +138,14 @@ impl StoredOperation {
                 );
                 self.open_once(MintWrap, *received_at);
             }
-            // Pure markers within their already-open stage.
-            WrapSubmitted { .. } | VaultDepositSubmitted { .. } => {}
+            // Pure markers within their already-open stage. Authorization
+            // signing/delivery happen inside the open `MintReceipt` run (the
+            // wait between acceptance and tokens arriving) and are not
+            // tracked as their own timing stage.
+            WrapSubmitted { .. }
+            | VaultDepositSubmitted { .. }
+            | MintAuthorizationSigned { .. }
+            | MintAuthorizationDelivered { .. } => {}
             // Mid-stream-first case as above: no open `MintWrap` run when
             // `TokensReceived` was never seen.
             TokensWrapped { wrapped_at, .. } => {
@@ -259,6 +265,8 @@ pub(super) fn mint_observed_at(event: &TokenizedEquityMintEvent) -> DateTime<Utc
         | MintAccepted {
             accepted_at: at, ..
         }
+        | MintAuthorizationSigned { signed_at: at, .. }
+        | MintAuthorizationDelivered { delivered_at: at }
         | MintAcceptanceFailed { failed_at: at, .. }
         | TokensReceived {
             received_at: at, ..
