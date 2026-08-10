@@ -311,7 +311,8 @@ fn parse_received_message(message: &[u8]) -> Result<CctpReceivedMessage<'_>, Cct
 /// Provides the minimal set of values needed to construct the bridge.
 /// CCTP contract addresses default to production addresses but can be
 /// overridden for testing with locally deployed contracts.
-/// Providers are obtained from the wallets via [`Wallet::provider()`].
+/// Providers are obtained from the wallets via `Wallet`'s inherited
+/// [`Evm::provider()`](st0x_evm::Evm::provider).
 pub struct CctpCtx<EthWallet, BaseWallet> {
     /// USDC token address on Ethereum
     pub usdc_ethereum: Address,

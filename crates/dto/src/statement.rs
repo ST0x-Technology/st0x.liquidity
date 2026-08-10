@@ -21,8 +21,8 @@ use crate::{CurrentState, LegacyTrade, Position, Trade};
 /// [`VariantNames`] derives `Statement::VARIANTS` — a compile-time
 /// slice of all variant names in snake_case. Adding a variant
 /// automatically updates the list; no manual bookkeeping needed.
-/// The dashboard uses [`guard_ts`] output to validate incoming
-/// WebSocket messages at runtime before dispatching.
+/// The dashboard uses [`guard_ts`](Statement::guard_ts) output to
+/// validate incoming WebSocket messages at runtime before dispatching.
 #[derive(Debug, Clone, Serialize, VariantNames, TS)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -43,7 +43,7 @@ impl Statement {
     /// `Statement` so the subsequent `matcher` call is type-safe —
     /// without it the dashboard would need an unsafe cast.
     ///
-    /// Tags come from [`VARIANTS`] (derived by strum from this enum).
+    /// Tags come from `VARIANTS` (derived by strum from this enum).
     /// The `satisfies StatementType[]` clause in the output gives a
     /// TypeScript-side compile error if the tags ever drift from the
     /// generated `Statement` type definition.
