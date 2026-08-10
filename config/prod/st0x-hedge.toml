@@ -43,25 +43,20 @@ orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 # with bot-EOA-owned vaults) or "managed" (settle through the shared
 # RaindexInventory below, which the bot must operate via OPERATOR_ROLE).
 #
-# Kept "legacy" until the RAI-1198 cutover: the shared inventory
-# (0x6b7B523fADd1677413AD92c9404C8F0796bACF6F, admin 0x679dF30b...) exists, but
-# the bot's EOA does not hold OPERATOR_ROLE on it yet, so enabling "managed"
-# now would fail the startup preflight and block the whole bot. At cutover,
-# switch this to "managed", set `inventory` to the migrated inventory, and flip
-# `vault_owner` below to that same address in the change that grants the bot
-# OPERATOR_ROLE and migrates the vaults.
-inventory_mode = "legacy"
-# Legacy mode has no shared inventory, so adapter settlements are impossible.
-inventory_adapters = []
-# REQUIRED. Owner of the Raindex orders/vaults on-chain -- the key every
-# vaultBalance2 read, vault-registry entry, and order-owner fill match is
-# scoped by. Currently the bot's Turnkey wallet (= [wallet].address below),
-# because the vaults are bot-EOA-owned pre-migration. Once RAI-1198 moves the
-# vaults under the inventory contract, flip this to the `inventory` address
-# above.
-vault_owner = "0xA9C16673F65AE808688cB18952AFE3d9658C808f"
-# Block number to start backfilling order events from.
-deployment_block = 43259507
+# Dedicated production inventory. The wallet must hold OPERATOR_ROLE because
+# startup verifies that role explicitly, even when the wallet is also admin.
+inventory_mode = "managed"
+# Operator addresses that attribute inventory settlements to venues.
+inventory_adapters = [
+  { venue = "bebop", operator = "0x3EE87Dcabfb324B2231044928080Dd4E6AC19baE" },
+]
+inventory = "0x10e4db39275C3b128C01bA1194D45D19aE1520d9"
+# REQUIRED. Owner used for vault balances, registry entries, and order-fill
+# matching. Managed mode requires this to equal `inventory`.
+vault_owner = "0x10e4db39275C3b128C01bA1194D45D19aE1520d9"
+# Backfill floor. No inventory-owned event can predate its deployment block; an
+# existing later checkpoint still resumes at checkpoint + 1.
+deployment_block = 49746968
 # Block confirmations required before a submitted transaction is treated as
 # settled. Does not govern fill ingestion (controlled by ingestion_cutoff).
 required_confirmations = 3
@@ -139,8 +134,9 @@ realert_interval = 43200
 
 # USDC vault and rebalancing settings.
 [assets.cash]
-# Raindex vault ID for USDC deposits/withdrawals.
-vault_id = "0xfab2"
+# USDC vault used by Bebop and cash rebalancing. The inventory keys vaults by
+# (token, vaultId), so both paths must use the same vault.
+vault_id = "0xfab"
 # Whether automatic USDC rebalancing between venues is active.
 rebalancing = "enabled"
 # Maximum USDC moved per rebalance operation.
