@@ -1011,7 +1011,7 @@ impl Wrapper for FixtureWrapper {
 /// `ConfirmUnwrap`/`SendTokens`) drive the side effect FROM WITHIN
 /// `transition()` itself (mint's analogous commands take the service
 /// result as command input instead), so a fresh, single-cycle-scoped
-/// [`FixtureRaindex`]/[`FixtureVaultLookup`]/[`FixtureWrapper`] triple is
+/// `FixtureRaindex`/`FixtureVaultLookup`/`FixtureWrapper` triple is
 /// built for every redemption.
 pub async fn seed_simulated_equity_redemption_history(
     pool: &SqlitePool,

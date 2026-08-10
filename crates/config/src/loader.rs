@@ -1198,11 +1198,12 @@ impl Ctx {
 
     /// Validates config and secrets files without constructing runtime objects.
     ///
-    /// Calls the same [`parse_and_validate`] function as [`load_files`](Self::load_files),
-    /// ensuring identical validation. The only difference is that `load_files`
-    /// additionally performs async wallet construction (which connects to RPC
-    /// endpoints). Suitable for pre-deploy validation where we want to catch
-    /// config errors before restarting the service.
+    /// Calls the same `parse_and_validate` function (private to this module) as
+    /// [`load_files`](Self::load_files), ensuring identical validation. The only
+    /// difference is that `load_files` additionally performs async wallet
+    /// construction (which connects to RPC endpoints). Suitable for pre-deploy
+    /// validation where we want to catch config errors before restarting the
+    /// service.
     pub fn validate_files(config_path: &Path, secrets_path: &Path) -> Result<(), CtxError> {
         let config_str =
             std::fs::read_to_string(config_path).map_err(|source| CtxError::ConfigIo {

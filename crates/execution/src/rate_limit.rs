@@ -70,7 +70,7 @@ pub fn parse_retry_after(header_value: &str, now: SystemTime) -> Option<Duration
 }
 
 /// Reads and parses the `Retry-After` header from a response's headers, if
-/// present, using [`parse_retry_after`].
+/// present, using `parse_retry_after` (private to this module).
 ///
 /// Returns `None` for a missing header, a header value that is not valid
 /// ASCII/visible-text, or a value the parser cannot interpret.

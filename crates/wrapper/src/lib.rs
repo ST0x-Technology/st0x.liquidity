@@ -266,9 +266,9 @@ pub trait Wrapper: Send + Sync {
     ///
     /// Load-balanced RPCs may route the next request to a backend that has
     /// not yet indexed the block produced by a just-confirmed transaction.
-    /// Call this with the block number returned by [`confirm_unwrap`] before
-    /// submitting any dependent on-chain write that reads the unwrapped
-    /// token balance.
+    /// Call this with the block number returned by
+    /// [`confirm_unwrap`](Wrapper::confirm_unwrap) before submitting any
+    /// dependent on-chain write that reads the unwrapped token balance.
     ///
     /// # Errors
     ///
