@@ -13526,6 +13526,114 @@ mod tests {
         );
     }
 
+    /// Entries past the CCTP burn are selected on every sweep tick
+    /// regardless of age so a durable Reconciled state is applied promptly.
+    /// An entry whose job row is live and whose elapsed time is below
+    /// transfer_timeout is running normally: the sweep logs the visit at
+    /// debug and leaves the guard and tracking intact.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn healthy_post_burn_transfer_with_live_job_does_not_warn() {
+        let trigger = make_trigger_with_inventory_config(
+            InventoryView::default(),
+            test_config_with_timeout(Duration::from_secs(1800)),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
+        queue
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(400),
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: Utc::now() - ChronoDuration::seconds(20),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            !logs_contain("exceeded its timeout"),
+            "WARN requires elapsed >= transfer_timeout",
+        );
+        assert!(
+            logs_contain("live and within its timeout"),
+            "a live transfer below its timeout logs the sweep visit at debug",
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "the sweep visit must not clear the guard while the job row is live",
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "the sweep visit must not drop tracking while the job row is live",
+        );
+    }
+
+    /// WARN fires when elapsed reaches transfer_timeout and the job row is
+    /// live, including for entries past the burn, whose selection ignores
+    /// elapsed time.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn timed_out_post_burn_transfer_with_live_job_still_warns() {
+        let trigger = make_trigger_with_inventory_config(
+            InventoryView::default(),
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
+        queue
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(400),
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: Utc::now() - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            logs_contain("exceeded its timeout"),
+            "a transfer past its timeout with a live job row must keep the WARN",
+        );
+    }
+
     #[tokio::test]
     async fn in_flight_hedging_transfer_blocks_market_making_enqueue() {
         let service = make_trigger_with_inventory(InventoryView::default()).await;
