@@ -6,6 +6,7 @@ use st0x_float_macro::float;
 mod builder;
 mod costs;
 mod diagnostics;
+mod ledger;
 mod parsing;
 mod query;
 mod replay;
@@ -19,6 +20,7 @@ mod windows;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use ledger::{PnlLedger, PnlLedgerReactor};
 pub(crate) use query::{PnlError, PnlQuery};
 pub(crate) use response::PnlResponse;
 #[cfg(test)]

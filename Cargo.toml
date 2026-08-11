@@ -139,7 +139,7 @@ wasm-bindgen = "=0.2.122"
 
 [workspace.dependencies.st0x-event-sorcery]
 git = "https://github.com/ST0x-Technology/event-sorcery.git"
-tag = "v0.2.0"
+tag = "v0.3.0"
 package = "event-sorcery"
 
 [package]
