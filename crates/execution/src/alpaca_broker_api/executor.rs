@@ -13,9 +13,7 @@ use st0x_float_serde::format_float_with_fallback;
 use super::auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx};
 use super::client::AlpacaBrokerApiClient;
 use super::journal::JournalResponse;
-use super::order::{
-    AlpacaLimitOrder, ConversionDirection, CryptoOrderOutcome, CryptoOrderResponse,
-};
+use super::order::{AlpacaLimitOrder, ConversionDirection, CryptoOrderResponse};
 use super::{AlpacaBrokerApiError, AssetStatus, MissingOrderField, TimeInForce};
 use crate::{
     CancellationOutcome, ClientOrderId, CounterTradePreflight, Direction, Executor,
@@ -364,7 +362,11 @@ impl AlpacaBrokerApi {
     /// - `UsdcToUsd`: Sells USDC for USD buying power
     /// - `UsdToUsdc`: Buys USDC with USD buying power
     ///
-    /// Returns the completed order response after the order is filled.
+    /// Returns the settled order once it stops moving: either a filled order,
+    /// or -- when it stalled past the poll deadline and its remainder was
+    /// cancelled -- a cancelled order carrying a non-zero partial fill.
+    /// Callers must size amounts from `filled_qty`/`filled_avg_price` rather
+    /// than from the requested amount or the status.
     pub async fn convert_usdc_usd(
         &self,
         amount: Float,
@@ -382,7 +384,12 @@ impl AlpacaBrokerApi {
             "USDC/USD conversion order placed, polling for completion..."
         );
 
-        super::order::poll_crypto_order_until_filled(&self.client, order.id).await
+        super::order::poll_crypto_order_until_filled(
+            &self.client,
+            order.id,
+            super::order::ConversionPollDeadlines::PRODUCTION,
+        )
+        .await
     }
 
     /// Looks up a previously-placed conversion order by its `client_order_id`
@@ -404,21 +411,20 @@ impl AlpacaBrokerApi {
     /// same wait the original placement performs in `convert_usdc_usd` -- instead
     /// of failing the job. Failing a healthy-but-slow conversion would burn the
     /// finite apalis retry budget and risk the timeout sweep clearing the
-    /// in-progress guard while the conversion is still settling.
+    /// in-progress guard while the conversion is still settling. The wait is
+    /// bounded: an order still non-terminal at the deadline has its remainder
+    /// cancelled and the settled terminal order is returned for the caller to
+    /// classify.
     pub async fn poll_conversion_to_terminal(
         &self,
         order_id: Uuid,
     ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
-        loop {
-            let order = self.client.get_crypto_order(order_id).await?;
-
-            match order.classify() {
-                CryptoOrderOutcome::Filled | CryptoOrderOutcome::Failed(_) => return Ok(order),
-                CryptoOrderOutcome::Pending => {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-            }
-        }
+        super::order::poll_crypto_order_to_terminal(
+            &self.client,
+            order_id,
+            super::order::ConversionPollDeadlines::PRODUCTION,
+        )
+        .await
     }
 
     /// Journal (transfer) equities from the configured account to a
