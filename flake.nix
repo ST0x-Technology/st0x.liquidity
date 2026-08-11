@@ -652,7 +652,7 @@
                 ${rustShell.shellHook}
                 ${rainMathFloatLink}
               '';
-              inherit (rustShell) buildInputs;
+              buildInputs = rustShell.buildInputs ++ [ pkgs.nushell ];
             };
           };
       }

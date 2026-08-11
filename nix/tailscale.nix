@@ -69,13 +69,13 @@ in
         ];
         serviceConfig = {
           Type = "oneshot";
-          RemainAfterExit = true;
+          # The daily timer can only restart a oneshot that returns to inactive.
+          RemainAfterExit = false;
           User = "nginx";
           Group = "nginx";
-          # Reload nginx so it picks up renewed certs on subsequent runs
-          # triggered by the timer. || true keeps the unit green on first
-          # boot when nginx hasn't started yet.
-          ExecStartPost = "+${pkgs.bash}/bin/bash -c 'systemctl is-active --quiet nginx.service && systemctl reload nginx.service || true'";
+          # Reload nginx after timer-triggered renewals. An inactive nginx is
+          # expected on first boot; an attempted reload failure is not.
+          ExecStartPost = "+${pkgs.bash}/bin/bash -c 'if systemctl is-active --quiet nginx.service; then systemctl reload nginx.service; fi'";
         };
         script = ''
           set -euo pipefail
@@ -96,7 +96,7 @@ in
       };
 
       nginx.after = [ "tailscale-cert.service" ];
-      nginx.requires = [ "tailscale-cert.service" ];
+      nginx.wants = [ "tailscale-cert.service" ];
     };
 
     timers.tailscale-cert = {
