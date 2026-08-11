@@ -1018,7 +1018,7 @@ impl RebalancingService {
         // - Pre-burn entries (not yet post-burn) are only selected after the
         //   timeout elapses, as before: they cannot have an in-flight on-chain
         //   burn so abandonment is safe to defer until then.
-        let candidate_ids = {
+        let candidates = {
             let tracking = self.usdc_tracking.read().await;
             tracking
                 .iter()
@@ -1027,7 +1027,7 @@ impl RebalancingService {
                         Self::elapsed_since_timeout_start(tracking.last_progress_at, now)?;
 
                     if tracking.is_post_burn() || elapsed >= self.config.transfer_timeout {
-                        Some(id.clone())
+                        Some((id.clone(), elapsed))
                     } else {
                         None
                     }
@@ -1035,7 +1035,7 @@ impl RebalancingService {
                 .collect::<Vec<_>>()
         };
 
-        for id in candidate_ids {
+        for (id, elapsed) in candidates {
             // A timed-out transfer whose apalis row is still live is NOT
             // abandoned: the job will resume and may have an irreversible on-chain
             // withdraw/burn already submitted. "Live" includes retryable Failed
@@ -1044,14 +1044,28 @@ impl RebalancingService {
             // in-progress guard / inventory inflight nor mark it timed-out (which
             // would make the reactor ignore its eventual terminal event and latch
             // the guard forever). Let apalis drive it to terminal.
+            // A candidate past the burn can land here before its timeout;
+            // that is the healthy in flight state and is logged at debug.
             match self.transfer_live_job_for_id(&id).await {
                 Ok(true) => {
-                    warn!(
-                        target: "rebalance",
-                        aggregate_id = %id,
-                        "USDC transfer exceeded its timeout but its apalis row is still live; \
-                         deferring cleanup to the job rather than clearing the guard"
-                    );
+                    if elapsed >= self.config.transfer_timeout {
+                        warn!(
+                            target: "rebalance",
+                            aggregate_id = %id,
+                            ?elapsed,
+                            "USDC transfer exceeded its timeout but its apalis row is still live; \
+                             deferring cleanup to the job rather than clearing the guard"
+                        );
+                    } else {
+                        debug!(
+                            target: "rebalance",
+                            aggregate_id = %id,
+                            ?elapsed,
+                            "USDC transfer job is live and within its timeout; the sweep \
+                             selected it only because it is past the burn, where durable \
+                             Reconciled state is checked on every tick"
+                        );
+                    }
                     continue;
                 }
                 Ok(false) => {}
