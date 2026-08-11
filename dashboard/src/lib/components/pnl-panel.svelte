@@ -104,12 +104,18 @@
     directionalImbalanceExcessPnlUsd: 'Directional realized'
   }
   const streamColors: Record<PnlStreamKey, string> = {
-    counterTradePnlUsd: '#38bdf8',
-    onchainNettingPnlUsd: '#22c55e',
-    directionalInventoryBaselinePnlUsd: '#f59e0b',
-    directionalImbalanceExcessPnlUsd: '#f43f5e'
+    counterTradePnlUsd: 'var(--chart-sky)',
+    onchainNettingPnlUsd: 'var(--chart-green)',
+    directionalInventoryBaselinePnlUsd: 'var(--chart-amber)',
+    directionalImbalanceExcessPnlUsd: 'var(--chart-rose)'
   }
-  const assetColors = ['#38bdf8', '#f59e0b', '#22c55e', '#f43f5e', '#a78bfa']
+  const assetColors = [
+    'var(--chart-sky)',
+    'var(--chart-amber)',
+    'var(--chart-green)',
+    'var(--chart-rose)',
+    'var(--chart-violet)'
+  ]
   const formulaRows = [
     {
       label: 'Counter-trade PnL',
@@ -416,7 +422,7 @@
   const costStatusClass = (status: string): string => {
     if (status === 'included') return 'text-green-500'
     if (status === 'zero') return 'text-muted-foreground'
-    return 'text-red-400'
+    return 'text-red-600 dark:text-red-400'
   }
   const costStatusLabel = (status: string): string => status.replaceAll('_', ' ')
   const costCategoryLabel = (entry: PnlCostEntry): string => entry.category.replaceAll('_', ' ')
@@ -425,7 +431,7 @@
     effect === 'revenue'
       ? 'text-green-500'
       : effect === 'cost'
-        ? 'text-red-400'
+        ? 'text-red-600 dark:text-red-400'
         : 'text-muted-foreground'
 
   const shortId = (id: string): string => {
@@ -627,7 +633,8 @@
   const labelY = barChartHeight - 18
   const rotateLabel = (x: number): string => `rotate(-45 ${String(x)} ${String(labelY)})`
 
-  const assetColor = (index: number): string => assetColors[index % assetColors.length] ?? '#94a3b8'
+  const assetColor = (index: number): string =>
+    assetColors[index % assetColors.length] ?? 'var(--chart-slate)'
   const assetColorForSymbol = (symbol: string): string =>
     assetColor(Math.max(0, chartSymbolUniverse.indexOf(symbol)))
 
@@ -806,7 +813,7 @@
       return {
         key,
         label: firstSegment?.label ?? key,
-        color: firstSegment?.color ?? '#94a3b8',
+        color: firstSegment?.color ?? 'var(--chart-slate)',
         path: [...top, ...bottom].join(' '),
         points
       }
@@ -981,7 +988,7 @@
         {#each presetButtons as preset (preset.value)}
           <button
             class="px-2 py-1 hover:bg-accent {selectedPreset.current === preset.value
-              ? 'bg-amber-500/20 text-amber-200'
+              ? 'bg-amber-500/20 text-amber-700 dark:text-amber-200'
               : 'bg-background'}"
             onclick={() => {
               applyRangePreset(preset.value)
@@ -1032,7 +1039,7 @@
       <div class="inline-flex overflow-hidden rounded border text-xs">
         <button
           class="px-2 py-1 hover:bg-accent {marketSessionFilter.current === 'all'
-            ? 'bg-amber-500/20 text-amber-200'
+            ? 'bg-amber-500/20 text-amber-700 dark:text-amber-200'
             : 'bg-background'}"
           onclick={() => {
             setMarketSessionFilter('all')
@@ -1040,7 +1047,7 @@
         >
         <button
           class="border-l px-2 py-1 hover:bg-accent {marketSessionFilter.current === 'pre'
-            ? 'bg-amber-500/20 text-amber-200'
+            ? 'bg-amber-500/20 text-amber-700 dark:text-amber-200'
             : 'bg-background'}"
           onclick={() => {
             setMarketSessionFilter('pre')
@@ -1048,7 +1055,7 @@
         >
         <button
           class="border-l px-2 py-1 hover:bg-accent {marketSessionFilter.current === 'rth'
-            ? 'bg-amber-500/20 text-amber-200'
+            ? 'bg-amber-500/20 text-amber-700 dark:text-amber-200'
             : 'bg-background'}"
           onclick={() => {
             setMarketSessionFilter('rth')
@@ -1056,7 +1063,7 @@
         >
         <button
           class="border-l px-2 py-1 hover:bg-accent {marketSessionFilter.current === 'post'
-            ? 'bg-amber-500/20 text-amber-200'
+            ? 'bg-amber-500/20 text-amber-700 dark:text-amber-200'
             : 'bg-background'}"
           onclick={() => {
             setMarketSessionFilter('post')
@@ -1064,7 +1071,7 @@
         >
         <button
           class="border-l px-2 py-1 hover:bg-accent {marketSessionFilter.current === 'overnight'
-            ? 'bg-amber-500/20 text-amber-200'
+            ? 'bg-amber-500/20 text-amber-700 dark:text-amber-200'
             : 'bg-background'}"
           onclick={() => {
             setMarketSessionFilter('overnight')
@@ -1072,7 +1079,7 @@
         >
         <button
           class="border-l px-2 py-1 hover:bg-accent {marketSessionFilter.current === 'weekend'
-            ? 'bg-amber-500/20 text-amber-200'
+            ? 'bg-amber-500/20 text-amber-700 dark:text-amber-200'
             : 'bg-background'}"
           onclick={() => {
             setMarketSessionFilter('weekend')
@@ -1231,7 +1238,7 @@
 
         <div class="rounded-lg border bg-card/60 p-3">
           <div class="text-xs text-muted-foreground">Tracked Costs</div>
-          <div class="mt-1 font-mono text-xl font-semibold text-red-400">
+          <div class="mt-1 font-mono text-xl font-semibold text-red-600 dark:text-red-400">
             {fmtUsd(summary.trackedCostsUsd)}
           </div>
           <div class="mt-1 text-xs text-muted-foreground">
@@ -1356,7 +1363,7 @@
                 <Table.Row class={selectedAsset === row.symbol ? 'bg-amber-500/10' : ''}>
                   <Table.Cell>
                     <button
-                      class="font-mono text-xs font-semibold text-foreground hover:text-amber-200"
+                      class="font-mono text-xs font-semibold text-foreground hover:text-amber-700 dark:hover:text-amber-200"
                       onclick={() => {
                         selectAsset(row.symbol)
                       }}
@@ -1369,7 +1376,7 @@
                   >
                     {fmtSignedUsd(row.grossRealizedPnlUsd)}
                   </Table.Cell>
-                  <Table.Cell class="text-right font-mono text-xs text-red-400">
+                  <Table.Cell class="text-right font-mono text-xs text-red-600 dark:text-red-400">
                     {fmtUsd(row.trackedCostsUsd)}
                   </Table.Cell>
                   <Table.Cell
@@ -1505,7 +1512,7 @@
                       </Table.Cell>
                       <Table.Cell
                         class="text-right font-mono text-[11px] {entry.delayedCounterTrade
-                          ? 'text-amber-300'
+                          ? 'text-amber-600 dark:text-amber-300'
                           : 'text-muted-foreground'}"
                       >
                         {fmtDuration(entry.elapsedSeconds)}
@@ -1533,7 +1540,7 @@
 
       {#if report.current.warnings.length > 0}
         <details
-          class="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-100"
+          class="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100"
         >
           <summary class="cursor-pointer select-none font-semibold">
             Debug ({report.current.warnings.length})
@@ -1726,7 +1733,7 @@
                       width={segment.width}
                       height={segment.height}
                       rx="3"
-                      fill={segment.color}
+                      style:fill={segment.color}
                       opacity="0.82"
                     />
                   {/if}
@@ -1818,7 +1825,7 @@
                       width={segment.width}
                       height={segment.height}
                       rx="3"
-                      fill={segment.color}
+                      style:fill={segment.color}
                       opacity="0.82"
                     />
                   {/if}
@@ -1901,13 +1908,13 @@
               >
 
               {#each byAssetArea.layers as layer (layer.key)}
-                <polygon points={layer.path} fill={layer.color} opacity="0.3" />
+                <polygon points={layer.path} style:fill={layer.color} opacity="0.3" />
                 <polyline
                   points={layer.points
                     .map((point) => `${point.x.toFixed(1)},${point.y1.toFixed(1)}`)
                     .join(' ')}
                   fill="none"
-                  stroke={layer.color}
+                  style:stroke={layer.color}
                   stroke-width="1.6"
                   opacity="0.9"
                 />
@@ -1989,13 +1996,13 @@
               >
 
               {#each byMethodArea.layers as layer (layer.key)}
-                <polygon points={layer.path} fill={layer.color} opacity="0.3" />
+                <polygon points={layer.path} style:fill={layer.color} opacity="0.3" />
                 <polyline
                   points={layer.points
                     .map((point) => `${point.x.toFixed(1)},${point.y1.toFixed(1)}`)
                     .join(' ')}
                   fill="none"
-                  stroke={layer.color}
+                  style:stroke={layer.color}
                   stroke-width="1.6"
                   opacity="0.9"
                 />

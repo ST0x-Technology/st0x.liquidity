@@ -3,6 +3,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use alloy::primitives::U256;
 use axum::Json;
@@ -160,6 +161,17 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
+/// Deadline for bringing the PnL ledger current on the `/pnl` request path.
+/// Catch-up work is proportional to the un-ingested backlog, not to the
+/// request, and concurrent requests serialize on the ledger's internal mutex
+/// before any admission control -- so past this deadline the request sheds
+/// with 503 instead of queueing behind ingestion. The boot-path catch-up
+/// stays unbounded: first-deploy backfill may legitimately exceed any
+/// request deadline. Cancellation is safe because each ingest batch commits
+/// its rows and checkpoint atomically; an elapsed deadline only rolls back
+/// the in-flight batch.
+const PNL_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn pnl(
     State(state): State<AppState>,
     Query(query): Query<PnlQuery>,
@@ -173,11 +185,19 @@ async fn pnl(
     query
         .symbol_filter(&mut Vec::new())
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let head = tokio::time::timeout(PNL_CATCH_UP_TIMEOUT, state.pnl_ledger.catch_up())
+        .await
+        .map_err(|_elapsed| {
+            warn!("PnL ledger catch-up exceeded its request deadline");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PnL ledger catch-up timed out".to_string(),
+            )
+        })?
+        .map_err(|error| pnl_error_response(PnlError::Ledger(error)))?;
+    validate_pnl_snapshot_rowid(head, &query).map_err(pnl_error_response)?;
     let permit =
         acquire_pnl_report_permit(&state.pnl_report_admission).map_err(pnl_error_response)?;
-    validate_pnl_snapshot_rowid(&state.pool, &query)
-        .await
-        .map_err(pnl_error_response)?;
 
     let activities = if let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &state.ctx.broker {
         alpaca_auth
@@ -194,7 +214,7 @@ async fn pnl(
         Vec::new()
     };
 
-    build_pnl_report_with_permit(&state.pool, &query, activities, Utc::now(), permit)
+    build_pnl_report_with_permit(&state.pool, &query, activities, Utc::now(), permit, head)
         .await
         .map(Json)
         .map_err(pnl_error_response)
@@ -205,12 +225,18 @@ fn pnl_error_response(error: PnlError) -> (StatusCode, String) {
         PnlError::InvalidDate { .. }
         | PnlError::InvalidSnapshotRowid { .. }
         | PnlError::InvalidSymbolFilter { .. } => (StatusCode::BAD_REQUEST, error.to_string()),
-        PnlError::InvalidPayload { .. }
-        | PnlError::InvalidBotGasReceiptCost { .. }
+        PnlError::InvalidLedgerRow { .. }
         | PnlError::MalformedPayload { .. }
         | PnlError::InvalidFinancialField { .. }
         | PnlError::InvalidInternalDecimal { .. } => {
-            error!(%error, "Failed to build PnL report from persisted payload");
+            error!(%error, "Failed to build PnL report from ledger data");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to build PnL report".to_string(),
+            )
+        }
+        PnlError::Ledger(error) => {
+            error!(%error, "PnL ledger ingestion failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to build PnL report".to_string(),
@@ -1894,6 +1920,7 @@ mod tests {
         AppState {
             settings: dashboard::settings_from_ctx(&ctx),
             ctx,
+            pnl_ledger: Arc::new(crate::dashboard::pnl::PnlLedger::new(pool.clone())),
             pool,
             event_sender: sender.clone(),
             inventory: Arc::new(BroadcastingInventory::new(

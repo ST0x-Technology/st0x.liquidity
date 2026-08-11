@@ -1,18 +1,15 @@
 //! Cost and revenue classification for backend PnL reports.
 use rain_math_float::Float;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use st0x_execution::alpaca_broker_api::AccountActivity;
 use st0x_finance::{Symbol, Usd};
 use st0x_float_macro::float;
 
-use super::parsing::{
-    fmt_decimal, is_safe_symbol, nested_record, parse_internal_decimal, persisted_decimal_value,
-    text_field,
-};
-use super::query::{PnlError, PnlFinancialFieldError};
+use super::parsing::{fmt_decimal, is_safe_symbol, parse_internal_decimal, parse_ledger_decimal};
+use super::query::{LEDGER_ROW_EVENT_TYPE, PnlError, PnlFinancialFieldError};
 use super::response::{PnlCostCoverage, PnlCostSummary, PnlSummary};
-use super::state::CostEventRow;
+use super::state::{CostLedgerRow, CostSource};
 
 const FEE_ACTIVITY_TYPES: &[&str] = &["FEE", "PTC"];
 const INTEREST_ACTIVITY_TYPES: &[&str] = &["INT"];
@@ -24,15 +21,6 @@ const DIVIDEND_ACTIVITY_TYPES: &[&str] = &[
     "DIV", "DIVCGL", "DIVCGS", "DIVNRA", "DIVROC", "DIVTXEX", "CGD", "CIL",
 ];
 const CASH_CREDIT_ACTIVITY_TYPES: &[&str] = &["CSD"];
-
-fn malformed_cost_payload(row: &CostEventRow, reason: &'static str) -> PnlError {
-    PnlError::MalformedPayload {
-        rowid: row.rowid,
-        aggregate_type: "CostEvent",
-        event_type: row.event_type.clone(),
-        reason,
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CostCategory {
@@ -497,153 +485,55 @@ const CCTP_FEE_ENTRY: CostEntryDefinition = CostEntryDefinition {
     detail: "CCTP fee_collected from bridge mint",
 };
 
-fn cost_entry(
-    row: &CostEventRow,
+/// Converts one fee-bearing ledger row into a cost entry. The symbol was
+/// attributed at ingestion (`pnl_mint_symbol`); an unsafe or invalid stored
+/// symbol degrades to no attribution with a warning, as the payload path did.
+fn ledger_cost_entry(
+    row: &CostLedgerRow,
     definition: CostEntryDefinition,
-    amount_usd: Float,
-    occurred_at: String,
-    symbol: Option<Symbol>,
+    amount: &str,
+    warnings: &mut Vec<String>,
 ) -> Result<CostEntryInternal, PnlError> {
+    let amount_usd = parse_ledger_decimal("pnl_cost_entry", row.event_rowid, "amount_usd", amount)?;
     let amount_usd = validated_cost_magnitude(
         amount_usd,
-        row.rowid,
+        row.event_rowid,
         definition.aggregate_type,
-        row.event_type.clone(),
+        LEDGER_ROW_EVENT_TYPE.to_owned(),
     )?;
+    let symbol = match row.symbol.as_deref() {
+        Some(symbol_text) if is_safe_symbol(symbol_text) => Symbol::new(symbol_text.to_owned())
+            .map_or_else(
+                |_| {
+                    warnings.push(format!(
+                        "Skipped invalid tokenization cost symbol in backend PnL response: \
+                         {symbol_text}"
+                    ));
+                    None
+                },
+                Some,
+            ),
+        Some(symbol_text) => {
+            warnings.push(format!(
+                "Skipped unsafe tokenization cost symbol in backend PnL response: {symbol_text}"
+            ));
+            None
+        }
+        None => None,
+    };
 
     Ok(CostEntryInternal {
         category: definition.category,
         accounting_bucket: definition.accounting_bucket,
         effect: definition.effect,
         amount_usd,
-        occurred_at,
+        occurred_at: row.occurred_at.clone(),
         aggregate_type: definition.aggregate_type.to_owned(),
         aggregate_id: row.aggregate_id.clone(),
-        event_rowid: row.rowid,
+        event_rowid: row.event_rowid,
         symbol,
         detail: definition.detail.to_owned(),
     })
-}
-
-fn parse_tokenized_equity_mint_cost_event(
-    row: &CostEventRow,
-    symbols_by_mint_aggregate: &mut HashMap<String, Symbol>,
-    warnings: &mut Vec<String>,
-) -> Result<Option<CostEntryInternal>, PnlError> {
-    if row.event_type == "TokenizedEquityMintEvent::MintRequested" {
-        let requested = nested_record(&row.payload, "MintRequested");
-        let symbol = requested.and_then(|payload| text_field(payload, "symbol"));
-        if let Some(symbol) = symbol {
-            if is_safe_symbol(&symbol) {
-                if let Ok(symbol) = Symbol::new(symbol) {
-                    symbols_by_mint_aggregate.insert(row.aggregate_id.clone(), symbol);
-                }
-            } else {
-                warnings.push(format!(
-                    "Skipped unsafe tokenization cost symbol in backend PnL response: {symbol}"
-                ));
-            }
-        }
-        return Ok(None);
-    }
-
-    let terminal_key = match row.event_type.as_str() {
-        "TokenizedEquityMintEvent::TokensReceived" => "TokensReceived",
-        "TokenizedEquityMintEvent::ProviderCompletionRecovered" => "ProviderCompletionRecovered",
-        _ => return Ok(None),
-    };
-
-    let Some(terminal) = nested_record(&row.payload, terminal_key) else {
-        return Err(malformed_cost_payload(
-            row,
-            "missing tokenization terminal payload",
-        ));
-    };
-
-    let occurred_at = if terminal_key == "TokensReceived" {
-        text_field(terminal, "received_at")
-    } else {
-        text_field(terminal, "recovered_at")
-    };
-    let fees = persisted_decimal_value(
-        row.rowid,
-        "TokenizedEquityMint",
-        row.event_type.clone(),
-        terminal,
-        "fees",
-    )?;
-    let Some(occurred_at) = occurred_at else {
-        return Err(malformed_cost_payload(
-            row,
-            "missing tokenization fee timestamp",
-        ));
-    };
-
-    let Some(fees) = fees else {
-        return Err(malformed_cost_payload(row, "missing tokenization fees"));
-    };
-
-    if fees.is_zero()? {
-        return Ok(None);
-    }
-
-    let entry = cost_entry(
-        row,
-        TOKENIZATION_FEE_ENTRY,
-        fees,
-        occurred_at,
-        symbols_by_mint_aggregate.get(&row.aggregate_id).cloned(),
-    )?;
-    Ok(Some(entry))
-}
-
-fn parse_usdc_rebalance_cost_event(
-    row: &CostEventRow,
-    _warnings: &mut Vec<String>,
-) -> Result<Option<CostEntryInternal>, PnlError> {
-    let bridge_key = match row.event_type.as_str() {
-        "UsdcRebalanceEvent::Bridged" => "Bridged",
-        "UsdcRebalanceEvent::BridgingCompletionRecovered" => "BridgingCompletionRecovered",
-        _ => return Ok(None),
-    };
-
-    let bridged = nested_record(&row.payload, bridge_key);
-    let Some(bridged) = bridged else {
-        return Err(malformed_cost_payload(row, "missing CCTP bridge payload"));
-    };
-    let fee_collected = persisted_decimal_value(
-        row.rowid,
-        "UsdcRebalance",
-        row.event_type.clone(),
-        bridged,
-        "fee_collected",
-    )?;
-    let occurred_at = {
-        if bridge_key == "Bridged" {
-            text_field(bridged, "minted_at")
-        } else {
-            text_field(bridged, "recovered_at")
-        }
-    };
-
-    let (Some(fee_collected), Some(occurred_at)) = (fee_collected, occurred_at) else {
-        return Err(malformed_cost_payload(
-            row,
-            "missing CCTP fee_collected or timestamp",
-        ));
-    };
-
-    if fee_collected.is_zero()? {
-        return Ok(None);
-    }
-
-    Ok(Some(cost_entry(
-        row,
-        CCTP_FEE_ENTRY,
-        fee_collected,
-        occurred_at,
-        None,
-    )?))
 }
 
 pub(crate) struct CostReplay {
@@ -652,53 +542,47 @@ pub(crate) struct CostReplay {
 }
 
 pub(crate) fn build_cost_entries(
-    rows: &[CostEventRow],
+    rows: &[CostLedgerRow],
     warnings: &mut Vec<String>,
 ) -> Result<CostReplay, PnlError> {
     let mut entries = Vec::new();
-    let mut symbols_by_mint_aggregate = HashMap::new();
     let mut counted_tokenization_fee_aggregates = HashSet::new();
-    let missing_cost_observation_count = 0;
-    let mut sorted = rows.to_vec();
-    sorted.sort_by_key(|row| row.rowid);
+    let mut unreported_fee_aggregates = HashSet::new();
+    let mut missing_cost_observation_count = 0;
 
-    for row in sorted {
-        if row.payload.is_null() {
-            warnings.push(format!(
-                "Skipped malformed cost event row {}: invalid payload",
-                row.rowid
-            ));
-            continue;
-        }
-
-        match row.aggregate_type.as_str() {
-            "TokenizedEquityMint" => {
-                let entry = parse_tokenized_equity_mint_cost_event(
-                    &row,
-                    &mut symbols_by_mint_aggregate,
-                    warnings,
-                )?;
-                if let Some(entry) = entry {
-                    if counted_tokenization_fee_aggregates.insert(row.aggregate_id.clone()) {
-                        entries.push(entry);
-                    } else {
-                        warnings.push(format!(
-                            "Skipped duplicate tokenization fee for mint aggregate {}",
-                            row.aggregate_id
-                        ));
-                    }
+    for row in rows {
+        match (row.source, row.amount_usd.as_deref()) {
+            (CostSource::TokenizationFee, None) => {
+                if unreported_fee_aggregates.insert(row.aggregate_id.clone()) {
+                    missing_cost_observation_count += 1;
                 }
             }
-            "UsdcRebalance" => {
-                if let Some(entry) = parse_usdc_rebalance_cost_event(&row, warnings)? {
-                    entries.push(entry);
+            (CostSource::TokenizationFee, Some(amount)) => {
+                if counted_tokenization_fee_aggregates.insert(row.aggregate_id.clone()) {
+                    entries.push(ledger_cost_entry(
+                        row,
+                        TOKENIZATION_FEE_ENTRY,
+                        amount,
+                        warnings,
+                    )?);
+                } else {
+                    warnings.push(format!(
+                        "Skipped duplicate tokenization fee for mint aggregate {}",
+                        row.aggregate_id
+                    ));
                 }
             }
-            other => {
-                warnings.push(format!(
-                    "Skipped unsupported cost event row {} with aggregate_type {}",
-                    row.rowid, other
-                ));
+            (CostSource::CctpFee, Some(amount)) => {
+                entries.push(ledger_cost_entry(row, CCTP_FEE_ENTRY, amount, warnings)?);
+            }
+            // The ledger schema forbids this shape (`CHECK (source != 'cctp_fee'
+            // OR amount_usd IS NOT NULL)`), so hitting it means a corrupt row.
+            (CostSource::CctpFee, None) => {
+                return Err(PnlError::InvalidLedgerRow {
+                    table: "pnl_cost_entry",
+                    rowid: row.event_rowid,
+                    reason: "cctp fee row missing amount",
+                });
             }
         }
     }

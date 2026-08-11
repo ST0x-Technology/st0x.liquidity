@@ -23,7 +23,7 @@ use sqlx_apalis::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalM
 use std::collections::{HashMap, HashSet};
 use std::num::TryFromIntError;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use task_supervisor::SupervisorHandle;
 use tokio::sync::{Mutex, broadcast};
 use tokio::task::{JoinError, JoinHandle};
@@ -61,6 +61,7 @@ use crate::bot_gas::{
 use crate::conductor::exit::{ConductorExit, ConductorExitError, MonitorTaskError};
 use crate::conductor::job::{BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureStreak};
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
+use crate::dashboard::pnl::{LedgerHead, PnlLedger, PnlLedgerReactor};
 use crate::dashboard::{Broadcaster, DashboardTradeDelivery};
 use crate::equity_redemption::{
     EquityRedemption, interrupted_redemption_ids, symbols_with_stuck_redemptions,
@@ -170,6 +171,29 @@ pub(crate) async fn setup_apalis_tables(
         .await?;
 
     Ok(())
+}
+
+/// Creates the apalis job tables and every queue frontend built on them:
+/// dex-trade accounting, order-fill backfill, the durable dashboard-trade
+/// delivery pipeline, and the rebalancing schedulers.
+async fn setup_apalis_queues(
+    pool: &SqlitePool,
+    apalis_pool: &apalis_sqlite::SqlitePool,
+    event_sender: broadcast::Sender<Statement>,
+) -> anyhow::Result<(
+    DexTradeAccountingJobQueue,
+    BackfillJobQueue,
+    DashboardTradeDelivery,
+    RebalancingSchedulers,
+)> {
+    setup_apalis_tables(apalis_pool).await?;
+
+    Ok((
+        DexTradeAccountingJobQueue::new(apalis_pool),
+        BackfillJobQueue::new(apalis_pool),
+        DashboardTradeDelivery::new(apalis_pool, pool, event_sender),
+        RebalancingSchedulers::new(apalis_pool),
+    ))
 }
 
 /// Builds the vault registry store and runs the seeding logic inline so
@@ -746,15 +770,32 @@ fn publish_recovery_handle(
     });
 }
 
+/// Handles the conductor shares with the axum server's `AppState`: the
+/// dashboard event stream, the broadcasting inventory, the recovery cell the
+/// conductor populates for `/transfers/resume`, and the PnL ledger whose
+/// ingestion both sides drive.
+pub(crate) struct ServerHandles {
+    pub(crate) event_sender: broadcast::Sender<Statement>,
+    pub(crate) inventory: Arc<BroadcastingInventory>,
+    pub(crate) recovery_cell: Arc<tokio::sync::OnceCell<crate::api::RecoveryHandle>>,
+    pub(crate) pnl_ledger: Arc<PnlLedger>,
+}
+
 impl Conductor {
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
         ctx: Ctx,
-        pools: DatabasePools,
-        event_sender: broadcast::Sender<Statement>,
-        inventory: Arc<BroadcastingInventory>,
+        DatabasePools {
+            cqrs: pool,
+            apalis: apalis_pool,
+        }: DatabasePools,
+        ServerHandles {
+            event_sender,
+            inventory,
+            recovery_cell,
+            pnl_ledger,
+        }: ServerHandles,
         shutdown_token: CancellationToken,
-        recovery_cell: Arc<tokio::sync::OnceCell<crate::api::RecoveryHandle>>,
         #[cfg(any(test, feature = "test-support"))]
         failure_injector: crate::conductor::job::FailureInjector,
     ) -> anyhow::Result<()>
@@ -763,26 +804,21 @@ impl Conductor {
         TradeAccountingError: From<E::Error>,
         crate::offchain::order::JobError: From<E::Error>,
     {
-        let DatabasePools {
-            cqrs: pool,
-            apalis: apalis_pool,
-        } = pools;
-
         let (executor, provider, telemetry_writer, telemetry) =
             setup_instrumentation(executor_ctx, &ctx.evm, pool.clone()).await?;
         let cache = SymbolCache::default();
 
-        setup_apalis_tables(&apalis_pool).await?;
-        let job_queue = DexTradeAccountingJobQueue::new(&apalis_pool);
-        let backfill_queue = BackfillJobQueue::new(&apalis_pool);
-        let dashboard_delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, event_sender);
-        let schedulers = RebalancingSchedulers::new(&apalis_pool);
+        let (job_queue, backfill_queue, dashboard_delivery, schedulers) =
+            setup_apalis_queues(&pool, &apalis_pool, event_sender).await?;
 
         let onchain_trade =
             setup_onchain_trade_store(&pool, dashboard_delivery.broadcaster.clone()).await?;
 
+        let pnl_ledger_reactor = setup_pnl_ledger(pnl_ledger).await?;
+
         let (record_bot_gas_receipt_cost_queue, record_bot_gas_receipt_cost_ctx) =
-            setup_bot_gas_receipt_cost(&pool, &apalis_pool, &ctx).await?;
+            setup_bot_gas_receipt_cost(&pool, &apalis_pool, &ctx, pnl_ledger_reactor.clone())
+                .await?;
 
         let (
             vault_registry,
@@ -838,6 +874,7 @@ impl Conductor {
                 ctx: ctx.clone(),
                 inventory: inventory.clone(),
                 broadcaster: dashboard_delivery.broadcaster.clone(),
+                pnl_ledger_reactor: pnl_ledger_reactor.clone(),
                 vault_registry: vault_registry.clone(),
                 vault_registry_projection,
                 schedulers: schedulers.clone(),
@@ -1204,6 +1241,29 @@ fn build_unwrapped_equity_recovery_ctx(
     }))
 }
 
+/// Brings the PnL ledger read model up to the event-log head (ADR 0018).
+/// Runs before any store is built so the returned doorbell reactor can be
+/// registered on every source aggregate's framework. The ledger instance is
+/// shared with `AppState` (the /pnl handler calls `catch_up` per request);
+/// sharing keeps ingestion serialized on the instance's internal mutex. The
+/// startup catch-up performs first-deploy backfill and `LEDGER_VERSION`
+/// rebuilds here, at boot, so that cost can never land inside a command
+/// dispatch or a /pnl request; on a normal restart it is a no-op (the bot is
+/// the sole writer of its database, so no events accumulate while it is
+/// down).
+async fn setup_pnl_ledger(ledger: Arc<PnlLedger>) -> anyhow::Result<Arc<PnlLedgerReactor>> {
+    let started_at = Instant::now();
+    let LedgerHead(head) = ledger.catch_up().await?;
+    info!(
+        target: "startup",
+        head,
+        elapsed = ?started_at.elapsed(),
+        "PnL ledger caught up at startup"
+    );
+
+    Ok(Arc::new(PnlLedgerReactor::new(ledger)))
+}
+
 /// Builds the bot-gas cost-recording wiring (ADR 0017): the event store, the
 /// job queue, and the ctx. The store and queue are constructed
 /// unconditionally because doing so is cheap and has no side effects,
@@ -1213,11 +1273,13 @@ async fn setup_bot_gas_receipt_cost(
     pool: &SqlitePool,
     apalis_pool: &apalis_sqlite::SqlitePool,
     ctx: &Ctx,
+    pnl_ledger_reactor: Arc<PnlLedgerReactor>,
 ) -> anyhow::Result<(
     RecordBotGasReceiptCostJobQueue,
     Option<Arc<RecordBotGasReceiptCostCtx>>,
 )> {
     let store = StoreBuilder::<BotGasReceiptCost>::new(pool.clone())
+        .with(pnl_ledger_reactor)
         .build(())
         .await?;
     let queue = RecordBotGasReceiptCostJobQueue::new(apalis_pool);
@@ -1568,6 +1630,7 @@ struct RebalancingDeps {
     ctx: Ctx,
     inventory: Arc<BroadcastingInventory>,
     broadcaster: Arc<Broadcaster>,
+    pnl_ledger_reactor: Arc<PnlLedgerReactor>,
     vault_registry: Arc<Store<VaultRegistry>>,
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
     schedulers: RebalancingSchedulers,
@@ -1696,10 +1759,12 @@ impl PositionAndRebalancing {
                 ctx,
                 inventory,
                 broadcaster,
+                pnl_ledger_reactor,
                 ..
             } = deps;
 
-            let (position, position_projection) = build_position_cqrs(&pool, broadcaster).await?;
+            let (position, position_projection) =
+                build_position_cqrs(&pool, broadcaster, pnl_ledger_reactor).await?;
 
             // Without the service, the projection is the only subscriber
             // keeping the dashboard view in sync.
@@ -1928,6 +1993,7 @@ async fn build_query_frameworks(
     broadcaster: Arc<Broadcaster>,
     rebalancing_service: Arc<RebalancingService>,
     equity_transfer_services: EquityTransferServices,
+    pnl_ledger_reactor: Arc<PnlLedgerReactor>,
 ) -> anyhow::Result<BuiltFrameworks> {
     let hedge_latency = HedgeLatencyProjection::new(pool.clone());
     let rebalance_timing = RebalanceTimingProjection::new(pool.clone());
@@ -1942,6 +2008,7 @@ async fn build_query_frameworks(
         rebalance_timing,
         equity_timing,
         lifecycle_failure,
+        pnl_ledger_reactor,
     );
 
     manifest.build(pool.clone(), equity_transfer_services).await
@@ -2103,6 +2170,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             deps.broadcaster,
             rebalancing_service.clone(),
             equity_transfer_services,
+            deps.pnl_ledger_reactor,
         )
         .await?;
 
@@ -2786,12 +2854,14 @@ fn orphaned_order_position_command(
 async fn build_position_cqrs(
     pool: &SqlitePool,
     broadcaster: Arc<Broadcaster>,
+    pnl_ledger_reactor: Arc<PnlLedgerReactor>,
 ) -> anyhow::Result<(Arc<Store<Position>>, Arc<Projection<Position>>)> {
     let (store, projection) = StoreBuilder::<Position>::new(pool.clone())
         .with(broadcaster)
         .with(Arc::new(RetryOnBusy {
             inner: HedgeLatencyProjection::new(pool.clone()),
         }))
+        .with(pnl_ledger_reactor)
         .build(())
         .await?;
 
@@ -4394,6 +4464,12 @@ mod tests {
             apalis_shutdown_token: CancellationToken::new(),
             worker_failure_notifier: Arc::new(NoopNotifier),
         }
+    }
+
+    fn test_pnl_ledger_reactor(pool: &SqlitePool) -> Arc<PnlLedgerReactor> {
+        Arc::new(PnlLedgerReactor::new(Arc::new(PnlLedger::new(
+            pool.clone(),
+        ))))
     }
 
     fn test_broadcaster(
@@ -9548,7 +9624,9 @@ mod tests {
             let (broadcaster, _receiver, _queue, _delivery_ctx) =
                 test_broadcaster(&pool, &apalis_pool);
             let (position_store, position_projection) =
-                build_position_cqrs(&pool, broadcaster).await.unwrap();
+                build_position_cqrs(&pool, broadcaster, test_pnl_ledger_reactor(&pool))
+                    .await
+                    .unwrap();
 
             position_store
                 .send(
@@ -9586,7 +9664,9 @@ mod tests {
             let (broadcaster, _receiver, _queue, _delivery_ctx) =
                 test_broadcaster(&pool, &apalis_pool);
             let (_position_store, position_projection) =
-                build_position_cqrs(&pool, broadcaster).await.unwrap();
+                build_position_cqrs(&pool, broadcaster, test_pnl_ledger_reactor(&pool))
+                    .await
+                    .unwrap();
 
             let position = position_projection
                 .load(&symbol)
@@ -9614,7 +9694,9 @@ mod tests {
         let (broadcaster, mut receiver, _queue, _delivery_ctx) =
             test_broadcaster(&pool, &apalis_pool);
         let (position_store, _position_projection) =
-            build_position_cqrs(&pool, broadcaster).await.unwrap();
+            build_position_cqrs(&pool, broadcaster, test_pnl_ledger_reactor(&pool))
+                .await
+                .unwrap();
 
         position_store
             .send(
@@ -9682,6 +9764,7 @@ mod tests {
                 ctx: ctx.clone(),
                 inventory,
                 broadcaster: dashboard_delivery.broadcaster,
+                pnl_ledger_reactor: test_pnl_ledger_reactor(&pool),
                 vault_registry,
                 vault_registry_projection,
                 schedulers: RebalancingSchedulers::new(&apalis_pool),
