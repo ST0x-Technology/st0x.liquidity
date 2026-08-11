@@ -52,8 +52,8 @@
   const statusColor = (status: string): string => {
     switch (status) {
       case 'Pending': return 'text-yellow-500'
-      case 'Submitted': return 'text-blue-400'
-      case 'PartiallyFilled': return 'text-blue-400'
+      case 'Submitted': return 'text-blue-600 dark:text-blue-400'
+      case 'PartiallyFilled': return 'text-blue-600 dark:text-blue-400'
       default: return ''
     }
   }
@@ -61,8 +61,8 @@
   const dotColor = (status: string): string => {
     switch (status) {
       case 'Pending': return 'bg-yellow-500'
-      case 'Submitted': return 'bg-blue-400'
-      case 'PartiallyFilled': return 'bg-blue-400'
+      case 'Submitted': return 'bg-blue-500 dark:bg-blue-400'
+      case 'PartiallyFilled': return 'bg-blue-500 dark:bg-blue-400'
       default: return 'bg-muted-foreground'
     }
   }

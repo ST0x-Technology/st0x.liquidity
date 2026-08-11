@@ -415,9 +415,9 @@
     switch (level.toUpperCase()) {
       case 'ERROR': return 'text-red-500'
       case 'WARN': return 'text-yellow-500'
-      case 'INFO': return 'text-blue-400'
-      case 'DEBUG': return 'text-cyan-400'
-      case 'TRACE': return 'text-purple-400'
+      case 'INFO': return 'text-blue-600 dark:text-blue-400'
+      case 'DEBUG': return 'text-cyan-600 dark:text-cyan-400'
+      case 'TRACE': return 'text-purple-600 dark:text-purple-400'
       default: return ''
     }
   }
