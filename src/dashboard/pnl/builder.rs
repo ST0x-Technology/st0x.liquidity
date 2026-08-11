@@ -26,7 +26,7 @@ use super::sessions::{
     date_key, et_day_key, matches_cost_date_filter, matches_cost_symbol_filter, matches_date_filter,
 };
 use super::state::{
-    BotGasCostRow, CostEventRow, PositionEventRow, PositionViewRow, SummaryAcc, SymbolBook,
+    BotGasCostRow, CostLedgerRow, PositionLedgerRow, PositionViewRow, SummaryAcc, SymbolBook,
 };
 use super::windows::build_windows;
 
@@ -102,9 +102,9 @@ fn remove_tokenization_fee_overlaps(
 /// Builds the `/pnl` response from already-loaded rows and returns net realized
 /// PnL bucketed by ET accounting day for the aligned capital calculation.
 pub(crate) fn build_pnl_response_from_rows(
-    event_rows: Vec<PositionEventRow>,
+    event_rows: Vec<PositionLedgerRow>,
     position_rows: &[PositionViewRow],
-    cost_rows: &[CostEventRow],
+    cost_rows: &[CostLedgerRow],
     bot_gas_rows: &[BotGasCostRow],
     alpaca_activities: &[AccountActivity],
     query: &PnlQuery,
@@ -116,7 +116,7 @@ pub(crate) fn build_pnl_response_from_rows(
     } else {
         event_rows
             .into_iter()
-            .filter(|row| symbols.contains(&row.symbol))
+            .filter(|row| symbols.contains(row.symbol()))
             .collect()
     };
     let (position_nets, position_symbols) = parse_position_view(position_rows, &mut warnings)?;
@@ -128,47 +128,44 @@ pub(crate) fn build_pnl_response_from_rows(
     let mut position_replay_deltas = Vec::new();
 
     for row in ordered_position_events(event_rows)? {
-        if !is_safe_symbol(&row.symbol) {
+        if !is_safe_symbol(row.symbol()) {
             warnings.push(format!(
                 "Skipped unsafe position event symbol in backend PnL response: {}",
-                row.symbol
+                row.symbol()
             ));
             continue;
         }
 
-        let Ok(symbol) = Symbol::new(row.symbol.clone()) else {
+        let Ok(symbol) = Symbol::new(row.symbol().to_owned()) else {
             warnings.push(format!(
                 "Skipped invalid position event symbol in backend PnL response: {}",
-                row.symbol
+                row.symbol()
             ));
             continue;
         };
 
         let book = books.entry(symbol).or_default();
-        match row.event_type.as_str() {
-            "PositionEvent::OnChainOrderFilled" => {
-                if let Some(fill) = parse_onchain_fill(&row, &mut warnings)? {
-                    apply_onchain_fill(book, &fill, &mut entries, &mut warnings)?;
-                }
+        match &row {
+            PositionLedgerRow::OnchainFill(fill_row) => {
+                let fill = parse_onchain_fill(fill_row)?;
+                apply_onchain_fill(book, &fill, &mut entries, &mut warnings)?;
             }
-            "PositionEvent::OffChainOrderPlaced" => {
-                apply_offchain_placement(book, &row, &mut warnings);
+            PositionLedgerRow::OffchainPlacement(placement) => {
+                apply_offchain_placement(book, placement, &mut warnings);
             }
-            "PositionEvent::OffChainOrderFilled" => {
-                if let Some(fill) = parse_offchain_fill(&row, &mut warnings)? {
-                    apply_offchain_fill(
-                        book,
-                        &fill,
-                        &mut entries,
-                        &mut warnings,
-                        &mut unmatched_offchain_allocations,
-                    )?;
-                }
+            PositionLedgerRow::OffchainFill(fill_row) => {
+                let fill = parse_offchain_fill(fill_row)?;
+                apply_offchain_fill(
+                    book,
+                    &fill,
+                    &mut entries,
+                    &mut warnings,
+                    &mut unmatched_offchain_allocations,
+                )?;
             }
-            "PositionEvent::ManualPositionAdjusted" => {
-                apply_manual_position_adjustment(book, &row, &mut warnings)?;
+            PositionLedgerRow::ManualAdjustment(adjustment) => {
+                apply_manual_position_adjustment(book, adjustment)?;
             }
-            _ => {}
         }
     }
 

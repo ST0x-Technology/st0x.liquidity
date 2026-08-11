@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
@@ -11,19 +11,20 @@ use num_decimal::num_bigint::{BigInt, Sign};
 use num_traits::Zero;
 use proptest::prelude::*;
 use rain_math_float::Float;
-use serde_json::Value;
 use sqlx::SqlitePool;
-use sqlx::sqlite::SqlitePoolOptions;
+use uuid::Uuid;
 
+use st0x_execution::ExecutorOrderId;
 use st0x_execution::alpaca_broker_api::AccountActivity;
-use st0x_finance::{Symbol, Usd};
+use st0x_finance::{FractionalShares, Positive, Symbol, Usd, Usdc};
 use st0x_float_macro::float;
 
 use super::builder::build_pnl_response_from_rows;
 use super::costs::{
     AccountingBucket, AccountingEffect, CostCategory, CostEntryInternal, validated_cost_magnitude,
 };
-use super::parsing::{fmt_decimal, parse_payload_string, parse_timestamp};
+use super::ledger::{LedgerHead, PnlLedgerError};
+use super::parsing::{fmt_decimal, parse_timestamp};
 use super::query::{PnlCounterTradingFilter, PnlError, PnlMarketSessionFilter, PnlQuery};
 use super::replay::{add_summary, with_direct_symbol_costs};
 use super::response::{PnlResponse, PnlSymbolSummary, PnlWindow, PnlWindowSymbol};
@@ -32,8 +33,8 @@ use super::source::{
     run_pnl_replay, run_pnl_replay_with_permit,
 };
 use super::state::{
-    BotGasCostRow, CostEventRow, Direction, PnlBucket, PositionEventRow, PositionViewRow,
-    SummaryAcc, Venue,
+    BotGasCostRow, CostLedgerRow, CostSource, Direction, ManualAdjustmentRow, OffchainFillRow,
+    OnchainFillRow, PnlBucket, PositionLedgerRow, PositionViewRow, SummaryAcc, Venue,
 };
 use super::windows::build_windows;
 use super::{
@@ -41,109 +42,91 @@ use super::{
     COST_WARNING, SYMBOL_FILTERED_CAPITAL_WARNING, validate_pnl_snapshot_rowid,
 };
 use crate::bot_gas::{
-    BotGasChain, BotGasOperationCategory, BotGasReceiptCost, BotGasReceiptCostEvent,
+    BotGasChain, BotGasOperationCategory, BotGasReceiptCost, BotGasReceiptCostError,
+    BotGasReceiptCostEvent,
 };
+use crate::offchain::order::OffchainOrderId;
 use crate::portfolio_snapshot::EtDayRange;
+use crate::position::{Position, PositionEvent, TradeId};
+use crate::test_utils::{persist_event, setup_test_db};
+use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
+use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId};
 
-fn event(rowid: i64, symbol: &str, event_type: &str, payload: Value) -> PositionEventRow {
-    PositionEventRow {
-        rowid,
-        symbol: symbol.to_owned(),
-        event_type: event_type.to_owned(),
-        payload,
-    }
+fn seed_rebalance(fee: &str, timestamp: &str) -> SeedEvent {
+    SeedEvent::Rebalance(
+        UsdcRebalanceId(Uuid::new_v4()).to_string(),
+        bridged_event(fee, timestamp),
+    )
 }
 
 fn onchain_fill(
     rowid: i64,
     symbol: &str,
-    direction: &str,
+    direction: Direction,
     price: &str,
     shares: &str,
     timestamp: &str,
-) -> PositionEventRow {
-    event(
-        rowid,
-        symbol,
-        "PositionEvent::OnChainOrderFilled",
-        serde_json::json!({
-            "OnChainOrderFilled": {
-                "amount": shares,
-                "direction": direction,
-                "price_usdc": price,
-                "block_timestamp": timestamp,
-                "trade_id": {
-                    "tx_hash": format!("0x{rowid}"),
-                    "log_index": 0
-                }
-            }
-        }),
-    )
+) -> PositionLedgerRow {
+    PositionLedgerRow::OnchainFill(OnchainFillRow {
+        event_rowid: rowid,
+        symbol: symbol.to_owned(),
+        tx_hash: format!("0x{rowid}"),
+        log_index: 0,
+        shares: shares.to_owned(),
+        direction,
+        price_usd: price.to_owned(),
+        executed_at: timestamp.to_owned(),
+    })
 }
 
-fn onchain_sell(rowid: i64, price: &str, timestamp: &str) -> PositionEventRow {
-    onchain_fill(rowid, "RKLB", "Sell", price, "1", timestamp)
+fn onchain_sell(rowid: i64, price: &str, timestamp: &str) -> PositionLedgerRow {
+    onchain_fill(rowid, "RKLB", Direction::Sell, price, "1", timestamp)
 }
 
-fn onchain_buy(rowid: i64, price: &str, timestamp: &str) -> PositionEventRow {
-    onchain_fill(rowid, "RKLB", "Buy", price, "1", timestamp)
+fn onchain_buy(rowid: i64, price: &str, timestamp: &str) -> PositionLedgerRow {
+    onchain_fill(rowid, "RKLB", Direction::Buy, price, "1", timestamp)
 }
 
 fn offchain_fill(
     rowid: i64,
     symbol: &str,
-    direction: &str,
+    direction: Direction,
     timestamp: &str,
     price: &str,
     shares: &str,
-) -> PositionEventRow {
-    event(
-        rowid,
-        symbol,
-        "PositionEvent::OffChainOrderFilled",
-        serde_json::json!({
-            "OffChainOrderFilled": {
-                "offchain_order_id": format!("alpaca-{rowid}"),
-                "shares_filled": shares,
-                "direction": direction,
-                "price": price,
-                "broker_timestamp": timestamp
-            }
-        }),
-    )
+) -> PositionLedgerRow {
+    PositionLedgerRow::OffchainFill(OffchainFillRow {
+        event_rowid: rowid,
+        symbol: symbol.to_owned(),
+        offchain_order_id: format!("alpaca-{rowid}"),
+        shares: shares.to_owned(),
+        direction,
+        price_usd: price.to_owned(),
+        executed_at: timestamp.to_owned(),
+    })
 }
 
-fn offchain_buy(rowid: i64, timestamp: &str, price: &str, shares: &str) -> PositionEventRow {
-    offchain_fill(rowid, "RKLB", "Buy", timestamp, price, shares)
+fn offchain_buy(rowid: i64, timestamp: &str, price: &str, shares: &str) -> PositionLedgerRow {
+    offchain_fill(rowid, "RKLB", Direction::Buy, timestamp, price, shares)
 }
 
-fn offchain_sell(rowid: i64, timestamp: &str, price: &str, shares: &str) -> PositionEventRow {
-    offchain_fill(rowid, "RKLB", "Sell", timestamp, price, shares)
+fn offchain_sell(rowid: i64, timestamp: &str, price: &str, shares: &str) -> PositionLedgerRow {
+    offchain_fill(rowid, "RKLB", Direction::Sell, timestamp, price, shares)
 }
 
 fn manual_adjustment(
     rowid: i64,
     target_net: &str,
-    price_usdc: Option<&str>,
+    price_usd: Option<&str>,
     timestamp: &str,
-) -> PositionEventRow {
-    let mut payload = serde_json::json!({
-        "ManualPositionAdjusted": {
-            "previous_net": "0",
-            "target_net": target_net,
-            "reason": "test repair",
-            "adjusted_at": timestamp
-        }
-    });
-    if let Some(price_usdc) = price_usdc {
-        payload["ManualPositionAdjusted"]["price_usdc"] = serde_json::json!(price_usdc);
-    }
-    event(
-        rowid,
-        "RKLB",
-        "PositionEvent::ManualPositionAdjusted",
-        payload,
-    )
+) -> PositionLedgerRow {
+    PositionLedgerRow::ManualAdjustment(ManualAdjustmentRow {
+        event_rowid: rowid,
+        symbol: "RKLB".to_owned(),
+        target_net: target_net.to_owned(),
+        price_usd: price_usd.map(str::to_owned),
+        adjusted_at: timestamp.to_owned(),
+    })
 }
 
 fn position_rows() -> Vec<PositionViewRow> {
@@ -262,14 +245,6 @@ fn et_day_range_leaves_lower_bound_open_when_only_to_date_set() {
     let EtDayRange { from, to } = query.et_day_range().unwrap();
     assert_eq!(from, None);
     assert_eq!(to, Some(NaiveDate::from_ymd_opt(2026, 5, 15).unwrap()));
-}
-
-#[test]
-fn malformed_persisted_payloads_are_rejected() {
-    let error = parse_payload_string("{not-json").unwrap_err();
-    assert_eq!(error.classify(), serde_json::error::Category::Syntax);
-    assert_eq!(error.line(), 1);
-    assert_eq!(error.column(), 2);
 }
 
 #[test]
@@ -415,16 +390,22 @@ fn invalid_persisted_financial_fields_fail_the_report() {
         error,
         PnlError::InvalidFinancialField {
             rowid: 1,
-            field: "price_usdc",
+            field: "price_usd",
             ..
         }
     ));
 }
 
 #[test]
-fn wrong_typed_persisted_fill_decimals_fail_the_report() {
-    let mut row = onchain_sell(1, "10", "2026-05-15T14:00:00Z");
-    row.payload["OnChainOrderFilled"]["amount"] = serde_json::json!(true);
+fn corrupt_ledger_fill_decimals_fail_the_report() {
+    let row = onchain_fill(
+        1,
+        "RKLB",
+        Direction::Sell,
+        "10",
+        "not-a-decimal",
+        "2026-05-15T14:00:00Z",
+    );
 
     let error = report_result(vec![row]).unwrap_err();
 
@@ -432,27 +413,7 @@ fn wrong_typed_persisted_fill_decimals_fail_the_report() {
         error,
         PnlError::InvalidFinancialField {
             rowid: 1,
-            field: "amount",
-            ..
-        }
-    ));
-}
-
-#[test]
-fn missing_persisted_fill_fields_fail_the_report() {
-    let mut row = onchain_sell(1, "10", "2026-05-15T14:00:00Z");
-    row.payload["OnChainOrderFilled"]
-        .as_object_mut()
-        .unwrap()
-        .remove("amount");
-
-    let error = report_result(vec![row]).unwrap_err();
-
-    assert!(matches!(
-        error,
-        PnlError::MalformedPayload {
-            rowid: 1,
-            reason: "incomplete OnChainOrderFilled payload",
+            field: "shares",
             ..
         }
     ));
@@ -460,15 +421,21 @@ fn missing_persisted_fill_fields_fail_the_report() {
 
 #[test]
 fn non_positive_onchain_fill_values_fail_the_report() {
-    let mut zero_amount = onchain_sell(1, "10", "2026-05-15T14:00:00Z");
-    zero_amount.payload["OnChainOrderFilled"]["amount"] = serde_json::json!("0");
-    let error = report_result(vec![zero_amount]).unwrap_err();
+    let zero_shares = onchain_fill(
+        1,
+        "RKLB",
+        Direction::Sell,
+        "10",
+        "0",
+        "2026-05-15T14:00:00Z",
+    );
+    let error = report_result(vec![zero_shares]).unwrap_err();
     assert!(matches!(
         error,
-        PnlError::MalformedPayload {
+        PnlError::InvalidLedgerRow {
+            table: "pnl_onchain_fill",
             rowid: 1,
-            reason: "non-positive OnChainOrderFilled amount",
-            ..
+            reason: "non-positive onchain fill shares",
         }
     ));
 
@@ -476,10 +443,10 @@ fn non_positive_onchain_fill_values_fail_the_report() {
     let error = report_result(vec![negative_price]).unwrap_err();
     assert!(matches!(
         error,
-        PnlError::MalformedPayload {
+        PnlError::InvalidLedgerRow {
+            table: "pnl_onchain_fill",
             rowid: 2,
-            reason: "non-positive OnChainOrderFilled price_usdc",
-            ..
+            reason: "non-positive onchain fill price",
         }
     ));
 }
@@ -490,10 +457,10 @@ fn non_positive_offchain_fill_values_fail_the_report() {
     let error = report_result(vec![zero_shares]).unwrap_err();
     assert!(matches!(
         error,
-        PnlError::MalformedPayload {
+        PnlError::InvalidLedgerRow {
+            table: "pnl_offchain_fill",
             rowid: 1,
-            reason: "non-positive OffChainOrderFilled shares_filled",
-            ..
+            reason: "non-positive offchain fill shares",
         }
     ));
 
@@ -501,24 +468,23 @@ fn non_positive_offchain_fill_values_fail_the_report() {
     let error = report_result(vec![negative_price]).unwrap_err();
     assert!(matches!(
         error,
-        PnlError::MalformedPayload {
+        PnlError::InvalidLedgerRow {
+            table: "pnl_offchain_fill",
             rowid: 2,
-            reason: "non-positive OffChainOrderFilled price",
-            ..
+            reason: "non-positive offchain fill price",
         }
     ));
 }
 
 #[test]
 fn invalid_replay_timestamps_fail_the_report() {
-    let mut row = onchain_sell(1, "10", "2026-05-15T14:00:00Z");
-    row.payload["OnChainOrderFilled"]["block_timestamp"] = serde_json::json!("not-a-timestamp");
+    let row = onchain_sell(1, "10", "not-a-timestamp");
 
     let error = report_result(vec![row]).unwrap_err();
 
     assert!(matches!(
         error,
-        PnlError::MalformedPayload {
+        PnlError::InvalidLedgerRow {
             rowid: 1,
             reason: "invalid replay timestamp",
             ..
@@ -533,96 +499,124 @@ fn position_row(symbol: &str, net_position: &str) -> PositionViewRow {
     }
 }
 
-fn cost_event(
+fn tokenization_fee(
     rowid: i64,
-    aggregate_type: &str,
     aggregate_id: &str,
-    event_type: &str,
-    payload: Value,
-) -> CostEventRow {
-    CostEventRow {
-        rowid,
-        aggregate_type: aggregate_type.to_owned(),
+    fees: Option<&str>,
+    timestamp: &str,
+) -> CostLedgerRow {
+    CostLedgerRow {
+        event_rowid: rowid,
+        source: CostSource::TokenizationFee,
         aggregate_id: aggregate_id.to_owned(),
-        event_type: event_type.to_owned(),
-        payload,
+        symbol: Some("RKLB".to_owned()),
+        amount_usd: fees.map(str::to_owned),
+        occurred_at: timestamp.to_owned(),
     }
 }
 
-fn tokenized_mint_requested(rowid: i64, aggregate_id: &str, symbol: &str) -> CostEventRow {
-    cost_event(
-        rowid,
-        "TokenizedEquityMint",
-        aggregate_id,
-        "TokenizedEquityMintEvent::MintRequested",
-        serde_json::json!({
-            "MintRequested": {
-                "symbol": symbol
-            }
-        }),
-    )
+fn cctp_fee(rowid: i64, aggregate_id: &str, fee: &str, timestamp: &str) -> CostLedgerRow {
+    CostLedgerRow {
+        event_rowid: rowid,
+        source: CostSource::CctpFee,
+        aggregate_id: aggregate_id.to_owned(),
+        symbol: None,
+        amount_usd: Some(fee.to_owned()),
+        occurred_at: timestamp.to_owned(),
+    }
 }
 
-fn tokenized_tokens_received(
-    rowid: i64,
-    aggregate_id: &str,
-    fees: &str,
+fn exec_direction(direction: Direction) -> st0x_execution::Direction {
+    match direction {
+        Direction::Buy => st0x_execution::Direction::Buy,
+        Direction::Sell => st0x_execution::Direction::Sell,
+    }
+}
+
+fn onchain_fill_event(
+    direction: Direction,
+    price: &str,
+    shares: &str,
     timestamp: &str,
-) -> CostEventRow {
-    cost_event(
-        rowid,
-        "TokenizedEquityMint",
-        aggregate_id,
-        "TokenizedEquityMintEvent::TokensReceived",
-        serde_json::json!({
-            "TokensReceived": {
-                "received_at": timestamp,
-                "fees": fees
-            }
-        }),
-    )
+) -> PositionEvent {
+    PositionEvent::OnChainOrderFilled {
+        trade_id: TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 0,
+        },
+        amount: FractionalShares::new(Float::parse(shares.to_owned()).unwrap()),
+        direction: exec_direction(direction),
+        price_usdc: Float::parse(price.to_owned()).unwrap(),
+        block_timestamp: parse_timestamp(timestamp).unwrap(),
+        block_number: None,
+        seen_at: parse_timestamp(timestamp).unwrap(),
+    }
 }
 
-fn tokenized_provider_completion_recovered(
-    rowid: i64,
-    aggregate_id: &str,
-    fees: &str,
+fn offchain_fill_event(
+    direction: Direction,
+    price: &str,
+    shares: &str,
     timestamp: &str,
-) -> CostEventRow {
-    cost_event(
-        rowid,
-        "TokenizedEquityMint",
-        aggregate_id,
-        "TokenizedEquityMintEvent::ProviderCompletionRecovered",
-        serde_json::json!({
-            "ProviderCompletionRecovered": {
-                "recovered_at": timestamp,
-                "fees": fees
-            }
-        }),
-    )
+) -> PositionEvent {
+    PositionEvent::OffChainOrderFilled {
+        offchain_order_id: OffchainOrderId::new(),
+        shares_filled: Positive::new(FractionalShares::new(
+            Float::parse(shares.to_owned()).unwrap(),
+        ))
+        .unwrap(),
+        direction: exec_direction(direction),
+        executor_order_id: ExecutorOrderId::new("broker-1"),
+        price: Usd::new(Float::parse(price.to_owned()).unwrap()),
+        broker_timestamp: parse_timestamp(timestamp).unwrap(),
+    }
 }
 
-fn usdc_bridged(rowid: i64, aggregate_id: &str, fee: &str, timestamp: &str) -> CostEventRow {
-    cost_event(
-        rowid,
-        "UsdcRebalance",
-        aggregate_id,
-        "UsdcRebalanceEvent::Bridged",
-        serde_json::json!({
-            "Bridged": {
-                "minted_at": timestamp,
-                "fee_collected": fee
-            }
-        }),
-    )
+fn manual_adjustment_event(
+    target_net: &str,
+    price_usdc: Option<&str>,
+    timestamp: &str,
+) -> PositionEvent {
+    PositionEvent::ManualPositionAdjusted {
+        previous_net: FractionalShares::new(float!(0)),
+        target_net: FractionalShares::new(Float::parse(target_net.to_owned()).unwrap()),
+        reason: "test repair".to_owned(),
+        price_usdc: price_usdc.map(|price| Float::parse(price.to_owned()).unwrap()),
+        adjusted_at: parse_timestamp(timestamp).unwrap(),
+    }
 }
 
-fn bot_gas_recorded(rowid: i64) -> CostEventRow {
-    let tx_hash = TxHash::repeat_byte(0xab);
-    let cost = BotGasReceiptCost {
+fn mint_requested_event(symbol: &str, timestamp: &str) -> TokenizedEquityMintEvent {
+    TokenizedEquityMintEvent::MintRequested {
+        symbol: Symbol::new(symbol).unwrap(),
+        quantity: float!(1),
+        wallet: Address::repeat_byte(0x22),
+        requested_at: parse_timestamp(timestamp).unwrap(),
+    }
+}
+
+fn tokens_received_event(fees: Option<&str>, timestamp: &str) -> TokenizedEquityMintEvent {
+    TokenizedEquityMintEvent::TokensReceived {
+        tx_hash: TxHash::random(),
+        shares_minted: U256::from(1_000_000_000_000_000_000_u128),
+        fees: fees.map(|fee| Float::parse(fee.to_owned()).unwrap()),
+        received_at: parse_timestamp(timestamp).unwrap(),
+    }
+}
+
+fn bridged_event(fee: &str, timestamp: &str) -> UsdcRebalanceEvent {
+    UsdcRebalanceEvent::Bridged {
+        mint_tx_hash: TxHash::random(),
+        amount_received: Usdc::new(float!(998.5)),
+        fee_collected: Usdc::new(Float::parse(fee.to_owned()).unwrap()),
+        minted_at: parse_timestamp(timestamp).unwrap(),
+    }
+}
+
+fn bot_gas_cost(usd_cost: Float) -> BotGasReceiptCost {
+    BotGasReceiptCost {
         chain: BotGasChain::Base,
-        tx_hash,
+        tx_hash: TxHash::repeat_byte(0xab),
         receipt_from: Address::repeat_byte(0x11),
         gas_used: 21_000,
         effective_gas_price_wei: 1_000_000_000,
@@ -631,18 +625,27 @@ fn bot_gas_recorded(rowid: i64) -> CostEventRow {
         eth_usd_price_source: "eth_usd_valuation_feed".to_owned(),
         eth_usd_price_at: Utc.with_ymd_and_hms(2026, 5, 15, 14, 0, 0).unwrap(),
         eth_usd_price_block_number: Some(123),
-        usd_cost: Usd::new(float!(0.042)),
+        usd_cost: Usd::new(usd_cost),
         operation_category: BotGasOperationCategory::VaultDeposit,
         symbol: Some(Symbol::new("RKLB").unwrap()),
         occurred_at: Utc.with_ymd_and_hms(2026, 5, 15, 14, 0, 1).unwrap(),
-    };
+    }
+}
 
-    cost_event(
-        rowid,
-        "BotGasReceiptCost",
-        &format!("base:{tx_hash}"),
-        "BotGasReceiptCostEvent::Recorded",
-        serde_json::to_value(BotGasReceiptCostEvent::Recorded { cost }).unwrap(),
+/// One event to seed into the real `events` table for pool-backed tests.
+/// Rowids are assigned by SQLite in insertion order, so seed order is the
+/// rowid order the ledger ingests and watermarks by.
+enum SeedEvent {
+    Position(&'static str, PositionEvent),
+    Mint(String, TokenizedEquityMintEvent),
+    Rebalance(String, UsdcRebalanceEvent),
+    BotGas(String, BotGasReceiptCostEvent),
+}
+
+fn seed_bot_gas(cost: BotGasReceiptCost) -> SeedEvent {
+    SeedEvent::BotGas(
+        format!("base:{}", cost.tx_hash),
+        BotGasReceiptCostEvent::Recorded { cost },
     )
 }
 
@@ -688,12 +691,12 @@ fn date_only_account_activity(
 }
 
 fn report_with(
-    events: Vec<PositionEventRow>,
-    position_rows: Vec<PositionViewRow>,
-    cost_rows: Vec<CostEventRow>,
-    alpaca_activities: Vec<AccountActivity>,
-    query: PnlQuery,
-    symbols: BTreeSet<String>,
+    events: Vec<PositionLedgerRow>,
+    position_rows: &[PositionViewRow],
+    cost_rows: &[CostLedgerRow],
+    alpaca_activities: &[AccountActivity],
+    query: &PnlQuery,
+    symbols: &BTreeSet<String>,
 ) -> PnlResponse {
     report_with_result(
         events,
@@ -707,50 +710,23 @@ fn report_with(
 }
 
 fn report_with_result(
-    events: Vec<PositionEventRow>,
-    position_rows: Vec<PositionViewRow>,
-    cost_rows: Vec<CostEventRow>,
-    alpaca_activities: Vec<AccountActivity>,
-    query: PnlQuery,
-    symbols: BTreeSet<String>,
+    events: Vec<PositionLedgerRow>,
+    position_rows: &[PositionViewRow],
+    cost_rows: &[CostLedgerRow],
+    alpaca_activities: &[AccountActivity],
+    query: &PnlQuery,
+    symbols: &BTreeSet<String>,
 ) -> Result<PnlResponse, PnlError> {
-    struct ReportInput {
-        events: Vec<PositionEventRow>,
-        position_rows: Vec<PositionViewRow>,
-        cost_rows: Vec<CostEventRow>,
-        bot_gas_rows: Vec<BotGasCostRow>,
-        alpaca_activities: Vec<AccountActivity>,
-        query: PnlQuery,
-        symbols: BTreeSet<String>,
-    }
-
-    let input = ReportInput {
-        events,
-        position_rows,
-        cost_rows,
-        bot_gas_rows: Vec::new(),
-        alpaca_activities,
-        query,
-        symbols,
-    };
-    let ReportInput {
-        events,
-        position_rows,
-        cost_rows,
-        bot_gas_rows,
-        alpaca_activities,
-        query,
-        symbols,
-    } = input;
+    let bot_gas_rows: Vec<BotGasCostRow> = Vec::new();
 
     build_pnl_response_from_rows(
         events,
-        &position_rows,
-        &cost_rows,
+        position_rows,
+        cost_rows,
         &bot_gas_rows,
-        &alpaca_activities,
-        &query,
-        &symbols,
+        alpaca_activities,
+        query,
+        symbols,
         vec![
             ATTRIBUTION_WARNING.to_owned(),
             BASELINE_WARNING.to_owned(),
@@ -760,90 +736,43 @@ fn report_with_result(
     .map(|(response, _daily_net_realized_pnl_usd)| response)
 }
 
-async fn pnl_test_pool(
-    events: Vec<PositionEventRow>,
-    positions: Vec<PositionViewRow>,
-) -> SqlitePool {
-    pnl_test_pool_with_costs(events, positions, Vec::new()).await
-}
+/// Seeds a fully migrated database with real typed events (which the ledger
+/// ingests on `build_pnl_report`'s catch-up) and `position_view` rows.
+async fn pnl_test_pool(seed: Vec<SeedEvent>, positions: Vec<PositionViewRow>) -> SqlitePool {
+    let pool = setup_test_db().await;
+    let mut sequences: HashMap<String, i64> = HashMap::new();
+    let mut next_sequence = |aggregate_id: &str| {
+        let sequence = sequences.entry(aggregate_id.to_owned()).or_insert(0);
+        *sequence += 1;
+        *sequence
+    };
 
-async fn pnl_test_pool_with_costs(
-    events: Vec<PositionEventRow>,
-    positions: Vec<PositionViewRow>,
-    cost_rows: Vec<CostEventRow>,
-) -> SqlitePool {
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-
-    sqlx::query(
-        "CREATE TABLE events ( \
-           aggregate_type TEXT NOT NULL, \
-           aggregate_id TEXT NOT NULL, \
-           event_type TEXT NOT NULL, \
-           payload TEXT NOT NULL \
-         )",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query("CREATE TABLE position_view (symbol TEXT, net_position TEXT)")
-        .execute(&pool)
-        .await
-        .unwrap();
-    // Empty by default: build_pnl_report's capital computation reads this
-    // table unconditionally, so it must exist even when a test doesn't
-    // seed any snapshot rows (capital is then omitted with a warning).
-    sqlx::query(
-        "CREATE TABLE portfolio_snapshot ( \
-           et_day TEXT NOT NULL, \
-           captured_at TEXT NOT NULL, \
-           location TEXT NOT NULL, \
-           asset TEXT NOT NULL, \
-           available_balance TEXT NOT NULL, \
-           inflight_balance TEXT NOT NULL, \
-           usd_mark TEXT, \
-           mark_captured_at TEXT, \
-           PRIMARY KEY (et_day, location, asset) \
-         )",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    for row in events {
-        sqlx::query(
-            "INSERT INTO events (aggregate_type, aggregate_id, event_type, payload) \
-             VALUES ('Position', ?, ?, ?)",
-        )
-        .bind(row.symbol)
-        .bind(row.event_type)
-        .bind(row.payload.to_string())
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-
-    for row in cost_rows {
-        sqlx::query(
-            "INSERT INTO events (aggregate_type, aggregate_id, event_type, payload) \
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(row.aggregate_type)
-        .bind(row.aggregate_id)
-        .bind(row.event_type)
-        .bind(row.payload.to_string())
-        .execute(&pool)
-        .await
-        .unwrap();
+    for event in seed {
+        match event {
+            SeedEvent::Position(symbol, event) => {
+                persist_event::<Position>(&pool, symbol, next_sequence(symbol), &event).await;
+            }
+            SeedEvent::Mint(id, event) => {
+                persist_event::<TokenizedEquityMint>(&pool, &id, next_sequence(&id), &event).await;
+            }
+            SeedEvent::Rebalance(id, event) => {
+                persist_event::<UsdcRebalance>(&pool, &id, next_sequence(&id), &event).await;
+            }
+            SeedEvent::BotGas(id, event) => {
+                persist_event::<BotGasReceiptCost>(&pool, &id, next_sequence(&id), &event).await;
+            }
+        }
     }
 
     for row in positions {
-        sqlx::query("INSERT INTO position_view (symbol, net_position) VALUES (?, ?)")
-            .bind(row.symbol)
-            .bind(row.net_position)
+        // symbol/net_position are STORED generated columns over the Lifecycle
+        // payload, so seeding goes through the payload JSON.
+        sqlx::query("INSERT INTO position_view (view_id, version, payload) VALUES (?1, 1, ?2)")
+            .bind(row.symbol.clone())
+            .bind(
+                serde_json::json!({"Live": {"symbol": row.symbol, "net": row.net_position}})
+                    .to_string(),
+            )
             .execute(&pool)
             .await
             .unwrap();
@@ -852,7 +781,7 @@ async fn pnl_test_pool_with_costs(
     pool
 }
 
-fn report_result(events: Vec<PositionEventRow>) -> Result<PnlResponse, PnlError> {
+fn report_result(events: Vec<PositionLedgerRow>) -> Result<PnlResponse, PnlError> {
     build_pnl_response_from_rows(
         events,
         &position_rows(),
@@ -870,14 +799,14 @@ fn report_result(events: Vec<PositionEventRow>) -> Result<PnlResponse, PnlError>
     .map(|(response, _daily_net_realized_pnl_usd)| response)
 }
 
-fn report(events: Vec<PositionEventRow>) -> PnlResponse {
+fn report(events: Vec<PositionLedgerRow>) -> PnlResponse {
     report_with(
         events,
-        position_rows(),
-        Vec::new(),
-        Vec::new(),
-        query(),
-        BTreeSet::new(),
+        &position_rows(),
+        &[],
+        &[],
+        &query(),
+        &BTreeSet::new(),
     )
 }
 
@@ -1051,8 +980,7 @@ fn manual_position_adjustment_resets_open_lots_before_later_fills() {
 
 #[test]
 fn zero_manual_position_adjustment_allows_null_price() {
-    let mut row = manual_adjustment(1, "0", None, "2026-05-15T13:30:00Z");
-    row.payload["ManualPositionAdjusted"]["price_usdc"] = serde_json::Value::Null;
+    let row = manual_adjustment(1, "0", None, "2026-05-15T13:30:00Z");
 
     let report = report(vec![row]);
 
@@ -1081,25 +1009,23 @@ fn manual_position_adjustment_seeds_priced_target_exposure() {
 
 #[test]
 fn nonzero_manual_position_adjustment_rejects_null_price() {
-    let mut row = manual_adjustment(1, "-1", None, "2026-05-15T13:30:00Z");
-    row.payload["ManualPositionAdjusted"]["price_usdc"] = serde_json::Value::Null;
+    let row = manual_adjustment(1, "-1", None, "2026-05-15T13:30:00Z");
 
     let error = report_result(vec![row]).unwrap_err();
 
     assert!(matches!(
         error,
-        PnlError::MalformedPayload {
+        PnlError::InvalidLedgerRow {
+            table: "pnl_manual_adjustment",
             rowid: 1,
-            reason: "nonzero ManualPositionAdjusted missing price_usdc and no prior replay price",
-            ..
+            reason: "nonzero manual adjustment missing price_usd and no prior replay price",
         }
     ));
 }
 
 #[test]
-fn wrong_typed_manual_adjustment_decimals_fail_the_report() {
-    let mut row = manual_adjustment(1, "0", None, "2026-05-15T13:30:00Z");
-    row.payload["ManualPositionAdjusted"]["target_net"] = serde_json::json!({});
+fn corrupt_manual_adjustment_decimals_fail_the_report() {
+    let row = manual_adjustment(1, "not-a-decimal", None, "2026-05-15T13:30:00Z");
 
     let error = report_result(vec![row]).unwrap_err();
 
@@ -1117,9 +1043,18 @@ fn wrong_typed_manual_adjustment_decimals_fail_the_report() {
 async fn source_loader_includes_manual_position_adjustments() {
     let pool = pnl_test_pool(
         vec![
-            onchain_sell(1, "10", "2026-05-15T13:00:00Z"),
-            manual_adjustment(2, "0", None, "2026-05-15T13:30:00Z"),
-            offchain_buy(3, "2026-05-15T14:00:00Z", "8", "1"),
+            SeedEvent::Position(
+                "RKLB",
+                onchain_fill_event(Direction::Sell, "10", "1", "2026-05-15T13:00:00Z"),
+            ),
+            SeedEvent::Position(
+                "RKLB",
+                manual_adjustment_event("0", None, "2026-05-15T13:30:00Z"),
+            ),
+            SeedEvent::Position(
+                "RKLB",
+                offchain_fill_event(Direction::Buy, "8", "1", "2026-05-15T14:00:00Z"),
+            ),
         ],
         vec![position_row("RKLB", "1")],
     )
@@ -1136,11 +1071,13 @@ async fn source_loader_includes_manual_position_adjustments() {
 }
 
 #[tokio::test]
-async fn source_loader_rejects_malformed_persisted_payload_text() {
+async fn ledger_ingestion_rejects_malformed_persisted_payload_text() {
     let pool = pnl_test_pool(Vec::new(), position_rows()).await;
     sqlx::query(
-        "INSERT INTO events (aggregate_type, aggregate_id, event_type, payload) \
-         VALUES ('Position', 'RKLB', 'PositionEvent::OnChainOrderFilled', '{not-json')",
+        "INSERT INTO events (aggregate_type, aggregate_id, sequence, \
+         event_type, event_version, payload, metadata) \
+         VALUES ('Position', 'RKLB', 1, 'PositionEvent::OnChainOrderFilled', '1.0', \
+         '{not-json', '{}')",
     )
     .execute(&pool)
     .await
@@ -1150,26 +1087,48 @@ async fn source_loader_rejects_malformed_persisted_payload_text() {
         .await
         .unwrap_err();
 
-    assert!(matches!(
-        error,
-        PnlError::InvalidPayload {
-            rowid: 1,
-            ref aggregate_type,
-            ref event_type,
-            ..
-        } if aggregate_type == "Position" && event_type == "PositionEvent::OnChainOrderFilled"
-    ));
+    assert!(matches!(error, PnlError::Ledger(PnlLedgerError::Stream(_))));
+}
+
+/// A structurally valid payload missing required event fields fails at
+/// ingestion (typed deserialization), the layer that replaced the old
+/// per-field payload parsing in the report path.
+#[tokio::test]
+async fn ledger_ingestion_rejects_incomplete_event_payload() {
+    let pool = pnl_test_pool(Vec::new(), position_rows()).await;
+    sqlx::query(
+        "INSERT INTO events (aggregate_type, aggregate_id, sequence, \
+         event_type, event_version, payload, metadata) \
+         VALUES ('Position', 'RKLB', 1, 'PositionEvent::OnChainOrderFilled', '1.0', \
+         '{\"OnChainOrderFilled\":{}}', '{}')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let error = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, PnlError::Ledger(PnlLedgerError::Stream(_))));
 }
 
 #[tokio::test]
 async fn source_loader_includes_persisted_cost_events() {
-    let pool = pnl_test_pool_with_costs(
-        Vec::new(),
-        position_rows(),
+    let mint_id = Uuid::new_v4().to_string();
+    let pool = pnl_test_pool(
         vec![
-            tokenized_mint_requested(10, "mint-1", "RKLB"),
-            tokenized_tokens_received(11, "mint-1", "0.25", "2026-05-15T12:02:00Z"),
+            SeedEvent::Mint(
+                mint_id.clone(),
+                mint_requested_event("RKLB", "2026-05-15T12:00:00Z"),
+            ),
+            SeedEvent::Mint(
+                mint_id,
+                tokens_received_event(Some("0.25"), "2026-05-15T12:02:00Z"),
+            ),
+            seed_rebalance("0.10", "2026-05-15T12:03:00Z"),
         ],
+        position_rows(),
     )
     .await;
 
@@ -1177,21 +1136,33 @@ async fn source_loader_includes_persisted_cost_events() {
         .await
         .unwrap();
 
-    assert_eq!(report.summary.tracked_costs_usd, "0.25");
+    assert_eq!(report.summary.tracked_costs_usd, "0.35");
     assert_eq!(report.costs.tokenization_fees_usd, "0.25");
-    assert_eq!(report.cost_entries.len(), 1);
-    assert_eq!(report.cost_entries[0].aggregate_type, "TokenizedEquityMint");
+    assert_eq!(report.costs.cctp_fees_usd, "0.1");
+    assert_eq!(report.cost_entries.len(), 2);
+    assert_eq!(report.cost_entries[0].aggregate_type, "UsdcRebalance");
+    assert_eq!(report.cost_entries[1].aggregate_type, "TokenizedEquityMint");
+    assert_eq!(
+        report.cost_entries[1].symbol.as_ref().map(Symbol::as_str),
+        Some("RKLB")
+    );
 }
 
 #[tokio::test]
 async fn source_loader_includes_persisted_bot_gas_costs() {
-    let pool = pnl_test_pool_with_costs(
+    let pool = pnl_test_pool(
         vec![
-            onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
-            offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
+            SeedEvent::Position(
+                "RKLB",
+                onchain_fill_event(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
+            ),
+            SeedEvent::Position(
+                "RKLB",
+                offchain_fill_event(Direction::Buy, "8", "1", "2026-05-15T14:01:00Z"),
+            ),
+            seed_bot_gas(bot_gas_cost(float!(0.042))),
         ],
         position_rows(),
-        vec![bot_gas_recorded(3)],
     )
     .await;
 
@@ -1214,13 +1185,19 @@ async fn source_loader_includes_persisted_bot_gas_costs() {
 
 #[tokio::test]
 async fn source_loader_excludes_bot_gas_recorded_after_snapshot() {
-    let pool = pnl_test_pool_with_costs(
+    let pool = pnl_test_pool(
         vec![
-            onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
-            offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
+            SeedEvent::Position(
+                "RKLB",
+                onchain_fill_event(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
+            ),
+            SeedEvent::Position(
+                "RKLB",
+                offchain_fill_event(Direction::Buy, "8", "1", "2026-05-15T14:01:00Z"),
+            ),
+            seed_bot_gas(bot_gas_cost(float!(0.042))),
         ],
         position_rows(),
-        vec![bot_gas_recorded(3)],
     )
     .await;
 
@@ -1243,11 +1220,9 @@ async fn source_loader_excludes_bot_gas_recorded_after_snapshot() {
 }
 
 #[tokio::test]
-async fn source_loader_rejects_non_positive_persisted_bot_gas_cost() {
-    for usd_cost in ["0", "-0.042"] {
-        let mut bot_gas = bot_gas_recorded(1);
-        bot_gas.payload["Recorded"]["cost"]["usd_cost"] = serde_json::json!(usd_cost);
-        let pool = pnl_test_pool_with_costs(Vec::new(), position_rows(), vec![bot_gas]).await;
+async fn ledger_ingestion_rejects_non_positive_persisted_bot_gas_cost() {
+    for usd_cost in [float!(0), float!(-0.042)] {
+        let pool = pnl_test_pool(vec![seed_bot_gas(bot_gas_cost(usd_cost))], position_rows()).await;
 
         let error = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
             .await
@@ -1256,30 +1231,46 @@ async fn source_loader_rejects_non_positive_persisted_bot_gas_cost() {
         assert!(
             matches!(
                 error,
-                PnlError::InvalidBotGasReceiptCost {
-                    source: crate::bot_gas::BotGasReceiptCostError::NonPositiveUsdCost,
-                    ..
-                }
+                PnlError::Ledger(PnlLedgerError::InvalidBotGasCost(
+                    BotGasReceiptCostError::NonPositiveUsdCost
+                ))
             ),
-            "unexpected result for persisted USD cost {usd_cost}"
+            "unexpected result for persisted USD cost {usd_cost:?}"
         );
     }
 }
 
 #[tokio::test]
 async fn source_loader_respects_as_of_rowid_for_position_and_cost_events() {
-    let pool = pnl_test_pool_with_costs(
+    let mint_id = Uuid::new_v4().to_string();
+    let pool = pnl_test_pool(
         vec![
-            onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
-            offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
-            onchain_sell(3, "20", "2026-05-15T15:00:00Z"),
-            offchain_buy(4, "2026-05-15T15:01:00Z", "17", "1"),
+            SeedEvent::Position(
+                "RKLB",
+                onchain_fill_event(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
+            ),
+            SeedEvent::Position(
+                "RKLB",
+                offchain_fill_event(Direction::Buy, "8", "1", "2026-05-15T14:01:00Z"),
+            ),
+            SeedEvent::Position(
+                "RKLB",
+                onchain_fill_event(Direction::Sell, "20", "1", "2026-05-15T15:00:00Z"),
+            ),
+            SeedEvent::Position(
+                "RKLB",
+                offchain_fill_event(Direction::Buy, "17", "1", "2026-05-15T15:01:00Z"),
+            ),
+            SeedEvent::Mint(
+                mint_id.clone(),
+                mint_requested_event("RKLB", "2026-05-15T12:00:00Z"),
+            ),
+            SeedEvent::Mint(
+                mint_id,
+                tokens_received_event(Some("0.25"), "2026-05-15T12:02:00Z"),
+            ),
         ],
         position_rows(),
-        vec![
-            tokenized_mint_requested(10, "mint-1", "RKLB"),
-            tokenized_tokens_received(11, "mint-1", "0.25", "2026-05-15T12:02:00Z"),
-        ],
     )
     .await;
 
@@ -1305,7 +1296,10 @@ async fn source_loader_respects_as_of_rowid_for_position_and_cost_events() {
 #[tokio::test]
 async fn source_loader_rejects_future_as_of_rowid() {
     let pool = pnl_test_pool(
-        vec![onchain_sell(1, "10", "2026-05-15T14:00:00Z")],
+        vec![SeedEvent::Position(
+            "RKLB",
+            onchain_fill_event(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
+        )],
         position_rows(),
     )
     .await;
@@ -1325,22 +1319,15 @@ async fn source_loader_rejects_future_as_of_rowid() {
     assert!(matches!(error, PnlError::InvalidSnapshotRowid { value: 2 }));
 }
 
-#[tokio::test]
-async fn snapshot_preflight_rejects_future_as_of_rowid() {
-    let pool = pnl_test_pool(
-        vec![onchain_sell(1, "10", "2026-05-15T14:00:00Z")],
-        position_rows(),
-    )
-    .await;
-
+#[test]
+fn snapshot_preflight_rejects_future_as_of_rowid() {
     let error = validate_pnl_snapshot_rowid(
-        &pool,
+        LedgerHead(1),
         &PnlQuery {
             as_of_rowid: Some(2),
             ..query()
         },
     )
-    .await
     .unwrap_err();
 
     assert!(matches!(error, PnlError::InvalidSnapshotRowid { value: 2 }));
@@ -1382,15 +1369,15 @@ fn paginates_entries_without_changing_filtered_summary() {
             onchain_sell(3, "20", "2026-05-15T15:00:00Z"),
             offchain_buy(4, "2026-05-15T15:01:00Z", "17", "1"),
         ],
-        position_rows(),
-        Vec::new(),
-        Vec::new(),
-        PnlQuery {
+        &position_rows(),
+        &[],
+        &[],
+        &PnlQuery {
             limit: Some(1),
             offset: Some(0),
             ..query()
         },
-        BTreeSet::new(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.total, 2);
@@ -1408,14 +1395,14 @@ fn counter_trading_filter_keeps_rth_closes_only() {
             onchain_sell(3, "20", "2026-05-15T13:59:00Z"),
             offchain_buy(4, "2026-05-15T14:00:00Z", "17", "1"),
         ],
-        position_rows(),
-        Vec::new(),
-        Vec::new(),
-        PnlQuery {
+        &position_rows(),
+        &[],
+        &[],
+        &PnlQuery {
             counter_trading_filter: Some(PnlCounterTradingFilter::CounterTradingActive),
             ..query()
         },
-        BTreeSet::new(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.total_pnl_usd, "3");
@@ -1433,14 +1420,14 @@ fn counter_trading_filter_keeps_inactive_closes_only() {
             onchain_sell(3, "20", "2026-05-15T14:00:00Z"),
             offchain_buy(4, "2026-05-15T14:01:00Z", "17", "1"),
         ],
-        position_rows(),
-        Vec::new(),
-        Vec::new(),
-        PnlQuery {
+        &position_rows(),
+        &[],
+        &[],
+        &PnlQuery {
             counter_trading_filter: Some(PnlCounterTradingFilter::CounterTradingInactive),
             ..query()
         },
-        BTreeSet::new(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.total_pnl_usd, "2");
@@ -1461,14 +1448,14 @@ fn market_session_filter_is_independent_from_counter_trading_filter() {
             onchain_sell(3, "20", "2026-05-15T14:00:00Z"),
             offchain_buy(4, "2026-05-15T14:01:00Z", "17", "1"),
         ],
-        position_rows(),
-        Vec::new(),
-        Vec::new(),
-        PnlQuery {
+        &position_rows(),
+        &[],
+        &[],
+        &PnlQuery {
             market_session_filter: Some(PnlMarketSessionFilter::Rth),
             ..query()
         },
-        BTreeSet::new(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.total_pnl_usd, "3");
@@ -1510,14 +1497,14 @@ fn available_range_ignores_selected_date_and_session_filters() {
             onchain_sell(2, "11", "2026-05-15T14:00:00Z"),
             offchain_buy(3, "2026-05-16T14:00:00Z", "9", "1"),
         ],
-        position_rows(),
-        Vec::new(),
-        Vec::new(),
-        PnlQuery {
+        &position_rows(),
+        &[],
+        &[],
+        &PnlQuery {
             market_session_filter: Some(PnlMarketSessionFilter::Rth),
             ..query()
         },
-        BTreeSet::new(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(
@@ -1551,14 +1538,14 @@ fn filters_sample_stats_by_selected_market_session() {
             onchain_sell(3, "20", "2026-05-15T14:00:00Z"),
             offchain_buy(4, "2026-05-15T14:01:00Z", "17", "1"),
         ],
-        position_rows(),
-        Vec::new(),
-        Vec::new(),
-        PnlQuery {
+        &position_rows(),
+        &[],
+        &[],
+        &PnlQuery {
             market_session_filter: Some(PnlMarketSessionFilter::Pre),
             ..query()
         },
-        BTreeSet::new(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(
@@ -1581,17 +1568,17 @@ fn deducts_account_level_alpaca_fees_from_aggregate_only() {
             onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
             offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
         ],
-        position_rows(),
-        Vec::new(),
-        vec![account_activity(
+        &position_rows(),
+        &[],
+        &[account_activity(
             "fee-1",
             "FEE",
             "-0.25",
             None,
             "2026-05-15T14:02:00Z",
         )],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.gross_realized_pnl_usd, "2");
@@ -1610,34 +1597,38 @@ fn tracked_costs_follow_counter_trading_session_filter() {
             onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
             offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
         ],
-        position_rows(),
-        vec![
-            tokenized_mint_requested(10, "mint-1", "RKLB"),
-            tokenized_tokens_received(11, "mint-1", "0.25", "2026-05-15T12:02:00Z"),
-        ],
-        Vec::new(),
-        PnlQuery {
+        &position_rows(),
+        &[tokenization_fee(
+            11,
+            "mint-1",
+            Some("0.25"),
+            "2026-05-15T12:02:00Z",
+        )],
+        &[],
+        &PnlQuery {
             counter_trading_filter: Some(PnlCounterTradingFilter::CounterTradingActive),
             ..query()
         },
-        BTreeSet::new(),
+        &BTreeSet::new(),
     );
     let inactive_report = report_with(
         vec![
             onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
             offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
         ],
-        position_rows(),
-        vec![
-            tokenized_mint_requested(10, "mint-1", "RKLB"),
-            tokenized_tokens_received(11, "mint-1", "0.25", "2026-05-15T12:02:00Z"),
-        ],
-        Vec::new(),
-        PnlQuery {
+        &position_rows(),
+        &[tokenization_fee(
+            11,
+            "mint-1",
+            Some("0.25"),
+            "2026-05-15T12:02:00Z",
+        )],
+        &[],
+        &PnlQuery {
             counter_trading_filter: Some(PnlCounterTradingFilter::CounterTradingInactive),
             ..query()
         },
-        BTreeSet::new(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(active_report.summary.gross_realized_pnl_usd, "2");
@@ -1652,17 +1643,16 @@ fn tracked_costs_follow_counter_trading_session_filter() {
 }
 
 #[test]
-fn wrong_typed_tokenization_fee_decimals_fail_the_report() {
-    let mut cost = tokenized_tokens_received(11, "mint-1", "0.25", "2026-05-15T12:02:00Z");
-    cost.payload["TokensReceived"]["fees"] = serde_json::json!([]);
+fn corrupt_tokenization_fee_decimals_fail_the_report() {
+    let cost = tokenization_fee(11, "mint-1", Some("not-a-decimal"), "2026-05-15T12:02:00Z");
 
     let error = report_with_result(
         Vec::new(),
-        position_rows(),
-        vec![tokenized_mint_requested(10, "mint-1", "RKLB"), cost],
-        Vec::new(),
-        query(),
-        BTreeSet::new(),
+        &position_rows(),
+        &[cost],
+        &[],
+        &query(),
+        &BTreeSet::new(),
     )
     .unwrap_err();
 
@@ -1670,29 +1660,28 @@ fn wrong_typed_tokenization_fee_decimals_fail_the_report() {
         error,
         PnlError::InvalidFinancialField {
             rowid: 11,
-            field: "fees",
+            field: "amount_usd",
             ..
         }
     ));
 }
 
 /// `TokensReceived.fees` is `Option<Float>` in the event schema ("if
-/// reported"), so persisted events legitimately carry `fees: null`. The
+/// reported"), so the ledger persists a NULL `amount_usd` for that case. The
 /// report must treat that as a missing cost observation -- skipping the
 /// entry and counting it -- not fail wholesale, which blanks /pnl for as
-/// long as the event exists.
+/// long as the row exists.
 #[test]
 fn null_tokenization_fees_are_missing_observations_not_fatal() {
-    let mut cost = tokenized_tokens_received(11, "mint-1", "0.25", "2026-05-15T12:02:00Z");
-    cost.payload["TokensReceived"]["fees"] = serde_json::json!(null);
+    let cost = tokenization_fee(11, "mint-1", None, "2026-05-15T12:02:00Z");
 
     let report = report_with_result(
         Vec::new(),
-        position_rows(),
-        vec![tokenized_mint_requested(10, "mint-1", "RKLB"), cost],
-        Vec::new(),
-        query(),
-        BTreeSet::new(),
+        &position_rows(),
+        &[cost],
+        &[],
+        &query(),
+        &BTreeSet::new(),
     )
     .unwrap();
 
@@ -1701,75 +1690,40 @@ fn null_tokenization_fees_are_missing_observations_not_fatal() {
     assert_eq!(report.costs.missing_cost_observation_count, 1);
 }
 
-/// Events persisted before the `fees` field existed deserialize through
-/// `#[serde(default)]` in the aggregate, so an absent key is the same
-/// "not reported" case as an explicit null.
+/// Multiple fee-bearing events of one mint aggregate each produce a ledger
+/// row; when none reports fees, the mint still counts as exactly one missing
+/// observation.
 #[test]
-fn absent_tokenization_fees_are_missing_observations_not_fatal() {
-    let mut missing_fees = tokenized_tokens_received(11, "mint-1", "0.25", "2026-05-15T12:02:00Z");
-    missing_fees.payload["TokensReceived"]
-        .as_object_mut()
-        .unwrap()
-        .remove("fees");
-
+fn repeated_missing_tokenization_fees_count_once_per_mint() {
     let report = report_with_result(
         Vec::new(),
-        position_rows(),
-        vec![tokenized_mint_requested(10, "mint-1", "RKLB"), missing_fees],
-        Vec::new(),
-        query(),
-        BTreeSet::new(),
-    )
-    .unwrap();
-
-    assert_eq!(report.costs.tokenization_fees_usd, "0");
-    assert_eq!(report.cost_entries.len(), 0);
-    assert_eq!(report.costs.missing_cost_observation_count, 1);
-}
-
-#[test]
-fn missing_tokenization_fee_timestamp_fails_the_report() {
-    let mut missing_timestamp =
-        tokenized_tokens_received(12, "mint-2", "0.25", "2026-05-15T12:02:00Z");
-    missing_timestamp.payload["TokensReceived"]
-        .as_object_mut()
-        .unwrap()
-        .remove("received_at");
-
-    let error = report_with_result(
-        Vec::new(),
-        position_rows(),
-        vec![
-            tokenized_mint_requested(10, "mint-2", "RKLB"),
-            missing_timestamp,
+        &position_rows(),
+        &[
+            tokenization_fee(11, "mint-1", None, "2026-05-15T12:02:00Z"),
+            tokenization_fee(12, "mint-1", None, "2026-05-15T12:03:00Z"),
         ],
-        Vec::new(),
-        query(),
-        BTreeSet::new(),
+        &[],
+        &query(),
+        &BTreeSet::new(),
     )
-    .unwrap_err();
-    assert!(matches!(
-        error,
-        PnlError::MalformedPayload {
-            rowid: 12,
-            reason: "missing tokenization fee timestamp",
-            ..
-        }
-    ));
+    .unwrap();
+
+    assert_eq!(report.costs.tokenization_fees_usd, "0");
+    assert_eq!(report.cost_entries.len(), 0);
+    assert_eq!(report.costs.missing_cost_observation_count, 1);
 }
 
 #[test]
-fn wrong_typed_cctp_fee_decimals_fail_the_report() {
-    let mut cost = usdc_bridged(11, "bridge-1", "0.25", "2026-05-15T12:02:00Z");
-    cost.payload["Bridged"]["fee_collected"] = serde_json::json!({});
+fn corrupt_cctp_fee_decimals_fail_the_report() {
+    let cost = cctp_fee(11, "bridge-1", "not-a-decimal", "2026-05-15T12:02:00Z");
 
     let error = report_with_result(
         Vec::new(),
-        position_rows(),
-        vec![cost],
-        Vec::new(),
-        query(),
-        BTreeSet::new(),
+        &position_rows(),
+        &[cost],
+        &[],
+        &query(),
+        &BTreeSet::new(),
     )
     .unwrap_err();
 
@@ -1777,59 +1731,42 @@ fn wrong_typed_cctp_fee_decimals_fail_the_report() {
         error,
         PnlError::InvalidFinancialField {
             rowid: 11,
-            field: "fee_collected",
+            field: "amount_usd",
             ..
         }
     ));
 }
 
+/// The ledger schema forbids a CCTP fee row without an amount (`CHECK`), so
+/// encountering one at query time is a corrupt-row failure, not a missing
+/// observation.
 #[test]
-fn missing_cctp_fee_fields_fail_the_report() {
-    let mut missing_fee = usdc_bridged(11, "bridge-1", "0.25", "2026-05-15T12:02:00Z");
-    missing_fee.payload["Bridged"]
-        .as_object_mut()
-        .unwrap()
-        .remove("fee_collected");
+fn missing_cctp_fee_amount_fails_the_report() {
+    let missing_fee = CostLedgerRow {
+        event_rowid: 11,
+        source: CostSource::CctpFee,
+        aggregate_id: "bridge-1".to_owned(),
+        symbol: None,
+        amount_usd: None,
+        occurred_at: "2026-05-15T12:02:00Z".to_owned(),
+    };
 
     let error = report_with_result(
         Vec::new(),
-        position_rows(),
-        vec![missing_fee],
-        Vec::new(),
-        query(),
-        BTreeSet::new(),
+        &position_rows(),
+        &[missing_fee],
+        &[],
+        &query(),
+        &BTreeSet::new(),
     )
     .unwrap_err();
+
     assert!(matches!(
         error,
-        PnlError::MalformedPayload {
+        PnlError::InvalidLedgerRow {
+            table: "pnl_cost_entry",
             rowid: 11,
-            reason: "missing CCTP fee_collected or timestamp",
-            ..
-        }
-    ));
-
-    let mut missing_timestamp = usdc_bridged(12, "bridge-2", "0.25", "2026-05-15T12:02:00Z");
-    missing_timestamp.payload["Bridged"]
-        .as_object_mut()
-        .unwrap()
-        .remove("minted_at");
-
-    let error = report_with_result(
-        Vec::new(),
-        position_rows(),
-        vec![missing_timestamp],
-        Vec::new(),
-        query(),
-        BTreeSet::new(),
-    )
-    .unwrap_err();
-    assert!(matches!(
-        error,
-        PnlError::MalformedPayload {
-            rowid: 12,
-            reason: "missing CCTP fee_collected or timestamp",
-            ..
+            reason: "cctp fee row missing amount",
         }
     ));
 }
@@ -1838,34 +1775,34 @@ fn missing_cctp_fee_fields_fail_the_report() {
 fn date_only_alpaca_activities_are_not_forced_into_session_filters() {
     let all_sessions = report_with(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![date_only_account_activity(
+        &position_rows(),
+        &[],
+        &[date_only_account_activity(
             "fee-date-only",
             "FEE",
             "-0.25",
             None,
             "2026-05-15",
         )],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     );
     let active_only = report_with(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![date_only_account_activity(
+        &position_rows(),
+        &[],
+        &[date_only_account_activity(
             "fee-date-only",
             "FEE",
             "-0.25",
             None,
             "2026-05-15",
         )],
-        PnlQuery {
+        &PnlQuery {
             counter_trading_filter: Some(PnlCounterTradingFilter::CounterTradingActive),
             ..query()
         },
-        BTreeSet::new(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(all_sessions.summary.tracked_costs_usd, "0.25");
@@ -1878,17 +1815,17 @@ fn date_only_alpaca_activities_are_not_forced_into_session_filters() {
 fn adds_symbol_dividends_to_aggregate_and_symbol_net_pnl() {
     let report = report_with(
         Vec::new(),
-        vec![position_row("SGOV", "0")],
-        Vec::new(),
-        vec![account_activity(
+        &[position_row("SGOV", "0")],
+        &[],
+        &[account_activity(
             "div-1",
             "DIV",
             "1.25",
             Some("SGOV"),
             "2026-05-15T14:02:00Z",
         )],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.gross_realized_pnl_usd, "0");
@@ -1904,17 +1841,17 @@ fn adds_symbol_dividends_to_aggregate_and_symbol_net_pnl() {
 fn capital_gain_distributions_are_tracked_as_dividend_revenue() {
     let report = report_with(
         Vec::new(),
-        vec![position_row("SGOV", "0")],
-        Vec::new(),
-        vec![account_activity(
+        &[position_row("SGOV", "0")],
+        &[],
+        &[account_activity(
             "cgd-1",
             "CGD",
             "1.25",
             Some("SGOV"),
             "2026-05-15T14:02:00Z",
         )],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.tracked_revenue_usd, "1.25");
@@ -1926,17 +1863,17 @@ fn capital_gain_distributions_are_tracked_as_dividend_revenue() {
 fn cash_in_lieu_rows_are_tracked_as_dividend_revenue() {
     let report = report_with(
         Vec::new(),
-        vec![position_row("SGOV", "0")],
-        Vec::new(),
-        vec![account_activity(
+        &[position_row("SGOV", "0")],
+        &[],
+        &[account_activity(
             "cil-1",
             "CIL",
             "0.42",
             Some("SGOV"),
             "2026-05-15T14:02:00Z",
         )],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.tracked_revenue_usd, "0.42");
@@ -1951,11 +1888,11 @@ fn non_usd_alpaca_activities_fail_the_report() {
 
     let error = report_with_result(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![activity],
-        query(),
-        BTreeSet::new(),
+        &position_rows(),
+        &[],
+        &[activity],
+        &query(),
+        &BTreeSet::new(),
     )
     .unwrap_err();
 
@@ -1982,11 +1919,11 @@ fn canceled_alpaca_activities_are_skipped() {
 
     let report = report_with(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![activity],
-        query(),
-        BTreeSet::new(),
+        &position_rows(),
+        &[],
+        &[activity],
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.tracked_costs_usd, "0");
@@ -2011,11 +1948,11 @@ fn corrected_alpaca_activities_are_included() {
 
     let report = report_with(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![activity],
-        query(),
-        BTreeSet::new(),
+        &position_rows(),
+        &[],
+        &[activity],
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.tracked_costs_usd, "0.25");
@@ -2026,17 +1963,17 @@ fn corrected_alpaca_activities_are_included() {
 fn records_negative_dividend_rows_as_account_costs() {
     let report = report_with(
         Vec::new(),
-        vec![position_row("SGOV", "0")],
-        Vec::new(),
-        vec![account_activity(
+        &[position_row("SGOV", "0")],
+        &[],
+        &[account_activity(
             "div-tax-1",
             "DIVNRA",
             "-0.15",
             Some("SGOV"),
             "2026-05-15T14:02:00Z",
         )],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.tracked_costs_usd, "0.15");
@@ -2061,11 +1998,11 @@ fn malformed_alpaca_activity_amounts_fail_the_report() {
 
     let error = report_with_result(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![missing_amount],
-        query(),
-        BTreeSet::new(),
+        &position_rows(),
+        &[],
+        &[missing_amount],
+        &query(),
+        &BTreeSet::new(),
     )
     .unwrap_err();
     assert!(matches!(
@@ -2079,17 +2016,17 @@ fn malformed_alpaca_activity_amounts_fail_the_report() {
 
     let error = report_with_result(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![account_activity(
+        &position_rows(),
+        &[],
+        &[account_activity(
             "bad-amount-1",
             "FEE",
             "not-a-decimal",
             None,
             "2026-05-15T14:03:00Z",
         )],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     )
     .unwrap_err();
     assert!(matches!(
@@ -2117,11 +2054,11 @@ fn malformed_alpaca_activity_timestamps_and_types_fail_the_report() {
 
     let error = report_with_result(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![missing_timestamp],
-        query(),
-        BTreeSet::new(),
+        &position_rows(),
+        &[],
+        &[missing_timestamp],
+        &query(),
+        &BTreeSet::new(),
     )
     .unwrap_err();
     assert!(matches!(
@@ -2135,17 +2072,17 @@ fn malformed_alpaca_activity_timestamps_and_types_fail_the_report() {
 
     let error = report_with_result(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![account_activity(
+        &position_rows(),
+        &[],
+        &[account_activity(
             "unknown-1",
             "UNKNOWN",
             "-0.5",
             None,
             "2026-05-15T14:04:00Z",
         )],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     )
     .unwrap_err();
     assert!(matches!(
@@ -2167,11 +2104,11 @@ fn malformed_alpaca_activity_timestamps_and_types_fail_the_report() {
     unsupported_status.status = Some("pending_review".to_owned());
     let error = report_with_result(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![unsupported_status],
-        query(),
-        BTreeSet::new(),
+        &position_rows(),
+        &[],
+        &[unsupported_status],
+        &query(),
+        &BTreeSet::new(),
     )
     .unwrap_err();
     assert!(matches!(
@@ -2188,17 +2125,17 @@ fn malformed_alpaca_activity_timestamps_and_types_fail_the_report() {
 fn zero_alpaca_activity_amounts_are_ignored() {
     let report = report_with(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![account_activity(
+        &position_rows(),
+        &[],
+        &[account_activity(
             "zero-fee-1",
             "FEE",
             "0",
             None,
             "2026-05-15T14:03:00Z",
         )],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.tracked_costs_usd, "0");
@@ -2210,17 +2147,17 @@ fn zero_alpaca_activity_amounts_are_ignored() {
 fn records_pass_through_credits_as_counter_trade_revenue() {
     let report = report_with(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![account_activity(
+        &position_rows(),
+        &[],
+        &[account_activity(
             "pass-through-credit-1",
             "PTC",
             "0.12",
             None,
             "2026-05-15T14:02:00Z",
         )],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.tracked_costs_usd, "0");
@@ -2234,17 +2171,17 @@ fn records_pass_through_credits_as_counter_trade_revenue() {
 fn records_positive_fee_rows_as_counter_trade_revenue() {
     let report = report_with(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![account_activity(
+        &position_rows(),
+        &[],
+        &[account_activity(
             "fee-credit-1",
             "FEE",
             "0.12",
             None,
             "2026-05-15T14:02:00Z",
         )],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.tracked_costs_usd, "0");
@@ -2258,17 +2195,17 @@ fn records_positive_fee_rows_as_counter_trade_revenue() {
 fn records_cash_disbursement_rows_as_generic_revenue() {
     let report = report_with(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![account_activity(
+        &position_rows(),
+        &[],
+        &[account_activity(
             "cash-credit-1",
             "CSD",
             "1.00",
             None,
             "2026-05-15T14:02:00Z",
         )],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.tracked_costs_usd, "0");
@@ -2282,9 +2219,9 @@ fn records_cash_disbursement_rows_as_generic_revenue() {
 fn broker_fees_and_interest_categories_net_debits_against_credits() {
     let report = report_with(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![
+        &position_rows(),
+        &[],
+        &[
             account_activity("fee-debit-1", "FEE", "-0.25", None, "2026-05-15T14:02:00Z"),
             account_activity("fee-credit-1", "FEE", "0.25", None, "2026-05-15T14:03:00Z"),
             account_activity(
@@ -2302,8 +2239,8 @@ fn broker_fees_and_interest_categories_net_debits_against_credits() {
                 "2026-05-15T14:05:00Z",
             ),
         ],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.tracked_costs_usd, "0.75");
@@ -2333,15 +2270,15 @@ fn alpaca_net_amount_parses_the_official_account_activity_sample() {
 
     let report = report_with(
         Vec::new(),
-        vec![position_row("T", "0")],
-        Vec::new(),
-        vec![activity],
-        PnlQuery {
+        &[position_row("T", "0")],
+        &[],
+        &[activity],
+        &PnlQuery {
             from_date: Some("2019-08-01".to_owned()),
             to_date: Some("2019-08-01".to_owned()),
             ..query()
         },
-        BTreeSet::new(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.costs.dividend_revenue_usd, "1.02");
@@ -2366,15 +2303,15 @@ fn alpaca_net_amount_deserializes_signed_cost_values() {
 
     let report = report_with(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![activity],
-        PnlQuery {
+        &position_rows(),
+        &[],
+        &[activity],
+        &PnlQuery {
             from_date: Some("2019-08-01".to_owned()),
             to_date: Some("2019-08-01".to_owned()),
             ..query()
         },
-        BTreeSet::new(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.costs.margin_interest_usd, "0.25");
@@ -2394,18 +2331,24 @@ fn matches_legacy_frontend_sql_fixture_for_stable_report_fields() {
             offchain_buy(6, "2026-05-15T14:10:01Z", "25", "1"),
             offchain_buy(7, "2026-05-15T14:11:00Z", "12", "1"),
             onchain_sell(8, "15", "2026-05-15T14:12:00Z"),
-            onchain_fill(9, "SPYM", "Buy", "80", "2", "2026-05-15T14:13:00Z"),
-            offchain_fill(10, "SPYM", "Sell", "2026-05-15T14:14:00Z", "85", "1.5"),
+            onchain_fill(9, "SPYM", Direction::Buy, "80", "2", "2026-05-15T14:13:00Z"),
+            offchain_fill(
+                10,
+                "SPYM",
+                Direction::Sell,
+                "2026-05-15T14:14:00Z",
+                "85",
+                "1.5",
+            ),
         ],
-        vec![position_row("RKLB", "0"), position_row("SPYM", "0.5")],
-        vec![
-            tokenized_mint_requested(20, "mint-rklb-1", "RKLB"),
-            tokenized_tokens_received(21, "mint-rklb-1", "0.25", "2026-05-15T14:15:00Z"),
-            usdc_bridged(22, "rebalance-1", "0.01", "2026-05-15T14:16:00Z"),
+        &[position_row("RKLB", "0"), position_row("SPYM", "0.5")],
+        &[
+            tokenization_fee(21, "mint-rklb-1", Some("0.25"), "2026-05-15T14:15:00Z"),
+            cctp_fee(22, "rebalance-1", "0.01", "2026-05-15T14:16:00Z"),
         ],
-        Vec::new(),
-        query(),
-        BTreeSet::new(),
+        &[],
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_legacy_fixture_summary(&report);
@@ -2582,17 +2525,17 @@ fn assert_legacy_fixture_windows(report: &PnlResponse) {
 fn records_margin_interest_as_generic_account_cost() {
     let report = report_with(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![account_activity(
+        &position_rows(),
+        &[],
+        &[account_activity(
             "interest-1",
             "INT",
             "-0.50",
             None,
             "2026-05-15T14:02:00Z",
         )],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.tracked_costs_usd, "0.5");
@@ -2605,15 +2548,14 @@ fn records_margin_interest_as_generic_account_cost() {
 fn includes_tokenization_and_cctp_cost_events() {
     let report = report_with(
         Vec::new(),
-        position_rows(),
-        vec![
-            tokenized_mint_requested(1, "mint-1", "RKLB"),
-            tokenized_tokens_received(2, "mint-1", "0.40", "2026-05-15T14:02:00Z"),
-            usdc_bridged(3, "rebalance-1", "0.10", "2026-05-15T14:03:00Z"),
+        &position_rows(),
+        &[
+            tokenization_fee(2, "mint-1", Some("0.40"), "2026-05-15T14:02:00Z"),
+            cctp_fee(3, "rebalance-1", "0.10", "2026-05-15T14:03:00Z"),
         ],
-        Vec::new(),
-        query(),
-        BTreeSet::new(),
+        &[],
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.tracked_costs_usd, "0.5");
@@ -2629,14 +2571,16 @@ fn includes_tokenization_and_cctp_cost_events() {
 fn negative_persisted_fees_fail_instead_of_reversing_their_accounting_effect() {
     let tokenization_error = report_with_result(
         Vec::new(),
-        position_rows(),
-        vec![
-            tokenized_mint_requested(1, "mint-1", "RKLB"),
-            tokenized_tokens_received(2, "mint-1", "-0.40", "2026-05-15T14:02:00Z"),
-        ],
-        Vec::new(),
-        query(),
-        BTreeSet::new(),
+        &position_rows(),
+        &[tokenization_fee(
+            2,
+            "mint-1",
+            Some("-0.40"),
+            "2026-05-15T14:02:00Z",
+        )],
+        &[],
+        &query(),
+        &BTreeSet::new(),
     )
     .unwrap_err();
 
@@ -2652,16 +2596,11 @@ fn negative_persisted_fees_fail_instead_of_reversing_their_accounting_effect() {
 
     let cctp_error = report_with_result(
         Vec::new(),
-        position_rows(),
-        vec![usdc_bridged(
-            3,
-            "rebalance-1",
-            "-0.10",
-            "2026-05-15T14:03:00Z",
-        )],
-        Vec::new(),
-        query(),
-        BTreeSet::new(),
+        &position_rows(),
+        &[cctp_fee(3, "rebalance-1", "-0.10", "2026-05-15T14:03:00Z")],
+        &[],
+        &query(),
+        &BTreeSet::new(),
     )
     .unwrap_err();
 
@@ -2680,15 +2619,14 @@ fn negative_persisted_fees_fail_instead_of_reversing_their_accounting_effect() {
 fn de_duplicates_recovered_tokenization_fee_by_mint_identity() {
     let report = report_with(
         Vec::new(),
-        position_rows(),
-        vec![
-            tokenized_mint_requested(1, "mint-1", "RKLB"),
-            tokenized_tokens_received(2, "mint-1", "0.40", "2026-05-15T14:02:00Z"),
-            tokenized_provider_completion_recovered(3, "mint-1", "0.40", "2026-05-15T14:03:00Z"),
+        &position_rows(),
+        &[
+            tokenization_fee(2, "mint-1", Some("0.40"), "2026-05-15T14:02:00Z"),
+            tokenization_fee(3, "mint-1", Some("0.40"), "2026-05-15T14:03:00Z"),
         ],
-        Vec::new(),
-        query(),
-        BTreeSet::new(),
+        &[],
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.tracked_costs_usd, "0.4");
@@ -2703,20 +2641,22 @@ fn de_duplicates_recovered_tokenization_fee_by_mint_identity() {
 fn de_duplicates_overlapping_alpaca_fee_against_tokenization_fee() {
     let report = report_with(
         Vec::new(),
-        position_rows(),
-        vec![
-            tokenized_mint_requested(1, "mint-1", "RKLB"),
-            tokenized_tokens_received(2, "mint-1", "0.40", "2026-05-15T14:02:00Z"),
-        ],
-        vec![account_activity(
+        &position_rows(),
+        &[tokenization_fee(
+            2,
+            "mint-1",
+            Some("0.40"),
+            "2026-05-15T14:02:00Z",
+        )],
+        &[account_activity(
             "alpaca-fee-1",
             "FEE",
             "-0.40",
             Some("RKLB"),
             "2026-05-15T16:30:00Z",
         )],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.tracked_costs_usd, "0.4");
@@ -2740,11 +2680,11 @@ fn keeps_symbol_universe_separate_from_filtered_pnl_rows() {
             onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
             offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
         ],
-        vec![position_row("RKLB", "0"), position_row("SPYM", "0")],
-        Vec::new(),
-        Vec::new(),
-        query(),
-        symbols,
+        &[position_row("RKLB", "0"), position_row("SPYM", "0")],
+        &[],
+        &[],
+        &query(),
+        &symbols,
     );
 
     assert_eq!(
@@ -2768,17 +2708,17 @@ fn symbol_filter_excludes_unallocated_account_level_costs() {
             onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
             offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
         ],
-        position_rows(),
-        Vec::new(),
-        vec![account_activity(
+        &position_rows(),
+        &[],
+        &[account_activity(
             "fee-1",
             "FEE",
             "-0.25",
             None,
             "2026-05-15T14:02:00Z",
         )],
-        query(),
-        symbols,
+        &query(),
+        &symbols,
     );
 
     assert_eq!(report.summary.tracked_costs_usd, "0");
@@ -2790,22 +2730,26 @@ fn symbol_filter_excludes_unallocated_account_level_costs() {
 fn drops_unsafe_symbols_from_replay_rows_and_position_view() {
     let report = report_with(
         vec![
-            PositionEventRow {
-                symbol: "RKLB'); DROP TABLE events; --".to_owned(),
-                ..onchain_sell(1, "10", "2026-05-15T14:00:00Z")
-            },
+            onchain_fill(
+                1,
+                "RKLB'); DROP TABLE events; --",
+                Direction::Sell,
+                "10",
+                "1",
+                "2026-05-15T14:00:00Z",
+            ),
             onchain_sell(2, "10", "2026-05-15T14:00:00Z"),
             offchain_buy(3, "2026-05-15T14:01:00Z", "8", "1"),
         ],
-        vec![
+        &[
             position_row("RKLB", "0"),
             position_row("SPYM", "0"),
             position_row("BAD';--", "0"),
         ],
-        Vec::new(),
-        Vec::new(),
-        query(),
-        BTreeSet::new(),
+        &[],
+        &[],
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.summary.counter_trade_pnl_usd, "2");
@@ -2877,14 +2821,14 @@ fn reports_position_view_reconciliation_delta() {
 fn invalid_position_view_decimal_fails_the_report() {
     let error = report_with_result(
         Vec::new(),
-        vec![PositionViewRow {
+        &[PositionViewRow {
             symbol: "RKLB".to_owned(),
             net_position: Some("not-a-decimal".to_owned()),
         }],
-        Vec::new(),
-        Vec::new(),
-        query(),
-        BTreeSet::new(),
+        &[],
+        &[],
+        &query(),
+        &BTreeSet::new(),
     )
     .unwrap_err();
 
@@ -2996,12 +2940,30 @@ async fn build_pnl_report_populates_capital_when_snapshots_exist() {
 async fn return_uses_only_pnl_from_days_with_usable_capital() {
     let pool = pnl_test_pool(
         vec![
-            onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
-            offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
-            onchain_sell(3, "110", "2026-05-16T14:00:00Z"),
-            offchain_buy(4, "2026-05-16T14:01:00Z", "10", "1"),
-            onchain_sell(5, "10", "2026-05-17T14:00:00Z"),
-            offchain_buy(6, "2026-05-17T14:01:00Z", "8", "1"),
+            SeedEvent::Position(
+                "RKLB",
+                onchain_fill_event(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
+            ),
+            SeedEvent::Position(
+                "RKLB",
+                offchain_fill_event(Direction::Buy, "8", "1", "2026-05-15T14:01:00Z"),
+            ),
+            SeedEvent::Position(
+                "RKLB",
+                onchain_fill_event(Direction::Sell, "110", "1", "2026-05-16T14:00:00Z"),
+            ),
+            SeedEvent::Position(
+                "RKLB",
+                offchain_fill_event(Direction::Buy, "10", "1", "2026-05-16T14:01:00Z"),
+            ),
+            SeedEvent::Position(
+                "RKLB",
+                onchain_fill_event(Direction::Sell, "10", "1", "2026-05-17T14:00:00Z"),
+            ),
+            SeedEvent::Position(
+                "RKLB",
+                offchain_fill_event(Direction::Buy, "8", "1", "2026-05-17T14:01:00Z"),
+            ),
         ],
         position_rows(),
     )
@@ -3058,15 +3020,24 @@ async fn high_precision_derived_prices_do_not_break_the_capital_calculation() {
 
     let pool = pnl_test_pool(
         vec![
-            onchain_fill(
-                1,
+            SeedEvent::Position(
                 "RKLB",
-                "Sell",
-                DERIVED_PRICE,
-                "0.029847962456751639",
-                "2026-05-15T14:00:00Z",
+                onchain_fill_event(
+                    Direction::Sell,
+                    DERIVED_PRICE,
+                    "0.029847962456751639",
+                    "2026-05-15T14:00:00Z",
+                ),
             ),
-            offchain_buy(2, "2026-05-15T14:01:00Z", "66.888", "0.029847962456751639"),
+            SeedEvent::Position(
+                "RKLB",
+                offchain_fill_event(
+                    Direction::Buy,
+                    "66.888",
+                    "0.029847962456751639",
+                    "2026-05-15T14:01:00Z",
+                ),
+            ),
         ],
         position_rows(),
     )
@@ -3110,13 +3081,19 @@ async fn high_precision_derived_prices_do_not_break_the_capital_calculation() {
 
 #[tokio::test]
 async fn return_excludes_signed_cost_effects_from_days_without_usable_capital() {
-    let pool = pnl_test_pool_with_costs(
-        Vec::new(),
-        position_rows(),
+    let mint_id = Uuid::new_v4().to_string();
+    let pool = pnl_test_pool(
         vec![
-            tokenized_mint_requested(1, "mint-excluded-day", "RKLB"),
-            tokenized_tokens_received(2, "mint-excluded-day", "100", "2026-05-16T14:02:00Z"),
+            SeedEvent::Mint(
+                mint_id.clone(),
+                mint_requested_event("RKLB", "2026-05-16T14:00:00Z"),
+            ),
+            SeedEvent::Mint(
+                mint_id,
+                tokens_received_event(Some("100"), "2026-05-16T14:02:00Z"),
+            ),
         ],
+        position_rows(),
     )
     .await;
     for et_day in ["2026-05-15", "2026-05-17"] {
@@ -3310,8 +3287,14 @@ async fn build_pnl_report_empty_symbol_param_preserves_capital() {
 async fn build_pnl_report_as_of_rowid_non_current_omits_capital_with_warning() {
     let pool = pnl_test_pool(
         vec![
-            onchain_sell(1, "10", "2026-05-15T14:00:00Z"),
-            offchain_buy(2, "2026-05-15T14:01:00Z", "8", "1"),
+            SeedEvent::Position(
+                "RKLB",
+                onchain_fill_event(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
+            ),
+            SeedEvent::Position(
+                "RKLB",
+                offchain_fill_event(Direction::Buy, "8", "1", "2026-05-15T14:01:00Z"),
+            ),
         ],
         position_rows(),
     )
@@ -3414,14 +3397,14 @@ fn cost_summarization_surfaces_float_overflow_as_arithmetic_error() {
     let amount = max_positive_float_text();
     let error = report_with_result(
         Vec::new(),
-        position_rows(),
-        Vec::new(),
-        vec![
+        &position_rows(),
+        &[],
+        &[
             account_activity("div-1", "DIV", &amount, None, "2026-05-15T14:00:00Z"),
             account_activity("div-2", "DIV", &amount, None, "2026-05-15T14:01:00Z"),
         ],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     )
     .unwrap_err();
 
@@ -3439,17 +3422,17 @@ fn daily_report_aggregation_surfaces_float_overflow_as_arithmetic_error() {
             onchain_sell(1, &amount, "2026-05-15T14:00:00Z"),
             offchain_buy(2, "2026-05-15T14:01:00Z", "1", "1"),
         ],
-        position_rows(),
-        Vec::new(),
-        vec![account_activity(
+        &position_rows(),
+        &[],
+        &[account_activity(
             "div-1",
             "DIV",
             &amount,
             None,
             "2026-05-15T14:02:00Z",
         )],
-        query(),
-        BTreeSet::new(),
+        &query(),
+        &BTreeSet::new(),
     )
     .unwrap_err();
 
@@ -3486,7 +3469,7 @@ async fn float_exponent_overflow_in_the_replay_pipeline_surfaces_as_arithmetic_e
         onchain_fill(
             1,
             "RKLB",
-            "Sell",
+            Direction::Sell,
             extreme_price,
             "1e2",
             "2026-05-15T14:00:00Z",
@@ -3502,11 +3485,11 @@ async fn float_exponent_overflow_in_the_replay_pipeline_surfaces_as_arithmetic_e
 fn report_includes_a_replay_only_open_position_in_symbol_summaries() {
     let report = report_with(
         vec![offchain_buy(1, "2026-05-15T14:01:00Z", "15", "2")],
-        vec![position_row("RKLB", "2")],
-        Vec::new(),
-        Vec::new(),
-        query(),
-        BTreeSet::new(),
+        &[position_row("RKLB", "2")],
+        &[],
+        &[],
+        &query(),
+        &BTreeSet::new(),
     );
 
     assert_eq!(report.symbols.len(), 1);

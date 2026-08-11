@@ -20,7 +20,7 @@ mod windows;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use ledger::{PnlLedger, PnlLedgerReactor};
+pub(crate) use ledger::{LedgerHead, PnlLedger, PnlLedgerReactor};
 pub(crate) use query::{PnlError, PnlQuery};
 pub(crate) use response::PnlResponse;
 #[cfg(test)]

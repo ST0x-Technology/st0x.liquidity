@@ -53,6 +53,24 @@ pub(crate) const LEDGER_VERSION: i64 = 1;
 /// a mid-backfill crash resumes from the last batch.
 const INGEST_BATCH: NonZeroU32 = NonZeroU32::new(1_000).unwrap();
 
+/// Text stored in the ledger's `direction` columns -- the exact values the
+/// migration's CHECK constraints admit and the read side parses back.
+pub(crate) const DIRECTION_BUY_TEXT: &str = "Buy";
+pub(crate) const DIRECTION_SELL_TEXT: &str = "Sell";
+
+/// `pnl_cost_entry.source` discriminators -- the exact values the
+/// migration's CHECK admits and the read side parses back.
+pub(crate) const TOKENIZATION_FEE_SOURCE: &str = "tokenization_fee";
+pub(crate) const CCTP_FEE_SOURCE: &str = "cctp_fee";
+
+/// Event-log head returned by [`PnlLedger::catch_up`]. Holding one is proof
+/// the ledger has been caught up through that rowid, which is what makes an
+/// `asOfRowid` watermark resolved against it meaningful -- the read path's
+/// signatures accept this type rather than a raw `i64` so a stale or
+/// computed rowid cannot slip in by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LedgerHead(pub(crate) i64);
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PnlLedgerError {
     #[error("ledger database access failed")]
@@ -106,14 +124,14 @@ impl PnlLedger {
     /// `pnl_ledger_checkpoint_lag_events` gauge -- which holds the stuck
     /// backlog size when ingestion cannot advance -- an operator can alert on
     /// a wedged ledger without reading logs.
-    pub(crate) async fn catch_up(&self) -> Result<i64, PnlLedgerError> {
+    pub(crate) async fn catch_up(&self) -> Result<LedgerHead, PnlLedgerError> {
         let _serialized = self.ingest.lock().await;
         let result = self.ingest_to_head().await;
         if result.is_err() {
             counter!("pnl_ledger_catch_up_failures_total").increment(1);
         }
 
-        result
+        result.map(LedgerHead)
     }
 
     async fn ingest_to_head(&self) -> Result<i64, PnlLedgerError> {
@@ -320,8 +338,8 @@ fn canonical_timestamp(at: &DateTime<Utc>) -> String {
 
 fn direction_text(direction: Direction) -> &'static str {
     match direction {
-        Direction::Buy => "Buy",
-        Direction::Sell => "Sell",
+        Direction::Buy => DIRECTION_BUY_TEXT,
+        Direction::Sell => DIRECTION_SELL_TEXT,
     }
 }
 
@@ -346,9 +364,10 @@ async fn ingest_position(
             seen_at: _,
         } => {
             sqlx::query(
-                "INSERT OR IGNORE INTO pnl_onchain_fill \
+                "INSERT INTO pnl_onchain_fill \
                  (event_rowid, symbol, tx_hash, log_index, shares, direction, price_usd, executed_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(event_rowid) DO NOTHING",
             )
             .bind(rowid)
             .bind(symbol.to_string())
@@ -367,9 +386,10 @@ async fn ingest_position(
             ..
         } => {
             sqlx::query(
-                "INSERT OR IGNORE INTO pnl_offchain_placement \
+                "INSERT INTO pnl_offchain_placement \
                  (event_rowid, symbol, offchain_order_id, placed_at) \
-                 VALUES (?1, ?2, ?3, ?4)",
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(event_rowid) DO NOTHING",
             )
             .bind(rowid)
             .bind(symbol.to_string())
@@ -387,9 +407,10 @@ async fn ingest_position(
             ..
         } => {
             sqlx::query(
-                "INSERT OR IGNORE INTO pnl_offchain_fill \
+                "INSERT INTO pnl_offchain_fill \
                  (event_rowid, symbol, offchain_order_id, shares, direction, price_usd, executed_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(event_rowid) DO NOTHING",
             )
             .bind(rowid)
             .bind(symbol.to_string())
@@ -409,9 +430,10 @@ async fn ingest_position(
         } => {
             let price = price_usdc.map(|price| format_float(&price)).transpose()?;
             sqlx::query(
-                "INSERT OR IGNORE INTO pnl_manual_adjustment \
+                "INSERT INTO pnl_manual_adjustment \
                  (event_rowid, symbol, target_net, price_usd, adjusted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(event_rowid) DO NOTHING",
             )
             .bind(rowid)
             .bind(symbol.to_string())
@@ -513,11 +535,13 @@ async fn insert_mint_fee(
     }
 
     sqlx::query(
-        "INSERT OR IGNORE INTO pnl_cost_entry \
+        "INSERT INTO pnl_cost_entry \
          (event_rowid, source, aggregate_id, symbol, amount_usd, occurred_at) \
-         VALUES (?1, 'tokenization_fee', ?2, ?3, ?4, ?5)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(event_rowid) DO NOTHING",
     )
     .bind(rowid)
+    .bind(TOKENIZATION_FEE_SOURCE)
     .bind(aggregate_id)
     .bind(symbol)
     .bind(amount)
@@ -573,11 +597,13 @@ async fn ingest_rebalance(
     }
 
     sqlx::query(
-        "INSERT OR IGNORE INTO pnl_cost_entry \
+        "INSERT INTO pnl_cost_entry \
          (event_rowid, source, aggregate_id, symbol, amount_usd, occurred_at) \
-         VALUES (?1, 'cctp_fee', ?2, NULL, ?3, ?4)",
+         VALUES (?1, ?2, ?3, NULL, ?4, ?5) \
+         ON CONFLICT(event_rowid) DO NOTHING",
     )
     .bind(rowid)
+    .bind(CCTP_FEE_SOURCE)
     .bind(id.to_string())
     .bind(format_float(&fee_collected.inner())?)
     .bind(canonical_timestamp(&occurred_at))
@@ -596,9 +622,10 @@ async fn ingest_bot_gas(
     cost.validate()?;
 
     sqlx::query(
-        "INSERT OR IGNORE INTO pnl_bot_gas_cost \
+        "INSERT INTO pnl_bot_gas_cost \
          (event_rowid, chain, tx_hash, usd_cost, operation_category, symbol, occurred_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(event_rowid) DO NOTHING",
     )
     .bind(rowid)
     .bind(cost.chain.to_string())
@@ -621,7 +648,7 @@ mod tests {
     use uuid::Uuid;
 
     use st0x_config::ExecutionThreshold;
-    use st0x_event_sorcery::{DomainEvent, StoreBuilder};
+    use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::{ExecutorOrderId, SupportedExecutor};
     use st0x_finance::{FractionalShares, Positive, Symbol, Usd, Usdc};
     use st0x_float_macro::float;
@@ -629,32 +656,10 @@ mod tests {
     use crate::bot_gas::{BotGasChain, BotGasOperationCategory};
     use crate::offchain::order::OffchainOrderId;
     use crate::position::{PositionCommand, TradeId, TriggerReason};
-    use crate::test_utils::setup_test_db;
+    use crate::test_utils::{persist_event, setup_test_db};
     use crate::usdc_rebalance::UsdcRebalanceId;
 
     use super::*;
-
-    async fn persist<Entity: EventSourced>(
-        pool: &SqlitePool,
-        aggregate_id: &str,
-        sequence: i64,
-        event: &Entity::Event,
-    ) {
-        sqlx::query(
-            "INSERT INTO events (aggregate_type, aggregate_id, sequence, \
-             event_type, event_version, payload, metadata) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}')",
-        )
-        .bind(Entity::AGGREGATE_TYPE)
-        .bind(aggregate_id)
-        .bind(sequence)
-        .bind(event.event_type())
-        .bind(event.event_version())
-        .bind(serde_json::to_string(event).unwrap())
-        .execute(pool)
-        .await
-        .unwrap();
-    }
 
     fn timestamp(minute: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 5, 15, 14, minute, 0).unwrap()
@@ -713,8 +718,8 @@ mod tests {
         let gas_id = format!("base:{}", gas.tx_hash);
 
         let fill = onchain_fill(7, 0);
-        persist::<Position>(&pool, "AAPL", 1, &fill).await;
-        persist::<Position>(
+        persist_event::<Position>(&pool, "AAPL", 1, &fill).await;
+        persist_event::<Position>(
             &pool,
             "AAPL",
             2,
@@ -731,7 +736,7 @@ mod tests {
             },
         )
         .await;
-        persist::<Position>(
+        persist_event::<Position>(
             &pool,
             "AAPL",
             3,
@@ -745,7 +750,7 @@ mod tests {
             },
         )
         .await;
-        persist::<Position>(
+        persist_event::<Position>(
             &pool,
             "AAPL",
             4,
@@ -758,7 +763,7 @@ mod tests {
             },
         )
         .await;
-        persist::<TokenizedEquityMint>(
+        persist_event::<TokenizedEquityMint>(
             &pool,
             &mint_id,
             1,
@@ -770,7 +775,7 @@ mod tests {
             },
         )
         .await;
-        persist::<TokenizedEquityMint>(
+        persist_event::<TokenizedEquityMint>(
             &pool,
             &mint_id,
             2,
@@ -782,7 +787,7 @@ mod tests {
             },
         )
         .await;
-        persist::<UsdcRebalance>(
+        persist_event::<UsdcRebalance>(
             &pool,
             &rebalance_id,
             1,
@@ -794,7 +799,7 @@ mod tests {
             },
         )
         .await;
-        persist::<BotGasReceiptCost>(
+        persist_event::<BotGasReceiptCost>(
             &pool,
             &gas_id,
             1,
@@ -803,7 +808,7 @@ mod tests {
         .await;
 
         let ledger = PnlLedger::new(pool.clone());
-        let head = ledger.catch_up().await.unwrap();
+        let LedgerHead(head) = ledger.catch_up().await.unwrap();
 
         assert_eq!(head, head_rowid(&pool).await.unwrap());
         assert_eq!(ledger.checkpoint().await.unwrap(), head);
@@ -872,7 +877,7 @@ mod tests {
     #[tokio::test]
     async fn catch_up_is_idempotent() {
         let pool = setup_test_db().await;
-        persist::<Position>(&pool, "AAPL", 1, &onchain_fill(1, 0)).await;
+        persist_event::<Position>(&pool, "AAPL", 1, &onchain_fill(1, 0)).await;
 
         let ledger = PnlLedger::new(pool.clone());
         let first_head = ledger.catch_up().await.unwrap();
@@ -889,7 +894,7 @@ mod tests {
     async fn small_batches_page_through_mixed_streams() {
         let pool = setup_test_db().await;
         let mint_id = Uuid::new_v4().to_string();
-        persist::<TokenizedEquityMint>(
+        persist_event::<TokenizedEquityMint>(
             &pool,
             &mint_id,
             1,
@@ -902,7 +907,7 @@ mod tests {
         )
         .await;
         for sequence in 1..=5 {
-            persist::<Position>(
+            persist_event::<Position>(
                 &pool,
                 "AAPL",
                 sequence,
@@ -910,7 +915,7 @@ mod tests {
             )
             .await;
         }
-        persist::<TokenizedEquityMint>(
+        persist_event::<TokenizedEquityMint>(
             &pool,
             &mint_id,
             2,
@@ -924,7 +929,7 @@ mod tests {
         .await;
 
         let ledger = PnlLedger::with_batch_size(pool.clone(), NonZeroU32::new(2).unwrap());
-        let head = ledger.catch_up().await.unwrap();
+        let LedgerHead(head) = ledger.catch_up().await.unwrap();
 
         assert_eq!(ledger.checkpoint().await.unwrap(), head);
         assert_eq!(count(&pool, "pnl_onchain_fill").await, 5);
@@ -940,16 +945,16 @@ mod tests {
     #[tokio::test]
     async fn version_mismatch_truncates_and_rebuilds() {
         let pool = setup_test_db().await;
-        persist::<Position>(&pool, "AAPL", 1, &onchain_fill(1, 0)).await;
+        persist_event::<Position>(&pool, "AAPL", 1, &onchain_fill(1, 0)).await;
 
         let ledger = PnlLedger::new(pool.clone());
-        let head = ledger.catch_up().await.unwrap();
+        let LedgerHead(head) = ledger.catch_up().await.unwrap();
         sqlx::query("UPDATE pnl_ledger_checkpoint SET ledger_version = 99 WHERE id = 1")
             .execute(&pool)
             .await
             .unwrap();
 
-        let rebuilt_head = ledger.catch_up().await.unwrap();
+        let LedgerHead(rebuilt_head) = ledger.catch_up().await.unwrap();
 
         assert_eq!(rebuilt_head, head);
         assert_eq!(count(&pool, "pnl_onchain_fill").await, 1);
@@ -967,7 +972,7 @@ mod tests {
         let pool = setup_test_db().await;
         let unreported_mint = Uuid::new_v4().to_string();
         let zero_fee_mint = Uuid::new_v4().to_string();
-        persist::<TokenizedEquityMint>(
+        persist_event::<TokenizedEquityMint>(
             &pool,
             &unreported_mint,
             1,
@@ -979,7 +984,7 @@ mod tests {
             },
         )
         .await;
-        persist::<TokenizedEquityMint>(
+        persist_event::<TokenizedEquityMint>(
             &pool,
             &zero_fee_mint,
             1,
@@ -1007,8 +1012,8 @@ mod tests {
     #[tokio::test]
     async fn duplicate_business_events_are_distinct_rows() {
         let pool = setup_test_db().await;
-        persist::<Position>(&pool, "AAPL", 1, &onchain_fill(7, 0)).await;
-        persist::<Position>(&pool, "AAPL", 2, &onchain_fill(7, 1)).await;
+        persist_event::<Position>(&pool, "AAPL", 1, &onchain_fill(7, 0)).await;
+        persist_event::<Position>(&pool, "AAPL", 2, &onchain_fill(7, 1)).await;
 
         PnlLedger::new(pool.clone()).catch_up().await.unwrap();
 
@@ -1069,6 +1074,47 @@ mod tests {
         );
     }
 
+    /// A row the schema rejects must fail ingestion loudly and pin the
+    /// checkpoint -- never be skipped with the checkpoint advancing past it,
+    /// which would permanently drop a committed event from the ledger. No
+    /// typed event can violate today's schema, so the test simulates future
+    /// ingester/schema drift by rebuilding the fill table with a CHECK no
+    /// real direction satisfies before ingesting a genuine event. This is
+    /// what `ON CONFLICT(event_rowid) DO NOTHING` buys over
+    /// `INSERT OR IGNORE`: only duplicate rowids no-op; constraint
+    /// violations abort the batch.
+    #[tokio::test]
+    async fn constraint_violating_row_fails_ingestion_without_advancing_checkpoint() {
+        let pool = setup_test_db().await;
+        sqlx::query("DROP TABLE pnl_onchain_fill")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE pnl_onchain_fill (
+                 event_rowid INTEGER PRIMARY KEY,
+                 symbol TEXT NOT NULL,
+                 tx_hash TEXT NOT NULL,
+                 log_index INTEGER NOT NULL,
+                 shares TEXT NOT NULL,
+                 direction TEXT NOT NULL CHECK (direction IN ('Neither')),
+                 price_usd TEXT NOT NULL,
+                 executed_at TEXT NOT NULL
+             ) STRICT",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        persist_event::<Position>(&pool, "AAPL", 1, &onchain_fill(7, 0)).await;
+
+        let ledger = PnlLedger::new(pool.clone());
+        let error = ledger.catch_up().await.unwrap_err();
+
+        assert!(matches!(error, PnlLedgerError::Database(_)));
+        assert_eq!(ledger.checkpoint().await.unwrap(), 0);
+        assert_eq!(count(&pool, "pnl_onchain_fill").await, 0);
+    }
+
     /// An invalid persisted gas cost fails ingestion closed: the batch rolls
     /// back and the checkpoint does not advance, so the failure is loud and
     /// re-hit until fixed rather than silently skipped.
@@ -1078,7 +1124,7 @@ mod tests {
         let mut cost = gas_cost();
         cost.usd_cost = Usd::new(float!(0));
         let gas_id = format!("base:{}", cost.tx_hash);
-        persist::<BotGasReceiptCost>(
+        persist_event::<BotGasReceiptCost>(
             &pool,
             &gas_id,
             1,
