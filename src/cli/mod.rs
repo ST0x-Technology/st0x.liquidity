@@ -68,8 +68,9 @@ pub enum TransferType {
 
 /// Why an operator is reconciling a stuck post-burn USDC transfer.
 ///
-/// CLI-facing mirror of [`crate::usdc_rebalance::ReconcileReason`]; mapped to
-/// the domain enum in the command handler so clap stays out of the aggregate.
+/// CLI-facing mirror of the crate-internal `usdc_rebalance::ReconcileReason`;
+/// mapped to the domain enum in the command handler so clap stays out of the
+/// aggregate.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ReconcileReasonArg {
     /// The minted USDC was moved to its destination manually.
@@ -358,7 +359,7 @@ pub enum Commands {
         /// Issuer request id for mint resume (printed by a fresh to-raindex run)
         #[arg(long = "issuer-request-id")]
         issuer_request_id: Option<Uuid>,
-        /// Alpaca redemption wallet (overrides [tokenization] config)
+        /// Alpaca redemption wallet (overrides the tokenization config section)
         #[arg(long = "redemption-wallet")]
         redemption_wallet: Option<Address>,
     },
@@ -668,7 +669,7 @@ pub enum Commands {
         /// Number of shares to redeem (supports fractional shares)
         #[arg(short = 'q', long = "quantity")]
         quantity: FractionalShares,
-        /// Alpaca redemption wallet (overrides [tokenization] config)
+        /// Alpaca redemption wallet (overrides the tokenization config section)
         #[arg(long = "redemption-wallet")]
         redemption_wallet: Option<Address>,
         /// Target network for the redemption (selects the wallet that sends

@@ -453,9 +453,9 @@ pub enum OffchainOrder {
         market_session: MarketSession,
     },
     /// `shares` carries the broker-accepted quantity for orders placed after the
-    /// durable-job extraction (built from [`OffchainOrderEvent::Accepted`]'s
+    /// durable-job extraction (built from `OffchainOrderEvent::Accepted`'s
     /// `placed_shares`), but the originally-requested quantity for pre-extraction
-    /// orders that replay the legacy [`OffchainOrderEvent::Submitted`] event. The
+    /// orders that replay the legacy `OffchainOrderEvent::Submitted` event. The
     /// two can differ when the broker truncated to its precision; consumers that
     /// compare fills against `shares` should treat the legacy value as the
     /// request, not a guaranteed broker-accepted amount.

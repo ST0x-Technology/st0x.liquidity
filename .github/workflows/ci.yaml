@@ -129,14 +129,19 @@ jobs:
           save-if: ${{ env.UNTRUSTED_PR != 'true' }}
 
       # Build the test binaries once into a nextest archive shared by all four
-      # partitions, and run clippy here since this is the single full compile.
-      - name: Build nextest archive and run clippy
+      # partitions, and run clippy and rustdoc here since this is the single
+      # full compile.
+      - name: Build nextest archive, run clippy and docs
         run: |
           nix develop .#ci-backend -c bash -c "
             set -euxo pipefail
             cargo nextest archive --workspace --all-features --profile ci \
               --archive-file \"\$RUNNER_TEMP/nextest-archive.tar.zst\"
             cargo clippy --workspace --all-targets --all-features
+            # rain-math-float is upstream source nix materializes under .tmp/,
+            # so it is a workspace member we do not own; exclude it rather than
+            # gate CI on its rustdoc warnings.
+            cargo doc --workspace --no-deps --all-features --exclude rain-math-float
             # compile_fail_tests (trybuild) shells out to cargo at run time, so
             # run it here where the workspace build cache is warm. The archive
             # partitions only carry prebuilt binaries and would compile it cold.

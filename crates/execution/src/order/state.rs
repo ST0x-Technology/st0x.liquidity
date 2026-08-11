@@ -12,7 +12,7 @@ use super::OrderStatus;
 /// the original order can still fill, which lets a retry hedge the same position
 /// twice.
 ///
-/// See Alpaca's order lifecycle (https://docs.alpaca.markets/docs/orders-at-alpaca).
+/// See Alpaca's order lifecycle (<https://docs.alpaca.markets/docs/orders-at-alpaca>).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderFailureTerminality {
     Terminal,

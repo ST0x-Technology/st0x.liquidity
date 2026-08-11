@@ -20,16 +20,15 @@
 //!   `submit::TxSubmitter::pending_nonce`'s doc comment), so the send
 //!   would be accepted and merely queue behind it, and the replacement
 //!   would never happen.
-//! - [`set_next_nonce()`] seeds the cache with a known-good nonce,
-//!   skipping the re-fetch entirely. Nonce-too-low recovery in
-//!   `submit::retry_after_nonce_too_low` uses this to seed a
+//! - `set_next_nonce()` (crate-internal) seeds the cache with a
+//!   known-good nonce, skipping the re-fetch entirely. Nonce-too-low
+//!   recovery in `submit::retry_after_nonce_too_low` uses this to seed a
 //!   pending-aware target nonce it computes itself (the higher of the
 //!   node's reported next nonce and its own `pending` read), since the
 //!   cold-cache re-fetch above intentionally stays on `latest`.
 //!
 //! [`CachedNonceManager`]: alloy::providers::fillers::CachedNonceManager
 //! [`invalidate()`]: ResettableNonceManager::invalidate
-//! [`set_next_nonce()`]: ResettableNonceManager::set_next_nonce
 
 use alloy::network::Network;
 use alloy::primitives::Address;
