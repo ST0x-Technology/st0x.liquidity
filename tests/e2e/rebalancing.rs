@@ -2361,6 +2361,11 @@ async fn inflight_state_survives_restart() -> anyhow::Result<()> {
 
     // Stop the first bot.
     bot1.abort();
+    let join_error = bot1.await.unwrap_err();
+    assert!(
+        join_error.is_cancelled(),
+        "First bot should be cancelled, got: {join_error}"
+    );
     // Allow the abort to propagate and release the database.
     tokio::time::sleep(Duration::from_secs(1)).await;
 
