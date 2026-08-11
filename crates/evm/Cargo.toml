@@ -13,6 +13,12 @@ turnkey = [
   "dep:turnkey_client",
   "dep:turnkey_api_key_stamper",
   "dep:mime",
+  # KMS-stamped (keyless) Turnkey authentication: base64/sha2 for the
+  # AsymmetricSign round-trip, p256 to parse/compress the public key and
+  # verify KMS signatures before use.
+  "dep:base64",
+  "dep:p256",
+  "dep:sha2",
 ]
 test-support = ["dep:url"]
 
@@ -20,9 +26,12 @@ test-support = ["dep:url"]
 alloy.workspace = true
 anyhow = { workspace = true, optional = true }
 async-trait.workspace = true
+base64 = { workspace = true, optional = true }
 dashmap = "6.1.0"
 futures = "0.3.32"
 mime = { version = "0.3.17", optional = true }
+p256 = { version = "0.13", features = ["ecdsa", "pem"], optional = true }
+sha2 = { version = "0.10", optional = true }
 rain-error-decoding.workspace = true
 reqwest = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }

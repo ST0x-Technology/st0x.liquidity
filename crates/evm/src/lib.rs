@@ -54,6 +54,8 @@ mod submit;
 #[cfg(feature = "local-signer")]
 pub mod local;
 #[cfg(feature = "turnkey")]
+pub mod gcp_kms_stamper;
+#[cfg(feature = "turnkey")]
 pub mod turnkey;
 
 #[cfg(feature = "mock")]

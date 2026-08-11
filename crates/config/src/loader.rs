@@ -873,7 +873,16 @@ fn parse_and_validate(
     // Validate wallet config/secrets pairing and required RPC URLs.
     // Actual wallet construction (async, connects to RPC) is deferred.
     let (wallet_inputs, wallet_meta) = match (config.wallet, secrets.wallet) {
-        (Some(wallet_config), Some(wallet_secrets)) => {
+        // A KMS-stamped Turnkey wallet ([wallet].kms_api_key in config)
+        // needs no [wallet] secrets: its "API key" is an IAM-gated KMS
+        // key, not stored material — an empty secrets table stands in.
+        // Backends that DO need credentials still fail crisply via
+        // WalletSecretsMissing below.
+        (Some(wallet_config), wallet_secrets)
+            if wallet_secrets.is_some() || wallet_config.get("kms_api_key").is_some() =>
+        {
+            let wallet_secrets =
+                wallet_secrets.unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
             let Some(base_url) = base_rpc_url else {
                 return Err(CtxError::WalletMissingRpcUrl {
                     field: "base_rpc_url",
@@ -3625,6 +3634,76 @@ mod tests {
         assert!(
             matches!(result, Err(CtxError::WalletSecretsMissing)),
             "Expected WalletSecretsMissing error, got {result:?}"
+        );
+    }
+
+    /// A KMS-stamped Turnkey wallet ([wallet].kms_api_key in config)
+    /// must pass config/secrets pairing WITHOUT a [wallet] secrets
+    /// section — the credential is an IAM-gated KMS key, not stored
+    /// material. Construction proceeds to the (deferred) wallet build,
+    /// which fails on the unreachable RPC here — the assertion is only
+    /// that the pairing gate no longer rejects the shape.
+    #[tokio::test]
+    async fn kms_turnkey_wallet_needs_no_wallet_secrets() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+
+            [assets.equities]
+            target_ratio = 0.5
+            ratio_deviation = 0.2
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory_adapters = []
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+
+            [broker]
+            counter_trade_slippage_bps = 100
+            extended_hours_reprice_timeout_secs = 300
+            extended_hours_close_flatten_window_secs = 900
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Corp"
+
+            [wallet]
+            kind = "turnkey"
+            address = "0x0000000000000000000000000000000000000001"
+            organization_id = "org-test"
+            kms_api_key = "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1"
+        "#,
+        );
+
+        let secrets = toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:1"
+            base_rpc_url = "http://localhost:1"
+            ethereum_rpc_url = "http://localhost:1"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+        "#,
+        );
+
+        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        assert!(
+            !matches!(result, Err(CtxError::WalletSecretsMissing)),
+            "KMS-stamped wallet must not require [wallet] secrets, got {result:?}"
         );
     }
 
