@@ -1,0 +1,127 @@
+name: build-oci
+
+# Liquidity bot + dashboard OCI images → t0-artifacts Artifact Registry
+# (t0-liquidity repo), mirroring st0x.bebop's deploy-cloudrun.yml: nix build
+# the flake's dockerTools images → push digests → sign (GitHub/Sigstore +
+# the t0-artifacts liquidity-image KMS attestor). NO deploy job: the staging
+# GCE VM rolls by pulling t0.devops terraform/staging-liquidity/images.yaml
+# state and verifying the attestation itself — promoting a digest is a PR
+# there, not a push here.
+#
+# Auth: GitHub OIDC → the t0-artifacts WIF provider, bound to
+# liquidity-deployer (master only — the WIF binding lives in t0.devops
+# terraform/production-artifacts/liquidity.tf). PRs get nothing.
+#
+# Coexists with deploy-staging.yaml / deploy-prod.yaml (the DO droplet
+# deploy-rs path) until the staging cutover retires the staging half.
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch: {}
+
+concurrency:
+  group: build-oci
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  # GitHub/Sigstore provenance attestation on every pushed digest.
+  attestations: write
+
+env:
+  REGION: europe-west3
+  AR_REPO: europe-west3-docker.pkg.dev/t0-artifacts/t0-liquidity
+  # t0-artifacts hub WIF provider (same as oracle/pricing/bebop;
+  # st0x.liquidity is admitted via extra_repos, bound to liquidity-deployer).
+  WIF_PROVIDER: projects/684788085322/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+  DEPLOYER_SA: liquidity-deployer@t0-artifacts.iam.gserviceaccount.com
+  ATTESTOR: projects/t0-artifacts/attestors/liquidity-image
+  ATTESTOR_KEY: projects/t0-artifacts/locations/europe-west3/keyRings/attestors/cryptoKeys/liquidity-image-attestor/cryptoKeyVersions/1
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - package: bot-oci
+            local_name: t0-liquidity
+            image: t0-liquidity
+          - package: dashboard-oci
+            local_name: t0-liquidity-dashboard
+            image: t0-liquidity-dashboard
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+
+      - uses: nixbuild/nix-quick-install-action@v30
+        with:
+          nix_conf: |
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-oci-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-oci-${{ runner.os }}-
+          gc-max-store-size-linux: 10G
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          # `container binauthz` lives in the beta component.
+          install_components: beta
+
+      - name: Configure docker for Artifact Registry
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Build OCI image from the flake
+        run: |
+          set -euo pipefail
+          nix build .#${{ matrix.package }}
+          # streamLayeredImage output is a script that streams the tar.
+          ./result | docker load
+          docker tag "${{ matrix.local_name }}:latest" "${AR_REPO}/${{ matrix.image }}:${GITHUB_SHA}"
+
+      - name: Push image and resolve digest
+        id: push
+        run: |
+          set -euo pipefail
+          docker push "${AR_REPO}/${{ matrix.image }}:${GITHUB_SHA}"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${AR_REPO}/${{ matrix.image }}:${GITHUB_SHA}")
+          echo "Pushed: ${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${DIGEST##*@}" >> "$GITHUB_OUTPUT"
+
+      # Two independent provenance proofs (bebop/oracle rationale): the
+      # GitHub/Sigstore attestation is non-blocking (needs a paid plan on
+      # private repos); the KMS/BinAuthz attestation below is the one the
+      # VM's roll timer actually verifies and MUST succeed.
+      - name: Attest build provenance (GitHub / Sigstore)
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.AR_REPO }}/${{ matrix.image }}
+          subject-digest: ${{ steps.push.outputs.sha256 }}
+
+      - name: Sign Binary Authorization attestation
+        run: |
+          set -euo pipefail
+          gcloud beta container binauthz attestations sign-and-create \
+            --project="t0-artifacts" \
+            --artifact-url="${{ steps.push.outputs.digest }}" \
+            --attestor="${ATTESTOR}" \
+            --keyversion="${ATTESTOR_KEY}"

@@ -360,7 +360,7 @@
                 '';
               };
 
-            others = {
+            others = rec {
               inherit (rust)
                 st0x-dto
                 st0x-liquidity
@@ -373,6 +373,19 @@
                 inherit bun2nix;
                 inherit (rust) st0x-dto;
               };
+
+              # OCI images for the GCP staging VM (pushed + attested to
+              # t0-artifacts by build-oci.yml; consumed by t0.devops
+              # terraform/staging-liquidity). See nix/oci-images.nix for the
+              # image contract.
+              inherit
+                (import ./nix/oci-images.nix {
+                  inherit pkgs st0x-dashboard;
+                  inherit (rust) st0x-liquidity;
+                })
+                bot-oci
+                dashboard-oci
+                ;
 
               ci = pkgs.writeShellApplication {
                 name = "ci";
