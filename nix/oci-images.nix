@@ -32,7 +32,7 @@ let
 
   dashboardRoot = pkgs.runCommand "st0x-dashboard-root" { } ''
     mkdir -p $out/usr/share
-    cp -r ${st0x-dashboard} $out/usr/share/st0x-dashboard
+    cp -r ${st0x-dashboard} $out/usr/share/t0-liquidity-dashboard
   '';
 
   # Same proxy surface as os.nix's virtualHost locations, addressed to the
@@ -59,7 +59,7 @@ let
 
       server {
         listen 80;
-        root /usr/share/st0x-dashboard;
+        root /usr/share/t0-liquidity-dashboard;
 
         location / {
           try_files $uri $uri/ /index.html;
