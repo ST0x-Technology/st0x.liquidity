@@ -658,7 +658,7 @@
                                 href={getExplorerTxUrl(value)}
                                 target="_blank"
                                 rel="noopener noreferrer"
-                                class="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300"
+                                class="inline-flex items-center gap-1 text-blue-600 hover:text-blue-500 dark:text-blue-400 dark:hover:text-blue-300"
                               >
                                 {value.slice(0, 10)}...{value.slice(-8)}
                                 <svg
@@ -682,7 +682,7 @@
                                   href={getExplorerTxUrl(txHash)}
                                   target="_blank"
                                   rel="noopener noreferrer"
-                                  class="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300"
+                                  class="inline-flex items-center gap-1 text-blue-600 hover:text-blue-500 dark:text-blue-400 dark:hover:text-blue-300"
                                 >
                                   {txHash.slice(0, 10)}...{txHash.slice(-8)}
                                   <svg
