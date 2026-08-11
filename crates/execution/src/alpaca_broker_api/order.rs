@@ -2580,6 +2580,64 @@ mod tests {
         assert_eq!(order.status_display(), "filled");
     }
 
+    /// A conversion order that partially fills and then stops progressing must
+    /// reach a decision -- accept the filled portion or fail -- rather than
+    /// polling indefinitely.
+    ///
+    /// `PartiallyFilled` is never named in `poll_crypto_order_until_filled`'s
+    /// match, so it falls into the catch-all arm that means "not done yet, keep
+    /// waiting" alongside `New` and `Accepted`. Those two are genuinely
+    /// not-started; a stalled partial fill is not, and grouping them is what
+    /// makes the loop unable to exit. Nothing bounds it on the Alpaca-to-Base
+    /// transfer path (that job deliberately carries no per-attempt timeout,
+    /// unlike its Base-to-Alpaca counterpart), so the single-concurrency worker
+    /// and the in-flight USDC rebalance guard wedge with no error, no terminal
+    /// event, and no operator alert.
+    #[tokio::test]
+    async fn partially_filled_conversion_order_must_not_poll_forever() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let order_id = uuid!("61e7b016-9c91-4a97-b912-615c9d365c9d");
+
+        // The broker reports a stalled partial fill: 300 of 500 USDC bought,
+        // the remainder unfillable inside the collar, order still open. Every
+        // poll returns this same snapshot.
+        server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": order_id.to_string(),
+                    "symbol": "USDCUSD",
+                    "qty": "500",
+                    "side": "buy",
+                    "status": "partially_filled",
+                    "filled_avg_price": "1.0001",
+                    "filled_qty": "300",
+                    "created_at": "2025-01-06T12:30:00Z"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        // The loop polls every 500ms, so this allows several passes before
+        // concluding it will never stop on its own.
+        let Ok(_decision) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            poll_crypto_order_until_filled(&client, order_id),
+        )
+        .await
+        else {
+            panic!(
+                "poll_crypto_order_until_filled never returned for a stalled \
+                 PartiallyFilled order: it polls forever instead of resolving, \
+                 leaving the conversion with no terminal state"
+            );
+        };
+    }
+
     #[tokio::test]
     async fn test_convert_usdc_usd_rejects_excess_precision() {
         let server = MockServer::start();
