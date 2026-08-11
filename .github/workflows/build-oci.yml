@@ -61,14 +61,29 @@ jobs:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
 
-      - uses: nixbuild/nix-quick-install-action@v30
+      # Same nix setup as ci.yaml, for the same reason its comment records:
+      # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
+      # (`cannot find flake 'flake:foundry'`); fixed in 2.30. v30 of this
+      # action only shipped up to 2.26 — pin a working release.
+      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035 # v34
         with:
+          nix_version: "2.31.2"
           nix_conf: |
+            accept-flake-config = true
+            fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
             keep-env-derivations = true
             keep-outputs = true
 
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        continue-on-error: true
+        with:
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+
       - name: Restore and save Nix store
-        uses: nix-community/cache-nix-action@v6
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
         with:
           primary-key: nix-oci-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock', 'Cargo.lock') }}
           restore-prefixes-first-match: nix-oci-${{ runner.os }}-
