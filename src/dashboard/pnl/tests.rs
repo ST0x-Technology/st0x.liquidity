@@ -1676,15 +1676,43 @@ fn wrong_typed_tokenization_fee_decimals_fail_the_report() {
     ));
 }
 
+/// `TokensReceived.fees` is `Option<Float>` in the event schema ("if
+/// reported"), so persisted events legitimately carry `fees: null`. The
+/// report must treat that as a missing cost observation -- skipping the
+/// entry and counting it -- not fail wholesale, which blanks /pnl for as
+/// long as the event exists.
 #[test]
-fn missing_tokenization_fee_fields_fail_the_report() {
+fn null_tokenization_fees_are_missing_observations_not_fatal() {
+    let mut cost = tokenized_tokens_received(11, "mint-1", "0.25", "2026-05-15T12:02:00Z");
+    cost.payload["TokensReceived"]["fees"] = serde_json::json!(null);
+
+    let report = report_with_result(
+        Vec::new(),
+        position_rows(),
+        vec![tokenized_mint_requested(10, "mint-1", "RKLB"), cost],
+        Vec::new(),
+        query(),
+        BTreeSet::new(),
+    )
+    .unwrap();
+
+    assert_eq!(report.costs.tokenization_fees_usd, "0");
+    assert_eq!(report.cost_entries.len(), 0);
+    assert_eq!(report.costs.missing_cost_observation_count, 1);
+}
+
+/// Events persisted before the `fees` field existed deserialize through
+/// `#[serde(default)]` in the aggregate, so an absent key is the same
+/// "not reported" case as an explicit null.
+#[test]
+fn absent_tokenization_fees_are_missing_observations_not_fatal() {
     let mut missing_fees = tokenized_tokens_received(11, "mint-1", "0.25", "2026-05-15T12:02:00Z");
     missing_fees.payload["TokensReceived"]
         .as_object_mut()
         .unwrap()
         .remove("fees");
 
-    let error = report_with_result(
+    let report = report_with_result(
         Vec::new(),
         position_rows(),
         vec![tokenized_mint_requested(10, "mint-1", "RKLB"), missing_fees],
@@ -1692,16 +1720,15 @@ fn missing_tokenization_fee_fields_fail_the_report() {
         query(),
         BTreeSet::new(),
     )
-    .unwrap_err();
-    assert!(matches!(
-        error,
-        PnlError::MalformedPayload {
-            rowid: 11,
-            reason: "missing tokenization fees",
-            ..
-        }
-    ));
+    .unwrap();
 
+    assert_eq!(report.costs.tokenization_fees_usd, "0");
+    assert_eq!(report.cost_entries.len(), 0);
+    assert_eq!(report.costs.missing_cost_observation_count, 1);
+}
+
+#[test]
+fn missing_tokenization_fee_timestamp_fails_the_report() {
     let mut missing_timestamp =
         tokenized_tokens_received(12, "mint-2", "0.25", "2026-05-15T12:02:00Z");
     missing_timestamp.payload["TokensReceived"]
