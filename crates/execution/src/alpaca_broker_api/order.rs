@@ -793,6 +793,16 @@ fn validate_usdc_amount_for_alpaca_precision(amount: Float) -> Result<Float, Alp
     Ok(amount)
 }
 
+/// Multiplier for the USD that Alpaca reserves against a `USDCUSD` market buy.
+///
+/// Alpaca's documented 2% collar holds `quantity x price x 1.02` until fill,
+/// so callers sizing a buy from available cash must divide by this multiplier
+/// or the order is rejected with `403 40310000: insufficient balance`.
+///
+/// The extra 0.1% is a prod-observed margin: the hold tracks the ask, not par,
+/// and settled cash is all a crypto buy can draw on.
+pub const USDC_CONVERSION_COLLAR_MULTIPLIER: Float = float!(1.021);
+
 /// Convert USDC to/from USD on Alpaca.
 ///
 /// This uses the USDC/USD trading pair:
