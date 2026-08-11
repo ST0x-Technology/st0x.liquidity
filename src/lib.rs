@@ -162,6 +162,7 @@ pub(crate) struct AppState {
     pub(crate) recovery: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
     pub(crate) resume_lock: Arc<api::ResumeLock>,
     pub(crate) pnl_report_admission: dashboard::pnl::PnlReportAdmission,
+    pub(crate) pnl_ledger: Arc<dashboard::pnl::PnlLedger>,
     pub(crate) metrics_handle: PrometheusHandle,
 }
 
@@ -232,6 +233,11 @@ async fn run_bot_session_inner(
         apalis: apalis_pool,
     };
 
+    // One shared ledger instance: the conductor's boot catch-up/reactor and
+    // the /pnl handler's per-request catch-up serialize on its internal
+    // ingestion mutex instead of racing as separate ingesters.
+    let pnl_ledger = Arc::new(dashboard::pnl::PnlLedger::new(pools.cqrs.clone()));
+
     let state = AppState {
         ctx: ctx.clone(),
         pool: pools.cqrs.clone(),
@@ -241,16 +247,20 @@ async fn run_bot_session_inner(
         recovery: recovery_cell.clone(),
         resume_lock,
         pnl_report_admission: dashboard::pnl::pnl_report_admission(),
+        pnl_ledger: pnl_ledger.clone(),
         metrics_handle,
     };
     let server_supervisor = spawn_server_supervisor(state, &pools, main_listener, board_listener);
     let bot_task = tokio::spawn(Box::pin(run_conductor_session(
         ctx,
         pools,
-        event_sender,
-        inventory,
+        conductor::ServerHandles {
+            event_sender,
+            inventory,
+            recovery_cell,
+            pnl_ledger,
+        },
         shutdown_token.clone(),
-        recovery_cell,
         #[cfg(any(test, feature = "test-support"))]
         failure_injector,
     )));
@@ -512,10 +522,8 @@ fn check_bot_result(result: Result<anyhow::Result<()>, JoinError>) -> anyhow::Re
 async fn run_conductor_session(
     ctx: Ctx,
     pools: DatabasePools,
-    event_sender: broadcast::Sender<Statement>,
-    inventory: Arc<inventory::BroadcastingInventory>,
+    server: conductor::ServerHandles,
     shutdown_token: tokio_util::sync::CancellationToken,
-    recovery_cell: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> anyhow::Result<()> {
     let result = match ctx.broker.clone() {
@@ -526,10 +534,8 @@ async fn run_conductor_session(
                 MockExecutorCtx,
                 ctx,
                 pools,
-                event_sender,
-                inventory,
+                server,
                 shutdown_token,
-                recovery_cell,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector,
             ))
@@ -541,10 +547,8 @@ async fn run_conductor_session(
                 alpaca_auth,
                 ctx,
                 pools,
-                event_sender,
-                inventory,
+                server,
                 shutdown_token,
-                recovery_cell,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector,
             ))
@@ -745,13 +749,16 @@ mod tests {
         let error = Box::pin(run_conductor_session(
             ctx,
             DatabasePools {
-                cqrs: pool,
+                cqrs: pool.clone(),
                 apalis: apalis_pool,
             },
-            create_test_event_sender(),
-            create_test_inventory(),
+            conductor::ServerHandles {
+                event_sender: create_test_event_sender(),
+                inventory: create_test_inventory(),
+                recovery_cell: Arc::new(tokio::sync::OnceCell::new()),
+                pnl_ledger: Arc::new(dashboard::pnl::PnlLedger::new(pool)),
+            },
             tokio_util::sync::CancellationToken::new(),
-            Arc::new(tokio::sync::OnceCell::new()),
             FailureInjector::new(),
         ))
         .await
@@ -775,13 +782,16 @@ mod tests {
         let error = Box::pin(run_conductor_session(
             ctx,
             DatabasePools {
-                cqrs: pool,
+                cqrs: pool.clone(),
                 apalis: apalis_pool,
             },
-            create_test_event_sender(),
-            create_test_inventory(),
+            conductor::ServerHandles {
+                event_sender: create_test_event_sender(),
+                inventory: create_test_inventory(),
+                recovery_cell: Arc::new(tokio::sync::OnceCell::new()),
+                pnl_ledger: Arc::new(dashboard::pnl::PnlLedger::new(pool)),
+            },
             tokio_util::sync::CancellationToken::new(),
-            Arc::new(tokio::sync::OnceCell::new()),
             FailureInjector::new(),
         ))
         .await
