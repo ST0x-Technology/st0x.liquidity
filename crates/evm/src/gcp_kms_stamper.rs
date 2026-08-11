@@ -42,7 +42,8 @@ const STAMP_HEADER_NAME: &str = "X-Stamp";
 const SIGNATURE_SCHEME_P256: &str = "SIGNATURE_SCHEME_TK_API_P256";
 
 const DEFAULT_KMS_BASE_URL: &str = "https://cloudkms.googleapis.com/v1";
-const METADATA_TOKEN_URL: &str = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+const METADATA_TOKEN_URL: &str =
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
 
 /// The algorithm the KMS key version must carry: ECDSA on P-256 over a
 /// SHA-256 digest — exactly what a Turnkey P-256 API-key stamp is.
@@ -309,13 +310,12 @@ mod tests {
     use httpmock::MockServer;
     use p256::ecdsa::SigningKey;
     use p256::ecdsa::signature::hazmat::PrehashSigner;
-    use p256::pkcs8::EncodePublicKey;
     use p256::elliptic_curve::rand_core::OsRng;
+    use p256::pkcs8::EncodePublicKey;
 
     use super::*;
 
-    const KEY_VERSION: &str =
-        "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1";
+    const KEY_VERSION: &str = "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1";
 
     fn test_signing_key() -> SigningKey {
         SigningKey::random(&mut OsRng)
@@ -350,7 +350,7 @@ mod tests {
         });
     }
 
-    async fn stamper_for(server: &MockServer, key: &SigningKey) -> GcpKmsStamper {
+    async fn stamper_for(server: &MockServer) -> GcpKmsStamper {
         GcpKmsStamper::with_endpoints(
             KEY_VERSION.to_string(),
             server.base_url(),
@@ -388,7 +388,7 @@ mod tests {
         let body = br#"{"type":"ACTIVITY_TYPE_SIGN_TRANSACTION_V2"}"#;
         mock_sign_endpoint(&server, &key, body);
 
-        let stamper = stamper_for(&server, &key).await;
+        let stamper = stamper_for(&server).await;
         let StampHeader { name, value } = stamper.stamp(body).await.expect("stamp should succeed");
 
         assert_eq!(name, "X-Stamp");
@@ -413,8 +413,7 @@ mod tests {
                 .expect("signature must be a string"),
         )
         .expect("signature must be hex");
-        let signature =
-            P256Signature::from_der(&der).expect("signature must be DER");
+        let signature = P256Signature::from_der(&der).expect("signature must be DER");
         key.verifying_key()
             .verify(body, &signature)
             .expect("stamp signature must verify over the body");
@@ -430,16 +429,13 @@ mod tests {
         // the body being stamped — the pre-send verification must refuse.
         mock_sign_endpoint(&server, &key, b"something else entirely");
 
-        let stamper = stamper_for(&server, &key).await;
+        let stamper = stamper_for(&server).await;
         let error = stamper
             .stamp(b"the actual request body")
             .await
             .expect_err("mismatched signature must be refused");
 
-        assert!(matches!(
-            error,
-            GcpKmsStamperError::SignatureVerification
-        ));
+        assert!(matches!(error, GcpKmsStamperError::SignatureVerification));
     }
 
     #[tokio::test]
@@ -504,8 +500,8 @@ mod tests {
     #[ignore = "requires GOOGLE_OAUTH_ACCESS_TOKEN + TURNKEY_KMS_KEY_VERSION -- run with `cargo test -- --ignored`"]
     #[tokio::test]
     async fn kms_integration() {
-        let key_version = std::env::var("TURNKEY_KMS_KEY_VERSION")
-            .expect("TURNKEY_KMS_KEY_VERSION must be set");
+        let key_version =
+            std::env::var("TURNKEY_KMS_KEY_VERSION").expect("TURNKEY_KMS_KEY_VERSION must be set");
 
         let stamper = GcpKmsStamper::new(key_version)
             .await

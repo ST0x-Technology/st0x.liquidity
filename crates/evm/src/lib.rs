@@ -51,10 +51,10 @@ mod inflight_nonces;
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 mod submit;
 
-#[cfg(feature = "local-signer")]
-pub mod local;
 #[cfg(feature = "turnkey")]
 pub mod gcp_kms_stamper;
+#[cfg(feature = "local-signer")]
+pub mod local;
 #[cfg(feature = "turnkey")]
 pub mod turnkey;
 
