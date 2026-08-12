@@ -395,10 +395,15 @@ the broker calendar:
 - **Regular** — standard hours; counter-trades place market orders.
 - **Extended** — pre-market or after-hours; the broker accepts only limit orders
   flagged `extended_hours = true`. Outside close-flatten mode, counter-trades
-  place a limit order priced from the latest trade price plus a configured
-  slippage buffer (`counter_trade_slippage_bps`). Rounding favors fill
-  probability (buys round up, sells round down) and honors the broker's minimum
-  price variance (penny increments at or above $1.00, sub-penny below).
+  use the same optional-primary-quote, mark, delayed-quote chain as close
+  flattening, plus a configured slippage buffer (`counter_trade_slippage_bps`).
+  With no primary provider wired, the mark replaces the market-data latest trade
+  because the latter resolves to the plan's default feed, which stops updating
+  between roughly 16:00 and 16:40 ET; pricing off it meant every hedge from then
+  until the 20:00 ET close used a frozen reference and silently failed to fill
+  whenever the market moved past the buffer. Rounding favors fill probability
+  (buys round up, sells round down) and honors the broker's minimum price
+  variance (penny increments at or above $1.00, sub-penny below).
 - **Closed** — outside all sessions (overnight, weekends, holidays); no order is
   placed. The exposure is left for the next scan to hedge once the venue
   reopens, rather than failing a durable job against a multi-hour closure.
@@ -447,20 +452,136 @@ placement:
   promptly. Partial fills are reconciled before cancellation; after the broker
   confirms the cancellation, every remaining broker-executable amount is
   released back to the position for retry.
-- Every hedge placed while the mode is active crosses the current NBBO and
-  applies the configured protection bound: buys use the current ask plus
-  `counter_trade_slippage_bps`, while sells use the current bid minus that
-  buffer. Buy prices round up and sell prices round down to Alpaca's allowed
-  tick. Quote requests explicitly select Alpaca's SIP feed so a
-  subscription-dependent default cannot silently substitute an IEX-only quote.
-  Missing SIP access and missing, non-positive, or crossed quotes are retryable
-  errors; the bot never falls back to a latest-trade or stale position price.
-- The existing `extended_hours_reprice_timeout_secs` remains active. With the
-  configured 300-second timeout and 900-second flatten window, an unfilled
-  aggressive hedge is cancelled, reconciled, and repriced from a fresh quote
-  approximately three times before close.
+- Every extended-hours hedge resolves its reference through one ordered chain:
+  an optional current bid/ask market-data source, then the **position mark**,
+  then the emergency delayed quote described below. Buys use the ask when the
+  primary quote is available; sells use the bid. The current deployment has no
+  entitled primary market-data source, so the optional source reports
+  unavailable and the effective reference remains the broker's `current_price`.
+  The source boundary is explicit so a future provider such as Alpaca SIP can be
+  added without changing the fallback contract or hedge orchestration. The mark
+  remains a fallback even after a primary source is added: a missing or failed
+  market-data lookup never prevents an otherwise priceable hedge. The selected
+  reference is crossed by a widening protection bound. Buys add the bound and
+  sells subtract it. Buy prices round up and sell prices round down to Alpaca's
+  allowed tick. See
+  [ADR 0019](adrs/0019-mark-priced-close-flatten-with-widening-cross.md).
+- The cross widens with elapsed time inside the window rather than applying one
+  flat band. It ramps linearly from `counter_trade_slippage_bps` at the window's
+  start to `close_flatten_cross_max_bps` at the extended-session close. The ramp
+  is anchored to the window, not to a per-order attempt count, so the cross is a
+  pure function of the window and the current time: restart-safe, identical
+  across retries, and independent of how many reprice cycles actually land. A
+  hedge that first becomes ready mid-window opens partway up the ramp, because
+  it has less time left to flatten. This converges toward a fill without needing
+  a real-time spread, which the bot cannot observe. An attempt that does not
+  fill is corrected only by a later, wider one, so the ceiling bounds how far
+  the bot will chase and a flatten can still end the session unfilled.
+- The `[broker]` close-flatten settings are required whenever extended-hours
+  broker windows are active: `extended_hours_close_flatten_window_secs`,
+  `close_flatten_cross_max_bps`, and `close_flatten_reprice_timeout_secs`. There
+  are no implicit defaults. Startup fails if any is missing, if the window or
+  timeout is zero or outside its supported range, or if
+  `close_flatten_cross_max_bps` is below `counter_trade_slippage_bps` or above
+  the global counter-trade slippage ceiling. The ordering constraint prevents a
+  ramp that narrows toward close.
+- When neither the optional primary source nor the mark supplies a reference,
+  the bot falls back to a quote on the `delayed_sip` feed. The emergency feed is
+  not configurable. It is the only value currently available that both answers
+  and returns a real consolidated book: `sip` is rejected without the
+  entitlement, and `iex` returns single-venue stub quotes once it stops trading.
+  Its quote is a genuine NBBO fifteen minutes old, and a wide but genuine quote
+  is crossed rather than refused, because refusing it would mean not flattening.
+- A missing, non-positive, crossed, or rejected result fails only its current
+  reference source. The resolver continues from the optional primary quote to
+  the position mark, then to the hardcoded `delayed_sip` quote. Only the error
+  selected after all three sources fail is scoped to the one symbol and raised
+  before the position is claimed. A permanent failure (any non-429 4xx) then
+  dead-letters the hedge attempt rather than retrying it in place: retrying a
+  rejection that an immediate retry cannot clear only consumes the shared retry
+  budget and can stop the process for every other symbol. A 429 follows the
+  bounded job reschedule policy under
+  [Broker rate-limit (429) backpressure](#broker-rate-limit-429-backpressure)
+  and does not consume the transient budget below. Transient failures --
+  transport errors, timeouts, and 5xx -- are re-driven on the hedge's own
+  durable budget instead: three re-drives at one, two, and four seconds, the
+  same cadence the shared worker budget would have given them. Abandoning a
+  transient failure at once would trade a full scan interval of unhedged
+  exposure for a saved second, but re-driving one forever would eventually stop
+  the process for every other symbol, so a symbol whose transient failure
+  outlives that budget dead-letters like a permanent one. A permanent cause
+  dead-letters at once and never spends the immediate transient budget, since
+  another request seconds later cannot change the answer. That dead-letter is an
+  observation and page, not suppression: the position scan deliberately attempts
+  the standing delta again on its next pass so recovery from an operator or
+  entitlement fix needs no restart. Alert deduplication prevents that periodic
+  retry from paging repeatedly for the same cause. Each dead-letter increments
+  `hedge_dead_lettered_total{symbol,reason}` and pages the operator once per
+  `(symbol, reason)`, since a dead-lettered hedge leaves a standing per-symbol
+  delta while the bot stays up; the position scan re-enqueues the hedge on its
+  next pass. The page for that exact `(symbol, reason)` is released once one of
+  the symbol's hedges reaches the broker again; other active reasons for the
+  symbol remain deduplicated independently. A feed regression that recurs a
+  later session therefore pages afresh rather than being silenced for the life
+  of the process, and a restart re-pages a failure that survived it. Initial-job
+  abandonment first reconciles any position claim that an earlier attempt of the
+  same job left outstanding. It records the dead-letter only after recovery
+  establishes that no broker order or claim remains. A pricing failure while
+  recovering an existing claimed order uses the same bounded
+  backpressure/transient budgets. Once that budget is exhausted, it dead-letters
+  the symbol but retains the claim under the pending offchain order. The
+  periodic recovery sweep owns the next recovery attempt, so the failure does
+  not stop every hedge worker. Dead-lettering is reached only after the optional
+  primary market-data source, the mark, and the hardcoded `delayed_sip` quote
+  feed have all failed, never on the first failed lookup: flattening before a
+  multi-day gap is mandatory, so a worse fill price is always preferred to no
+  fill.
+- An extended-hours buy the position scan drops before it can become a hedge job
+  -- because no reference price could be resolved for it, or because the cross
+  could not be applied -- is counted on
+  `hedge_scan_skipped_total{symbol,reason}`. The dead-letter counter cannot
+  report a job that never existed, so this is the per-symbol signal for a
+  standing delta the scan keeps skipping. A permanent or unclassified failed
+  reference-price lookup also pages the operator through the same
+  `(symbol, reason)` dedup the hedge dead-letter uses. A transient or
+  rate-limited failure remains counted but waits for the next scan rather than
+  paging on its first observation. Any page is released by the same successful
+  placement as a job-side dead-letter. Inside a close-flatten window, the same
+  skip also increments `close_flatten_blocked_total{symbol,reason}`. The former
+  is authoritative for all scan/immediate-path skips; the latter is the
+  close-flatten-only dashboard subset. They intentionally describe overlapping
+  populations and must not be summed.
+- Repricing uses two explicit cadences. The ordinary extended-hours
+  `extended_hours_reprice_timeout_secs` remains 300 seconds, preserving broker
+  time priority and avoiding repeated cancel/place calls at an unchanged flat
+  cross from 16:00 until the close-flatten window. Inside the window,
+  `close_flatten_reprice_timeout_secs` is configured to 60 seconds. An unfilled
+  aggressive hedge is repeatedly cancelled, reconciled, and repriced from a
+  fresh reference before close. Replacement occurs on a later position scan,
+  whose cadence is the separately configured `position_check_interval` (60
+  seconds in the shipped deployments), so the timeout alone does not determine
+  the number of attempts inside a window. Each later reprice samples the time
+  ramp further along, so it crosses wider than the one before it. Both timeout
+  fields are required whenever extended-hours broker windows are active; neither
+  cadence is an implicit fallback.
+- `close_flatten_outcomes_total{symbol,direction,outcome}` records terminal
+  broker-state dispatches for close-flatten placements, with `outcome` equal to
+  `filled`, `cancelled`, or `failed`. Evaluate attempt fill rate per
+  close-flatten window as `filled / (filled + cancelled + failed)`, aggregating
+  symbols and directions only when the operational question permits it. A
+  partial fill that later completes is `filled`; a partially filled order that
+  terminates cancelled or failed remains that terminal outcome and is not
+  share-weighted. Unfilled terminal outcomes therefore remain in the
+  denominator. Compare this rate with
+  `close_flatten_placements_total{symbol,direction,cross_bucket}` over the same
+  windows: concentration in the ceiling bucket together with a low fill rate is
+  the signal to evaluate raising `close_flatten_cross_max_bps`, while fills at
+  lower buckets argue against widening it. These are attempt-level operational
+  counters, not a unique-order ledger; delayed follow-up commits can cause a
+  terminal state to be observed more than once, so dashboards must use the same
+  observation semantics for numerator and denominator.
 - New onchain fills received while close-flatten mode is active use the same
-  quote-crossing placement path automatically.
+  mark-crossing placement path automatically.
 - If the extended session closes before a queued attempt runs, the session
   re-check prevents submitting an invalid extended-hours order.
 
