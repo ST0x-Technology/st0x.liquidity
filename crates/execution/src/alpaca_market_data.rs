@@ -8,9 +8,21 @@ use tracing::trace;
 
 use crate::rate_limit::retry_after_from_response_headers;
 use crate::{
-    Backpressure, LatestQuote, LatestQuoteError, Positive, Symbol, Usd,
+    Backpressure, LatestQuote, LatestQuoteError, Permanence, Positive, Symbol, Usd,
     deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
+    status_permanence,
 };
+
+/// The only market-data feed this account can price a quote against.
+///
+/// `sip` is rejected outright without a real-time SIP entitlement, which Broker
+/// API partners must arrange separately. `iex` answers, but it is a single
+/// venue that stops quoting around 16:00 ET and publishes stub books afterwards
+/// -- exactly when extended-hours hedging needs it. `delayed_sip` returns a real
+/// consolidated NBBO fifteen minutes old, which is the best quote available
+/// here. Not configurable: there is one correct value, and offering the others
+/// only creates a way to misconfigure the bot into losing money (ADR 0019).
+const QUOTE_FEED: &str = "delayed_sip";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AlpacaMarketDataError {
@@ -24,6 +36,13 @@ pub enum AlpacaMarketDataError {
     },
     #[error("failed to parse latest trade response: {0}")]
     JsonParse(#[from] serde_json::Error),
+    #[error("failed to parse latest quote response: {0}")]
+    LatestQuoteJsonParse(#[source] serde_json::Error),
+    #[error(
+        "latest quote endpoint returned {returned} when {requested} was requested; refusing to \
+         price from another symbol"
+    )]
+    LatestQuoteSymbolMismatch { requested: Symbol, returned: Symbol },
     #[error("latest trade response for {symbol} did not include a price")]
     MissingPrice { symbol: Symbol },
     #[error(
@@ -68,6 +87,8 @@ impl AlpacaMarketDataError {
             Self::ApiError { .. }
             | Self::Http(_)
             | Self::JsonParse(_)
+            | Self::LatestQuoteJsonParse(_)
+            | Self::LatestQuoteSymbolMismatch { .. }
             | Self::MissingPrice { .. }
             | Self::NonPositivePrice { .. }
             | Self::MissingQuote { .. }
@@ -76,6 +97,34 @@ impl AlpacaMarketDataError {
             | Self::NonPositiveBid { .. }
             | Self::NonPositiveAsk { .. }
             | Self::InvalidQuote { .. } => None,
+        }
+    }
+
+    /// Classifies whether an immediate retry of the same lookup can plausibly
+    /// succeed.
+    pub(crate) fn permanence(&self) -> Permanence {
+        match self {
+            Self::ApiError { status, .. } => status_permanence(*status),
+
+            // A malformed response is deterministic for the response that
+            // arrived and does not become usable by immediately parsing it
+            // again.
+            Self::JsonParse(_)
+            | Self::LatestQuoteJsonParse(_)
+            | Self::MissingPrice { .. }
+            | Self::NonPositivePrice { .. } => Permanence::Permanent,
+
+            // Transport failures can clear, and syntactically valid latest
+            // quotes are dynamic snapshots: a later request can carry a
+            // complete, positive, uncrossed book even when this one did not.
+            Self::Http(_)
+            | Self::LatestQuoteSymbolMismatch { .. }
+            | Self::MissingQuote { .. }
+            | Self::MissingBid { .. }
+            | Self::MissingAsk { .. }
+            | Self::NonPositiveBid { .. }
+            | Self::NonPositiveAsk { .. }
+            | Self::InvalidQuote { .. } => Permanence::Transient,
         }
     }
 }
@@ -96,6 +145,7 @@ struct LatestTrade {
 
 #[derive(Debug, Deserialize)]
 struct LatestQuoteEnvelope {
+    symbol: Symbol,
     quote: Option<LatestQuotePayload>,
 }
 
@@ -194,14 +244,18 @@ pub(crate) async fn fetch_latest_quote(
             .get(format!(
                 "{market_data_base_url}/v2/stocks/{symbol}/quotes/latest"
             ))
-            // Explicit SIP prevents Alpaca's subscription-dependent default
-            // from silently returning the single-exchange IEX quote instead
-            // of NBBO.
-            .query(&[("feed", "sip")]),
+            .query(&[("feed", QUOTE_FEED)]),
     )
     .await?;
 
-    let response: LatestQuoteEnvelope = serde_json::from_slice(&bytes)?;
+    let response: LatestQuoteEnvelope =
+        serde_json::from_slice(&bytes).map_err(AlpacaMarketDataError::LatestQuoteJsonParse)?;
+    if response.symbol != *symbol {
+        return Err(AlpacaMarketDataError::LatestQuoteSymbolMismatch {
+            requested: symbol.clone(),
+            returned: response.symbol,
+        });
+    }
     let quote = response
         .quote
         .ok_or_else(|| AlpacaMarketDataError::MissingQuote {
@@ -247,10 +301,10 @@ mod tests {
         server.mock(|when, then| {
             when.method(GET)
                 .path("/v2/stocks/AAPL/quotes/latest")
-                .query_param("feed", "sip");
+                .query_param("feed", "delayed_sip");
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!({ "quote": quote }));
+                .json_body(json!({ "symbol": "AAPL", "quote": quote }));
         });
 
         fetch_latest_quote(&client, &server.base_url(), &symbol).await
@@ -287,7 +341,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(GET)
                 .path("/v2/stocks/AAPL/quotes/latest")
-                .query_param("feed", "sip");
+                .query_param("feed", "delayed_sip");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -321,6 +375,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_latest_quote_rejects_a_response_for_another_symbol() {
+        let server = MockServer::start();
+        let client = Client::new();
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/stocks/AAPL/quotes/latest")
+                .query_param("feed", "delayed_sip");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "symbol": "TSLA",
+                    "quote": { "bp": "99.50", "ap": "100.25" }
+                }));
+        });
+
+        let error = fetch_latest_quote(&client, &server.base_url(), &symbol)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AlpacaMarketDataError::LatestQuoteSymbolMismatch {
+                requested,
+                returned,
+            } if requested == symbol && returned == Symbol::new("TSLA").unwrap()
+        ));
+    }
+
+    #[tokio::test]
     async fn fetch_latest_quote_rejects_missing_side() {
         let missing_bid = latest_quote_result(json!({ "ap": "100.25" }))
             .await
@@ -348,10 +433,10 @@ mod tests {
         server.mock(|when, then| {
             when.method(GET)
                 .path("/v2/stocks/AAPL/quotes/latest")
-                .query_param("feed", "sip");
+                .query_param("feed", "delayed_sip");
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!({}));
+                .json_body(json!({ "symbol": "AAPL" }));
         });
 
         let error = fetch_latest_quote(&client, &server.base_url(), &symbol)
@@ -533,7 +618,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(GET)
                 .path("/v2/stocks/AAPL/quotes/latest")
-                .query_param("feed", "sip");
+                .query_param("feed", "delayed_sip");
             then.status(403)
                 .header("content-type", "application/json")
                 .json_body(json!({ "message": "subscription does not permit SIP feed" }));
@@ -617,5 +702,68 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.backpressure(), None);
+    }
+
+    #[test]
+    fn api_error_permanence_splits_on_status() {
+        let api_error = |status| AlpacaMarketDataError::ApiError {
+            status,
+            body: "rejected".to_string(),
+            retry_after: None,
+        };
+
+        assert_eq!(
+            api_error(StatusCode::FORBIDDEN).permanence(),
+            Permanence::Permanent
+        );
+        assert_eq!(
+            api_error(StatusCode::INTERNAL_SERVER_ERROR).permanence(),
+            Permanence::Transient
+        );
+        assert_eq!(
+            api_error(StatusCode::TOO_MANY_REQUESTS).permanence(),
+            Permanence::Transient
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_quote_shape_errors_are_transient() {
+        let payloads = [
+            json!(null),
+            json!({ "ap": "100.25" }),
+            json!({ "bp": "100.00" }),
+            json!({ "bp": "0", "ap": "100.25" }),
+            json!({ "bp": "100.00", "ap": "0" }),
+            json!({ "bp": "100.26", "ap": "100.25" }),
+        ];
+
+        for payload in payloads {
+            let error = latest_quote_result(payload).await.unwrap_err();
+            assert_eq!(error.permanence(), Permanence::Transient, "{error:?}");
+        }
+    }
+
+    #[test]
+    fn quote_parse_errors_are_permanent_but_dynamic_failures_are_transient() {
+        let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let requested = Symbol::new("AAPL").unwrap();
+        let returned = Symbol::new("TSLA").unwrap();
+        let http_error = Client::new().get("://invalid").build().unwrap_err();
+
+        assert_eq!(
+            AlpacaMarketDataError::LatestQuoteJsonParse(json_error).permanence(),
+            Permanence::Permanent,
+            "a syntactically malformed response must match latest-trade classification"
+        );
+
+        for error in [
+            AlpacaMarketDataError::LatestQuoteSymbolMismatch {
+                requested,
+                returned,
+            },
+            AlpacaMarketDataError::Http(http_error),
+        ] {
+            assert_eq!(error.permanence(), Permanence::Transient, "{error:?}");
+        }
     }
 }

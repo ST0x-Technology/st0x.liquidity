@@ -196,6 +196,42 @@ pub struct Backpressure {
     pub retry_after: Option<Duration>,
 }
 
+/// Whether an Alpaca failure can plausibly resolve on an immediate retry.
+///
+/// Classified the same way as [`Backpressure`]: an inherent `.permanence()`
+/// on each Alpaca error type, so the decision is made at the type that owns
+/// the variant.
+///
+/// The distinction exists because a caller cannot infer it from the call
+/// site: one lookup can fail with an entitlement rejection the account will
+/// keep producing, or with a TCP reset that is gone a second later. Only the
+/// former is worth abandoning an attempt over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Permanence {
+    /// The same request against the same account fails the same way: a
+    /// deterministic 4xx rejection, or a failure decided locally from a
+    /// response that has already arrived.
+    Permanent,
+    /// Retrying can plausibly succeed: transport errors and timeouts, 5xx
+    /// server-side failures, and rate limiting.
+    Transient,
+}
+
+/// The one place that decides which HTTP statuses clear on their own: 5xx is
+/// server-side, 408 is a request timeout, and 429 is rate limiting, all of
+/// which can pass on a later attempt. Every other supported 4xx is the account
+/// or request itself being rejected. Shared by every Alpaca error type's
+/// `permanence()` so the policy cannot drift between them.
+pub(crate) fn status_permanence(status: reqwest::StatusCode) -> Permanence {
+    match status {
+        reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            Permanence::Transient
+        }
+        status if status.is_client_error() => Permanence::Permanent,
+        _ => Permanence::Transient,
+    }
+}
+
 #[async_trait]
 pub trait Executor: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
@@ -274,25 +310,19 @@ pub trait Executor: Send + Sync + 'static {
         Ok(CounterTradePreflight::Allowed { reservation: None })
     }
 
-    /// Checks whether a buy counter-trade can be submitted without relying
-    /// on margin, using `reference_price` (rather than the latest trade
-    /// price `preflight_counter_trade` fetches internally) as the cash
-    /// estimate's basis.
+    /// Checks whether a counter-trade can be submitted at an exact limit price
+    /// without relying on margin or short inventory.
     ///
-    /// Close-flatten buys submit a limit priced off the current ask, not the
-    /// latest trade, so the cash preflight for that path must check the same
-    /// reference the order will actually be priced against -- otherwise a
-    /// widening extended-hours spread can pass this check while the
-    /// submitted limit needs more buying power than was checked. Sell orders
-    /// are unaffected by price (inventory availability doesn't depend on
-    /// it), so callers can delegate to `preflight_counter_trade` for sells.
-    /// No default: every implementor must explicitly decide how to use
-    /// `reference_price` rather than silently inheriting a fallback that
-    /// ignores it.
+    /// The supplied buy price is already the order's hard cost ceiling, so
+    /// implementations must not add another slippage buffer. Sell orders are
+    /// unaffected by price because inventory availability does not depend on
+    /// it. No default is provided: every implementor must explicitly honor the
+    /// exact-price contract rather than silently inheriting a fallback that
+    /// ignores the price.
     async fn preflight_counter_trade_at_price(
         &self,
         order: MarketOrder,
-        reference_price: Positive<Usd>,
+        limit_price: Positive<Usd>,
     ) -> Result<CounterTradePreflight, Self::Error>;
 
     /// Returns the current market session (regular, extended, or closed).
@@ -316,18 +346,36 @@ pub trait Executor: Send + Sync + 'static {
             .map(MarketSessionStatus::without_close_metadata)
     }
 
-    /// Fetches the latest trade price for a symbol from the broker's market
-    /// data feed. Used to determine limit prices for extended-hours
-    /// counter-trades. Returns `None` when not supported by the executor.
-    async fn fetch_latest_trade_price(
+    /// Fetches an optional current bid/ask quote suitable as the primary
+    /// reference for an extended-hours limit order. Executors return `None`
+    /// when no such market-data provider is wired; callers then fall back to the
+    /// position mark (ADR 0019).
+    async fn fetch_primary_limit_quote(
+        &self,
+        _symbol: &Symbol,
+    ) -> Result<Option<LatestQuote>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Fetches the broker's mark for a symbol -- the price it values an open
+    /// position at. This is the required fallback for every extended-hours
+    /// limit price when the optional primary market-data source is unavailable
+    /// or fails (ADR 0019).
+    ///
+    /// Returns `None` when the executor holds no position in the symbol, cannot
+    /// supply a mark, or reports an unusable one. Callers treat that as "try the
+    /// next reference source", never as a reason to abandon the hedge.
+    async fn fetch_position_mark(
         &self,
         _symbol: &Symbol,
     ) -> Result<Option<Positive<Usd>>, Self::Error> {
         Ok(None)
     }
 
-    /// Fetches the latest validated bid and ask for a symbol. Returns `None`
-    /// when the executor does not support quote lookups.
+    /// Fetches the validated emergency quote for a symbol. Alpaca implements
+    /// this with the hardcoded `delayed_sip` feed, after both the optional
+    /// primary quote and the position mark fail. Returns `None` when the
+    /// executor does not support the fallback lookup.
     async fn fetch_latest_quote(
         &self,
         _symbol: &Symbol,
@@ -765,6 +813,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(rounded_up_cost_cents, 10_101);
+    }
+
+    #[test]
+    fn status_permanence_classifies_retryable_and_permanent_statuses() {
+        assert_eq!(
+            status_permanence(reqwest::StatusCode::REQUEST_TIMEOUT),
+            Permanence::Transient
+        );
+        assert_eq!(
+            status_permanence(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            Permanence::Transient
+        );
+        assert_eq!(
+            status_permanence(reqwest::StatusCode::BAD_GATEWAY),
+            Permanence::Transient
+        );
+        assert_eq!(
+            status_permanence(reqwest::StatusCode::FORBIDDEN),
+            Permanence::Permanent
+        );
     }
 
     #[test]

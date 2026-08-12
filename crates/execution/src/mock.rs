@@ -17,8 +17,8 @@ use crate::{
     CancellationOutcome, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
     DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutionError, Executor,
     ExecutorOrderId, Inventory, InventoryResult, LatestQuote, LimitOrder, MarketOrder,
-    MarketSession, MarketSessionStatus, OrderPlacement, OrderState, PostCloseGap,
-    SupportedExecutor, TryIntoExecutor, Usd, estimate_buffered_cost_cents,
+    MarketSession, MarketSessionStatus, OrderPlacement, OrderState, Positive, PostCloseGap,
+    SupportedExecutor, Symbol, TryIntoExecutor, Usd, estimate_buffered_cost_cents,
 };
 
 /// Context for MockExecutor (unit struct - no context needed)
@@ -47,7 +47,9 @@ pub struct MockExecutor {
     market_session_status_failure: Option<String>,
     extended_session_closes_at_override: Option<DateTime<Utc>>,
     post_close_gap_override: PostCloseGap,
+    primary_limit_quote_override: Option<LatestQuote>,
     latest_quote_override: Option<LatestQuote>,
+    position_mark_override: Option<Positive<Usd>>,
     preflight_price: Float,
 }
 
@@ -64,7 +66,9 @@ impl MockExecutor {
             market_session_status_failure: None,
             extended_session_closes_at_override: None,
             post_close_gap_override: PostCloseGap::Unknown,
+            primary_limit_quote_override: None,
             latest_quote_override: None,
+            position_mark_override: None,
             preflight_price: *MOCK_FILL_PRICE,
         }
     }
@@ -137,6 +141,19 @@ impl MockExecutor {
         self
     }
 
+    /// Stubs the broker mark extended-hours hedges price against.
+    #[must_use]
+    pub fn with_position_mark(mut self, mark: Positive<Usd>) -> Self {
+        self.position_mark_override = Some(mark);
+        self
+    }
+
+    #[must_use]
+    pub fn with_primary_limit_quote(mut self, quote: LatestQuote) -> Self {
+        self.primary_limit_quote_override = Some(quote);
+        self
+    }
+
     #[must_use]
     pub fn with_latest_quote(mut self, quote: LatestQuote) -> Self {
         self.latest_quote_override = Some(quote);
@@ -180,16 +197,12 @@ impl MockExecutor {
         Ok(crate::resolve_sell_preflight(order, available)?)
     }
 
-    /// Shared cash check for [`Executor::preflight_counter_trade`] and
-    /// [`Executor::preflight_counter_trade_at_price`]'s buy branches -- only
-    /// the reference price used to estimate cost differs between the two
-    /// callers (the configured `preflight_price` vs. a caller-supplied
-    /// price such as a close-flatten ask), mirroring `AlpacaBrokerApi`'s
-    /// real preflight split.
+    /// Shared cash check for counter-trade buy branches.
     fn preflight_buy_cash(
         &self,
         order: &MarketOrder,
         reference_price: crate::Positive<Usd>,
+        slippage_bps: u16,
     ) -> Result<CounterTradePreflight, ExecutionError> {
         let InventoryResult::Fetched(inventory) = &self.inventory_result else {
             return Ok(CounterTradePreflight::Allowed { reservation: None });
@@ -198,7 +211,7 @@ impl MockExecutor {
         let estimated_cost_cents = estimate_buffered_cost_cents(
             order.shares,
             reference_price.inner().inner(),
-            DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            slippage_bps,
         )?;
 
         if inventory.usd_balance_cents >= estimated_cost_cents {
@@ -316,7 +329,11 @@ impl Executor for MockExecutor {
                 // `with_preflight_price`), validated here rather than at
                 // construction so `MockExecutor::new()` stays infallible.
                 let reference_price = crate::Positive::new(Usd::new(self.preflight_price))?;
-                self.preflight_buy_cash(&order, reference_price)
+                self.preflight_buy_cash(
+                    &order,
+                    reference_price,
+                    DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+                )
             }
         }
     }
@@ -324,14 +341,14 @@ impl Executor for MockExecutor {
     async fn preflight_counter_trade_at_price(
         &self,
         order: MarketOrder,
-        reference_price: crate::Positive<Usd>,
+        limit_price: crate::Positive<Usd>,
     ) -> Result<CounterTradePreflight, Self::Error> {
         self.fail_if_unhealthy()?;
 
         match order.direction {
             // Inventory availability doesn't depend on price.
             Direction::Sell => self.preflight_sell(order),
-            Direction::Buy => self.preflight_buy_cash(&order, reference_price),
+            Direction::Buy => self.preflight_buy_cash(&order, limit_price, 0),
         }
     }
 
@@ -364,6 +381,22 @@ impl Executor for MockExecutor {
             extended_session_closes_at: self.extended_session_closes_at_override,
             post_close_gap: self.post_close_gap_override,
         })
+    }
+
+    async fn fetch_position_mark(
+        &self,
+        _symbol: &Symbol,
+    ) -> Result<Option<Positive<Usd>>, Self::Error> {
+        self.fail_if_unhealthy()?;
+        Ok(self.position_mark_override)
+    }
+
+    async fn fetch_primary_limit_quote(
+        &self,
+        _symbol: &Symbol,
+    ) -> Result<Option<LatestQuote>, Self::Error> {
+        self.fail_if_unhealthy()?;
+        Ok(self.primary_limit_quote_override)
     }
 
     async fn fetch_latest_quote(
@@ -726,6 +759,108 @@ mod tests {
                 available_buying_power_cents,
             }) if estimated_cost_cents == 20_200 && available_buying_power_cents == 10_000
         ));
+    }
+
+    #[tokio::test]
+    async fn preflight_counter_trade_at_price_uses_exact_limit_cost() {
+        let executor = MockExecutor::new().with_inventory(crate::Inventory {
+            positions: vec![],
+            usd_balance_cents: 20_000,
+            cash_buying_power_cents: Some(20_000),
+            alpaca_usdc: None,
+            cash_withdrawable_cents: None,
+        });
+
+        let preflight = executor
+            .preflight_counter_trade_at_price(
+                MarketOrder {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: positive_shares("2"),
+                    direction: Direction::Buy,
+                    client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+                Positive::new(Usd::new(float!(100))).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            preflight,
+            CounterTradePreflight::Allowed {
+                reservation: Some(CounterTradeReservation::BuyingPower {
+                    estimated_cost_cents,
+                    available_buying_power_cents,
+                }),
+            } if estimated_cost_cents == 20_000 && available_buying_power_cents == 20_000
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_position_mark_returns_configured_failure() {
+        let mark = Positive::new(Usd::new(float!(100))).unwrap();
+        let executor = MockExecutor::with_failure("mark lookup failed").with_position_mark(mark);
+
+        assert!(matches!(
+            executor
+                .fetch_position_mark(&Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap_err(),
+            ExecutionError::MockFailure { message } if message == "mark lookup failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_position_mark_returns_the_configured_mark() {
+        let mark = Positive::new(Usd::new(float!(223.80))).unwrap();
+        let executor = MockExecutor::new().with_position_mark(mark);
+
+        assert_eq!(
+            executor
+                .fetch_position_mark(&Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap(),
+            Some(mark)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_position_mark_is_absent_without_an_override() {
+        assert_eq!(
+            MockExecutor::new()
+                .fetch_position_mark(&Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_primary_limit_quote_returns_the_configured_quote() {
+        let quote = LatestQuote::new(
+            Positive::new(Usd::new(float!(99))).unwrap(),
+            Positive::new(Usd::new(float!(101))).unwrap(),
+        )
+        .unwrap();
+        let executor = MockExecutor::new().with_primary_limit_quote(quote);
+
+        assert_eq!(
+            executor
+                .fetch_primary_limit_quote(&Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap(),
+            Some(quote)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_primary_limit_quote_is_absent_without_an_override() {
+        assert_eq!(
+            MockExecutor::new()
+                .fetch_primary_limit_quote(&Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

@@ -872,7 +872,7 @@ fn register_endpoints(server: &MockServer, state: &Arc<Mutex<MockState>>) {
     register_calendar_endpoint(server, state);
     register_positions_endpoint(server, state);
     register_wallet_get_endpoint(server, state);
-    register_latest_trade_endpoint(server, state);
+    register_market_data_endpoint(server, state);
     register_asset_endpoint(server);
     register_order_placement_endpoint(server, state);
     register_order_by_client_order_id_endpoint(server, state);
@@ -1017,10 +1017,12 @@ fn register_calendar_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>
 
 fn register_positions_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
     let state = Arc::clone(state);
-    server.mock(|when, then| {
-        when.method(GET)
-            .path(format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/positions"));
-        then.respond_with(move |_request: &HttpMockRequest| {
+    let positions_path = format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/positions");
+    let position_prefix = format!("{positions_path}/");
+
+    server.mock(move |when, then| {
+        when.method(GET).path_prefix(positions_path.clone());
+        then.respond_with(move |request: &HttpMockRequest| {
             let result = (|| -> Result<Vec<Value>, rain_math_float::FloatError> {
                 let state = lock(&state);
                 let mut positions = state
@@ -1033,13 +1035,18 @@ fn register_positions_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>
                             .lt(Float::from_raw(alloy::primitives::B256::ZERO))?;
                         let side = if is_neg { "short" } else { "long" };
                         let abs_qty = pos.quantity.abs()?;
-                        Ok::<Value, rain_math_float::FloatError>(json!({
+                        let mut entry = json!({
                             "symbol": pos.symbol,
                             "qty_available": format_float_with_fallback(&abs_qty),
                             "market_value": format_float_with_fallback(&pos.market_value),
                             "side": side,
                             "avg_entry_price": "0",
-                        }))
+                        });
+                        if let Some(mark) = state.symbol_fill_prices.get(&pos.symbol) {
+                            entry["current_price"] =
+                                Value::String(format_float_with_fallback(mark));
+                        }
+                        Ok::<Value, rain_math_float::FloatError>(entry)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
@@ -1067,7 +1074,22 @@ fn register_positions_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>
             })();
 
             match result {
-                Ok(positions) => json_response(200, &Value::Array(positions)),
+                Ok(positions) if request.uri().path() == positions_path => {
+                    json_response(200, &Value::Array(positions))
+                }
+                Ok(positions) => {
+                    let request_uri = request.uri();
+                    let request_path = request_uri.path();
+                    let Some(symbol) = request_path.strip_prefix(&position_prefix) else {
+                        return json_response(404, &json!({"message": "not found"}));
+                    };
+                    let Some(position) = positions.into_iter().find(|position| {
+                        position.get("symbol").and_then(Value::as_str) == Some(symbol)
+                    }) else {
+                        return json_response(404, &json!({"message": "position does not exist"}));
+                    };
+                    json_response(200, &position)
+                }
                 Err(error) => json_response(
                     500,
                     &json!({"message": format!("Mock /positions FloatError: {error}")}),
@@ -1077,7 +1099,12 @@ fn register_positions_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>
     });
 }
 
-fn register_latest_trade_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+enum MockMarketDataKind {
+    Trade,
+    Quote,
+}
+
+fn register_market_data_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
     let state = Arc::clone(state);
     let prefix = "/v2/stocks/";
 
@@ -1085,10 +1112,20 @@ fn register_latest_trade_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
         when.method(GET).path_prefix(prefix);
         then.respond_with(move |request: &HttpMockRequest| {
             let request_path = request.uri().path().to_owned();
-            let Some(symbol) = request_path
-                .strip_prefix(prefix)
-                .and_then(|path| path.strip_suffix("/trades/latest"))
-            else {
+            let Some(path) = request_path.strip_prefix(prefix) else {
+                return json_response(404, &json!({"message": "not found"}));
+            };
+            let (symbol, kind) = if let Some(symbol) = path.strip_suffix("/trades/latest") {
+                (symbol, MockMarketDataKind::Trade)
+            } else if let Some(symbol) = path.strip_suffix("/quotes/latest") {
+                if request.uri().query() != Some("feed=delayed_sip") {
+                    return json_response(
+                        400,
+                        &json!({"message": "mock quotes require feed=delayed_sip"}),
+                    );
+                }
+                (symbol, MockMarketDataKind::Quote)
+            } else {
                 return json_response(404, &json!({"message": "not found"}));
             };
 
@@ -1097,17 +1134,24 @@ fn register_latest_trade_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
             };
 
             let Some(price) = lock(&state).symbol_fill_prices.get(&symbol).copied() else {
-                return json_response(404, &json!({"message": "no latest trade configured"}));
+                return json_response(404, &json!({"message": "no market price configured"}));
             };
 
-            json_response(
-                200,
-                &json!({
+            let body = match kind {
+                MockMarketDataKind::Trade => json!({
                     "trade": {
                         "p": format_float_with_fallback(&price),
                     }
                 }),
-            )
+                MockMarketDataKind::Quote => json!({
+                    "symbol": symbol,
+                    "quote": {
+                        "bp": format_float_with_fallback(&price),
+                        "ap": format_float_with_fallback(&price),
+                    }
+                }),
+            };
+            json_response(200, &body)
         });
     });
 }
@@ -2163,17 +2207,20 @@ mod tests {
     use chrono_tz::America::New_York;
     use uuid::Uuid;
 
+    use st0x_float_macro::float;
+
     use super::{
-        AlpacaBrokerMock, MockAccount, MockMode, MockState, OrderSide, TEST_ACCOUNT_ID,
-        TEST_API_KEY, TEST_API_SECRET, format_u256_as_usdc, handle_crypto_order,
+        AlpacaBrokerMock, MockAccount, MockMode, MockPosition, MockState, OrderSide,
+        TEST_ACCOUNT_ID, TEST_API_KEY, TEST_API_SECRET, format_u256_as_usdc, handle_crypto_order,
     };
     use crate::alpaca_broker_api::auth::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
     use crate::alpaca_broker_api::client::AlpacaBrokerApiClient;
-    use crate::alpaca_broker_api::{AccountActivitiesQuery, TimeInForce, market_hours};
-    use crate::{MarketSession, Symbol};
-    use st0x_float_macro::float;
+    use crate::alpaca_broker_api::{
+        AccountActivitiesQuery, AlpacaBrokerApi, TimeInForce, market_hours,
+    };
+    use crate::{Executor, MarketSession, Symbol, Usd};
 
     /// Regression test for the calendar contract between `AlpacaBrokerMock`
     /// and the market-hours parser: `CalendarDay` requires `session_open` /
@@ -2273,6 +2320,67 @@ mod tests {
             time_in_force: TimeInForce::Day,
             counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         }
+    }
+
+    #[tokio::test]
+    async fn delayed_sip_quote_is_served_by_the_mock_broker() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![(symbol.clone(), float!(150))])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        let ctx = AlpacaBrokerApiCtx {
+            api_key: TEST_API_KEY.to_string(),
+            api_secret: TEST_API_SECRET.to_string(),
+            account_id: AlpacaAccountId::new(Uuid::parse_str(TEST_ACCOUNT_ID).unwrap()),
+            mode: Some(AlpacaBrokerApiMode::Mock(mock.base_url())),
+            asset_cache_ttl: Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        };
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+
+        let quote = executor
+            .fetch_latest_quote(&symbol)
+            .await
+            .unwrap()
+            .expect("Alpaca mock supports latest quotes");
+
+        assert_eq!(quote.bid().inner(), Usd::new(float!(150)));
+        assert_eq!(quote.ask().inner(), Usd::new(float!(150)));
+    }
+
+    #[tokio::test]
+    async fn position_mark_uses_the_mock_brokers_single_position_endpoint() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![(symbol.clone(), float!(150))])
+            .symbol_positions(vec![MockPosition {
+                symbol: symbol.clone(),
+                quantity: float!(3),
+                market_value: float!(450),
+            }])
+            .call()
+            .await;
+        let ctx = AlpacaBrokerApiCtx {
+            api_key: TEST_API_KEY.to_string(),
+            api_secret: TEST_API_SECRET.to_string(),
+            account_id: AlpacaAccountId::new(Uuid::parse_str(TEST_ACCOUNT_ID).unwrap()),
+            mode: Some(AlpacaBrokerApiMode::Mock(mock.base_url())),
+            asset_cache_ttl: Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        };
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+
+        let mark = executor
+            .fetch_position_mark(&symbol)
+            .await
+            .unwrap()
+            .expect("configured mock position carries a mark");
+
+        assert_eq!(mark.inner(), Usd::new(float!(150)));
     }
 
     /// Every executed fill leaves a broker-fee activity in the ledger, so a

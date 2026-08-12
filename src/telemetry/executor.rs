@@ -165,13 +165,28 @@ impl<Inner: Executor + Clone> Executor for InstrumentedExecutor<Inner> {
         result
     }
 
-    async fn fetch_latest_trade_price(
+    /// Forwarding this explicitly is load-bearing. `Executor::fetch_position_mark`
+    /// has an `Ok(None)` default, and the production executor is always wrapped
+    /// in this type, so an unforwarded method would silently report "no mark" for
+    /// every symbol while every test that talks to the inner executor still
+    /// passed. `records_broker_calls_with_operation_labels` pins it.
+    async fn fetch_position_mark(
         &self,
         symbol: &Symbol,
     ) -> Result<Option<Positive<Usd>>, Self::Error> {
         let started = Instant::now();
-        let result = self.inner.fetch_latest_trade_price(symbol).await;
-        self.record("fetch_latest_trade_price", started, &result);
+        let result = self.inner.fetch_position_mark(symbol).await;
+        self.record("fetch_position_mark", started, &result);
+        result
+    }
+
+    async fn fetch_primary_limit_quote(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<LatestQuote>, Self::Error> {
+        let started = Instant::now();
+        let result = self.inner.fetch_primary_limit_quote(symbol).await;
+        self.record("fetch_primary_limit_quote", started, &result);
         result
     }
 
@@ -235,7 +250,18 @@ mod tests {
         let pool = setup_test_db().await;
         let (sender, receiver) = TelemetrySender::channel();
         let writer = spawn_dependency_call_writer(pool.clone(), receiver);
-        let executor = InstrumentedExecutor::new(MockExecutor::new(), sender.clone());
+        let mark = Positive::new(Usd::new(float!(123.45))).unwrap();
+        let primary_quote = LatestQuote::new(
+            Positive::new(Usd::new(float!(123.40))).unwrap(),
+            Positive::new(Usd::new(float!(123.50))).unwrap(),
+        )
+        .unwrap();
+        let executor = InstrumentedExecutor::new(
+            MockExecutor::new()
+                .with_position_mark(mark)
+                .with_primary_limit_quote(primary_quote),
+            sender.clone(),
+        );
 
         executor.is_market_open().await.unwrap();
         executor.place_market_order(market_order()).await.unwrap();
@@ -261,6 +287,26 @@ mod tests {
             .fetch_latest_quote(&Symbol::new("AAPL").unwrap())
             .await
             .unwrap();
+        let forwarded_primary_quote = executor
+            .fetch_primary_limit_quote(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            forwarded_primary_quote,
+            Some(primary_quote),
+            "the wrapper must forward the optional primary quote instead of using the \
+             trait's Ok(None) default"
+        );
+        let forwarded_mark = executor
+            .fetch_position_mark(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            forwarded_mark,
+            Some(mark),
+            "the wrapper must forward the inner executor's mark unchanged, not the \
+             trait's Ok(None) default"
+        );
 
         drop(executor);
         drop(sender);
@@ -275,8 +321,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             rows.len(),
-            9,
-            "all nine exercised methods must emit samples"
+            11,
+            "all eleven exercised methods must emit samples"
         );
         let operations: Vec<&str> = rows.iter().map(|(_, op, _)| op.as_str()).collect();
         assert!(
@@ -314,6 +360,14 @@ mod tests {
         assert!(
             operations.contains(&"fetch_latest_quote"),
             "fetch_latest_quote must be recorded"
+        );
+        assert!(
+            operations.contains(&"fetch_position_mark"),
+            "fetch_position_mark must be recorded"
+        );
+        assert!(
+            operations.contains(&"fetch_primary_limit_quote"),
+            "fetch_primary_limit_quote must be recorded"
         );
         for (dep, _, outcome) in &rows {
             assert_eq!(dep, "broker");

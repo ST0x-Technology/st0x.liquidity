@@ -18,7 +18,7 @@ use st0x_config::Ctx;
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
-use st0x_execution::{ExecutionError, Executor};
+use st0x_execution::{ExecutionError, Executor, Permanence};
 use st0x_raindex::RaindexContracts;
 use st0x_registry::{SymbolCache, get_symbol_lock};
 
@@ -26,7 +26,7 @@ use super::inclusion::EmittedOnChain;
 use super::skipped_fill::{SkipReason, record_skipped_fill};
 use crate::conductor::job::{
     BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureOutcome, BackpressureStreak, Job, JobQueue, Label,
-    advance_backpressure, apply_backpressure_step, find_backpressure,
+    advance_backpressure, apply_backpressure_step, find_backpressure, find_permanence,
 };
 use crate::conductor::{
     TradeProcessingCqrs, VaultDiscoveryCtx, discover_vaults_for_trade, process_queued_trade,
@@ -535,14 +535,12 @@ pub(crate) enum TradeAccountingError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    #[error("Failed to fetch latest trade price for {symbol}")]
-    LimitPriceFetch {
+    #[error("Failed to fetch the broker mark for {symbol}")]
+    MarkFetch {
         symbol: st0x_execution::Symbol,
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    #[error("Executor does not support fetching trade prices for {symbol}")]
-    LimitPriceUnavailable { symbol: st0x_execution::Symbol },
     #[error("Failed to fetch latest bid/ask quote for {symbol}")]
     LimitQuoteFetch {
         symbol: st0x_execution::Symbol,
@@ -551,8 +549,11 @@ pub(crate) enum TradeAccountingError {
     },
     #[error("Executor does not support fetching bid/ask quotes for {symbol}")]
     LimitQuoteUnavailable { symbol: st0x_execution::Symbol },
+    /// Deliberately not `#[from]`: this variant is dead-letterable, and an
+    /// implicit conversion would let a future `?` classify a failure as
+    /// abandonable without the call site ever naming that choice.
     #[error("Slippage calculation failed")]
-    SlippageCalculation(#[from] crate::trading::offchain::hedge::SlippageError),
+    SlippageCalculation(#[source] crate::trading::offchain::hedge::SlippageError),
     #[error(
         "Failed to re-preflight close-flatten buy against its submitted ask price for {symbol}"
     )]
@@ -561,8 +562,193 @@ pub(crate) enum TradeAccountingError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// Wraps a pricing failure raised on the recovery path, where a claim is
+    /// already outstanding. Distinct from the unwrapped pricing variants so
+    /// the hedge worker can preserve the claim while applying the source's
+    /// bounded backpressure/transient policy. Once that budget is exhausted,
+    /// the periodic recovery sweep owns the still-pending claim.
+    #[error(
+        "Failed to re-derive the counter-trade order kind for {symbol} while its position is \
+         already claimed by a pending offchain order"
+    )]
+    ClaimedHedgeOrderKind {
+        symbol: st0x_execution::Symbol,
+        #[source]
+        source: ClaimedHedgeOrderKindCause,
+    },
     #[error("PollOrderStatus live-job guard failed: {0}")]
     PollJobGuard(#[from] crate::offchain::order::JobError),
+}
+
+/// A failure re-deriving an order kind after the position is already claimed.
+///
+/// The variant records the claim-aware scope when the wrapper is constructed.
+/// This keeps every source supported by order-kind selection -- including the
+/// account-wide market-session lookup and all symbol-scoped pricing failures --
+/// while preventing the claimed path from carrying an unclassified error.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ClaimedHedgeOrderKindCause {
+    #[error("symbol-scoped order-kind selection failed with an outstanding position claim")]
+    SymbolScoped {
+        reason: SymbolScopedReason,
+        #[source]
+        source: Box<TradeAccountingError>,
+    },
+    #[error("process-scoped order-kind selection failed with an outstanding position claim")]
+    ProcessScoped {
+        #[source]
+        source: Box<TradeAccountingError>,
+    },
+}
+
+impl ClaimedHedgeOrderKindCause {
+    pub(crate) fn classify(source: TradeAccountingError) -> Self {
+        match source.scope() {
+            ErrorScope::SymbolScoped { reason } => Self::SymbolScoped {
+                reason,
+                source: Box::new(source),
+            },
+            ErrorScope::ProcessScoped => Self::ProcessScoped {
+                source: Box::new(source),
+            },
+        }
+    }
+}
+
+/// The pre-claim failures [`TradeAccountingError::scope`] can classify as
+/// [`ErrorScope::SymbolScoped`]. An enum rather than a bare `&'static str` so
+/// a label can only come from a classification the compiler checked, and
+/// separate from [`DeadLetterReason`] so `scope()` cannot name a label that
+/// belongs to the other abandonment path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SymbolScopedReason {
+    MarkFetch,
+    LimitQuoteFetch,
+    LimitQuoteUnavailable,
+    SlippageCalculation,
+    CloseFlattenPreflightAtPrice,
+}
+
+impl SymbolScopedReason {
+    pub(crate) const fn metric_label(self) -> &'static str {
+        match self {
+            Self::MarkFetch => "mark_fetch",
+            Self::LimitQuoteFetch => "limit_quote_fetch",
+            Self::LimitQuoteUnavailable => "limit_quote_unavailable",
+            Self::SlippageCalculation => "slippage_calculation",
+            Self::CloseFlattenPreflightAtPrice => "close_flatten_preflight_at_price",
+        }
+    }
+}
+
+/// Why a hedge attempt was abandoned: the closed set of `reason` labels on
+/// `hedge_dead_lettered_total`, whose wire strings the dashboards query live
+/// in exactly one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DeadLetterReason {
+    /// A permanent failure raised before the position claim.
+    SymbolScoped(SymbolScopedReason),
+    /// Not a [`TradeAccountingError`] classification: recorded when broker
+    /// rate-limiting outlives the reschedule budget, so every abandonment
+    /// path shares one counter and is told apart by this label.
+    BackpressureExhausted,
+}
+
+impl DeadLetterReason {
+    pub(crate) const fn metric_label(self) -> &'static str {
+        match self {
+            Self::SymbolScoped(reason) => reason.metric_label(),
+            Self::BackpressureExhausted => "backpressure_exhausted",
+        }
+    }
+}
+
+/// Where a [`TradeAccountingError`] sits relative to the position claim.
+///
+/// This is only half of the dead-letter decision, and deliberately so. It
+/// answers "can abandoning this attempt strand a claim?", which is a
+/// property of the variant. Whether abandoning is *worthwhile* -- whether an
+/// immediate retry could have succeeded -- is a property of the underlying
+/// cause, not the variant, and `handle_place_hedge_error` classifies that
+/// separately via `find_permanence`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ErrorScope {
+    /// Raised before this attempt claimed the position, so abandoning it
+    /// leaves nothing this attempt created outstanding. Carries the metric
+    /// `reason` label for the dead-letter counter.
+    SymbolScoped { reason: SymbolScopedReason },
+    /// Everything else -- including anything raised once a claim is
+    /// outstanding; must propagate through the normal retry/circuit-breaker
+    /// path.
+    ProcessScoped,
+}
+
+impl TradeAccountingError {
+    /// Classifies this error against the position claim.
+    ///
+    /// Every symbol-scoped variant is raised inside
+    /// `select_order_kind_for_current_session` (or, for
+    /// `CloseFlattenPreflightAtPrice`, inside
+    /// `close_flatten_preflight_at_submitted_price`, which it calls). That
+    /// function has two callers: `perform_body`, which runs it before
+    /// `PositionCommand::PlaceOffChainOrder` claims the position, and
+    /// `recover_pending_poll_status`, which runs it with a prior attempt's
+    /// claim already outstanding. The latter re-wraps every failure into
+    /// `ClaimedHedgeOrderKind`, which remains process-scoped at this generic
+    /// boundary. The hedge worker recognizes that wrapper before ordinary
+    /// scope routing and applies the boxed source's symbol-scoped retry policy
+    /// without releasing the claim.
+    ///
+    /// That does NOT make the position unclaimed at dead-letter time: apalis
+    /// re-runs `perform_body` from the top, so this attempt's pre-claim
+    /// failure can follow an EARLIER attempt that claimed the position and
+    /// left a live broker order behind. `handle_place_hedge_error` therefore
+    /// resolves any outstanding claim through `recover_pending_poll_status`
+    /// before abandoning the job, rather than assuming there is none.
+    pub(crate) fn scope(&self) -> ErrorScope {
+        use ErrorScope::{ProcessScoped, SymbolScoped};
+
+        match self {
+            Self::MarkFetch { .. } => SymbolScoped {
+                reason: SymbolScopedReason::MarkFetch,
+            },
+            Self::LimitQuoteFetch { .. } => SymbolScoped {
+                reason: SymbolScopedReason::LimitQuoteFetch,
+            },
+            Self::LimitQuoteUnavailable { .. } => SymbolScoped {
+                reason: SymbolScopedReason::LimitQuoteUnavailable,
+            },
+            Self::SlippageCalculation(_) => SymbolScoped {
+                reason: SymbolScopedReason::SlippageCalculation,
+            },
+            Self::CloseFlattenPreflightAtPrice { source, .. }
+                if find_permanence(source.as_ref()) == Some(Permanence::Permanent) =>
+            {
+                ProcessScoped
+            }
+            Self::CloseFlattenPreflightAtPrice { .. } => SymbolScoped {
+                reason: SymbolScopedReason::CloseFlattenPreflightAtPrice,
+            },
+
+            Self::ClaimedHedgeOrderKind { .. }
+            | Self::OnChain(_)
+            | Self::OnChainTradeCommand(_)
+            | Self::VaultRegistry(_)
+            | Self::PositionCommand(_)
+            | Self::OffchainOrderCommand(_)
+            | Self::OffchainOrderPlacement(_)
+            | Self::Execution(_)
+            | Self::AlpacaBrokerApi(_)
+            | Self::EnqueueJob(_)
+            | Self::PositionFillLookup(_)
+            | Self::MissingBlockTimestamp { .. }
+            | Self::UnexpectedPostPlaceState { .. }
+            | Self::InconsistentOnChainTradeState { .. }
+            // A broker-clock failure is account-wide, not per-symbol.
+            | Self::MarketSessionCheck { .. }
+            | Self::PollJobGuard(_) => ProcessScoped,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -579,7 +765,7 @@ mod tests {
     use st0x_config::ExecutionThreshold;
     use st0x_config::create_test_ctx_with_order_owner;
     use st0x_config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
-    use st0x_event_sorcery::StoreBuilder;
+    use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder};
     use st0x_evm::IERC20::{decimalsCall, symbolCall};
     use st0x_execution::{
         CancellationOutcome, FractionalShares, InventoryResult, MockExecutor, MockExecutorCtx,
@@ -652,6 +838,11 @@ mod tests {
             execution_threshold,
             assets: ctx.assets.clone(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
+            close_flatten_policy:
+                crate::trading::offchain::close_flatten::CloseFlattenPolicy::from_secs(900).unwrap(),
+            close_flatten_ramp:
+                crate::trading::offchain::close_flatten::CloseFlattenCrossRamp::new(100, 400)
+                    .unwrap(),
             poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
@@ -2119,5 +2310,188 @@ mod tests {
             panic!("expected the non-backpressure error to propagate unchanged");
         };
         assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// These variants are all raised with a position claim outstanding, so
+    /// classifying any of them as symbol-scoped would let
+    /// `handle_place_hedge_error` abandon a claimed position and a possibly
+    /// live broker order. The claim boundary is invisible from the variant
+    /// name alone, which is exactly why it is pinned here.
+    #[test]
+    fn scope_classifies_post_claim_variants_as_process_scoped() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = crate::offchain::order::OffchainOrderId::new();
+
+        let post_claim = vec![
+            TradeAccountingError::ClaimedHedgeOrderKind {
+                symbol: symbol.clone(),
+                source: ClaimedHedgeOrderKindCause::classify(
+                    TradeAccountingError::LimitQuoteUnavailable {
+                        symbol: symbol.clone(),
+                    },
+                ),
+            },
+            TradeAccountingError::PositionCommand(AggregateError::UserError(
+                LifecycleError::Apply(crate::position::PositionError::PendingExecution {
+                    offchain_order_id,
+                }),
+            )),
+            TradeAccountingError::OffchainOrderCommand(AggregateError::UserError(
+                LifecycleError::Apply(crate::offchain::order::OffchainOrderError::NotSubmitted),
+            )),
+            TradeAccountingError::OffchainOrderPlacement(
+                crate::offchain::order::PlaceOffchainOrderError::Backpressure {
+                    source: "rate limited".into(),
+                },
+            ),
+            TradeAccountingError::UnexpectedPostPlaceState {
+                offchain_order_id,
+                state: OffchainOrder::Pending {
+                    symbol,
+                    shares: Positive::new(FractionalShares::new(float!(1.0))).unwrap(),
+                    direction: st0x_execution::Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    placed_at: chrono::Utc::now(),
+                    market_session: st0x_execution::MarketSession::Regular,
+                    close_flatten: false,
+                },
+            },
+        ];
+
+        for error in post_claim {
+            assert_eq!(
+                error.scope(),
+                ErrorScope::ProcessScoped,
+                "a variant raised after the position claim must never dead-letter: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claimed_order_kind_cause_preserves_pricing_and_session_scopes() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let pricing =
+            ClaimedHedgeOrderKindCause::classify(TradeAccountingError::LimitQuoteUnavailable {
+                symbol: symbol.clone(),
+            });
+        assert!(matches!(
+            pricing,
+            ClaimedHedgeOrderKindCause::SymbolScoped {
+                reason: SymbolScopedReason::LimitQuoteUnavailable,
+                ..
+            }
+        ));
+
+        let session =
+            ClaimedHedgeOrderKindCause::classify(TradeAccountingError::MarketSessionCheck {
+                symbol,
+                source: "broker clock unavailable".into(),
+            });
+        assert!(matches!(
+            session,
+            ClaimedHedgeOrderKindCause::ProcessScoped { .. }
+        ));
+    }
+
+    #[test]
+    fn scope_classifies_pre_claim_pricing_variants_as_symbol_scoped() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let boxed = || -> Box<dyn std::error::Error + Send + Sync> { "broker down".into() };
+        let slippage = crate::trading::offchain::hedge::apply_slippage(
+            st0x_execution::Usd::new(float!(1)),
+            st0x_execution::Direction::Sell,
+            10_000,
+        )
+        .unwrap_err();
+
+        let pre_claim = vec![
+            (
+                TradeAccountingError::MarkFetch {
+                    symbol: symbol.clone(),
+                    source: boxed(),
+                },
+                SymbolScopedReason::MarkFetch,
+            ),
+            (
+                TradeAccountingError::LimitQuoteFetch {
+                    symbol: symbol.clone(),
+                    source: boxed(),
+                },
+                SymbolScopedReason::LimitQuoteFetch,
+            ),
+            (
+                TradeAccountingError::LimitQuoteUnavailable {
+                    symbol: symbol.clone(),
+                },
+                SymbolScopedReason::LimitQuoteUnavailable,
+            ),
+            (
+                TradeAccountingError::SlippageCalculation(slippage),
+                SymbolScopedReason::SlippageCalculation,
+            ),
+            (
+                TradeAccountingError::CloseFlattenPreflightAtPrice {
+                    symbol,
+                    source: boxed(),
+                },
+                SymbolScopedReason::CloseFlattenPreflightAtPrice,
+            ),
+        ];
+
+        for (error, expected) in pre_claim {
+            assert_eq!(
+                error.scope(),
+                ErrorScope::SymbolScoped { reason: expected },
+                "a pre-claim pricing variant must stay symbol-scoped: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn permanent_account_preflight_failure_is_process_scoped() {
+        let error = TradeAccountingError::CloseFlattenPreflightAtPrice {
+            symbol: Symbol::new("AAPL").unwrap(),
+            source: Box::new(AlpacaBrokerApiError::ApiError {
+                status: reqwest::StatusCode::FORBIDDEN,
+                alpaca_code: None,
+                message: "account inactive".to_string(),
+                retry_after: None,
+            }),
+        };
+
+        assert_eq!(error.scope(), ErrorScope::ProcessScoped);
+    }
+
+    /// The `reason` label is what dashboards and alerts query, so it is a
+    /// wire format: pinned to literals here rather than derived from the
+    /// enum, which would make any rename silently self-consistent.
+    #[test]
+    fn dead_letter_reason_metric_labels_are_stable() {
+        assert_eq!(SymbolScopedReason::MarkFetch.metric_label(), "mark_fetch");
+        assert_eq!(
+            SymbolScopedReason::LimitQuoteFetch.metric_label(),
+            "limit_quote_fetch"
+        );
+        assert_eq!(
+            SymbolScopedReason::LimitQuoteUnavailable.metric_label(),
+            "limit_quote_unavailable"
+        );
+        assert_eq!(
+            SymbolScopedReason::SlippageCalculation.metric_label(),
+            "slippage_calculation"
+        );
+        assert_eq!(
+            SymbolScopedReason::CloseFlattenPreflightAtPrice.metric_label(),
+            "close_flatten_preflight_at_price"
+        );
+        assert_eq!(
+            DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteFetch).metric_label(),
+            "limit_quote_fetch",
+            "the shared counter's label must delegate, not re-spell, the symbol-scoped set"
+        );
+        assert_eq!(
+            DeadLetterReason::BackpressureExhausted.metric_label(),
+            "backpressure_exhausted"
+        );
     }
 }

@@ -29,7 +29,9 @@ inventory_divergence_threshold = 10
 [broker]
 counter_trade_slippage_bps = 100
 extended_hours_reprice_timeout_secs = 300
+close_flatten_reprice_timeout_secs = 60
 extended_hours_close_flatten_window_secs = 900
+close_flatten_cross_max_bps = 400
 
 # Travel Rule beneficiary identity for Alpaca whitelist creation.
 [broker.travel_rule]
