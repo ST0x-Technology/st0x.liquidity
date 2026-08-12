@@ -49,6 +49,36 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
         "Close-flatten attempts blocked before submission, by symbol and stable reason"
     );
     metrics::describe_counter!(
+        "close_flatten_placements_total",
+        "Close-flatten limit orders priced and cleared for submission, by symbol, direction, \
+         and the cross applied bucketed to whole percent. Counts attempts, not orders: a \
+         retried or re-driven placement of the same hedge counts again, and an attempt the \
+         broker later rejects still counts"
+    );
+    metrics::describe_counter!(
+        "close_flatten_outcomes_total",
+        "Terminal broker-state dispatches for close-flatten placements, by symbol, direction, \
+         and outcome (filled/cancelled/failed). A placement can be observed again until its \
+         follow-up job commits the terminal aggregate transition"
+    );
+    metrics::describe_counter!(
+        "hedge_price_source_total",
+        "Which reference an extended-hours limit was priced from, by symbol, path \
+         (ordinary_extended/close_flatten), and source \
+         (primary_quote/mark/delayed_sip_quote). Shows which fallback legs are load-bearing"
+    );
+    metrics::describe_counter!(
+        "hedge_scan_skipped_total",
+        "Extended-hours buys the position scan dropped because reference-price resolution or \
+         crossing failed before enqueueing a hedge job, by symbol and cause"
+    );
+    metrics::describe_counter!(
+        "hedge_dead_lettered_total",
+        "Hedge attempts this process gave up on, by symbol and reason: a permanent or \
+         retry-budget-exhausted transient symbol-scoped pricing failure, or broker \
+         rate-limiting that outlived the reschedule budget"
+    );
+    metrics::describe_counter!(
         "inventory_ambiguous_settlement_total",
         "Inventory settlements quarantined because a tx emitted multiple \
          OperatorDeposits or multiple OperatorWithdraws and could not be safely paired"

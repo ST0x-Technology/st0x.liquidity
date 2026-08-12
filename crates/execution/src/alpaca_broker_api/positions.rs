@@ -5,13 +5,14 @@ use serde::Deserialize;
 use st0x_finance::{HasZero, Usdc};
 use st0x_float_macro::float;
 use st0x_float_serde::{DebugFloat, DebugOptionFloat};
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
+use urlencoding::encode;
 
 use super::AlpacaBrokerApiError;
 use super::client::AlpacaBrokerApiClient;
 use crate::{
-    EquityPosition, FractionalShares, Inventory, Symbol, deserialize_float_from_number_or_string,
-    deserialize_option_float_from_number_or_string,
+    EquityPosition, FractionalShares, Inventory, Positive, Symbol, Usd,
+    deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
 };
 
 /// Account-level USD figures from the broker, all denominated in cents.
@@ -48,6 +49,15 @@ struct PositionResponse {
         deserialize_with = "deserialize_option_float_from_number_or_string"
     )]
     market_value: Option<Float>,
+    /// The broker's mark for the symbol, fed by the CTA and UTP consolidated
+    /// tapes. Unlike the market-data feeds this account is entitled to, it keeps
+    /// updating through the extended session, which is why extended-hours hedges
+    /// price against it (ADR 0019).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_float_from_number_or_string"
+    )]
+    current_price: Option<Float>,
 }
 
 impl std::fmt::Debug for PositionResponse {
@@ -59,6 +69,7 @@ impl std::fmt::Debug for PositionResponse {
             .field("quantity", &DebugFloat(&self.quantity))
             .field("total_quantity", &DebugOptionFloat(&self.total_quantity))
             .field("market_value", &DebugOptionFloat(&self.market_value))
+            .field("current_price", &DebugOptionFloat(&self.current_price))
             .finish()
     }
 }
@@ -203,6 +214,71 @@ pub(super) async fn get_account_funds(
         buying_power: balance,
         withdrawable,
     })
+}
+
+/// Reads the broker's mark from its single-position endpoint.
+///
+/// Alpaca documents `GET /v1/trading/accounts/{account_id}/positions/{symbol}`
+/// as returning one open position, with 404 meaning the account has none.
+///
+/// Returns `Ok(None)` when the account holds no position in the symbol, when
+/// the broker omits `current_price`, or when the value is not positive. None of
+/// those are errors: they mean "no mark to price against", and the caller falls
+/// through to its next reference source rather than abandoning the hedge
+/// (ADR 0019).
+pub(super) async fn fetch_position_mark(
+    client: &AlpacaBrokerApiClient,
+    symbol: &Symbol,
+) -> Result<Option<Positive<Usd>>, AlpacaBrokerApiError> {
+    let url = format!(
+        "{}/v1/trading/accounts/{}/positions/{}",
+        client.base_url(),
+        client.account_id(),
+        encode(symbol.as_str())
+    );
+
+    debug!(%symbol, "Fetching open broker position mark from {url}");
+
+    let position = match client.get::<PositionResponse>(&url).await {
+        Ok(position) => position,
+        Err(AlpacaBrokerApiError::ApiError { status, .. })
+            if status == reqwest::StatusCode::NOT_FOUND =>
+        {
+            debug!(%symbol, "No open broker position; no mark available");
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+
+    let returned_symbol = Symbol::new(&position.symbol)?;
+    if &returned_symbol != symbol {
+        return Err(AlpacaBrokerApiError::PositionSymbolMismatch {
+            requested: symbol.clone(),
+            returned: returned_symbol,
+        });
+    }
+
+    if position.is_non_equity() {
+        debug!(%symbol, "Open broker position is not an equity; no mark available");
+        return Ok(None);
+    }
+
+    let Some(current_price) = position.current_price else {
+        warn!(%symbol, "Broker position omitted current_price; no mark available");
+        return Ok(None);
+    };
+
+    match Positive::new(Usd::new(current_price)) {
+        Ok(mark) => Ok(Some(mark)),
+        Err(error) => {
+            warn!(
+                %symbol,
+                mark = %error.value,
+                "Broker position reported a non-positive mark; no mark available"
+            );
+            Ok(None)
+        }
+    }
 }
 
 async fn list_positions(
@@ -1087,5 +1163,199 @@ mod tests {
 
         assert_eq!(symbols, vec!["AAPL"]);
         assert_eq!(inventory.alpaca_usdc, Some(Usdc::ZERO));
+    }
+
+    /// Serves the single-position endpoint and reads its mark.
+    async fn mark_for(
+        position: Option<serde_json::Value>,
+        symbol: &str,
+    ) -> Result<Option<Positive<Usd>>, AlpacaBrokerApiError> {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let position_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions/{}",
+                encode(symbol)
+            ));
+            match position {
+                Some(position) => {
+                    then.status(200)
+                        .header("content-type", "application/json")
+                        .json_body(position);
+                }
+                None => {
+                    then.status(404)
+                        .header("content-type", "application/json")
+                        .json_body(json!({ "message": "position does not exist" }));
+                }
+            }
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let mark = fetch_position_mark(&client, &Symbol::new(symbol).unwrap()).await;
+        position_mock.assert();
+        mark
+    }
+
+    #[tokio::test]
+    async fn position_mark_reads_current_price_for_the_requested_symbol() {
+        let mark = mark_for(
+            Some(json!({
+                "symbol": "AAPL",
+                "qty_available": "3",
+                "current_price": "223.80"
+            })),
+            "AAPL",
+        )
+        .await
+        .unwrap()
+        .expect("AAPL holds a position carrying a mark");
+
+        assert_eq!(
+            mark.inner(),
+            Usd::new(Float::parse("223.80".to_string()).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn position_mark_encodes_the_symbol_as_one_path_segment() {
+        let mark = mark_for(
+            Some(json!({
+                "symbol": "BTC/USD",
+                "qty_available": "3",
+                "current_price": "223.80"
+            })),
+            "BTC/USD",
+        )
+        .await
+        .unwrap()
+        .expect("the encoded symbol holds a position carrying a mark");
+
+        assert_eq!(
+            mark.inner(),
+            Usd::new(Float::parse("223.80".to_string()).unwrap())
+        );
+    }
+
+    /// A short hedge position is still a position, and its mark is still the
+    /// price to hedge against -- the sign belongs to the quantity, not the mark.
+    #[tokio::test]
+    async fn position_mark_reads_short_positions() {
+        let mark = mark_for(
+            Some(json!({
+                "symbol": "AAPL",
+                "qty_available": "-3",
+                "current_price": "223.80"
+            })),
+            "AAPL",
+        )
+        .await
+        .unwrap()
+        .expect("a short position still carries a mark");
+
+        assert_eq!(
+            mark.inner(),
+            Usd::new(Float::parse("223.80".to_string()).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn position_mark_is_absent_when_the_account_holds_no_position() {
+        assert_eq!(mark_for(None, "AAPL").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn position_mark_is_absent_when_the_broker_omits_current_price() {
+        assert_eq!(
+            mark_for(
+                Some(json!({
+                    "symbol": "AAPL",
+                    "qty_available": "3",
+                    "market_value": "671.40"
+                })),
+                "AAPL",
+            )
+            .await
+            .unwrap(),
+            None
+        );
+    }
+
+    /// A zero or negative mark cannot price a limit order. It resolves to "no
+    /// mark" so the caller falls through to its next reference source, rather
+    /// than erroring and abandoning a flatten that must happen.
+    #[tokio::test]
+    async fn position_mark_is_absent_when_the_mark_is_not_positive() {
+        assert_eq!(
+            mark_for(
+                Some(json!({
+                    "symbol": "AAPL",
+                    "qty_available": "3",
+                    "current_price": "0"
+                })),
+                "AAPL",
+            )
+            .await
+            .unwrap(),
+            None
+        );
+    }
+
+    /// USDCUSD is Alpaca's crypto pair. It is excluded from equity everywhere
+    /// else, and it must not be able to answer an equity mark lookup either.
+    #[tokio::test]
+    async fn position_mark_ignores_non_equity_positions() {
+        assert_eq!(
+            mark_for(
+                Some(json!({
+                    "symbol": "USDCUSD",
+                    "qty_available": "100",
+                    "current_price": "1.00",
+                    "asset_class": "crypto",
+                })),
+                "USDCUSD",
+            )
+            .await
+            .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn position_mark_rejects_a_response_for_another_symbol() {
+        let error = mark_for(
+            Some(json!({
+                "symbol": "TSLA",
+                "qty_available": "3",
+                "current_price": "223.80"
+            })),
+            "AAPL",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::PositionSymbolMismatch { requested, returned }
+                if requested == Symbol::new("AAPL").unwrap()
+                    && returned == Symbol::new("TSLA").unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn position_mark_rejects_an_invalid_response_symbol() {
+        let error = mark_for(
+            Some(json!({
+                "symbol": " ",
+                "qty_available": "3",
+                "current_price": "223.80"
+            })),
+            "AAPL",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, AlpacaBrokerApiError::InvalidSymbol(_)));
     }
 }

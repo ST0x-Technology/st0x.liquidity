@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::alpaca_market_data::AlpacaMarketDataError;
 use crate::{
     Backpressure, ClientOrderId, CounterTradeCostError, ExecutorOrderId, FractionalShares,
-    Positive, Symbol, Usd,
+    Permanence, Positive, Symbol, Usd,
 };
 
 /// Time-in-force specifies how long an order remains active before it expires.
@@ -173,6 +173,12 @@ pub enum AlpacaBrokerApiError {
     #[error("Failed to parse Alpaca API response: {0}")]
     JsonParse(#[from] serde_json::Error),
 
+    #[error(
+        "position endpoint returned {returned} when {requested} was requested; refusing to price \
+         from another symbol"
+    )]
+    PositionSymbolMismatch { requested: Symbol, returned: Symbol },
+
     #[error("Invalid header value: {0}")]
     InvalidHeader(#[from] reqwest::header::InvalidHeaderValue),
 
@@ -308,8 +314,13 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Float conversion error: {0}")]
     FloatConversion(#[from] FloatError),
+    // Boxed to keep `AlpacaBrokerApiError` inside clippy's large-`Err`
+    // budget: two variants carrying `AlpacaMarketDataError` inline push
+    // every `Result` in the crate's call graph over the threshold.
     #[error("latest trade lookup failed: {0}")]
-    LatestTrade(#[from] AlpacaMarketDataError),
+    LatestTrade(#[source] Box<AlpacaMarketDataError>),
+    #[error("latest quote lookup failed: {0}")]
+    LatestQuote(#[source] Box<AlpacaMarketDataError>),
     #[error("counter-trade cost estimation failed: {0}")]
     CounterTradeCost(#[from] CounterTradeCostError),
 }
@@ -353,6 +364,7 @@ impl AlpacaBrokerApiError {
             Self::ApiError { .. }
             | Self::HttpClient(_)
             | Self::JsonParse(_)
+            | Self::PositionSymbolMismatch { .. }
             | Self::InvalidHeader(_)
             | Self::InvalidOrderId(_)
             | Self::IncompleteOrder { .. }
@@ -383,12 +395,64 @@ impl AlpacaBrokerApiError {
             // Delegate rather than returning `None`: `find_backpressure`'s
             // chain-walk downcasts `AlpacaBrokerApiError` before it ever
             // reaches the wrapped `AlpacaMarketDataError`, so classifying
-            // here means a 429 from `fetch_latest_trade_price` (e.g. the
-            // extended-hours limit-price lookup) is caught at this first
-            // hop instead of relying on a second, separate
-            // `AlpacaMarketDataError` downcast one level further down the
-            // chain.
-            Self::LatestTrade(source) => source.backpressure(),
+            // here means a 429 from `fetch_latest_trade_price` or
+            // `fetch_latest_quote` is caught at this first hop instead of
+            // relying on a second, separate `AlpacaMarketDataError`
+            // downcast one level further down the chain.
+            Self::LatestTrade(source) | Self::LatestQuote(source) => source.backpressure(),
+        }
+    }
+
+    /// Classifies whether an immediate retry of the same request can
+    /// plausibly succeed, so a caller can tell a rejection it must stop
+    /// re-sending from a blip it should re-send within the second. Delegates
+    /// for the wrapped market-data variants for the same reason
+    /// [`Self::backpressure`] does.
+    pub fn permanence(&self) -> Permanence {
+        match self {
+            Self::ApiError { status, .. } => crate::status_permanence(*status),
+
+            // Request-builder failures are deterministic for the same inputs.
+            // Once a request is built, connect failures, resets, and the
+            // client's own request timeout are transient. A single-symbol
+            // endpoint returning another symbol is likewise an upstream
+            // routing/cache failure: a fresh request can clear it, but the
+            // mismatched financial value must never be consumed.
+            Self::HttpClient(source) if source.is_builder() => Permanence::Permanent,
+            Self::HttpClient(_) | Self::PositionSymbolMismatch { .. } => Permanence::Transient,
+
+            // Everything else is decided locally -- from a response that
+            // already arrived, from configuration, or from arithmetic on
+            // values in hand -- so the same inputs fail the same way.
+            Self::JsonParse(_)
+            | Self::InvalidHeader(_)
+            | Self::InvalidOrderId(_)
+            | Self::IncompleteOrder { .. }
+            | Self::AccountNotActive { .. }
+            | Self::CryptoOrderFailed { .. }
+            | Self::DuplicateOrderNotFound { .. }
+            | Self::CalendarIterationInvariantViolation
+            | Self::CalendarDateMismatch { .. }
+            | Self::CalendarLocalTimeUnresolvable { .. }
+            | Self::InvalidAccountActivitiesUrl { .. }
+            | Self::AccountActivitiesPaginationInvariantViolation
+            | Self::AccountActivitiesPageLimitExceeded { .. }
+            | Self::AssetNotActive { .. }
+            | Self::AssetNotTradable { .. }
+            | Self::InvalidLimitPricePrecision { .. }
+            | Self::UsdBalanceConversion(_)
+            | Self::FractionalCents(_)
+            | Self::InvalidSymbol(_)
+            | Self::MissingPositionQuantity
+            | Self::BelowPrecision { .. }
+            | Self::UsdcBelowPrecision { .. }
+            | Self::UsdcPrecisionExceeded { .. }
+            | Self::NotPositive(_)
+            | Self::NotPositiveLimitPrice(_)
+            | Self::FloatConversion(_)
+            | Self::CounterTradeCost(_) => Permanence::Permanent,
+
+            Self::LatestTrade(source) | Self::LatestQuote(source) => source.permanence(),
         }
     }
 }
@@ -446,5 +510,115 @@ mod tests {
         let error = AlpacaBrokerApiError::MissingPositionQuantity;
 
         assert_eq!(error.backpressure(), None);
+    }
+
+    fn api_error(status: reqwest::StatusCode) -> AlpacaBrokerApiError {
+        AlpacaBrokerApiError::ApiError {
+            status,
+            alpaca_code: None,
+            message: "boom".to_string(),
+            retry_after: None,
+        }
+    }
+
+    #[test]
+    fn permanence_permanent_for_a_403() {
+        assert_eq!(
+            api_error(reqwest::StatusCode::FORBIDDEN).permanence(),
+            Permanence::Permanent
+        );
+    }
+
+    #[test]
+    fn permanence_transient_for_a_500() {
+        assert_eq!(
+            api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR).permanence(),
+            Permanence::Transient
+        );
+    }
+
+    /// 429 is the one 4xx that clears on its own; `backpressure()` already
+    /// routes it to a reschedule, and it must never read as permanent if it
+    /// reaches this classification some other way.
+    #[test]
+    fn permanence_transient_for_a_429() {
+        assert_eq!(
+            api_error(reqwest::StatusCode::TOO_MANY_REQUESTS).permanence(),
+            Permanence::Transient
+        );
+    }
+
+    /// The transport variant every non-market-data broker call fails with
+    /// when the network drops. Driven through a real `reqwest::Error` rather
+    /// than a constructed one, since the type has no public constructor.
+    #[tokio::test]
+    async fn permanence_transient_for_a_transport_failure() {
+        // Port 1 is reserved and never listening, so this is a genuine
+        // connect failure carried in a real `reqwest::Error`.
+        let transport = reqwest::Client::new()
+            .get("http://127.0.0.1:1/v1/trading/accounts")
+            .send()
+            .await
+            .expect_err("connecting to a closed port must fail");
+
+        assert_eq!(
+            AlpacaBrokerApiError::from(transport).permanence(),
+            Permanence::Transient
+        );
+    }
+
+    #[test]
+    fn permanence_permanent_for_a_request_builder_failure() {
+        let builder = reqwest::Client::new()
+            .get("not a valid URL")
+            .build()
+            .expect_err("an invalid URL must fail while building the request");
+
+        assert!(builder.is_builder());
+        assert_eq!(
+            AlpacaBrokerApiError::from(builder).permanence(),
+            Permanence::Permanent
+        );
+    }
+
+    #[test]
+    fn permanence_transient_for_a_position_symbol_mismatch() {
+        assert_eq!(
+            AlpacaBrokerApiError::PositionSymbolMismatch {
+                requested: Symbol::new("AAPL").unwrap(),
+                returned: Symbol::new("TSLA").unwrap(),
+            }
+            .permanence(),
+            Permanence::Transient
+        );
+    }
+
+    #[test]
+    fn permanence_permanent_for_a_locally_decided_variant() {
+        assert_eq!(
+            AlpacaBrokerApiError::MissingPositionQuantity.permanence(),
+            Permanence::Permanent
+        );
+    }
+
+    /// The real wrapping shape of a market-data failure: classification must
+    /// come from the wrapped error, not from the wrapper's own variant.
+    #[test]
+    fn permanence_delegates_through_a_wrapped_market_data_error() {
+        let transient =
+            AlpacaBrokerApiError::LatestQuote(Box::new(AlpacaMarketDataError::ApiError {
+                status: reqwest::StatusCode::BAD_GATEWAY,
+                body: "upstream down".to_string(),
+                retry_after: None,
+            }));
+        let permanent =
+            AlpacaBrokerApiError::LatestTrade(Box::new(AlpacaMarketDataError::ApiError {
+                status: reqwest::StatusCode::FORBIDDEN,
+                body: "subscription does not permit querying recent SIP data".to_string(),
+                retry_after: None,
+            }));
+
+        assert_eq!(transient.permanence(), Permanence::Transient);
+        assert_eq!(permanent.permanence(), Permanence::Permanent);
     }
 }

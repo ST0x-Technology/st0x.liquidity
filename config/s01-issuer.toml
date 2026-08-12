@@ -51,7 +51,9 @@ organization_id = "b100145e-7894-4c17-b3e7-160435f84803"
 [broker]
 counter_trade_slippage_bps = 100
 extended_hours_reprice_timeout_secs = 300
+close_flatten_reprice_timeout_secs = 60
 extended_hours_close_flatten_window_secs = 900
+close_flatten_cross_max_bps = 400
 
 # Travel Rule beneficiary identity for Alpaca whitelist creation. Must be the
 # real entity (validate-config rejects placeholder values).

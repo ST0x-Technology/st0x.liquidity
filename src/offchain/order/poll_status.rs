@@ -159,6 +159,75 @@ where
     }
 }
 
+/// How a close-flatten placement ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseFlattenOutcome {
+    Filled,
+    Failed,
+    Cancelled,
+}
+
+impl CloseFlattenOutcome {
+    const fn metric_label(self) -> &'static str {
+        match self {
+            Self::Filled => "filled",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Returns `None` when this order was not
+/// priced by close-flatten mode or the broker state is not terminal.
+///
+/// Read off the pre-transition entity, since the flag lives only on the
+/// pre-terminal states.
+fn close_flatten_outcome(
+    order: &OffchainOrder,
+    order_state: &OrderState,
+) -> Option<CloseFlattenOutcome> {
+    if !order.close_flatten() {
+        return None;
+    }
+
+    match order_state {
+        OrderState::Filled { .. } => Some(CloseFlattenOutcome::Filled),
+        OrderState::Failed {
+            terminality: OrderFailureTerminality::Terminal,
+            ..
+        } => Some(CloseFlattenOutcome::Failed),
+        OrderState::Cancelled { .. } => Some(CloseFlattenOutcome::Cancelled),
+        OrderState::Pending
+        | OrderState::Submitted { .. }
+        | OrderState::PartiallyFilled { .. }
+        | OrderState::Failed {
+            terminality: OrderFailureTerminality::NotTerminal,
+            ..
+        } => None,
+    }
+}
+
+/// Counts successful terminal broker-state dispatches for close-flatten
+/// placements (ADR 0019).
+///
+/// Called once a terminal broker-state dispatch succeeds. The follow-up fill or
+/// rejection job commits the aggregate transition separately, so a delayed
+/// follow-up can leave the order eligible for another terminal observation.
+/// Emitting from the aggregate's `evolve` instead would inflate the counter on
+/// every rehydration, since replay re-runs every historical transition.
+fn record_close_flatten_outcome(order: &OffchainOrder, outcome: CloseFlattenOutcome) {
+    metrics::counter!(
+        "close_flatten_outcomes_total",
+        "symbol" => order.symbol().to_string(),
+        "direction" => match order.direction() {
+            st0x_execution::Direction::Buy => "buy",
+            st0x_execution::Direction::Sell => "sell",
+        },
+        "outcome" => outcome.metric_label()
+    )
+    .increment(1);
+}
+
 impl PollOrderStatus {
     async fn query_broker_and_dispatch<E>(
         &self,
@@ -268,7 +337,8 @@ impl PollOrderStatus {
         use OrderState::{Cancelled, Failed, Filled, PartiallyFilled, Pending, Submitted};
         validate_broker_terminal_fill(executor_order_id, &order_state)?;
         let symbol = order.symbol();
-        match order_state {
+        let outcome = close_flatten_outcome(order, &order_state);
+        let dispatched = match order_state {
             Filled {
                 price,
                 order_id,
@@ -421,7 +491,15 @@ impl PollOrderStatus {
 
                 reschedule_self(ctx, self.offchain_order_id).await
             }
+        };
+
+        if dispatched.is_ok()
+            && let Some(outcome) = outcome
+        {
+            record_close_flatten_outcome(order, outcome);
         }
+
+        dispatched
     }
 
     async fn record_partial_fill<E>(
@@ -5451,5 +5529,237 @@ mod tests {
         );
 
         monitor_handle.abort();
+    }
+
+    /// Reads the `close_flatten_outcomes_total` sample for exactly this
+    /// `symbol`/`direction`/`outcome` tuple. Matching the counter's own series,
+    /// rather than a substring of the whole render, is what makes an assertion
+    /// fail when the attribution is wrong instead of passing because another
+    /// series happens to carry the same symbol and outcome.
+    fn close_flatten_outcome_count(
+        rendered: &str,
+        symbol: &Symbol,
+        direction: Direction,
+        outcome: &str,
+    ) -> u64 {
+        let direction = match direction {
+            Direction::Buy => "buy",
+            Direction::Sell => "sell",
+        };
+        let Some(sample) = rendered.lines().find(|line| {
+            line.starts_with("close_flatten_outcomes_total{")
+                && line.contains(&format!("symbol=\"{symbol}\""))
+                && line.contains(&format!("direction=\"{direction}\""))
+                && line.contains(&format!("outcome=\"{outcome}\""))
+        }) else {
+            return 0;
+        };
+
+        let (_, value) = sample
+            .rsplit_once(' ')
+            .unwrap_or_else(|| panic!("malformed Prometheus sample line: {sample}"));
+        value
+            .parse()
+            .unwrap_or_else(|error| panic!("unparseable counter value in {sample}: {error}"))
+    }
+
+    /// Every `close_flatten_outcomes_total` sample the recorder rendered, so a
+    /// test can assert that a poll produced no outcome at all rather than just
+    /// no outcome under the label it expected.
+    fn close_flatten_outcome_samples(rendered: &str) -> Vec<&str> {
+        rendered
+            .lines()
+            .filter(|line| line.starts_with("close_flatten_outcomes_total{"))
+            .collect()
+    }
+
+    fn close_flatten_order(symbol: &Symbol, close_flatten: bool) -> OffchainOrder {
+        OffchainOrder::Submitted {
+            symbol: symbol.clone(),
+            shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            requested_shares: None,
+            direction: Direction::Sell,
+            executor: SupportedExecutor::DryRun,
+            executor_order_id: ExecutorOrderId::new("order-1"),
+            placed_at: Utc::now(),
+            submitted_at: Utc::now(),
+            market_session: st0x_execution::MarketSession::Extended,
+            close_flatten,
+        }
+    }
+
+    fn broker_filled() -> OrderState {
+        OrderState::Filled {
+            price: Usd::new(float!(100)),
+            order_id: ExecutorOrderId::new("order-1"),
+            executed_at: Utc::now(),
+        }
+    }
+
+    /// The metric is the only way to judge whether the cross ceiling is wide
+    /// enough, so it has to fire on a terminal state and stay silent on the
+    /// non-terminal polls around it -- a still-working order is not an outcome.
+    /// Repeated terminal observations are not deduplicated; see
+    /// `record_close_flatten_outcome`.
+    #[tokio::test]
+    async fn close_flatten_outcome_is_counted_for_a_terminal_state_but_not_a_non_terminal_one() {
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let order = close_flatten_order(&symbol, true);
+        let executor_order_id = ExecutorOrderId::new("order-1");
+        let job = PollOrderStatus {
+            offchain_order_id: OffchainOrderId::new(),
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        job.dispatch_for_broker_state(&infra.ctx, &order, &executor_order_id, broker_filled())
+            .await
+            .unwrap();
+        job.dispatch_for_broker_state(
+            &infra.ctx,
+            &order,
+            &executor_order_id,
+            OrderState::Submitted {
+                order_id: executor_order_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let rendered = handle.render();
+        assert_eq!(
+            close_flatten_outcome_count(&rendered, &symbol, Direction::Sell, "filled"),
+            1,
+            "one terminal fill must be counted exactly once, in:\n{rendered}"
+        );
+        assert_eq!(
+            close_flatten_outcome_samples(&rendered).len(),
+            1,
+            "a non-terminal poll must not emit any outcome series, in:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn close_flatten_outcome_metric_labels_are_stable() {
+        assert_eq!(CloseFlattenOutcome::Filled.metric_label(), "filled");
+        assert_eq!(CloseFlattenOutcome::Failed.metric_label(), "failed");
+        assert_eq!(CloseFlattenOutcome::Cancelled.metric_label(), "cancelled");
+    }
+
+    /// Alpaca can report statuses such as `suspended` through `Failed` while
+    /// explicitly classifying them as non-terminal. The order may later resume
+    /// and fill, so treating that observation as a terminal failure corrupts
+    /// the fill-rate signal used to tune the close-flatten cross.
+    #[tokio::test]
+    async fn non_terminal_failure_is_not_a_close_flatten_outcome() {
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let symbol = Symbol::new("NVDA").unwrap();
+        let order = close_flatten_order(&symbol, true);
+
+        PollOrderStatus {
+            offchain_order_id: OffchainOrderId::new(),
+            backpressure_streak: BackpressureStreak::default(),
+        }
+        .dispatch_for_broker_state(
+            &infra.ctx,
+            &order,
+            &ExecutorOrderId::new("order-1"),
+            OrderState::Failed {
+                failed_at: Utc::now(),
+                error_reason: Some("suspended".to_string()),
+                shares_filled: Some(FractionalShares::ZERO),
+                avg_price: None,
+                terminality: OrderFailureTerminality::NotTerminal,
+            },
+        )
+        .await
+        .unwrap();
+
+        let rendered = handle.render();
+        assert_eq!(
+            close_flatten_outcome_samples(&rendered),
+            Vec::<&str>::new(),
+            "a non-terminal broker failure must emit no close-flatten outcome, in:\n{rendered}"
+        );
+    }
+
+    /// A dispatch that fails leaves the order pre-terminal, so apalis retries it
+    /// against the same broker state. Counting before the dispatch commits would
+    /// count that single real outcome once per attempt.
+    #[tokio::test]
+    async fn close_flatten_outcomes_are_counted_only_once_the_dispatch_commits() {
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let mut infra = build_test_infra(MockExecutor::new()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let order = close_flatten_order(&symbol, true);
+        let executor_order_id = ExecutorOrderId::new("order-1");
+        let job = PollOrderStatus {
+            offchain_order_id: OffchainOrderId::new(),
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        // The reconcile enqueue the Filled arm performs targets a closed pool,
+        // so the first attempt fails exactly as a transient sqlite error would.
+        let closed_pool = crate::test_utils::setup_test_apalis_pool().await;
+        closed_pool.close().await;
+        let live_queue = std::mem::replace(
+            &mut infra.ctx.reconcile_queue,
+            ReconcileOrderFillJobQueue::new(&closed_pool),
+        );
+
+        let error = job
+            .dispatch_for_broker_state(&infra.ctx, &order, &executor_order_id, broker_filled())
+            .await
+            .unwrap_err();
+        let rendered = handle.render();
+        assert_eq!(
+            close_flatten_outcome_count(&rendered, &symbol, Direction::Sell, "filled"),
+            0,
+            "a failed dispatch ({error:?}) must not count an outcome, in:\n{rendered}"
+        );
+
+        infra.ctx.reconcile_queue = live_queue;
+        job.dispatch_for_broker_state(&infra.ctx, &order, &executor_order_id, broker_filled())
+            .await
+            .unwrap();
+
+        let rendered = handle.render();
+        assert_eq!(
+            close_flatten_outcome_count(&rendered, &symbol, Direction::Sell, "filled"),
+            1,
+            "the retry that commits must count the outcome exactly once, in:\n{rendered}"
+        );
+    }
+
+    /// An ordinary extended-hours order shares the terminal path but is not a
+    /// flatten, so it must not inflate the flatten denominator's numerator.
+    #[tokio::test]
+    async fn ordinary_orders_are_not_counted_as_close_flatten_outcomes() {
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let infra = build_test_infra(MockExecutor::new()).await;
+        let symbol = Symbol::new("TSLA").unwrap();
+        let order = close_flatten_order(&symbol, false);
+
+        PollOrderStatus {
+            offchain_order_id: OffchainOrderId::new(),
+            backpressure_streak: BackpressureStreak::default(),
+        }
+        .dispatch_for_broker_state(
+            &infra.ctx,
+            &order,
+            &ExecutorOrderId::new("order-1"),
+            broker_filled(),
+        )
+        .await
+        .unwrap();
+
+        let rendered = handle.render();
+        assert_eq!(
+            close_flatten_outcome_samples(&rendered),
+            Vec::<&str>::new(),
+            "an ordinary extended-hours fill must emit no close-flatten outcome"
+        );
     }
 }

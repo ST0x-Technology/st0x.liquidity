@@ -838,8 +838,9 @@ the order cannot strand the position with a pending ID no retry can claim.
 
 During an Extended market session, only symbols with
 `extended_hours_counter_trading = enabled` place limit orders; disabled symbols
-skip. Ordinary extended-hours orders use the latest trade plus the configured
-`counter_trade_slippage_bps` buffer.
+skip. Extended-hours pricing tries the optional primary quote first, then the
+broker position mark, then Alpaca's hardcoded delayed-SIP quote feed. Buys use
+the ask and sells use the bid before applying the configured cross.
 
 The executor's `MarketSessionStatus` also classifies the gap after the current
 session as `OrdinaryOvernight`, `MultiDayClosure`, or `Unknown`. Both
@@ -847,17 +848,19 @@ session as `OrdinaryOvernight`, `MultiDayClosure`, or `Unknown`. Both
 configured final window before a multi-day or unknown gap, the scanner cancels
 any order resting since before the window and placement switches to
 quote-crossing limits. Buys use ask plus the configured buffer; sells use bid
-minus it. The quote request explicitly selects Alpaca's SIP feed so the result
-is NBBO rather than a subscription-dependent IEX default. Missing SIP access and
-missing, non-positive, or crossed quotes fail the hedge attempt for retry and
-never fall back to a latest-trade price.
+minus it. The final quote fallback explicitly selects Alpaca's delayed-SIP feed
+so the result is independent of a subscription-dependent default. The hedge is
+abandoned only after every configured source fails.
 
-The ordinary 300-second extended-hours reprice timeout remains active inside the
-window. Each confirmed cancellation releases the position after applying any
-partial fill, so the next scan retries the broker-executable residual using a
-fresh quote. This produces repeated bounded-loss attempts until the session
-closes, while the existing buying-power, equity-inventory, operational-limit,
-and broker-minimum checks continue to block invalid or leveraged orders.
+Ordinary extended-hours orders retain the explicit 300-second
+`extended_hours_reprice_timeout_secs` cadence. Orders placed by close-flatten
+use the separate 60-second `close_flatten_reprice_timeout_secs` cadence. Each
+confirmed cancellation releases the position after applying any partial fill, so
+the next scan retries the broker-executable residual using a fresh reference and
+a later point on the cross ramp. This produces repeated bounded-loss attempts
+until the session closes, while the existing buying-power, equity-inventory,
+operational-limit, and broker-minimum checks continue to block invalid or
+leveraged orders.
 
 ## Conductor assembly
 

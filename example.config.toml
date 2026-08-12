@@ -28,7 +28,13 @@ logs_endpoint = "http://100.x.x.x:9428"
 [broker]
 counter_trade_slippage_bps = 100
 extended_hours_reprice_timeout_secs = 300
+close_flatten_reprice_timeout_secs = 60
 extended_hours_close_flatten_window_secs = 900
+# The cross for a close-flatten hedge ramps toward this ceiling by the 20:00 ET
+# close, starting from counter_trade_slippage_bps at the start of the window.
+# Placement prices off the broker's position mark, so this bounds how far it
+# will chase a fill before a weekend or holiday (ADR 0019).
+close_flatten_cross_max_bps = 400
 
 [broker.travel_rule]
 beneficiary_entity_name = "Acme Corp"

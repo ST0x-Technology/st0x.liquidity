@@ -7,11 +7,12 @@ use sqlx::SqlitePool;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use task_supervisor::SupervisorBuilder;
+use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use st0x_config::{BrokerCtx, Ctx, ExecutionThreshold};
+use st0x_config::{Ctx, ExecutionThreshold};
 use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::{Executor, Symbol};
@@ -77,7 +78,9 @@ use crate::rebalancing::{
     EquityRebalancingCheck, EquityRebalancingCheckScheduler, RebalancingService,
     UsdcRebalancingCheck, UsdcRebalancingCheckScheduler,
 };
-use crate::trading::offchain::close_flatten::CloseFlattenPolicy;
+use crate::trading::offchain::close_flatten::{
+    CloseFlattenCrossRamp, CloseFlattenCrossRampError, CloseFlattenPolicy,
+};
 use crate::trading::offchain::hedge::{HedgeCtx, HedgeJobQueue, PlaceHedge};
 use crate::trading::onchain::trade_accountant::{
     AccountForDexTrade, AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
@@ -101,6 +104,14 @@ pub(crate) struct CqrsFrameworks {
     pub(crate) vault_registry: Arc<Store<VaultRegistry>>,
     pub(crate) snapshot: Arc<Store<InventorySnapshot>>,
     pub(crate) portfolio_snapshot: Arc<Store<PortfolioSnapshot>>,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ConductorSpawnError {
+    #[error(transparent)]
+    CloseFlattenWindow(#[from] chrono::OutOfRangeError),
+    #[error(transparent)]
+    CloseFlattenCrossRamp(#[from] CloseFlattenCrossRampError),
 }
 
 /// Everything needed to construct a running [`Conductor`].
@@ -214,7 +225,7 @@ pub(crate) fn spawn<Prov, Exec>(
     job_cleanup: JoinHandle<()>,
     telemetry_writer: JoinHandle<()>,
     worker_failure_notifier: Arc<dyn Notifier>,
-) -> Result<Conductor, chrono::OutOfRangeError>
+) -> Result<Conductor, ConductorSpawnError>
 where
     Prov: Provider + Clone + Send + Sync + 'static,
     Exec: Executor + Clone + Send + Sync + 'static,
@@ -345,6 +356,17 @@ where
     let close_flatten_policy =
         CloseFlattenPolicy::from_secs(context.ctx.extended_hours_close_flatten_window_secs)?;
 
+    let close_flatten_ramp = CloseFlattenCrossRamp::new(
+        context.ctx.broker.counter_trade_slippage_bps(),
+        context.ctx.close_flatten_cross_max_bps,
+    )?;
+
+    // One set, shared by both paths: a symbol dropped by the scan and the
+    // dead-letter it would have become are the same standing delta, so they
+    // must page once, and the release the hedge path performs once a
+    // placement reaches the broker must clear the scan's entries too.
+    let alerted_dead_letters = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+
     let hedge_ctx = Arc::new(HedgeCtx {
         position: context.frameworks.position.clone(),
         offchain_order: context.frameworks.offchain_order.clone(),
@@ -353,12 +375,11 @@ where
         hedge_queue: hedge_queue.clone(),
         assets: context.ctx.assets.clone(),
         counter_trade_submission_lock: counter_trade_submission_lock.clone(),
-        counter_trade_slippage_bps: match &context.ctx.broker {
-            BrokerCtx::AlpacaBrokerApi(alpaca_ctx) => alpaca_ctx.counter_trade_slippage_bps,
-            BrokerCtx::DryRun => st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-        },
         close_flatten_policy,
+        close_flatten_ramp,
         poll_interval,
+        notifier: notifier.clone(),
+        alerted_dead_letters: alerted_dead_letters.clone(),
     });
 
     let check_positions_ctx = Arc::new(CheckPositionsCtx {
@@ -376,7 +397,10 @@ where
         pool: context.pool.clone(),
         check_interval: std::time::Duration::from_secs(context.ctx.position_check_interval),
         close_flatten_policy,
+        close_flatten_ramp,
         poll_interval,
+        notifier: notifier.clone(),
+        alerted_dead_letters,
     });
 
     let portfolio_snapshot_ctx = Arc::new(PortfolioSnapshotCtx {
@@ -402,6 +426,8 @@ where
         execution_threshold: context.execution_threshold,
         assets: context.ctx.assets.clone(),
         counter_trade_submission_lock,
+        close_flatten_policy,
+        close_flatten_ramp,
         poll_status_queue: poll_status_queue.clone(),
         hedge_queue: hedge_queue.clone(),
         poll_interval,

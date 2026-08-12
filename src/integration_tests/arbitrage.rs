@@ -962,6 +962,12 @@ async fn create_test_cqrs_with_assets(
         execution_threshold: ExecutionThreshold::whole_share(),
         assets,
         counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
+        close_flatten_policy:
+            crate::trading::offchain::close_flatten::CloseFlattenPolicy::from_secs(900).unwrap(),
+        close_flatten_ramp: crate::trading::offchain::close_flatten::CloseFlattenCrossRamp::new(
+            100, 400,
+        )
+        .unwrap(),
         poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(apalis_pool),
         order_placer,
         hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),

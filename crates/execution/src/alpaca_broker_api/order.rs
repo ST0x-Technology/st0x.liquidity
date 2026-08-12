@@ -463,6 +463,7 @@ fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
         }
         HttpClient(_)
         | JsonParse(_)
+        | PositionSymbolMismatch { .. }
         | InvalidHeader(_)
         | InvalidOrderId(_)
         | IncompleteOrder { .. }
@@ -489,6 +490,7 @@ fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
         | NotPositiveLimitPrice(_)
         | FloatConversion(_)
         | LatestTrade(_)
+        | LatestQuote(_)
         | CounterTradeCost(_) => false,
     }
 }
