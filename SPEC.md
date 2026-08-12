@@ -1000,6 +1000,11 @@ _System configuration_ (deploy-rs `activate.nixos`):
 - ragenix integration for secret decryption
 - Nix configuration (flakes, garbage collection)
 
+The dashboard's Tailscale-issued TLS certificate renews on a persistent daily
+systemd timer. The renewal oneshot returns to inactive after each run so the
+timer can start it again without a deployment or operator action. A successful
+renewal reloads nginx so it serves the new certificate.
+
 _Per-service profiles_ (deploy-rs `activate.custom`, deployed independently):
 
 The set of deployed profiles is declared as a registry in `services.nix`. Each
