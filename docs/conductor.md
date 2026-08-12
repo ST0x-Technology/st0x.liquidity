@@ -838,26 +838,123 @@ the order cannot strand the position with a pending ID no retry can claim.
 
 During an Extended market session, only symbols with
 `extended_hours_counter_trading = enabled` place limit orders; disabled symbols
-skip. Extended-hours pricing tries the optional primary quote first, then the
-broker position mark, then Alpaca's hardcoded delayed-SIP quote feed. Buys use
-the ask and sells use the bid before applying the configured cross.
+skip. Ordinary extended-hours orders use the shared reference-price resolver
+plus the configured `counter_trade_slippage_bps` buffer. With no primary
+provider wired today, the broker position mark is the first available production
+source.
 
 The executor's `MarketSessionStatus` also classifies the gap after the current
 session as `OrdinaryOvernight`, `MultiDayClosure`, or `Unknown`. Both
 `CheckPositions` and `PlaceHedge` use the same `CloseFlattenPolicy`: during the
 configured final window before a multi-day or unknown gap, the scanner cancels
-any order resting since before the window and placement switches to
-quote-crossing limits. Buys use ask plus the configured buffer; sells use bid
-minus it. The final quote fallback explicitly selects Alpaca's delayed-SIP feed
-so the result is independent of a subscription-dependent default. The hedge is
-abandoned only after every configured source fails.
+any order resting since before the window and placement switches to aggressive
+limits. This close-flatten cancellation is independent of
+`extended_hours_reprice_timeout_secs`: it targets live extended-hours orders
+placed before `CloseFlattenWindow.started_at`, even when they are younger than
+the timeout. That timeout gates only the separate reprice-timeout cancellation
+sweep. The shared resolver first asks an optional current bid/ask quote source,
+then falls back to the broker's position `current_price`, then to the emergency
+delayed quote. No primary provider is wired today, so effective production
+behaviour remains mark first. Buys add the cross and sells subtract it. The
+cross ramps linearly with elapsed time inside the window, from
+`counter_trade_slippage_bps` at the window's start to
+`close_flatten_cross_max_bps` at the close. `CloseFlattenCrossRamp` anchors it
+to the window rather than to a per-order attempt count, so it is a pure function
+of the window and the current time: restart-safe, identical across apalis
+retries, and independent of how many reprice cycles land. A hedge that first
+becomes ready mid-window opens partway up the ramp. See
+[ADR 0019](../adrs/0019-mark-priced-close-flatten-with-widening-cross.md) for
+the source-order and fallback decision.
+
+If the optional primary provider is absent or fails, and the symbol has no
+broker position or its mark lookup also fails, placement falls back to a quote
+on the `delayed_sip` feed. That emergency feed is hardcoded rather than
+configured: `sip` draws an entitlement 403, `iex` publishes single-venue stub
+quotes once it stops trading around 16:00 ET, and `delayed_sip` is the only
+value currently available that returns a real consolidated book. Its quote is a
+genuine NBBO fifteen minutes stale. After validating the book, the order price
+crosses its ask for a buy or its bid for a sell, regardless of spread width,
+since refusing that reference would leave the position unflattened.
+
+Only after the resolver has exhausted the optional primary quote, broker mark,
+and delayed SIP fallback does the selected missing, non-positive, bid-above-ask,
+or failed quote outcome classify as `ErrorScope::SymbolScoped` in
+`TradeAccountingError::scope()`. That says only that the failure was raised
+before this attempt ran `PositionCommand::PlaceOffChainOrder`.
+`handle_place_hedge_error` needs a second answer before it abandons the job,
+because the same variant boxes an opaque source: `find_permanence` walks the
+error chain for a broker `AlpacaBrokerApiError::permanence()` classification. A
+non-429 4xx (the entitlement 403 a `sip` quote draws on a Basic plan) and a
+syntactically malformed response are permanent. A valid but incomplete,
+non-positive, bid-above-ask, or wrong-symbol quote is a dynamic snapshot that
+may clear on the next request; those outcomes, 5xx, timeouts, and transport
+errors are transient.
+
+A permanent cause dead-letters at once, since re-asking cannot change the
+answer. A transient one is re-driven on the job's own durable budget first:
+`redrive_transient_failure` pushes a successor carrying an incremented
+`TransientFailureStreak` after 1s, 2s, then 4s, mirroring the supervised
+worker's `RetryPolicy::retries(3)` and its backoff, so the retry cadence is
+unchanged and only the terminal action differs. The streak is a `#[serde]`
+payload field, so it survives a restart rather than resetting the budget. Once
+`TRANSIENT_RESCHEDULE_LIMIT` re-drives are spent the symbol dead-letters like a
+permanent cause, because propagating instead would exhaust the shared retry
+budget and stop hedging for every other symbol -- the outage this isolation
+exists to prevent (RAI-1690).
+
+On a terminal symbol-scoped path the dead-letter is the same: the job increments
+`hedge_dead_lettered_total{symbol,reason}`, logs the cause, pages the operator
+through the shared `Notifier` (once per `(symbol, reason)`, so the ~60s
+`CheckPositions` re-enqueue cannot spam the channel), and returns `Ok(())`
+rather than consuming the shared retry budget or propagating an error that
+affects other symbols. A process-scoped recovery failure instead propagates
+through `dead_letter_or_propagate` so apalis can retry it. Notification delivery
+is bounded so an unreachable alert channel cannot serialize the single hedge
+worker; a failed or timed-out delivery releases the dedup reservation for the
+next scan. `CheckPositions` re-enqueues the hedge on its next scan. The dedup
+set is not a process-lifetime latch: `route_placement_outcome` drops every entry
+for a symbol as soon as one of its hedges reaches the broker, so a regression
+that recurs the following session pages again instead of silently accumulating a
+delta.
+
+`CheckPositions` can also drop an extended-hours buy before a `PlaceHedge` job
+exists, when the scan-time preflight cannot resolve a reference price or cannot
+cross it. Nothing downstream can report that, so the scan counts it on
+`hedge_scan_skipped_total{symbol,reason}` with the leg that failed. A permanent
+or unclassified failed reference-price lookup pages through the same
+`alert_dead_letter` and shared `(symbol, reason)` set as the hedge job. A
+transient or rate-limited failure remains counted but waits for the next scan
+instead of creating a dead-letter page on its first observation. Any page is
+released by the same successful placement.
+
+Dead-lettering does not assume the position is unclaimed. apalis re-runs
+`perform_body` from the top, so a retry can fail this pre-claim lookup after an
+earlier attempt already claimed the position and left a broker order behind;
+`handle_place_hedge_error` therefore resolves the claim through
+`recover_pending_poll_status` -- a no-op when nothing is claimed, a re-drive or
+re-arm of polling when something is -- _before_ it records the abandonment, and
+propagates a failed process-scoped recovery so apalis retries instead of
+counting a hedge that is still in flight as given up on. The one place pricing
+runs with a claim outstanding -- `recover_pending_poll_status`'s `Pending`
+re-drive -- wraps the failure as `ClaimedHedgeOrderKind`. Its symbol-scoped
+source uses the same bounded backpressure/transient budgets as the pre-claim
+path, then dead-letters while deliberately leaving the claim for the periodic
+recovery sweep; a genuinely process-scoped source still propagates. Placement
+dead-letters only once the optional primary quote, the mark, and the hardcoded
+`delayed_sip` quote feed have all failed: flattening before a multi-day gap is
+mandatory, so a worse fill price always beats no fill.
 
 Ordinary extended-hours orders retain the explicit 300-second
 `extended_hours_reprice_timeout_secs` cadence. Orders placed by close-flatten
-use the separate 60-second `close_flatten_reprice_timeout_secs` cadence. Each
-confirmed cancellation releases the position after applying any partial fill, so
-the next scan retries the broker-executable residual using a fresh reference and
-a later point on the cross ramp. This produces repeated bounded-loss attempts
+use the separate 60-second `close_flatten_reprice_timeout_secs` cadence. The
+initial close-flatten cancellation remains independent of both timeouts: it
+targets any live extended-hours order placed before the window. Each confirmed
+cancellation releases the position after applying any partial fill, so a later
+scan retries the broker-executable residual using a fresh reference and a later
+point on the cross ramp. That retry also waits for `position_check_interval`.
+The shipped deployments use 60 seconds, but cancellation confirmation and job
+execution add variable delay, so neither that interval nor the reprice timeout
+defines a fixed attempt count. This produces repeated bounded-loss attempts
 until the session closes, while the existing buying-power, equity-inventory,
 operational-limit, and broker-minimum checks continue to block invalid or
 leveraged orders.

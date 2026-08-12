@@ -168,10 +168,33 @@ reprice cadence; `broker.close_flatten_reprice_timeout_secs`, the faster cadence
 inside close-flatten; `broker.extended_hours_close_flatten_window_secs`, the
 length of the final window before weekends, exchange holidays, or an unknown
 next session; and `broker.close_flatten_cross_max_bps`, the maximum cross at the
-session close. All five are required and have no implicit defaults. Ordinary
-extended-hours orders retain their 300-second timeout, while close-flatten
-orders use the dedicated 60-second timeout and cross progressively wider until
-the session closes.
+session close. The maximum cross must be at least `counter_trade_slippage_bps`,
+since the ramp starts there, and no more than `9,999` bps, the global
+counter-trade slippage ceiling. All five are required and have no implicit
+defaults. Ordinary extended-hours orders retain their 300-second timeout, while
+close-flatten orders use the dedicated 60-second timeout and cross progressively
+wider until the session closes.
+
+Extended-hours limit orders use an ordered reference chain: an optional current
+bid/ask quote source, the broker's **position mark**, then an emergency
+`delayed_sip` quote. The current deployment has no primary quote provider, so
+its effective behaviour remains mark first, delayed SIP second. The executor
+capability is already present for a future source such as Alpaca SIP, and the
+mark remains the fallback if that source is missing or fails. No market-data
+feed config is exposed until a real provider is selected. See
+[ADR 0019](adrs/0019-mark-priced-close-flatten-with-widening-cross.md).
+
+Inside the close-flatten window the cross ramps linearly from
+`counter_trade_slippage_bps` at the window's start to
+`close_flatten_cross_max_bps` at the close, so each reprice crosses further than
+the last and the bot converges on a fill before the gap. Outside it,
+extended-hours orders keep the flat `counter_trade_slippage_bps` band. Only once
+every reference source has failed does the attempt dead-letter (counted by
+`hedge_dead_lettered_total{symbol,reason}`). Transient failures in queued
+`PlaceHedge` attempts, such as timeouts and 5xx, receive three durable redrives
+after 1s, 2s, and 4s; exhausting that budget increments the same dead-letter
+metric. Scan-time transient and rate-limited preflight failures instead wait for
+`CheckPositions` to re-enqueue the hedge on its next scan.
 
 ## Deployment
 
