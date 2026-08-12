@@ -323,7 +323,7 @@ mod tests {
 
     fn public_key_pem(key: &SigningKey) -> String {
         key.verifying_key()
-            .to_public_key_pem(Default::default())
+            .to_public_key_pem(p256::pkcs8::LineEnding::default())
             .expect("PEM encoding of a valid P-256 key cannot fail")
     }
 

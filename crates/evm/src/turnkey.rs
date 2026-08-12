@@ -123,10 +123,11 @@ pub enum TracingTurnkeySignerError {
     SystemTime { source: SystemTimeError },
 }
 
-/// Full resource name of a GCP KMS `EC_SIGN_P256_SHA256` key version
-/// (`projects/.../cryptoKeyVersions/N`) whose PUBLIC half is registered
-/// as a Turnkey API user. Non-secret — it names an IAM-gated key, it is
-/// not a credential itself. See [`crate::gcp_kms_stamper`].
+/// Full resource name of a GCP KMS `EC_SIGN_P256_SHA256` key version.
+///
+/// Shaped `projects/.../cryptoKeyVersions/N`; its PUBLIC half is
+/// registered as a Turnkey API user. Non-secret — it names an IAM-gated
+/// key, it is not a credential itself. See [`crate::gcp_kms_stamper`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(transparent)]
 pub struct TurnkeyKmsApiKey(String);
@@ -1453,6 +1454,121 @@ mod tests {
             !message.contains("sensitive-signed-tx-marker"),
             "response body leaked into error message: {message}"
         );
+    }
+
+    /// Builds a WalletCtx in the shape the DigitalOcean deployments use
+    /// TODAY: a stored P-256 api_private_key in [wallet] secrets, no
+    /// kms_api_key anywhere.
+    fn stored_key_ctx<P: Provider>(
+        provider: P,
+    ) -> WalletCtx<TurnkeySettings, TurnkeyCredentials, P> {
+        WalletCtx {
+            settings: TurnkeySettings {
+                address: Address::random(),
+                organization_id: TurnkeyOrganizationId::new("org-test".to_string()),
+                kms_api_key: None,
+            },
+            credentials: TurnkeyCredentials {
+                // A random P-256 scalar, hex-encoded — the exact shape the
+                // secrets file carries. (turnkey_api_key_stamper 0.4 has no
+                // private-key accessor on its generated keys, so mint one
+                // directly with p256.)
+                api_private_key: Some(TurnkeyApiPrivateKey::new(hex::encode(
+                    p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng)
+                        .to_bytes(),
+                ))),
+            },
+            provider,
+            required_confirmations: 1,
+        }
+    }
+
+    /// BACKWARD COMPATIBILITY: the live DO prod/staging shape -- stored
+    /// api_private_key, no kms_api_key -- must keep constructing a wallet
+    /// exactly as before. The KMS stamper is strictly opt-in; this test
+    /// fails if it ever becomes required.
+    #[tokio::test]
+    async fn new_accepts_stored_api_key_without_kms() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+
+        let ctx = stored_key_ctx(provider);
+        let expected_address = ctx.settings.address;
+
+        let wallet = TurnkeyWallet::new(ctx)
+            .await
+            .expect("stored-api-key (DigitalOcean) wallets must keep working");
+
+        assert_eq!(wallet.address(), expected_address);
+    }
+
+    /// A config carrying BOTH credential sources is refused rather than
+    /// silently preferring one -- an operator mid-migration must be told,
+    /// not guessed at. Checked before any KMS call, so no network needed.
+    #[tokio::test]
+    async fn new_rejects_both_credential_sources() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+
+        let mut ctx = stored_key_ctx(provider);
+        ctx.settings.kms_api_key = Some(TurnkeyKmsApiKey::new(
+            "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1".to_string(),
+        ));
+
+        let error = TurnkeyWallet::new(ctx)
+            .await
+            .expect_err("both credential sources must be refused");
+
+        assert!(
+            matches!(
+                error,
+                EvmError::Turnkey(TurnkeyError::Signer(
+                    TracingTurnkeySignerError::AmbiguousCredentials
+                ))
+            ),
+            "expected AmbiguousCredentials, got: {error:?}"
+        );
+    }
+
+    /// Neither source configured fails at startup with an actionable
+    /// message instead of a confusing auth failure on the first signature.
+    #[tokio::test]
+    async fn new_rejects_missing_credentials() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+
+        let mut ctx = stored_key_ctx(provider);
+        ctx.credentials.api_private_key = None;
+
+        let error = TurnkeyWallet::new(ctx)
+            .await
+            .expect_err("no credential source must be refused");
+
+        assert!(
+            matches!(
+                error,
+                EvmError::Turnkey(TurnkeyError::Signer(
+                    TracingTurnkeySignerError::MissingCredentials
+                ))
+            ),
+            "expected MissingCredentials, got: {error:?}"
+        );
+    }
+
+    /// BACKWARD COMPATIBILITY: the exact [wallet] TOML the DO prod and
+    /// staging configs ship (no kms_api_key key at all) still
+    /// deserializes -- the new field is additive and defaulted.
+    #[test]
+    fn existing_wallet_config_toml_still_deserializes() {
+        let settings: TurnkeySettings = toml::from_str(
+            r#"
+            address = "0x16ca08a5825612aAe805D172a81B1a52b43574bf"
+            organization_id = "b100145e-0000-0000-0000-000000000000"
+            "#,
+        )
+        .expect("pre-KMS [wallet] config must still parse");
+
+        assert!(settings.kms_api_key.is_none());
     }
 
     #[tokio::test]

@@ -873,16 +873,22 @@ fn parse_and_validate(
     // Validate wallet config/secrets pairing and required RPC URLs.
     // Actual wallet construction (async, connects to RPC) is deferred.
     let (wallet_inputs, wallet_meta) = match (config.wallet, secrets.wallet) {
-        // A KMS-stamped Turnkey wallet ([wallet].kms_api_key in config)
-        // needs no [wallet] secrets: its "API key" is an IAM-gated KMS
-        // key, not stored material — an empty secrets table stands in.
-        // Backends that DO need credentials still fail crisply via
-        // WalletSecretsMissing below.
-        (Some(wallet_config), wallet_secrets)
-            if wallet_secrets.is_some() || wallet_config.get("kms_api_key").is_some() =>
-        {
-            let wallet_secrets =
-                wallet_secrets.unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+        (Some(wallet_config), wallet_secrets) => {
+            // Wallet secrets stay REQUIRED for every credential-bearing
+            // backend (private-key, and Turnkey with a stored
+            // api_private_key) -- the DigitalOcean deployments' shape,
+            // unchanged. The single exemption is a KMS-stamped Turnkey
+            // wallet ([wallet].kms_api_key in config): its credential is
+            // an IAM-gated KMS key, so there is nothing to put in the
+            // secrets file and an empty table stands in.
+            let wallet_secrets = match wallet_secrets {
+                Some(wallet_secrets) => wallet_secrets,
+                None if wallet_config.get("kms_api_key").is_some() => {
+                    toml::Value::Table(toml::map::Map::new())
+                }
+                None => return Err(CtxError::WalletSecretsMissing),
+            };
+
             let Some(base_url) = base_rpc_url else {
                 return Err(CtxError::WalletMissingRpcUrl {
                     field: "base_rpc_url",
@@ -912,7 +918,6 @@ fn parse_and_validate(
                 wallet_meta,
             )
         }
-        (Some(_), None) => return Err(CtxError::WalletSecretsMissing),
         (None, Some(_)) => {
             // Wallet secrets present but no [wallet] in config.
             // Common when sharing one secrets file across bot + CLI
