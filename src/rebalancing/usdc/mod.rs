@@ -222,6 +222,59 @@ pub(crate) enum UsdcTransferError {
         withdrawn: alloy::primitives::U256,
         requested: alloy::primitives::U256,
     },
+    /// The USD->USDC conversion settled below Alpaca's withdrawal minimum,
+    /// which the trigger can only enforce on the amount it *requests*: a
+    /// stalled conversion whose remainder was cancelled delivers whatever
+    /// filled, and any non-zero fill under the floor produces a withdrawal
+    /// Alpaca rejects. Named here rather than left to that rejection so the
+    /// recorded cause is the short conversion, and so the amount now sitting
+    /// in the Alpaca crypto wallet is in the failure itself.
+    #[error(
+        "USDC rebalance {id} converted only {converted}, below Alpaca's {minimum} \
+         withdrawal minimum; no withdrawal was attempted and the converted USDC is \
+         held in the Alpaca crypto wallet pending operator reconciliation"
+    )]
+    ConversionBelowWithdrawalMinimum {
+        id: UsdcRebalanceId,
+        converted: Usdc,
+        minimum: Usdc,
+    },
+    /// The conversion order's outcome could not be established: the deadline
+    /// cancel was never confirmed settled, or the broker stopped recognising
+    /// the order. The order may still be live and still fill, so the
+    /// rebalance is deliberately NOT terminalized -- it stays latched at
+    /// `Converting` with the in-flight guard held, the same fail-closed
+    /// treatment an inconclusive burn submission gets. Terminalizing instead
+    /// would release the guard and re-arm a second conversion for the same
+    /// imbalance while real money can still move.
+    #[error(
+        "USDC rebalance {id} conversion outcome could not be established, so the \
+         rebalance is latched for operator reconciliation: {source}"
+    )]
+    ConversionOutcomeUnresolved {
+        id: UsdcRebalanceId,
+        /// Boxed to keep it off every `Result<_, UsdcTransferError>` in this
+        /// module: the broker error is by far the largest variant payload, and
+        /// inlining it widens the error type for callers that can never return
+        /// this variant.
+        #[source]
+        source: Box<AlpacaBrokerApiError>,
+    },
+    /// The post-deposit USDC->USD conversion sold less USDC than was
+    /// deposited, because a stalled order's remainder was cancelled. The
+    /// unconverted USDC stays in the Alpaca crypto wallet, which the offchain
+    /// cash inventory does not read, so the rebalance is failed for
+    /// reconciliation rather than confirmed as a success that moved only part
+    /// of the cash.
+    #[error(
+        "USDC rebalance {id} post-deposit conversion sold only {converted}; {unconverted} \
+         is stranded as USDC in the Alpaca crypto wallet and needs operator reconciliation"
+    )]
+    PostDepositConversionShortFill {
+        id: UsdcRebalanceId,
+        converted: Usdc,
+        unconverted: Usdc,
+    },
     #[error(
         "USDC rebalance {id} Withdrawing has non-Alpaca withdrawal ref; \
          AlpacaToBase always records the Alpaca transfer ID"
@@ -378,6 +431,9 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::MissingFilledQuantity { .. }
             | Self::MissingFilledAveragePrice { .. }
             | Self::ResumeIndeterminateConversion { .. }
+            | Self::ConversionBelowWithdrawalMinimum { .. }
+            | Self::ConversionOutcomeUnresolved { .. }
+            | Self::PostDepositConversionShortFill { .. }
             | Self::ResumeWithoutMintScanBound { .. }
             | Self::AttestationTimedOut { .. }
             | Self::AttestationRetryDeadlineElapsed { .. }

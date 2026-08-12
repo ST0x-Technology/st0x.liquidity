@@ -14,12 +14,14 @@ use uuid::Uuid;
 
 use st0x_bridge::cctp::{AttestationResponse, CctpBridge, CctpError};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
+use st0x_config::ALPACA_MINIMUM_WITHDRAWAL;
 use st0x_event_sorcery::Store;
 use st0x_evm::{USDC_BASE, Wallet};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
-    AlpacaTransferId, AlpacaWalletError, AlpacaWalletService, ClientOrderId, ConversionDirection,
-    CryptoOrderOutcome, Network, Positive, TokenSymbol, Transfer, TransferStatus,
+    AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, AlpacaWalletService, ClientOrderId,
+    ConversionDirection, CryptoOrderOutcome, Network, Positive, TokenSymbol, Transfer,
+    TransferStatus,
 };
 use st0x_finance::Usdc;
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
@@ -640,6 +642,21 @@ impl<
             .await
         {
             Ok(order) => order,
+            // The order's fate is unknown: it may still be live at the broker
+            // and still fill. Recording a failure would release the in-flight
+            // guard and let the trigger arm a second conversion for the same
+            // imbalance while real money can still move, so the aggregate is
+            // left at `Converting` for operator reconciliation instead.
+            Err(
+                error @ (AlpacaBrokerApiError::ConversionCancelNotSettled { .. }
+                | AlpacaBrokerApiError::ConversionOrderNotFound { .. }),
+            ) => {
+                error!(target: "rebalance", %error, "USD to USDC conversion outcome unresolved");
+                return Err(UsdcTransferError::ConversionOutcomeUnresolved {
+                    id: id.clone(),
+                    source: Box::new(error),
+                });
+            }
             Err(error) => {
                 // Conversion placement fails fast on ANY error (RAI-1494:
                 // deliberately NOT rescheduled, unlike the deposit/withdrawal
@@ -675,6 +692,42 @@ impl<
             .record_conversion_or_fail(id, &correlation_id, &order, ConversionDirection::UsdToUsdc)
             .await?;
         let received_amount = conversion.received_amount;
+
+        // The trigger's floor only covers the amount it *requests*; a stalled
+        // conversion whose remainder was cancelled delivers whatever filled,
+        // and Alpaca rejects a withdrawal below its minimum outright. Failing
+        // here rather than at the withdrawal is what keeps the rebalance
+        // terminalizable: `FailConversion` is only legal while the aggregate
+        // is still `Converting`, so confirming first would leave it holding
+        // the in-flight guard with no terminal transition left.
+        if received_amount.lt(&ALPACA_MINIMUM_WITHDRAWAL)? {
+            error!(target: "rebalance",
+                order_id = %order.id,
+                requested = %amount,
+                converted = %received_amount,
+                minimum = %*ALPACA_MINIMUM_WITHDRAWAL,
+                "USD to USDC conversion settled below Alpaca's withdrawal minimum; \
+                 no withdrawal will be attempted"
+            );
+            self.cqrs
+                .send(
+                    id,
+                    UsdcRebalanceCommand::FailConversion {
+                        reason: format!(
+                            "conversion settled at {received_amount}, below Alpaca's {} \
+                             withdrawal minimum; the converted USDC needs reconciliation \
+                             in the Alpaca crypto wallet",
+                            *ALPACA_MINIMUM_WITHDRAWAL
+                        ),
+                    },
+                )
+                .await?;
+            return Err(UsdcTransferError::ConversionBelowWithdrawalMinimum {
+                id: id.clone(),
+                converted: received_amount,
+                minimum: *ALPACA_MINIMUM_WITHDRAWAL,
+            });
+        }
 
         self.cqrs
             .send(id, UsdcRebalanceCommand::ConfirmConversion { conversion })
@@ -742,6 +795,21 @@ impl<
             .await
         {
             Ok(order) => order,
+            // Identical broker state decides identically on both legs: the
+            // order's fate is unknown and it may still fill, so recording a
+            // durable failure against it is wrong here for the same reason it
+            // is wrong on the USD->USDC leg. Left unterminalized for operator
+            // reconciliation.
+            Err(
+                error @ (AlpacaBrokerApiError::ConversionCancelNotSettled { .. }
+                | AlpacaBrokerApiError::ConversionOrderNotFound { .. }),
+            ) => {
+                error!(target: "rebalance", %error, "USDC to USD conversion outcome unresolved");
+                return Err(UsdcTransferError::ConversionOutcomeUnresolved {
+                    id: id.clone(),
+                    source: Box::new(error),
+                });
+            }
             Err(error) => {
                 // Conversion placement fails fast on ANY error (RAI-1494):
                 // same rationale as `execute_usd_to_usdc_conversion` above --
@@ -768,6 +836,47 @@ impl<
             .record_conversion_or_fail(id, &correlation_id, &order, ConversionDirection::UsdcToUsd)
             .await?;
         let proceeds = conversion.received_amount;
+
+        // `source_amount` is the USDC actually sold. A stalled order whose
+        // remainder was cancelled sells less than was deposited, and the rest
+        // stays as USDC in the Alpaca crypto wallet -- a denomination the
+        // offchain cash inventory does not read, so the imbalance calculation
+        // cannot see it and no later rebalance sweeps it. Confirming here
+        // would report a rebalance that moved part of the cash as a complete
+        // success. Fail instead, naming the unconverted amount: the same
+        // treatment `resume_converting` already gives an identical broker
+        // outcome. This asymmetry with the USD->USDC leg is deliberate --
+        // there the unfilled remainder stays as USD buying power, which the
+        // inventory does see.
+        if conversion.source_amount.lt(&amount)? {
+            let unconverted = (amount - conversion.source_amount)?;
+
+            error!(target: "rebalance",
+                order_id = %order.id,
+                requested = %amount,
+                converted = %conversion.source_amount,
+                %unconverted,
+                "USDC to USD conversion filled short; unconverted USDC is stranded in the \
+                 Alpaca crypto wallet"
+            );
+            self.cqrs
+                .send(
+                    id,
+                    UsdcRebalanceCommand::FailConversion {
+                        reason: format!(
+                            "post-deposit conversion filled only {} of {}; {unconverted} \
+                             USDC needs reconciliation in the Alpaca crypto wallet",
+                            conversion.source_amount, amount
+                        ),
+                    },
+                )
+                .await?;
+            return Err(UsdcTransferError::PostDepositConversionShortFill {
+                id: id.clone(),
+                converted: conversion.source_amount,
+                unconverted,
+            });
+        }
 
         self.cqrs
             .send(id, UsdcRebalanceCommand::ConfirmConversion { conversion })
@@ -1649,6 +1758,30 @@ impl<
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) -> Result<Transfer, UsdcTransferError> {
+        // Defence in depth for the resume path. `execute_usd_to_usdc_conversion`
+        // refuses a sub-minimum fill while the aggregate is still `Converting`
+        // and `FailConversion` is legal, so a freshly converted rebalance never
+        // arrives here short. An aggregate that persisted `ConversionComplete`
+        // before that guard existed still can, and from there no failure
+        // transition remains -- so this refuses the call Alpaca would reject
+        // and leaves the aggregate for reconciliation rather than recording a
+        // terminal state it has no transition for. The job latches on this
+        // error instead of retrying, since every retry fails identically.
+        if amount.lt(&ALPACA_MINIMUM_WITHDRAWAL)? {
+            error!(target: "rebalance",
+                %id,
+                converted = %amount,
+                minimum = %*ALPACA_MINIMUM_WITHDRAWAL,
+                "Refusing an Alpaca withdrawal below the broker minimum; the converted \
+                 USDC needs reconciliation in the Alpaca crypto wallet"
+            );
+            return Err(UsdcTransferError::ConversionBelowWithdrawalMinimum {
+                id: id.clone(),
+                converted: amount,
+                minimum: *ALPACA_MINIMUM_WITHDRAWAL,
+            });
+        }
+
         let usdc = TokenSymbol::new("USDC");
         let positive_amount = Positive::new(amount)?;
 
@@ -2616,14 +2749,33 @@ impl<
         // per-attempt window -- and let the timeout sweep clear the in-progress
         // guard while the conversion is still healthy, the partial-completion clobber
         // this resume path exists to prevent.
-        let order = match order.classify() {
-            CryptoOrderOutcome::Pending => {
-                warn!(target: "rebalance", order_id = %order.id, "Resumed conversion still settling; awaiting terminal state");
-                self.alpaca_broker
-                    .poll_conversion_to_terminal(order.id)
-                    .await?
-            }
-            _ => order,
+        // Gate on terminality rather than on `Pending` alone: a `suspended`,
+        // `replaced` or `calculated` order is reported as `Failed` but the
+        // broker may still resume and fill it, so failing on sight here would
+        // record a failed rebalance against live money -- the same drift the
+        // shared terminality rule exists to prevent.
+        let order = if order.classify().is_terminal() {
+            order
+        } else {
+            warn!(target: "rebalance", order_id = %order.id, "Resumed conversion not yet terminal; awaiting a terminal state");
+            self.alpaca_broker
+                .poll_conversion_to_terminal(order.id)
+                .await
+                .map_err(|error| match error {
+                    // The order's fate is unknown: it may still be live and
+                    // still fill. Mapping here is what routes the job to its
+                    // latch arm instead of the generic retry path, so resume
+                    // decides the same way as both direct conversion legs.
+                    error @ (AlpacaBrokerApiError::ConversionCancelNotSettled { .. }
+                    | AlpacaBrokerApiError::ConversionOrderNotFound { .. }) => {
+                        error!(target: "rebalance", %error, "Resumed conversion outcome unresolved");
+                        UsdcTransferError::ConversionOutcomeUnresolved {
+                            id: id.clone(),
+                            source: Box::new(error),
+                        }
+                    }
+                    other => other.into(),
+                })?
         };
 
         match order.classify() {
@@ -8015,6 +8167,440 @@ mod tests {
         );
     }
 
+    /// A conversion whose stalled remainder was cancelled can settle below
+    /// Alpaca's withdrawal minimum, which the trigger only enforces on the
+    /// requested amount. The withdrawal must be refused before it is sent,
+    /// naming the converted amount, instead of being attempted and rejected
+    /// by Alpaca as an opaque wallet error. Driven through the resume path
+    /// because that is the one an apalis retry re-enters.
+    #[tokio::test]
+    async fn conversion_settling_below_the_alpaca_minimum_refuses_the_withdrawal() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("500");
+        let converted = usdc("20");
+
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: ConversionAmounts::new(usdc("20.002"), converted),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Any wallet call is a failure of the guard, so the whitelist lookup
+        // the withdrawal starts from is mocked only to count its calls.
+        let whitelist = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        let error = manager
+            .resume_alpaca_to_base(&id, amount)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            whitelist.calls(),
+            0,
+            "a sub-minimum withdrawal must not reach Alpaca"
+        );
+        match error {
+            UsdcTransferError::ConversionBelowWithdrawalMinimum {
+                converted: reported,
+                minimum,
+                ..
+            } => {
+                assert_eq!(reported, converted);
+                assert_eq!(minimum, *st0x_config::ALPACA_MINIMUM_WITHDRAWAL);
+            }
+            other => panic!("expected ConversionBelowWithdrawalMinimum, got {other:?}"),
+        }
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::ConversionComplete { .. }),
+            "the resume path has no legal failure transition from ConversionComplete, so it \
+             must leave the aggregate there for reconciliation, got: {state:?}"
+        );
+    }
+
+    /// The fresh conversion path must refuse a sub-minimum fill before it
+    /// confirms, because `FailConversion` is only legal while the aggregate is
+    /// still `Converting`. Confirming first would leave the rebalance holding
+    /// the in-flight guard with no terminal transition left.
+    #[tokio::test]
+    async fn fresh_conversion_settling_below_the_alpaca_minimum_fails_the_rebalance() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("500");
+
+        // 500 requested, 20 settled: what a stalled order whose remainder was
+        // cancelled delivers, well under Alpaca's withdrawal minimum.
+        let _order_mock = create_conversion_order_pending_mock(&server, "500");
+        let _get_mock = create_get_order_mock_with_fill(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "500",
+            "20",
+            "1.0001",
+        );
+
+        // Any wallet call is a failure of the guard, so the whitelist lookup
+        // the withdrawal starts from is mocked only to count its calls.
+        let whitelist = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        let error = manager
+            .execute_usd_to_usdc_conversion(&id, amount)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            whitelist.calls(),
+            0,
+            "a sub-minimum conversion must not reach the withdrawal"
+        );
+        match error {
+            UsdcTransferError::ConversionBelowWithdrawalMinimum {
+                converted, minimum, ..
+            } => {
+                assert_eq!(converted, usdc("20"));
+                assert_eq!(minimum, *st0x_config::ALPACA_MINIMUM_WITHDRAWAL);
+            }
+            other => panic!("expected ConversionBelowWithdrawalMinimum, got {other:?}"),
+        }
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::ConversionFailed { .. }),
+            "refusing before ConfirmConversion is what keeps the rebalance terminalizable, \
+             got: {state:?}"
+        );
+    }
+
+    /// The floor is exclusive: a conversion settling at exactly the Alpaca
+    /// minimum is withdrawable and must confirm, not fail. Pins the `.lt()`
+    /// boundary on the fresh path -- a `<=` regression would terminalize a
+    /// perfectly viable rebalance.
+    #[tokio::test]
+    async fn fresh_conversion_settling_exactly_at_the_alpaca_minimum_confirms() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("500");
+
+        // 500 requested, 51 settled: the smallest fill Alpaca will still
+        // accept a withdrawal for.
+        let _order_mock = create_conversion_order_pending_mock(&server, "500");
+        let _get_mock = create_get_order_mock_with_fill(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "500",
+            "51",
+            "1.0001",
+        );
+
+        let received = manager
+            .execute_usd_to_usdc_conversion(&id, amount)
+            .await
+            .expect("an exact-minimum conversion must not be refused");
+
+        assert_eq!(received, usdc("51"));
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::ConversionComplete { .. }),
+            "an exact-minimum conversion must confirm, got: {state:?}"
+        );
+    }
+
+    /// The same exclusive boundary on the resume path's defensive re-check:
+    /// an aggregate resuming from `ConversionComplete` with exactly the
+    /// minimum converted must attempt the withdrawal, not refuse it.
+    #[tokio::test]
+    async fn resumed_conversion_settled_exactly_at_the_alpaca_minimum_attempts_the_withdrawal() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("500");
+        let converted = usdc("51");
+
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: ConversionAmounts::new(usdc("51.0051"), converted),
+            },
+        )
+        .await
+        .unwrap();
+
+        let whitelist = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        // Unmocked past the whitelist lookup; the assertion is that the
+        // re-check let the boundary amount through to the withdrawal.
+        let error = manager
+            .resume_alpaca_to_base(&id, amount)
+            .await
+            .unwrap_err();
+
+        assert!(
+            !matches!(
+                error,
+                UsdcTransferError::ConversionBelowWithdrawalMinimum { .. }
+            ),
+            "an exact-minimum withdrawal must not be refused, got: {error:?}"
+        );
+        assert_eq!(
+            whitelist.calls(),
+            1,
+            "an exact-minimum withdrawal must be attempted"
+        );
+    }
+
+    /// Mocks a conversion order that never leaves `new`, answers the deadline
+    /// cancel, and keeps reading back non-terminal afterwards, so the cancel
+    /// never settles and the order's fill state stays unknowable. Returns the
+    /// cancel mock for hit assertions.
+    fn mock_conversion_whose_cancel_never_settles<'a>(
+        server: &'a MockServer,
+        amount: &str,
+    ) -> httpmock::Mock<'a> {
+        let _get_mock = create_get_order_mock(
+            server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "new",
+            amount,
+        );
+
+        server.mock(|when, then| {
+            when.method(DELETE).path(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/61e7b016-9c91-4a97-b912-615c9d365c9d",
+            );
+            then.status(204);
+        })
+    }
+
+    /// One burst of virtual time, sized below the broker client's HTTP request
+    /// timeout so a request that happens to be in flight cannot have its own
+    /// deadline jumped by a single step.
+    const CONVERSION_DEADLINE_STEP: Duration = Duration::from_secs(25);
+
+    /// Skips the conversion poll's compiled-in deadlines (five minutes of order
+    /// wait plus half a minute of cancel settling) instead of waiting them out.
+    ///
+    /// The clock is frozen only across an `advance`, during which this task
+    /// stays runnable, so the runtime never parks under a frozen clock and
+    /// tokio's auto-advance -- which would otherwise fire the broker client's
+    /// own request timeouts -- never engages. The real sleep between bursts
+    /// leaves the poll far more time than a mock round trip needs, so bursts
+    /// land while it is parked between reads.
+    async fn skip_conversion_poll_deadlines() {
+        loop {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::pause();
+            tokio::time::advance(CONVERSION_DEADLINE_STEP).await;
+            tokio::time::resume();
+        }
+    }
+
+    /// A cancel that never settles leaves the order possibly live and still
+    /// able to fill. Recording a failure would release the in-flight guard and
+    /// let the trigger arm a second conversion for the same imbalance while
+    /// real money can still move, so the aggregate must stay `Converting`.
+    #[tokio::test]
+    async fn unresolved_conversion_outcome_leaves_the_aggregate_converting() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("500");
+
+        let _order_mock = create_conversion_order_pending_mock(&server, "500");
+        let cancel = mock_conversion_whose_cancel_never_settles(&server, "500");
+
+        let clock = tokio::spawn(skip_conversion_poll_deadlines());
+        let error = manager
+            .execute_usd_to_usdc_conversion(&id, amount)
+            .await
+            .unwrap_err();
+        clock.abort();
+
+        assert_eq!(
+            cancel.calls(),
+            1,
+            "the stalled order's remainder must be cancelled at the deadline"
+        );
+        match error {
+            UsdcTransferError::ConversionOutcomeUnresolved { source, .. }
+                if matches!(
+                    *source,
+                    AlpacaBrokerApiError::ConversionCancelNotSettled { .. }
+                ) => {}
+            other => panic!("expected ConversionOutcomeUnresolved, got {other:?}"),
+        }
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::Converting { .. }),
+            "an unresolved outcome must not terminalize the rebalance, got: {state:?}"
+        );
+    }
+
+    /// The same unknowable broker state must decide the same way on the
+    /// post-deposit leg. The remainder may still sell, so this leg must not
+    /// record the failure it records for a conversion whose short fill is
+    /// known.
+    #[tokio::test]
+    async fn unresolved_post_deposit_conversion_outcome_leaves_the_aggregate_converting() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let amount_received = usdc("100");
+        advance_to_bridged_base_to_alpaca(&cqrs, &id, amount, amount_received).await;
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(fixed_bytes!(
+                    "0xbbbb111111111111111111111111111111111111111111111111111111111111"
+                )),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .await
+            .unwrap();
+
+        let _order_mock = create_conversion_order_pending_mock(&server, "100");
+        let cancel = mock_conversion_whose_cancel_never_settles(&server, "100");
+
+        let clock = tokio::spawn(skip_conversion_poll_deadlines());
+        let error = manager
+            .execute_usdc_to_usd_conversion(&id, amount_received)
+            .await
+            .unwrap_err();
+        clock.abort();
+
+        assert_eq!(
+            cancel.calls(),
+            1,
+            "the stalled order's remainder must be cancelled at the deadline"
+        );
+        match error {
+            UsdcTransferError::ConversionOutcomeUnresolved { source, .. }
+                if matches!(
+                    *source,
+                    AlpacaBrokerApiError::ConversionCancelNotSettled { .. }
+                ) => {}
+            other => panic!("expected ConversionOutcomeUnresolved, got {other:?}"),
+        }
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::Converting { .. }),
+            "an unresolved outcome must not terminalize the rebalance, got: {state:?}"
+        );
+    }
+
+    /// A post-deposit conversion that sells less USDC than was deposited
+    /// leaves the remainder in the Alpaca crypto wallet, where the offchain
+    /// cash inventory cannot see it. That must fail the rebalance for
+    /// reconciliation, not confirm it as a completed one.
+    #[tokio::test]
+    async fn post_deposit_conversion_short_fill_fails_instead_of_confirming() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let amount_received = usdc("100");
+        advance_to_bridged_base_to_alpaca(&cqrs, &id, amount, amount_received).await;
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(fixed_bytes!(
+                    "0xbbbb111111111111111111111111111111111111111111111111111111111111"
+                )),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .await
+            .unwrap();
+
+        let _conversion_mock = create_conversion_order_mock(&server, "100");
+        let _get_order_mock = create_get_order_mock_with_fill(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "100",
+            "30",
+            "0.9999",
+        );
+
+        let error = manager
+            .execute_usdc_to_usd_conversion(&id, amount_received)
+            .await
+            .unwrap_err();
+
+        match error {
+            UsdcTransferError::PostDepositConversionShortFill {
+                converted,
+                unconverted,
+                ..
+            } => {
+                assert_eq!(converted, usdc("30"));
+                assert_eq!(unconverted, usdc("70"));
+            }
+            other => panic!("expected PostDepositConversionShortFill, got {other:?}"),
+        }
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::ConversionFailed { .. }),
+            "short fill must terminalize the rebalance, got: {state:?}"
+        );
+    }
+
     #[tokio::test]
     async fn resume_base_to_alpaca_from_conversion_complete_is_noop() {
         let server = MockServer::start();
@@ -8216,6 +8802,103 @@ mod tests {
         assert!(
             matches!(state, Some(UsdcRebalance::ConversionFailed { .. })),
             "aggregate must be ConversionFailed after the awaited order terminates failed, got {state:?}"
+        );
+    }
+
+    /// A cancel that never settles on the RESUME path must latch exactly as
+    /// it does on both direct legs: surfaced as `ConversionOutcomeUnresolved`
+    /// so the job latches for reconciliation, not as a generic broker error
+    /// the worker would retry -- re-entering this resume and, from
+    /// `Converting`, emitting the `FailConversion` that releases the guard
+    /// against a possibly-live order.
+    #[tokio::test]
+    async fn resume_base_to_alpaca_from_converting_latches_when_the_cancel_never_settles() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let amount_received = usdc("99.99");
+        let correlation_id =
+            ClientOrderId::from_uuid(uuid!("44444444-4444-4444-8444-444444444444"));
+
+        advance_to_converting_base_to_alpaca(&cqrs, &id, amount, amount_received, &correlation_id)
+            .await;
+
+        // Still settling at lookup; the poll then never observes a terminal
+        // state, and the deadline cancel never settles either -- the order
+        // reads back `new` even after the DELETE is accepted.
+        let lookup_mock = mock_conversion_lookup(&server, &correlation_id, "new", "0");
+        let _poll_mock = mock_get_crypto_order(&server, "new", "0");
+        let cancel = server.mock(|when, then| {
+            when.method(DELETE).path(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/904837e3-3b76-47ec-b432-046db621571b",
+            );
+            then.status(204);
+        });
+
+        let clock = tokio::spawn(skip_conversion_poll_deadlines());
+        let error = manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
+        clock.abort();
+
+        lookup_mock.assert();
+        assert_eq!(
+            cancel.calls(),
+            1,
+            "the stalled order's remainder must be cancelled at the deadline"
+        );
+        match error {
+            UsdcTransferError::ConversionOutcomeUnresolved { source, .. }
+                if matches!(
+                    *source,
+                    AlpacaBrokerApiError::ConversionCancelNotSettled { .. }
+                ) => {}
+            other => panic!("expected ConversionOutcomeUnresolved, got {other:?}"),
+        }
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::Converting { .. }),
+            "an unresolved outcome on resume must not terminalize the rebalance, got: {state:?}"
+        );
+    }
+
+    /// `suspended` reads as a failure but is one the broker can resume from,
+    /// so the order may still fill. Resume must wait it out to a terminal
+    /// state; failing on sight would record a failed rebalance against money
+    /// that can still move.
+    #[tokio::test]
+    async fn resume_base_to_alpaca_from_converting_awaits_a_suspended_order() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let amount_received = usdc("99.99");
+        let correlation_id =
+            ClientOrderId::from_uuid(uuid!("66666666-6666-4666-8666-666666666666"));
+
+        advance_to_converting_base_to_alpaca(&cqrs, &id, amount, amount_received, &correlation_id)
+            .await;
+
+        let lookup_mock = mock_conversion_lookup(&server, &correlation_id, "suspended", "0");
+        let poll_mock = mock_get_crypto_order(&server, "filled", "99.99");
+
+        manager.resume_base_to_alpaca(&id, amount).await.unwrap();
+
+        lookup_mock.assert();
+        poll_mock.assert();
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                &state,
+                UsdcRebalance::ConversionComplete { conversion, .. }
+                    if conversion.received_amount == usdc("99.99")
+            ),
+            "a suspended order must be polled to its terminal state, not failed on sight, \
+             got: {state:?}"
         );
     }
 

@@ -776,6 +776,27 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                     warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging inconclusive-burn alert");
                 }
             }
+            // The post-deposit conversion's fate is unknown and the order may
+            // still fill, so retrying would race a live order and recording a
+            // failure would terminalize the rebalance against one. Latched for
+            // the operator, matching the Alpaca->Base leg.
+            Err(UsdcTransferError::ConversionOutcomeUnresolved { id, source }) => {
+                error!(
+                    target: "rebalance",
+                    %id, %source,
+                    "Base->Alpaca USDC transfer: conversion outcome unresolved; the broker \
+                     order may still be live. Latched for operator reconciliation \
+                     (no auto-retry, no failure recorded)"
+                );
+                let message = format!(
+                    "USDC transfer {id}: post-deposit conversion outcome unresolved ({source}). \
+                     The broker order may still be live and may still fill; verify at Alpaca \
+                     before forcing this rebalance either way."
+                );
+                if let Err(error) = ctx.notifier.notify(&message).await {
+                    warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging unresolved-conversion alert");
+                }
+            }
             // Deterministic vault-liquidity revert: the withdraw is atomic
             // (nothing left the vault) and re-issuing it just reverts again
             // until the vault is refunded, burning gas per attempt. Returning
@@ -1436,6 +1457,17 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
                     warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making inconclusive-burn alert");
                 }
             }
+            // Both outcomes are deterministic across retries and neither has a
+            // safe automatic next step, so they latch for an operator instead
+            // of burning the retry budget on an identical failure. Returning
+            // `Ok` is what stops apalis re-entering the resume, which for an
+            // unresolved conversion would reach the `Converting` arm and emit
+            // `FailConversion` -- releasing the in-flight guard while the
+            // broker order may still be live and still fill.
+            Err(
+                error @ (UsdcTransferError::ConversionBelowWithdrawalMinimum { .. }
+                | UsdcTransferError::ConversionOutcomeUnresolved { .. }),
+            ) => self.latch_conversion_for_reconciliation(ctx, &error).await,
             Err(error) => return self.handle_terminal_or_backpressure_error(ctx, error).await,
         }
 
@@ -1444,6 +1476,49 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
 }
 
 impl TransferUsdcToMarketMaking {
+    /// Ends the attempt without a retry for the two conversion outcomes that
+    /// are deterministic across retries and have no safe automatic next step,
+    /// alerting the operator instead.
+    ///
+    /// The caller returns `Ok` after this, which is the whole mechanism: an
+    /// unresolved conversion re-entered by apalis would reach the `Converting`
+    /// resume arm and emit `FailConversion`, releasing the in-flight guard
+    /// while the broker order may still be live and still fill. A sub-minimum
+    /// conversion would simply fail identically every attempt.
+    async fn latch_conversion_for_reconciliation(
+        &self,
+        ctx: &TransferUsdcToMarketMakingCtx,
+        error: &UsdcTransferError,
+    ) {
+        let (context, detail) = match error {
+            UsdcTransferError::ConversionBelowWithdrawalMinimum {
+                converted, minimum, ..
+            } => (
+                "conversion settled below the broker's withdrawal minimum; the converted \
+                 USDC is in the Alpaca crypto wallet and needs reconciliation",
+                format!(
+                    "settled at {converted}, below Alpaca's {minimum} withdrawal minimum. \
+                     No withdrawal was attempted."
+                ),
+            ),
+            _ => (
+                "conversion outcome unresolved; the broker order may still be live. Latched \
+                 with no failure recorded",
+                format!(
+                    "outcome unresolved ({error}). The order may still fill; verify at \
+                     Alpaca before forcing this rebalance either way."
+                ),
+            ),
+        };
+
+        error!(target: "rebalance", id = %self.id, %error, "Alpaca->Base USDC transfer: {context}");
+
+        let message = format!("USDC transfer {}: {detail}", self.id);
+        if let Err(notify_error) = ctx.notifier.notify(&message).await {
+            warn!(target: "rebalance", ?notify_error, "Failed to deliver USDC market-making conversion-latch alert");
+        }
+    }
+
     /// `reason` is supplied by the caller, where the concrete settlement
     /// variant is already known statically. Re-deriving it here from the
     /// widened `&UsdcTransferError` would need an `unreachable!` fallback that
@@ -1799,10 +1874,12 @@ mod tests {
     use alloy::primitives::{Address, TxHash, U256};
     use chrono::{DateTime, Utc};
     use reqwest::StatusCode;
-    use uuid::Uuid;
+    use uuid::{Uuid, uuid};
 
     use st0x_evm::EvmError;
-    use st0x_execution::{AlpacaTransferId, AlpacaWalletError};
+    use st0x_execution::{
+        AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, DeadlineCancel,
+    };
     use st0x_float_macro::float;
 
     use super::*;
@@ -2061,6 +2138,13 @@ mod tests {
         /// Deterministic vault-liquidity revert: re-issuing the withdraw just
         /// reverts again until the vault is refunded, so the job must latch.
         InsufficientVaultLiquidity,
+        /// The conversion order may still be live: a redrive would race it and
+        /// could reach the resume's failure transition, releasing the in-flight
+        /// guard while real money can still move.
+        ConversionOutcomeUnresolved,
+        /// Deterministic across retries -- the converted amount cannot grow --
+        /// and the withdrawal it blocks needs an operator, not a retry.
+        ConversionBelowWithdrawalMinimum,
     }
 
     impl TerminalOutcome {
@@ -2096,6 +2180,23 @@ mod tests {
                     requested: U256::from(100),
                     received: U256::from(40),
                 },
+                Self::ConversionOutcomeUnresolved => {
+                    UsdcTransferError::ConversionOutcomeUnresolved {
+                        id: id.clone(),
+                        source: Box::new(AlpacaBrokerApiError::ConversionCancelNotSettled {
+                            order_id: uuid!("61e7b016-9c91-4a97-b912-615c9d365c9d"),
+                            cancel: DeadlineCancel::Accepted,
+                            filled_quantity: None,
+                        }),
+                    }
+                }
+                Self::ConversionBelowWithdrawalMinimum => {
+                    UsdcTransferError::ConversionBelowWithdrawalMinimum {
+                        id: id.clone(),
+                        converted: Usdc::new(float!(20)),
+                        minimum: *st0x_config::ALPACA_MINIMUM_WITHDRAWAL,
+                    }
+                }
             }
         }
     }
@@ -3824,6 +3925,43 @@ mod tests {
             TerminalOutcome::BurnTxDropped,
             "BurnTxDropped (market-making)",
             Some(TxHash::from([0xAB; 32])),
+        )
+        .await;
+    }
+
+    /// An unresolved conversion outcome must latch on both legs. A redrive
+    /// would re-enter the resume while the broker order may still be live,
+    /// and on the Alpaca->Base leg that reaches the `Converting` arm and
+    /// emits `FailConversion`, releasing the in-flight guard.
+    #[tokio::test]
+    async fn hedging_job_latches_on_unresolved_conversion_outcome() {
+        assert_hedging_fail_closed(
+            TerminalOutcome::ConversionOutcomeUnresolved,
+            "ConversionOutcomeUnresolved (hedging)",
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn market_making_job_latches_on_unresolved_conversion_outcome() {
+        assert_market_making_fail_closed(
+            TerminalOutcome::ConversionOutcomeUnresolved,
+            "ConversionOutcomeUnresolved (market-making)",
+            None,
+        )
+        .await;
+    }
+
+    /// Every retry converts the same sub-minimum amount and is refused
+    /// identically, so retrying only burns the budget an operator alert is
+    /// worth more than.
+    #[tokio::test]
+    async fn market_making_job_latches_on_conversion_below_withdrawal_minimum() {
+        assert_market_making_fail_closed(
+            TerminalOutcome::ConversionBelowWithdrawalMinimum,
+            "ConversionBelowWithdrawalMinimum (market-making)",
+            None,
         )
         .await;
     }

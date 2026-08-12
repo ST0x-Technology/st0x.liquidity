@@ -352,6 +352,17 @@ enum TerminalCryptoOutcome {
 }
 
 impl CryptoOrderOutcome {
+    /// Whether this classification is an answer, or the order can still
+    /// change state.
+    ///
+    /// Exposed so callers outside this crate decide "keep waiting?" from the
+    /// same rule the polls use, rather than re-deriving it from the variant.
+    /// Matching on [`Self::Pending`] alone is not equivalent: a `Failed`
+    /// status the broker may still resume from is also not an answer.
+    pub fn is_terminal(self) -> bool {
+        self.terminal().is_some()
+    }
+
     /// The terminal outcome this classification represents, or `None` while
     /// the order can still change state.
     ///
