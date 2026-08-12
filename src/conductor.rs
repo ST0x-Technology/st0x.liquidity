@@ -44,7 +44,7 @@ use st0x_evm::{OpenChainErrorRegistry, USDC_BASE, Wallet};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, ClientOrderId, CounterTradePreflight,
     CounterTradeReservation, CounterTradeSkipReason, ExecutionError, Executor, FractionalShares,
-    MarketOrder, MarketSession, Network, Symbol, TryIntoExecutor,
+    MarketOrder, MarketSession, Network, Positive, Symbol, TryIntoExecutor, Usd,
 };
 use st0x_issuance_client::IssuanceClient;
 use st0x_raindex::{RaindexService, RaindexVaultId, RevokeOutcome};
@@ -97,6 +97,7 @@ use crate::portfolio_snapshot::{PortfolioSnapshot, PortfolioSnapshotProjection};
 use crate::position::{
     AnchorDisposition, Position, PositionCommand, PositionError, PositionEvent, TradeId,
 };
+use crate::position_check::{HedgeScanSkipReason, record_scan_skip};
 use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, ResumeTokenizationAggregate,
     ResumeTokenizationCtx, ResumeTokenizationJobQueue, ResumeTokenizationTarget,
@@ -117,6 +118,8 @@ use crate::telemetry::executor::InstrumentedExecutor;
 use crate::telemetry::rpc::RpcTelemetryLayer;
 use crate::telemetry::{TelemetrySender, spawn_dependency_call_writer};
 use crate::tokenized_equity_mint::{TokenizedEquityMint, interrupted_mint_ids};
+use crate::trading::offchain::close_flatten::{CloseFlattenCrossRamp, CloseFlattenPolicy};
+use crate::trading::offchain::hedge::{apply_slippage, resolve_extended_hours_reference_price};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, TradeAccountingError};
 use crate::unwrapped_equity_recovery::{
@@ -347,14 +350,16 @@ pub(crate) struct TradeProcessingCqrs {
     pub(crate) execution_threshold: ExecutionThreshold,
     pub(crate) assets: AssetsConfig,
     pub(crate) counter_trade_submission_lock: Arc<Mutex<()>>,
+    pub(crate) close_flatten_policy: CloseFlattenPolicy,
+    pub(crate) close_flatten_ramp: CloseFlattenCrossRamp,
     /// Queue every newly-submitted offchain order is enrolled into so the
     /// per-order poll job picks up where the broker left off. Without this
     /// hook the order stays `Submitted` forever -- the system has no other
     /// trigger to ask the broker about an in-flight order.
     pub(crate) poll_status_queue: PollOrderStatusJobQueue,
-    /// Used to enqueue an immediate `PlaceHedge` for extended-hours fills, which
-    /// the inline path cannot place itself (it has no `OrderPlacer` for the
-    /// limit-order price lookup). `CheckPositions` is the backstop.
+    /// Used to enqueue an immediate `PlaceHedge` after the inline path uses
+    /// `order_placer` to preflight the same crossed reference the job will use.
+    /// `CheckPositions` is the backstop.
     pub(crate) hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue,
     /// Fed to [`push_poll_job_if_absent`] before every `PollOrderStatus`
     /// push this pipeline makes, so a re-push for an order that already has a
@@ -3405,16 +3410,18 @@ where
         return Ok(None);
     };
 
-    // Extended-hours counter-trades cannot be placed inline (this path has no
-    // OrderPlacer for the limit-order price lookup). Instead of waiting for the
-    // next CheckPositions scan (~1 min), enqueue an immediate PlaceHedge job,
-    // which has the OrderPlacer and submits the limit order. CheckPositions
-    // remains the backstop. Preflight + clamp here, mirroring the scan path, so
-    // we never enqueue a hedge that would exceed buying power.
+    // Extended-hours counter-trades cannot be placed inline. Instead of waiting
+    // for the next CheckPositions scan (~1 min), enqueue an immediate PlaceHedge
+    // job. CheckPositions remains the backstop. Preflight buys from the same
+    // crossed reference the job will price from; the ordinary latest-trade
+    // preflight can understate a ramped limit's buying-power requirement.
     if execution.market_session == MarketSession::Extended {
+        let Some(preflight) = resolve_extended_hours_preflight(&execution, cqrs).await else {
+            return Ok(None);
+        };
         let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
 
-        match preflight_counter_trade_submission(executor, &execution, None).await? {
+        match preflight_extended_hours_trade_submission(executor, &execution, preflight).await? {
             CounterTradeSubmissionCheck::Skipped => return Ok(None),
             CounterTradeSubmissionCheck::Allowed { reservation } => {
                 clamp_shares_to_reservation(&mut execution, reservation.as_ref());
@@ -3439,6 +3446,7 @@ where
             offchain_order_id,
             market_session: execution.market_session,
             backpressure_streak: BackpressureStreak::default(),
+            transient_streak: crate::trading::offchain::hedge::TransientFailureStreak::default(),
         };
 
         if let Err(error) = cqrs.hedge_queue.clone().push(job).await {
@@ -3586,6 +3594,120 @@ enum CounterTradeSubmissionCheck {
         reservation: Option<CounterTradeReservation>,
     },
     Skipped,
+}
+
+enum ExtendedHoursPreflight {
+    Standard,
+    ExactPrice(Positive<Usd>),
+}
+
+async fn resolve_extended_hours_preflight(
+    execution: &ExecutionCtx,
+    cqrs: &TradeProcessingCqrs,
+) -> Option<ExtendedHoursPreflight> {
+    if execution.direction == st0x_execution::Direction::Sell {
+        return Some(ExtendedHoursPreflight::Standard);
+    }
+
+    let status = match cqrs.order_placer.market_session_status().await {
+        Ok(status) => status,
+        Err(error) => {
+            record_scan_skip(
+                &execution.symbol,
+                HedgeScanSkipReason::MarketSessionCheck,
+                None,
+            );
+            warn!(
+                target: "hedge",
+                symbol = %execution.symbol,
+                %error,
+                "Skipping immediate extended-hours hedge enqueue: failed to resolve the \
+                 close-flatten window for crossed-price preflight"
+            );
+            return None;
+        }
+    };
+    let now = Utc::now();
+    let close_flatten_window = cqrs.close_flatten_policy.active_window(status, now);
+    let reference = match resolve_extended_hours_reference_price(
+        cqrs.order_placer.as_ref(),
+        &execution.symbol,
+        execution.direction,
+    )
+    .await
+    {
+        Ok(reference) => reference,
+        Err(error) => {
+            record_scan_skip(
+                &execution.symbol,
+                HedgeScanSkipReason::from(&error),
+                close_flatten_window,
+            );
+            warn!(
+                target: "hedge",
+                symbol = %execution.symbol,
+                ?error,
+                "Skipping immediate extended-hours hedge enqueue: no reference price for \
+                 crossed-price preflight"
+            );
+            return None;
+        }
+    };
+    let cross_bps = cqrs.close_flatten_ramp.cross_bps(close_flatten_window, now);
+    let reference_price =
+        match apply_slippage(reference.price.inner(), execution.direction, cross_bps) {
+            Ok(reference_price) => reference_price,
+            Err(error) => {
+                record_scan_skip(
+                    &execution.symbol,
+                    HedgeScanSkipReason::SlippageCalculation,
+                    close_flatten_window,
+                );
+                warn!(
+                    target: "hedge",
+                    symbol = %execution.symbol,
+                    %error,
+                    "Skipping immediate extended-hours hedge enqueue: failed to cross the \
+                     preflight reference price"
+                );
+                return None;
+            }
+        };
+
+    Some(ExtendedHoursPreflight::ExactPrice(reference_price))
+}
+
+async fn preflight_extended_hours_trade_submission<E: Executor>(
+    executor: &E,
+    execution: &ExecutionCtx,
+    preflight: ExtendedHoursPreflight,
+) -> Result<CounterTradeSubmissionCheck, TradeAccountingError>
+where
+    TradeAccountingError: From<E::Error>,
+{
+    let ExtendedHoursPreflight::ExactPrice(reference_price) = preflight else {
+        return preflight_counter_trade_submission(executor, execution, None).await;
+    };
+
+    let order = MarketOrder {
+        symbol: execution.symbol.clone(),
+        shares: execution.shares,
+        direction: execution.direction,
+        client_order_id: ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+    };
+
+    match executor
+        .preflight_counter_trade_at_price(order, reference_price)
+        .await?
+    {
+        CounterTradePreflight::Allowed { reservation } => {
+            Ok(CounterTradeSubmissionCheck::Allowed { reservation })
+        }
+        CounterTradePreflight::Skipped(reason) => {
+            log_counter_trade_skip(execution, "extended_hours_crossed_price", &reason);
+            Ok(CounterTradeSubmissionCheck::Skipped)
+        }
+    }
 }
 
 /// When the preflight returns an equity reservation with fewer shares than
@@ -6723,6 +6845,8 @@ mod tests {
             execution_threshold: threshold,
             assets,
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
+            close_flatten_policy: CloseFlattenPolicy::from_secs(900).unwrap(),
+            close_flatten_ramp: CloseFlattenCrossRamp::new(100, 400).unwrap(),
             poll_status_queue: PollOrderStatusJobQueue::new(apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
@@ -8097,6 +8221,227 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn immediate_extended_hours_buy_preflights_the_ramped_mark() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Extended)
+            .with_extended_session_closes_at(Utc::now() + chrono::Duration::seconds(10))
+            .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+            .with_position_mark(Positive::new(Usd::new(float!(100))).unwrap())
+            .with_inventory(ExecutionInventory {
+                positions: Vec::new(),
+                usd_balance_cents: 20_500,
+                cash_buying_power_cents: Some(20_500),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            });
+        let mut cqrs = trade_processing_cqrs_with_assets(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+            extended_hours_assets(&symbol),
+        );
+        cqrs.order_placer = Arc::new(ExecutorOrderPlacer(executor.clone()));
+        let execution = ExecutionCtx {
+            symbol,
+            direction: Direction::Buy,
+            shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            executor: st0x_execution::SupportedExecutor::DryRun,
+            market_session: MarketSession::Extended,
+        };
+
+        let resolved = resolve_extended_hours_preflight(&execution, &cqrs)
+            .await
+            .unwrap();
+        let preflight = preflight_extended_hours_trade_submission(&executor, &execution, resolved)
+            .await
+            .unwrap();
+
+        assert!(matches!(preflight, CounterTradeSubmissionCheck::Skipped));
+        assert_eq!(
+            executor.market_session_status_call_count(),
+            1,
+            "the immediate path must resolve the active ramp window"
+        );
+    }
+
+    #[tokio::test]
+    async fn immediate_extended_hours_buy_skips_without_a_reference_price() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let executor = MockExecutor::new().with_market_session(MarketSession::Extended);
+        let mut cqrs = trade_processing_cqrs_with_assets(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+            extended_hours_assets(&symbol),
+        );
+        cqrs.order_placer = Arc::new(ExecutorOrderPlacer(executor));
+        let execution = ExecutionCtx {
+            symbol,
+            direction: Direction::Buy,
+            shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            executor: st0x_execution::SupportedExecutor::DryRun,
+            market_session: MarketSession::Extended,
+        };
+
+        assert!(
+            resolve_extended_hours_preflight(&execution, &cqrs)
+                .await
+                .is_none(),
+            "a buy without any reference source must not reach submission preflight"
+        );
+        let rendered = metrics_handle.render();
+        assert!(
+            rendered.contains("hedge_scan_skipped_total{"),
+            "an immediate hedge that never reaches the queue must be counted, in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("reason=\"reference_price_unavailable\""),
+            "the counter must preserve the failed gate, in:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn immediate_extended_hours_buy_skips_when_the_cross_overflows() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Extended)
+            .with_position_mark(
+                Positive::new(Usd::new(Float::max_positive_value().unwrap())).unwrap(),
+            );
+        let mut cqrs = trade_processing_cqrs_with_assets(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+            extended_hours_assets(&symbol),
+        );
+        cqrs.order_placer = Arc::new(ExecutorOrderPlacer(executor));
+        let execution = ExecutionCtx {
+            symbol,
+            direction: Direction::Buy,
+            shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            executor: st0x_execution::SupportedExecutor::DryRun,
+            market_session: MarketSession::Extended,
+        };
+
+        assert!(
+            resolve_extended_hours_preflight(&execution, &cqrs)
+                .await
+                .is_none(),
+            "a buy whose crossed price overflows must not reach submission preflight"
+        );
+        let rendered = metrics_handle.render();
+        assert!(
+            rendered.contains("reason=\"slippage_calculation\""),
+            "a cross failure on the immediate path must be counted, in:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn immediate_extended_hours_buy_counts_a_session_lookup_skip() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Extended)
+            .with_market_session_status_failure("calendar endpoint unavailable");
+        let mut cqrs = trade_processing_cqrs_with_assets(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+            extended_hours_assets(&symbol),
+        );
+        cqrs.order_placer = Arc::new(ExecutorOrderPlacer(executor));
+        let execution = ExecutionCtx {
+            symbol,
+            direction: Direction::Buy,
+            shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            executor: st0x_execution::SupportedExecutor::DryRun,
+            market_session: MarketSession::Extended,
+        };
+
+        assert!(
+            resolve_extended_hours_preflight(&execution, &cqrs)
+                .await
+                .is_none()
+        );
+        let rendered = metrics_handle.render();
+        assert!(
+            rendered.contains("reason=\"market_session_check\""),
+            "a failed session gate must be visible even though no job exists, in:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn immediate_extended_hours_buy_allows_when_cash_covers_the_ramped_mark() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Extended)
+            .with_extended_session_closes_at(Utc::now() + chrono::Duration::seconds(10))
+            .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+            .with_position_mark(Positive::new(Usd::new(float!(100))).unwrap())
+            .with_inventory(ExecutionInventory {
+                positions: Vec::new(),
+                usd_balance_cents: 21_000,
+                cash_buying_power_cents: Some(21_000),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            });
+        let mut cqrs = trade_processing_cqrs_with_assets(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+            extended_hours_assets(&symbol),
+        );
+        cqrs.order_placer = Arc::new(ExecutorOrderPlacer(executor.clone()));
+        let execution = ExecutionCtx {
+            symbol,
+            direction: Direction::Buy,
+            shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            executor: st0x_execution::SupportedExecutor::DryRun,
+            market_session: MarketSession::Extended,
+        };
+
+        let resolved = resolve_extended_hours_preflight(&execution, &cqrs)
+            .await
+            .unwrap();
+        let preflight = preflight_extended_hours_trade_submission(&executor, &execution, resolved)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            preflight,
+            CounterTradeSubmissionCheck::Allowed { .. }
+        ));
+        assert_eq!(
+            executor.market_session_status_call_count(),
+            1,
+            "the immediate path must resolve the active ramp window"
+        );
+    }
+
+    #[tokio::test]
     async fn extended_hours_trade_enqueues_immediate_hedge_job() {
         // With extended-hours counter-trading enabled and the broker in an
         // Extended session, an onchain fill must enqueue an immediate PlaceHedge
@@ -8134,6 +8479,8 @@ mod tests {
                 cash: None,
             },
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
+            close_flatten_policy: CloseFlattenPolicy::from_secs(900).unwrap(),
+            close_flatten_ramp: CloseFlattenCrossRamp::new(100, 400).unwrap(),
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
@@ -11778,6 +12125,7 @@ mod tests {
             executor: st0x_execution::SupportedExecutor::DryRun,
             placed_at: Utc::now(),
             market_session: st0x_execution::MarketSession::Regular,
+            close_flatten: false,
         };
 
         let error =
@@ -12713,6 +13061,7 @@ mod tests {
             submitted_at: Utc::now(),
             cancel_requested_at: Utc::now(),
             market_session: st0x_execution::MarketSession::Regular,
+            close_flatten: false,
         };
 
         let result = dispatch_post_place_state(Some(cancelling), &symbol, &cqrs, offchain_order_id)

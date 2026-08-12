@@ -266,8 +266,10 @@ impl Executor for AlpacaBrokerApi {
                     self.client.market_data_base_url(),
                     &order.symbol,
                 )
-                .await?;
-                self.preflight_buy_cash(&order, latest_trade_price).await
+                .await
+                .map_err(|source| AlpacaBrokerApiError::LatestTrade(Box::new(source)))?;
+                self.preflight_buy_cash(&order, latest_trade_price, self.counter_trade_slippage_bps)
+                    .await
             }
         }
     }
@@ -275,27 +277,21 @@ impl Executor for AlpacaBrokerApi {
     async fn preflight_counter_trade_at_price(
         &self,
         order: MarketOrder,
-        reference_price: Positive<Usd>,
+        limit_price: Positive<Usd>,
     ) -> Result<CounterTradePreflight, Self::Error> {
         match order.direction {
             // Inventory availability doesn't depend on price; keep the
             // ordinary preflight for sells.
             Direction::Sell => self.preflight_counter_trade(order).await,
-            Direction::Buy => self.preflight_buy_cash(&order, reference_price).await,
+            Direction::Buy => self.preflight_buy_cash(&order, limit_price, 0).await,
         }
     }
 
-    async fn fetch_latest_trade_price(
+    async fn fetch_position_mark(
         &self,
         symbol: &Symbol,
     ) -> Result<Option<Positive<Usd>>, Self::Error> {
-        let price = crate::alpaca_market_data::fetch_latest_trade_price(
-            self.client.market_data_http_client(),
-            self.client.market_data_base_url(),
-            symbol,
-        )
-        .await?;
-        Ok(Some(price))
+        super::positions::fetch_position_mark(&self.client, symbol).await
     }
 
     async fn fetch_latest_quote(
@@ -307,7 +303,8 @@ impl Executor for AlpacaBrokerApi {
             self.client.market_data_base_url(),
             symbol,
         )
-        .await?;
+        .await
+        .map_err(|source| AlpacaBrokerApiError::LatestQuote(Box::new(source)))?;
         Ok(Some(quote))
     }
 
@@ -492,21 +489,22 @@ impl AlpacaBrokerApi {
         Ok(())
     }
 
-    /// Shared buying-power check for [`Executor::preflight_counter_trade`]
-    /// and [`Executor::preflight_counter_trade_at_price`]'s buy branches --
-    /// only the reference price used to estimate cost differs between the
-    /// two callers (latest trade price vs. a caller-supplied price such as
-    /// a close-flatten ask).
+    /// Shared buying-power check for counter-trade buy branches.
+    ///
+    /// Ordinary market-order preflight supplies the configured slippage band;
+    /// exact-limit preflight supplies zero because its price is already the
+    /// order's hard cost ceiling.
     async fn preflight_buy_cash(
         &self,
         order: &MarketOrder,
         reference_price: Positive<Usd>,
+        slippage_bps: u16,
     ) -> Result<CounterTradePreflight, AlpacaBrokerApiError> {
         let account_funds = super::positions::get_account_funds(&self.client).await?;
         let estimated_cost_cents = estimate_buffered_cost_cents(
             order.shares,
             reference_price.inner().inner(),
-            self.counter_trade_slippage_bps,
+            slippage_bps,
         )?;
 
         let available_buying_power_cents = account_funds.buying_power;
@@ -543,8 +541,9 @@ mod tests {
     };
     use crate::alpaca_broker_api::order::AlpacaLimitPrice;
     use crate::{
-        ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
-        Direction, FractionalShares, LimitOrder, OrderFailureTerminality, Positive, Usd,
+        AlpacaMarketDataError, Backpressure, ClientOrderId, CounterTradePreflight,
+        CounterTradeReservation, CounterTradeSkipReason, Direction, FractionalShares, LimitOrder,
+        OrderFailureTerminality, Permanence, Positive, Usd,
     };
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
@@ -870,6 +869,145 @@ mod tests {
         })
     }
 
+    /// Pins the `feed` query param to `delayed_sip`. The mock matches on it, so
+    /// requesting any other feed leaves this mock unmatched and httpmock answers
+    /// with a 404 that would fold into the same `ApiError` variant -- the
+    /// assertion below would still pass on the status, but `quote_mock.assert()`
+    /// catches the substitution.
+    #[tokio::test]
+    async fn executor_fetch_latest_quote_403_surfaces_as_latest_quote_error() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+
+        let quote_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/stocks/AAPL/quotes/latest")
+                .query_param("feed", "delayed_sip");
+            then.status(403)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "message": "subscription does not permit querying recent SIP data"
+                }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let error = executor
+            .fetch_latest_quote(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap_err();
+
+        quote_mock.assert();
+        let AlpacaBrokerApiError::LatestQuote(source) = &error else {
+            panic!("expected LatestQuote, got {error:?}");
+        };
+        let AlpacaMarketDataError::ApiError { status, .. } = source.as_ref() else {
+            panic!("expected LatestQuote(ApiError), got {source:?}");
+        };
+        assert_eq!(*status, reqwest::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn executor_fetch_latest_quote_malformed_json_is_permanent() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+
+        let quote_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/stocks/AAPL/quotes/latest")
+                .query_param("feed", "delayed_sip");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body("{not-json");
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let error = executor
+            .fetch_latest_quote(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap_err();
+
+        quote_mock.assert();
+        let AlpacaBrokerApiError::LatestQuote(source) = &error else {
+            panic!("expected LatestQuote, got {error:?}");
+        };
+        assert!(matches!(
+            source.as_ref(),
+            AlpacaMarketDataError::LatestQuoteJsonParse(_)
+        ));
+        assert_eq!(error.permanence(), Permanence::Permanent);
+    }
+
+    /// The mark is the required extended-hours fallback, so a broker failure to
+    /// serve it must surface as an error the caller can classify, not as the
+    /// `Ok(None)` that means "no mark, try the next source".
+    #[tokio::test]
+    async fn executor_fetch_position_mark_surfaces_broker_errors() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+
+        let positions_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions/AAPL");
+            then.status(500)
+                .header("content-type", "application/json")
+                .json_body(json!({ "message": "internal error" }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let error = executor
+            .fetch_position_mark(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap_err();
+
+        positions_mock.assert();
+        let AlpacaBrokerApiError::ApiError { status, .. } = &error else {
+            panic!("expected ApiError, got {error:?}");
+        };
+        assert_eq!(*status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn executor_fetch_latest_quote_429_classifies_as_backpressure_through_latest_quote() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/stocks/AAPL/quotes/latest")
+                .query_param("feed", "delayed_sip");
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("Retry-After", "15")
+                .json_body(json!({ "message": "rate limited" }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let error = executor
+            .fetch_latest_quote(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AlpacaBrokerApiError::LatestQuote(_)));
+        assert_eq!(
+            error.backpressure(),
+            Some(Backpressure {
+                retry_after: Some(Duration::from_secs(15))
+            })
+        );
+    }
+
     #[tokio::test]
     async fn test_preflight_counter_trade_skips_buy_without_cash() {
         let server = MockServer::start();
@@ -958,13 +1096,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_preflight_counter_trade_at_price_uses_given_price_not_latest_trade() {
-        // Close-flatten buys price their submitted limit off the current ask,
-        // not the latest trade -- so `preflight_counter_trade_at_price` must
-        // estimate cost from the caller-supplied reference price and must
-        // NOT hit the latest-trade endpoint at all. Here the latest trade
-        // price ($1.00) would pass easily; the caller-supplied ask ($100.00)
-        // must be what actually gets checked and rejected.
+    async fn test_preflight_counter_trade_at_price_checks_exact_limit_without_extra_buffer() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
@@ -976,7 +1108,7 @@ mod tests {
                 .json_body(json!({
                     "id": "904837e3-3b76-47ec-b432-046db621571b",
                     "status": "ACTIVE",
-                    "cash": "100.00"
+                    "cash": "200.00"
                 }));
         });
         let latest_trade_mock = create_latest_trade_mock(&server, "1.00");
@@ -998,10 +1130,12 @@ mod tests {
         latest_trade_mock.assert_calls(0);
         assert!(matches!(
             preflight,
-            CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientBuyingPower {
-                estimated_cost_cents,
-                available_buying_power_cents,
-            }) if estimated_cost_cents == 20_200 && available_buying_power_cents == 10_000
+            CounterTradePreflight::Allowed {
+                reservation: Some(CounterTradeReservation::BuyingPower {
+                    estimated_cost_cents,
+                    available_buying_power_cents,
+                }),
+            } if estimated_cost_cents == 20_000 && available_buying_power_cents == 20_000
         ));
     }
 

@@ -22,7 +22,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{debug, error, warn};
 
-use st0x_execution::{AlpacaBrokerApiError, AlpacaWalletError, Backpressure};
+use st0x_execution::{AlpacaBrokerApiError, AlpacaWalletError, Backpressure, Permanence};
 use st0x_tokenization::{AlpacaTokenizationError, TokenizerError};
 
 /// Deterministic exponential backoff for the apalis retry layer.
@@ -299,6 +299,26 @@ pub(crate) fn find_backpressure(error: &(dyn std::error::Error + 'static)) -> Op
                     .downcast_ref::<TokenizerError>()
                     .and_then(TokenizerError::backpressure)
             })
+    })
+}
+
+/// Walks an error chain for a broker failure's [`Permanence`], the same way
+/// [`find_backpressure`] walks it for a 429: the hedge path boxes its broker
+/// failures behind `dyn Error`, so the classification sits however many hops
+/// down the source chain the wrapping put it.
+///
+/// Only `AlpacaBrokerApiError` is downcast, for the same reason
+/// `find_backpressure` names only four types: a market-data failure reaches
+/// the app wrapped in `AlpacaBrokerApiError::LatestTrade`/`LatestQuote`,
+/// whose `permanence()` delegates to the wrapped error at that hop.
+///
+/// `None` means no broker failure appears in the chain at all -- the caller,
+/// not the broker, decided the outcome.
+pub(crate) fn find_permanence(error: &(dyn std::error::Error + 'static)) -> Option<Permanence> {
+    std::iter::successors(Some(error), |error| error.source()).find_map(|error| {
+        error
+            .downcast_ref::<AlpacaBrokerApiError>()
+            .map(AlpacaBrokerApiError::permanence)
     })
 }
 
@@ -1112,15 +1132,48 @@ mod tests {
     /// needing its own separate `AlpacaMarketDataError` downcast.
     #[test]
     fn find_backpressure_classifies_a_market_data_429_wrapped_in_latest_trade() {
-        let error =
-            AlpacaBrokerApiError::LatestTrade(st0x_execution::AlpacaMarketDataError::ApiError {
+        let error = AlpacaBrokerApiError::LatestTrade(Box::new(
+            st0x_execution::AlpacaMarketDataError::ApiError {
                 status: reqwest::StatusCode::TOO_MANY_REQUESTS,
                 body: "rate limited".to_string(),
                 retry_after: Some(Duration::from_secs(9)),
-            });
+            },
+        ));
 
         let backpressure = find_backpressure(&error).expect("expected a classified 429");
         assert_eq!(backpressure.retry_after, Some(Duration::from_secs(9)));
+    }
+
+    #[test]
+    fn find_permanence_walks_multiple_hops_to_a_wrapped_403() {
+        let error = IntermediateTestError(AlpacaBrokerApiError::LatestQuote(Box::new(
+            st0x_execution::AlpacaMarketDataError::ApiError {
+                status: reqwest::StatusCode::FORBIDDEN,
+                body: "subscription does not permit querying recent SIP data".to_string(),
+                retry_after: None,
+            },
+        )));
+
+        assert_eq!(find_permanence(&error), Some(Permanence::Permanent));
+    }
+
+    #[test]
+    fn find_permanence_walks_multiple_hops_to_a_wrapped_500() {
+        let error = IntermediateTestError(AlpacaBrokerApiError::ApiError {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            alpaca_code: None,
+            message: "boom".to_string(),
+            retry_after: None,
+        });
+
+        assert_eq!(find_permanence(&error), Some(Permanence::Transient));
+    }
+
+    #[test]
+    fn find_permanence_none_for_an_unrelated_error_chain() {
+        let io_error = std::io::Error::other("boom");
+
+        assert_eq!(find_permanence(&io_error), None);
     }
 
     #[test]

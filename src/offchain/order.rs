@@ -248,7 +248,7 @@ pub(crate) async fn place_offchain_order_at_broker(
             };
             order_placer.place_market_order(market_order).await
         }
-        CounterTradeOrderKind::ExtendedHoursLimit { limit_price } => {
+        CounterTradeOrderKind::ExtendedHoursLimit { limit_price, .. } => {
             let limit_order = LimitOrder {
                 symbol,
                 shares,
@@ -404,9 +404,12 @@ fn placed_event(
     placed_at: DateTime<Utc>,
 ) -> OffchainOrderEvent {
     let requested_market_session = kind.market_session();
-    let limit_price = match kind {
-        CounterTradeOrderKind::ExtendedHoursLimit { limit_price } => Some(*limit_price),
-        CounterTradeOrderKind::Market => None,
+    let (limit_price, close_flatten) = match kind {
+        CounterTradeOrderKind::ExtendedHoursLimit {
+            limit_price,
+            close_flatten,
+        } => (Some(*limit_price), *close_flatten),
+        CounterTradeOrderKind::Market => (None, false),
     };
 
     OffchainOrderEvent::Placed {
@@ -418,6 +421,7 @@ fn placed_event(
         is_extended_hours: requested_market_session == MarketSession::Extended,
         limit_price,
         client_order_id: Some(client_order_id.clone()),
+        close_flatten,
     }
 }
 
@@ -451,6 +455,8 @@ pub enum OffchainOrder {
             deserialize_with = "deserialize_market_session"
         )]
         market_session: MarketSession,
+        #[serde(default)]
+        close_flatten: bool,
     },
     /// `shares` carries the broker-accepted quantity for orders placed after the
     /// durable-job extraction (built from `OffchainOrderEvent::Accepted`'s
@@ -475,6 +481,8 @@ pub enum OffchainOrder {
             deserialize_with = "deserialize_market_session"
         )]
         market_session: MarketSession,
+        #[serde(default)]
+        close_flatten: bool,
     },
     PartiallyFilled {
         symbol: Symbol,
@@ -495,6 +503,8 @@ pub enum OffchainOrder {
             deserialize_with = "deserialize_market_session"
         )]
         market_session: MarketSession,
+        #[serde(default)]
+        close_flatten: bool,
     },
     Cancelling {
         symbol: Symbol,
@@ -516,6 +526,8 @@ pub enum OffchainOrder {
             deserialize_with = "deserialize_market_session"
         )]
         market_session: MarketSession,
+        #[serde(default)]
+        close_flatten: bool,
     },
     Filled {
         symbol: Symbol,
@@ -584,6 +596,7 @@ fn originate_offchain_order(event: &OffchainOrderEvent) -> Option<OffchainOrder>
             is_extended_hours,
             limit_price: _,
             client_order_id: _,
+            close_flatten,
         } => Some(OffchainOrder::Pending {
             symbol: symbol.clone(),
             shares: *shares,
@@ -591,6 +604,7 @@ fn originate_offchain_order(event: &OffchainOrderEvent) -> Option<OffchainOrder>
             executor: *executor,
             placed_at: *placed_at,
             market_session: market_session_from_extended(*is_extended_hours),
+            close_flatten: *close_flatten,
         }),
         _ => None,
     }
@@ -739,6 +753,7 @@ impl EventSourced for OffchainOrder {
                     executor,
                     placed_at,
                     market_session,
+                    close_flatten,
                 } = entity
                 else {
                     return Ok(None);
@@ -754,6 +769,7 @@ impl EventSourced for OffchainOrder {
                     placed_at: *placed_at,
                     submitted_at: *submitted_at,
                     market_session: *market_session,
+                    close_flatten: *close_flatten,
                 }))
             }
 
@@ -770,6 +786,7 @@ impl EventSourced for OffchainOrder {
                     direction,
                     executor,
                     placed_at,
+                    close_flatten,
                     ..
                 } = entity
                 else {
@@ -789,6 +806,7 @@ impl EventSourced for OffchainOrder {
                     placed_at: *placed_at,
                     submitted_at: *submitted_at,
                     market_session: *market_session,
+                    close_flatten: *close_flatten,
                 }))
             }
 
@@ -1258,6 +1276,7 @@ fn evolve_partially_filled(
             placed_at,
             submitted_at,
             market_session,
+            close_flatten,
         }
         | OffchainOrder::PartiallyFilled {
             symbol,
@@ -1269,6 +1288,7 @@ fn evolve_partially_filled(
             placed_at,
             submitted_at,
             market_session,
+            close_flatten,
             ..
         } => Some(OffchainOrder::PartiallyFilled {
             symbol: symbol.clone(),
@@ -1283,6 +1303,7 @@ fn evolve_partially_filled(
             submitted_at: *submitted_at,
             partially_filled_at,
             market_session: *market_session,
+            close_flatten: *close_flatten,
         }),
         OffchainOrder::Cancelling {
             symbol,
@@ -1296,6 +1317,7 @@ fn evolve_partially_filled(
             submitted_at,
             cancel_requested_at,
             market_session,
+            close_flatten,
             ..
         } => Some(OffchainOrder::Cancelling {
             symbol: symbol.clone(),
@@ -1314,6 +1336,7 @@ fn evolve_partially_filled(
             submitted_at: *submitted_at,
             cancel_requested_at: *cancel_requested_at,
             market_session: *market_session,
+            close_flatten: *close_flatten,
         }),
         OffchainOrder::Pending { .. }
         | OffchainOrder::Filled { .. }
@@ -1338,6 +1361,7 @@ fn evolve_cancel_requested(
             placed_at,
             submitted_at,
             market_session,
+            close_flatten,
         } => Some(OffchainOrder::Cancelling {
             symbol: symbol.clone(),
             shares: *shares,
@@ -1351,6 +1375,7 @@ fn evolve_cancel_requested(
             submitted_at: *submitted_at,
             cancel_requested_at,
             market_session: *market_session,
+            close_flatten: *close_flatten,
         }),
         OffchainOrder::PartiallyFilled {
             symbol,
@@ -1365,6 +1390,7 @@ fn evolve_cancel_requested(
             submitted_at,
             partially_filled_at,
             market_session,
+            close_flatten,
             ..
         } => Some(OffchainOrder::Cancelling {
             symbol: symbol.clone(),
@@ -1383,6 +1409,7 @@ fn evolve_cancel_requested(
             submitted_at: *submitted_at,
             cancel_requested_at,
             market_session: *market_session,
+            close_flatten: *close_flatten,
         }),
         OffchainOrder::Pending { .. }
         | OffchainOrder::Cancelling { .. }
@@ -1846,6 +1873,25 @@ impl OffchainOrder {
             | Filled { symbol, .. }
             | Failed { symbol, .. }
             | Cancelled { symbol, .. } => symbol,
+        }
+    }
+
+    /// Whether close-flatten mode priced this order.
+    ///
+    /// Only the pre-terminal states carry it, which is enough: a terminal
+    /// transition is always commanded against the state that preceded it, so the
+    /// outcome metric reads the flag before the state collapses. Terminal states
+    /// answer `false` because nothing consults them for attribution.
+    pub(crate) const fn close_flatten(&self) -> bool {
+        use OffchainOrder::{
+            Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
+        };
+        match self {
+            Pending { close_flatten, .. }
+            | Submitted { close_flatten, .. }
+            | PartiallyFilled { close_flatten, .. }
+            | Cancelling { close_flatten, .. } => *close_flatten,
+            Filled { .. } | Failed { .. } | Cancelled { .. } => false,
         }
     }
 
@@ -2524,10 +2570,21 @@ pub trait OrderPlacer: Send + Sync {
         executor_order_id: &ExecutorOrderId,
     ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>;
 
-    /// Fetches the latest trade price for a symbol, used to compute limit
-    /// prices for extended-hours counter-trades. Returns `None` when the
-    /// executor does not support market data lookups.
-    async fn fetch_latest_trade_price(
+    /// Fetches an optional current bid/ask quote suitable as the primary
+    /// extended-hours limit-order reference. The default preserves today's
+    /// mark-first behaviour until a market-data provider is wired.
+    async fn fetch_primary_limit_quote(
+        &self,
+        _symbol: &Symbol,
+    ) -> Result<Option<LatestQuote>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+
+    /// Fetches the broker's mark for a symbol, the fallback every
+    /// extended-hours limit price can use. Returns `None` when there is no
+    /// position to read a mark from, which means "try the next reference
+    /// source", never "abandon the hedge".
+    async fn fetch_position_mark(
         &self,
         _symbol: &Symbol,
     ) -> Result<Option<st0x_execution::Positive<Usd>>, Box<dyn std::error::Error + Send + Sync>>
@@ -2535,7 +2592,8 @@ pub trait OrderPlacer: Send + Sync {
         Ok(None)
     }
 
-    /// Fetches a validated latest bid/ask quote for close-flatten pricing.
+    /// Fetches the validated emergency bid/ask quote used after the optional
+    /// primary source and the position mark fail.
     async fn fetch_latest_quote(
         &self,
         _symbol: &Symbol,
@@ -2641,12 +2699,19 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         Ok(self.0.cancel_order(&order_id).await?)
     }
 
-    async fn fetch_latest_trade_price(
+    async fn fetch_position_mark(
         &self,
         symbol: &Symbol,
     ) -> Result<Option<st0x_execution::Positive<Usd>>, Box<dyn std::error::Error + Send + Sync>>
     {
-        Ok(self.0.fetch_latest_trade_price(symbol).await?)
+        Ok(self.0.fetch_position_mark(symbol).await?)
+    }
+
+    async fn fetch_primary_limit_quote(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<LatestQuote>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.0.fetch_primary_limit_quote(symbol).await?)
     }
 
     async fn fetch_latest_quote(
@@ -2760,7 +2825,10 @@ pub(crate) fn noop_placed_shares(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CounterTradeOrderKind {
     Market,
-    ExtendedHoursLimit { limit_price: Positive<Usd> },
+    ExtendedHoursLimit {
+        limit_price: Positive<Usd>,
+        close_flatten: bool,
+    },
 }
 
 impl CounterTradeOrderKind {
@@ -2886,6 +2954,11 @@ pub enum OffchainOrderEvent {
         /// `#[serde(default)]` (None) for events predating this field.
         #[serde(default)]
         client_order_id: Option<ClientOrderId>,
+        /// Whether close-flatten mode priced this order. Seeds the entity flag
+        /// of the same name, so a terminal transition can attribute its outcome
+        /// to the flatten window. `false` for events predating this field.
+        #[serde(default)]
+        close_flatten: bool,
     },
     /// Legacy broker-acceptance event. Predates the durable-job extraction,
     /// where `Place` did the broker call inline and emitted this alongside
@@ -3085,9 +3158,30 @@ mod tests {
     use serde_json::json;
 
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, TestStore, replay};
+    use st0x_execution::MockExecutor;
+    use st0x_float_macro::float;
 
     use super::*;
-    use st0x_float_macro::float;
+
+    #[tokio::test]
+    async fn executor_order_placer_forwards_the_optional_primary_quote() {
+        let quote = LatestQuote::new(
+            Positive::new(Usd::new(float!(99))).unwrap(),
+            Positive::new(Usd::new(float!(101))).unwrap(),
+        )
+        .unwrap();
+        let placer = ExecutorOrderPlacer(MockExecutor::new().with_primary_limit_quote(quote));
+
+        assert_eq!(
+            placer
+                .fetch_primary_limit_quote(&Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap(),
+            Some(quote),
+            "the object-safe bridge must not replace the executor's primary quote with its \
+             Ok(None) default"
+        );
+    }
 
     fn failing_order_placer() -> Arc<dyn OrderPlacer> {
         struct Failing;
@@ -3223,6 +3317,119 @@ mod tests {
             .unwrap();
     }
 
+    /// The flag is only useful if it is still readable at the terminal
+    /// transition, which is where the outcome metric attributes the fill. It has
+    /// to survive Pending -> Submitted, since a broker acceptance rebuilds the
+    /// state from the event rather than carrying the entity forward.
+    #[tokio::test]
+    async fn close_flatten_survives_from_placement_to_the_terminal_transition() {
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let id = OffchainOrderId::new();
+        let requested = Positive::new(FractionalShares::new(float!(100))).unwrap();
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: requested,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    kind: CounterTradeOrderKind::ExtendedHoursLimit {
+                        limit_price: Positive::new(Usd::new(float!(100))).unwrap(),
+                        close_flatten: true,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store.load(&id).await.unwrap().unwrap().close_flatten(),
+            "the placement's close-flatten attribution must reach the entity"
+        );
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("TEST-ACCEPT"),
+                    placed_shares: noop_placed_shares(requested),
+                    submitted_at: Utc::now(),
+                    market_session: MarketSession::Extended,
+                    limit_price: Some(Positive::new(Usd::new(float!(100))).unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store.load(&id).await.unwrap().unwrap().close_flatten(),
+            "broker acceptance must not drop the attribution before the outcome is known"
+        );
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(50)),
+                    avg_price: Usd::new(float!(100)),
+                    partially_filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store.load(&id).await.unwrap().unwrap().close_flatten(),
+            "a partial fill must retain attribution for its eventual terminal outcome"
+        );
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::CancelOrder {
+                    reason: CancellationReason::ExtendedHoursCloseFlatten,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store.load(&id).await.unwrap().unwrap().close_flatten(),
+            "an in-flight cancellation must retain attribution for its terminal outcome"
+        );
+    }
+
+    /// An ordinary extended-hours limit is not a flatten, so it must not be
+    /// counted as one.
+    #[tokio::test]
+    async fn an_ordinary_extended_hours_limit_is_not_attributed_to_close_flatten() {
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let id = OffchainOrderId::new();
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    kind: CounterTradeOrderKind::ExtendedHoursLimit {
+                        limit_price: Positive::new(Usd::new(float!(100))).unwrap(),
+                        close_flatten: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!store.load(&id).await.unwrap().unwrap().close_flatten());
+    }
+
     #[test]
     fn placed_event_records_order_terms_and_defaults_for_legacy_events() {
         let event = OffchainOrderEvent::Placed {
@@ -3234,6 +3441,7 @@ mod tests {
             is_extended_hours: true,
             limit_price: Some(Positive::new(Usd::new(float!(195.25))).unwrap()),
             client_order_id: Some(ClientOrderId::from_uuid(uuid::Uuid::new_v4())),
+            close_flatten: true,
         };
 
         // The submitted terms are recorded on the event for audit.
@@ -3252,6 +3460,7 @@ mod tests {
         let placed = value["Placed"].as_object_mut().unwrap();
         placed.remove("limit_price");
         placed.remove("client_order_id");
+        placed.remove("close_flatten");
         let legacy: OffchainOrderEvent = serde_json::from_value(value).unwrap();
         assert!(
             matches!(
@@ -3259,10 +3468,15 @@ mod tests {
                 OffchainOrderEvent::Placed {
                     limit_price: None,
                     client_order_id: None,
+                    close_flatten: false,
                     ..
                 }
             ),
             "legacy Placed event must default the audit terms to None, got: {legacy:?}"
+        );
+        assert!(
+            !OffchainOrder::originate(&legacy).unwrap().close_flatten(),
+            "the legacy event default must propagate into pending aggregate state"
         );
     }
 
@@ -3745,6 +3959,7 @@ mod tests {
             placed_at: submitted_at,
             submitted_at,
             market_session: MarketSession::Extended,
+            close_flatten: false,
         };
 
         let mut legacy_payload = serde_json::to_value(submitted).unwrap();
@@ -3753,6 +3968,7 @@ mod tests {
             .and_then(serde_json::Value::as_object_mut)
             .expect("Submitted variant serializes as an object");
         submitted.remove("market_session");
+        submitted.remove("close_flatten");
         submitted.insert("is_extended_hours".to_string(), json!(true));
 
         let state: OffchainOrder = serde_json::from_value(legacy_payload).unwrap();
@@ -3761,11 +3977,81 @@ mod tests {
                 state,
                 OffchainOrder::Submitted {
                     market_session: MarketSession::Extended,
+                    close_flatten: false,
                     ..
                 }
             ),
-            "legacy is_extended_hours=true must deserialize as Extended, got: {state:?}"
+            "legacy is_extended_hours=true must deserialize as Extended with no close-flatten \
+             attribution, got: {state:?}"
         );
+    }
+
+    /// `close_flatten` was added to four persisted pre-terminal variants, and
+    /// snapshots written before it must still replay: a dropped
+    /// `#[serde(default)]` would fail startup rather than CI.
+    #[test]
+    fn legacy_pre_terminal_states_deserialize_without_close_flatten() {
+        let placed_at = Utc::now();
+        let pending = OffchainOrder::Pending {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::DryRun,
+            placed_at,
+            market_session: MarketSession::Extended,
+            close_flatten: true,
+        };
+        let cancelling = OffchainOrder::Cancelling {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
+            requested_shares: None,
+            retained_fill: None,
+            direction: Direction::Buy,
+            executor: SupportedExecutor::DryRun,
+            executor_order_id: ExecutorOrderId::new("broker-123"),
+            reason: CancellationReason::ExtendedHoursRepriceTimeout,
+            placed_at,
+            submitted_at: placed_at,
+            cancel_requested_at: placed_at,
+            market_session: MarketSession::Extended,
+            close_flatten: true,
+        };
+        let partially_filled = OffchainOrder::PartiallyFilled {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
+            requested_shares: None,
+            shares_filled: FractionalShares::new(float!(25)),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::DryRun,
+            executor_order_id: ExecutorOrderId::new("broker-123"),
+            avg_price: Usd::new(float!(100)),
+            placed_at,
+            submitted_at: placed_at,
+            partially_filled_at: placed_at,
+            market_session: MarketSession::Extended,
+            close_flatten: true,
+        };
+
+        for (variant, state) in [
+            ("Pending", pending),
+            ("PartiallyFilled", partially_filled),
+            ("Cancelling", cancelling),
+        ] {
+            let mut legacy_payload = serde_json::to_value(state).unwrap();
+            legacy_payload
+                .get_mut(variant)
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("variant serializes as an object")
+                .remove("close_flatten")
+                .expect("the field must be present before it is stripped");
+
+            let replayed: OffchainOrder = serde_json::from_value(legacy_payload).unwrap();
+            assert!(
+                !replayed.close_flatten(),
+                "{variant} snapshot without close_flatten must replay as not attributed, \
+                 got: {replayed:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3965,6 +4251,7 @@ mod tests {
             placer.as_ref(),
             CounterTradeOrderKind::ExtendedHoursLimit {
                 limit_price: Positive::new(Usd::new(float!(195.25))).unwrap(),
+                close_flatten: false,
             },
         )
         .await;
@@ -4008,6 +4295,7 @@ mod tests {
             placer.as_ref(),
             CounterTradeOrderKind::ExtendedHoursLimit {
                 limit_price: Positive::new(Usd::new(float!(195.25))).unwrap(),
+                close_flatten: false,
             },
         )
         .await;
@@ -5750,6 +6038,7 @@ mod tests {
             executor: SupportedExecutor::DryRun,
             placed_at: Utc::now(),
             market_session: MarketSession::Regular,
+            close_flatten: false,
         };
 
         let err = pending
@@ -5807,7 +6096,8 @@ mod tests {
     }
 
     /// Events persisted before this PR lack the new `Placed` fields
-    /// (`is_extended_hours` / `limit_price` / `client_order_id`). Replaying
+    /// (`is_extended_hours` / `limit_price` / `client_order_id` /
+    /// `close_flatten`). Replaying
     /// such a legacy stream through the real `EventSourced` machinery -- the
     /// path startup recovery takes for orders that predate the schema change
     /// -- must still produce the correct terminal `Failed` aggregate with no
@@ -5824,6 +6114,7 @@ mod tests {
             is_extended_hours: false,
             limit_price: None,
             client_order_id: None,
+            close_flatten: false,
         };
 
         // Strip the post-upgrade keys to reconstruct the exact payload shape
@@ -5836,6 +6127,7 @@ mod tests {
         placed_object.remove("is_extended_hours");
         placed_object.remove("limit_price");
         placed_object.remove("client_order_id");
+        placed_object.remove("close_flatten");
 
         let mut failed_value = serde_json::to_value(OffchainOrderEvent::Failed {
             error: "broker rejected".to_string(),
@@ -5913,6 +6205,7 @@ mod tests {
                 is_extended_hours: false,
                 limit_price: None,
                 client_order_id: None,
+                close_flatten: false,
             },
             OffchainOrderEvent::Submitted {
                 executor_order_id: ExecutorOrderId::new("broker-cancelled"),

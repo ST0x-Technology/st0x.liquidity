@@ -4,6 +4,7 @@
 //! broker order for an accumulated position. The position monitor enqueues
 //! these; the apalis worker processes them with retry semantics.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,18 +14,20 @@ use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use st0x_float_macro::float;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use st0x_config::{AssetsConfig, ExecutionThreshold};
 use st0x_event_sorcery::{AggregateError, LifecycleError, Store};
 use st0x_execution::{
-    ClientOrderId, CounterTradePreflight, Direction, FractionalShares, MarketOrder, MarketSession,
-    Positive, PostCloseGap, SupportedExecutor, Symbol, Usd,
+    Backpressure, ClientOrderId, CounterTradePreflight, CounterTradeSkipReason, Direction,
+    FractionalShares, MarketOrder, MarketSession, Permanence, Positive, PostCloseGap,
+    SupportedExecutor, Symbol, Usd,
 };
 
+use crate::alerts::Notifier;
 use crate::conductor::job::{
     BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureOutcome, BackpressureStreak, Job, JobQueue, Label,
-    advance_backpressure, apply_backpressure_step, find_backpressure,
+    advance_backpressure, apply_backpressure_step, find_backpressure, find_permanence,
 };
 #[cfg(test)]
 use crate::offchain::order::PollOrderStatus;
@@ -35,8 +38,11 @@ use crate::offchain::order::{
     push_poll_job_if_absent,
 };
 use crate::position::{AnchorDisposition, Position, PositionCommand, PositionError};
-use crate::trading::offchain::close_flatten::{CloseFlattenPolicy, preflight_skip_reason_label};
-use crate::trading::onchain::trade_accountant::TradeAccountingError;
+use crate::trading::offchain::close_flatten::{CloseFlattenCrossRamp, CloseFlattenPolicy};
+use crate::trading::onchain::trade_accountant::{
+    ClaimedHedgeOrderKindCause, DeadLetterReason, ErrorScope, SymbolScopedReason,
+    TradeAccountingError,
+};
 
 /// Error returned by [`apply_slippage`].
 #[derive(Debug, thiserror::Error)]
@@ -53,7 +59,7 @@ pub(crate) enum SlippageError {
 /// maximizes fill probability (ceiling for buys, floor for sells), which
 /// can push the realized limit slightly beyond the configured slippage
 /// budget by up to one tick.
-fn apply_slippage(
+pub(crate) fn apply_slippage(
     price: Usd,
     direction: Direction,
     slippage_bps: u16,
@@ -120,12 +126,12 @@ pub(crate) struct HedgeCtx {
     /// regular-open cancel-and-replace sweep is keyed off the same per-symbol
     /// flag, so an extended order for a disabled symbol would be orphaned).
     pub(crate) assets: AssetsConfig,
-    pub(crate) counter_trade_slippage_bps: u16,
     /// Validated once at construction (`conductor/builder.rs`) instead of
     /// re-parsed from a raw `u64` on every hedge job -- the window is fixed
     /// for the process lifetime, so re-validating it per job just threads an
     /// always-succeeds-in-practice `Result` through the hot placement path.
     pub(crate) close_flatten_policy: CloseFlattenPolicy,
+    pub(crate) close_flatten_ramp: CloseFlattenCrossRamp,
     /// Serialises broker submissions across hedge jobs and the inline
     /// counter-trade path in `conductor.rs`, so a preflight running under
     /// this same lock (the inline path's) observes any prior submission
@@ -142,6 +148,70 @@ pub(crate) struct HedgeCtx {
     /// order that already has a live poll job is skipped instead of forking a
     /// new self-perpetuating chain.
     pub(crate) poll_interval: Duration,
+    /// Pages the operator when a hedge is abandoned. Dead-lettering keeps the
+    /// process alive, so without this an abandoned symbol would accumulate a
+    /// standing delta with no push signal -- only a counter nobody is
+    /// watching. The same `Arc<dyn Notifier>` the supervised-worker fail-stop
+    /// alert uses, so both share one delivery channel and one config section.
+    pub(crate) notifier: Arc<dyn Notifier>,
+    /// The `(symbol, reason)` pairs reserved for delivery or already delivered
+    /// in this process.
+    /// `CheckPositions` re-enqueues an abandoned hedge every scan, so an
+    /// un-deduped page would repeat for as long as the underlying failure
+    /// lasts. A symbol's entries are dropped again as soon as one of its
+    /// hedges reaches the broker ([`route_placement_outcome`]), so the set
+    /// suppresses repeats of a *standing* failure rather than latching for the
+    /// process lifetime -- a feed regression that recurs next session pages
+    /// again. In-process only: a restart re-pages, which is the right
+    /// behaviour for a condition that survived a restart.
+    pub(crate) alerted_dead_letters: Arc<Mutex<HashSet<(Symbol, DeadLetterReason)>>>,
+}
+
+/// Pages the operator once per `(symbol, reason)` for a hedge this process
+/// abandoned, mirroring the USDC rebalancer's dead-letter alert. Delivery
+/// failure is logged and swallowed: the abandonment already happened, and the
+/// counter plus `error!` remain.
+///
+/// The pair is reserved before delivery so the hedge and position-scan workers
+/// cannot both send it. A failed or timed-out delivery releases the reservation
+/// for the next scan; a successful one keeps it latched until the symbol places.
+///
+/// Takes the notifier and the dedup set rather than a `HedgeCtx` because the
+/// position scan pages through the same mechanism for a buy it drops before a
+/// hedge job exists (`position_check.rs`). Both share one set, so a symbol
+/// paged by either path is silenced by the other until one of its hedges
+/// reaches the broker.
+pub(crate) async fn alert_dead_letter(
+    notifier: &dyn Notifier,
+    alerted_dead_letters: &Mutex<HashSet<(Symbol, DeadLetterReason)>>,
+    symbol: &Symbol,
+    reason: DeadLetterReason,
+    message: &str,
+) {
+    let key = (symbol.clone(), reason);
+    if !alerted_dead_letters.lock().await.insert(key.clone()) {
+        return;
+    }
+
+    match tokio::time::timeout(DEAD_LETTER_ALERT_TIMEOUT, notifier.notify(message)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            alerted_dead_letters.lock().await.remove(&key);
+            warn!(
+                target: "hedge", ?error, %symbol,
+                "Failed to deliver hedge dead-letter alert; the next scan re-attempts it"
+            );
+        }
+        Err(_elapsed) => {
+            alerted_dead_letters.lock().await.remove(&key);
+            warn!(
+                target: "hedge",
+                %symbol,
+                timeout_secs = DEAD_LETTER_ALERT_TIMEOUT.as_secs(),
+                "Timed out delivering hedge dead-letter alert; the next scan re-attempts it"
+            );
+        }
+    }
 }
 
 /// A durable job that places an offsetting broker order for an accumulated
@@ -177,10 +247,49 @@ pub(crate) struct PlaceHedge {
     /// the same deterministic broker `client_order_id`.
     #[serde(default)]
     pub(crate) backpressure_streak: BackpressureStreak,
+    /// Consecutive symbol-scoped *transient* failures (a market-data 5xx, a
+    /// transport error) already re-driven for this hedge. Bounded by
+    /// [`TRANSIENT_RESCHEDULE_LIMIT`], past which the symbol is dead-lettered
+    /// rather than propagated into the supervised worker's fail-stop.
+    /// `#[serde(default)]` so a row enqueued under the previous payload shape
+    /// still deserializes to `0` instead of crashing the poll stream's decode.
+    #[serde(default)]
+    pub(crate) transient_streak: TransientFailureStreak,
 }
+
+/// Durable count of consecutive symbol-scoped transient re-drives leading up to
+/// a hedge attempt (RAI-1690). Distinct at the type level from
+/// [`BackpressureStreak`], which counts broker rate-limiting, so the two cannot
+/// be swapped at the one construction site that sets both.
+/// `#[serde(transparent)]` keeps the wire format an unadorned integer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct TransientFailureStreak(pub(crate) u32);
+
+/// How many times a symbol-scoped transient failure is re-driven before the
+/// symbol is abandoned. Mirrors the supervised worker's own
+/// `RetryPolicy::retries(3)` budget and its 1s/2s/4s backoff, so the retry
+/// cadence a transient failure gets is unchanged -- only the terminal action
+/// differs: one symbol's sustained market-data outage dead-letters that symbol
+/// instead of failing the worker, and with it hedging for every other symbol.
+const TRANSIENT_RESCHEDULE_LIMIT: u32 = 3;
+
+/// Delay before the first transient re-drive; doubles with each consecutive
+/// transient failure, matching the supervised worker's retry backoff.
+const TRANSIENT_RESCHEDULE_BASE: Duration = Duration::from_secs(1);
+
+/// Keeps a stalled alert channel from serialising every other symbol behind a
+/// dead-letter on the concurrency-one hedge worker.
+const DEAD_LETTER_ALERT_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn default_market_session() -> MarketSession {
     MarketSession::Regular
+}
+
+#[derive(Clone, Copy)]
+enum SubmittedPricePreflight {
+    Required,
+    SkipForIdempotentRecovery,
 }
 
 async fn select_order_kind_for_current_session(
@@ -189,6 +298,7 @@ async fn select_order_kind_for_current_session(
     shares: Positive<FractionalShares>,
     direction: Direction,
     enqueued_session: MarketSession,
+    submitted_price_preflight: SubmittedPricePreflight,
 ) -> Result<Option<CounterTradeOrderKind>, TradeAccountingError> {
     let status = ctx
         .order_placer
@@ -232,12 +342,11 @@ async fn select_order_kind_for_current_session(
                 return Ok(None);
             }
 
-            let close_flatten_active = ctx
-                .close_flatten_policy
-                .active_window(status, chrono::Utc::now())
-                .is_some();
+            let now = chrono::Utc::now();
+            let close_flatten_window = ctx.close_flatten_policy.active_window(status, now);
+            let close_flatten_active = close_flatten_window.is_some();
 
-            let latest_price = if close_flatten_active {
+            if close_flatten_active {
                 counter!(
                     "close_flatten_attempts_total",
                     "symbol" => symbol.to_string(),
@@ -245,79 +354,75 @@ async fn select_order_kind_for_current_session(
                     "reason" => post_close_gap_label(status.post_close_gap)
                 )
                 .increment(1);
+            }
 
-                let quote = match ctx.order_placer.fetch_latest_quote(symbol).await {
-                    Ok(Some(quote)) => quote,
-                    Ok(None) => {
-                        record_close_flatten_block(symbol, "quote_unavailable");
-                        error!(
-                            target: "hedge",
-                            %symbol,
-                            "Close flatten blocked: executor does not support latest quotes"
-                        );
-                        return Err(TradeAccountingError::LimitQuoteUnavailable {
-                            symbol: symbol.clone(),
-                        });
-                    }
-                    Err(source) => {
-                        record_close_flatten_block(symbol, "quote_fetch_failed");
-                        error!(
-                            target: "hedge",
-                            %symbol,
-                            %source,
-                            "Close flatten blocked: latest quote fetch failed"
-                        );
-                        return Err(TradeAccountingError::LimitQuoteFetch {
-                            symbol: symbol.clone(),
-                            source,
-                        });
-                    }
-                };
-
-                match direction {
-                    Direction::Buy => quote.ask(),
-                    Direction::Sell => quote.bid(),
-                }
-            } else {
-                ctx.order_placer
-                    .fetch_latest_trade_price(symbol)
-                    .await
-                    .map_err(|source| TradeAccountingError::LimitPriceFetch {
-                        symbol: symbol.clone(),
-                        source,
-                    })?
-                    .ok_or_else(|| TradeAccountingError::LimitPriceUnavailable {
-                        symbol: symbol.clone(),
-                    })?
-            };
-
-            let limit_price = apply_slippage(
-                latest_price.inner(),
+            let reference = resolve_extended_hours_reference_price(
+                ctx.order_placer.as_ref(),
+                symbol,
                 direction,
-                ctx.counter_trade_slippage_bps,
-            )?;
+            )
+            .await
+            .inspect_err(|error| {
+                if close_flatten_active {
+                    record_close_flatten_block(symbol, CloseFlattenBlockReason::from(error));
+                }
+            })
+            .map_err(|error| error.into_trade_accounting_error(symbol))?;
 
-            // The scan-time preflight (`preflight_and_clamp_shares` ->
-            // `preflight_close_flatten_buy`) approved this buy against a
-            // quote fetched during CheckPositions -- potentially minutes
-            // stale by the time this job reaches perform(). Re-check cash
-            // sufficiency against the exact price this order is about to
-            // submit at (the same ask this function just derived
-            // `limit_price` from), closing that staleness window instead of
-            // relying solely on broker-side rejection as the backstop. Sells
-            // are unaffected by price, so only buys need this.
-            if close_flatten_active
-                && direction == Direction::Buy
-                && !close_flatten_preflight_at_submitted_price(
+            counter!(
+                "hedge_price_source_total",
+                "symbol" => symbol.to_string(),
+                "path" => if close_flatten_active { "close_flatten" } else { "ordinary_extended" },
+                "source" => reference.source.metric_label()
+            )
+            .increment(1);
+
+            let cross_bps = ctx.close_flatten_ramp.cross_bps(close_flatten_window, now);
+
+            let limit_price = apply_slippage(reference.price.inner(), direction, cross_bps)
+                .map_err(TradeAccountingError::SlippageCalculation)?;
+
+            // A fresh job's scan-time preflight approved this buy against an
+            // earlier reference -- potentially minutes stale by perform().
+            // Re-check cash sufficiency against the exact submitted limit.
+            // A Pending recovery deliberately skips this gate: the original
+            // broker request is idempotently re-driven by client order ID and
+            // may already have reserved the cash that this account-wide check
+            // would otherwise reject, stranding the claim without a poller.
+            // Sells are unaffected by price, so only buys need this.
+            if direction == Direction::Buy
+                && matches!(submitted_price_preflight, SubmittedPricePreflight::Required)
+                && !extended_hours_preflight_at_submitted_price(
                     ctx,
                     symbol,
                     shares,
                     direction,
                     limit_price,
+                    close_flatten_active,
                 )
                 .await?
             {
                 return Ok(None);
+            }
+
+            // Counted only once the attempt has cleared every gate that can
+            // still abort it here, so a preflight-blocked buy is not reported
+            // as a priced placement.
+            if let Some(window) = close_flatten_window {
+                counter!(
+                    "close_flatten_placements_total",
+                    "symbol" => symbol.to_string(),
+                    "direction" => direction_label(direction),
+                    "cross_bucket" => cross_bucket_label(cross_bps)
+                )
+                .increment(1);
+                debug!(
+                    target: "hedge",
+                    %symbol,
+                    cross_bps,
+                    window_started_at = %window.started_at,
+                    "Close flatten cross ramped for this attempt"
+                );
             }
 
             info!(
@@ -331,25 +436,27 @@ async fn select_order_kind_for_current_session(
 
             Ok(Some(CounterTradeOrderKind::ExtendedHoursLimit {
                 limit_price,
+                close_flatten: close_flatten_active,
             }))
         }
     }
 }
 
-/// Re-checks buying power for a close-flatten buy against the exact ask
+/// Re-checks buying power for an extended-hours buy against the exact limit
 /// price it is about to submit at, closing the staleness window between the
-/// scan-time preflight's quote (fetched during `CheckPositions`, possibly
-/// minutes earlier) and this job's own quote. Returns `true` if the order
-/// should proceed, `false` if it should be skipped -- mirroring
+/// scan-time preflight's reference and this job's fresh mark or quote. Returns
+/// `true` if the order should proceed, `false` if it should be skipped -- mirroring
 /// `CheckPositions::preflight_and_clamp_shares`'s "bool: proceed vs skip"
-/// contract, since a rejection here is a routine outcome of a widening
-/// spread, not an error.
-async fn close_flatten_preflight_at_submitted_price(
+/// contract, since a rejection here is a routine outcome of a moved price, not
+/// an error. Only a rejection inside close-flatten mode contributes to that
+/// mode's blocked-attempt metric.
+async fn extended_hours_preflight_at_submitted_price(
     ctx: &HedgeCtx,
     symbol: &Symbol,
     shares: Positive<FractionalShares>,
     direction: Direction,
     limit_price: Positive<Usd>,
+    close_flatten_active: bool,
 ) -> Result<bool, TradeAccountingError> {
     let order = MarketOrder {
         symbol: symbol.clone(),
@@ -374,16 +481,273 @@ async fn close_flatten_preflight_at_submitted_price(
     match preflight {
         CounterTradePreflight::Allowed { .. } => Ok(true),
         CounterTradePreflight::Skipped(reason) => {
-            record_close_flatten_block(symbol, preflight_skip_reason_label(&reason));
+            if close_flatten_active {
+                record_close_flatten_block(symbol, CloseFlattenBlockReason::from(&reason));
+            }
             warn!(
                 target: "hedge",
-                %symbol, %reason, %limit_price,
-                "Close flatten blocked at submission time: ask moved past the \
-                 scan-time preflight's approved price"
+                %symbol, %reason, %limit_price, close_flatten_active,
+                "Extended-hours hedge blocked at submission time: the exact limit no longer \
+                 passes the scan-time preflight"
             );
             Ok(false)
         }
     }
+}
+
+/// Which source supplied the price an extended-hours limit was derived from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReferencePriceSource {
+    /// An optional current bid/ask market-data quote. The preferred source when
+    /// a provider is wired.
+    PrimaryQuote,
+    /// The broker's position mark: the required fallback when the optional
+    /// primary quote is absent or fails.
+    Mark,
+    /// A `delayed_sip` quote, used only when neither the optional primary quote
+    /// nor the mark can supply a reference. A real NBBO, fifteen minutes stale.
+    DelayedSipQuote,
+}
+
+impl ReferencePriceSource {
+    const fn metric_label(self) -> &'static str {
+        match self {
+            Self::PrimaryQuote => "primary_quote",
+            Self::Mark => "mark",
+            Self::DelayedSipQuote => "delayed_sip_quote",
+        }
+    }
+}
+
+/// The price an extended-hours limit is crossed from, and where it came from.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReferencePrice {
+    pub(crate) price: Positive<Usd>,
+    source: ReferencePriceSource,
+}
+
+/// Failure to establish any reference price. Only reached once *every* source
+/// has been tried, because a flatten must not be skipped for want of a price.
+#[derive(Debug)]
+pub(crate) enum ReferencePriceError {
+    /// No source could supply a price, and none of them errored.
+    Unavailable,
+    /// The mark lookup failed and the quote could not cover for it. Selected
+    /// when the mark failure has at least as useful a retry classification as
+    /// the quote failure.
+    MarkFetch(Box<dyn std::error::Error + Send + Sync>),
+    /// The quote lookup failed after the mark was absent, or its failure has a
+    /// better retry classification than a failed mark lookup.
+    QuoteFetch(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl ReferencePriceError {
+    /// The `(symbol, reason)` dedup key this cause would page under had it
+    /// been raised inside the hedge job. The scan drops a buy before that job
+    /// exists, so it pages under the same key to stay deduped against it.
+    pub(crate) const fn dead_letter_reason(&self) -> DeadLetterReason {
+        DeadLetterReason::SymbolScoped(match self {
+            Self::Unavailable => SymbolScopedReason::LimitQuoteUnavailable,
+            Self::MarkFetch(_) => SymbolScopedReason::MarkFetch,
+            Self::QuoteFetch(_) => SymbolScopedReason::LimitQuoteFetch,
+        })
+    }
+
+    fn into_trade_accounting_error(self, symbol: &Symbol) -> TradeAccountingError {
+        match self {
+            Self::Unavailable => TradeAccountingError::LimitQuoteUnavailable {
+                symbol: symbol.clone(),
+            },
+            Self::MarkFetch(source) => TradeAccountingError::MarkFetch {
+                symbol: symbol.clone(),
+                source,
+            },
+            Self::QuoteFetch(source) => TradeAccountingError::LimitQuoteFetch {
+                symbol: symbol.clone(),
+                source,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseFlattenBlockReason {
+    ReferencePriceUnavailable,
+    MarkFetchFailed,
+    QuoteFetchFailed,
+    InsufficientEquity,
+    InsufficientBuyingPower,
+}
+
+impl CloseFlattenBlockReason {
+    const fn metric_label(self) -> &'static str {
+        match self {
+            Self::ReferencePriceUnavailable => "reference_price_unavailable",
+            Self::MarkFetchFailed => "mark_fetch_failed",
+            Self::QuoteFetchFailed => "quote_fetch_failed",
+            Self::InsufficientEquity => "insufficient_equity",
+            Self::InsufficientBuyingPower => "insufficient_buying_power",
+        }
+    }
+}
+
+impl From<&ReferencePriceError> for CloseFlattenBlockReason {
+    fn from(error: &ReferencePriceError) -> Self {
+        match error {
+            ReferencePriceError::Unavailable => Self::ReferencePriceUnavailable,
+            ReferencePriceError::MarkFetch(_) => Self::MarkFetchFailed,
+            ReferencePriceError::QuoteFetch(_) => Self::QuoteFetchFailed,
+        }
+    }
+}
+
+impl From<&CounterTradeSkipReason> for CloseFlattenBlockReason {
+    fn from(reason: &CounterTradeSkipReason) -> Self {
+        match reason {
+            CounterTradeSkipReason::InsufficientEquity { .. } => Self::InsufficientEquity,
+            CounterTradeSkipReason::InsufficientBuyingPower { .. } => Self::InsufficientBuyingPower,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ReferencePriceRetryability {
+    PermanentOrUnknown,
+    Transient,
+    Backpressure,
+}
+
+fn reference_price_retryability(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> ReferencePriceRetryability {
+    if find_backpressure(error).is_some() {
+        ReferencePriceRetryability::Backpressure
+    } else if find_permanence(error) == Some(Permanence::Transient) {
+        ReferencePriceRetryability::Transient
+    } else {
+        ReferencePriceRetryability::PermanentOrUnknown
+    }
+}
+
+fn prefer_reference_price_failure(
+    current: ReferencePriceError,
+    candidate: ReferencePriceError,
+) -> ReferencePriceError {
+    let retryability = |error: &ReferencePriceError| match error {
+        ReferencePriceError::MarkFetch(source) | ReferencePriceError::QuoteFetch(source) => {
+            reference_price_retryability(source.as_ref())
+        }
+        ReferencePriceError::Unavailable => ReferencePriceRetryability::PermanentOrUnknown,
+    };
+
+    if retryability(&candidate) > retryability(&current) {
+        candidate
+    } else {
+        current
+    }
+}
+
+/// Resolves the price an extended-hours limit order is crossed from.
+///
+/// An optional current bid/ask quote comes first. The mark is the required
+/// fallback, followed by a `delayed_sip` emergency quote. No primary provider is
+/// currently wired, so today's effective order remains mark then delayed SIP
+/// (ADR 0019).
+///
+/// A source error falls through as readily as a missing value does. The
+/// position and market-data endpoints are separate services, so one being down
+/// says nothing about the others, and flattening before a multi-day gap is
+/// mandatory: a worse price always beats no fill. When every leg fails, the
+/// error with the best retry path propagates: rate limiting before other
+/// transient failures, then permanent or unclassified failures.
+pub(crate) async fn resolve_extended_hours_reference_price(
+    order_placer: &dyn OrderPlacer,
+    symbol: &Symbol,
+    direction: Direction,
+) -> Result<ReferencePrice, ReferencePriceError> {
+    let mut failure = match order_placer.fetch_primary_limit_quote(symbol).await {
+        Ok(Some(quote)) => {
+            return Ok(ReferencePrice {
+                price: match direction {
+                    Direction::Buy => quote.ask(),
+                    Direction::Sell => quote.bid(),
+                },
+                source: ReferencePriceSource::PrimaryQuote,
+            });
+        }
+        Ok(None) => None,
+        Err(source) => {
+            warn!(
+                target: "hedge",
+                %symbol,
+                %source,
+                "Primary limit-quote lookup failed; falling back to the broker mark"
+            );
+            Some(ReferencePriceError::QuoteFetch(source))
+        }
+    };
+
+    match order_placer.fetch_position_mark(symbol).await {
+        Ok(Some(price)) => {
+            return Ok(ReferencePrice {
+                price,
+                source: ReferencePriceSource::Mark,
+            });
+        }
+        Ok(None) => {
+            debug!(
+                target: "hedge",
+                %symbol,
+                "No broker mark for symbol; falling back to the emergency delayed quote"
+            );
+        }
+        Err(source) => {
+            warn!(
+                target: "hedge",
+                %symbol,
+                %source,
+                "Broker mark lookup failed; falling back to the emergency delayed quote"
+            );
+            let mark_failure = ReferencePriceError::MarkFetch(source);
+            failure = Some(match failure {
+                Some(primary_failure) => {
+                    prefer_reference_price_failure(primary_failure, mark_failure)
+                }
+                None => mark_failure,
+            });
+        }
+    }
+
+    let quote = match order_placer.fetch_latest_quote(symbol).await {
+        Ok(Some(quote)) => quote,
+        Ok(None) => {
+            return Err(failure.unwrap_or(ReferencePriceError::Unavailable));
+        }
+        Err(source) => {
+            let quote_failure = ReferencePriceError::QuoteFetch(source);
+            return Err(match failure {
+                Some(previous_failure) => {
+                    warn!(
+                        target: "hedge",
+                        %symbol,
+                        error = ?quote_failure,
+                        "Delayed-quote fallback also failed; surfacing the failure with the \
+                         best retry path"
+                    );
+                    prefer_reference_price_failure(previous_failure, quote_failure)
+                }
+                None => quote_failure,
+            });
+        }
+    };
+
+    Ok(ReferencePrice {
+        price: match direction {
+            Direction::Buy => quote.ask(),
+            Direction::Sell => quote.bid(),
+        },
+        source: ReferencePriceSource::DelayedSipQuote,
+    })
 }
 
 fn direction_label(direction: Direction) -> &'static str {
@@ -391,6 +755,13 @@ fn direction_label(direction: Direction) -> &'static str {
         Direction::Buy => "buy",
         Direction::Sell => "sell",
     }
+}
+
+/// Buckets the ramped cross to the nearest 100 bps below it, so the metric's
+/// label cardinality stays at the handful of whole-percent steps between the
+/// base and the ceiling rather than one series per distinct basis point.
+fn cross_bucket_label(cross_bps: u16) -> String {
+    (cross_bps / 100 * 100).to_string()
 }
 
 fn post_close_gap_label(post_close_gap: PostCloseGap) -> &'static str {
@@ -401,13 +772,32 @@ fn post_close_gap_label(post_close_gap: PostCloseGap) -> &'static str {
     }
 }
 
-fn record_close_flatten_block(symbol: &Symbol, reason: &'static str) {
+fn record_close_flatten_block(symbol: &Symbol, reason: CloseFlattenBlockReason) {
     counter!(
         "close_flatten_blocked_total",
         "symbol" => symbol.to_string(),
-        "reason" => reason
+        "reason" => reason.metric_label()
     )
     .increment(1);
+}
+
+/// What [`recover_pending_poll_status`] found for the claim an earlier attempt
+/// may have left behind. The dead-letter path branches on this: only
+/// [`ClaimOutcome::NothingClaimed`] is a hedge this process gave up on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimOutcome {
+    /// An earlier attempt's order is live at the broker -- it was already
+    /// there, or this recovery re-drove it there -- and its poll job is
+    /// armed, so the hedge is still in flight.
+    Recovered,
+    /// The order already filled. The hedge happened, so it is the opposite of
+    /// an abandonment even though nothing is outstanding at the broker.
+    Completed,
+    /// Nothing is outstanding at the broker: no pending order, one that is
+    /// already terminal, or a re-drive the broker rejected (which rolled the
+    /// position back). Abandoning here abandons a hedge that was never
+    /// placed.
+    NothingClaimed,
 }
 
 /// Recovery path for the `PendingExecution` rejection. A previous attempt for
@@ -432,7 +822,7 @@ fn record_close_flatten_block(symbol: &Symbol, reason: &'static str) {
 async fn recover_pending_poll_status(
     ctx: &HedgeCtx,
     pending_id: OffchainOrderId,
-) -> Result<(), TradeAccountingError> {
+) -> Result<ClaimOutcome, TradeAccountingError> {
     use OffchainOrder::{
         Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
     };
@@ -440,7 +830,7 @@ async fn recover_pending_poll_status(
         Some(Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. }) => {
             push_poll_job_if_absent(ctx.poll_status_queue.clone(), pending_id, ctx.poll_interval)
                 .await?;
-            Ok(())
+            Ok(ClaimOutcome::Recovered)
         }
         Some(Pending {
             symbol,
@@ -450,16 +840,25 @@ async fn recover_pending_poll_status(
             market_session,
             ..
         }) => {
+            // Must re-wrap: a symbol-scoped variant escaping here would
+            // dead-letter an already-claimed position.
             let Some(order_kind) = select_order_kind_for_current_session(
                 ctx,
                 &symbol,
                 shares,
                 direction,
                 market_session,
+                SubmittedPricePreflight::SkipForIdempotentRecovery,
             )
-            .await?
+            .await
+            .map_err(|source| TradeAccountingError::ClaimedHedgeOrderKind {
+                symbol: symbol.clone(),
+                source: ClaimedHedgeOrderKindCause::classify(source),
+            })?
             else {
-                return Ok(());
+                // The venue closed under the claim, so nothing can be placed
+                // until it reopens.
+                return Ok(ClaimOutcome::NothingClaimed);
             };
 
             let anchor = ctx
@@ -484,7 +883,21 @@ async fn recover_pending_poll_status(
             )
             .await?;
 
-            route_placement_outcome(ctx, &symbol, pending_id, placed).await
+            // Read before the outcome is routed (which consumes it): a
+            // re-drive the broker rejected lands `Failed` and is rolled back,
+            // so it leaves nothing in flight and must not read as recovered.
+            let outcome = match &placed {
+                Some(Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. }) => {
+                    ClaimOutcome::Recovered
+                }
+                Some(Failed { .. } | Cancelled { .. } | Pending { .. } | Filled { .. }) | None => {
+                    ClaimOutcome::NothingClaimed
+                }
+            };
+
+            route_placement_outcome(ctx, &symbol, pending_id, placed).await?;
+
+            Ok(outcome)
         }
         // The position still references a pending order that is already
         // terminal (Cancelled/Failed) -- a stale apalis retry re-claimed the
@@ -502,9 +915,10 @@ async fn recover_pending_poll_status(
                  terminal; the CheckPositions finalize sweep will release the \
                  position on its next tick"
             );
-            Ok(())
+            Ok(ClaimOutcome::NothingClaimed)
         }
-        Some(Filled { .. }) | None => Ok(()),
+        Some(Filled { .. }) => Ok(ClaimOutcome::Completed),
+        None => Ok(ClaimOutcome::NothingClaimed),
     }
 }
 
@@ -561,6 +975,16 @@ async fn route_placement_outcome(
                 ctx.poll_interval,
             )
             .await?;
+
+            // This symbol is placing again, so whatever paged for it has
+            // resolved: release its alert slots. Without this the dedup set
+            // latches for the process lifetime, and a failure that recurs the
+            // following session -- the shape an entitlement or feed regression
+            // takes -- would accumulate a standing delta with no page at all.
+            ctx.alerted_dead_letters
+                .lock()
+                .await
+                .retain(|(alerted, _)| alerted != symbol);
         }
 
         // No order exists after a successful `Place` -- there is nothing to
@@ -665,14 +1089,18 @@ impl PlaceHedge {
             self.shares,
             self.direction,
             self.market_session,
+            SubmittedPricePreflight::Required,
         )
         .await?
         else {
             // Not a plain Ok(()): a retry whose first attempt submitted the
             // order but lost the poll enqueue must re-enqueue it here, or
             // the live order sits un-polled (and its fill unrecorded) until
-            // the next restart.
-            return recover_pending_poll_status(ctx, self.offchain_order_id).await;
+            // the next restart. A stale job may have a different ID from the
+            // order that actually owns the position, so recover the live claim
+            // under the same submission lock as every broker placement.
+            self.recover_actual_pending_order(ctx).await?;
+            return Ok(());
         };
 
         // Serialize every broker placement (ADR 0014): the trade-processing path
@@ -718,7 +1146,8 @@ impl PlaceHedge {
                     symbol = %self.symbol, %pending_id,
                     "Position already has a pending execution; recovering poll-status enqueue if needed"
                 );
-                return recover_pending_poll_status(ctx, pending_id).await;
+                recover_pending_poll_status(ctx, pending_id).await?;
+                return Ok(());
             }
 
             Err(AggregateError::UserError(LifecycleError::Apply(
@@ -772,8 +1201,7 @@ impl PlaceHedge {
 
     /// Handles a `perform_body` failure: reschedules with a classified delay
     /// on broker rate-limiting (429) instead of consuming the terminal retry
-    /// budget, or propagates any other error through the normal, unmodified
-    /// retry/circuit-breaker path.
+    /// budget, and hands anything else to [`Self::dead_letter_or_propagate`].
     ///
     /// `PositionCommand::PlaceOffChainOrder` claims the position before the
     /// broker call. A rescheduled successor therefore enters
@@ -787,9 +1215,17 @@ impl PlaceHedge {
         error: TradeAccountingError,
     ) -> Result<(), TradeAccountingError> {
         let Some(backpressure) = find_backpressure(&error) else {
-            return Err(error);
+            return self.dead_letter_or_propagate(ctx, error).await;
         };
 
+        self.handle_backpressure(ctx, backpressure).await
+    }
+
+    async fn handle_backpressure(
+        &self,
+        ctx: &HedgeCtx,
+        backpressure: Backpressure,
+    ) -> Result<(), TradeAccountingError> {
         let step = advance_backpressure(&backpressure, self.backpressure_streak);
         let mut queue = ctx.hedge_queue.clone();
         let outcome = apply_backpressure_step(step, &mut queue, |next_streak| Self {
@@ -801,6 +1237,7 @@ impl PlaceHedge {
             offchain_order_id: self.offchain_order_id,
             market_session: self.market_session,
             backpressure_streak: next_streak,
+            transient_streak: self.transient_streak,
         })
         .await?;
 
@@ -810,6 +1247,15 @@ impl PlaceHedge {
                 // to every supervised job): dead-letter instead of propagating
                 // `Err` into the shared supervised on-event path.
                 let BackpressureStreak(streak) = self.backpressure_streak;
+                // Same counter as `dead_letter_or_propagate`'s exit, so
+                // `hedge_dead_lettered_total` means "hedges this process gave
+                // up on" for every abandonment path, distinguished by `reason`.
+                counter!(
+                    "hedge_dead_lettered_total",
+                    "symbol" => self.symbol.to_string(),
+                    "reason" => DeadLetterReason::BackpressureExhausted.metric_label()
+                )
+                .increment(1);
                 error!(
                     target: "hedge",
                     symbol = %self.symbol,
@@ -821,6 +1267,19 @@ impl PlaceHedge {
                      -- treat as a structurally-dead Alpaca integration needing manual \
                      reconciliation"
                 );
+                alert_dead_letter(
+                    ctx.notifier.as_ref(),
+                    &ctx.alerted_dead_letters,
+                    &self.symbol,
+                    DeadLetterReason::BackpressureExhausted,
+                    &format!(
+                        "Hedge for {} abandoned: broker rate-limiting exceeded the \
+                         {BACKPRESSURE_RESCHEDULE_LIMIT}-reschedule budget. The symbol carries \
+                         a standing delta until the Alpaca integration is reconciled.",
+                        self.symbol
+                    ),
+                )
+                .await;
             }
             BackpressureOutcome::Rescheduled {
                 next_streak: BackpressureStreak(streak),
@@ -840,16 +1299,271 @@ impl PlaceHedge {
 
         Ok(())
     }
+
+    /// Decides what to do with a `perform_body` failure that is not broker
+    /// rate-limiting: abandon this hedge, re-drive it, or propagate it into the
+    /// normal retry/circuit-breaker path.
+    ///
+    /// Ordinary process-scoped failures still propagate. A pricing failure
+    /// wrapped by `ClaimedHedgeOrderKind` is the narrow exception: it uses the
+    /// same bounded budgets as its inner symbol-scoped cause, then leaves the
+    /// existing claim for the periodic recovery sweep instead of fail-stopping.
+    ///
+    /// The underlying cause then decides how quickly the symbol is given up on,
+    /// which the variant alone does not say: `MarkFetch`, `LimitQuoteFetch` and
+    /// `CloseFlattenPreflightAtPrice` each box an opaque source that carries an
+    /// entitlement 403 and a TCP reset alike. A permanent cause is abandoned at
+    /// once, since re-asking cannot change the answer; a transient one is
+    /// re-driven on this job's own bounded budget first, because abandoning it
+    /// immediately would trade a one-second retry for a full `CheckPositions`
+    /// interval of unhedged exposure. Either way the symbol is abandoned rather
+    /// than the worker failed: a sustained per-symbol market-data outage must
+    /// not stop hedging for every other symbol (RAI-1690).
+    async fn dead_letter_or_propagate(
+        &self,
+        ctx: &HedgeCtx,
+        error: TradeAccountingError,
+    ) -> Result<(), TradeAccountingError> {
+        if matches!(&error, TradeAccountingError::ClaimedHedgeOrderKind { .. }) {
+            return self.handle_claimed_order_kind_failure(ctx, error).await;
+        }
+
+        let reason = match error.scope() {
+            ErrorScope::ProcessScoped => return Err(error),
+            ErrorScope::SymbolScoped { reason } => reason,
+        };
+
+        match find_permanence(&error) {
+            Some(Permanence::Transient) => {
+                let TransientFailureStreak(streak) = self.transient_streak;
+
+                if streak < TRANSIENT_RESCHEDULE_LIMIT {
+                    return self.redrive_transient_failure(ctx, streak, &error).await;
+                }
+
+                self.abandon_or_recover(ctx, reason, &error).await
+            }
+
+            // `None` means no broker failure anywhere in the chain: the
+            // outcome was decided locally (no quote to price against, a
+            // slippage floor), and re-asking cannot change it.
+            Some(Permanence::Permanent) | None => {
+                self.abandon_or_recover(ctx, reason, &error).await
+            }
+        }
+    }
+
+    async fn handle_claimed_order_kind_failure(
+        &self,
+        ctx: &HedgeCtx,
+        error: TradeAccountingError,
+    ) -> Result<(), TradeAccountingError> {
+        let TradeAccountingError::ClaimedHedgeOrderKind { symbol, source } = error else {
+            return Err(error);
+        };
+        let (reason, source) = match source {
+            ClaimedHedgeOrderKindCause::SymbolScoped { reason, source } => (reason, source),
+            source @ ClaimedHedgeOrderKindCause::ProcessScoped { .. } => {
+                return Err(TradeAccountingError::ClaimedHedgeOrderKind { symbol, source });
+            }
+        };
+
+        if let Some(backpressure) = find_backpressure(source.as_ref()) {
+            return self.handle_backpressure(ctx, backpressure).await;
+        }
+
+        if find_permanence(source.as_ref()) == Some(Permanence::Transient) {
+            let TransientFailureStreak(streak) = self.transient_streak;
+
+            if streak < TRANSIENT_RESCHEDULE_LIMIT {
+                return self
+                    .redrive_transient_failure(ctx, streak, source.as_ref())
+                    .await;
+            }
+        }
+
+        self.record_abandoned_hedge(ctx, reason, source.as_ref())
+            .await;
+
+        Ok(())
+    }
+
+    /// Re-drives a transient symbol-scoped failure on this job's own durable
+    /// budget: pushes a successor carrying the incremented streak and returns
+    /// `Ok(())`, so the failure never reaches the supervised worker's retry
+    /// budget, whose exhaustion stops the process.
+    async fn redrive_transient_failure(
+        &self,
+        ctx: &HedgeCtx,
+        streak: u32,
+        error: &TradeAccountingError,
+    ) -> Result<(), TradeAccountingError> {
+        let next_streak = streak.saturating_add(1);
+        let delay = TRANSIENT_RESCHEDULE_BASE.saturating_mul(2u32.saturating_pow(streak));
+
+        ctx.hedge_queue
+            .clone()
+            .push_with_delay(
+                Self {
+                    transient_streak: TransientFailureStreak(next_streak),
+                    ..self.clone()
+                },
+                delay,
+            )
+            .await?;
+
+        warn!(
+            target: "hedge",
+            symbol = %self.symbol,
+            offchain_order_id = %self.offchain_order_id,
+            streak = next_streak,
+            limit = TRANSIENT_RESCHEDULE_LIMIT,
+            ?error,
+            "PlaceHedge: transient symbol-scoped failure; re-driving this hedge instead of \
+             spending the worker's retry budget, whose exhaustion would stop every symbol"
+        );
+
+        Ok(())
+    }
+
+    /// Recovers the order that currently owns this symbol's position claim.
+    ///
+    /// Recovery can re-drive a `Pending` order through the broker, so it must
+    /// hold ADR 0014's submission lock. The job's own ID is only the fallback
+    /// for a prior attempt whose position claim was already cleared.
+    async fn recover_actual_pending_order(
+        &self,
+        ctx: &HedgeCtx,
+    ) -> Result<ClaimOutcome, TradeAccountingError> {
+        let _submission_guard = ctx.counter_trade_submission_lock.lock().await;
+        let pending_id = ctx
+            .position
+            .load(&self.symbol)
+            .await?
+            .and_then(|position| position.pending_offchain_order_id)
+            .unwrap_or(self.offchain_order_id);
+
+        recover_pending_poll_status(ctx, pending_id).await
+    }
+
+    /// Resolves whatever an earlier attempt left claimed, then abandons this
+    /// hedge only if nothing is outstanding at the broker.
+    ///
+    /// An earlier attempt may have claimed the position, and a hedge that
+    /// recovery re-drove to the broker -- or one that already filled -- is not
+    /// one this process gave up on. A pricing failure during that recovery is
+    /// handled on its own bounded budget and deliberately leaves the claim for
+    /// the periodic recovery sweep.
+    async fn abandon_or_recover(
+        &self,
+        ctx: &HedgeCtx,
+        reason: SymbolScopedReason,
+        error: &TradeAccountingError,
+    ) -> Result<(), TradeAccountingError> {
+        // ADR 0014: the recovery below can re-drive an earlier attempt's
+        // `Pending` order all the way through `place_offchain_order_at_broker`,
+        // so it must hold the same submission lock every other placement path
+        // takes -- `perform_body`'s guard was released before this handler ran.
+        // Taken here rather than inside `recover_pending_poll_status`, whose
+        // other call site already runs under the guard and would deadlock on a
+        // non-reentrant mutex.
+        let recovery = self.recover_actual_pending_order(ctx).await;
+        let outcome = match recovery {
+            Ok(outcome) => outcome,
+            Err(error @ TradeAccountingError::ClaimedHedgeOrderKind { .. }) => {
+                return self.handle_claimed_order_kind_failure(ctx, error).await;
+            }
+            Err(error) => return Err(error),
+        };
+
+        match outcome {
+            ClaimOutcome::Recovered => {
+                info!(
+                    target: "hedge",
+                    symbol = %self.symbol,
+                    offchain_order_id = %self.offchain_order_id,
+                    ?error,
+                    "PlaceHedge: symbol-scoped failure, but an earlier attempt's order is live \
+                     at the broker; the hedge is still in flight, so it is not counted or \
+                     paged as abandoned"
+                );
+
+                Ok(())
+            }
+
+            ClaimOutcome::Completed => {
+                info!(
+                    target: "hedge",
+                    symbol = %self.symbol,
+                    offchain_order_id = %self.offchain_order_id,
+                    ?error,
+                    "PlaceHedge: symbol-scoped failure against an order that already filled; \
+                     the hedge happened, so it is not counted or paged as abandoned"
+                );
+
+                Ok(())
+            }
+
+            ClaimOutcome::NothingClaimed => {
+                self.record_abandoned_hedge(ctx, reason, error).await;
+
+                Ok(())
+            }
+        }
+    }
+
+    /// Counts and pages a hedge this process gave up on, after
+    /// [`Self::abandon_or_recover`] has established that nothing is
+    /// outstanding at the broker.
+    async fn record_abandoned_hedge(
+        &self,
+        ctx: &HedgeCtx,
+        reason: SymbolScopedReason,
+        error: &TradeAccountingError,
+    ) {
+        let reason = DeadLetterReason::SymbolScoped(reason);
+        counter!(
+            "hedge_dead_lettered_total",
+            "symbol" => self.symbol.to_string(),
+            "reason" => reason.metric_label()
+        )
+        .increment(1);
+        error!(
+            target: "hedge",
+            symbol = %self.symbol,
+            offchain_order_id = %self.offchain_order_id,
+            reason = reason.metric_label(),
+            ?error,
+            "PlaceHedge: symbol-scoped failure the symbol cannot get past; dead-lettering \
+             this hedge instead of exiting the process -- CheckPositions will re-enqueue on \
+             its next scan"
+        );
+        alert_dead_letter(
+            ctx.notifier.as_ref(),
+            &ctx.alerted_dead_letters,
+            &self.symbol,
+            reason,
+            &format!(
+                "Hedge for {} abandoned: {} failure did not clear. CheckPositions keeps \
+                 re-enqueueing it, so the symbol carries a standing delta until the \
+                 market-data failure is fixed.",
+                self.symbol,
+                reason.metric_label()
+            ),
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::any::type_name;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
 
     use alloy::primitives::{Address, TxHash};
     use proptest::prelude::*;
+    use tokio::sync::Notify;
     use uuid::Uuid;
 
     use st0x_config::{EquitiesConfig, EquityAssetConfig, ExecutionThreshold, OperationMode};
@@ -1035,11 +1749,79 @@ mod tests {
         Arc::new(RejectingPlacer)
     }
 
+    /// Captures every delivered message, and can be switched to fail delivery
+    /// so a test can exercise the notifier error path this module swallows.
+    /// Local rather than shared, matching the per-module failing doubles in
+    /// `rebalancing::usdc::job` and `conductor`.
+    #[derive(Default)]
+    struct FlakyNotifier {
+        delivered: StdMutex<Vec<String>>,
+        failing: AtomicBool,
+    }
+
+    impl FlakyNotifier {
+        fn messages(&self) -> Vec<String> {
+            self.delivered.lock().unwrap().clone()
+        }
+
+        fn fail_delivery(&self, failing: bool) {
+            self.failing.store(failing, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::alerts::Notifier for FlakyNotifier {
+        async fn notify(&self, message: &str) -> Result<(), crate::alerts::NotifierError> {
+            if self.failing.load(Ordering::SeqCst) {
+                return Err(crate::alerts::NotifierError::ApiError {
+                    status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                    body: "injected delivery failure".to_string(),
+                });
+            }
+
+            self.delivered.lock().unwrap().push(message.to_string());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct PausingNotifier {
+        calls: AtomicUsize,
+        started: Notify,
+        release: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::alerts::Notifier for PausingNotifier {
+        async fn notify(&self, _message: &str) -> Result<(), crate::alerts::NotifierError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct HangingNotifier {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::alerts::Notifier for HangingNotifier {
+        async fn notify(&self, _message: &str) -> Result<(), crate::alerts::NotifierError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+
     struct TestInfra {
         ctx: HedgeCtx,
         apalis_pool: apalis_sqlite::SqlitePool,
         position_projection: Arc<st0x_event_sorcery::Projection<Position>>,
         offchain_order_projection: Arc<st0x_event_sorcery::Projection<OffchainOrder>>,
+        /// The same instance `ctx.notifier` points at, so a test can read
+        /// back the operator pages a dead-letter delivered.
+        notifier: Arc<FlakyNotifier>,
     }
 
     async fn create_hedge_ctx(order_placer: Arc<dyn OrderPlacer>) -> TestInfra {
@@ -1056,6 +1838,8 @@ mod tests {
                 .await
                 .unwrap();
 
+        let notifier = Arc::new(FlakyNotifier::default());
+
         let ctx = HedgeCtx {
             position: position.clone(),
             offchain_order,
@@ -1067,10 +1851,12 @@ mod tests {
             // Regular path's session gate is not what skips them.
             order_placer,
             assets: extended_hours_assets("AAPL", true),
-            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
             close_flatten_policy: CloseFlattenPolicy::from_secs(900).unwrap(),
+            close_flatten_ramp: CloseFlattenCrossRamp::new(100, 400).unwrap(),
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
             poll_interval: TEST_POLL_INTERVAL,
+            notifier: notifier.clone(),
+            alerted_dead_letters: Arc::new(Mutex::new(HashSet::new())),
         };
 
         TestInfra {
@@ -1078,6 +1864,7 @@ mod tests {
             apalis_pool,
             position_projection,
             offchain_order_projection,
+            notifier,
         }
     }
 
@@ -1118,6 +1905,7 @@ mod tests {
             offchain_order_id: OffchainOrderId::new(),
             market_session: MarketSession::Regular,
             backpressure_streak: BackpressureStreak::default(),
+            transient_streak: TransientFailureStreak::default(),
         }
     }
 
@@ -1160,6 +1948,12 @@ mod tests {
         let job: PlaceHedge = serde_json::from_value(payload).unwrap();
 
         assert_eq!(job.backpressure_streak, BackpressureStreak::default());
+        assert_eq!(
+            job.transient_streak,
+            TransientFailureStreak::default(),
+            "a row enqueued before the transient budget existed must decode as an unspent \
+             budget rather than fail the poll stream"
+        );
     }
 
     fn place_hedge_job_type() -> &'static str {
@@ -1212,8 +2006,12 @@ mod tests {
 
     #[tokio::test]
     async fn place_hedge_429_past_reschedule_limit_dead_letters_without_propagating_err() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
         let TestInfra {
-            ctx, apalis_pool, ..
+            ctx,
+            apalis_pool,
+            notifier,
+            ..
         } = create_hedge_ctx(succeeding_order_placer()).await;
         let symbol = Symbol::new("AAPL").unwrap();
         let mut job = hedge_job(&symbol, 2.0, Direction::Sell);
@@ -1232,6 +2030,301 @@ mod tests {
         assert_eq!(
             job_count, 0,
             "an exhausted backpressure streak must dead-letter, not reschedule"
+        );
+
+        let rendered = metrics_handle.render();
+        assert_eq!(
+            dead_letter_count(&rendered, &symbol, DeadLetterReason::BackpressureExhausted),
+            1,
+            "an exhausted streak must be counted on the shared dead-letter counter, \
+             in:\n{rendered}"
+        );
+
+        assert_eq!(
+            notifier.messages(),
+            vec![format!(
+                "Hedge for AAPL abandoned: broker rate-limiting exceeded the \
+                 {BACKPRESSURE_RESCHEDULE_LIMIT}-reschedule budget. The symbol carries a \
+                 standing delta until the Alpaca integration is reconciled."
+            )]
+        );
+    }
+
+    /// A close-flatten session status whose extended session closes exactly
+    /// one policy window from now, so `now` sits at the ramp's start and the
+    /// cross is the base band. Any nearer close would put a price assertion on
+    /// a moving ramp, so every close-flatten placer shares this one status
+    /// rather than repeating the literal.
+    fn ramp_start_session_status() -> st0x_execution::MarketSessionStatus {
+        st0x_execution::MarketSessionStatus {
+            session: MarketSession::Extended,
+            extended_session_closes_at: Some(chrono::Utc::now() + chrono::TimeDelta::seconds(900)),
+            post_close_gap: st0x_execution::PostCloseGap::MultiDayClosure,
+        }
+    }
+
+    fn dead_letter_page(symbol: &str, reason: &str) -> String {
+        format!(
+            "Hedge for {symbol} abandoned: {reason} failure did not clear. CheckPositions \
+             keeps re-enqueueing it, so the symbol carries a standing delta until the \
+             market-data failure is fixed."
+        )
+    }
+
+    #[tokio::test]
+    async fn dead_letter_pages_the_operator_once_per_symbol_and_reason() {
+        let TestInfra { ctx, notifier, .. } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        for _ in 0..2 {
+            job.handle_place_hedge_error(
+                &ctx,
+                quote_fetch_failure(&symbol, reqwest::StatusCode::FORBIDDEN),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("expected a 403 quote fetch to dead-letter: {error:?}"));
+        }
+
+        assert_eq!(
+            notifier.messages(),
+            vec![dead_letter_page("AAPL", "limit_quote_fetch")]
+        );
+
+        job.handle_place_hedge_error(
+            &ctx,
+            TradeAccountingError::LimitQuoteUnavailable {
+                symbol: symbol.clone(),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("expected an unavailable price to dead-letter: {error:?}"));
+
+        // One shared 403 abandons every symbol it touches, so the symbol half
+        // of the dedup key is what keeps the other symbols visible.
+        let other_symbol = Symbol::new("TSLA").unwrap();
+        let other_job = hedge_job(&other_symbol, 2.0, Direction::Sell);
+        other_job
+            .handle_place_hedge_error(
+                &ctx,
+                quote_fetch_failure(&other_symbol, reqwest::StatusCode::FORBIDDEN),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("expected a second symbol's 403 quote fetch to dead-letter: {error:?}")
+            });
+
+        assert_eq!(
+            notifier.messages(),
+            vec![
+                dead_letter_page("AAPL", "limit_quote_fetch"),
+                dead_letter_page("AAPL", "limit_quote_unavailable"),
+                dead_letter_page("TSLA", "limit_quote_fetch"),
+            ],
+            "a second reason for the same symbol, and the same reason for a second symbol, are \
+             each a separate thing to fix and must page"
+        );
+    }
+
+    /// Delivery failure must not consume the pair's one alert slot: the
+    /// abandonment is still recorded, and the page is re-attempted on the next
+    /// `CheckPositions` scan. Latching on a failed send would leave the
+    /// operator with no push signal at all for that symbol.
+    #[tokio::test]
+    async fn dead_letter_page_that_fails_to_deliver_is_retried_on_the_next_scan() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let TestInfra { ctx, notifier, .. } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+        let reason = DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteFetch);
+
+        notifier.fail_delivery(true);
+        job.handle_place_hedge_error(
+            &ctx,
+            quote_fetch_failure(&symbol, reqwest::StatusCode::FORBIDDEN),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("a failed page must not abort the dead-letter: {error:?}"));
+
+        assert_eq!(
+            notifier.messages(),
+            Vec::<String>::new(),
+            "the injected failure must have dropped the page"
+        );
+        let rendered = metrics_handle.render();
+        assert_eq!(
+            dead_letter_count(&rendered, &symbol, reason),
+            1,
+            "the abandonment is counted whether or not its page was delivered, in:\n{rendered}"
+        );
+
+        notifier.fail_delivery(false);
+        job.handle_place_hedge_error(
+            &ctx,
+            quote_fetch_failure(&symbol, reqwest::StatusCode::FORBIDDEN),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("expected a 403 quote fetch to dead-letter: {error:?}"));
+
+        assert_eq!(
+            notifier.messages(),
+            vec![dead_letter_page("AAPL", "limit_quote_fetch")]
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_dead_letter_pages_reserve_one_delivery_slot() {
+        let notifier = PausingNotifier::default();
+        let alerted = Mutex::new(HashSet::new());
+        let symbol = Symbol::new("AAPL").unwrap();
+        let reason = DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteFetch);
+
+        tokio::join!(
+            alert_dead_letter(&notifier, &alerted, &symbol, reason, "first"),
+            async {
+                notifier.started.notified().await;
+                alert_dead_letter(&notifier, &alerted, &symbol, reason, "second").await;
+                notifier.release.notify_one();
+            }
+        );
+
+        assert_eq!(
+            notifier.calls.load(Ordering::SeqCst),
+            1,
+            "the scan and hedge workers must not deliver the same page concurrently"
+        );
+        assert!(
+            alerted.lock().await.contains(&(symbol, reason)),
+            "a successful delivery must keep the reserved slot latched"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_page_cannot_relatch_a_symbol_after_it_recovers() {
+        let notifier = PausingNotifier::default();
+        let alerted = Mutex::new(HashSet::new());
+        let symbol = Symbol::new("AAPL").unwrap();
+        let reason = DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteFetch);
+        let key = (symbol.clone(), reason);
+
+        tokio::join!(
+            alert_dead_letter(&notifier, &alerted, &symbol, reason, "page"),
+            async {
+                notifier.started.notified().await;
+                assert!(
+                    alerted.lock().await.remove(&key),
+                    "the in-flight delivery must have reserved its slot before notifying"
+                );
+                notifier.release.notify_one();
+            }
+        );
+
+        assert!(
+            alerted.lock().await.is_empty(),
+            "a delivery that completes after recovery must not reinsert a stale slot"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_dead_letter_notifier_is_bounded_and_retried() {
+        let notifier = HangingNotifier::default();
+        let alerted = Mutex::new(HashSet::new());
+        let symbol = Symbol::new("AAPL").unwrap();
+        let reason = DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteFetch);
+
+        for _ in 0..2 {
+            alert_dead_letter(&notifier, &alerted, &symbol, reason, "page").await;
+        }
+
+        assert_eq!(
+            notifier.calls.load(Ordering::SeqCst),
+            2,
+            "timing out must release the slot so the next scan can retry"
+        );
+        assert!(
+            alerted.lock().await.is_empty(),
+            "a delivery that never completed must not suppress the next page"
+        );
+    }
+
+    /// The dedup set must not latch for the life of the process: a failure
+    /// that recurs a session later -- the shape an entitlement or feed
+    /// regression takes -- would otherwise accumulate a standing delta with no
+    /// push signal at all, since the bot runs for weeks between deploys. A
+    /// hedge reaching the broker is what says the condition resolved.
+    #[tokio::test]
+    async fn a_symbol_that_hedges_again_pages_on_its_next_abandonment() {
+        let TestInfra { ctx, notifier, .. } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let abandoned = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        abandoned
+            .handle_place_hedge_error(
+                &ctx,
+                quote_fetch_failure(&symbol, reqwest::StatusCode::FORBIDDEN),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("expected a 403 quote fetch to dead-letter: {error:?}"));
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+        let recovered = hedge_job(&symbol, 2.0, Direction::Sell);
+        recovered
+            .perform(&ctx)
+            .await
+            .expect("the recovered symbol must place");
+        let alerts_after_recovery = ctx.alerted_dead_letters.lock().await.clone();
+        assert!(
+            alerts_after_recovery.is_empty(),
+            "a successful placement must release every alert for the symbol, still latched: \
+             {alerts_after_recovery:?}"
+        );
+        ctx.offchain_order
+            .send(
+                &recovered.offchain_order_id,
+                OffchainOrderCommand::CompleteFill {
+                    price: Usd::new(float!(150.0)),
+                    filled_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::CompleteOffChainOrder {
+                    offchain_order_id: recovered.offchain_order_id,
+                    shares_filled: recovered.shares,
+                    direction: recovered.direction,
+                    executor_order_id: ExecutorOrderId::new("test-order-123"),
+                    price: Usd::new(float!(150.0)),
+                    broker_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        abandoned
+            .handle_place_hedge_error(
+                &ctx,
+                quote_fetch_failure(&symbol, reqwest::StatusCode::FORBIDDEN),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("expected a 403 quote fetch to dead-letter: {error:?}"));
+
+        assert_eq!(
+            notifier.messages(),
+            vec![
+                dead_letter_page("AAPL", "limit_quote_fetch"),
+                dead_letter_page("AAPL", "limit_quote_fetch"),
+            ],
+            "a failure that returns after the symbol recovered is a new thing to fix and \
+             must page again"
         );
     }
 
@@ -1258,10 +2351,1100 @@ mod tests {
         assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
     }
 
+    #[tokio::test]
+    async fn place_hedge_market_session_check_error_propagates_unchanged() {
+        let TestInfra { ctx, .. } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+        let error = TradeAccountingError::MarketSessionCheck {
+            symbol: symbol.clone(),
+            source: "broker calendar endpoint down".into(),
+        };
+
+        let result = job.handle_place_hedge_error(&ctx, error).await;
+
+        assert!(
+            matches!(result, Err(TradeAccountingError::MarketSessionCheck { .. })),
+            "expected MarketSessionCheck to propagate, got: {result:?}"
+        );
+    }
+
+    /// Reads the `hedge_dead_lettered_total` sample for exactly this
+    /// `symbol`/`reason` pair. Matching the counter's own series, rather than
+    /// a substring of the whole render, is what makes an assertion fail when
+    /// the label is wrong instead of passing because some other metric
+    /// happens to carry the same symbol.
+    /// Reads the value of the single `metric` sample carrying every label in
+    /// `labels`. Matching the series, rather than a substring of the whole
+    /// render, is what makes an assertion fail when a label is wrong instead
+    /// of passing because some other metric carries the same symbol.
+    fn counter_value(rendered: &str, metric: &str, labels: &[(&str, &str)]) -> u64 {
+        let prefix = format!("{metric}{{");
+        let Some(sample) = rendered.lines().find(|line| {
+            line.starts_with(&prefix)
+                && labels
+                    .iter()
+                    .all(|(name, value)| line.contains(&format!("{name}=\"{value}\"")))
+        }) else {
+            return 0;
+        };
+
+        let (_, value) = sample
+            .rsplit_once(' ')
+            .unwrap_or_else(|| panic!("malformed Prometheus sample line: {sample}"));
+        value
+            .parse()
+            .unwrap_or_else(|error| panic!("unparseable counter value in {sample}: {error}"))
+    }
+
+    /// The bucket is a label dashboards group by, so it is a wire format:
+    /// pinned to literals rather than derived from the same expression the
+    /// implementation uses, which would make any change self-consistent.
+    #[test]
+    fn cross_bucket_labels_are_stable() {
+        assert_eq!(cross_bucket_label(100), "100");
+        assert_eq!(cross_bucket_label(175), "100");
+        assert_eq!(cross_bucket_label(199), "100");
+        assert_eq!(cross_bucket_label(200), "200");
+        assert_eq!(cross_bucket_label(400), "400");
+    }
+
+    /// The `source` label is likewise a wire format, and the only signal
+    /// telling an operator whether the delayed-quote fallback is a corner case
+    /// or load-bearing.
+    #[test]
+    fn reference_price_source_metric_labels_are_stable() {
+        assert_eq!(
+            ReferencePriceSource::PrimaryQuote.metric_label(),
+            "primary_quote"
+        );
+        assert_eq!(ReferencePriceSource::Mark.metric_label(), "mark");
+        assert_eq!(
+            ReferencePriceSource::DelayedSipQuote.metric_label(),
+            "delayed_sip_quote"
+        );
+    }
+
+    #[test]
+    fn close_flatten_block_reason_metric_labels_are_stable() {
+        assert_eq!(
+            CloseFlattenBlockReason::ReferencePriceUnavailable.metric_label(),
+            "reference_price_unavailable"
+        );
+        assert_eq!(
+            CloseFlattenBlockReason::MarkFetchFailed.metric_label(),
+            "mark_fetch_failed"
+        );
+        assert_eq!(
+            CloseFlattenBlockReason::QuoteFetchFailed.metric_label(),
+            "quote_fetch_failed"
+        );
+        assert_eq!(
+            CloseFlattenBlockReason::InsufficientEquity.metric_label(),
+            "insufficient_equity"
+        );
+        assert_eq!(
+            CloseFlattenBlockReason::InsufficientBuyingPower.metric_label(),
+            "insufficient_buying_power"
+        );
+    }
+
+    fn dead_letter_count(rendered: &str, symbol: &Symbol, reason: DeadLetterReason) -> u64 {
+        let label = reason.metric_label();
+        let Some(sample) = rendered.lines().find(|line| {
+            line.starts_with("hedge_dead_lettered_total{")
+                && line.contains(&format!("reason=\"{label}\""))
+                && line.contains(&format!("symbol=\"{symbol}\""))
+        }) else {
+            return 0;
+        };
+
+        let (_, value) = sample
+            .rsplit_once(' ')
+            .unwrap_or_else(|| panic!("malformed Prometheus sample line: {sample}"));
+        value
+            .parse()
+            .unwrap_or_else(|error| panic!("unparseable counter value in {sample}: {error}"))
+    }
+
+    /// Every `SymbolScopedReason`, and therefore every symbol-scoped
+    /// `TradeAccountingError` variant, listed once. The list is hand-written
+    /// because the enum carries no iteration, but [`sample_symbol_scoped_error`]
+    /// matches it exhaustively, so a new variant cannot be added without the
+    /// compiler pointing at this pair.
+    const EVERY_SYMBOL_SCOPED_REASON: [SymbolScopedReason; 5] = [
+        SymbolScopedReason::MarkFetch,
+        SymbolScopedReason::LimitQuoteFetch,
+        SymbolScopedReason::LimitQuoteUnavailable,
+        SymbolScopedReason::SlippageCalculation,
+        SymbolScopedReason::CloseFlattenPreflightAtPrice,
+    ];
+
+    /// Builds the error variant `scope()` classifies as `reason`, with a cause
+    /// carrying no broker classification so every one of them is abandoned
+    /// rather than re-driven.
+    fn sample_symbol_scoped_error(
+        reason: SymbolScopedReason,
+        symbol: &Symbol,
+    ) -> TradeAccountingError {
+        match reason {
+            SymbolScopedReason::MarkFetch => TradeAccountingError::MarkFetch {
+                symbol: symbol.clone(),
+                source: "positions endpoint unavailable".into(),
+            },
+            SymbolScopedReason::LimitQuoteFetch => TradeAccountingError::LimitQuoteFetch {
+                symbol: symbol.clone(),
+                source: "quote endpoint unavailable".into(),
+            },
+            SymbolScopedReason::LimitQuoteUnavailable => {
+                TradeAccountingError::LimitQuoteUnavailable {
+                    symbol: symbol.clone(),
+                }
+            }
+            SymbolScopedReason::SlippageCalculation => TradeAccountingError::SlippageCalculation(
+                apply_slippage(Usd::new(float!(0.50)), Direction::Sell, 9999).expect_err(
+                    "max slippage on a sub-dollar sell must floor to a non-positive price",
+                ),
+            ),
+            SymbolScopedReason::CloseFlattenPreflightAtPrice => {
+                TradeAccountingError::CloseFlattenPreflightAtPrice {
+                    symbol: symbol.clone(),
+                    source: "preflight endpoint unavailable".into(),
+                }
+            }
+        }
+    }
+
+    /// Every symbol-scoped `TradeAccountingError` variant must
+    /// dead-letter -- returning `Ok(())` instead of propagating -- and must
+    /// record its own `reason` label, so the skip is visible in both logs and
+    /// `hedge_dead_lettered_total` rather than silently stopping the process.
+    #[tokio::test]
+    async fn place_hedge_dead_letters_every_symbol_scoped_variant_with_its_metric_reason() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let TestInfra { ctx, .. } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        for expected_reason in EVERY_SYMBOL_SCOPED_REASON {
+            let error = sample_symbol_scoped_error(expected_reason, &symbol);
+            let reason = DeadLetterReason::SymbolScoped(expected_reason);
+            let label = reason.metric_label();
+            let result = job.handle_place_hedge_error(&ctx, error).await;
+            result.unwrap_or_else(|error| {
+                panic!("expected {label} to dead-letter, got Err: {error:?}")
+            });
+
+            let rendered = metrics_handle.render();
+            assert_eq!(
+                dead_letter_count(&rendered, &symbol, reason),
+                1,
+                "expected exactly one hedge_dead_lettered_total{{symbol=\"AAPL\",\
+                 reason=\"{label}\"}} in:\n{rendered}"
+            );
+        }
+    }
+
+    /// Wraps a market-data status the way the real Alpaca executor does:
+    /// `LimitQuoteFetch` boxes a `dyn Error`, which is the broker error,
+    /// which boxes the market-data error carrying the status.
+    fn quote_fetch_failure(symbol: &Symbol, status: reqwest::StatusCode) -> TradeAccountingError {
+        TradeAccountingError::LimitQuoteFetch {
+            symbol: symbol.clone(),
+            source: Box::new(st0x_execution::AlpacaBrokerApiError::LatestQuote(Box::new(
+                st0x_execution::AlpacaMarketDataError::ApiError {
+                    status,
+                    body: "quote lookup rejected".to_string(),
+                    retry_after: None,
+                },
+            ))),
+        }
+    }
+
+    fn claimed_quote_fetch_failure(
+        symbol: &Symbol,
+        status: reqwest::StatusCode,
+    ) -> TradeAccountingError {
+        TradeAccountingError::ClaimedHedgeOrderKind {
+            symbol: symbol.clone(),
+            source: ClaimedHedgeOrderKindCause::classify(quote_fetch_failure(symbol, status)),
+        }
+    }
+
+    #[tokio::test]
+    async fn place_hedge_dead_letters_a_symbol_scoped_403() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let TestInfra { ctx, .. } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        job.handle_place_hedge_error(
+            &ctx,
+            quote_fetch_failure(&symbol, reqwest::StatusCode::FORBIDDEN),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("expected a 403 quote fetch to dead-letter: {error:?}"));
+
+        let rendered = metrics_handle.render();
+        assert_eq!(
+            dead_letter_count(
+                &rendered,
+                &symbol,
+                DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteFetch)
+            ),
+            1,
+            "expected the 403 to be counted as a dead-letter, in:\n{rendered}"
+        );
+    }
+
+    /// Reads the `transient_streak` every enqueued `PlaceHedge` successor
+    /// carries, so a test can pin both that a re-drive happened and which
+    /// budget it spent.
+    async fn successor_transient_streaks(apalis_pool: &apalis_sqlite::SqlitePool) -> Vec<i64> {
+        sqlx_apalis::query_scalar(
+            "SELECT json_extract(CAST(job AS TEXT), '$.transient_streak') FROM Jobs \
+             WHERE job_type = ?",
+        )
+        .bind(place_hedge_job_type())
+        .fetch_all(apalis_pool)
+        .await
+        .unwrap()
+    }
+
+    /// Same variant, transient cause: a 5xx clears on its own, so abandoning
+    /// the attempt at once would trade a one-second retry for a full
+    /// CheckPositions interval of unhedged exposure. It must NOT propagate
+    /// either -- the supervised worker stops the whole process when its retry
+    /// budget runs out, which is the outage this isolation exists to prevent
+    /// (RAI-1690) -- so it is re-driven on the job's own durable budget.
+    #[tokio::test]
+    async fn place_hedge_redrives_a_symbol_scoped_5xx_instead_of_propagating() {
+        let TestInfra {
+            ctx, apalis_pool, ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        job.handle_place_hedge_error(
+            &ctx,
+            quote_fetch_failure(&symbol, reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("a transient 5xx must not reach the worker: {error:?}"));
+
+        assert_eq!(
+            successor_transient_streaks(&apalis_pool).await,
+            vec![1],
+            "a transient symbol-scoped failure must enqueue exactly one successor, \
+             carrying the incremented transient streak"
+        );
+    }
+
+    #[tokio::test]
+    async fn place_hedge_redrives_a_claimed_symbol_scoped_5xx_instead_of_fail_stopping() {
+        let TestInfra {
+            ctx, apalis_pool, ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        job.handle_place_hedge_error(
+            &ctx,
+            claimed_quote_fetch_failure(&symbol, reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("a transient claimed-path failure must not reach the worker: {error:?}")
+        });
+
+        assert_eq!(
+            successor_transient_streaks(&apalis_pool).await,
+            vec![1],
+            "the claimed path must use the same durable transient budget"
+        );
+    }
+
+    /// A real connection failure, not a synthesised status: the classification
+    /// must reach the same "re-drive it" answer for a transport error as for a
+    /// 5xx, since that is the case that fires on every extended-hours hedge
+    /// when the network blips.
+    #[tokio::test]
+    async fn place_hedge_redrives_a_symbol_scoped_transport_failure() {
+        let TestInfra {
+            ctx, apalis_pool, ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        // Port 1 is reserved and never listening, so this is a genuine
+        // connect failure carried in a real `reqwest::Error`.
+        let transport = reqwest::Client::new()
+            .get("http://127.0.0.1:1/v2/stocks/AAPL/trades/latest")
+            .send()
+            .await
+            .expect_err("connecting to a closed port must fail");
+
+        job.handle_place_hedge_error(
+            &ctx,
+            TradeAccountingError::LimitQuoteFetch {
+                symbol: symbol.clone(),
+                source: Box::new(st0x_execution::AlpacaBrokerApiError::LatestQuote(Box::new(
+                    st0x_execution::AlpacaMarketDataError::Http(transport),
+                ))),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("a transport failure must not reach the worker: {error:?}"));
+
+        assert_eq!(
+            successor_transient_streaks(&apalis_pool).await,
+            vec![1],
+            "a transport failure must be re-driven on the job's own budget"
+        );
+    }
+
+    /// The whole point of the durable budget: a market-data outage that
+    /// outlives it abandons the SYMBOL, with a counter and a page, rather than
+    /// propagating an `Err` that stops the supervised worker and with it every
+    /// other symbol's hedging (RAI-1690).
+    #[tokio::test]
+    async fn a_transient_failure_past_the_redrive_budget_dead_letters_the_symbol() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let TestInfra {
+            ctx,
+            apalis_pool,
+            notifier,
+            ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let job = PlaceHedge {
+            transient_streak: TransientFailureStreak(TRANSIENT_RESCHEDULE_LIMIT),
+            ..hedge_job(&symbol, 2.0, Direction::Sell)
+        };
+
+        job.handle_place_hedge_error(
+            &ctx,
+            quote_fetch_failure(&symbol, reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("an exhausted transient budget must dead-letter, not propagate: {error:?}")
+        });
+
+        assert_eq!(
+            successor_transient_streaks(&apalis_pool).await,
+            Vec::<i64>::new(),
+            "an exhausted budget must stop re-driving"
+        );
+
+        let rendered = metrics_handle.render();
+        assert_eq!(
+            dead_letter_count(
+                &rendered,
+                &symbol,
+                DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteFetch)
+            ),
+            1,
+            "a sustained transient failure must be counted on the shared dead-letter \
+             counter, in:\n{rendered}"
+        );
+        assert_eq!(
+            notifier.messages(),
+            vec![dead_letter_page("AAPL", "limit_quote_fetch")],
+            "the operator must be paged for a symbol abandoned to a sustained outage"
+        );
+    }
+
+    /// A permanent cause must not spend the re-drive budget: re-asking a 403
+    /// entitlement failure cannot change the answer, so the symbol is
+    /// abandoned on the first attempt.
+    #[tokio::test]
+    async fn a_permanent_failure_dead_letters_without_spending_the_redrive_budget() {
+        let TestInfra {
+            ctx, apalis_pool, ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        job.handle_place_hedge_error(
+            &ctx,
+            quote_fetch_failure(&symbol, reqwest::StatusCode::FORBIDDEN),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("expected a 403 quote fetch to dead-letter: {error:?}"));
+
+        assert_eq!(
+            successor_transient_streaks(&apalis_pool).await,
+            Vec::<i64>::new(),
+            "a permanent failure must dead-letter immediately, not re-drive"
+        );
+    }
+
+    /// The dead-letter must not walk away from a claim an EARLIER attempt
+    /// left behind: `perform_body` re-runs the pre-claim pricing lookup on
+    /// every apalis attempt, so a retry can fail there while attempt 1's
+    /// order is still `Pending` at the broker. Abandoning it silently would
+    /// leave that order unplaced and the symbol blocked behind the claim
+    /// until a restart. A re-drive that reaches the broker is the opposite of
+    /// an abandonment, so it must neither count nor page as one.
+    #[tokio::test]
+    async fn dead_letter_resolves_a_claim_left_by_an_earlier_attempt() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let TestInfra {
+            ctx,
+            offchain_order_projection,
+            notifier,
+            ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        // Attempt 1's state: the position is claimed and the order recorded,
+        // but the broker outcome commit was lost, so it is still `Pending`.
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: job.offchain_order_id,
+                    shares: job.shares,
+                    direction: job.direction,
+                    executor: job.executor,
+                    threshold: job.threshold,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &job.offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares: job.shares,
+                    direction: job.direction,
+                    executor: job.executor,
+                    client_order_id: ClientOrderId::from_uuid(job.offchain_order_id.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+
+        job.handle_place_hedge_error(
+            &ctx,
+            TradeAccountingError::LimitQuoteUnavailable {
+                symbol: symbol.clone(),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("expected the dead-letter to succeed: {error:?}"));
+
+        let order = offchain_order_projection
+            .load(&job.offchain_order_id)
+            .await
+            .unwrap()
+            .expect("the prior attempt's order must still exist");
+        assert!(
+            matches!(order, OffchainOrder::Submitted { .. }),
+            "the dead-letter must re-drive the prior attempt's pending order rather than \
+             abandon it, got {order:?}"
+        );
+
+        let rendered = metrics_handle.render();
+        assert_eq!(
+            dead_letter_count(
+                &rendered,
+                &symbol,
+                DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteUnavailable)
+            ),
+            0,
+            "a hedge re-driven to the broker was not given up on, in:\n{rendered}"
+        );
+        assert_eq!(
+            notifier.messages(),
+            Vec::<String>::new(),
+            "paging an abandonment that did not happen burns the pair's one alert slot"
+        );
+    }
+
+    /// CheckPositions can enqueue more than one hedge before the first job
+    /// claims the position. A stale job must recover the order that actually
+    /// owns the position, not assume its own independently-minted ID is the
+    /// claim. Otherwise it reports a standing delta while another hedge is
+    /// already live at the broker.
+    #[tokio::test]
+    async fn stale_job_does_not_dead_letter_a_different_live_claim() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let TestInfra {
+            ctx,
+            apalis_pool,
+            notifier,
+            ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let stale_job = hedge_job(&symbol, 2.0, Direction::Sell);
+        let claimed_order_id = OffchainOrderId::new();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: claimed_order_id,
+                    shares: stale_job.shares,
+                    direction: stale_job.direction,
+                    executor: stale_job.executor,
+                    threshold: stale_job.threshold,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &claimed_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares: stale_job.shares,
+                    direction: stale_job.direction,
+                    executor: stale_job.executor,
+                    client_order_id: ClientOrderId::from_uuid(claimed_order_id.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &claimed_order_id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("different-live-claim"),
+                    placed_shares: stale_job.shares,
+                    submitted_at: chrono::Utc::now(),
+                    market_session: MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        stale_job
+            .handle_place_hedge_error(
+                &ctx,
+                TradeAccountingError::LimitQuoteUnavailable {
+                    symbol: symbol.clone(),
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("the live claim must be recovered: {error:?}"));
+
+        let live_poll_jobs: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status IN ('Pending', 'Queued', \
+             'Running')",
+        )
+        .bind(type_name::<PollOrderStatus>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            live_poll_jobs, 1,
+            "the stale job must re-arm polling for the order that owns the position"
+        );
+
+        let rendered = metrics_handle.render();
+        assert_eq!(
+            dead_letter_count(
+                &rendered,
+                &symbol,
+                DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteUnavailable)
+            ),
+            0,
+            "a symbol with a live hedge must not be reported as abandoned, in:\n{rendered}"
+        );
+        assert_eq!(
+            notifier.messages(),
+            Vec::<String>::new(),
+            "a symbol with a live hedge must not page a standing delta"
+        );
+    }
+
+    /// ADR 0014: the claim recovery the dead-letter path runs can re-drive a
+    /// `Pending` order through the broker, so it must serialize on the same
+    /// submission lock as every other placement. `perform_body`'s guard is
+    /// already released by the time the error handler runs, so without a guard
+    /// here this is the one unlocked path that can submit -- and the inline
+    /// counter-trade path driving the same order could then interleave, landing
+    /// a live broker order permanently `Failed`.
+    #[tokio::test]
+    async fn dead_letter_recovery_blocks_while_the_submission_lock_is_held() {
+        let TestInfra {
+            ctx,
+            offchain_order_projection,
+            ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        // An earlier attempt's state: claimed, recorded, and still `Pending`
+        // because its broker outcome commit was lost -- the case whose
+        // recovery re-drives the broker call.
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: job.offchain_order_id,
+                    shares: job.shares,
+                    direction: job.direction,
+                    executor: job.executor,
+                    threshold: job.threshold,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &job.offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares: job.shares,
+                    direction: job.direction,
+                    executor: job.executor,
+                    client_order_id: ClientOrderId::from_uuid(job.offchain_order_id.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+
+        let guard = ctx.counter_trade_submission_lock.clone().lock_owned().await;
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            job.handle_place_hedge_error(
+                &ctx,
+                TradeAccountingError::LimitQuoteUnavailable {
+                    symbol: symbol.clone(),
+                },
+            ),
+        )
+        .await;
+        blocked.unwrap_err();
+
+        let order = offchain_order_projection
+            .load(&job.offchain_order_id)
+            .await
+            .unwrap()
+            .expect("the earlier attempt's order must still exist");
+        assert!(
+            matches!(order, OffchainOrder::Pending { .. }),
+            "no re-drive may reach the broker while the submission lock is held, got {order:?}"
+        );
+
+        drop(guard);
+        job.handle_place_hedge_error(
+            &ctx,
+            TradeAccountingError::LimitQuoteUnavailable {
+                symbol: symbol.clone(),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("expected the dead-letter to succeed: {error:?}"));
+
+        let order = offchain_order_projection
+            .load(&job.offchain_order_id)
+            .await
+            .unwrap()
+            .expect("the earlier attempt's order must still exist");
+        assert!(
+            matches!(order, OffchainOrder::Submitted { .. }),
+            "the re-drive proceeds once the lock is released, got {order:?}"
+        );
+    }
+
+    /// A hedge that already filled is the opposite of one this process gave up
+    /// on, so the dead-letter path must neither count nor page it -- both
+    /// would tell an operator a symbol carries a standing delta it does not.
+    #[tokio::test]
+    async fn a_filled_order_is_not_reported_as_an_abandoned_hedge() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let TestInfra { ctx, notifier, .. } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        // Drive this job's own order to Filled: the shape a crash between
+        // placement and the outcome commit leaves once boot recovery polls it.
+        ctx.offchain_order
+            .send(
+                &job.offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares: job.shares,
+                    direction: job.direction,
+                    executor: job.executor,
+                    client_order_id: ClientOrderId::from_uuid(job.offchain_order_id.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &job.offchain_order_id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("filled-order-1"),
+                    placed_shares: job.shares,
+                    submitted_at: chrono::Utc::now(),
+                    market_session: MarketSession::Regular,
+                    limit_price: None,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &job.offchain_order_id,
+                OffchainOrderCommand::CompleteFill {
+                    price: Usd::new(float!(150.0)),
+                    filled_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        job.handle_place_hedge_error(
+            &ctx,
+            TradeAccountingError::LimitQuoteUnavailable {
+                symbol: symbol.clone(),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("expected the dead-letter path to succeed: {error:?}"));
+
+        let rendered = metrics_handle.render();
+        assert_eq!(
+            dead_letter_count(
+                &rendered,
+                &symbol,
+                DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteUnavailable)
+            ),
+            0,
+            "a hedge that filled was not given up on, in:\n{rendered}"
+        );
+        assert_eq!(
+            notifier.messages(),
+            Vec::<String>::new(),
+            "a false abandonment page burns the pair's one alert slot"
+        );
+    }
+
+    /// Encodes the safety invariant the dead-letter path relies on: a
+    /// symbol-scoped failure is raised before the position is claimed, so
+    /// dead-lettering it leaves nothing outstanding and the next attempt
+    /// places from a clean slate. The second `perform` is what pins that: if
+    /// the dead-letter had claimed the position, it would hit
+    /// `PositionError::PendingExecution` and recover an order that does not
+    /// exist, leaving nothing `Submitted`.
+    #[tokio::test]
+    async fn symbol_scoped_dead_letter_never_claims_the_position() {
+        struct QuoteFailingPlacer {
+            /// Close-flatten (quote-priced) while set; flipped to a Regular
+            /// session so the second attempt takes the plain market path.
+            extended_session: AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for QuoteFailingPlacer {
+            async fn place_market_order(
+                &self,
+                order: st0x_execution::MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("test-order-123"),
+                    placed_shares: order.shares,
+                    is_extended_hours: false,
+                    limit_price: None,
+                })
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("place_limit_order must not be called; the quote fetch fails first".into())
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
+            }
+
+            async fn fetch_latest_quote(
+                &self,
+                _symbol: &Symbol,
+            ) -> Result<Option<st0x_execution::LatestQuote>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("quote endpoint unavailable".into())
+            }
+
+            async fn market_session_status(
+                &self,
+            ) -> Result<st0x_execution::MarketSessionStatus, Box<dyn std::error::Error + Send + Sync>>
+            {
+                if !self.extended_session.load(Ordering::SeqCst) {
+                    return Ok(st0x_execution::MarketSessionStatus {
+                        session: MarketSession::Regular,
+                        extended_session_closes_at: None,
+                        post_close_gap: st0x_execution::PostCloseGap::OrdinaryOvernight,
+                    });
+                }
+
+                Ok(ramp_start_session_status())
+            }
+        }
+
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let placer = Arc::new(QuoteFailingPlacer {
+            extended_session: AtomicBool::new(true),
+        });
+        let TestInfra {
+            ctx,
+            position_projection,
+            offchain_order_projection,
+            ..
+        } = create_hedge_ctx_with(placer.clone(), extended_hours_assets("AAPL", true)).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+        let result = job.perform(&ctx).await;
+        result.unwrap_or_else(|error| {
+            panic!("expected the close-flatten quote failure to dead-letter, got Err: {error:?}")
+        });
+
+        // Without this, an `Ok(())` from any earlier skip inside
+        // `select_order_kind_for_current_session` would satisfy the
+        // assertions below just as well as the failure this test names.
+        let rendered = metrics_handle.render();
+        assert_eq!(
+            dead_letter_count(
+                &rendered,
+                &symbol,
+                DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteFetch)
+            ),
+            1,
+            "expected the quote fetch failure to dead-letter, in:\n{rendered}"
+        );
+
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "a symbol-scoped failure raised before the claim must never leave the \
+             position claimed"
+        );
+
+        placer.extended_session.store(false, Ordering::SeqCst);
+        let retry = job.perform(&ctx).await;
+        retry.unwrap_or_else(|error| {
+            panic!("expected the retry after a dead-letter to place cleanly, got Err: {error:?}")
+        });
+
+        let order = offchain_order_projection
+            .load(&job.offchain_order_id)
+            .await
+            .unwrap()
+            .expect("the retry must record its offchain order");
+        assert!(
+            matches!(order, OffchainOrder::Submitted { .. }),
+            "the retry after a dead-letter must claim and submit, not recover a \
+             phantom pending order, got {order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_pricing_failure_on_the_claimed_recovery_path_dead_letters() {
+        struct PriceFetchFailingPlacer;
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for PriceFetchFailingPlacer {
+            async fn place_market_order(
+                &self,
+                _order: st0x_execution::MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("place_market_order must not be called during an extended session".into())
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("place_limit_order must not be called; the recovery lookup fails first".into())
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
+            }
+
+            async fn fetch_position_mark(
+                &self,
+                _symbol: &Symbol,
+            ) -> Result<Option<Positive<Usd>>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err(Box::new(st0x_execution::AlpacaBrokerApiError::LatestTrade(
+                    Box::new(st0x_execution::AlpacaMarketDataError::ApiError {
+                        status: reqwest::StatusCode::FORBIDDEN,
+                        body: "market data entitlement rejected".to_string(),
+                        retry_after: None,
+                    }),
+                )))
+            }
+
+            async fn market_session_status(
+                &self,
+            ) -> Result<st0x_execution::MarketSessionStatus, Box<dyn std::error::Error + Send + Sync>>
+            {
+                // Extended with an ordinary overnight gap: the limit price
+                // comes from the latest trade, not a close-flatten quote.
+                Ok(st0x_execution::MarketSessionStatus {
+                    session: MarketSession::Extended,
+                    extended_session_closes_at: Some(
+                        chrono::Utc::now() + chrono::TimeDelta::minutes(5),
+                    ),
+                    post_close_gap: st0x_execution::PostCloseGap::OrdinaryOvernight,
+                })
+            }
+        }
+
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let TestInfra {
+            ctx,
+            position_projection,
+            notifier,
+            ..
+        } = create_hedge_ctx_with(
+            Arc::new(PriceFetchFailingPlacer),
+            extended_hours_assets("AAPL", true),
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        // Seed the claimed-but-unsubmitted state a prior attempt leaves
+        // behind when its broker outcome commit is lost.
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: job.offchain_order_id,
+                    shares: job.shares,
+                    direction: job.direction,
+                    executor: job.executor,
+                    threshold: job.threshold,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &job.offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares: job.shares,
+                    direction: job.direction,
+                    executor: job.executor,
+                    client_order_id: ClientOrderId::from_uuid(job.offchain_order_id.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+
+        job.perform(&ctx).await.unwrap_or_else(|error| {
+            panic!("a permanent claimed-path pricing failure must not fail-stop: {error:?}")
+        });
+
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.pending_offchain_order_id,
+            Some(job.offchain_order_id),
+            "the existing claim must survive so the retry can re-drive it"
+        );
+        let rendered = metrics_handle.render();
+        assert_eq!(
+            dead_letter_count(
+                &rendered,
+                &symbol,
+                DeadLetterReason::SymbolScoped(SymbolScopedReason::MarkFetch)
+            ),
+            1,
+            "the claimed-path abandonment must stay visible while its claim awaits recovery, \
+             in:\n{rendered}"
+        );
+        assert_eq!(
+            notifier.messages(),
+            vec![dead_letter_page("AAPL", "mark_fetch")],
+            "leaving the claim for the recovery sweep must still page the standing delta"
+        );
+    }
+
     /// `OrderPlacer` whose extended-hours price lookup fails with a classified
     /// broker rate-limit (429) wrapped exactly as the real Alpaca executor
     /// produces it: `AlpacaBrokerApiError::LatestTrade(AlpacaMarketDataError)`,
-    /// a two-hop boxed source (`TradeAccountingError::LimitPriceFetch` boxes
+    /// a two-hop boxed source (`TradeAccountingError::MarkFetch` boxes
     /// a `dyn Error`, which itself wraps the market-data error). Used to pin
     /// the extended-hours reschedule path `handle_place_hedge_error`'s doc
     /// comment claims handles (RAI-1494).
@@ -1300,7 +3483,7 @@ mod tests {
                 Ok(st0x_execution::CancellationOutcome::Requested)
             }
 
-            async fn fetch_latest_trade_price(
+            async fn fetch_position_mark(
                 &self,
                 _symbol: &Symbol,
             ) -> Result<
@@ -1308,11 +3491,11 @@ mod tests {
                 Box<dyn std::error::Error + Send + Sync>,
             > {
                 Err(Box::new(st0x_execution::AlpacaBrokerApiError::LatestTrade(
-                    st0x_execution::AlpacaMarketDataError::ApiError {
+                    Box::new(st0x_execution::AlpacaMarketDataError::ApiError {
                         status: reqwest::StatusCode::TOO_MANY_REQUESTS,
                         body: "rate limited".to_string(),
                         retry_after: Some(Duration::from_millis(1)),
-                    },
+                    }),
                 )))
             }
 
@@ -1428,6 +3611,7 @@ mod tests {
             offchain_order_id: OffchainOrderId::new(),
             market_session: MarketSession::Extended,
             backpressure_streak: BackpressureStreak::default(),
+            transient_streak: TransientFailureStreak::default(),
         };
 
         // Driven through the REAL `Job::perform` entry point (not
@@ -1552,6 +3736,7 @@ mod tests {
             executor: SupportedExecutor::DryRun,
             placed_at: chrono::Utc::now(),
             market_session: MarketSession::Regular,
+            close_flatten: false,
         };
 
         let error =
@@ -1596,6 +3781,7 @@ mod tests {
             placed_at: chrono::Utc::now(),
             submitted_at: chrono::Utc::now(),
             market_session: MarketSession::Regular,
+            close_flatten: false,
         };
 
         // First call: no live poll job yet, so the guard is a no-op and the
@@ -2102,7 +4288,7 @@ mod tests {
                 Ok(st0x_execution::CancellationOutcome::Requested)
             }
 
-            async fn fetch_latest_trade_price(
+            async fn fetch_position_mark(
                 &self,
                 _symbol: &Symbol,
             ) -> Result<
@@ -2167,7 +4353,7 @@ mod tests {
                 Ok(st0x_execution::CancellationOutcome::Requested)
             }
 
-            async fn fetch_latest_trade_price(
+            async fn fetch_position_mark(
                 &self,
                 _symbol: &Symbol,
             ) -> Result<Option<Positive<Usd>>, Box<dyn std::error::Error + Send + Sync>>
@@ -2188,13 +4374,7 @@ mod tests {
                 &self,
             ) -> Result<st0x_execution::MarketSessionStatus, Box<dyn std::error::Error + Send + Sync>>
             {
-                Ok(st0x_execution::MarketSessionStatus {
-                    session: MarketSession::Extended,
-                    extended_session_closes_at: Some(
-                        chrono::Utc::now() + chrono::TimeDelta::minutes(5),
-                    ),
-                    post_close_gap: st0x_execution::PostCloseGap::MultiDayClosure,
-                })
+                Ok(ramp_start_session_status())
             }
         }
 
@@ -2273,13 +4453,7 @@ mod tests {
                 &self,
             ) -> Result<st0x_execution::MarketSessionStatus, Box<dyn std::error::Error + Send + Sync>>
             {
-                Ok(st0x_execution::MarketSessionStatus {
-                    session: MarketSession::Extended,
-                    extended_session_closes_at: Some(
-                        chrono::Utc::now() + chrono::TimeDelta::minutes(5),
-                    ),
-                    post_close_gap: st0x_execution::PostCloseGap::MultiDayClosure,
-                })
+                Ok(ramp_start_session_status())
             }
         }
 
@@ -2290,6 +4464,102 @@ mod tests {
             )
             .unwrap(),
         })
+    }
+
+    fn extended_preflight_rejecting_placer(
+        mark: Float,
+        allow_limit_placement: bool,
+    ) -> Arc<dyn OrderPlacer> {
+        struct RejectingPreflightPlacer {
+            mark: Positive<Usd>,
+            allow_limit_placement: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for RejectingPreflightPlacer {
+            async fn place_market_order(
+                &self,
+                _order: st0x_execution::MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("an extended-hours hedge must not place a market order");
+            }
+
+            async fn place_limit_order(
+                &self,
+                order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                assert!(
+                    self.allow_limit_placement,
+                    "a fresh perform-time preflight rejection must abort before the broker is called"
+                );
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("recovered-live-order"),
+                    placed_shares: order.shares,
+                    is_extended_hours: true,
+                    limit_price: Some(order.limit_price),
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
+            }
+
+            async fn fetch_position_mark(
+                &self,
+                _symbol: &Symbol,
+            ) -> Result<Option<Positive<Usd>>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(Some(self.mark))
+            }
+
+            async fn preflight_counter_trade_at_price(
+                &self,
+                _order: st0x_execution::MarketOrder,
+                reference_price: Positive<Usd>,
+            ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>>
+            {
+                assert!(
+                    reference_price.inner().inner().eq(float!(101.00)).unwrap(),
+                    "the preflight must receive the fresh 100 USD mark crossed by 100 bps"
+                );
+                Ok(CounterTradePreflight::Skipped(
+                    st0x_execution::CounterTradeSkipReason::InsufficientBuyingPower {
+                        estimated_cost_cents: 20_200,
+                        available_buying_power_cents: 20_000,
+                    },
+                ))
+            }
+
+            async fn market_session_status(
+                &self,
+            ) -> Result<st0x_execution::MarketSessionStatus, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::MarketSessionStatus {
+                    session: MarketSession::Extended,
+                    extended_session_closes_at: None,
+                    post_close_gap: st0x_execution::PostCloseGap::OrdinaryOvernight,
+                })
+            }
+        }
+
+        Arc::new(RejectingPreflightPlacer {
+            mark: Positive::new(Usd::new(mark)).unwrap(),
+            allow_limit_placement,
+        })
+    }
+
+    fn ordinary_extended_preflight_rejecting_placer(mark: Float) -> Arc<dyn OrderPlacer> {
+        extended_preflight_rejecting_placer(mark, false)
+    }
+
+    fn pending_recovery_preflight_rejecting_placer(mark: Float) -> Arc<dyn OrderPlacer> {
+        extended_preflight_rejecting_placer(mark, true)
     }
 
     /// Regression test for the TOCTOU between the scan-time close-flatten
@@ -2357,6 +4627,170 @@ mod tests {
         assert!(rendered.contains("symbol=\"AAPL\""));
     }
 
+    /// Ordinary extended-hours buys have the same gap between the scan's
+    /// buying-power snapshot and the fresh mark used at perform time. The
+    /// exact crossed limit must be re-preflighted even when no close-flatten
+    /// window is active.
+    #[tokio::test]
+    async fn ordinary_extended_buy_rechecks_the_fresh_limit_before_submission() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let TestInfra {
+            ctx,
+            position_projection,
+            offchain_order_projection,
+            ..
+        } = create_hedge_ctx_with(
+            ordinary_extended_preflight_rejecting_placer(float!(100.00)),
+            extended_hours_assets("AAPL", true),
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Sell,
+        )
+        .await;
+
+        PlaceHedge {
+            market_session: MarketSession::Extended,
+            ..hedge_job(&symbol, 2.0, Direction::Buy)
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            offchain_order_projection.load_all().await.unwrap(),
+            Vec::new(),
+            "a moved ordinary-extended price must be rejected before broker submission"
+        );
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should remain available for a later retry");
+        assert_eq!(position.pending_offchain_order_id, None);
+
+        assert!(
+            !metrics_handle
+                .render()
+                .contains("close_flatten_blocked_total{"),
+            "an ordinary extended-hours rejection must not inflate close-flatten metrics"
+        );
+    }
+
+    /// A perform-time preflight skip happens before this job can claim the
+    /// position, but a different queued job may already own it. The skip path
+    /// must recover that live order under the submission lock rather than
+    /// looking up this stale job's unrelated ID and leaving the broker order
+    /// unpolled.
+    #[tokio::test]
+    async fn preflight_skip_recovers_a_different_live_claim() {
+        let TestInfra {
+            ctx,
+            apalis_pool,
+            offchain_order_projection,
+            position_projection,
+            ..
+        } = create_hedge_ctx_with(
+            ordinary_extended_preflight_rejecting_placer(float!(100.00)),
+            extended_hours_assets("AAPL", true),
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let stale_job = PlaceHedge {
+            market_session: MarketSession::Extended,
+            ..hedge_job(&symbol, 2.0, Direction::Buy)
+        };
+        let claimed_order_id = OffchainOrderId::new();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Sell,
+        )
+        .await;
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: claimed_order_id,
+                    shares: stale_job.shares,
+                    direction: stale_job.direction,
+                    executor: stale_job.executor,
+                    threshold: stale_job.threshold,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &claimed_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares: stale_job.shares,
+                    direction: stale_job.direction,
+                    executor: stale_job.executor,
+                    client_order_id: ClientOrderId::from_uuid(claimed_order_id.as_uuid()),
+                    kind: CounterTradeOrderKind::ExtendedHoursLimit {
+                        limit_price: Positive::new(Usd::new(float!(101.00))).unwrap(),
+                        close_flatten: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &claimed_order_id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("preflight-skip-live-claim"),
+                    placed_shares: stale_job.shares,
+                    submitted_at: chrono::Utc::now(),
+                    market_session: MarketSession::Extended,
+                    limit_price: Some(Positive::new(Usd::new(float!(101.00))).unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+
+        stale_job.perform(&ctx).await.unwrap();
+
+        let live_poll_jobs: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status IN ('Pending', 'Queued', \
+             'Running')",
+        )
+        .bind(type_name::<PollOrderStatus>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            live_poll_jobs, 1,
+            "the skipped stale job must re-arm polling for the live claim"
+        );
+        assert_eq!(
+            offchain_order_projection
+                .load(&stale_job.offchain_order_id)
+                .await
+                .unwrap(),
+            None,
+            "the skipped job must not create its own order"
+        );
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .and_then(|position| position.pending_offchain_order_id),
+            Some(claimed_order_id),
+            "recovery must preserve the order that owns the position"
+        );
+    }
+
     async fn create_extended_hours_ctx(price: rain_math_float::Float) -> TestInfra {
         let placer = extended_hours_order_placer(price);
 
@@ -2373,6 +4807,8 @@ mod tests {
                 .await
                 .unwrap();
 
+        let notifier = Arc::new(FlakyNotifier::default());
+
         let ctx = HedgeCtx {
             position: position.clone(),
             offchain_order,
@@ -2380,10 +4816,12 @@ mod tests {
             hedge_queue: HedgeJobQueue::new(&apalis_pool),
             order_placer: placer,
             assets: extended_hours_assets("AAPL", true),
-            counter_trade_slippage_bps: 100,
             close_flatten_policy: CloseFlattenPolicy::from_secs(900).unwrap(),
+            close_flatten_ramp: CloseFlattenCrossRamp::new(100, 400).unwrap(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
             poll_interval: TEST_POLL_INTERVAL,
+            notifier: notifier.clone(),
+            alerted_dead_letters: Arc::new(Mutex::new(HashSet::new())),
         };
 
         TestInfra {
@@ -2391,6 +4829,7 @@ mod tests {
             apalis_pool,
             position_projection,
             offchain_order_projection,
+            notifier,
         }
     }
 
@@ -2435,14 +4874,55 @@ mod tests {
             Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
             Direction::Buy,
             MarketSession::Extended,
+            SubmittedPricePreflight::Required,
         )
         .await
         .unwrap()
         .unwrap();
-        let CounterTradeOrderKind::ExtendedHoursLimit { limit_price } = selected_kind else {
+        let CounterTradeOrderKind::ExtendedHoursLimit {
+            limit_price,
+            close_flatten,
+        } = selected_kind
+        else {
             panic!("close flatten must select an extended-hours limit");
         };
         assert!(limit_price.inner().inner().eq(float!(101.02)).unwrap());
+        assert!(
+            close_flatten,
+            "the flag every close-flatten outcome metric is attributed by must be set here, \
+             or close_flatten_outcomes_total stays permanently empty"
+        );
+
+        // Read before the `perform` below prices a second attempt, so these
+        // are the counts for exactly one placement.
+        let rendered = metrics_handle.render();
+        assert_eq!(
+            counter_value(
+                &rendered,
+                "close_flatten_placements_total",
+                &[
+                    ("symbol", "AAPL"),
+                    ("direction", "buy"),
+                    ("cross_bucket", "100"),
+                ],
+            ),
+            1,
+            "the fill-rate denominator must count this placement at its cross bucket, \
+             in:\n{rendered}"
+        );
+        assert_eq!(
+            counter_value(
+                &rendered,
+                "hedge_price_source_total",
+                &[
+                    ("symbol", "AAPL"),
+                    ("path", "close_flatten"),
+                    ("source", "delayed_sip_quote"),
+                ],
+            ),
+            1,
+            "a close-flatten limit priced off the quote fallback must say so, in:\n{rendered}"
+        );
 
         fill_position(
             &ctx.position,
@@ -2460,6 +4940,7 @@ mod tests {
             offchain_order_id: OffchainOrderId::new(),
             market_session: MarketSession::Extended,
             backpressure_streak: BackpressureStreak::default(),
+            transient_streak: TransientFailureStreak::default(),
         };
 
         job.perform(&ctx).await.unwrap();
@@ -2497,15 +4978,24 @@ mod tests {
             Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
             Direction::Sell,
             MarketSession::Extended,
+            SubmittedPricePreflight::Required,
         )
         .await
         .unwrap()
         .unwrap();
 
-        let CounterTradeOrderKind::ExtendedHoursLimit { limit_price } = kind else {
+        let CounterTradeOrderKind::ExtendedHoursLimit {
+            limit_price,
+            close_flatten,
+        } = kind
+        else {
             panic!("close flatten must select an extended-hours limit");
         };
         assert!(limit_price.inner().inner().eq(float!(99.00)).unwrap());
+        assert!(
+            close_flatten,
+            "a sell inside the window is close-flatten too"
+        );
     }
 
     #[tokio::test]
@@ -2529,6 +5019,7 @@ mod tests {
                 Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
                 Direction::Buy,
                 MarketSession::Extended,
+                SubmittedPricePreflight::Required,
             )
             .await
             .unwrap()
@@ -2539,7 +5030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_flatten_quote_failure_is_retryable_without_trade_price_fallback() {
+    async fn close_flatten_surfaces_the_mark_error_when_every_source_fails() {
         let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
         struct QuoteFailingPlacer;
 
@@ -2569,12 +5060,12 @@ mod tests {
                 Ok(st0x_execution::CancellationOutcome::Requested)
             }
 
-            async fn fetch_latest_trade_price(
+            async fn fetch_position_mark(
                 &self,
                 _symbol: &Symbol,
             ) -> Result<Option<Positive<Usd>>, Box<dyn std::error::Error + Send + Sync>>
             {
-                Err("latest trade fallback is forbidden".into())
+                Err("positions endpoint down".into())
             }
 
             async fn fetch_latest_quote(
@@ -2589,13 +5080,7 @@ mod tests {
                 &self,
             ) -> Result<st0x_execution::MarketSessionStatus, Box<dyn std::error::Error + Send + Sync>>
             {
-                Ok(st0x_execution::MarketSessionStatus {
-                    session: MarketSession::Extended,
-                    extended_session_closes_at: Some(
-                        chrono::Utc::now() + chrono::TimeDelta::minutes(5),
-                    ),
-                    post_close_gap: st0x_execution::PostCloseGap::MultiDayClosure,
-                })
+                Ok(ramp_start_session_status())
             }
         }
 
@@ -2612,17 +5097,23 @@ mod tests {
             Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
             Direction::Buy,
             MarketSession::Extended,
+            SubmittedPricePreflight::Required,
         )
         .await;
 
-        assert!(matches!(
-            result,
-            Err(TradeAccountingError::LimitQuoteFetch { .. })
-        ));
+        // No optional primary provider is wired by this placer. The mark error
+        // therefore remains the preferred failure when the emergency quote has
+        // the same retry classification: collapsing it into a generic "no
+        // price" would strip a 429 or 5xx classification and dead-letter a
+        // hedge that should have been retried.
+        assert!(
+            matches!(result, Err(TradeAccountingError::MarkFetch { .. })),
+            "expected the mark error to survive the fallback chain, got {result:?}"
+        );
         let rendered = metrics_handle.render();
         assert!(rendered.contains("close_flatten_blocked_total{"));
         assert!(rendered.contains("symbol=\"AAPL\""));
-        assert!(rendered.contains("reason=\"quote_fetch_failed\""));
+        assert!(rendered.contains("reason=\"mark_fetch_failed\""));
     }
 
     #[test]
@@ -2782,6 +5273,7 @@ mod tests {
             offchain_order_id: OffchainOrderId::new(),
             market_session: MarketSession::Extended,
             backpressure_streak: BackpressureStreak::default(),
+            transient_streak: TransientFailureStreak::default(),
         };
 
         job.perform(&ctx).await.unwrap();
@@ -2855,6 +5347,7 @@ mod tests {
             // Stale: enqueued during regular hours, retried during Extended.
             market_session: MarketSession::Regular,
             backpressure_streak: BackpressureStreak::default(),
+            transient_streak: TransientFailureStreak::default(),
         };
 
         job.perform(&ctx)
@@ -2919,6 +5412,7 @@ mod tests {
             // Stale serialized session: enqueued during regular hours.
             market_session: MarketSession::Regular,
             backpressure_streak: BackpressureStreak::default(),
+            transient_streak: TransientFailureStreak::default(),
         };
 
         job.perform(&ctx)
@@ -2978,14 +5472,14 @@ mod tests {
                 Ok(st0x_execution::CancellationOutcome::Requested)
             }
 
-            async fn fetch_latest_trade_price(
+            async fn fetch_position_mark(
                 &self,
                 _symbol: &Symbol,
             ) -> Result<
                 Option<st0x_execution::Positive<Usd>>,
                 Box<dyn std::error::Error + Send + Sync>,
             > {
-                Err("market data endpoint down".into())
+                Err("positions endpoint down".into())
             }
 
             async fn market_session(
@@ -2998,6 +5492,419 @@ mod tests {
         Arc::new(FailingPricePlacer)
     }
 
+    /// Records the limit price a hedge actually reached the broker with, so a
+    /// test can assert which reference the placement was derived from.
+    #[derive(Clone)]
+    struct RecordingLimitPlacer {
+        primary_quote: Option<Result<st0x_execution::LatestQuote, ()>>,
+        mark: Option<Result<Positive<Usd>, ()>>,
+        quote: Option<st0x_execution::LatestQuote>,
+        placed: Arc<std::sync::Mutex<Vec<Usd>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl OrderPlacer for RecordingLimitPlacer {
+        async fn place_market_order(
+            &self,
+            _order: st0x_execution::MarketOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            Err("extended hours must not place a market order".into())
+        }
+
+        async fn place_limit_order(
+            &self,
+            order: st0x_execution::LimitOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            self.placed.lock().unwrap().push(order.limit_price.inner());
+            Ok(OrderPlacementResult {
+                executor_order_id: ExecutorOrderId::new("recorded-order"),
+                placed_shares: order.shares,
+                is_extended_hours: order.extended_hours,
+                limit_price: Some(order.limit_price),
+            })
+        }
+
+        async fn cancel_order(
+            &self,
+            _executor_order_id: &st0x_execution::ExecutorOrderId,
+        ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(st0x_execution::CancellationOutcome::Requested)
+        }
+
+        async fn fetch_position_mark(
+            &self,
+            _symbol: &Symbol,
+        ) -> Result<Option<st0x_execution::Positive<Usd>>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            match self.mark {
+                Some(Ok(mark)) => Ok(Some(mark)),
+                Some(Err(())) => Err("positions endpoint down".into()),
+                None => Ok(None),
+            }
+        }
+
+        async fn fetch_primary_limit_quote(
+            &self,
+            _symbol: &Symbol,
+        ) -> Result<Option<st0x_execution::LatestQuote>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            match self.primary_quote {
+                Some(Ok(quote)) => Ok(Some(quote)),
+                Some(Err(())) => Err("primary quote endpoint down".into()),
+                None => Ok(None),
+            }
+        }
+
+        async fn fetch_latest_quote(
+            &self,
+            _symbol: &Symbol,
+        ) -> Result<Option<st0x_execution::LatestQuote>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(self.quote)
+        }
+
+        async fn market_session(
+            &self,
+        ) -> Result<MarketSession, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(MarketSession::Extended)
+        }
+    }
+
+    fn usd(value: &str) -> Positive<Usd> {
+        Positive::new(Usd::new(float!(value))).unwrap()
+    }
+
+    /// The whole point of ADR 0019's fallback chain: a broker that cannot serve
+    /// a mark must not stop the hedge, because flattening before a multi-day gap
+    /// is mandatory. The delayed quote takes over and the order still goes out.
+    #[tokio::test]
+    async fn a_failed_mark_falls_through_to_the_quote_and_still_places() {
+        let submitted_prices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let placer = RecordingLimitPlacer {
+            primary_quote: None,
+            mark: Some(Err(())),
+            quote: Some(st0x_execution::LatestQuote::new(usd("99.00"), usd("101.00")).unwrap()),
+            placed: submitted_prices.clone(),
+        };
+
+        let TestInfra { ctx, .. } =
+            create_hedge_ctx_with(Arc::new(placer), extended_hours_assets("AAPL", true)).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        PlaceHedge {
+            symbol: symbol.clone(),
+            direction: Direction::Sell,
+            shares: Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+            executor: SupportedExecutor::DryRun,
+            threshold: ExecutionThreshold::whole_share(),
+            offchain_order_id: OffchainOrderId::new(),
+            market_session: MarketSession::Extended,
+            backpressure_streak: BackpressureStreak::default(),
+            transient_streak: TransientFailureStreak::default(),
+        }
+        .perform(&ctx)
+        .await
+        .expect("a failed mark must fall through to the quote, not abandon the hedge");
+
+        let submitted = submitted_prices.lock().unwrap().clone();
+        assert_eq!(
+            submitted.len(),
+            1,
+            "the hedge must still reach the broker, got: {submitted:?}"
+        );
+        // Sell off the bid (99.00), crossed down by the 100 bps base band.
+        assert_eq!(submitted[0], Usd::new(float!("98.01")));
+    }
+
+    /// With the mark merely absent rather than broken, a quote failure is the
+    /// only thing that went wrong, so its own error surfaces and stays
+    /// classifiable. This is the leg that keeps `LimitQuoteFetch` reachable.
+    #[tokio::test]
+    async fn an_absent_mark_surfaces_the_quote_error() {
+        struct QuoteOnlyFailurePlacer;
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for QuoteOnlyFailurePlacer {
+            async fn place_market_order(
+                &self,
+                _order: st0x_execution::MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("placement must not run without a price".into())
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("placement must not run without a price".into())
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
+            }
+
+            async fn fetch_position_mark(
+                &self,
+                _symbol: &Symbol,
+            ) -> Result<Option<Positive<Usd>>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(None)
+            }
+
+            async fn fetch_latest_quote(
+                &self,
+                _symbol: &Symbol,
+            ) -> Result<Option<st0x_execution::LatestQuote>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("quote endpoint unavailable".into())
+            }
+
+            async fn market_session(
+                &self,
+            ) -> Result<MarketSession, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(MarketSession::Extended)
+            }
+        }
+
+        let TestInfra { ctx, .. } = create_hedge_ctx_with(
+            Arc::new(QuoteOnlyFailurePlacer),
+            extended_hours_assets("AAPL", true),
+        )
+        .await;
+
+        let result = select_order_kind_for_current_session(
+            &ctx,
+            &Symbol::new("AAPL").unwrap(),
+            Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+            Direction::Sell,
+            MarketSession::Extended,
+            SubmittedPricePreflight::Required,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(TradeAccountingError::LimitQuoteFetch { .. })),
+            "expected the quote error to surface when the mark was merely absent, got {result:?}"
+        );
+    }
+
+    fn classified_market_data_failure(
+        status: reqwest::StatusCode,
+    ) -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(st0x_execution::AlpacaBrokerApiError::LatestQuote(Box::new(
+            st0x_execution::AlpacaMarketDataError::ApiError {
+                status,
+                body: "classified test failure".to_string(),
+                retry_after: None,
+            },
+        )))
+    }
+
+    #[test]
+    fn both_reference_failures_surface_the_one_with_the_best_retry_path() {
+        let transient = prefer_reference_price_failure(
+            ReferencePriceError::MarkFetch(classified_market_data_failure(
+                reqwest::StatusCode::FORBIDDEN,
+            )),
+            ReferencePriceError::QuoteFetch(classified_market_data_failure(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            )),
+        );
+        let ReferencePriceError::QuoteFetch(source) = transient else {
+            panic!("a transient quote failure must outrank a permanent mark failure")
+        };
+        assert_eq!(
+            find_permanence(source.as_ref()),
+            Some(Permanence::Transient)
+        );
+
+        let backpressure = prefer_reference_price_failure(
+            ReferencePriceError::MarkFetch(classified_market_data_failure(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            )),
+            ReferencePriceError::QuoteFetch(classified_market_data_failure(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+            )),
+        );
+        let ReferencePriceError::QuoteFetch(source) = backpressure else {
+            panic!("a rate-limited quote failure must outrank a transient mark failure")
+        };
+        assert!(
+            find_backpressure(source.as_ref()).is_some(),
+            "the selected error must preserve the quote endpoint's 429 backoff"
+        );
+    }
+
+    /// The mirror of the close-flatten selection tests: an ordinary
+    /// extended-hours limit must NOT carry the close-flatten flag, or every
+    /// outcome it reaches is attributed to a flatten that never happened, and
+    /// its price source is reported on the ordinary path.
+    #[tokio::test]
+    async fn an_ordinary_extended_limit_is_not_flagged_as_close_flatten() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let placer = RecordingLimitPlacer {
+            primary_quote: None,
+            mark: Some(Ok(usd("110.00"))),
+            quote: None,
+            placed: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+
+        let TestInfra { ctx, .. } =
+            create_hedge_ctx_with(Arc::new(placer), extended_hours_assets("AAPL", true)).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let kind = select_order_kind_for_current_session(
+            &ctx,
+            &symbol,
+            Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+            Direction::Sell,
+            MarketSession::Extended,
+            SubmittedPricePreflight::Required,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let CounterTradeOrderKind::ExtendedHoursLimit { close_flatten, .. } = kind else {
+            panic!("an extended session must select an extended-hours limit");
+        };
+        assert!(
+            !close_flatten,
+            "an ordinary overnight gap is not a close-flatten window"
+        );
+
+        let rendered = metrics_handle.render();
+        assert_eq!(
+            counter_value(
+                &rendered,
+                "hedge_price_source_total",
+                &[
+                    ("symbol", "AAPL"),
+                    ("path", "ordinary_extended"),
+                    ("source", "mark"),
+                ],
+            ),
+            1,
+            "the daily extended path must report the mark as its source, in:\n{rendered}"
+        );
+        assert_eq!(
+            counter_value(
+                &rendered,
+                "close_flatten_placements_total",
+                &[("symbol", "AAPL")],
+            ),
+            0,
+            "an ordinary extended placement must not inflate the flatten denominator, \
+             in:\n{rendered}"
+        );
+    }
+
+    /// The mark is preferred over the quote whenever both are available: it is
+    /// live where the delayed quote is fifteen minutes stale.
+    #[tokio::test]
+    async fn the_mark_is_preferred_over_the_delayed_quote() {
+        let submitted_prices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let placer = RecordingLimitPlacer {
+            primary_quote: None,
+            mark: Some(Ok(usd("110.00"))),
+            quote: Some(st0x_execution::LatestQuote::new(usd("99.00"), usd("101.00")).unwrap()),
+            placed: submitted_prices.clone(),
+        };
+
+        let TestInfra { ctx, .. } =
+            create_hedge_ctx_with(Arc::new(placer), extended_hours_assets("AAPL", true)).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        PlaceHedge {
+            symbol: symbol.clone(),
+            direction: Direction::Sell,
+            shares: Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+            executor: SupportedExecutor::DryRun,
+            threshold: ExecutionThreshold::whole_share(),
+            offchain_order_id: OffchainOrderId::new(),
+            market_session: MarketSession::Extended,
+            backpressure_streak: BackpressureStreak::default(),
+            transient_streak: TransientFailureStreak::default(),
+        }
+        .perform(&ctx)
+        .await
+        .expect("a live mark must price the hedge");
+
+        let submitted = submitted_prices.lock().unwrap().clone();
+        // 110.00 mark crossed down by 100 bps, not the 99.00 quote bid.
+        assert_eq!(submitted[0], Usd::new(float!("108.90")));
+    }
+
+    #[tokio::test]
+    async fn a_primary_quote_is_preferred_over_the_mark_and_delayed_quote() {
+        let placer = RecordingLimitPlacer {
+            primary_quote: Some(Ok(st0x_execution::LatestQuote::new(
+                usd("99.00"),
+                usd("101.00"),
+            )
+            .unwrap())),
+            mark: Some(Ok(usd("110.00"))),
+            quote: Some(st0x_execution::LatestQuote::new(usd("79.00"), usd("81.00")).unwrap()),
+            placed: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let buy_reference =
+            resolve_extended_hours_reference_price(&placer, &symbol, Direction::Buy)
+                .await
+                .expect("a primary quote should resolve the reference");
+        let sell_reference =
+            resolve_extended_hours_reference_price(&placer, &symbol, Direction::Sell)
+                .await
+                .expect("a primary quote should resolve the reference");
+
+        assert_eq!(buy_reference.source, ReferencePriceSource::PrimaryQuote);
+        assert_eq!(buy_reference.price, usd("101.00"));
+        assert_eq!(sell_reference.source, ReferencePriceSource::PrimaryQuote);
+        assert_eq!(sell_reference.price, usd("99.00"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_primary_quote_falls_back_to_the_mark() {
+        let placer = RecordingLimitPlacer {
+            primary_quote: Some(Err(())),
+            mark: Some(Ok(usd("110.00"))),
+            quote: Some(st0x_execution::LatestQuote::new(usd("79.00"), usd("81.00")).unwrap()),
+            placed: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let reference = resolve_extended_hours_reference_price(&placer, &symbol, Direction::Sell)
+            .await
+            .expect("a primary quote failure must not suppress the mark fallback");
+
+        assert_eq!(reference.source, ReferencePriceSource::Mark);
+        assert_eq!(reference.price, usd("110.00"));
+    }
+
     #[tokio::test]
     async fn price_fetch_failure_during_extended_session_does_not_claim_position() {
         // order_placer is Some but the latest-trade-price lookup fails (e.g.
@@ -3005,6 +5912,7 @@ mod tests {
         // BEFORE the position is claimed: a regression that claims the
         // position first would leave a dangling pending_offchain_order_id with
         // no actual order, silently blocking all future hedging of the symbol.
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
         let TestInfra {
             ctx,
             position_projection,
@@ -3034,14 +5942,26 @@ mod tests {
             offchain_order_id: OffchainOrderId::new(),
             market_session: MarketSession::Extended,
             backpressure_streak: BackpressureStreak::default(),
+            transient_streak: TransientFailureStreak::default(),
         };
 
-        // The job fails with a retryable error (it propagates, so apalis
-        // re-runs it) rather than being swallowed.
         let result = job.perform(&ctx).await;
-        assert!(
-            matches!(result, Err(TradeAccountingError::LimitPriceFetch { .. })),
-            "expected LimitPriceFetch, got: {result:?}"
+        result.unwrap_or_else(|error| {
+            panic!("expected the price-fetch failure to dead-letter, got Err: {error:?}")
+        });
+
+        // Without this, an `Ok(())` from any earlier skip inside
+        // `select_order_kind_for_current_session` would satisfy the
+        // assertions below just as well as the failure this test names.
+        let rendered = metrics_handle.render();
+        assert_eq!(
+            dead_letter_count(
+                &rendered,
+                &symbol,
+                DeadLetterReason::SymbolScoped(SymbolScopedReason::MarkFetch)
+            ),
+            1,
+            "expected the exhausted reference chain to dead-letter, in:\n{rendered}"
         );
 
         let position = position_projection
@@ -3067,8 +5987,8 @@ mod tests {
     #[tokio::test]
     async fn market_session_failure_surfaces_dedicated_error_without_claiming_position() {
         // The session re-check at the top of perform fails (broker calendar /
-        // clock endpoint down). The error must be MarketSessionCheck -- not
-        // LimitPriceFetch, which would point operators at the market-data
+        // clock endpoint down). The error must be MarketSessionCheck -- not a
+        // reference-price error, which would point operators at the wrong
         // endpoint -- and the position must remain unclaimed so the retry can
         // start clean.
         struct SessionFailingPlacer;
@@ -3175,6 +6095,7 @@ mod tests {
             offchain_order_id: OffchainOrderId::new(),
             market_session: MarketSession::Extended,
             backpressure_streak: BackpressureStreak::default(),
+            transient_streak: TransientFailureStreak::default(),
         };
 
         job.perform(&ctx)
@@ -3222,6 +6143,7 @@ mod tests {
             offchain_order_id: OffchainOrderId::new(),
             market_session: MarketSession::Extended,
             backpressure_streak: BackpressureStreak::default(),
+            transient_streak: TransientFailureStreak::default(),
         };
 
         job.perform(&ctx).await.unwrap();
@@ -3291,7 +6213,7 @@ mod tests {
                 Ok(st0x_execution::CancellationOutcome::Requested)
             }
 
-            async fn fetch_latest_trade_price(
+            async fn fetch_position_mark(
                 &self,
                 _symbol: &Symbol,
             ) -> Result<
@@ -3333,6 +6255,8 @@ mod tests {
                 .await
                 .unwrap();
 
+        let notifier = Arc::new(FlakyNotifier::default());
+
         let ctx = HedgeCtx {
             position: position.clone(),
             offchain_order,
@@ -3340,10 +6264,12 @@ mod tests {
             hedge_queue: HedgeJobQueue::new(&apalis_pool),
             order_placer: placer,
             assets,
-            counter_trade_slippage_bps: 100,
             close_flatten_policy: CloseFlattenPolicy::from_secs(900).unwrap(),
+            close_flatten_ramp: CloseFlattenCrossRamp::new(100, 400).unwrap(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
             poll_interval: TEST_POLL_INTERVAL,
+            notifier: notifier.clone(),
+            alerted_dead_letters: Arc::new(Mutex::new(HashSet::new())),
         };
 
         TestInfra {
@@ -3351,6 +6277,7 @@ mod tests {
             apalis_pool,
             position_projection,
             offchain_order_projection,
+            notifier,
         }
     }
 
@@ -3544,6 +6471,86 @@ mod tests {
         assert_eq!(
             poll_jobs, 1,
             "Pending re-drive must enqueue exactly one PollOrderStatus job"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_extended_buy_recovery_bypasses_reserved_buying_power_preflight() {
+        let TestInfra {
+            ctx,
+            apalis_pool,
+            offchain_order_projection,
+            ..
+        } = create_hedge_ctx_with(
+            pending_recovery_preflight_rejecting_placer(float!(100.00)),
+            extended_hours_assets("AAPL", true),
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Sell,
+        )
+        .await;
+        let job = PlaceHedge {
+            market_session: MarketSession::Extended,
+            ..hedge_job(&symbol, 2.0, Direction::Buy)
+        };
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: job.offchain_order_id,
+                    shares: job.shares,
+                    direction: job.direction,
+                    executor: job.executor,
+                    threshold: job.threshold,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &job.offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares: job.shares,
+                    direction: job.direction,
+                    executor: job.executor,
+                    client_order_id: ClientOrderId::from_uuid(job.offchain_order_id.as_uuid()),
+                    kind: CounterTradeOrderKind::ExtendedHoursLimit {
+                        limit_price: Positive::new(Usd::new(float!(101.00))).unwrap(),
+                        close_flatten: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        job.perform(&ctx).await.unwrap();
+
+        assert!(matches!(
+            offchain_order_projection
+                .load(&job.offchain_order_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            OffchainOrder::Submitted {
+                market_session: MarketSession::Extended,
+                ..
+            }
+        ));
+        let poll_jobs: i64 =
+            sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(type_name::<PollOrderStatus>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            poll_jobs, 1,
+            "the idempotent recovery must re-arm polling even when reserved cash makes a fresh preflight reject"
         );
     }
 

@@ -1355,7 +1355,9 @@ mod tests {
             inventory_divergence_threshold: std::num::NonZeroU32::MIN,
             order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: 300,
+            close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
+            close_flatten_cross_max_bps: 400,
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::DryRun,
             telemetry: None,
@@ -2477,6 +2479,11 @@ mod tests {
                 cash: None,
             },
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
+            close_flatten_policy:
+                crate::trading::offchain::close_flatten::CloseFlattenPolicy::from_secs(900).unwrap(),
+            close_flatten_ramp:
+                crate::trading::offchain::close_flatten::CloseFlattenCrossRamp::new(100, 400)
+                    .unwrap(),
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
@@ -2958,6 +2965,7 @@ mod tests {
             submitted_at: block_timestamp,
             cancel_requested_at: block_timestamp,
             market_session: st0x_execution::MarketSession::Regular,
+            close_flatten: false,
         };
 
         let mut stdout = Vec::new();

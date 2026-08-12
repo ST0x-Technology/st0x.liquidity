@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
 use st0x_execution::{
-    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Positive,
-    SupportedExecutor, Symbol, TimeInForce,
+    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
+    DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, FractionalShares, Positive, SupportedExecutor,
+    Symbol, TimeInForce,
 };
 use st0x_finance::{Usd, Usdc};
 use std::collections::HashMap;
@@ -414,8 +415,10 @@ struct TokenizationConfig {
 struct BrokerConfig {
     counter_trade_slippage_bps: Option<u16>,
     extended_hours_reprice_timeout_secs: Option<u64>,
+    close_flatten_reprice_timeout_secs: Option<u64>,
     extended_hours_close_flatten_window_secs: Option<u64>,
     travel_rule: Option<TravelRuleConfig>,
+    close_flatten_cross_max_bps: Option<u16>,
 }
 
 /// Alpaca Travel Rule beneficiary identity, required for whitelist
@@ -485,6 +488,21 @@ impl BrokerConfig {
         Ok(configured)
     }
 
+    fn close_flatten_reprice_timeout_secs(&self) -> Result<u64, CtxError> {
+        let configured = self
+            .close_flatten_reprice_timeout_secs
+            .ok_or(CtxError::MissingCloseFlattenRepriceTimeout)?;
+
+        if configured == 0 || configured > MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS {
+            return Err(CtxError::CloseFlattenRepriceTimeoutOutOfRange {
+                configured,
+                max: MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS,
+            });
+        }
+
+        Ok(configured)
+    }
+
     fn extended_hours_close_flatten_window_secs(&self) -> Result<u64, CtxError> {
         let configured = self
             .extended_hours_close_flatten_window_secs
@@ -494,6 +512,30 @@ impl BrokerConfig {
             return Err(CtxError::ExtendedHoursCloseFlattenWindowOutOfRange {
                 configured,
                 max: MAX_EXTENDED_HOURS_CLOSE_FLATTEN_WINDOW_SECS,
+            });
+        }
+
+        Ok(configured)
+    }
+
+    /// The cross a close-flatten hedge reaches at the extended-session close.
+    ///
+    /// Placement ramps linearly from `ramp_base_bps` at the start of the window
+    /// to this value at the close, so it must be at least the base or the ramp
+    /// would run backwards (ADR 0019). The caller supplies the effective
+    /// runtime base from [`BrokerCtx::counter_trade_slippage_bps`], not the raw
+    /// configured field: DryRun uses the executor default, so validating against
+    /// the configured value would admit an inverted ramp.
+    fn close_flatten_cross_max_bps(&self, ramp_base_bps: u16) -> Result<u16, CtxError> {
+        let configured = self
+            .close_flatten_cross_max_bps
+            .ok_or(CtxError::MissingCloseFlattenCrossMaxBps)?;
+
+        if configured < ramp_base_bps || configured > MAX_COUNTER_TRADE_SLIPPAGE_BPS {
+            return Err(CtxError::CloseFlattenCrossMaxBpsOutOfRange {
+                configured,
+                min: ramp_base_bps,
+                max: MAX_COUNTER_TRADE_SLIPPAGE_BPS,
             });
         }
 
@@ -576,10 +618,16 @@ pub struct Ctx {
     /// Maximum age (seconds) for a live extended-hours limit hedge before it is
     /// cancelled so the next scan can place a fresh marketable limit.
     pub extended_hours_reprice_timeout_secs: u64,
+    /// Maximum age (seconds) for a close-flatten limit hedge before it is
+    /// cancelled and repriced further along the widening cross ramp.
+    pub close_flatten_reprice_timeout_secs: u64,
     /// Window (seconds) before a long-gap extended-session close during which
     /// the bot repeatedly cancels, refreshes, and replaces executable residual
     /// exposure with quote-crossing limits.
     pub extended_hours_close_flatten_window_secs: u64,
+    /// Cross a close-flatten hedge ramps to at the extended-session close,
+    /// starting from `counter_trade_slippage_bps` at the window's start.
+    pub close_flatten_cross_max_bps: u16,
     pub apalis_finished_job_cleanup_interval_secs: u64,
     pub broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
@@ -626,6 +674,16 @@ impl BrokerCtx {
         }
     }
 
+    /// Returns the slippage band the runtime uses as the base of extended-hours
+    /// counter-trade pricing.
+    #[must_use]
+    pub fn counter_trade_slippage_bps(&self) -> u16 {
+        match self {
+            Self::AlpacaBrokerApi(ctx) => ctx.counter_trade_slippage_bps,
+            Self::DryRun => DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        }
+    }
+
     fn execution_threshold(&self) -> Result<ExecutionThreshold, CtxError> {
         match self {
             Self::AlpacaBrokerApi(_) => Ok(ExecutionThreshold::dollar_value(*ALPACA_MIN_DOLLARS)?),
@@ -645,17 +703,24 @@ impl BrokerCtx {
                 api_secret,
                 account_id,
                 mode,
-            } => Ok(Self::AlpacaBrokerApi(AlpacaBrokerApiCtx {
-                api_key,
-                api_secret,
-                account_id,
-                mode,
-                asset_cache_ttl: std::time::Duration::from_secs(3600),
-                time_in_force: TimeInForce::default(),
-                counter_trade_slippage_bps: broker_config
-                    .ok_or(CtxError::MissingCounterTradeSlippageBps)?
-                    .counter_trade_slippage_bps()?,
-            })),
+            } => {
+                // Unwrap the section once: a per-field `ok_or` would make the
+                // error reported for a wholly missing `[broker]` depend on
+                // field declaration order, and every arm after the first
+                // would be unreachable.
+                let broker_config =
+                    broker_config.ok_or(CtxError::MissingCounterTradeSlippageBps)?;
+
+                Ok(Self::AlpacaBrokerApi(AlpacaBrokerApiCtx {
+                    api_key,
+                    api_secret,
+                    account_id,
+                    mode,
+                    asset_cache_ttl: std::time::Duration::from_secs(3600),
+                    time_in_force: TimeInForce::default(),
+                    counter_trade_slippage_bps: broker_config.counter_trade_slippage_bps()?,
+                }))
+            }
 
             BrokerSecrets::DryRun => Ok(Self::DryRun),
         }
@@ -696,8 +761,16 @@ impl std::fmt::Debug for Ctx {
                 &self.extended_hours_reprice_timeout_secs,
             )
             .field(
+                "close_flatten_reprice_timeout_secs",
+                &self.close_flatten_reprice_timeout_secs,
+            )
+            .field(
                 "extended_hours_close_flatten_window_secs",
                 &self.extended_hours_close_flatten_window_secs,
+            )
+            .field(
+                "close_flatten_cross_max_bps",
+                &self.close_flatten_cross_max_bps,
             )
             .field(
                 "apalis_finished_job_cleanup_interval_secs",
@@ -773,7 +846,9 @@ struct ValidatedParts {
     inventory_divergence_threshold: NonZeroU32,
     order_fill_poll_interval: u64,
     extended_hours_reprice_timeout_secs: u64,
+    close_flatten_reprice_timeout_secs: u64,
     extended_hours_close_flatten_window_secs: u64,
+    close_flatten_cross_max_bps: u16,
     apalis_finished_job_cleanup_interval_secs: u64,
     broker: BrokerCtx,
     telemetry: Option<TelemetryCtx>,
@@ -809,6 +884,63 @@ pub struct WalletMeta {
     pub kind: String,
     pub address: Address,
     pub organization_id: Option<String>,
+}
+
+/// Validates the config/secrets pairing and RPC prerequisites for wallet
+/// construction without connecting to either chain.
+fn validate_wallet_inputs(
+    wallet_config: Option<toml::Value>,
+    wallet_secrets: Option<toml::Value>,
+    base_rpc_url: Option<Url>,
+    ethereum_rpc_url: Option<Url>,
+    config_path: &Path,
+) -> Result<(WalletInputs, WalletMeta), CtxError> {
+    match (wallet_config, wallet_secrets) {
+        (Some(wallet_config), wallet_secrets) => {
+            // Credential-bearing backends require wallet secrets. A
+            // KMS-stamped Turnkey wallet is the sole exception because its
+            // credential is an IAM-gated KMS key in plaintext config.
+            let wallet_secrets = match wallet_secrets {
+                Some(wallet_secrets) => wallet_secrets,
+                None if wallet_config.get("kms_api_key").is_some() => {
+                    toml::Value::Table(toml::map::Map::new())
+                }
+                None => return Err(CtxError::WalletSecretsMissing),
+            };
+
+            let base_rpc_url = base_rpc_url.ok_or(CtxError::WalletMissingRpcUrl {
+                field: "base_rpc_url",
+            })?;
+            let ethereum_rpc_url = ethereum_rpc_url.ok_or(CtxError::WalletMissingRpcUrl {
+                field: "ethereum_rpc_url",
+            })?;
+            let wallet_meta = WalletMeta::deserialize(wallet_config.clone()).map_err(|source| {
+                CtxError::ConfigToml {
+                    path: config_path.to_path_buf(),
+                    source,
+                }
+            })?;
+
+            Ok((
+                WalletInputs {
+                    config: wallet_config,
+                    secrets: wallet_secrets,
+                    base_rpc_url,
+                    ethereum_rpc_url,
+                },
+                wallet_meta,
+            ))
+        }
+        (None, Some(_)) => {
+            warn!(
+                target: "startup",
+                "[wallet] secrets present but no [wallet] config section -- \
+                 wallet signing will not be available"
+            );
+            Err(CtxError::WalletNotConfigured)
+        }
+        (None, None) => Err(CtxError::WalletNotConfigured),
+    }
 }
 
 /// Rejects extended-hours trading that its prerequisite can never reach.
@@ -870,67 +1002,13 @@ fn parse_and_validate(
     let base_rpc_url = secrets.evm.base.take();
     let ethereum_rpc_url = secrets.evm.ethereum.take();
     let evm = EvmCtx::new(&config.raindex, secrets.evm)?;
-    // Validate wallet config/secrets pairing and required RPC URLs.
-    // Actual wallet construction (async, connects to RPC) is deferred.
-    let (wallet_inputs, wallet_meta) = match (config.wallet, secrets.wallet) {
-        (Some(wallet_config), wallet_secrets) => {
-            // Wallet secrets stay REQUIRED for every credential-bearing
-            // backend (private-key, and Turnkey with a stored
-            // api_private_key) -- the DigitalOcean deployments' shape,
-            // unchanged. The single exemption is a KMS-stamped Turnkey
-            // wallet ([wallet].kms_api_key in config): its credential is
-            // an IAM-gated KMS key, so there is nothing to put in the
-            // secrets file and an empty table stands in.
-            let wallet_secrets = match wallet_secrets {
-                Some(wallet_secrets) => wallet_secrets,
-                None if wallet_config.get("kms_api_key").is_some() => {
-                    toml::Value::Table(toml::map::Map::new())
-                }
-                None => return Err(CtxError::WalletSecretsMissing),
-            };
-
-            let Some(base_url) = base_rpc_url else {
-                return Err(CtxError::WalletMissingRpcUrl {
-                    field: "base_rpc_url",
-                });
-            };
-
-            let Some(eth_url) = ethereum_rpc_url else {
-                return Err(CtxError::WalletMissingRpcUrl {
-                    field: "ethereum_rpc_url",
-                });
-            };
-
-            let wallet_meta = WalletMeta::deserialize(wallet_config.clone()).map_err(|source| {
-                CtxError::ConfigToml {
-                    path: config_path.to_path_buf(),
-                    source,
-                }
-            })?;
-
-            (
-                WalletInputs {
-                    config: wallet_config,
-                    secrets: wallet_secrets,
-                    base_rpc_url: base_url,
-                    ethereum_rpc_url: eth_url,
-                },
-                wallet_meta,
-            )
-        }
-        (None, Some(_)) => {
-            // Wallet secrets present but no [wallet] in config.
-            // Common when sharing one secrets file across bot + CLI
-            // where the bot config doesn't need a wallet.
-            warn!(
-                target: "startup",
-                "[wallet] secrets present but no [wallet] config section -- \
-                 wallet signing will not be available"
-            );
-            return Err(CtxError::WalletNotConfigured);
-        }
-        (None, None) => return Err(CtxError::WalletNotConfigured),
-    };
+    let (wallet_inputs, wallet_meta) = validate_wallet_inputs(
+        config.wallet,
+        secrets.wallet,
+        base_rpc_url,
+        ethereum_rpc_url,
+        config_path,
+    )?;
 
     let trading_mode = match config.rebalancing {
         Some(rebalancing_config) => {
@@ -1003,7 +1081,9 @@ fn parse_and_validate(
 
     let ExtendedHoursBrokerWindows {
         reprice_timeout_secs: extended_hours_reprice_timeout_secs,
+        close_flatten_reprice_timeout_secs,
         close_flatten_window_secs: extended_hours_close_flatten_window_secs,
+        close_flatten_cross_max_bps,
     } = extended_hours_broker_windows(&broker, config.broker.as_ref(), &config.assets)?;
 
     let apalis_finished_job_cleanup_interval_secs =
@@ -1049,7 +1129,9 @@ fn parse_and_validate(
         inventory_divergence_threshold: config.inventory_divergence_threshold,
         order_fill_poll_interval,
         extended_hours_reprice_timeout_secs,
+        close_flatten_reprice_timeout_secs,
         extended_hours_close_flatten_window_secs,
+        close_flatten_cross_max_bps,
         apalis_finished_job_cleanup_interval_secs,
         broker,
         telemetry,
@@ -1095,7 +1177,9 @@ fn parse_and_validate(
 /// `Ctx` field.
 struct ExtendedHoursBrokerWindows {
     reprice_timeout_secs: u64,
+    close_flatten_reprice_timeout_secs: u64,
     close_flatten_window_secs: u64,
+    close_flatten_cross_max_bps: u16,
 }
 
 /// Resolves both extended-hours windows, requiring validated config values
@@ -1118,7 +1202,9 @@ fn extended_hours_broker_windows(
     if !requires_configured_windows {
         return Ok(ExtendedHoursBrokerWindows {
             reprice_timeout_secs: 0,
+            close_flatten_reprice_timeout_secs: 0,
             close_flatten_window_secs: 0,
+            close_flatten_cross_max_bps: broker.counter_trade_slippage_bps(),
         });
     }
 
@@ -1126,7 +1212,10 @@ fn extended_hours_broker_windows(
 
     Ok(ExtendedHoursBrokerWindows {
         reprice_timeout_secs: broker_config.extended_hours_reprice_timeout_secs()?,
+        close_flatten_reprice_timeout_secs: broker_config.close_flatten_reprice_timeout_secs()?,
         close_flatten_window_secs: broker_config.extended_hours_close_flatten_window_secs()?,
+        close_flatten_cross_max_bps: broker_config
+            .close_flatten_cross_max_bps(broker.counter_trade_slippage_bps())?,
     })
 }
 
@@ -1189,8 +1278,10 @@ impl Ctx {
             inventory_divergence_threshold: parts.inventory_divergence_threshold,
             order_fill_poll_interval: parts.order_fill_poll_interval,
             extended_hours_reprice_timeout_secs: parts.extended_hours_reprice_timeout_secs,
+            close_flatten_reprice_timeout_secs: parts.close_flatten_reprice_timeout_secs,
             extended_hours_close_flatten_window_secs: parts
                 .extended_hours_close_flatten_window_secs,
+            close_flatten_cross_max_bps: parts.close_flatten_cross_max_bps,
             apalis_finished_job_cleanup_interval_secs: parts
                 .apalis_finished_job_cleanup_interval_secs,
             broker: parts.broker,
@@ -1472,7 +1563,9 @@ impl Ctx {
             inventory_divergence_threshold,
             order_fill_poll_interval: 1,
             extended_hours_reprice_timeout_secs: 300,
+            close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
+            close_flatten_cross_max_bps: 400,
             apalis_finished_job_cleanup_interval_secs,
             broker,
             telemetry: None,
@@ -1538,6 +1631,18 @@ pub enum CtxError {
     )]
     MissingCounterTradeSlippageBps,
     #[error(
+        "[broker] close_flatten_cross_max_bps is required when using Alpaca \
+         Broker API, or when using DryRun with extended-hours counter-trading \
+         enabled for any asset"
+    )]
+    MissingCloseFlattenCrossMaxBps,
+    #[error(
+        "[broker] close_flatten_cross_max_bps {configured} is out of range; \
+         expected {min}..={max}, where the minimum is the effective runtime \
+         counter-trade slippage base"
+    )]
+    CloseFlattenCrossMaxBpsOutOfRange { configured: u16, min: u16, max: u16 },
+    #[error(
         "[broker] extended_hours_reprice_timeout_secs is required when using \
          Alpaca Broker API, or when using DryRun with extended-hours \
          counter-trading enabled for any asset"
@@ -1548,6 +1653,17 @@ pub enum CtxError {
          expected 1..={max}"
     )]
     ExtendedHoursRepriceTimeoutOutOfRange { configured: u64, max: u64 },
+    #[error(
+        "[broker] close_flatten_reprice_timeout_secs is required when using \
+         Alpaca Broker API, or when using DryRun with extended-hours \
+         counter-trading enabled for any asset"
+    )]
+    MissingCloseFlattenRepriceTimeout,
+    #[error(
+        "[broker] close_flatten_reprice_timeout_secs {configured} is out of range; \
+         expected 1..={max}"
+    )]
+    CloseFlattenRepriceTimeoutOutOfRange { configured: u64, max: u64 },
     #[error(
         "[broker] extended_hours_close_flatten_window_secs is required when \
          using Alpaca Broker API, or when using DryRun with extended-hours \
@@ -1646,9 +1762,17 @@ impl CtxError {
             Self::SecretsToml { .. } => "failed to parse secrets",
             Self::InvalidThreshold(_) => "invalid execution threshold",
             Self::MissingCounterTradeSlippageBps => "missing counter trade slippage bps",
+            Self::MissingCloseFlattenCrossMaxBps => "missing close flatten cross max bps",
+            Self::CloseFlattenCrossMaxBpsOutOfRange { .. } => {
+                "close flatten cross max bps out of range"
+            }
             Self::MissingExtendedHoursRepriceTimeout => "missing extended hours reprice timeout",
             Self::ExtendedHoursRepriceTimeoutOutOfRange { .. } => {
                 "extended hours reprice timeout out of range"
+            }
+            Self::MissingCloseFlattenRepriceTimeout => "missing close flatten reprice timeout",
+            Self::CloseFlattenRepriceTimeoutOutOfRange { .. } => {
+                "close flatten reprice timeout out of range"
             }
             Self::MissingExtendedHoursCloseFlattenWindow => {
                 "missing extended hours close flatten window"
@@ -1789,7 +1913,9 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         inventory_divergence_threshold: NonZeroU32::MIN,
         order_fill_poll_interval: 5,
         extended_hours_reprice_timeout_secs: 300,
+        close_flatten_reprice_timeout_secs: 60,
         extended_hours_close_flatten_window_secs: 900,
+        close_flatten_cross_max_bps: 400,
         apalis_finished_job_cleanup_interval_secs: 3600,
         broker: BrokerCtx::DryRun,
         telemetry: None,
@@ -1937,9 +2063,15 @@ mod tests {
 
     /// Minimal config with `[broker.travel_rule]` included, for tests
     /// that use Alpaca Broker API secrets (which now require travel rule
-    /// at startup).
-    fn alpaca_config_toml() -> NamedTempFile {
-        toml_file(
+    /// at startup). `close_flatten_cross_max_bps` is a parameter because it is
+    /// the one key a test may need to vary -- or omit, via `None` -- without
+    /// restating the whole file.
+    fn alpaca_config_toml(close_flatten_cross_max_bps: Option<u16>) -> NamedTempFile {
+        let cross_max_line = close_flatten_cross_max_bps
+            .map(|bps| format!("close_flatten_cross_max_bps = {bps}"))
+            .unwrap_or_default();
+
+        toml_file(&format!(
             r#"
             database_url = ":memory:"
             server_port = 8080
@@ -1963,7 +2095,9 @@ mod tests {
             [broker]
             counter_trade_slippage_bps = 100
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
+            {cross_max_line}
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Entity"
@@ -1971,6 +2105,34 @@ mod tests {
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
+        "#
+        ))
+    }
+
+    /// The Alpaca Broker API secrets every `alpaca_config_toml` test pairs
+    /// with: a complete `[evm]`/`[broker]`/`[wallet]`/`[issuance]` set, so a
+    /// test asserting on one config key does not also depend on which
+    /// secrets check runs first.
+    fn alpaca_secrets_toml() -> NamedTempFile {
+        toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+            [issuance]
+            base_url = "http://issuance.test:8000"
+            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
         "#,
         )
     }
@@ -1999,7 +2161,9 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
 
             [wallet]
@@ -2114,6 +2278,11 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(ctx.broker, BrokerCtx::DryRun));
+        assert_eq!(
+            ctx.close_flatten_cross_max_bps,
+            ctx.broker.counter_trade_slippage_bps(),
+            "an inactive DryRun ramp must still have a valid base-equal ceiling"
+        );
     }
 
     #[tokio::test]
@@ -2908,7 +3077,9 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
 
             [tokenization]
@@ -3198,7 +3369,9 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
 
             [tokenization]
@@ -3266,7 +3439,9 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
 
             [broker.travel_rule]
@@ -3342,7 +3517,9 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
 
             [broker.travel_rule]
@@ -3423,7 +3600,9 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
 
             [broker.travel_rule]
@@ -3609,7 +3788,9 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
 
             [broker.travel_rule]
@@ -3737,7 +3918,9 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
 
             [broker.travel_rule]
@@ -3816,6 +3999,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alpaca_broker_api_requires_close_flatten_cross_max_bps() {
+        let config = alpaca_config_toml(None);
+        let secrets = alpaca_secrets_toml();
+
+        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+
+        assert!(
+            matches!(err, CtxError::MissingCloseFlattenCrossMaxBps),
+            "Expected MissingCloseFlattenCrossMaxBps, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn alpaca_broker_api_requires_extended_hours_reprice_timeout_config() {
         let config = toml_file(
             r#"
@@ -3839,6 +4035,7 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
 
             [wallet]
             kind = "private-key"
@@ -3876,8 +4073,10 @@ mod tests {
         let broker = BrokerConfig {
             counter_trade_slippage_bps: Some(100),
             extended_hours_reprice_timeout_secs: Some(u64::MAX),
+            close_flatten_reprice_timeout_secs: Some(60),
             extended_hours_close_flatten_window_secs: Some(300),
             travel_rule: None,
+            close_flatten_cross_max_bps: None,
         };
 
         let error = broker.extended_hours_reprice_timeout_secs().unwrap_err();
@@ -3899,8 +4098,10 @@ mod tests {
         let broker = BrokerConfig {
             counter_trade_slippage_bps: Some(100),
             extended_hours_reprice_timeout_secs: Some(0),
+            close_flatten_reprice_timeout_secs: Some(60),
             extended_hours_close_flatten_window_secs: Some(300),
             travel_rule: None,
+            close_flatten_cross_max_bps: None,
         };
 
         let error = broker.extended_hours_reprice_timeout_secs().unwrap_err();
@@ -3919,8 +4120,10 @@ mod tests {
         let broker = BrokerConfig {
             counter_trade_slippage_bps: Some(100),
             extended_hours_reprice_timeout_secs: Some(MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS),
+            close_flatten_reprice_timeout_secs: Some(60),
             extended_hours_close_flatten_window_secs: Some(300),
             travel_rule: None,
+            close_flatten_cross_max_bps: None,
         };
 
         assert_eq!(
@@ -3930,12 +4133,39 @@ mod tests {
     }
 
     #[test]
+    fn close_flatten_reprice_timeout_is_required_and_rejects_zero() {
+        let missing = BrokerConfig {
+            counter_trade_slippage_bps: Some(100),
+            extended_hours_reprice_timeout_secs: Some(300),
+            close_flatten_reprice_timeout_secs: None,
+            extended_hours_close_flatten_window_secs: Some(300),
+            travel_rule: None,
+            close_flatten_cross_max_bps: None,
+        };
+        assert!(matches!(
+            missing.close_flatten_reprice_timeout_secs(),
+            Err(CtxError::MissingCloseFlattenRepriceTimeout)
+        ));
+
+        let zero = BrokerConfig {
+            close_flatten_reprice_timeout_secs: Some(0),
+            ..missing
+        };
+        assert!(matches!(
+            zero.close_flatten_reprice_timeout_secs(),
+            Err(CtxError::CloseFlattenRepriceTimeoutOutOfRange { configured: 0, .. })
+        ));
+    }
+
+    #[test]
     fn extended_hours_close_flatten_window_rejects_values_chrono_cannot_represent() {
         let broker = BrokerConfig {
             counter_trade_slippage_bps: Some(100),
             extended_hours_reprice_timeout_secs: Some(300),
+            close_flatten_reprice_timeout_secs: Some(60),
             extended_hours_close_flatten_window_secs: Some(u64::MAX),
             travel_rule: None,
+            close_flatten_cross_max_bps: None,
         };
 
         let error = broker
@@ -3959,10 +4189,12 @@ mod tests {
         let broker = BrokerConfig {
             counter_trade_slippage_bps: Some(100),
             extended_hours_reprice_timeout_secs: Some(300),
+            close_flatten_reprice_timeout_secs: Some(60),
             extended_hours_close_flatten_window_secs: Some(
                 MAX_EXTENDED_HOURS_CLOSE_FLATTEN_WINDOW_SECS,
             ),
             travel_rule: None,
+            close_flatten_cross_max_bps: None,
         };
 
         assert_eq!(
@@ -3995,7 +4227,9 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
 
             [wallet]
             kind = "private-key"
@@ -4052,7 +4286,9 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 0
 
             [wallet]
@@ -4174,7 +4410,9 @@ mod tests {
             [broker]
             counter_trade_slippage_bps = 10000
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
+            close_flatten_cross_max_bps = 400
         "#,
         );
         let secrets = toml_file(
@@ -4233,7 +4471,9 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 9999
+            close_flatten_cross_max_bps = 9999
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
 
             [broker.travel_rule]
@@ -4270,7 +4510,9 @@ mod tests {
             .await
             .unwrap();
 
-        let BrokerCtx::AlpacaBrokerApi(broker) = ctx.broker else {
+        assert_eq!(ctx.broker.counter_trade_slippage_bps(), 9999);
+
+        let BrokerCtx::AlpacaBrokerApi(broker) = &ctx.broker else {
             panic!("expected AlpacaBrokerApi broker");
         };
 
@@ -4278,35 +4520,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_flatten_cross_max_bps_accepts_the_slippage_base_as_its_floor() {
+        let config = alpaca_config_toml(Some(100));
+        let secrets = alpaca_secrets_toml();
+
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.broker.counter_trade_slippage_bps(), 100);
+        assert_eq!(ctx.close_flatten_cross_max_bps, 100);
+    }
+
+    /// The ramp runs from `counter_trade_slippage_bps` up to this ceiling, so a
+    /// ceiling below the base would run it backwards and price a close-flatten
+    /// hedge *less* aggressively as the close approached.
+    #[tokio::test]
+    async fn close_flatten_cross_max_bps_below_the_slippage_base_is_rejected() {
+        let config = alpaca_config_toml(Some(50));
+        let secrets = alpaca_secrets_toml();
+
+        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+
+        let CtxError::CloseFlattenCrossMaxBpsOutOfRange {
+            configured,
+            min,
+            max,
+        } = err
+        else {
+            panic!("expected CloseFlattenCrossMaxBpsOutOfRange, got: {err:?}");
+        };
+        assert_eq!((configured, min, max), (50, 100, 9_999));
+    }
+
+    /// The ceiling shares `counter_trade_slippage_bps`'s upper bound: a cross of
+    /// 100% or more is a typo, not a tuning choice.
+    #[tokio::test]
+    async fn close_flatten_cross_max_bps_above_the_slippage_ceiling_is_rejected() {
+        let config = alpaca_config_toml(Some(10_000));
+        let secrets = alpaca_secrets_toml();
+
+        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+
+        let CtxError::CloseFlattenCrossMaxBpsOutOfRange {
+            configured,
+            min,
+            max,
+        } = err
+        else {
+            panic!("expected CloseFlattenCrossMaxBpsOutOfRange, got: {err:?}");
+        };
+        assert_eq!((configured, min, max), (10_000, 100, 9_999));
+    }
+
+    #[tokio::test]
     async fn alpaca_broker_api_executor_uses_dollar_threshold() {
-        let config = alpaca_config_toml();
-        let secrets = toml_file(
-            r#"
-            [evm]
-            rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-
-            [broker]
-            type = "alpaca-broker-api"
-            api_key = "test-key"
-            api_secret = "test-secret"
-            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
-
-            [wallet]
-            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-
-            [issuance]
-            base_url = "http://issuance.test:8000"
-            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
-        "#,
-        );
+        let config = alpaca_config_toml(Some(400));
+        let secrets = alpaca_secrets_toml();
 
         let ctx = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap();
         let expected = ExecutionThreshold::dollar_value(Usdc::new(float!(2))).unwrap();
         assert_eq!(ctx.execution_threshold, expected);
+        assert_eq!(ctx.close_flatten_cross_max_bps, 400);
     }
 
     #[tokio::test]
@@ -4683,8 +4960,14 @@ mod tests {
             .counter_trade_slippage_bps
             .expect("prod config must set [broker].counter_trade_slippage_bps");
         broker
+            .close_flatten_cross_max_bps
+            .expect("prod config must set [broker].close_flatten_cross_max_bps");
+        broker
             .extended_hours_reprice_timeout_secs
             .expect("prod config must set [broker].extended_hours_reprice_timeout_secs");
+        broker
+            .close_flatten_reprice_timeout_secs
+            .expect("prod config must set [broker].close_flatten_reprice_timeout_secs");
         broker
             .extended_hours_close_flatten_window_secs
             .expect("prod config must set [broker].extended_hours_close_flatten_window_secs");
@@ -4711,6 +4994,68 @@ mod tests {
     }
 
     #[test]
+    fn staging_config_toml_is_valid() {
+        let config_str = include_str!("../../../config/staging/st0x-hedge.toml");
+        let config: Config = toml::from_str(config_str).unwrap();
+
+        let broker = config
+            .broker
+            .expect("staging config must include the [broker] section");
+
+        broker
+            .counter_trade_slippage_bps
+            .expect("staging config must set [broker].counter_trade_slippage_bps");
+        broker
+            .close_flatten_cross_max_bps
+            .expect("staging config must set [broker].close_flatten_cross_max_bps");
+        broker
+            .extended_hours_reprice_timeout_secs
+            .expect("staging config must set [broker].extended_hours_reprice_timeout_secs");
+        broker
+            .close_flatten_reprice_timeout_secs
+            .expect("staging config must set [broker].close_flatten_reprice_timeout_secs");
+        broker
+            .extended_hours_close_flatten_window_secs
+            .expect("staging config must set [broker].extended_hours_close_flatten_window_secs");
+        broker
+            .travel_rule
+            .expect("staging config must include [broker.travel_rule]")
+            .validated()
+            .unwrap();
+    }
+
+    #[test]
+    fn staging_gcp_config_toml_is_valid() {
+        let config_str = include_str!("../../../config/staging-gcp/st0x-hedge.toml");
+        let config: Config = toml::from_str(config_str).unwrap();
+
+        let broker = config
+            .broker
+            .expect("staging-gcp config must include the [broker] section");
+
+        broker
+            .counter_trade_slippage_bps
+            .expect("staging-gcp config must set [broker].counter_trade_slippage_bps");
+        broker
+            .close_flatten_cross_max_bps
+            .expect("staging-gcp config must set [broker].close_flatten_cross_max_bps");
+        broker
+            .extended_hours_reprice_timeout_secs
+            .expect("staging-gcp config must set [broker].extended_hours_reprice_timeout_secs");
+        broker
+            .close_flatten_reprice_timeout_secs
+            .expect("staging-gcp config must set [broker].close_flatten_reprice_timeout_secs");
+        broker.extended_hours_close_flatten_window_secs.expect(
+            "staging-gcp config must set [broker].extended_hours_close_flatten_window_secs",
+        );
+        broker
+            .travel_rule
+            .expect("staging-gcp config must include [broker.travel_rule]")
+            .validated()
+            .unwrap();
+    }
+
+    #[test]
     fn s01_issuer_config_toml_is_valid() {
         let config_str = include_str!("../../../config/s01-issuer.toml");
         let config: Config = toml::from_str(config_str).unwrap();
@@ -4721,8 +5066,14 @@ mod tests {
             .broker
             .expect("s01-issuer config must include [broker] for the dividend buy leg");
         broker
+            .close_flatten_cross_max_bps
+            .expect("s01-issuer config must set [broker].close_flatten_cross_max_bps");
+        broker
             .extended_hours_reprice_timeout_secs
             .expect("s01-issuer config must set [broker].extended_hours_reprice_timeout_secs");
+        broker
+            .close_flatten_reprice_timeout_secs
+            .expect("s01-issuer config must set [broker].close_flatten_reprice_timeout_secs");
         broker
             .extended_hours_close_flatten_window_secs
             .expect("s01-issuer config must set [broker].extended_hours_close_flatten_window_secs");
@@ -6304,7 +6655,9 @@ mod tests {
 
             [broker]
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
+            close_flatten_cross_max_bps = 400
 
             [wallet]
             kind = "private-key"
@@ -6388,7 +6741,9 @@ mod tests {
 
             [broker]
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
+            close_flatten_cross_max_bps = 400
 
             [wallet]
             kind = "private-key"
@@ -6402,7 +6757,108 @@ mod tests {
             .unwrap();
 
         assert_eq!(ctx.extended_hours_reprice_timeout_secs, 300);
+        assert_eq!(ctx.close_flatten_reprice_timeout_secs, 60);
         assert_eq!(ctx.extended_hours_close_flatten_window_secs, 900);
+    }
+
+    /// DryRun config with extended hours enabled, so the close-flatten keys are
+    /// required. `counter_trade_slippage_bps` is a parameter because DryRun
+    /// never reads it: the ramp base is the executor default, and validation
+    /// must be checked against the base the runtime actually uses.
+    fn dry_run_extended_hours_config_toml(
+        counter_trade_slippage_bps: Option<u16>,
+        close_flatten_cross_max_bps: u16,
+    ) -> NamedTempFile {
+        let slippage_line = counter_trade_slippage_bps
+            .map(|bps| format!("counter_trade_slippage_bps = {bps}"))
+            .unwrap_or_default();
+
+        toml_file(&format!(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+
+            [assets.equities.AAPL]
+            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "enabled"
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "legacy"
+            inventory_adapters = []
+            vault_owner = "0x0000000000000000000000000000000000000001"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [broker]
+            {slippage_line}
+            extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
+            extended_hours_close_flatten_window_secs = 900
+            close_flatten_cross_max_bps = {close_flatten_cross_max_bps}
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#
+        ))
+    }
+
+    /// A DryRun ceiling equal to a configured base still runs the ramp
+    /// backwards, because DryRun builds the ramp from the executor default
+    /// instead of the configured value.
+    #[test]
+    fn dry_run_close_flatten_cross_max_bps_below_the_executor_default_is_rejected() {
+        let config = dry_run_extended_hours_config_toml(Some(50), 50);
+        let secrets = dry_run_secrets_toml();
+
+        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let message = err.to_string();
+
+        let CtxError::CloseFlattenCrossMaxBpsOutOfRange {
+            configured,
+            min,
+            max,
+        } = err
+        else {
+            panic!("expected CloseFlattenCrossMaxBpsOutOfRange, got: {err:?}");
+        };
+        assert_eq!(
+            (configured, min, max),
+            (50, DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, 9_999)
+        );
+        assert!(message.contains("minimum is the effective runtime counter-trade slippage base"));
+    }
+
+    /// The mirror case: a ceiling at the executor default is accepted even
+    /// though the configured base sits below it, since the configured base is
+    /// dead weight under DryRun.
+    #[tokio::test]
+    async fn dry_run_close_flatten_cross_max_bps_accepts_the_executor_default_as_its_floor() {
+        let config =
+            dry_run_extended_hours_config_toml(Some(50), DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS);
+        let secrets = dry_run_secrets_toml();
+
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ctx.close_flatten_cross_max_bps,
+            DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS
+        );
+        assert_eq!(
+            ctx.broker.counter_trade_slippage_bps(),
+            DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS
+        );
     }
 
     #[test]
@@ -6434,6 +6890,7 @@ mod tests {
 
             [broker]
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
 
             [wallet]
             kind = "private-key"
@@ -6567,7 +7024,9 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
 
             [broker.travel_rule]
@@ -6624,7 +7083,9 @@ mod tests {
 
             [broker]
             counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
             extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
 
             [broker.travel_rule]

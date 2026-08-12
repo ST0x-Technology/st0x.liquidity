@@ -162,12 +162,16 @@ threshold-based).
 Add credentials to your TOML config file under the `[broker]` section (see
 `example.config.toml` and `example.secrets.toml`). Alpaca configs must also set
 `broker.counter_trade_slippage_bps`, which controls the buy-side preflight
-buffer and the protection bound on extended-hours limit orders, and
-`broker.extended_hours_close_flatten_window_secs`, which is required and sets
-the length of the final close-flatten window before weekends, exchange holidays,
-or an unknown next session. During that window, those limits cross the current
-SIP bid/ask and are refreshed on the extended-hours reprice cycle. Ordinary
-weekday closes keep the normal latest-trade pricing path.
+buffer and the protection bound on extended-hours limit orders;
+`broker.extended_hours_reprice_timeout_secs`, the ordinary extended-hours
+reprice cadence; `broker.close_flatten_reprice_timeout_secs`, the faster cadence
+inside close-flatten; `broker.extended_hours_close_flatten_window_secs`, the
+length of the final window before weekends, exchange holidays, or an unknown
+next session; and `broker.close_flatten_cross_max_bps`, the maximum cross at the
+session close. All five are required and have no implicit defaults. Ordinary
+extended-hours orders retain their 300-second timeout, while close-flatten
+orders use the dedicated 60-second timeout and cross progressively wider until
+the session closes.
 
 ## Deployment
 
