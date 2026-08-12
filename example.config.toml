@@ -100,6 +100,14 @@ address = "0xfcad0b19bb29d4674531d6f115237e16afce377c"
 # kind = "turnkey"
 # address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 # organization_id = "org-example-turnkey-org-id"
+#
+# Turnkey authentication comes from exactly ONE of:
+#   - api_private_key in the SECRETS file [wallet] section (stored key), or
+#   - kms_api_key here: a GCP KMS EC_SIGN_P256_SHA256 key version whose
+#     public half is registered as a Turnkey API user. Requests are then
+#     stamped via the runtime's ambient GCP identity (IAM, keyless) and
+#     the secrets file needs no [wallet] section at all.
+# kms_api_key = "projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>/cryptoKeyVersions/1"
 
 # Alpaca tokenization settings. Required when [rebalancing] is configured
 # (used for equity redemptions). Also needed for CLI commands: alpaca-redeem

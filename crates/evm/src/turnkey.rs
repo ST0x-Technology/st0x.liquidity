@@ -35,6 +35,7 @@ use turnkey_client::generated::{
 };
 use turnkey_client::{RetryConfig, TurnkeyClientError};
 
+use crate::gcp_kms_stamper::{GcpKmsStamper, GcpKmsStamperError};
 use crate::inflight_nonces::InFlightNonces;
 use crate::nonce::ResettableNonceManager;
 use crate::submit::{release_in_flight_after_wait, send_with_recovery};
@@ -77,11 +78,31 @@ pub enum TurnkeyError {
     Signer(#[from] TracingTurnkeySignerError),
 }
 
+/// Error from one Turnkey request round-trip: either the client/HTTP
+/// layer or, for KMS-stamped requests, the stamping step itself.
+#[derive(Debug, thiserror::Error)]
+pub enum TurnkeyRequestError {
+    #[error(transparent)]
+    Client(#[from] TurnkeyClientError),
+    #[error(transparent)]
+    KmsStamper(#[from] GcpKmsStamperError),
+}
+
 /// Errors that can occur when using the traced Turnkey signer.
 #[derive(Debug, thiserror::Error)]
 pub enum TracingTurnkeySignerError {
     #[error(transparent)]
-    TurnkeyClient(#[from] TurnkeyClientError),
+    TurnkeyClient(#[from] TurnkeyRequestError),
+    #[error(
+        "Turnkey credentials ambiguous: both [wallet].kms_api_key (config) and \
+         api_private_key (secrets) are set -- keep exactly one"
+    )]
+    AmbiguousCredentials,
+    #[error(
+        "Turnkey credentials missing: set either [wallet].kms_api_key in config \
+         (KMS-stamped, keyless) or api_private_key in [wallet] secrets"
+    )]
+    MissingCredentials,
     #[error("invalid hex string: {0}")]
     Hex(#[from] hex::FromHexError),
     #[error("invalid EIP-2718 signed transaction envelope: {0}")]
@@ -102,24 +123,50 @@ pub enum TracingTurnkeySignerError {
     SystemTime { source: SystemTimeError },
 }
 
-/// Non-secret Turnkey configuration: wallet address and organization ID.
+/// Full resource name of a GCP KMS `EC_SIGN_P256_SHA256` key version.
+///
+/// Shaped `projects/.../cryptoKeyVersions/N`; its PUBLIC half is
+/// registered as a Turnkey API user. Non-secret — it names an IAM-gated
+/// key, it is not a credential itself. See [`crate::gcp_kms_stamper`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(transparent)]
+pub struct TurnkeyKmsApiKey(String);
+
+impl TurnkeyKmsApiKey {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+/// Non-secret Turnkey configuration: wallet address, organization ID,
+/// and (for keyless KMS stamping) the KMS API-key version name.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TurnkeySettings {
     pub address: Address,
     pub organization_id: TurnkeyOrganizationId,
+    /// When set, Turnkey requests are stamped by this KMS key via the
+    /// runtime's ambient GCP identity and `[wallet]` secrets need no
+    /// `api_private_key` (setting both is refused as ambiguous).
+    #[serde(default)]
+    pub kms_api_key: Option<TurnkeyKmsApiKey>,
 }
 
-/// Secret Turnkey credential: the P-256 API private key.
-#[derive(Clone, Deserialize)]
+/// Secret Turnkey credential: the P-256 API private key. Absent when
+/// the KMS stamper is configured ([`TurnkeySettings::kms_api_key`]).
+#[derive(Clone, Default, Deserialize)]
 pub struct TurnkeyCredentials {
-    pub api_private_key: TurnkeyApiPrivateKey,
+    #[serde(default)]
+    pub api_private_key: Option<TurnkeyApiPrivateKey>,
 }
 
 impl std::fmt::Debug for TurnkeyCredentials {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("TurnkeyCredentials")
-            .field("api_private_key", &"[REDACTED]")
+            .field(
+                "api_private_key",
+                &self.api_private_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -199,18 +246,38 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
         let TurnkeySettings {
             address,
             organization_id,
+            kms_api_key,
         } = ctx.settings;
         let TurnkeyCredentials { api_private_key } = ctx.credentials;
 
         let chain_id = ctx.provider.get_chain_id().await?;
 
-        let signer = TracingTurnkeySigner::from_api_key(
-            &api_private_key,
-            organization_id,
-            address,
-            Some(chain_id),
-        )
-        .map_err(TurnkeyError::from)?;
+        // Exactly one credential source: a stored P-256 API key (secrets)
+        // or a KMS-held one addressed from config (keyless). Both set is
+        // ambiguous and refused rather than silently preferring one.
+        let stamper = match (kms_api_key, api_private_key) {
+            (Some(TurnkeyKmsApiKey(key_version)), None) => ApiStamper::GcpKms(
+                GcpKmsStamper::new(key_version)
+                    .await
+                    .map_err(|error| TurnkeyError::Signer(error.into()))?,
+            ),
+            (None, Some(api_private_key)) => ApiStamper::local(&api_private_key)
+                .map_err(|error| TurnkeyError::Signer(error.into()))?,
+            (Some(_), Some(_)) => {
+                return Err(
+                    TurnkeyError::Signer(TracingTurnkeySignerError::AmbiguousCredentials).into(),
+                );
+            }
+            (None, None) => {
+                return Err(
+                    TurnkeyError::Signer(TracingTurnkeySignerError::MissingCredentials).into(),
+                );
+            }
+        };
+
+        let client = TracingTurnkeyClient::for_stamper(stamper)
+            .map_err(|error| TurnkeyError::Signer(error.into()))?;
+        let signer = TracingTurnkeySigner::new(client, organization_id, address, Some(chain_id));
 
         let eth_wallet = EthereumWallet::from(signer);
 
@@ -283,10 +350,62 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
     }
 }
 
+impl From<GcpKmsStamperError> for TracingTurnkeySignerError {
+    fn from(error: GcpKmsStamperError) -> Self {
+        Self::TurnkeyClient(TurnkeyRequestError::KmsStamper(error))
+    }
+}
+
+impl From<TurnkeyClientError> for TracingTurnkeySignerError {
+    fn from(error: TurnkeyClientError) -> Self {
+        Self::TurnkeyClient(TurnkeyRequestError::Client(error))
+    }
+}
+
+/// How outgoing Turnkey requests are stamped: with a locally-held P-256
+/// API private key (the classic stored credential) or via a GCP
+/// KMS-held key signed through the runtime's ambient IAM identity
+/// (keyless — see [`crate::gcp_kms_stamper`]).
+enum ApiStamper {
+    Local(TurnkeyP256ApiKey),
+    GcpKms(GcpKmsStamper),
+}
+
+impl std::fmt::Debug for ApiStamper {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(_) => formatter.write_str("ApiStamper::Local([REDACTED])"),
+            Self::GcpKms(stamper) => formatter
+                .debug_tuple("ApiStamper::GcpKms")
+                .field(stamper)
+                .finish(),
+        }
+    }
+}
+
+impl ApiStamper {
+    fn local(api_private_key: &TurnkeyApiPrivateKey) -> Result<Self, TurnkeyClientError> {
+        let TurnkeyApiPrivateKey(api_key_hex) = api_private_key;
+        Ok(Self::Local(TurnkeyP256ApiKey::from_strings(
+            api_key_hex,
+            None,
+        )?))
+    }
+
+    async fn stamp(&self, body: &[u8]) -> Result<StampHeader, TurnkeyRequestError> {
+        match self {
+            Self::Local(api_key) => api_key
+                .stamp(body)
+                .map_err(|error| TurnkeyRequestError::Client(error.into())),
+            Self::GcpKms(stamper) => Ok(stamper.stamp(body).await?),
+        }
+    }
+}
+
 struct TracingTurnkeyClient {
     http: reqwest::Client,
     base_url: String,
-    api_key: TurnkeyP256ApiKey,
+    stamper: ApiStamper,
     retry_config: RetryConfig,
 }
 
@@ -300,9 +419,7 @@ impl std::fmt::Debug for TracingTurnkeyClient {
 }
 
 impl TracingTurnkeyClient {
-    fn from_api_key(api_private_key: &TurnkeyApiPrivateKey) -> Result<Self, TurnkeyClientError> {
-        let TurnkeyApiPrivateKey(api_key_hex) = api_private_key;
-        let api_key = TurnkeyP256ApiKey::from_strings(api_key_hex, None)?;
+    fn for_stamper(stamper: ApiStamper) -> Result<Self, TurnkeyClientError> {
         Ok(Self::new(
             reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
@@ -310,7 +427,7 @@ impl TracingTurnkeyClient {
                 .build()
                 .map_err(TurnkeyClientError::ReqwestBuilder)?,
             "https://api.turnkey.com".to_string(),
-            api_key,
+            stamper,
             RetryConfig::default(),
         ))
     }
@@ -327,7 +444,7 @@ impl TracingTurnkeyClient {
                 .build()
                 .map_err(TurnkeyClientError::ReqwestBuilder)?,
             base_url,
-            api_key,
+            ApiStamper::Local(api_key),
             RetryConfig::default(),
         ))
     }
@@ -335,13 +452,13 @@ impl TracingTurnkeyClient {
     fn new(
         http: reqwest::Client,
         base_url: String,
-        api_key: TurnkeyP256ApiKey,
+        stamper: ApiStamper,
         retry_config: RetryConfig,
     ) -> Self {
         Self {
             http,
             base_url,
-            api_key,
+            stamper,
             retry_config,
         }
     }
@@ -358,7 +475,7 @@ impl TracingTurnkeyClient {
         organization_id: TurnkeyOrganizationId,
         timestamp_ms: u128,
         params: SignTransactionIntentV2,
-    ) -> Result<SignTransactionResult, TurnkeyClientError> {
+    ) -> Result<SignTransactionResult, TurnkeyRequestError> {
         let TurnkeyOrganizationId(organization_id) = organization_id;
         let request = SignTransactionRequest {
             r#type: "ACTIVITY_TYPE_SIGN_TRANSACTION_V2".to_string(),
@@ -378,8 +495,9 @@ impl TracingTurnkeyClient {
         match inner {
             result::Inner::SignTransactionResult(result) => Ok(result),
             other => Err(TurnkeyClientError::UnexpectedInnerActivityResult(
-                serde_json::to_string(&other)?,
-            )),
+                serde_json::to_string(&other).map_err(TurnkeyClientError::from)?,
+            )
+            .into()),
         }
     }
 
@@ -387,7 +505,7 @@ impl TracingTurnkeyClient {
         &self,
         request: &Request,
         path: &str,
-    ) -> Result<Activity, TurnkeyClientError> {
+    ) -> Result<Activity, TurnkeyRequestError> {
         let mut retry_count = 0;
 
         loop {
@@ -400,41 +518,57 @@ impl TracingTurnkeyClient {
                 ActivityStatus::Completed => return Ok(activity),
                 ActivityStatus::Pending => {
                     if retry_count >= self.retry_config.max_retries {
-                        return Err(TurnkeyClientError::ExceededRetries(retry_count));
+                        return Err(TurnkeyClientError::ExceededRetries(retry_count).into());
                     }
 
                     retry_count += 1;
                     tokio::time::sleep(self.retry_config.compute_delay(retry_count)).await;
                 }
                 ActivityStatus::Failed => {
-                    return Err(TurnkeyClientError::ActivityFailed(activity.failure));
+                    return Err(TurnkeyClientError::ActivityFailed(activity.failure).into());
                 }
                 ActivityStatus::ConsensusNeeded => {
-                    return Err(TurnkeyClientError::ActivityRequiresApproval(activity.id));
+                    return Err(TurnkeyClientError::ActivityRequiresApproval(activity.id).into());
                 }
                 ActivityStatus::Unspecified
                 | ActivityStatus::Created
                 | ActivityStatus::Rejected => {
                     return Err(TurnkeyClientError::UnexpectedActivityStatus(
                         activity.status.as_str_name().to_string(),
-                    ));
+                    )
+                    .into());
                 }
             }
         }
     }
 
+    /// Serializes the request, stamps its exact bytes (locally or via
+    /// KMS), and dispatches — the split exists because stamping can now
+    /// fail with a non-client error ([`GcpKmsStamperError`]).
     async fn process_request<Request, Response>(
         &self,
         request: &Request,
         path: &str,
-    ) -> Result<Response, TurnkeyClientError>
+    ) -> Result<Response, TurnkeyRequestError>
     where
         Request: Serialize + Sync,
         Response: serde::de::DeserializeOwned,
     {
+        let post_body = serde_json::to_string(request).map_err(TurnkeyClientError::from)?;
+        let stamp = self.stamper.stamp(post_body.as_bytes()).await?;
+        Ok(self.dispatch(path, stamp, post_body).await?)
+    }
+
+    async fn dispatch<Response>(
+        &self,
+        path: &str,
+        StampHeader { name, value }: StampHeader,
+        post_body: String,
+    ) -> Result<Response, TurnkeyClientError>
+    where
+        Response: serde::de::DeserializeOwned,
+    {
         let url = format!("{}{}", self.base_url, path);
-        let post_body = serde_json::to_string(request)?;
-        let StampHeader { name, value } = self.api_key.stamp(post_body.as_bytes())?;
         let response = self
             .http
             .post(&url)
@@ -540,16 +674,6 @@ impl TracingTurnkeySigner {
             address,
             chain_id,
         }
-    }
-
-    fn from_api_key(
-        api_private_key: &TurnkeyApiPrivateKey,
-        organization_id: TurnkeyOrganizationId,
-        address: Address,
-        chain_id: Option<ChainId>,
-    ) -> Result<Self, TracingTurnkeySignerError> {
-        let client = TracingTurnkeyClient::from_api_key(api_private_key)?;
-        Ok(Self::new(client, organization_id, address, chain_id))
     }
 
     /// Decodes Turnkey's signed-transaction envelope and extracts its
@@ -759,7 +883,7 @@ mod tests {
                 .build()
                 .unwrap(),
             server.base_url(),
-            test_api_key(),
+            ApiStamper::Local(test_api_key()),
             retry_config,
         )
     }
@@ -1162,7 +1286,10 @@ mod tests {
             .unwrap_err();
 
         mock.assert();
-        assert!(matches!(error, TurnkeyClientError::ExceededRetries(0)));
+        assert!(matches!(
+            error,
+            TurnkeyRequestError::Client(TurnkeyClientError::ExceededRetries(0))
+        ));
     }
 
     #[tracing_test::traced_test]
@@ -1286,7 +1413,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            TurnkeyClientError::UnexpectedMimeType(mime) if mime == "text/html"
+            TurnkeyRequestError::Client(TurnkeyClientError::UnexpectedMimeType(mime)) if mime == "text/html"
         ));
     }
 
@@ -1316,7 +1443,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        let TurnkeyClientError::Decode(message, _) = error else {
+        let TurnkeyRequestError::Client(TurnkeyClientError::Decode(message, _)) = error else {
             panic!("expected Decode error, got: {error:?}");
         };
         assert!(
@@ -1327,6 +1454,121 @@ mod tests {
             !message.contains("sensitive-signed-tx-marker"),
             "response body leaked into error message: {message}"
         );
+    }
+
+    /// Builds a WalletCtx in the shape the DigitalOcean deployments use
+    /// TODAY: a stored P-256 api_private_key in [wallet] secrets, no
+    /// kms_api_key anywhere.
+    fn stored_key_ctx<P: Provider>(
+        provider: P,
+    ) -> WalletCtx<TurnkeySettings, TurnkeyCredentials, P> {
+        WalletCtx {
+            settings: TurnkeySettings {
+                address: Address::random(),
+                organization_id: TurnkeyOrganizationId::new("org-test".to_string()),
+                kms_api_key: None,
+            },
+            credentials: TurnkeyCredentials {
+                // A random P-256 scalar, hex-encoded — the exact shape the
+                // secrets file carries. (turnkey_api_key_stamper 0.4 has no
+                // private-key accessor on its generated keys, so mint one
+                // directly with p256.)
+                api_private_key: Some(TurnkeyApiPrivateKey::new(hex::encode(
+                    p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng)
+                        .to_bytes(),
+                ))),
+            },
+            provider,
+            required_confirmations: 1,
+        }
+    }
+
+    /// BACKWARD COMPATIBILITY: the live DO prod/staging shape -- stored
+    /// api_private_key, no kms_api_key -- must keep constructing a wallet
+    /// exactly as before. The KMS stamper is strictly opt-in; this test
+    /// fails if it ever becomes required.
+    #[tokio::test]
+    async fn new_accepts_stored_api_key_without_kms() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+
+        let ctx = stored_key_ctx(provider);
+        let expected_address = ctx.settings.address;
+
+        let wallet = TurnkeyWallet::new(ctx)
+            .await
+            .expect("stored-api-key (DigitalOcean) wallets must keep working");
+
+        assert_eq!(wallet.address(), expected_address);
+    }
+
+    /// A config carrying BOTH credential sources is refused rather than
+    /// silently preferring one -- an operator mid-migration must be told,
+    /// not guessed at. Checked before any KMS call, so no network needed.
+    #[tokio::test]
+    async fn new_rejects_both_credential_sources() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+
+        let mut ctx = stored_key_ctx(provider);
+        ctx.settings.kms_api_key = Some(TurnkeyKmsApiKey::new(
+            "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1".to_string(),
+        ));
+
+        let error = TurnkeyWallet::new(ctx)
+            .await
+            .expect_err("both credential sources must be refused");
+
+        assert!(
+            matches!(
+                error,
+                EvmError::Turnkey(TurnkeyError::Signer(
+                    TracingTurnkeySignerError::AmbiguousCredentials
+                ))
+            ),
+            "expected AmbiguousCredentials, got: {error:?}"
+        );
+    }
+
+    /// Neither source configured fails at startup with an actionable
+    /// message instead of a confusing auth failure on the first signature.
+    #[tokio::test]
+    async fn new_rejects_missing_credentials() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+
+        let mut ctx = stored_key_ctx(provider);
+        ctx.credentials.api_private_key = None;
+
+        let error = TurnkeyWallet::new(ctx)
+            .await
+            .expect_err("no credential source must be refused");
+
+        assert!(
+            matches!(
+                error,
+                EvmError::Turnkey(TurnkeyError::Signer(
+                    TracingTurnkeySignerError::MissingCredentials
+                ))
+            ),
+            "expected MissingCredentials, got: {error:?}"
+        );
+    }
+
+    /// BACKWARD COMPATIBILITY: the exact [wallet] TOML the DO prod and
+    /// staging configs ship (no kms_api_key key at all) still
+    /// deserializes -- the new field is additive and defaulted.
+    #[test]
+    fn existing_wallet_config_toml_still_deserializes() {
+        let settings: TurnkeySettings = toml::from_str(
+            r#"
+            address = "0x16ca08a5825612aAe805D172a81B1a52b43574bf"
+            organization_id = "b100145e-0000-0000-0000-000000000000"
+            "#,
+        )
+        .expect("pre-KMS [wallet] config must still parse");
+
+        assert!(settings.kms_api_key.is_none());
     }
 
     #[tokio::test]
@@ -1396,9 +1638,10 @@ mod tests {
             settings: TurnkeySettings {
                 address,
                 organization_id: TurnkeyOrganizationId::new(org_id),
+                kms_api_key: None,
             },
             credentials: TurnkeyCredentials {
-                api_private_key: TurnkeyApiPrivateKey::new(api_key),
+                api_private_key: Some(TurnkeyApiPrivateKey::new(api_key)),
             },
             provider,
             required_confirmations: 1,
