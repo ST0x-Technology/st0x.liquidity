@@ -135,9 +135,21 @@ jobs:
           subject-name: ${{ env.AR_REPO }}/${{ matrix.image }}
           subject-digest: ${{ steps.push.outputs.sha256 }}
 
+      # Nix image builds are reproducible, so a push that does not change an
+      # image reproduces its digest, and sign-and-create 409s on the occurrence
+      # that already exists for (attestor, digest). Skipping is sound: the
+      # attestation the VM's roll timer verifies is exactly the one found.
       - name: Sign Binary Authorization attestation
         run: |
           set -euo pipefail
+          if gcloud beta container binauthz attestations list \
+              --project="t0-artifacts" \
+              --attestor="${ATTESTOR}" \
+              --artifact-url="${{ steps.push.outputs.digest }}" \
+              --format='value(name)' | grep -q .; then
+            echo "Attestation already exists for ${{ steps.push.outputs.digest }}; skipping"
+            exit 0
+          fi
           gcloud beta container binauthz attestations sign-and-create \
             --project="t0-artifacts" \
             --artifact-url="${{ steps.push.outputs.digest }}" \
