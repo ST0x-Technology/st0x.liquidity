@@ -82,8 +82,19 @@ let
           try_files $uri $uri/ /index.html;
         }
 
+        # NO URI after $bot_upstream, in any of these. nginx normally
+        # replaces the matched location prefix with the proxy_pass URI, but
+        # when proxy_pass contains a VARIABLE that rewriting is skipped and
+        # the literal URI is sent instead of the request path. So
+        # `proxy_pass http://$bot_upstream/orders/` sent every /orders/*
+        # request to the bot as plain `/orders/` -- 404 for /orders/pending
+        # and /orders/raindex (the whole Orders tab), and 404 for all four
+        # /performance/* endpoints. Worse than the 404s: /transfers/interrupted
+        # and /trades/{venue}/{id}/events silently returned the plain
+        # /transfers and /trades lists, a wrong answer with a 200.
+        # With no URI part, nginx forwards the original request URI unchanged.
         location /api/ws {
-          proxy_pass http://$bot_upstream/api/ws;
+          proxy_pass http://$bot_upstream;
           proxy_http_version 1.1;
           proxy_set_header Upgrade $http_upgrade;
           proxy_set_header Connection "upgrade";
@@ -92,13 +103,13 @@ let
           proxy_read_timeout 86400;
         }
 
-        location /health      { proxy_pass http://$bot_upstream/health; }
-        location /logs        { proxy_pass http://$bot_upstream/logs; }
-        location /orders/     { proxy_pass http://$bot_upstream/orders/; }
-        location /pnl         { proxy_pass http://$bot_upstream/pnl; }
-        location /trades      { proxy_pass http://$bot_upstream/trades; }
-        location /transfers   { proxy_pass http://$bot_upstream/transfers; }
-        location /performance { proxy_pass http://$bot_upstream/performance; }
+        location /health      { proxy_pass http://$bot_upstream; }
+        location /logs        { proxy_pass http://$bot_upstream; }
+        location /orders/     { proxy_pass http://$bot_upstream; }
+        location /pnl         { proxy_pass http://$bot_upstream; }
+        location /trades      { proxy_pass http://$bot_upstream; }
+        location /transfers   { proxy_pass http://$bot_upstream; }
+        location /performance { proxy_pass http://$bot_upstream; }
       }
     }
   '';
