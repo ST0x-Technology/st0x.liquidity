@@ -137,21 +137,28 @@ jobs:
 
       # Nix image builds are reproducible, so a push that does not change an
       # image reproduces its digest, and sign-and-create 409s on the occurrence
-      # that already exists for (attestor, digest). Skipping is sound: the
-      # attestation the VM's roll timer verifies is exactly the one found.
+      # that already exists for (attestor, digest). Tolerating that conflict is
+      # sound: it means the attestation the VM's roll timer verifies is already
+      # in place. Detected from the error text after the fact rather than by a
+      # list-first guard because liquidity-deployer can attach occurrences to
+      # the attestor note but lacks containeranalysis.notes.listOccurrences,
+      # and a permission-denied list is indistinguishable from an empty one.
       - name: Sign Binary Authorization attestation
         run: |
           set -euo pipefail
-          if gcloud beta container binauthz attestations list \
-              --project="t0-artifacts" \
-              --attestor="${ATTESTOR}" \
-              --artifact-url="${{ steps.push.outputs.digest }}" \
-              --format='value(name)' | grep -q .; then
-            echo "Attestation already exists for ${{ steps.push.outputs.digest }}; skipping"
-            exit 0
-          fi
-          gcloud beta container binauthz attestations sign-and-create \
+          set +e
+          output=$(gcloud beta container binauthz attestations sign-and-create \
             --project="t0-artifacts" \
             --artifact-url="${{ steps.push.outputs.digest }}" \
             --attestor="${ATTESTOR}" \
-            --keyversion="${ATTESTOR_KEY}"
+            --keyversion="${ATTESTOR_KEY}" 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            if printf '%s' "$output" | grep -q "is the subject of a conflict"; then
+              echo "Attestation already exists for ${{ steps.push.outputs.digest }}; skipping"
+              exit 0
+            fi
+            exit "$status"
+          fi
