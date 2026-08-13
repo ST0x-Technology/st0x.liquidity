@@ -137,7 +137,10 @@ in
       pkgs.cacert
     ];
     config = {
-      Entrypoint = [ "/bin/sh" "-c" ];
+      Entrypoint = [
+        "/bin/sh"
+        "-c"
+      ];
       Cmd = [
         (
           "until [ -f /mnt/data/st0x-hedge.db ]; do "
