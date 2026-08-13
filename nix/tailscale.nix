@@ -4,12 +4,12 @@
 # and provisions a Tailscale-issued HTTPS certificate that nginx
 # serves the dashboard from.
 #
-# The `tailscale-cert` oneshot waits for tailscaled to be Running,
-# then writes the cert/key into `/var/lib/tailscale-cert` and reloads
-# nginx so it picks up the new files. A daily timer re-runs the same
-# oneshot to renew before expiry. `tailscaled.ExecStartPre` deletes
-# the stale `tailscale0` TUN device so the unit doesn't crash-loop
-# when a previous tailscaled hasn't released it yet.
+# The `tailscale-cert` oneshot provisions the initial certificate and
+# remains active so later NixOS switches do not call the certificate API.
+# A separate daily `tailscale-cert-renew` oneshot renews the certificate
+# and reloads nginx. `tailscaled.ExecStartPre` deletes the stale
+# `tailscale0` TUN device so the unit doesn't crash-loop when a previous
+# tailscaled hasn't released it yet.
 {
   pkgs,
   environment,
@@ -19,6 +19,24 @@
 
 let
   certDir = "/var/lib/tailscale-cert";
+  certPath = "${certDir}/${tailscaleMagicDnsName}.crt";
+  keyPath = "${certDir}/${tailscaleMagicDnsName}.key";
+  certificateScript = ''
+    set -euo pipefail
+    retries=0
+    until [ "$(tailscale status --json 2>/dev/null | jq -r '.BackendState' 2>/dev/null)" = "Running" ]; do
+      retries=$((retries + 1))
+      if [ "$retries" -ge 30 ]; then
+        echo "Tailscale BackendState != Running after 60s" >&2
+        exit 1
+      fi
+      sleep 2
+    done
+    tailscale cert \
+      --cert-file ${certPath} \
+      --key-file ${keyPath} \
+      ${tailscaleMagicDnsName}
+  '';
 in
 {
   # Per-environment reusable, tagged auth key. Used only on first
@@ -69,37 +87,43 @@ in
         ];
         serviceConfig = {
           Type = "oneshot";
-          # The daily timer can only restart a oneshot that returns to inactive.
-          RemainAfterExit = false;
+          RemainAfterExit = true;
+          TimeoutStartSec = "5min";
           User = "nginx";
           Group = "nginx";
-          # Reload nginx after timer-triggered renewals. An inactive nginx is
-          # expected on first boot; an attempted reload failure is not.
+          # An inactive nginx is expected while the first certificate is
+          # provisioned, so there is nothing to reload on first boot.
           ExecStartPost = "+${pkgs.bash}/bin/bash -c 'if systemctl is-active --quiet nginx.service; then systemctl reload nginx.service; fi'";
         };
-        script = ''
-          set -euo pipefail
-          retries=0
-          until [ "$(tailscale status --json 2>/dev/null | jq -r '.BackendState' 2>/dev/null)" = "Running" ]; do
-            retries=$((retries + 1))
-            if [ "$retries" -ge 30 ]; then
-              echo "Tailscale BackendState != Running after 60s" >&2
-              exit 1
-            fi
-            sleep 2
-          done
-          tailscale cert \
-            --cert-file ${certDir}/${tailscaleMagicDnsName}.crt \
-            --key-file ${certDir}/${tailscaleMagicDnsName}.key \
-            ${tailscaleMagicDnsName}
-        '';
+        script = certificateScript;
+      };
+
+      # Renew independently of nginx and NixOS activation. A slow certificate
+      # API can fail this timer run without blocking or rolling back a deploy.
+      tailscale-cert-renew = {
+        description = "Renew Tailscale HTTPS certificate for ${tailscaleMagicDnsName}";
+        after = [ "tailscale-cert.service" ];
+        wants = [ "tailscale-cert.service" ];
+        path = [
+          pkgs.tailscale
+          pkgs.jq
+        ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = false;
+          TimeoutStartSec = "5min";
+          User = "nginx";
+          Group = "nginx";
+          ExecStartPost = "+${pkgs.bash}/bin/bash -c 'if systemctl is-active --quiet nginx.service; then systemctl reload nginx.service; fi'";
+        };
+        script = certificateScript;
       };
 
       nginx.after = [ "tailscale-cert.service" ];
-      nginx.wants = [ "tailscale-cert.service" ];
+      nginx.requires = [ "tailscale-cert.service" ];
     };
 
-    timers.tailscale-cert = {
+    timers.tailscale-cert-renew = {
       description = "Renew Tailscale HTTPS certificate daily";
       wantedBy = [ "timers.target" ];
       timerConfig = {
