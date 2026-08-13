@@ -1684,6 +1684,93 @@ mod tests {
         order_mock.assert();
     }
 
+    fn mock_active_account(server: &MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE"
+                }));
+        })
+    }
+
+    #[tokio::test]
+    async fn cancel_broker_order_reports_requested_on_success() {
+        let server = MockServer::start();
+        let ctx = create_alpaca_broker_api_test_ctx(&server);
+        let account_mock = mock_active_account(&server);
+
+        let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d";
+        let delete_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(204);
+        });
+
+        let mut stdout = Vec::new();
+        cancel_broker_order(&ctx, order_id, &mut stdout)
+            .await
+            .unwrap();
+
+        account_mock.assert();
+        delete_mock.assert();
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("Cancellation requested for order {order_id}\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_broker_order_reports_not_found_on_404() {
+        let server = MockServer::start();
+        let ctx = create_alpaca_broker_api_test_ctx(&server);
+        let account_mock = mock_active_account(&server);
+
+        let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d";
+        let delete_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(json!({ "message": "Resource does not exist" }));
+        });
+
+        let mut stdout = Vec::new();
+        cancel_broker_order(&ctx, order_id, &mut stdout)
+            .await
+            .unwrap();
+
+        account_mock.assert();
+        delete_mock.assert();
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!(
+                "Order {order_id} not found at the broker (already filled, cancelled, or unknown)\n"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_broker_order_dry_run_reports_requested() {
+        let mut ctx = create_base_test_ctx();
+        ctx.broker = BrokerCtx::DryRun;
+
+        let mut stdout = Vec::new();
+        cancel_broker_order(&ctx, "test-order-id", &mut stdout)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "Cancellation requested for order test-order-id\n"
+        );
+    }
+
     #[tokio::test]
     async fn test_execute_order_failure_stdout_contains_error() {
         let server = MockServer::start();
