@@ -143,12 +143,6 @@ vault_id = "0xfab"
 rebalancing = "enabled"
 # Maximum USDC moved per rebalance operation.
 operational_limit = 10000
-# Cash held back at the broker. This is a stopgap, not an operational floor. A
-# transfer sized at the full withdrawable balance cannot fund the ~2% collar that
-# the USDCUSD market buy reserves, so the conversion returns 403 and the circuit
-# opens. Keep this above 2% of operational_limit. RAI-1522 sizes capacity from the
-# collar instead, after which this goes back to 0 (omitted).
-reserved = 250
 
 # Per-equity asset configuration.
 # - trading: whether the bot hedges fills for this asset.
