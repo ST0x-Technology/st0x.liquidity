@@ -14,9 +14,9 @@ use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::alpaca_broker_api::{AlpacaLimitOrder, AlpacaLimitPrice};
 use st0x_execution::{
-    ClientOrderId, Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder,
-    MockExecutor, MockExecutorCtx, OrderFailureTerminality, OrderPlacement, OrderState, Positive,
-    Symbol, TimeInForce, TryIntoExecutor,
+    CancellationOutcome, ClientOrderId, Direction, Executor, ExecutorOrderId, FractionalShares,
+    MarketOrder, MockExecutor, MockExecutorCtx, OrderFailureTerminality, OrderPlacement,
+    OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
 };
 use st0x_float_serde::format_float_with_fallback;
 
@@ -71,7 +71,7 @@ impl OrderPlacer for CliOrderPlacer {
     async fn cancel_order(
         &self,
         _executor_order_id: &ExecutorOrderId,
-    ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
         Err("CLI does not support order cancellation".into())
     }
 
@@ -285,6 +285,46 @@ async fn get_broker_order_status<W: Write>(
             Ok(broker.get_order_status(&order_id.to_string()).await?)
         }
     }
+}
+
+/// Cancels an open broker order by the id the broker assigned at placement
+/// and reports the outcome. `OrderNotFound` is a result, not an error: the
+/// broker does not know the id, so no live order exists under it and a retry
+/// of the cancel can never succeed.
+pub(super) async fn cancel_broker_order<W: Write>(
+    ctx: &Ctx,
+    order_id: &str,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    let outcome = match &ctx.broker {
+        BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
+            let broker = alpaca_auth.clone().try_into_executor().await?;
+            let order_id = order_id.to_string();
+            retry_on_backpressure(
+                || broker.cancel_order(&order_id),
+                BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+            )
+            .await?
+        }
+        BrokerCtx::DryRun => {
+            let broker = MockExecutorCtx.try_into_executor().await?;
+            broker.cancel_order(&order_id.to_string()).await?
+        }
+    };
+
+    match outcome {
+        CancellationOutcome::Requested => {
+            writeln!(stdout, "Cancellation requested for order {order_id}")?;
+        }
+        CancellationOutcome::OrderNotFound => {
+            writeln!(
+                stdout,
+                "Order {order_id} not found at the broker (already filled, cancelled, or unknown)"
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 pub(super) async fn execute_order_with_writers<W: Write>(
