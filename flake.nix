@@ -385,6 +385,7 @@
                 })
                 bot-oci
                 dashboard-oci
+                datasette-oci
                 ;
 
               ci = pkgs.writeShellApplication {

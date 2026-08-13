@@ -8,11 +8,15 @@
 # Image contract (consumed by the stack's docker-compose in t0.devops —
 # keep the two in sync):
 #   bot:       Entrypoint = the `server` binary; env configs baked at
-#              /app/config/{staging,prod}/st0x-hedge.toml; the compose
+#              /app/config/{staging,staging-gcp,prod}/st0x-hedge.toml; the compose
 #              command appends --config <baked path> --secrets <mounted
 #              Secret Manager file>. database_url in the configs stays
 #              sqlite:///mnt/data/st0x-hedge.db (the VM mounts its data
 #              disk there — byte-identical to the droplet).
+#   datasette: the nixpkgs datasette (same package the droplet runs), NOT
+#              the upstream Docker image -- that one's bundled SQLite is too
+#              old to parse the schema's STRICT table (dashboard_trade_delivery)
+#              and dies with "malformed database schema".
 #   dashboard: nginx serving the SvelteKit build, proxying the API paths to
 #              the compose service name `bot` on :8001 (same location list
 #              the droplet's os.nix nginx serves, minus TLS — the VM has no
@@ -25,8 +29,13 @@
 
 let
   bakedConfigs = pkgs.runCommand "st0x-hedge-configs" { } ''
-    mkdir -p $out/app/config/staging $out/app/config/prod
+    mkdir -p $out/app/config/staging $out/app/config/staging-gcp $out/app/config/prod
     cp ${../config/staging/st0x-hedge.toml} $out/app/config/staging/st0x-hedge.toml
+    # The GCP VM runs this variant: kms_api_key (keyless Turnkey auth, so
+    # the secrets file has no [wallet]) and no [telemetry]. #1182 added the
+    # file but not this line, so the image shipped without the directory
+    # and the bot crash-looped on "failed to read config file" at cutover.
+    cp ${../config/staging-gcp/st0x-hedge.toml} $out/app/config/staging-gcp/st0x-hedge.toml
     cp ${../config/prod/st0x-hedge.toml} $out/app/config/prod/st0x-hedge.toml
   '';
 
@@ -57,16 +66,24 @@ let
       uwsgi_temp_path /tmp/uwsgi;
       scgi_temp_path /tmp/scgi;
 
+      # Docker's embedded DNS. Without an explicit resolver + variable
+      # upstream, nginx resolves `bot` at CONFIG LOAD and exits
+      # "host not found in upstream" whenever the bot container is not
+      # already up -- which is every restart where the bot is slower, and
+      # every moment the workload is gated off.
+      resolver 127.0.0.11 valid=10s ipv6=off;
+
       server {
         listen 80;
         root /usr/share/t0-liquidity-dashboard;
+        set $bot_upstream "bot:8001";
 
         location / {
           try_files $uri $uri/ /index.html;
         }
 
         location /api/ws {
-          proxy_pass http://bot:8001/api/ws;
+          proxy_pass http://$bot_upstream/api/ws;
           proxy_http_version 1.1;
           proxy_set_header Upgrade $http_upgrade;
           proxy_set_header Connection "upgrade";
@@ -75,13 +92,13 @@ let
           proxy_read_timeout 86400;
         }
 
-        location /health      { proxy_pass http://bot:8001/health; }
-        location /logs        { proxy_pass http://bot:8001/logs; }
-        location /orders/     { proxy_pass http://bot:8001/orders/; }
-        location /pnl         { proxy_pass http://bot:8001/pnl; }
-        location /trades      { proxy_pass http://bot:8001/trades; }
-        location /transfers   { proxy_pass http://bot:8001/transfers; }
-        location /performance { proxy_pass http://bot:8001/performance; }
+        location /health      { proxy_pass http://$bot_upstream/health; }
+        location /logs        { proxy_pass http://$bot_upstream/logs; }
+        location /orders/     { proxy_pass http://$bot_upstream/orders/; }
+        location /pnl         { proxy_pass http://$bot_upstream/pnl; }
+        location /trades      { proxy_pass http://$bot_upstream/trades; }
+        location /transfers   { proxy_pass http://$bot_upstream/transfers; }
+        location /performance { proxy_pass http://$bot_upstream/performance; }
       }
     }
   '';
@@ -105,6 +122,34 @@ in
         "8001/tcp" = { };
         "8002/tcp" = { };
       };
+    };
+  };
+
+  # Waits for the database before exec'ing: it only appears at cutover (copied
+  # from the droplet), and datasette exits immediately on a missing file.
+  datasette-oci = pkgs.dockerTools.streamLayeredImage {
+    name = "t0-liquidity-datasette";
+    tag = "latest";
+    created = "1970-01-01T00:00:01Z";
+    contents = [
+      pkgs.datasette
+      pkgs.busybox
+      pkgs.cacert
+    ];
+    config = {
+      Entrypoint = [
+        "/bin/sh"
+        "-c"
+      ];
+      Cmd = [
+        (
+          "until [ -f /mnt/data/st0x-hedge.db ]; do "
+          + "echo 'waiting for /mnt/data/st0x-hedge.db'; sleep 10; done; "
+          + "exec ${pkgs.datasette}/bin/datasette serve /mnt/data/st0x-hedge.db "
+          + "--host 0.0.0.0 --port 8081 --setting sql_time_limit_ms 5000"
+        )
+      ];
+      ExposedPorts."8081/tcp" = { };
     };
   };
 
