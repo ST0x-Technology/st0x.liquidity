@@ -53,6 +53,9 @@ jobs:
           - package: dashboard-oci
             local_name: t0-liquidity-dashboard
             image: t0-liquidity-dashboard
+          - package: datasette-oci
+            local_name: t0-liquidity-datasette
+            image: t0-liquidity-datasette
     steps:
       - uses: actions/checkout@v4
         with:
