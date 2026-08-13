@@ -266,6 +266,13 @@ pub enum AlpacaBrokerApiError {
         field: MissingOrderField,
     },
 
+    #[error("Order {order_id} reports filled quantity {filled} for ordered quantity {ordered}")]
+    FilledQuantityMismatch {
+        order_id: ExecutorOrderId,
+        ordered: Positive<FractionalShares>,
+        filled: Positive<FractionalShares>,
+    },
+
     #[error("Account {account_id} is not active (status: {status:?})")]
     AccountNotActive {
         account_id: Uuid,
@@ -468,6 +475,7 @@ impl AlpacaBrokerApiError {
             | Self::InvalidHeader(_)
             | Self::InvalidOrderId(_)
             | Self::IncompleteOrder { .. }
+            | Self::FilledQuantityMismatch { .. }
             | Self::AccountNotActive { .. }
             | Self::CryptoOrderFailed { .. }
             | Self::ConversionTimedOut { .. }
@@ -531,6 +539,7 @@ impl AlpacaBrokerApiError {
             | Self::InvalidHeader(_)
             | Self::InvalidOrderId(_)
             | Self::IncompleteOrder { .. }
+            | Self::FilledQuantityMismatch { .. }
             | Self::AccountNotActive { .. }
             | Self::CryptoOrderFailed { .. }
             | Self::DuplicateOrderNotFound { .. }

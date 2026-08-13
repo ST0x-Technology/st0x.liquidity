@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use st0x_float_macro::float;
 use std::str::FromStr;
 use std::time::Duration;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
 use super::client::AlpacaBrokerApiClient;
@@ -538,6 +538,7 @@ fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
         | InvalidHeader(_)
         | InvalidOrderId(_)
         | IncompleteOrder { .. }
+        | FilledQuantityMismatch { .. }
         | AccountNotActive { .. }
         | CryptoOrderFailed { .. }
         | ConversionTimedOut { .. }
@@ -1136,13 +1137,6 @@ async fn cancel_and_settle(
         }
 
         if started.elapsed() >= deadlines.cancel_settle {
-            error!(
-                target: "broker",
-                order_id = %order_id,
-                filled = ?filled_quantity,
-                "Cancelled conversion order never reached a terminal state and may \
-                 still be live; manual reconciliation required"
-            );
             return Err(AlpacaBrokerApiError::ConversionCancelNotSettled {
                 order_id,
                 cancel,
@@ -1169,12 +1163,6 @@ async fn request_cancel(
     match client.cancel_order(order_id).await {
         Ok(CancellationOutcome::Requested) => Ok(DeadlineCancel::Accepted),
         Ok(CancellationOutcome::OrderNotFound) => {
-            error!(
-                target: "broker",
-                order_id = %order_id,
-                "Broker does not recognise the conversion order being cancelled; \
-                 its fill state cannot be read back"
-            );
             Err(AlpacaBrokerApiError::ConversionOrderNotFound { order_id })
         }
         Err(AlpacaBrokerApiError::ApiError { status, .. })
@@ -3271,7 +3259,6 @@ mod tests {
             }
             other => panic!("expected ConversionCancelNotSettled, got {other:?}"),
         }
-        assert!(logs_contain("may still be live"));
     }
 
     /// A cancel the broker never accepts leaves the remainder live, so it must

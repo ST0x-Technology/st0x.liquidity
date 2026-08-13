@@ -264,9 +264,9 @@ mod tests {
         );
 
         executor.is_market_open().await.unwrap();
-        executor.place_market_order(market_order()).await.unwrap();
+        let placement = executor.place_market_order(market_order()).await.unwrap();
         executor
-            .get_order_status(&executor.parse_order_id("order-1").unwrap())
+            .get_order_status(&placement.order_id)
             .await
             .unwrap();
         executor.maintenance_tick().await.unwrap();

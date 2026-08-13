@@ -1,8 +1,6 @@
+use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -34,10 +32,27 @@ enum Health {
     Failing { message: String },
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum MockOrderIdError {
+    #[error("mock order ID {order_id} does not contain a filled quantity")]
+    MissingQuantity { order_id: String },
+    #[error("mock order ID {order_id} contains an invalid filled quantity")]
+    InvalidQuantity {
+        order_id: String,
+        #[source]
+        source: rain_math_float::FloatError,
+    },
+    #[error("mock order ID {order_id} contains a non-positive filled quantity")]
+    NonPositiveQuantity {
+        order_id: String,
+        #[source]
+        source: crate::NotPositive<crate::FractionalShares>,
+    },
+}
+
 /// Unified test executor for dry-run mode and testing that logs operations without executing real trades
 #[derive(Debug, Clone)]
 pub struct MockExecutor {
-    order_counter: Arc<AtomicU64>,
     health: Health,
     inventory_result: InventoryResult,
     order_status_override: Option<OrderState>,
@@ -56,7 +71,6 @@ pub struct MockExecutor {
 impl MockExecutor {
     pub fn new() -> Self {
         Self {
-            order_counter: Arc::new(AtomicU64::new(1)),
             health: Health::Healthy,
             inventory_result: InventoryResult::Unimplemented,
             order_status_override: None,
@@ -178,9 +192,32 @@ impl MockExecutor {
         self
     }
 
-    fn generate_order_id(&self) -> String {
-        let id = self.order_counter.fetch_add(1, Ordering::SeqCst);
-        format!("TEST_{id}")
+    fn order_id(
+        client_order_id: &crate::ClientOrderId,
+        shares: Positive<crate::FractionalShares>,
+    ) -> String {
+        format!("TEST:{client_order_id}:{shares}")
+    }
+
+    fn shares_from_order_id(
+        order_id: &str,
+    ) -> Result<Positive<crate::FractionalShares>, MockOrderIdError> {
+        let (_, shares) =
+            order_id
+                .rsplit_once(':')
+                .ok_or_else(|| MockOrderIdError::MissingQuantity {
+                    order_id: order_id.to_string(),
+                })?;
+        let shares = shares
+            .parse()
+            .map_err(|source| MockOrderIdError::InvalidQuantity {
+                order_id: order_id.to_string(),
+                source,
+            })?;
+        Positive::new(shares).map_err(|source| MockOrderIdError::NonPositiveQuantity {
+            order_id: order_id.to_string(),
+            source,
+        })
     }
 
     fn preflight_sell(&self, order: MarketOrder) -> Result<CounterTradePreflight, ExecutionError> {
@@ -260,7 +297,7 @@ impl Executor for MockExecutor {
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
         self.fail_if_unhealthy()?;
 
-        let order_id = self.generate_order_id();
+        let order_id = Self::order_id(&order.client_order_id, order.shares);
 
         debug!(
             target: "broker",
@@ -293,10 +330,12 @@ impl Executor for MockExecutor {
 
         // Always return filled status in test mode with mock price
         let price = *MOCK_FILL_PRICE;
+        let shares_filled = Self::shares_from_order_id(order_id)?;
 
         Ok(OrderState::Filled {
             executed_at: chrono::Utc::now(),
             order_id: ExecutorOrderId::new(order_id),
+            shares_filled,
             price: Usd::new(price),
         })
     }
@@ -413,7 +452,7 @@ impl Executor for MockExecutor {
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
         self.fail_if_unhealthy()?;
 
-        let order_id = self.generate_order_id();
+        let order_id = Self::order_id(&order.client_order_id, order.shares);
 
         debug!(
             target: "broker",
@@ -504,7 +543,7 @@ mod tests {
 
         let placement = executor.place_market_order(order).await.unwrap();
 
-        assert!(placement.order_id.starts_with("TEST_"));
+        assert!(placement.order_id.starts_with("TEST:"));
         assert_eq!(placement.symbol, Symbol::new("AAPL").unwrap());
         assert_eq!(placement.shares, positive_shares("10"));
         assert_eq!(placement.direction, Direction::Buy);
@@ -529,12 +568,97 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_success() {
         let executor = MockExecutor::new();
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: positive_shares("0.004115451"),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+        };
+        let placement = executor.place_market_order(order).await.unwrap();
 
         let state = executor
-            .get_order_status(&"TEST_1".to_string())
+            .get_order_status(&placement.order_id)
             .await
             .unwrap();
-        assert!(matches!(state, OrderState::Filled { .. }));
+        assert!(matches!(
+            state,
+            OrderState::Filled { shares_filled, .. }
+                if shares_filled == positive_shares("0.004115451")
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_order_status_returns_limit_order_quantity() {
+        let executor = MockExecutor::new();
+        let order = LimitOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: positive_shares("0.004115451"),
+            direction: Direction::Buy,
+            limit_price: Positive::new(Usd::new(float!(199.50))).unwrap(),
+            extended_hours: true,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+        };
+        let placement = executor.place_limit_order(order).await.unwrap();
+
+        let state = executor
+            .get_order_status(&placement.order_id)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            state,
+            OrderState::Filled { shares_filled, .. }
+                if shares_filled == positive_shares("0.004115451")
+        ));
+    }
+
+    #[tokio::test]
+    async fn new_executor_recovers_filled_quantity_from_order_id() {
+        let placing_executor = MockExecutor::new();
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: positive_shares("0.004115451"),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+        };
+        let placement = placing_executor.place_market_order(order).await.unwrap();
+        let restarted_executor = MockExecutor::new();
+
+        assert!(matches!(
+            restarted_executor
+                .get_order_status(&placement.order_id)
+                .await
+                .unwrap(),
+            OrderState::Filled { shares_filled, .. }
+                if shares_filled == positive_shares("0.004115451")
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_order_id_quantity_errors() {
+        let executor = MockExecutor::new();
+
+        assert!(matches!(
+            executor
+                .get_order_status(&"TEST-without-quantity".to_string())
+                .await
+                .unwrap_err(),
+            ExecutionError::InvalidMockOrderId(MockOrderIdError::MissingQuantity { .. })
+        ));
+        assert!(matches!(
+            executor
+                .get_order_status(&"TEST:client:not-a-number".to_string())
+                .await
+                .unwrap_err(),
+            ExecutionError::InvalidMockOrderId(MockOrderIdError::InvalidQuantity { .. })
+        ));
+        assert!(matches!(
+            executor
+                .get_order_status(&"TEST:client:0".to_string())
+                .await
+                .unwrap_err(),
+            ExecutionError::InvalidMockOrderId(MockOrderIdError::NonPositiveQuantity { .. })
+        ));
     }
 
     #[tokio::test]

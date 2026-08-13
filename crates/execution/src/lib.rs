@@ -602,6 +602,8 @@ pub enum ExecutionError {
     MissingExecutedAt { status: OrderStatus },
     #[error("Order not found: {order_id}")]
     OrderNotFound { order_id: String },
+    #[error(transparent)]
+    InvalidMockOrderId(#[from] mock::MockOrderIdError),
     #[error("Mock executor failure: {message}")]
     MockFailure { message: String },
     #[error("configured mock preflight price is not positive: {0}")]

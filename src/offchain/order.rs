@@ -7026,6 +7026,10 @@ mod tests {
                 {
                     Ok(st0x_execution::OrderState::Filled {
                         order_id: ExecutorOrderId::new("ORD-OK"),
+                        shares_filled: st0x_execution::Positive::new(
+                            st0x_execution::FractionalShares::new(float!(2)),
+                        )
+                        .unwrap(),
                         price: Usd::new(float!(150.0)),
                         executed_at: Utc::now(),
                     })

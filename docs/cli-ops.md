@@ -90,13 +90,16 @@ s01 dividend-bump -s COIN -q 10
 buy, tokenize, and donate from the **market-making** wallet, not the issuer. To
 use `stox` you must pass the issuer `--config`/`--secrets` explicitly.
 
-The command buys 10 COIN offchain and waits for the fill, tokenizes the shares
-to the configured wallet and waits for them to arrive onchain, then transfers
-them into the wrapper and waits for confirmation. No wrapped shares are minted
--- every existing wtCOIN holder's shares are simply worth more. The standalone
-`buy`, `alpaca-tokenize`, and `donate-equity` subcommands remain for running a
-single step in isolation; use `wrap-equity` only when you want to _receive_
-wrapped shares (a deposit), never for a dividend bump.
+The command buys 10 COIN offchain and waits for the fill, tokenizes the exact
+quantity Alpaca reports as filled, then donates that same quantity into the
+wrapper and waits for confirmation. Alpaca may truncate the requested order to
+its supported precision; when requested, placed, and filled quantities differ,
+the command prints all three. A filled order with a missing, non-positive, or
+internally inconsistent filled quantity stops before tokenization. No wrapped
+shares are minted -- every existing wtCOIN holder's shares are simply worth
+more. The standalone `buy`, `alpaca-tokenize`, and `donate-equity` subcommands
+remain for running a single step in isolation; use `wrap-equity` only when you
+want to _receive_ wrapped shares (a deposit), never for a dividend bump.
 
 ### Selling and Redeeming (Liquidating Tokenized Shares)
 
@@ -119,6 +122,10 @@ stox sell -s COIN -q 10
 ```
 stox order-status --order-id <order-id>
 ```
+
+Order status requires a live broker configuration. Dry-run mode does not persist
+broker order state, so it rejects standalone status lookups rather than
+inventing a filled quantity.
 
 ### Moving Stranded Raindex Equity Vault Funds
 

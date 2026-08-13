@@ -158,6 +158,25 @@ impl Executor for AlpacaBrokerApi {
                 })
             }
             OrderStatus::Filled => {
+                let shares_filled = order_update.shares_filled.ok_or_else(|| {
+                    AlpacaBrokerApiError::IncompleteOrder {
+                        order_id: ExecutorOrderId::new(order_id),
+                        field: MissingOrderField::FilledQty,
+                    }
+                })?;
+                let shares_filled = Positive::new(shares_filled)?;
+                if !shares_filled
+                    .inner()
+                    .inner()
+                    .eq(order_update.shares.inner().inner())?
+                {
+                    return Err(AlpacaBrokerApiError::FilledQuantityMismatch {
+                        order_id: ExecutorOrderId::new(order_id),
+                        ordered: order_update.shares,
+                        filled: shares_filled,
+                    });
+                }
+
                 let price =
                     order_update
                         .price
@@ -169,6 +188,7 @@ impl Executor for AlpacaBrokerApi {
                 Ok(OrderState::Filled {
                     executed_at: order_update.updated_at,
                     order_id: ExecutorOrderId::new(order_id),
+                    shares_filled,
                     price: Usd::new(price),
                 })
             }
@@ -1769,6 +1789,163 @@ mod tests {
 
         cancel_mock.assert();
         assert_eq!(outcome, crate::CancellationOutcome::Requested);
+    }
+
+    #[tokio::test]
+    async fn get_order_status_preserves_filled_quantity() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d".to_string();
+        let status_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": order_id,
+                    "symbol": "AAPL",
+                    "qty": "0.0041",
+                    "filled_qty": "0.0041",
+                    "side": "buy",
+                    "status": "filled",
+                    "filled_avg_price": "199.50",
+                    "filled_at": "2025-01-06T14:32:01.111111Z"
+                }));
+        });
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let state = executor.get_order_status(&order_id).await.unwrap();
+
+        status_mock.assert();
+        let OrderState::Filled { shares_filled, .. } = state else {
+            panic!("expected OrderState::Filled, got {state:?}");
+        };
+        assert_eq!(
+            shares_filled,
+            Positive::new(FractionalShares::new(float!(0.0041))).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_order_status_filled_without_filled_quantity_errors() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d".to_string();
+        let status_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": order_id,
+                    "symbol": "AAPL",
+                    "qty": "0.0041",
+                    "side": "buy",
+                    "status": "filled",
+                    "filled_avg_price": "199.50",
+                    "filled_at": "2025-01-06T14:32:01.111111Z"
+                }));
+        });
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let error = executor.get_order_status(&order_id).await.unwrap_err();
+
+        status_mock.assert();
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::IncompleteOrder {
+                    order_id: ref returned_order_id,
+                    field: MissingOrderField::FilledQty,
+                } if *returned_order_id == ExecutorOrderId::new(&order_id)
+            ),
+            "expected missing filled quantity error, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_order_status_filled_with_mismatched_quantity_errors() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d".to_string();
+        let status_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": order_id,
+                    "symbol": "AAPL",
+                    "qty": "0.0041",
+                    "filled_qty": "0.0040",
+                    "side": "buy",
+                    "status": "filled",
+                    "filled_avg_price": "199.50",
+                    "filled_at": "2025-01-06T14:32:01.111111Z"
+                }));
+        });
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let error = executor.get_order_status(&order_id).await.unwrap_err();
+
+        status_mock.assert();
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::FilledQuantityMismatch {
+                    order_id: ref returned_order_id,
+                    ordered,
+                    filled,
+                } if *returned_order_id == ExecutorOrderId::new(&order_id)
+                    && ordered == Positive::new(FractionalShares::new(float!(0.0041))).unwrap()
+                    && filled == Positive::new(FractionalShares::new(float!(0.0040))).unwrap()
+            ),
+            "expected filled quantity mismatch error, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_order_status_filled_with_zero_quantity_errors() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d".to_string();
+        let status_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": order_id,
+                    "symbol": "AAPL",
+                    "qty": "0.0041",
+                    "filled_qty": "0",
+                    "side": "buy",
+                    "status": "filled",
+                    "filled_avg_price": "199.50",
+                    "filled_at": "2025-01-06T14:32:01.111111Z"
+                }));
+        });
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let error = executor.get_order_status(&order_id).await.unwrap_err();
+
+        status_mock.assert();
+        assert!(
+            matches!(error, AlpacaBrokerApiError::NotPositive(_)),
+            "expected non-positive filled quantity error, got {error:?}"
+        );
     }
 
     #[tokio::test]
