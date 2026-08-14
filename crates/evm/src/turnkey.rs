@@ -230,10 +230,10 @@ pub struct TurnkeyWallet<P: Provider> {
     /// every handle to the same address contends on one lock.
     send_lock: Arc<Mutex<()>>,
     /// Second handle to the signer (sharing the transaction signer's HTTP
-    /// client via `Arc`) for detached-digest signing
-    /// ([`Wallet::sign_digest`]) -- the transaction copy is consumed by
-    /// the `EthereumWallet` inside `signing_provider`.
-    digest_signer: TracingTurnkeySigner,
+    /// client via `Arc`) for detached typed-data signing
+    /// ([`Wallet::sign_typed_data`]) -- the transaction copy is consumed
+    /// by the `EthereumWallet` inside `signing_provider`.
+    typed_data_signer: TracingTurnkeySigner,
     address: Address,
     required_confirmations: u64,
 }
@@ -295,7 +295,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
             .map_err(|error| TurnkeyError::Signer(error.into()))?;
         let signer = TracingTurnkeySigner::new(client, organization_id, address, Some(chain_id));
 
-        let digest_signer = signer.clone();
+        let typed_data_signer = signer.clone();
         let eth_wallet = EthereumWallet::from(signer);
 
         let base_provider = ctx.provider.clone();
@@ -320,7 +320,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
             nonce_manager,
             in_flight: InFlightNonces::default(),
             send_lock: Arc::new(Mutex::new(())),
-            digest_signer,
+            typed_data_signer,
             address,
             required_confirmations,
         })
@@ -342,7 +342,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
 
         let signer = TracingTurnkeySigner::new(client, organization_id, address, Some(chain_id));
 
-        let digest_signer = signer.clone();
+        let typed_data_signer = signer.clone();
         let eth_wallet = EthereumWallet::from(signer);
 
         let base_provider = provider.clone();
@@ -363,7 +363,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
             nonce_manager,
             in_flight: InFlightNonces::default(),
             send_lock: Arc::new(Mutex::new(())),
-            digest_signer,
+            typed_data_signer,
             address,
             required_confirmations,
         })
@@ -764,12 +764,23 @@ impl TracingTurnkeySigner {
         Ok(signature)
     }
 
-    /// Signs a precomputed 32-byte digest via Turnkey's raw-payload
-    /// activity. The payload is transmitted as the bare digest hex with
-    /// `HASH_FUNCTION_NO_OP`: the digest already IS the final hash (e.g.
-    /// an EIP-712 signing hash), so Turnkey must sign it as-is rather
-    /// than hashing again.
-    async fn sign_digest(&self, digest: B256) -> Result<Signature, TracingTurnkeySignerError> {
+    /// Signs a full EIP-712 typed-data payload via Turnkey's raw-payload
+    /// activity with `PAYLOAD_ENCODING_EIP712`: Turnkey parses the
+    /// structured `{types, primaryType, domain, message}` JSON and computes
+    /// the signing hash itself, which is what lets its policy engine scope
+    /// the grant on `eth.eip_712.domain` / `primary_type` instead of
+    /// allowing arbitrary digests.
+    ///
+    /// The recovery check in [`Self::parse_raw_signature`] runs against the
+    /// CALLER-computed `expected_digest`, so it doubles as an end-to-end
+    /// proof that Turnkey's server-side hashing of our serialized payload
+    /// produced exactly the digest the verifying contract will check — any
+    /// serialization divergence fails loudly here, before delivery.
+    async fn sign_typed_data(
+        &self,
+        payload_json: String,
+        expected_digest: B256,
+    ) -> Result<Signature, TracingTurnkeySignerError> {
         let response = self
             .client
             .sign_raw_payload(
@@ -777,14 +788,14 @@ impl TracingTurnkeySigner {
                 TracingTurnkeyClient::current_timestamp()?,
                 SignRawPayloadIntentV2 {
                     sign_with: self.address.to_string(),
-                    payload: hex::encode(digest),
-                    encoding: PayloadEncoding::Hexadecimal,
+                    payload: payload_json,
+                    encoding: PayloadEncoding::Eip712,
                     hash_function: HashFunction::NoOp,
                 },
             )
             .await?;
 
-        Self::parse_raw_signature(&response, digest, self.address)
+        Self::parse_raw_signature(&response, expected_digest, self.address)
     }
 
     /// Assembles Turnkey's raw-payload `r`/`s`/`v` components into a
@@ -932,10 +943,14 @@ where
         self.address
     }
 
-    async fn sign_digest(&self, digest: B256) -> Result<Signature, EvmError> {
+    async fn sign_typed_data(
+        &self,
+        payload_json: String,
+        expected_digest: B256,
+    ) -> Result<Signature, EvmError> {
         Ok(self
-            .digest_signer
-            .sign_digest(digest)
+            .typed_data_signer
+            .sign_typed_data(payload_json, expected_digest)
             .await
             .map_err(TurnkeyError::from)?)
     }
@@ -1010,6 +1025,7 @@ mod tests {
     use alloy::providers::ext::AnvilApi;
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
+    use alloy::sol_types::SolValue;
     use httpmock::MockServer;
 
     use super::*;
@@ -1300,17 +1316,19 @@ mod tests {
         ));
     }
 
-    /// The full raw-payload round trip: the request must carry the bare
-    /// digest hex with `HASH_FUNCTION_NO_OP` (the digest is already the
-    /// final hash -- re-hashing would sign the wrong message), and the
-    /// r/s/v response must assemble into exactly the signature the
-    /// "enclave" key produced.
+    /// The full typed-data round trip: the request must carry the payload
+    /// JSON verbatim with `PAYLOAD_ENCODING_EIP712` and
+    /// `HASH_FUNCTION_NO_OP` (Turnkey's EIP-712 parser computes the
+    /// signing hash itself -- an extra hash pass would sign the wrong
+    /// message), and the r/s/v response must assemble into exactly the
+    /// signature the "enclave" key produced over the expected digest.
     #[tokio::test]
-    async fn sign_digest_returns_signature_from_completed_activity() {
+    async fn sign_typed_data_returns_signature_from_completed_activity() {
         let key_signer = PrivateKeySigner::random();
         let address = key_signer.address();
-        let digest = keccak256(b"detached digest");
-        let expected_signature = key_signer.sign_hash(&digest).await.unwrap();
+        let payload_json = r#"{"primaryType":"MintAuth"}"#.to_owned();
+        let expected_digest = keccak256(b"typed-data signing hash");
+        let expected_signature = key_signer.sign_hash(&expected_digest).await.unwrap();
 
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
@@ -1321,8 +1339,8 @@ mod tests {
                         "type": "ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2",
                         "parameters": {
                             "signWith": address.to_string(),
-                            "payload": hex::encode(digest),
-                            "encoding": "PAYLOAD_ENCODING_HEXADECIMAL",
+                            "payload": payload_json,
+                            "encoding": "PAYLOAD_ENCODING_EIP712",
                             "hashFunction": "HASH_FUNCTION_NO_OP",
                         }
                     })
@@ -1340,25 +1358,32 @@ mod tests {
             Some(8453),
         );
 
-        let signature = signer.sign_digest(digest).await.unwrap();
+        let signature = signer
+            .sign_typed_data(payload_json, expected_digest)
+            .await
+            .unwrap();
 
         mock.assert();
         assert_eq!(signature, expected_signature);
         assert_eq!(
-            signature.recover_address_from_prehash(&digest).unwrap(),
+            signature
+                .recover_address_from_prehash(&expected_digest)
+                .unwrap(),
             address
         );
     }
 
     /// The same trust boundary as transaction signing: components that
     /// recover to someone else's key -- however well-formed -- must be
-    /// rejected, never returned.
+    /// rejected, never returned. Because the recovery runs over the
+    /// CALLER's expected digest, this same rejection also catches Turnkey
+    /// hashing a divergent serialization of the payload.
     #[tokio::test]
-    async fn sign_digest_rejects_signature_from_wrong_signer() {
+    async fn sign_typed_data_rejects_signature_from_wrong_signer() {
         let configured_signer = PrivateKeySigner::random();
         let different_signer = PrivateKeySigner::random();
-        let digest = keccak256(b"detached digest");
-        let foreign_signature = different_signer.sign_hash(&digest).await.unwrap();
+        let expected_digest = keccak256(b"typed-data signing hash");
+        let foreign_signature = different_signer.sign_hash(&expected_digest).await.unwrap();
 
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
@@ -1376,7 +1401,10 @@ mod tests {
             Some(8453),
         );
 
-        let error = signer.sign_digest(digest).await.unwrap_err();
+        let error = signer
+            .sign_typed_data(r#"{"primaryType":"MintAuth"}"#.to_owned(), expected_digest)
+            .await
+            .unwrap_err();
 
         mock.assert();
         assert!(matches!(
@@ -1520,15 +1548,16 @@ mod tests {
         assert!(matches!(error, TracingTurnkeySignerError::Hex(_)));
     }
 
-    /// Wallet-level wiring: `TurnkeyWallet::sign_digest` must route through
-    /// the stored `digest_signer` (the clone sharing the transaction
-    /// signer's client), not panic or hit the transaction path.
+    /// Wallet-level wiring: `TurnkeyWallet::sign_typed_data` must route
+    /// through the stored `typed_data_signer` (the clone sharing the
+    /// transaction signer's client), not panic or hit the transaction
+    /// path.
     #[tokio::test]
-    async fn turnkey_wallet_signs_digest_via_raw_payload_activity() {
+    async fn turnkey_wallet_signs_typed_data_via_raw_payload_activity() {
         let key_signer = PrivateKeySigner::random();
         let address = key_signer.address();
-        let digest = keccak256(b"wallet-level digest");
-        let expected_signature = key_signer.sign_hash(&digest).await.unwrap();
+        let expected_digest = keccak256(b"wallet-level typed-data signing hash");
+        let expected_signature = key_signer.sign_hash(&expected_digest).await.unwrap();
 
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
@@ -1552,7 +1581,10 @@ mod tests {
         .await
         .unwrap();
 
-        let signature = wallet.sign_digest(digest).await.unwrap();
+        let signature = wallet
+            .sign_typed_data(r#"{"primaryType":"MintAuth"}"#.to_owned(), expected_digest)
+            .await
+            .unwrap();
 
         mock.assert();
         assert_eq!(signature, expected_signature);
@@ -2085,36 +2117,222 @@ mod tests {
         (wallet, anvil)
     }
 
-    /// Proves the raw-payload activity against the REAL Turnkey API: the
-    /// request shape, the org's policy allowance for `SIGN_RAW_PAYLOAD`
-    /// (a separate policy surface from transaction signing), and the
-    /// payload encoding -- the digest is sent as unprefixed lowercase hex
-    /// (matching the prod-proven transaction path), and only the real
-    /// endpoint can prove `PAYLOAD_ENCODING_HEXADECIMAL` accepts it, since
-    /// the mocked tests pin whatever we send. Run this before any
-    /// production cutover that depends on digest signing -- it is the
-    /// preflight for a path whose routine tests all use the private-key
-    /// backend.
-    #[ignore = "requires TURNKEY_* env vars -- run with `cargo test -- --ignored`"]
+    /// The orchestrator address the typed-signing policy's
+    /// `verifying_contract` condition allows. A policy scoped to the
+    /// production orchestrator rejects any other domain, so a made-up test
+    /// address would fail against exactly the policy these tests prove.
+    fn orchestrator_env() -> Address {
+        std::env::var("ST0X_ORCHESTRATOR_ADDRESS")
+            .expect(
+                "ST0X_ORCHESTRATOR_ADDRESS must be set to the orchestrator the \
+                 typed-signing policy's verifying_contract condition allows",
+            )
+            .parse()
+            .expect("ST0X_ORCHESTRATOR_ADDRESS must be a hex address")
+    }
+
+    /// Hand-composes a MintAuth-shaped typed payload and its EIP-712
+    /// signing hash, parameterized over the policy-scoped knobs (primary
+    /// type, chain id, verifying contract) so each denial probe can vary
+    /// exactly one condition. Message values are placeholders -- the
+    /// policy scopes the domain and primary type, not the message fields.
+    /// Shares no code with the mint_authorization service whose
+    /// serialization the allow-side test proves.
+    fn policy_probe(
+        primary_type: &str,
+        chain_id: u64,
+        verifying_contract: Address,
+        recipient: Address,
+    ) -> (String, B256) {
+        let token = Address::repeat_byte(0x21);
+        let amount = U256::from(1_000_000_000_000_000_000_u128);
+        let nonce = keccak256(b"st0x typed-signing integration test");
+
+        let mut types = serde_json::Map::new();
+        types.insert(
+            "EIP712Domain".to_owned(),
+            serde_json::json!([
+                { "name": "name", "type": "string" },
+                { "name": "version", "type": "string" },
+                { "name": "chainId", "type": "uint256" },
+                { "name": "verifyingContract", "type": "address" },
+            ]),
+        );
+        types.insert(
+            primary_type.to_owned(),
+            serde_json::json!([
+                { "name": "token", "type": "address" },
+                { "name": "recipient", "type": "address" },
+                { "name": "amount", "type": "uint256" },
+                { "name": "nonce", "type": "bytes32" },
+            ]),
+        );
+        let payload = serde_json::json!({
+            "types": types,
+            "primaryType": primary_type,
+            "domain": {
+                "name": "ST0xOrchestrator",
+                "version": "1",
+                "chainId": chain_id,
+                "verifyingContract": verifying_contract,
+            },
+            "message": {
+                "token": token,
+                "recipient": recipient,
+                "amount": amount.to_string(),
+                "nonce": nonce,
+            },
+        })
+        .to_string();
+
+        let domain_separator = keccak256(
+            (
+                keccak256(
+                    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+                ),
+                keccak256("ST0xOrchestrator"),
+                keccak256("1"),
+                U256::from(chain_id),
+                verifying_contract,
+            )
+                .abi_encode_params(),
+        );
+        let struct_type =
+            format!("{primary_type}(address token,address recipient,uint256 amount,bytes32 nonce)");
+        let hash_struct = keccak256(
+            (keccak256(struct_type), token, recipient, amount, nonce).abi_encode_params(),
+        );
+        let digest = keccak256(
+            [
+                [0x19, 0x01].as_slice(),
+                domain_separator.as_slice(),
+                hash_struct.as_slice(),
+            ]
+            .concat(),
+        );
+
+        (payload, digest)
+    }
+
+    /// Proves the ALLOW half of the typed-signing policy against the REAL
+    /// Turnkey API: the request shape, the org's policy allowance for
+    /// `SIGN_RAW_PAYLOAD_V2` with `PAYLOAD_ENCODING_EIP712` (a policy
+    /// scoped on `eth.eip_712.domain` / `primary_type` conditions, not a
+    /// blanket raw-payload grant), and Turnkey's server-side EIP-712
+    /// hashing of the exact `{types, primaryType, domain, message}` shape
+    /// the mint-authorization service serializes. Only the real endpoint
+    /// can prove the payload is accepted and hashed to the digest we
+    /// compute locally -- `sign_typed_data`'s recovery check enforces that
+    /// equality. Run this before any production cutover that depends on
+    /// MintAuth signing, TOGETHER WITH
+    /// [`turnkey_typed_signing_policy_denials_integration`]: passing alone
+    /// proves nothing about scoping, since a blanket raw-payload grant
+    /// also passes this test.
+    #[ignore = "requires TURNKEY_* env vars and ST0X_ORCHESTRATOR_ADDRESS -- run with `cargo test -- --ignored`"]
     #[tokio::test]
-    async fn turnkey_digest_signing_integration() {
+    async fn turnkey_typed_signing_integration() {
         let (api_key, org_id, address) = turnkey_env()
             .expect("TURNKEY_API_PRIVATE_KEY, TURNKEY_ORG_ID, and TURNKEY_ADDRESS must be set");
+        let orchestrator = orchestrator_env();
 
         let (wallet, _anvil) = integration_wallet(api_key, org_id, address).await;
 
-        let digest = keccak256(b"st0x digest-signing integration test");
+        // Base -- the chain the orchestrator is deployed to and the
+        // policy's chain_id condition names.
+        let (payload, digest) = policy_probe("MintAuth", 8453, orchestrator, address);
 
-        let signature = wallet
-            .sign_digest(digest)
-            .await
-            .expect("Turnkey raw-payload signing should succeed (policy must allow it)");
+        let signature = wallet.sign_typed_data(payload, digest).await.expect(
+            "Turnkey typed-data signing should succeed (the typed-scoped \
+                 policy must allow this domain and primary type)",
+        );
 
         assert_eq!(
             signature.recover_address_from_prehash(&digest).unwrap(),
             address,
-            "signature must recover to the Turnkey-managed address"
+            "signature must recover to the Turnkey-managed address over the \
+             locally composed EIP-712 digest"
         );
+    }
+
+    /// Proves the DENY half of the typed-signing policy against the REAL
+    /// Turnkey API -- the half [`turnkey_typed_signing_integration`] cannot
+    /// see: a blanket raw-payload grant passes the allow side, and only
+    /// refusals prove the `eth.eip_712` scoping. Four probes, each varying
+    /// exactly one scoped condition: a foreign primary type, a foreign
+    /// verifying contract, a foreign chain id, and a bare hex digest
+    /// (which carries no `eth.eip_712` fields for the policy to match, so
+    /// under default-deny it is refused unless a blanket raw-payload
+    /// allowance shadows the scoping).
+    ///
+    /// Every probe's expected digest matches its payload, so a wrongly
+    /// allowed probe surfaces as a VALID signature -- an unambiguous `Ok`
+    /// -- rather than a recovery mismatch. Only the refusal itself is
+    /// asserted: the denial's error shape (failed activity vs. HTTP
+    /// rejection) is Turnkey's to choose, not part of our contract.
+    #[ignore = "requires TURNKEY_* env vars and ST0X_ORCHESTRATOR_ADDRESS -- run with `cargo test -- --ignored`"]
+    #[tokio::test]
+    async fn turnkey_typed_signing_policy_denials_integration() {
+        let (api_key, org_id, address) = turnkey_env()
+            .expect("TURNKEY_API_PRIVATE_KEY, TURNKEY_ORG_ID, and TURNKEY_ADDRESS must be set");
+        let orchestrator = orchestrator_env();
+
+        let (wallet, _anvil) = integration_wallet(api_key.clone(), org_id.clone(), address).await;
+
+        for (condition, probe) in [
+            (
+                "a foreign primary type",
+                policy_probe("MintAuthV2", 8453, orchestrator, address),
+            ),
+            (
+                "a foreign verifying contract",
+                policy_probe("MintAuth", 8453, Address::repeat_byte(0x66), address),
+            ),
+            (
+                "a foreign chain id",
+                policy_probe("MintAuth", 1, orchestrator, address),
+            ),
+        ] {
+            let (payload, digest) = probe;
+            wallet
+                .sign_typed_data(payload, digest)
+                .await
+                .expect_err(&format!(
+                    "the typed-signing policy must refuse {condition}; an Ok means \
+                 Turnkey signed the probe and the policy is broader than the \
+                 eth.eip_712 scoping the runbook requires"
+                ));
+        }
+
+        // A bare digest submitted as PAYLOAD_ENCODING_HEXADECIMAL, using
+        // the digest the policy WOULD sign through the EIP-712 encoding --
+        // the exact bypass a leftover blanket raw-payload allowance would
+        // permit.
+        let (_, allowed_digest) = policy_probe("MintAuth", 8453, orchestrator, address);
+        let client = TracingTurnkeyClient::for_stamper(
+            ApiStamper::local(&TurnkeyApiPrivateKey::new(api_key)).expect("stamper builds"),
+        )
+        .expect("client builds");
+        let hex_submission = client
+            .sign_raw_payload(
+                TurnkeyOrganizationId::new(org_id),
+                TracingTurnkeyClient::current_timestamp().expect("clock is after the epoch"),
+                SignRawPayloadIntentV2 {
+                    sign_with: address.to_string(),
+                    payload: hex::encode(allowed_digest),
+                    encoding: PayloadEncoding::Hexadecimal,
+                    hash_function: HashFunction::NoOp,
+                },
+            )
+            .await;
+
+        // `SignRawPayloadResult` has no Debug impl, so no `expect_err`.
+        match hex_submission {
+            Err(_refused) => {}
+            Ok(_) => panic!(
+                "Turnkey SIGNED a bare hex digest: the org carries a blanket \
+                 raw-payload allowance that bypasses the eth.eip_712 scoping"
+            ),
+        }
     }
 
     #[ignore = "requires TURNKEY_* env vars -- run with `cargo test -- --ignored`"]

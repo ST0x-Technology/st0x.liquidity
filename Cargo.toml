@@ -176,7 +176,7 @@ apalis-cron = { version = "1.0.0-rc.8", default-features = false }
 task-supervisor = { version = "0.4", features = ["tracing"] }
 
 aes-gcm.workspace = true
-alloy.workspace = true
+alloy = { workspace = true, features = ["eip712"] }
 alloy-primitives.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true

@@ -189,13 +189,33 @@ distinct — neither key alone can both mint and authorize.
   every server-side mint initiation and fails closed — an indeterminate mode is
   never treated as vault-direct. For vault-direct assets the post-discovery
   execution path is unchanged: no signing, no delivery.
-- **Signing**: the bot reads the digest from the configured orchestrator's
-  `mintAuthDigest(token, recipient, amount, nonce)` view and signs that — never
-  constructing EIP-712 locally, so typehash/domain drift is impossible. `amount`
-  is the mint quantity scaled losslessly to 18-decimal share-wei. The wallet
-  seam is `Wallet::sign_digest`: private-key backend for dev/test, Turnkey
-  `ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2` (no-op hashing, hex payload) in
-  production.
+- **Signing**: the bot builds the EIP-712 `MintAuth` payload from the
+  orchestrator contract's own answers — domain via `eip712Domain()` (EIP-5267),
+  typehash via `MINT_AUTH_TYPEHASH()` — and proves its local signing hash equals
+  the contract's `mintAuthDigest(token, recipient, amount, nonce)` view before
+  signing, so any typehash/domain/encoding drift refuses loudly instead of
+  producing a signature the orchestrator would reject. The domain's chain id
+  must additionally equal the serving RPC's own `eth_chainId` — every other
+  pre-signing read comes from that same endpoint, so a wrong-network RPC would
+  otherwise pass every divergence check and bind the signature to a chain the
+  bot never meant to authorize. `amount` is the mint quantity scaled losslessly
+  to 18-decimal share-wei. The wallet seam is
+  `Wallet::sign_typed_data(payload_json, expected_digest)`: the private-key
+  backend (dev/test) signs the expected digest directly; Turnkey (production)
+  receives the full typed payload via `ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2` with
+  `PAYLOAD_ENCODING_EIP712` and no-op hashing, hashes it server-side, and the
+  returned signature must recover over the expected digest — the end-to-end
+  proof that Turnkey signed exactly what the orchestrator will verify. Because
+  the structured payload (not a bare digest) crosses Turnkey, the signing grant
+  is policy-scoped on `eth.eip_712` conditions — `primary_type == "MintAuth"`,
+  `domain.verifying_contract == <orchestrator>`, `domain.chain_id` — never a
+  blanket raw-payload allowance. The executable proof of that policy is the PAIR
+  of ignored tests in `crates/evm/src/turnkey.rs` (both need `TURNKEY_*`
+  - `ST0X_ORCHESTRATOR_ADDRESS`): `turnkey_typed_signing_integration` proves the
+    allow half, and `turnkey_typed_signing_policy_denials_integration` proves
+    the deny half — a bare hex digest and probes varying the primary type,
+    verifying contract, and chain id must all be refused. The allow test alone
+    proves nothing about scoping, since a blanket grant also passes it.
 - **Nonce discipline**: a random `bytes32` generated once per mint, persisted
   (`MintAuthorizationSigned`) before any delivery attempt, and redelivered
   byte-identically on every retry. A fresh nonce only ever belongs to a
@@ -1263,26 +1283,34 @@ The main crate forwards these as `wallet-turnkey` and `wallet-private-key`
 features. Domain logic is decoupled from the signing backend. See
 [crates/evm/](crates/evm/) for implementation details.
 
-#### Detached Digest Signing
+#### Detached Typed-Data Signing
 
-Beyond transaction submission, the `Wallet` trait exposes `sign_digest`: it
-signs a caller-supplied, precomputed 32-byte digest (e.g. an EIP-712 signing
-hash) exactly as given -- no EIP-191 message prefix and no further hashing --
-and returns the detached secp256k1 signature. Nothing is broadcast and no
-transaction nonce is consumed. The caller is responsible for supplying the exact
-digest the verifier expects, typically by reading it from the verifying contract
-itself rather than reconstructing it locally.
+Beyond transaction submission, the `Wallet` trait exposes
+`sign_typed_data(payload_json, expected_digest)`: it signs a full serialized
+EIP-712 payload (`{types, primaryType, domain, message}`) and returns the
+detached secp256k1 signature over its signing hash. Nothing is broadcast and no
+transaction nonce is consumed. The caller supplies both the payload and the
+signing hash it computed for it (verified against the verifying contract's own
+digest view before the call), and the returned signature must recover to the
+wallet address over that expected digest -- so a backend hashing a divergent
+serialization fails closed instead of returning a signature the verifier would
+reject. This is deliberately the only detached-signature surface: exposing the
+structured payload to the signing backend is what lets its policy engine scope
+the grant to a domain and primary type rather than "any 32 bytes".
 
 Backend expectations:
 
 - **Turnkey**: signs via the raw-payload activity
-  (`ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2`) with hexadecimal payload encoding and
-  the no-op hash function, so the enclave signs the digest bytes as-is. The
-  returned `r`/`s`/`v` components are strictly parsed (exact 32-byte scalars;
-  only the `00`/`01`/`1b`/`1c` recovery-id encodings are accepted), and the
-  assembled signature must recover to the wallet address over the requested
-  digest -- any mismatch fails closed.
-- **Raw private key**: signs the prehash directly with the local key.
+  (`ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2`) with `PAYLOAD_ENCODING_EIP712` and the
+  no-op hash function: the enclave parses the typed payload and computes the
+  signing hash itself, which its policy engine scopes via `eth.eip_712`
+  conditions. The returned `r`/`s`/`v` components are strictly parsed (exact
+  32-byte scalars; only the `00`/`01`/`1b`/`1c` recovery-id encodings are
+  accepted), and the assembled signature must recover to the wallet address over
+  the caller's expected digest -- any mismatch, including a server-side hash of
+  the payload diverging from the caller's, fails closed.
+- **Raw private key**: signs the expected digest directly with the local key
+  (nothing hashes the payload locally, the caller's digest is exact).
 
 ## Crate Architecture
 

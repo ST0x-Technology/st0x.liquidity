@@ -1783,11 +1783,12 @@ mod tests {
             self.address
         }
 
-        async fn sign_digest(
+        async fn sign_typed_data(
             &self,
-            _digest: alloy::primitives::B256,
+            _payload_json: String,
+            _expected_digest: alloy::primitives::B256,
         ) -> Result<alloy::primitives::Signature, EvmError> {
-            panic!("MockEthereumWallet::sign_digest should not be called in polling tests")
+            panic!("MockEthereumWallet::sign_typed_data should not be called in polling tests")
         }
 
         async fn send_pending(
@@ -1828,11 +1829,12 @@ mod tests {
             self.address
         }
 
-        async fn sign_digest(
+        async fn sign_typed_data(
             &self,
-            _digest: alloy::primitives::B256,
+            _payload_json: String,
+            _expected_digest: alloy::primitives::B256,
         ) -> Result<alloy::primitives::Signature, EvmError> {
-            panic!("MockBaseWallet::sign_digest should not be called in polling tests")
+            panic!("MockBaseWallet::sign_typed_data should not be called in polling tests")
         }
 
         async fn send_pending(

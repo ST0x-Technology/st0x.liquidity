@@ -462,11 +462,14 @@ mod tests {
             self.address
         }
 
-        async fn sign_digest(
+        async fn sign_typed_data(
             &self,
-            _digest: alloy::primitives::B256,
+            _payload_json: String,
+            _expected_digest: alloy::primitives::B256,
         ) -> Result<alloy::primitives::Signature, EvmError> {
-            panic!("StubWallet::sign_digest called - use a real wallet in tests that need signing")
+            panic!(
+                "StubWallet::sign_typed_data called - use a real wallet in tests that need signing"
+            )
         }
 
         async fn send_pending(
@@ -701,11 +704,12 @@ mod tests {
             self.address
         }
 
-        async fn sign_digest(
+        async fn sign_typed_data(
             &self,
-            _digest: alloy::primitives::B256,
+            _payload_json: String,
+            _expected_digest: alloy::primitives::B256,
         ) -> Result<alloy::primitives::Signature, EvmError> {
-            panic!("MockedWallet::sign_digest should not be called in wrapper tests")
+            panic!("MockedWallet::sign_typed_data should not be called in wrapper tests")
         }
 
         async fn send_pending(

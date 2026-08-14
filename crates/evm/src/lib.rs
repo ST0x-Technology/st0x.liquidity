@@ -559,15 +559,28 @@ pub trait Wallet: Evm {
     /// Returns the address this wallet signs transactions from.
     fn address(&self) -> Address;
 
-    /// Signs a precomputed 32-byte digest (e.g. an EIP-712 signing hash)
-    /// with this wallet's key, returning the raw signature.
+    /// Signs an EIP-712 typed-data payload with this wallet's key.
     ///
-    /// The digest is signed as-is -- no message prefix and no further
-    /// hashing -- so the caller is responsible for supplying the exact
-    /// digest the verifier expects (typically read from the verifying
-    /// contract itself). Detached-signature counterpart to transaction
-    /// signing: nothing is broadcast and no nonce is consumed.
-    async fn sign_digest(&self, digest: B256) -> Result<Signature, EvmError>;
+    /// `payload_json` is the full serialized EIP-712 payload
+    /// (`{types, primaryType, domain, message}`), and `expected_digest` is
+    /// the signing hash the caller computed for it. Backends that hash the
+    /// structured payload themselves (Turnkey's `PAYLOAD_ENCODING_EIP712`)
+    /// MUST verify the returned signature recovers to this wallet's
+    /// address over `expected_digest` -- that check is what proves the
+    /// backend hashed the same bytes the verifier will, turning any
+    /// payload-serialization divergence into a loud failure instead of an
+    /// invalid signature discovered on-chain. Backends that sign locally
+    /// may sign `expected_digest` directly.
+    ///
+    /// Deliberately the only detached-signature surface: the structured
+    /// payload is visible to the signing backend, so its policy engine can
+    /// scope the grant to the payload's domain and primary type rather
+    /// than "any 32 bytes". Nothing is broadcast and no nonce is consumed.
+    async fn sign_typed_data(
+        &self,
+        payload_json: String,
+        expected_digest: B256,
+    ) -> Result<Signature, EvmError>;
 
     /// Submit a signed transaction and return the tx hash immediately,
     /// without waiting for confirmation.
@@ -772,8 +785,14 @@ impl<Inner: Wallet + ?Sized> Wallet for Arc<Inner> {
         (**self).address()
     }
 
-    async fn sign_digest(&self, digest: B256) -> Result<Signature, EvmError> {
-        (**self).sign_digest(digest).await
+    async fn sign_typed_data(
+        &self,
+        payload_json: String,
+        expected_digest: B256,
+    ) -> Result<Signature, EvmError> {
+        (**self)
+            .sign_typed_data(payload_json, expected_digest)
+            .await
     }
 
     async fn send_pending(

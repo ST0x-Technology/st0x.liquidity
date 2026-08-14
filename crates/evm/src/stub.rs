@@ -48,8 +48,12 @@ impl Wallet for StubWallet {
         self.address
     }
 
-    async fn sign_digest(&self, _digest: B256) -> Result<Signature, EvmError> {
-        panic!("StubWallet::sign_digest called - use a real wallet in tests that need signing")
+    async fn sign_typed_data(
+        &self,
+        _payload_json: String,
+        _expected_digest: B256,
+    ) -> Result<Signature, EvmError> {
+        panic!("StubWallet::sign_typed_data called - use a real wallet in tests that need signing")
     }
 
     async fn send_pending(

@@ -1747,11 +1747,14 @@ mod tests {
             self.inner.address()
         }
 
-        async fn sign_digest(
+        async fn sign_typed_data(
             &self,
-            digest: alloy::primitives::B256,
+            payload_json: String,
+            expected_digest: alloy::primitives::B256,
         ) -> Result<alloy::primitives::Signature, EvmError> {
-            self.inner.sign_digest(digest).await
+            self.inner
+                .sign_typed_data(payload_json, expected_digest)
+                .await
         }
 
         async fn send_pending(

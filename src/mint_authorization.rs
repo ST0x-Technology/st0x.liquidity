@@ -12,7 +12,10 @@
 //! be redelivered byte-identically on retry; persistence and retry
 //! scheduling belong to the mint aggregate and its delivery job, not here.
 
+use alloy::dyn_abi::TypedData;
 use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::providers::Provider;
+use alloy::sol_types::{Eip712Domain, SolStruct};
 use async_trait::async_trait;
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
@@ -24,7 +27,7 @@ use st0x_issuance_client::{ClientError, IssuanceClient};
 use st0x_issuance_dto::{MintAuthorizationRequest, UnderlyingSymbol, VaultModeTag};
 use st0x_tokenization::TokenizationRequestId;
 
-use crate::bindings::IST0xOrchestratorV1;
+use crate::bindings::{IST0xOrchestratorV1, MintAuth, ST0xOrchestrator};
 use crate::tokenized_equity_mint::quantity_to_u256_18_decimals;
 // Re-exported so the pub error surfaces below stay publicly reachable
 // while the owning modules remain private.
@@ -133,6 +136,58 @@ pub enum MintAuthorizationError {
          entry; the mint authorizer is disabled"
     )]
     NotConfigured,
+    /// Our locally declared `MintAuth` struct hashes to a different
+    /// typehash than the contract's `MINT_AUTH_TYPEHASH` -- the local
+    /// struct definition has drifted from the deployed contract. Nothing is
+    /// signed; fix the local declaration.
+    #[error(
+        "local MintAuth typehash {local} diverges from the contract's \
+         MINT_AUTH_TYPEHASH {onchain}; the local struct declaration drifted"
+    )]
+    TypehashDiverged { local: B256, onchain: B256 },
+    /// The locally computed EIP-712 signing hash diverges from the
+    /// contract's own `mintAuthDigest` -- domain or encoding drift. Nothing
+    /// is signed: a signature over either digest would be wrong for the
+    /// other, and the on-chain read is the verifier's truth.
+    #[error(
+        "local EIP-712 digest {local} diverges from the contract's \
+         mintAuthDigest {onchain}; domain or struct encoding drifted"
+    )]
+    DigestDiverged { local: B256, onchain: B256 },
+    /// The contract's `eip712Domain()` names a different verifying contract
+    /// than the orchestrator address this service was configured with.
+    #[error(
+        "eip712Domain() reports verifying contract {reported} but the \
+         service is configured for orchestrator {configured}"
+    )]
+    VerifyingContractDiverged {
+        configured: Address,
+        reported: Address,
+    },
+    /// The contract's `eip712Domain()` fields bitmap is not the expected
+    /// name+version+chainId+verifyingContract shape (0x0f) -- the domain
+    /// has components (salt, extensions) our payload does not encode.
+    #[error(
+        "eip712Domain() fields bitmap {fields:#04x} is not the supported \
+         0x0f (name, version, chainId, verifyingContract)"
+    )]
+    UnsupportedDomainFields { fields: u8 },
+    /// The contract's `eip712Domain()` chain id differs from the chain the
+    /// serving RPC itself claims (`eth_chainId`). Every other pre-signing
+    /// read comes from the same endpoint, so without this binding a
+    /// wrong-network RPC (or a contract reporting a foreign domain) would
+    /// sail through the digest equality check and produce a signature for
+    /// a chain we never meant to authorize. Nothing is signed.
+    #[error(
+        "eip712Domain() reports chain id {reported} but the serving RPC's \
+         eth_chainId is {rpc}; refusing to bind the authorization to a \
+         foreign chain"
+    )]
+    ChainIdDiverged { reported: U256, rpc: u64 },
+    /// The typed-data payload could not be serialized for the signing
+    /// backend.
+    #[error("failed to serialize the MintAuth typed-data payload: {0}")]
+    PayloadSerialization(#[from] serde_json::Error),
 }
 
 /// [`MintAuthorizer`] backed by the configured orchestrator contract and
@@ -162,11 +217,81 @@ impl<SigningWallet: Wallet + Sync> MintAuthorizer for MintAuthorizationService<S
         let amount: U256 = quantity_to_u256_18_decimals(quantity)?;
         let recipient = self.wallet.address();
 
-        // The contract's own digest view guarantees the exact EIP-712
-        // domain and struct hash the orchestrator will verify at mint time
-        // -- the same read the issuance bot performs when validating the
-        // delivered authorization.
-        let digest: B256 = self
+        // Build the typed payload from the CONTRACT's own answers -- domain
+        // via EIP-5267, typehash via its constant -- and prove the local
+        // encoding against `mintAuthDigest` before anything is signed. The
+        // structured payload (not a bare digest) is what crosses Turnkey,
+        // so its policy engine can scope the grant on the payload's domain
+        // and primary type; these three reads keep that payload provably
+        // equal to what the orchestrator will verify at mint time.
+        let onchain_typehash: B256 = self
+            .wallet
+            .call::<NoOpErrorRegistry, _>(
+                self.orchestrator,
+                ST0xOrchestrator::MINT_AUTH_TYPEHASHCall {},
+            )
+            .await?;
+        let mint_auth = MintAuth {
+            token,
+            recipient,
+            amount,
+            nonce,
+        };
+        let local_typehash = mint_auth.eip712_type_hash();
+        if local_typehash != onchain_typehash {
+            return Err(MintAuthorizationError::TypehashDiverged {
+                local: local_typehash,
+                onchain: onchain_typehash,
+            });
+        }
+
+        let reported = self
+            .wallet
+            .call::<NoOpErrorRegistry, _>(self.orchestrator, ST0xOrchestrator::eip712DomainCall {})
+            .await?;
+        let fields = reported.fields.0[0];
+        if fields != 0x0f {
+            return Err(MintAuthorizationError::UnsupportedDomainFields { fields });
+        }
+        if reported.verifyingContract != self.orchestrator {
+            return Err(MintAuthorizationError::VerifyingContractDiverged {
+                configured: self.orchestrator,
+                reported: reported.verifyingContract,
+            });
+        }
+
+        // Binds the signing domain to the chain the RPC actually serves:
+        // every other pre-signing read comes from this same endpoint, so a
+        // wrong-network RPC (or a contract reporting a foreign domain)
+        // would otherwise pass every divergence check and yield a
+        // signature for a chain we never meant to authorize.
+        let rpc_chain_id = self
+            .wallet
+            .provider()
+            .get_chain_id()
+            .await
+            .map_err(EvmError::from)?;
+        if reported.chainId != U256::from(rpc_chain_id) {
+            return Err(MintAuthorizationError::ChainIdDiverged {
+                reported: reported.chainId,
+                rpc: rpc_chain_id,
+            });
+        }
+
+        let domain = Eip712Domain {
+            name: Some(reported.name.into()),
+            version: Some(reported.version.into()),
+            chain_id: Some(reported.chainId),
+            verifying_contract: Some(reported.verifyingContract),
+            salt: None,
+        };
+        let local_digest = mint_auth.eip712_signing_hash(&domain);
+
+        // The contract's own digest view is the verifier's truth -- the
+        // same read the issuance bot performs when validating the delivered
+        // authorization. Equality here proves the payload below encodes
+        // exactly what the orchestrator will check.
+        let onchain_digest: B256 = self
             .wallet
             .call::<NoOpErrorRegistry, _>(
                 self.orchestrator,
@@ -178,8 +303,23 @@ impl<SigningWallet: Wallet + Sync> MintAuthorizer for MintAuthorizationService<S
                 },
             )
             .await?;
+        if local_digest != onchain_digest {
+            return Err(MintAuthorizationError::DigestDiverged {
+                local: local_digest,
+                onchain: onchain_digest,
+            });
+        }
 
-        let signature = self.wallet.sign_digest(digest).await?;
+        // The exact JSON Turnkey parses and hashes server-side, derived
+        // from the SAME struct and domain the local digest was computed
+        // from -- one source of truth, no hand-written types section. A
+        // serialization quirk still cannot slip through: the signing seam
+        // verifies the returned signature recovers over `local_digest`, so
+        // a divergent server-side hash fails loudly instead of producing a
+        // signature the orchestrator would reject.
+        let payload = serde_json::to_string(&TypedData::from_struct(&mint_auth, Some(domain)))?;
+
+        let signature = self.wallet.sign_typed_data(payload, local_digest).await?;
 
         Ok(SignedMintAuthorization {
             nonce,
@@ -454,18 +594,140 @@ mod tests {
         ));
     }
 
-    /// The service must sign exactly the digest the orchestrator reports
-    /// (recovery over that digest yields the wallet address) and pass the
-    /// caller's nonce through unchanged. The mock only responds when the
-    /// JSON-RPC body carries the orchestrator address and the exact
-    /// `mintAuthDigest` calldata over `(token, recipient, scaled amount,
-    /// nonce)` -- built here independently, with the amount as a literal --
-    /// so a mis-encoded call (swapped token/recipient, wrong amount
-    /// scaling, dropped nonce) fails the call and the hit-count assert.
-    #[tokio::test]
-    async fn signs_the_orchestrator_reported_digest_with_the_wallet_key() {
-        let digest = keccak256(b"orchestrator-reported digest");
+    /// The exact struct string the deployed orchestrator's
+    /// `MINT_AUTH_TYPEHASH` hashes -- pinned as a literal so the mocked
+    /// contract answers are built independently of the implementation's own
+    /// `MintAuth` declaration.
+    const MINT_AUTH_TYPE: &str =
+        "MintAuth(address token,address recipient,uint256 amount,bytes32 nonce)";
 
+    const DOMAIN_NAME: &str = "ST0xOrchestrator";
+    const DOMAIN_VERSION: &str = "1";
+    const CHAIN_ID: u64 = 8453;
+
+    /// ABI-encoded `eip712Domain()` return the mock orchestrator reports:
+    /// the standard name+version+chainId+verifyingContract shape (0x0f).
+    fn eip712_domain_return() -> Vec<u8> {
+        (
+            alloy::primitives::FixedBytes::<1>::from([0x0fu8]),
+            DOMAIN_NAME.to_string(),
+            DOMAIN_VERSION.to_string(),
+            U256::from(CHAIN_ID),
+            ORCHESTRATOR,
+            B256::ZERO,
+            Vec::<U256>::new(),
+        )
+            .abi_encode_params()
+    }
+
+    /// The payload crossing Turnkey is derived via `TypedData::from_struct`
+    /// while the expected digest comes from `SolStruct::eip712_signing_hash`
+    /// -- the two derivations must agree, or Turnkey's server-side hash of
+    /// the payload could never recover over the expected digest and every
+    /// production signing would fail closed.
+    #[test]
+    fn typed_data_payload_hashes_to_the_solstruct_digest() {
+        let mint_auth = MintAuth {
+            token: TOKEN,
+            recipient: address!("0x3333333333333333333333333333333333333333"),
+            amount: U256::from(10u64).pow(U256::from(18u64)),
+            nonce: NONCE,
+        };
+        let domain = Eip712Domain {
+            name: Some(DOMAIN_NAME.into()),
+            version: Some(DOMAIN_VERSION.into()),
+            chain_id: Some(U256::from(CHAIN_ID)),
+            verifying_contract: Some(ORCHESTRATOR),
+            salt: None,
+        };
+
+        let typed_data = TypedData::from_struct(&mint_auth, Some(domain.clone()));
+
+        assert_eq!(
+            typed_data.eip712_signing_hash().unwrap(),
+            mint_auth.eip712_signing_hash(&domain),
+            "the serialized payload and the expected digest must hash the \
+             same MintAuth"
+        );
+
+        // Pins the exact JSON wire shape crossing Turnkey: field names,
+        // primary type, and value encodings (hex-quantity uints, hex
+        // bytes32, hex addresses). Turnkey's parser and policy engine see
+        // exactly this -- a serialization change here silently changes what
+        // the policy conditions match against, so it must be a deliberate,
+        // reviewed change.
+        assert_eq!(
+            serde_json::to_value(&typed_data).unwrap(),
+            json!({
+                "types": {
+                    "EIP712Domain": [
+                        { "name": "name", "type": "string" },
+                        { "name": "version", "type": "string" },
+                        { "name": "chainId", "type": "uint256" },
+                        { "name": "verifyingContract", "type": "address" },
+                    ],
+                    "MintAuth": [
+                        { "name": "token", "type": "address" },
+                        { "name": "recipient", "type": "address" },
+                        { "name": "amount", "type": "uint256" },
+                        { "name": "nonce", "type": "bytes32" },
+                    ],
+                },
+                "primaryType": "MintAuth",
+                "domain": {
+                    "name": "ST0xOrchestrator",
+                    "version": "1",
+                    "chainId": "0x2105",
+                    "verifyingContract": "0x2222222222222222222222222222222222222222",
+                },
+                "message": {
+                    "token": "0x1111111111111111111111111111111111111111",
+                    "recipient": "0x3333333333333333333333333333333333333333",
+                    "amount": "0xde0b6b3a7640000",
+                    "nonce": "0x0707070707070707070707070707070707070707070707070707070707070707",
+                },
+            }),
+            "the Turnkey-bound payload must keep this exact wire shape"
+        );
+    }
+
+    /// Composes the EIP-712 signing hash by hand
+    /// (`0x1901 || domainSeparator || hashStruct`), independent of the
+    /// implementation's `SolStruct` machinery, so the test pins the
+    /// encoding rather than mirroring it.
+    fn hand_composed_digest(recipient: Address, amount: U256) -> B256 {
+        let domain_separator = keccak256(
+            (
+                keccak256(
+                    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+                ),
+                keccak256(DOMAIN_NAME),
+                keccak256(DOMAIN_VERSION),
+                U256::from(CHAIN_ID),
+                ORCHESTRATOR,
+            )
+                .abi_encode_params(),
+        );
+        let hash_struct = keccak256(
+            (keccak256(MINT_AUTH_TYPE), TOKEN, recipient, amount, NONCE).abi_encode_params(),
+        );
+        let mut preimage = Vec::with_capacity(2 + 32 + 32);
+        preimage.extend_from_slice(&[0x19, 0x01]);
+        preimage.extend_from_slice(domain_separator.as_slice());
+        preimage.extend_from_slice(hash_struct.as_slice());
+        keccak256(preimage)
+    }
+
+    /// The service must sign exactly the digest the orchestrator will
+    /// verify: the local EIP-712 encoding is cross-checked against the
+    /// contract's `MINT_AUTH_TYPEHASH`, `eip712Domain()`, and
+    /// `mintAuthDigest` reads before signing, and recovery over the
+    /// hand-composed digest yields the wallet address. The `mintAuthDigest`
+    /// mock only responds to the exact calldata over `(token, recipient,
+    /// scaled amount, nonce)` -- built here independently -- so a
+    /// mis-encoded call fails the call and the hit-count assert.
+    #[tokio::test]
+    async fn signs_the_orchestrator_verified_digest_with_the_wallet_key() {
         let server = MockServer::start_async().await;
         let provider = ProviderBuilder::new().connect_http(server.base_url().parse().unwrap());
 
@@ -474,19 +736,61 @@ mod tests {
         let wallet = RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
         let wallet_address = wallet.address();
 
-        let calldata = alloy::hex::encode_prefixed(
+        let amount = U256::from(50u64) * U256::from(10u64).pow(U256::from(18u64));
+        let digest = hand_composed_digest(wallet_address, amount);
+
+        let typehash_calldata =
+            alloy::hex::encode_prefixed(ST0xOrchestrator::MINT_AUTH_TYPEHASHCall {}.abi_encode());
+        let typehash_mock = server
+            .mock_async(|when, then| {
+                when.method(POST).body_includes(&typehash_calldata);
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "result": alloy::hex::encode_prefixed(keccak256(MINT_AUTH_TYPE).abi_encode()),
+                }));
+            })
+            .await;
+
+        let domain_calldata =
+            alloy::hex::encode_prefixed(ST0xOrchestrator::eip712DomainCall {}.abi_encode());
+        let domain_mock = server
+            .mock_async(|when, then| {
+                when.method(POST).body_includes(&domain_calldata);
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "result": alloy::hex::encode_prefixed(eip712_domain_return()),
+                }));
+            })
+            .await;
+
+        // The chain-binding read: the serving RPC must claim the same chain
+        // the domain reports.
+        let chain_id_mock = server
+            .mock_async(|when, then| {
+                when.method(POST).body_includes("eth_chainId");
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "result": format!("{:#x}", CHAIN_ID),
+                }));
+            })
+            .await;
+
+        let digest_calldata = alloy::hex::encode_prefixed(
             IST0xOrchestratorV1::mintAuthDigestCall {
                 token: TOKEN,
                 to: wallet_address,
-                amount: U256::from(50u64) * U256::from(10u64).pow(U256::from(18u64)),
+                amount,
                 nonce: NONCE,
             }
             .abi_encode(),
         );
-        let rpc_mock = server
+        let digest_mock = server
             .mock_async(|when, then| {
                 when.method(POST)
-                    .body_includes(&calldata)
+                    .body_includes(&digest_calldata)
                     .body_includes(alloy::hex::encode_prefixed(ORCHESTRATOR));
                 then.status(200).json_body(json!({
                     "jsonrpc": "2.0",
@@ -503,13 +807,186 @@ mod tests {
             .await
             .unwrap();
 
-        rpc_mock.assert_async().await;
+        typehash_mock.assert_async().await;
+        domain_mock.assert_async().await;
+        chain_id_mock.assert_async().await;
+        digest_mock.assert_async().await;
         assert_eq!(authorization.nonce, NONCE);
         let signature = Signature::from_raw(authorization.signature.as_ref()).unwrap();
         assert_eq!(
             signature.recover_address_from_prehash(&digest).unwrap(),
             wallet_address
         );
+    }
+
+    /// A contract typehash diverging from the local `MintAuth` declaration
+    /// must refuse before anything else is read or signed.
+    #[tokio::test]
+    async fn diverging_typehash_refuses_before_signing() {
+        let asserter = Asserter::new();
+        asserter.push_success(&alloy::hex::encode_prefixed(
+            keccak256("MintAuthV2(address token)").abi_encode(),
+        ));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let private_key =
+            b256!("0x4242424242424242424242424242424242424242424242424242424242424242");
+        let wallet = RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
+        let service = MintAuthorizationService::new(wallet, ORCHESTRATOR);
+
+        let error = service
+            .sign_mint_authorization(TOKEN, float!(50), NONCE)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MintAuthorizationError::TypehashDiverged { .. }
+        ));
+    }
+
+    /// A domain naming a different verifying contract than the configured
+    /// orchestrator must refuse -- the payload would bind the signature to
+    /// a contract we never meant to authorize.
+    #[tokio::test]
+    async fn diverging_verifying_contract_refuses_before_signing() {
+        let asserter = Asserter::new();
+        asserter.push_success(&alloy::hex::encode_prefixed(
+            keccak256(MINT_AUTH_TYPE).abi_encode(),
+        ));
+        let foreign = (
+            alloy::primitives::FixedBytes::<1>::from([0x0fu8]),
+            DOMAIN_NAME.to_string(),
+            DOMAIN_VERSION.to_string(),
+            U256::from(CHAIN_ID),
+            address!("0x9999999999999999999999999999999999999999"),
+            B256::ZERO,
+            Vec::<U256>::new(),
+        )
+            .abi_encode_params();
+        asserter.push_success(&alloy::hex::encode_prefixed(foreign));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let private_key =
+            b256!("0x4242424242424242424242424242424242424242424242424242424242424242");
+        let wallet = RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
+        let service = MintAuthorizationService::new(wallet, ORCHESTRATOR);
+
+        let error = service
+            .sign_mint_authorization(TOKEN, float!(50), NONCE)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MintAuthorizationError::VerifyingContractDiverged { .. }
+        ));
+    }
+
+    /// An `eip712Domain()` fields bitmap other than
+    /// name+version+chainId+verifyingContract (0x0f) must refuse -- the
+    /// domain has components (salt, extensions) the payload does not
+    /// encode. No `mintAuthDigest` response is queued: reaching that read
+    /// would surface a transport error instead of
+    /// `UnsupportedDomainFields`, so the exact-variant assert also proves
+    /// the service stops before the digest read.
+    #[tokio::test]
+    async fn unsupported_domain_fields_refuses_before_digest_read() {
+        let asserter = Asserter::new();
+        asserter.push_success(&alloy::hex::encode_prefixed(
+            keccak256(MINT_AUTH_TYPE).abi_encode(),
+        ));
+        // 0x1f = the standard four fields PLUS the salt bit.
+        let salted = (
+            alloy::primitives::FixedBytes::<1>::from([0x1fu8]),
+            DOMAIN_NAME.to_string(),
+            DOMAIN_VERSION.to_string(),
+            U256::from(CHAIN_ID),
+            ORCHESTRATOR,
+            B256::repeat_byte(0x44),
+            Vec::<U256>::new(),
+        )
+            .abi_encode_params();
+        asserter.push_success(&alloy::hex::encode_prefixed(salted));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let private_key =
+            b256!("0x4242424242424242424242424242424242424242424242424242424242424242");
+        let wallet = RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
+        let service = MintAuthorizationService::new(wallet, ORCHESTRATOR);
+
+        let error = service
+            .sign_mint_authorization(TOKEN, float!(50), NONCE)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MintAuthorizationError::UnsupportedDomainFields { fields: 0x1f }
+        ));
+    }
+
+    /// A domain reporting a different chain id than the serving RPC's own
+    /// `eth_chainId` must refuse before the digest read -- a wrong-network
+    /// RPC (or a contract reporting a foreign domain) would pass every
+    /// same-endpoint divergence check, and the signature would bind to a
+    /// chain we never meant to authorize. No `mintAuthDigest` response is
+    /// queued: reaching that read would surface a transport error instead
+    /// of `ChainIdDiverged`, so the exact-variant assert also proves the
+    /// service stops here.
+    #[tokio::test]
+    async fn diverging_chain_id_refuses_before_digest_read() {
+        let asserter = Asserter::new();
+        asserter.push_success(&alloy::hex::encode_prefixed(
+            keccak256(MINT_AUTH_TYPE).abi_encode(),
+        ));
+        // The domain claims CHAIN_ID (8453)...
+        asserter.push_success(&alloy::hex::encode_prefixed(eip712_domain_return()));
+        // ...but the RPC itself claims mainnet.
+        asserter.push_success(&"0x1");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let private_key =
+            b256!("0x4242424242424242424242424242424242424242424242424242424242424242");
+        let wallet = RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
+        let service = MintAuthorizationService::new(wallet, ORCHESTRATOR);
+
+        let error = service
+            .sign_mint_authorization(TOKEN, float!(50), NONCE)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MintAuthorizationError::ChainIdDiverged { rpc: 1, .. }
+        ));
+    }
+
+    /// A `mintAuthDigest` answer diverging from the locally computed
+    /// signing hash must refuse -- signing either digest would be wrong for
+    /// the other, and the on-chain read is the verifier's truth.
+    #[tokio::test]
+    async fn diverging_digest_refuses_before_signing() {
+        let asserter = Asserter::new();
+        asserter.push_success(&alloy::hex::encode_prefixed(
+            keccak256(MINT_AUTH_TYPE).abi_encode(),
+        ));
+        asserter.push_success(&alloy::hex::encode_prefixed(eip712_domain_return()));
+        asserter.push_success(&format!("{CHAIN_ID:#x}"));
+        asserter.push_success(&alloy::hex::encode_prefixed(
+            keccak256(b"a digest the local encoding never produced").abi_encode(),
+        ));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let private_key =
+            b256!("0x4242424242424242424242424242424242424242424242424242424242424242");
+        let wallet = RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
+        let service = MintAuthorizationService::new(wallet, ORCHESTRATOR);
+
+        let error = service
+            .sign_mint_authorization(TOKEN, float!(50), NONCE)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MintAuthorizationError::DigestDiverged { .. }
+        ));
     }
 
     /// A quantity that cannot scale losslessly must fail BEFORE any chain
