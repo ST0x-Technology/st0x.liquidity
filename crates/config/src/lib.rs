@@ -24,7 +24,7 @@ pub use evm::{
 };
 pub use imbalance_threshold::{ImbalanceThreshold, InvalidImbalanceThreshold};
 pub use loader::*;
-pub use orchestrator::{OrchestratorConfig, OrchestratorError};
+pub use orchestrator::{OrchestratorAddresses, OrchestratorConfig, OrchestratorError};
 pub use order_poller::OrderPollerCtx;
 pub use rebalancing::{
     ALPACA_MINIMUM_WITHDRAWAL, RebalancingConfig, RebalancingCtx, RebalancingCtxError,

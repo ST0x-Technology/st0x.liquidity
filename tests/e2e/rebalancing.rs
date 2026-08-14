@@ -3373,7 +3373,10 @@ async fn drive_mint_with_orchestrator_configured(
         .redemption_wallet(REDEMPTION_WALLET)
         .issuance_base_url(issuance_base_url)
         .orchestrator(st0x_config::OrchestratorConfig {
-            address: orchestrator_address,
+            addresses: st0x_config::OrchestratorAddresses {
+                base: Some(orchestrator_address),
+                ethereum: None,
+            },
         })
         .call()?;
     let mut bot = spawn_bot(ctx);
