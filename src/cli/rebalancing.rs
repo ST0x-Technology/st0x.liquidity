@@ -4057,6 +4057,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn hyperevm_network_requires_explicit_token_address() {
+        let ctx = create_alpaca_ctx_without_rebalancing();
+        let mut stdout = Vec::new();
+
+        let error = alpaca_redeem_command(
+            &mut stdout,
+            Symbol::new("RKLB").unwrap(),
+            FractionalShares::new(float!(1)),
+            None,
+            TokenizationNetwork::HyperEvm,
+            None,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("pass --token"),
+            "hyperevm without --token must fail closed, got: {error}"
+        );
+    }
+
     #[test]
     fn token_override_bypasses_assets_config() {
         let ctx = create_alpaca_ctx_without_rebalancing();
