@@ -126,8 +126,9 @@ Manual cancellation of an open Alpaca order by the id printed at placement:
 cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml cancel 61e7b016-9c91-4a97-b912-615c9d365c9d
 ```
 
-A cancel for an id the broker does not recognise (already filled, cancelled, or
-never placed) reports not found instead of erroring.
+A cancel for an id the broker does not know reports it as unknown, and a cancel
+for an order that already filled or was cancelled reports it as no longer
+cancelable — neither is an error.
 
 Manual repair of local position tracking after an operator trade or rebalance:
 

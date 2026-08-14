@@ -3,6 +3,7 @@
 use alloy::primitives::TxHash;
 use alloy::providers::Provider;
 use async_trait::async_trait;
+use reqwest::StatusCode;
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
@@ -14,9 +15,9 @@ use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::alpaca_broker_api::{AlpacaLimitOrder, AlpacaLimitPrice};
 use st0x_execution::{
-    CancellationOutcome, ClientOrderId, Direction, Executor, ExecutorOrderId, FractionalShares,
-    MarketOrder, MockExecutor, MockExecutorCtx, OrderFailureTerminality, OrderPlacement,
-    OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
+    AlpacaBrokerApiError, CancellationOutcome, ClientOrderId, Direction, Executor, ExecutorOrderId,
+    FractionalShares, MarketOrder, MockExecutor, MockExecutorCtx, OrderFailureTerminality,
+    OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
 };
 use st0x_float_serde::format_float_with_fallback;
 
@@ -288,23 +289,38 @@ async fn get_broker_order_status<W: Write>(
 }
 
 /// Cancels an open broker order by the id the broker assigned at placement
-/// and reports the outcome. `OrderNotFound` is a result, not an error: the
-/// broker does not know the id, so no live order exists under it and a retry
-/// of the cancel can never succeed.
+/// and reports the outcome. Two broker responses are results, not errors,
+/// because retrying the cancel can never succeed: a 404 means the broker does
+/// not know the id at all, and a 422 means the order is known but no longer
+/// cancelable (already filled or cancelled).
 pub(super) async fn cancel_broker_order<W: Write>(
     ctx: &Ctx,
-    order_id: &str,
+    order_id: Uuid,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
     let outcome = match &ctx.broker {
         BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
             let broker = alpaca_auth.clone().try_into_executor().await?;
-            let order_id = order_id.to_string();
-            retry_on_backpressure(
-                || broker.cancel_order(&order_id),
+            let broker_order_id = order_id.to_string();
+            let cancellation = retry_on_backpressure(
+                || broker.cancel_order(&broker_order_id),
                 BACKPRESSURE_RETRY_MAX_ATTEMPTS,
             )
-            .await?
+            .await;
+
+            match cancellation {
+                Ok(outcome) => outcome,
+                Err(AlpacaBrokerApiError::ApiError { status, .. })
+                    if status == StatusCode::UNPROCESSABLE_ENTITY =>
+                {
+                    writeln!(
+                        stdout,
+                        "Order {order_id} is no longer cancelable (already filled or cancelled)"
+                    )?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         BrokerCtx::DryRun => {
             let broker = MockExecutorCtx.try_into_executor().await?;
@@ -317,10 +333,7 @@ pub(super) async fn cancel_broker_order<W: Write>(
             writeln!(stdout, "Cancellation requested for order {order_id}")?;
         }
         CancellationOutcome::OrderNotFound => {
-            writeln!(
-                stdout,
-                "Order {order_id} not found at the broker (already filled, cancelled, or unknown)"
-            )?;
+            writeln!(stdout, "Order {order_id} unknown to the broker")?;
         }
     }
 
@@ -1487,13 +1500,8 @@ mod tests {
         };
     }
 
-    fn setup_alpaca_broker_market_order_mocks<'a>(
-        server: &'a MockServer,
-        symbol: &'a str,
-        quantity: &'a str,
-        side: &'a str,
-    ) -> (httpmock::Mock<'a>, httpmock::Mock<'a>, httpmock::Mock<'a>) {
-        let account_mock = server.mock(|when, then| {
+    fn mock_active_account(server: &MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
             when.method(httpmock::Method::GET)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
@@ -1502,7 +1510,16 @@ mod tests {
                     "id": "904837e3-3b76-47ec-b432-046db621571b",
                     "status": "ACTIVE"
                 }));
-        });
+        })
+    }
+
+    fn setup_alpaca_broker_market_order_mocks<'a>(
+        server: &'a MockServer,
+        symbol: &'a str,
+        quantity: &'a str,
+        side: &'a str,
+    ) -> (httpmock::Mock<'a>, httpmock::Mock<'a>, httpmock::Mock<'a>) {
+        let account_mock = mock_active_account(server);
 
         let asset_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1562,16 +1579,7 @@ mod tests {
     fn setup_alpaca_broker_limit_order_mocks(
         server: &MockServer,
     ) -> (httpmock::Mock<'_>, httpmock::Mock<'_>, httpmock::Mock<'_>) {
-        let account_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "id": "904837e3-3b76-47ec-b432-046db621571b",
-                    "status": "ACTIVE"
-                }));
-        });
+        let account_mock = mock_active_account(server);
 
         let asset_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET).path("/v1/assets/AAPL");
@@ -1684,26 +1692,13 @@ mod tests {
         order_mock.assert();
     }
 
-    fn mock_active_account(server: &MockServer) -> httpmock::Mock<'_> {
-        server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "id": "904837e3-3b76-47ec-b432-046db621571b",
-                    "status": "ACTIVE"
-                }));
-        })
-    }
-
     #[tokio::test]
     async fn cancel_broker_order_reports_requested_on_success() {
         let server = MockServer::start();
         let ctx = create_alpaca_broker_api_test_ctx(&server);
         let account_mock = mock_active_account(&server);
 
-        let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d";
+        let order_id = uuid!("61e7b016-9c91-4a97-b912-615c9d365c9d");
         let delete_mock = server.mock(|when, then| {
             when.method(httpmock::Method::DELETE).path(format!(
                 "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
@@ -1730,7 +1725,7 @@ mod tests {
         let ctx = create_alpaca_broker_api_test_ctx(&server);
         let account_mock = mock_active_account(&server);
 
-        let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d";
+        let order_id = uuid!("61e7b016-9c91-4a97-b912-615c9d365c9d");
         let delete_mock = server.mock(|when, then| {
             when.method(httpmock::Method::DELETE).path(format!(
                 "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
@@ -1749,9 +1744,41 @@ mod tests {
         delete_mock.assert();
         assert_eq!(
             String::from_utf8(stdout).unwrap(),
-            format!(
-                "Order {order_id} not found at the broker (already filled, cancelled, or unknown)\n"
-            )
+            format!("Order {order_id} unknown to the broker\n")
+        );
+    }
+
+    /// An order that just filled or was already cancelled is KNOWN to the
+    /// broker, so the DELETE answers 422 ("order is not cancelable"), not
+    /// 404. The CLI must report that as an outcome and exit 0 -- the most
+    /// likely operator scenario is the limit order filling before the cancel
+    /// lands, which is not an error.
+    #[tokio::test]
+    async fn cancel_broker_order_reports_no_longer_cancelable_on_422() {
+        let server = MockServer::start();
+        let ctx = create_alpaca_broker_api_test_ctx(&server);
+        let account_mock = mock_active_account(&server);
+
+        let order_id = uuid!("61e7b016-9c91-4a97-b912-615c9d365c9d");
+        let delete_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(422)
+                .header("content-type", "application/json")
+                .json_body(json!({ "message": "order is not cancelable" }));
+        });
+
+        let mut stdout = Vec::new();
+        cancel_broker_order(&ctx, order_id, &mut stdout)
+            .await
+            .unwrap();
+
+        account_mock.assert();
+        delete_mock.assert();
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("Order {order_id} is no longer cancelable (already filled or cancelled)\n")
         );
     }
 
@@ -1760,14 +1787,15 @@ mod tests {
         let mut ctx = create_base_test_ctx();
         ctx.broker = BrokerCtx::DryRun;
 
+        let order_id = uuid!("61e7b016-9c91-4a97-b912-615c9d365c9d");
         let mut stdout = Vec::new();
-        cancel_broker_order(&ctx, "test-order-id", &mut stdout)
+        cancel_broker_order(&ctx, order_id, &mut stdout)
             .await
             .unwrap();
 
         assert_eq!(
             String::from_utf8(stdout).unwrap(),
-            "Cancellation requested for order test-order-id\n"
+            format!("Cancellation requested for order {order_id}\n")
         );
     }
 
@@ -1777,16 +1805,7 @@ mod tests {
         let ctx = create_alpaca_broker_api_test_ctx(&server);
         let pool = setup_test_db().await;
 
-        server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "id": "904837e3-3b76-47ec-b432-046db621571b",
-                    "status": "ACTIVE"
-                }));
-        });
+        mock_active_account(&server);
 
         server.mock(|when, then| {
             when.method(httpmock::Method::GET).path("/v1/assets/AAPL");

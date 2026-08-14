@@ -330,9 +330,8 @@ pub enum Commands {
     },
     /// Cancel an open Alpaca order by its broker order id
     ///
-    /// Reports the outcome: cancellation requested, or order not found when
-    /// the broker does not recognise the id (already filled, cancelled, or
-    /// never placed).
+    /// Reports the outcome: cancellation requested, order id unknown to the
+    /// broker, or order no longer cancelable (already filled or cancelled).
     Cancel {
         /// Broker order id (UUID) printed at placement
         order_id: Uuid,
@@ -1557,7 +1556,7 @@ async fn run_simple_command<W: Write>(
             execute_order(request, ctx, pool, stdout).await
         }
         SimpleCommand::Cancel { order_id } => {
-            trading::cancel_broker_order(ctx, &order_id.to_string(), stdout).await
+            trading::cancel_broker_order(ctx, order_id, stdout).await
         }
         SimpleCommand::TransferEquity {
             direction,
