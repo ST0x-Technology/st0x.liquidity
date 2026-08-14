@@ -46,6 +46,8 @@ impl st0x_evm::Parser for TomlValue {
 pub enum WalletCtxError {
     #[error("invalid wallet config: {0}")]
     WalletConfig(#[from] toml::de::Error),
+    #[error("failed to build the wallet RPC HTTP client: {0}")]
+    HttpClient(#[from] reqwest::Error),
     #[error(transparent)]
     Evm(#[from] st0x_evm::EvmError),
 }
@@ -127,14 +129,24 @@ impl OnchainWalletCtx {
     }
 }
 
-/// Creates an HTTP RPC client with retry layer for transient errors.
-fn http_client_with_retry(url: Url) -> RpcClient {
+/// Creates an HTTP RPC client with a retry layer for transient errors.
+///
+/// Redirects are disabled: the RPC URL is validated at config load (https or
+/// loopback), and following a redirect would let the server route signing
+/// traffic to a destination that never passed that validation.
+fn http_client_with_retry(url: Url) -> Result<RpcClient, reqwest::Error> {
     let retry_layer = RetryBackoffLayer::new(
         RPC_MAX_RETRIES,
         RPC_INITIAL_BACKOFF_MS,
         RPC_COMPUTE_UNITS_PER_SECOND,
     );
-    RpcClient::builder().layer(retry_layer).http(url)
+    let http_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let transport = alloy::transports::http::Http::with_client(http_client, url);
+    Ok(RpcClient::builder()
+        .layer(retry_layer)
+        .transport(transport, false))
 }
 
 pub async fn build_wallet(
@@ -143,7 +155,7 @@ pub async fn build_wallet(
     wallet_secrets: toml::Value,
     rpc_url: Url,
 ) -> Result<Arc<dyn Wallet<Provider = RootProvider>>, WalletCtxError> {
-    let provider = RootProvider::new(http_client_with_retry(rpc_url));
+    let provider = RootProvider::new(http_client_with_retry(rpc_url)?);
 
     Ok(kind
         .try_into_wallet(EvmWalletCtx {
