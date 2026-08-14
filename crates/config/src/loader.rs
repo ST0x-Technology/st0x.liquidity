@@ -887,28 +887,6 @@ pub struct WalletMeta {
     pub organization_id: Option<String>,
 }
 
-/// Rejects wallet RPC URLs that would carry signing traffic over cleartext
-/// HTTP. HTTP is allowed only for loopback hosts, so local test nodes
-/// (Anvil) keep working while any routable endpoint must be HTTPS.
-fn require_secure_wallet_rpc_url(url: Url, field: &'static str) -> Result<Url, CtxError> {
-    if url.scheme() == "https" {
-        return Ok(url);
-    }
-
-    let is_loopback = match url.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(url::Host::Domain(host)) => host == "localhost",
-        None => false,
-    };
-
-    if is_loopback {
-        Ok(url)
-    } else {
-        Err(CtxError::WalletInsecureRpcUrl { field })
-    }
-}
-
 /// Validates the config/secrets pairing and RPC prerequisites for wallet
 /// construction without connecting to either chain.
 fn validate_wallet_inputs(
@@ -932,24 +910,18 @@ fn validate_wallet_inputs(
                 None => return Err(CtxError::WalletSecretsMissing),
             };
 
-            let base_rpc_url = require_secure_wallet_rpc_url(
-                base_rpc_url.ok_or(CtxError::WalletMissingRpcUrl {
-                    field: "base_rpc_url",
-                })?,
-                "base_rpc_url",
-            )?;
-            let ethereum_rpc_url = require_secure_wallet_rpc_url(
-                ethereum_rpc_url.ok_or(CtxError::WalletMissingRpcUrl {
-                    field: "ethereum_rpc_url",
-                })?,
-                "ethereum_rpc_url",
-            )?;
-            let hyperevm_rpc_url = require_secure_wallet_rpc_url(
-                hyperevm_rpc_url.ok_or(CtxError::WalletMissingRpcUrl {
-                    field: "hyperevm_rpc_url",
-                })?,
-                "hyperevm_rpc_url",
-            )?;
+            let base_rpc_url = base_rpc_url.ok_or(CtxError::WalletMissingRpcUrl {
+                field: "base_rpc_url",
+            })?;
+            let ethereum_rpc_url = ethereum_rpc_url.ok_or(CtxError::WalletMissingRpcUrl {
+                field: "ethereum_rpc_url",
+            })?;
+            let hyperevm_rpc_url = hyperevm_rpc_url.ok_or(CtxError::WalletMissingRpcUrl {
+                field: "hyperevm_rpc_url",
+            })?;
+            crate::wallet::require_secure_wallet_rpc_url(&base_rpc_url, "base_rpc_url")?;
+            crate::wallet::require_secure_wallet_rpc_url(&ethereum_rpc_url, "ethereum_rpc_url")?;
+            crate::wallet::require_secure_wallet_rpc_url(&hyperevm_rpc_url, "hyperevm_rpc_url")?;
             let wallet_meta = WalletMeta::deserialize(wallet_config.clone()).map_err(|source| {
                 CtxError::ConfigToml {
                     path: config_path.to_path_buf(),
@@ -1746,11 +1718,6 @@ pub enum CtxError {
     Wallet(#[from] crate::wallet::WalletCtxError),
     #[error("[evm] {field} is required when [wallet] is configured")]
     WalletMissingRpcUrl { field: &'static str },
-    #[error(
-        "[evm] {field} must use https; http is allowed only for loopback \
-         hosts (local test nodes)"
-    )]
-    WalletInsecureRpcUrl { field: &'static str },
     #[error("[wallet] config present but [wallet] secrets missing")]
     WalletSecretsMissing,
     #[error(
@@ -1847,7 +1814,6 @@ impl CtxError {
             Self::WalletNotConfigured => "wallet not configured",
             Self::Wallet(_) => "wallet construction error",
             Self::WalletMissingRpcUrl { .. } => "wallet missing RPC URL",
-            Self::WalletInsecureRpcUrl { .. } => "wallet RPC URL not https",
             Self::WalletSecretsMissing => "wallet secrets missing",
             Self::RestApiClient(_) => "failed to build REST API HTTP client",
             Self::MissingIssuanceConfig => "missing issuance config",
@@ -4091,12 +4057,12 @@ mod tests {
     fn wallet_rpc_url_rejects_routable_http() {
         let url = Url::parse("http://mainnet.example.com").unwrap();
 
-        let result = require_secure_wallet_rpc_url(url, "hyperevm_rpc_url");
+        let result = crate::wallet::require_secure_wallet_rpc_url(&url, "hyperevm_rpc_url");
 
         assert!(
             matches!(
                 result,
-                Err(CtxError::WalletInsecureRpcUrl {
+                Err(crate::wallet::WalletCtxError::InsecureRpcUrl {
                     field: "hyperevm_rpc_url"
                 })
             ),
@@ -4113,8 +4079,7 @@ mod tests {
             "http://[::1]:8545",
         ] {
             let parsed = Url::parse(url).unwrap();
-            let accepted = require_secure_wallet_rpc_url(parsed.clone(), "base_rpc_url").unwrap();
-            assert_eq!(accepted, parsed, "{url} must be accepted unchanged");
+            crate::wallet::require_secure_wallet_rpc_url(&parsed, "base_rpc_url").unwrap();
         }
     }
 

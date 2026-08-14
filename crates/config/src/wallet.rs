@@ -49,8 +49,37 @@ pub enum WalletCtxError {
     WalletConfig(#[from] toml::de::Error),
     #[error("failed to build the wallet RPC HTTP client: {0}")]
     HttpClient(#[from] reqwest::Error),
+    #[error(
+        "{field} must use https; http is allowed only for loopback hosts \
+         (local test nodes)"
+    )]
+    InsecureRpcUrl { field: &'static str },
     #[error(transparent)]
     Evm(#[from] st0x_evm::EvmError),
+}
+
+/// Rejects wallet RPC URLs that would carry signing traffic over cleartext
+/// HTTP. HTTP is allowed only for loopback hosts, so local test nodes
+/// (Anvil) keep working while any routable endpoint must be HTTPS. Enforced
+/// both at config load and in [`OnchainWalletCtx::new`], so no caller of the
+/// public constructor can bypass it.
+pub fn require_secure_wallet_rpc_url(url: &Url, field: &'static str) -> Result<(), WalletCtxError> {
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+
+    let is_loopback = match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(host)) => host == "localhost",
+        None => false,
+    };
+
+    if is_loopback {
+        Ok(())
+    } else {
+        Err(WalletCtxError::InsecureRpcUrl { field })
+    }
 }
 
 /// Pre-built signing wallets for Base and Ethereum chains.
@@ -81,6 +110,10 @@ impl OnchainWalletCtx {
         ethereum_rpc_url: Url,
         hyperevm_rpc_url: Url,
     ) -> Result<Self, WalletCtxError> {
+        require_secure_wallet_rpc_url(&base_rpc_url, "base_rpc_url")?;
+        require_secure_wallet_rpc_url(&ethereum_rpc_url, "ethereum_rpc_url")?;
+        require_secure_wallet_rpc_url(&hyperevm_rpc_url, "hyperevm_rpc_url")?;
+
         let WalletKindTag { kind } = WalletKindTag::deserialize(wallet_config.clone())?;
 
         let (base_wallet, ethereum_wallet, hyperevm_wallet) = tokio::try_join!(
