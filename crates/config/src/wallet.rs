@@ -56,9 +56,9 @@ pub enum WalletCtxError {
 /// configure a wallet for manual CLI operations.
 #[derive(Clone)]
 pub struct OnchainWalletCtx {
-    base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
-    ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
-    hyperevm_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    base: Arc<dyn Wallet<Provider = RootProvider>>,
+    ethereum: Arc<dyn Wallet<Provider = RootProvider>>,
+    hyperevm: Arc<dyn Wallet<Provider = RootProvider>>,
 }
 
 impl OnchainWalletCtx {
@@ -103,22 +103,22 @@ impl OnchainWalletCtx {
         );
 
         Ok(Self {
-            base_wallet,
-            ethereum_wallet,
-            hyperevm_wallet,
+            base: base_wallet,
+            ethereum: ethereum_wallet,
+            hyperevm: hyperevm_wallet,
         })
     }
 
     pub fn base_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
-        &self.base_wallet
+        &self.base
     }
 
     pub fn ethereum_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
-        &self.ethereum_wallet
+        &self.ethereum
     }
 
     pub fn hyperevm_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
-        &self.hyperevm_wallet
+        &self.hyperevm
     }
 }
 
@@ -159,9 +159,9 @@ impl OnchainWalletCtx {
         let stub_wallet = st0x_evm::StubWallet::stub(Address::ZERO);
 
         Self {
-            base_wallet: stub_wallet.clone(),
-            ethereum_wallet: stub_wallet.clone(),
-            hyperevm_wallet: stub_wallet,
+            base: stub_wallet.clone(),
+            ethereum: stub_wallet.clone(),
+            hyperevm: stub_wallet,
         }
     }
 }
@@ -175,9 +175,9 @@ impl OnchainWalletCtx {
         hyperevm_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     ) -> Self {
         Self {
-            base_wallet,
-            ethereum_wallet,
-            hyperevm_wallet,
+            base: base_wallet,
+            ethereum: ethereum_wallet,
+            hyperevm: hyperevm_wallet,
         }
     }
 }
