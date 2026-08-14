@@ -6760,7 +6760,7 @@ dependencies = [
 [[package]]
 name = "st0x-issuance-client"
 version = "0.1.0"
-source = "git+https://github.com/ST0x-Technology/st0x.issuance.git?tag=0.2.0#6d0b7b95b17a61a82f55550d9f6f94c4f500f3e4"
+source = "git+https://github.com/ST0x-Technology/st0x.issuance.git?branch=2026-08-06-mint-authorization-client-dto#5c7dabf5f9f50145960d590e3f40cdc430710773"
 dependencies = [
  "reqwest 0.12.28",
  "st0x-issuance-dto",
@@ -6771,10 +6771,11 @@ dependencies = [
 [[package]]
 name = "st0x-issuance-dto"
 version = "0.1.0"
-source = "git+https://github.com/ST0x-Technology/st0x.issuance.git?tag=0.2.0#6d0b7b95b17a61a82f55550d9f6f94c4f500f3e4"
+source = "git+https://github.com/ST0x-Technology/st0x.issuance.git?branch=2026-08-06-mint-authorization-client-dto#5c7dabf5f9f50145960d590e3f40cdc430710773"
 dependencies = [
  "alloy-primitives",
  "serde",
+ "thiserror 2.0.18",
  "ts-rs",
 ]
 

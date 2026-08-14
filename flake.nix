@@ -66,6 +66,14 @@
       inputs.nixos-stable.follows = "nixpkgs";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    st0x-deploy = {
+      type = "git";
+      url = "https://github.com/S01-Issuer/st0x.deploy";
+      rev = "c526422e4c493b9e8be30ddfd7f7ec536efe2fb0";
+      flake = false;
+      submodules = true;
+    };
   };
 
   outputs =
@@ -82,6 +90,7 @@
       disko,
       nixos-anywhere,
       crane,
+      st0x-deploy,
       ...
     }:
     let
@@ -213,17 +222,19 @@
             solc = rainix.pkgs.${system}.solc_0_8_25;
           })
           mkAbi
+          mkSoldeerAbi
           ;
 
         inherit
           (import ./nix/abis.nix {
-            inherit pkgs mkAbi;
+            inherit pkgs mkAbi mkSoldeerAbi;
             sources = {
               inherit
                 forge-std
                 rain-math-float
                 rain-orderbook
                 raindex-governance
+                st0x-deploy
                 ;
             };
           })

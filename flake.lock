@@ -651,7 +651,8 @@
         "rain-math-float": "rain-math-float",
         "rain-orderbook": "rain-orderbook",
         "raindex-governance": "raindex-governance",
-        "rainix": "rainix"
+        "rainix": "rainix",
+        "st0x-deploy": "st0x-deploy"
       }
     },
     "rust-overlay": {
@@ -727,6 +728,25 @@
       "original": {
         "type": "file",
         "url": "https://github.com/argotorg/solc-bin/raw/83cb756/macosx-amd64/list.json"
+      }
+    },
+    "st0x-deploy": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784133383,
+        "narHash": "sha256-zsRMSYyBCAAFpi69TZ7HKsDeVO3aNYjJpwe1c79qLKA=",
+        "ref": "refs/heads/main",
+        "rev": "c526422e4c493b9e8be30ddfd7f7ec536efe2fb0",
+        "revCount": 775,
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/S01-Issuer/st0x.deploy"
+      },
+      "original": {
+        "rev": "c526422e4c493b9e8be30ddfd7f7ec536efe2fb0",
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/S01-Issuer/st0x.deploy"
       }
     },
     "systems": {
