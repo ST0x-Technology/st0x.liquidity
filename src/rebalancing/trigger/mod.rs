@@ -1018,7 +1018,7 @@ impl RebalancingService {
         // - Pre-burn entries (not yet post-burn) are only selected after the
         //   timeout elapses, as before: they cannot have an in-flight on-chain
         //   burn so abandonment is safe to defer until then.
-        let candidate_ids = {
+        let candidates = {
             let tracking = self.usdc_tracking.read().await;
             tracking
                 .iter()
@@ -1027,7 +1027,7 @@ impl RebalancingService {
                         Self::elapsed_since_timeout_start(tracking.last_progress_at, now)?;
 
                     if tracking.is_post_burn() || elapsed >= self.config.transfer_timeout {
-                        Some(id.clone())
+                        Some((id.clone(), elapsed))
                     } else {
                         None
                     }
@@ -1035,7 +1035,7 @@ impl RebalancingService {
                 .collect::<Vec<_>>()
         };
 
-        for id in candidate_ids {
+        for (id, elapsed) in candidates {
             // A timed-out transfer whose apalis row is still live is NOT
             // abandoned: the job will resume and may have an irreversible on-chain
             // withdraw/burn already submitted. "Live" includes retryable Failed
@@ -1044,14 +1044,28 @@ impl RebalancingService {
             // in-progress guard / inventory inflight nor mark it timed-out (which
             // would make the reactor ignore its eventual terminal event and latch
             // the guard forever). Let apalis drive it to terminal.
+            // A candidate past the burn can land here before its timeout;
+            // that is the healthy in flight state and is logged at debug.
             match self.transfer_live_job_for_id(&id).await {
                 Ok(true) => {
-                    warn!(
-                        target: "rebalance",
-                        aggregate_id = %id,
-                        "USDC transfer exceeded its timeout but its apalis row is still live; \
-                         deferring cleanup to the job rather than clearing the guard"
-                    );
+                    if elapsed >= self.config.transfer_timeout {
+                        warn!(
+                            target: "rebalance",
+                            aggregate_id = %id,
+                            ?elapsed,
+                            "USDC transfer exceeded its timeout but its apalis row is still live; \
+                             deferring cleanup to the job rather than clearing the guard"
+                        );
+                    } else {
+                        debug!(
+                            target: "rebalance",
+                            aggregate_id = %id,
+                            ?elapsed,
+                            "USDC transfer job is live and within its timeout; the sweep \
+                             selected it only because it is past the burn, where durable \
+                             Reconciled state is checked on every tick"
+                        );
+                    }
                     continue;
                 }
                 Ok(false) => {}
@@ -13523,6 +13537,114 @@ mod tests {
         assert!(
             !trigger.usdc_tracking.read().await.contains_key(&id),
             "timeout must drop tracking once the transfer job is terminal",
+        );
+    }
+
+    /// Entries past the CCTP burn are selected on every sweep tick
+    /// regardless of age so a durable Reconciled state is applied promptly.
+    /// An entry whose job row is live and whose elapsed time is below
+    /// transfer_timeout is running normally: the sweep logs the visit at
+    /// debug and leaves the guard and tracking intact.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn healthy_post_burn_transfer_with_live_job_does_not_warn() {
+        let trigger = make_trigger_with_inventory_config(
+            InventoryView::default(),
+            test_config_with_timeout(Duration::from_secs(1800)),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
+        queue
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(400),
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: Utc::now() - ChronoDuration::seconds(20),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            !logs_contain("exceeded its timeout"),
+            "WARN requires elapsed >= transfer_timeout",
+        );
+        assert!(
+            logs_contain("live and within its timeout"),
+            "a live transfer below its timeout logs the sweep visit at debug",
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "the sweep visit must not clear the guard while the job row is live",
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "the sweep visit must not drop tracking while the job row is live",
+        );
+    }
+
+    /// WARN fires when elapsed reaches transfer_timeout and the job row is
+    /// live, including for entries past the burn, whose selection ignores
+    /// elapsed time.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn timed_out_post_burn_transfer_with_live_job_still_warns() {
+        let trigger = make_trigger_with_inventory_config(
+            InventoryView::default(),
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
+        queue
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(400),
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: Utc::now() - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            logs_contain("exceeded its timeout"),
+            "a transfer past its timeout with a live job row must keep the WARN",
         );
     }
 
