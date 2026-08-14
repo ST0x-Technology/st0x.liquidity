@@ -9,6 +9,7 @@ mod bot_gas_valuation;
 mod evm;
 mod imbalance_threshold;
 mod loader;
+mod orchestrator;
 mod order_poller;
 mod rebalancing;
 mod telemetry;
@@ -23,6 +24,7 @@ pub use evm::{
 };
 pub use imbalance_threshold::{ImbalanceThreshold, InvalidImbalanceThreshold};
 pub use loader::*;
+pub use orchestrator::{OrchestratorConfig, OrchestratorError};
 pub use order_poller::OrderPollerCtx;
 pub use rebalancing::{
     ALPACA_MINIMUM_WITHDRAWAL, RebalancingConfig, RebalancingCtx, RebalancingCtxError,

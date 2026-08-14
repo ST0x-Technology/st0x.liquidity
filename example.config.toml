@@ -132,6 +132,15 @@ redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 pyth_contract = "0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a"
 eth_usd_feed_id = "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"
 
+# Optional — the ST0xOrchestrator contract, needed to sign MintAuthV1
+# recipient authorizations for orchestrator-mode mints. Which assets are
+# orchestrator-mode is owned by the issuance bot (the vault_mode field on its
+# per-asset status endpoint); this section only supplies the contract address.
+# Omit while every asset is vault-direct. When present, a malformed or zero
+# address fails config validation even before any asset cuts over.
+# [orchestrator]
+# address = "0xcccccccccccccccccccccccccccccccccccccccc"
+
 # Optional — only needed for automatic rebalancing.
 # Without this section the bot runs in Standalone mode (hedging only).
 [rebalancing]

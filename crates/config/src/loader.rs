@@ -25,8 +25,8 @@ use url::Url;
 
 use crate::{
     AlertsConfig, AlertsCtx, AlertsSecrets, BotGasValuationConfig, EvmConfig, EvmCtx, EvmSecrets,
-    ExecutionThreshold, InvalidThresholdError, InventoryAdapters, RebalancingConfig,
-    RebalancingCtx, RebalancingCtxError, TelemetryConfig, TelemetryCtx,
+    ExecutionThreshold, InvalidThresholdError, InventoryAdapters, OrchestratorConfig,
+    RebalancingConfig, RebalancingCtx, RebalancingCtxError, TelemetryConfig, TelemetryCtx,
 };
 use st0x_float_macro::float;
 
@@ -244,6 +244,8 @@ struct Config {
     /// ETH/USD valuation source for bot-gas cost recording. See
     /// [`Ctx::bot_gas_valuation`] for when this is required.
     bot_gas_valuation: Option<BotGasValuationConfig>,
+    /// ST0xOrchestrator contract address. See [`Ctx::orchestrator`].
+    orchestrator: Option<OrchestratorConfig>,
 }
 
 /// Plaintext REST API settings (URL only). Credentials live in secrets.
@@ -657,6 +659,13 @@ pub struct Ctx {
     /// including in Standalone mode, where an operator may still configure it
     /// even though no rebalancing path will ever enqueue to it.
     pub bot_gas_valuation: Option<BotGasValuationConfig>,
+    /// ST0xOrchestrator contract address from `[orchestrator]`, needed to
+    /// sign `MintAuthV1` recipient authorizations for orchestrator-mode
+    /// mints. `Some` when the config includes an `[orchestrator]` section.
+    /// Optional so the bot runs unchanged while every asset is
+    /// vault-direct; a mint that discovers an orchestrator-mode asset with
+    /// this absent must fail loudly, never guess an address.
+    pub orchestrator: Option<OrchestratorConfig>,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
@@ -789,7 +798,8 @@ impl std::fmt::Debug for Ctx {
             .field("redemption_wallet", &self.redemption_wallet)
             .field("rest_api", &self.rest_api)
             .field("issuance", &self.issuance)
-            .field("bot_gas_valuation", &self.bot_gas_valuation);
+            .field("bot_gas_valuation", &self.bot_gas_valuation)
+            .field("orchestrator", &self.orchestrator);
 
         debug_struct.finish()
     }
@@ -861,6 +871,7 @@ struct ValidatedParts {
     issuance: IssuanceStatusCtx,
     redemption_wallet: Option<Address>,
     bot_gas_valuation: Option<BotGasValuationConfig>,
+    orchestrator: Option<OrchestratorConfig>,
     /// Wallet construction inputs. Always present — `parse_and_validate`
     /// returns `WalletNotConfigured` when both config and secrets lack
     /// a `[wallet]` section. Actual async wallet construction is deferred
@@ -961,6 +972,46 @@ fn validate_extended_hours_counter_trading(assets: &AssetsConfig) -> Result<(), 
     Ok(())
 }
 
+/// The poll cadences with defaults applied, each rejected at zero -- a zero
+/// interval would spin the corresponding poller in a hot loop.
+struct PollingIntervals {
+    order_polling_interval: u64,
+    position_check_interval: u64,
+    inventory_poll_interval: u64,
+    order_fill_poll_interval: u64,
+    apalis_finished_job_cleanup_interval_secs: u64,
+}
+
+fn validated_polling_intervals(config: &Config) -> Result<PollingIntervals, CtxError> {
+    let intervals = PollingIntervals {
+        order_polling_interval: config.order_polling_interval.unwrap_or(15),
+        position_check_interval: config.position_check_interval.unwrap_or(60),
+        inventory_poll_interval: config.inventory_poll_interval.unwrap_or(60),
+        order_fill_poll_interval: config.order_fill_poll_interval.unwrap_or(5),
+        apalis_finished_job_cleanup_interval_secs: config.apalis_finished_job_cleanup_interval_secs,
+    };
+
+    for (value, field) in [
+        (intervals.order_polling_interval, "order_polling_interval"),
+        (intervals.position_check_interval, "position_check_interval"),
+        (intervals.inventory_poll_interval, "inventory_poll_interval"),
+        (
+            intervals.order_fill_poll_interval,
+            "order_fill_poll_interval",
+        ),
+        (
+            intervals.apalis_finished_job_cleanup_interval_secs,
+            "apalis_finished_job_cleanup_interval_secs",
+        ),
+    ] {
+        if value == 0 {
+            return Err(CtxError::ZeroPollingInterval { field });
+        }
+    }
+
+    Ok(intervals)
+}
+
 /// Single validation path shared by [`Ctx::load_files`] and
 /// [`Ctx::validate_files`]. All config/secrets business-rule checks live
 /// here — neither caller duplicates validation logic.
@@ -987,6 +1038,7 @@ fn parse_and_validate(
     }
 
     validate_extended_hours_counter_trading(&config.assets)?;
+    let polling_intervals = validated_polling_intervals(&config)?;
 
     let broker = BrokerCtx::from_parts(secrets.broker, config.broker.as_ref())?;
     let telemetry = config.telemetry.map(TelemetryCtx::from);
@@ -1051,48 +1103,12 @@ fn parse_and_validate(
 
     let log_level = config.log_level.unwrap_or(LogLevel::Debug);
 
-    let order_polling_interval = config.order_polling_interval.unwrap_or(15);
-    if order_polling_interval == 0 {
-        return Err(CtxError::ZeroPollingInterval {
-            field: "order_polling_interval",
-        });
-    }
-
-    let position_check_interval = config.position_check_interval.unwrap_or(60);
-    if position_check_interval == 0 {
-        return Err(CtxError::ZeroPollingInterval {
-            field: "position_check_interval",
-        });
-    }
-
-    let inventory_poll_interval = config.inventory_poll_interval.unwrap_or(60);
-    if inventory_poll_interval == 0 {
-        return Err(CtxError::ZeroPollingInterval {
-            field: "inventory_poll_interval",
-        });
-    }
-
-    let order_fill_poll_interval = config.order_fill_poll_interval.unwrap_or(5);
-    if order_fill_poll_interval == 0 {
-        return Err(CtxError::ZeroPollingInterval {
-            field: "order_fill_poll_interval",
-        });
-    }
-
     let ExtendedHoursBrokerWindows {
         reprice_timeout_secs: extended_hours_reprice_timeout_secs,
         close_flatten_reprice_timeout_secs,
         close_flatten_window_secs: extended_hours_close_flatten_window_secs,
         close_flatten_cross_max_bps,
     } = extended_hours_broker_windows(&broker, config.broker.as_ref(), &config.assets)?;
-
-    let apalis_finished_job_cleanup_interval_secs =
-        config.apalis_finished_job_cleanup_interval_secs;
-    if apalis_finished_job_cleanup_interval_secs == 0 {
-        return Err(CtxError::ZeroPollingInterval {
-            field: "apalis_finished_job_cleanup_interval_secs",
-        });
-    }
 
     let travel_rule = config
         .broker
@@ -1122,17 +1138,18 @@ fn parse_and_validate(
         board_port: config.board_port,
         evm,
         inventory_adapters: config.raindex.inventory_adapters,
-        order_polling_interval,
+        order_polling_interval: polling_intervals.order_polling_interval,
         order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
-        position_check_interval,
-        inventory_poll_interval,
+        position_check_interval: polling_intervals.position_check_interval,
+        inventory_poll_interval: polling_intervals.inventory_poll_interval,
         inventory_divergence_threshold: config.inventory_divergence_threshold,
-        order_fill_poll_interval,
+        order_fill_poll_interval: polling_intervals.order_fill_poll_interval,
         extended_hours_reprice_timeout_secs,
         close_flatten_reprice_timeout_secs,
         extended_hours_close_flatten_window_secs,
         close_flatten_cross_max_bps,
-        apalis_finished_job_cleanup_interval_secs,
+        apalis_finished_job_cleanup_interval_secs: polling_intervals
+            .apalis_finished_job_cleanup_interval_secs,
         broker,
         telemetry,
         alerts,
@@ -1165,6 +1182,7 @@ fn parse_and_validate(
         )?,
         redemption_wallet,
         bot_gas_valuation: config.bot_gas_valuation,
+        orchestrator: config.orchestrator,
         wallet_inputs,
         wallet_meta,
     })
@@ -1298,6 +1316,7 @@ impl Ctx {
             issuance: parts.issuance,
             redemption_wallet: parts.redemption_wallet,
             bot_gas_valuation: parts.bot_gas_valuation,
+            orchestrator: parts.orchestrator,
         })
     }
 
@@ -1510,6 +1529,7 @@ impl Ctx {
         #[builder(default = create_test_issuance_ctx())] issuance: IssuanceStatusCtx,
         redemption_wallet: Option<Address>,
         bot_gas_valuation: Option<BotGasValuationConfig>,
+        orchestrator: Option<OrchestratorConfig>,
     ) -> Result<Self, CtxError> {
         let execution_threshold = match execution_threshold_override {
             Some(threshold) => threshold,
@@ -1581,6 +1601,7 @@ impl Ctx {
             issuance,
             redemption_wallet,
             bot_gas_valuation,
+            orchestrator,
         })
     }
 }
@@ -1934,6 +1955,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         issuance: create_test_issuance_ctx(),
         redemption_wallet: None,
         bot_gas_valuation: None,
+        orchestrator: None,
     }
 }
 
@@ -3704,6 +3726,100 @@ mod tests {
         assert_eq!(
             bot_gas_valuation.eth_usd_feed_id,
             b256!("0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace")
+        );
+    }
+
+    /// The full bot-gas section plus the section under test -- the splice
+    /// hole in [`rebalancing_toml_with_bot_gas_valuation`] is plain TOML
+    /// text, and section order is insignificant, so appending
+    /// `[orchestrator]` there exercises the complete real config shape.
+    fn bot_gas_and_orchestrator_sections(orchestrator_section: &str) -> String {
+        format!(
+            r#"[bot_gas_valuation]
+            pyth_contract = "0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a"
+            eth_usd_feed_id = "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"
+
+            {orchestrator_section}"#
+        )
+    }
+
+    #[test]
+    fn orchestrator_section_flows_into_parts() {
+        let config_str =
+            rebalancing_toml_with_bot_gas_valuation(&bot_gas_and_orchestrator_sections(
+                r#"[orchestrator]
+            address = "0x4444444444444444444444444444444444444444""#,
+            ));
+        let secrets = rebalancing_secrets_toml();
+        let secrets_str = std::fs::read_to_string(secrets.path()).unwrap();
+
+        let parts = parse_and_validate(
+            &config_str,
+            Path::new("config.toml"),
+            &secrets_str,
+            Path::new("secrets.toml"),
+        )
+        .unwrap();
+
+        let orchestrator = parts
+            .orchestrator
+            .expect("orchestrator should be Some when configured");
+        assert_eq!(
+            orchestrator.address,
+            address!("0x4444444444444444444444444444444444444444")
+        );
+    }
+
+    /// Absence of `[orchestrator]` is the dark default: every asset is
+    /// vault-direct and the bot must run unchanged without the section.
+    #[test]
+    fn missing_orchestrator_section_parses_as_none() {
+        let config_str =
+            rebalancing_toml_with_bot_gas_valuation(&bot_gas_and_orchestrator_sections(""));
+        let secrets = rebalancing_secrets_toml();
+        let secrets_str = std::fs::read_to_string(secrets.path()).unwrap();
+
+        let parts = parse_and_validate(
+            &config_str,
+            Path::new("config.toml"),
+            &secrets_str,
+            Path::new("secrets.toml"),
+        )
+        .unwrap();
+
+        assert_eq!(parts.orchestrator, None);
+    }
+
+    /// A zero orchestrator address is a placeholder that slipped through;
+    /// it must fail the whole config parse (and thus `validate-config`)
+    /// even while no asset is orchestrator-mode.
+    #[test]
+    fn zero_orchestrator_address_fails_config_parse() {
+        let config_str =
+            rebalancing_toml_with_bot_gas_valuation(&bot_gas_and_orchestrator_sections(
+                r#"[orchestrator]
+            address = "0x0000000000000000000000000000000000000000""#,
+            ));
+        let secrets = rebalancing_secrets_toml();
+        let secrets_str = std::fs::read_to_string(secrets.path()).unwrap();
+
+        let result = parse_and_validate(
+            &config_str,
+            Path::new("config.toml"),
+            &secrets_str,
+            Path::new("secrets.toml"),
+        );
+
+        let source = match result {
+            Err(CtxError::ConfigToml { source, .. }) => source,
+            Err(other) => panic!("expected ConfigToml error, got {other:?}"),
+            Ok(_) => panic!("zero orchestrator address must fail config parse"),
+        };
+        assert!(
+            source
+                .to_string()
+                .contains("address must not be the zero address"),
+            "expected zero-address rejection, got: {source}"
         );
     }
 
