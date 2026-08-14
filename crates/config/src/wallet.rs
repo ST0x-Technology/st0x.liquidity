@@ -109,6 +109,11 @@ impl OnchainWalletCtx {
         })
     }
 
+    // The accessors below are deliberately trivial getters: the fields are
+    // private across the crate boundary, and wallet selection logic stays
+    // out of this crate on purpose. The consumer pairs a wallet with its
+    // Alpaca wire value in a single match (see the CLI's
+    // tokenization_network_context) so the two cannot diverge.
     pub fn base_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
         &self.base
     }
