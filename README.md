@@ -120,8 +120,7 @@ configured Base liquidity wallet):
 cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml unwrap-equity --symbol AAPL --quantity 10.5
 ```
 
-Manual cancellation of an open Alpaca order by the order id printed at
-placement:
+Manual cancellation of an open Alpaca order by the id printed at placement:
 
 ```bash
 cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml cancel 61e7b016-9c91-4a97-b912-615c9d365c9d
