@@ -1,15 +1,19 @@
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use st0x_float_macro::float;
 use std::str::FromStr;
-use tracing::{debug, trace, warn};
+use std::time::Duration;
+use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
 use super::client::AlpacaBrokerApiClient;
-use super::{AlpacaBrokerApiError, CryptoOrderFailureReason, MissingOrderField, TimeInForce};
+use super::{
+    AlpacaBrokerApiError, CryptoOrderFailureReason, DeadlineCancel, MissingOrderField, TimeInForce,
+};
 use crate::{
-    ClientOrderId, Direction, ExecutorOrderId, FractionalShares, MarketOrder,
+    CancellationOutcome, ClientOrderId, Direction, ExecutorOrderId, FractionalShares, MarketOrder,
     OrderFailureTerminality, OrderPlacement, OrderStatus, OrderUpdate, Positive, Symbol, Usd,
     deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
     serialize_float_as_string,
@@ -281,6 +285,11 @@ pub enum CryptoOrderOutcome {
 
 impl CryptoOrderResponse {
     /// Returns the status as a display-friendly string.
+    ///
+    /// Exhaustive rather than wildcarded to "other": the conversion poll logs
+    /// this when it decides to keep waiting on a stalled order, and the
+    /// statuses that drive that decision are exactly the ones a wildcard
+    /// would hide.
     pub fn status_display(&self) -> &'static str {
         use BrokerOrderStatus::*;
 
@@ -293,7 +302,14 @@ impl CryptoOrderResponse {
             Expired => "expired",
             Rejected => "rejected",
             Accepted => "accepted",
-            _ => "other",
+            AcceptedForBidding => "accepted_for_bidding",
+            PendingCancel => "pending_cancel",
+            PendingReplace => "pending_replace",
+            Stopped => "stopped",
+            DoneForDay => "done_for_day",
+            Replaced => "replaced",
+            Suspended => "suspended",
+            Calculated => "calculated",
         }
     }
 
@@ -320,6 +336,50 @@ impl CryptoOrderResponse {
         };
 
         CryptoOrderOutcome::Failed(reason)
+    }
+}
+
+/// An outcome the order can no longer leave.
+///
+/// Distinct from [`CryptoOrderOutcome`], which also covers the states an order
+/// can still move out of: pending, and the `Failed` statuses Alpaca may resume
+/// or fill from. Returning this from `cancel_and_settle` is what lets its
+/// caller match two real arms instead of a third impossible one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalCryptoOutcome {
+    Filled,
+    Failed(CryptoOrderFailureReason),
+}
+
+impl CryptoOrderOutcome {
+    /// The terminal outcome this classification represents, or `None` while
+    /// the order can still change state.
+    ///
+    /// A `Failed` status whose [`CryptoOrderFailureReason::terminality`] is
+    /// `NotTerminal` is deliberately `None`: the order may still resume and
+    /// fill, so treating it as an answer would terminalize a rebalance while
+    /// the broker can still move real money.
+    ///
+    /// `DoneForDay` is the one status this reads differently from
+    /// `terminality`, whose `Terminal` answer holds for the Day
+    /// time-in-force equity orders it also serves. Alpaca defines the status
+    /// as "no further updates until the next trading day", and does not
+    /// document what it means for a `gtc` order on a 24/7 crypto pair, so the
+    /// order is not assumed dead: waiting it out costs one deadline and ends
+    /// in a cancel that settles the order, while calling it terminal records
+    /// a failed rebalance against an order that may still fill.
+    fn terminal(self) -> Option<TerminalCryptoOutcome> {
+        match self {
+            Self::Filled => Some(TerminalCryptoOutcome::Filled),
+            // Not an answer yet, for two different reasons: the order is still
+            // working, or it is `DoneForDay`, which this deliberately reads as
+            // non-final for a crypto `gtc` order (see above).
+            Self::Pending | Self::Failed(CryptoOrderFailureReason::DoneForDay) => None,
+            Self::Failed(reason) => match reason.terminality() {
+                OrderFailureTerminality::Terminal => Some(TerminalCryptoOutcome::Failed(reason)),
+                OrderFailureTerminality::NotTerminal => None,
+            },
+        }
     }
 }
 
@@ -469,6 +529,9 @@ fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
         | IncompleteOrder { .. }
         | AccountNotActive { .. }
         | CryptoOrderFailed { .. }
+        | ConversionTimedOut { .. }
+        | ConversionCancelNotSettled { .. }
+        | ConversionOrderNotFound { .. }
         | DuplicateOrderNotFound { .. }
         | CalendarIterationInvariantViolation
         | CalendarDateMismatch { .. }
@@ -706,11 +769,13 @@ fn broker_time_or_observation(broker_time: Option<DateTime<Utc>>, order_id: &str
 }
 
 /// Classifies a broker status into the `OrderStatus` it maps to, and --
-/// whenever that status is `OrderStatus::Failed` -- the failure's
-/// terminality per Alpaca's order lifecycle
-/// (https://docs.alpaca.markets/docs/orders-at-alpaca). `DoneForDay` is
-/// terminal only because every order this bot places is Day time-in-force,
-/// so it cannot resume in a later session.
+/// whenever that status is `OrderStatus::Failed` -- the failure's terminality.
+/// A caller may release its idempotency key only on a `Terminal` failure.
+///
+/// The terminality half is not decided here: it is read off
+/// [`CryptoOrderFailureReason::terminality`], the crate's single source, so
+/// this mapping and the conversion poll's wait-vs-fail decision cannot drift
+/// apart.
 ///
 /// A single exhaustive match producing both classifications together, rather
 /// than two independent matches over `BrokerOrderStatus`: the previous shape
@@ -723,7 +788,7 @@ fn classify_broker_status(
     status: BrokerOrderStatus,
 ) -> (OrderStatus, Option<OrderFailureTerminality>) {
     use BrokerOrderStatus::*;
-    use OrderFailureTerminality::{NotTerminal, Terminal};
+    use CryptoOrderFailureReason as Reason;
 
     match status {
         // Submitted to broker and in progress.
@@ -740,13 +805,12 @@ fn classify_broker_status(
         // Cancelled by the broker after a cancel request was accepted.
         Canceled => (OrderStatus::Cancelled, None),
 
-        // Failed/terminal statuses: the order will never resume or fill
-        // further, so a caller may release its idempotency key.
-        Expired | Rejected | DoneForDay => (OrderStatus::Failed, Some(Terminal)),
-
-        // Failed statuses the order may still resume or fill from: a caller
-        // must NOT release its idempotency key on these.
-        Replaced | Suspended | Calculated => (OrderStatus::Failed, Some(NotTerminal)),
+        Expired => (OrderStatus::Failed, Some(Reason::Expired.terminality())),
+        Rejected => (OrderStatus::Failed, Some(Reason::Rejected.terminality())),
+        DoneForDay => (OrderStatus::Failed, Some(Reason::DoneForDay.terminality())),
+        Replaced => (OrderStatus::Failed, Some(Reason::Replaced.terminality())),
+        Suspended => (OrderStatus::Failed, Some(Reason::Suspended.terminality())),
+        Calculated => (OrderStatus::Failed, Some(Reason::Calculated.terminality())),
     }
 }
 
@@ -834,45 +898,287 @@ pub(crate) async fn convert_usdc_usd(
     client.place_crypto_order(&request).await
 }
 
-/// Poll for a crypto order's status until it reaches a terminal state.
+/// How long a conversion order may stay non-terminal before the remainder is
+/// cancelled. `USDCUSD` market orders normally fill in seconds; minutes with
+/// no terminal state means the collared limit sits outside the market and
+/// will not complete on its own.
+///
+/// On Alpaca->Base this deadline is the ONLY bound on the wait: that transfer
+/// job carries no per-attempt timeout. On Base->Alpaca it must additionally
+/// stay well below the transfer job's per-attempt timeout (1h in prod), so
+/// the resolution propagates while the outer await is still active.
+const CONVERSION_ORDER_DEADLINE: Duration = Duration::from_secs(300);
+
+/// After a deadline cancel, how long to wait for the broker to report the
+/// cancelled order's terminal state before giving up.
+///
+/// A chosen bound, not a documented one: Alpaca publishes no cancel
+/// acknowledgement or settlement time for crypto orders, so this value is not
+/// backed by the API reference and has not been measured against a live
+/// `pending_cancel`. Exceeding it does not abandon the order silently -- the
+/// poll fails with `ConversionCancelNotSettled`, which records the last
+/// observed fill and that the order may still be live.
+const CANCEL_SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The bounds a conversion poll runs under, carried together so a call
+/// site cannot swap them and so tests control the real timing: a settle
+/// deadline shorter than the poll interval would otherwise silently wait a
+/// full interval anyway.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConversionPollDeadlines {
+    /// How long the order may stay non-terminal before its remainder is
+    /// cancelled.
+    order: Duration,
+    /// How long the broker then has to report the cancelled order terminal.
+    cancel_settle: Duration,
+    /// How long to wait between order reads, both before the deadline and
+    /// inside the settle window.
+    interval: Duration,
+}
+
+impl ConversionPollDeadlines {
+    pub(super) const PRODUCTION: Self = Self {
+        order: CONVERSION_ORDER_DEADLINE,
+        cancel_settle: CANCEL_SETTLE_DEADLINE,
+        interval: Duration::from_millis(500),
+    };
+}
+
+/// A conversion order that reached a state it can no longer leave, and
+/// whether the deadline cancel is what forced it there -- the fact that
+/// separates "the broker resolved this order" from "we gave up on it", which
+/// [`poll_crypto_order_until_filled`] needs to accept a partial fill only on
+/// the path that cancelled the remainder itself.
+struct SettledConversionOrder {
+    order: CryptoOrderResponse,
+    outcome: TerminalCryptoOutcome,
+    deadline_cancelled: bool,
+}
+
+/// Poll a crypto order until it fills, treating a stall as a decision point
+/// rather than waiting forever.
+///
+/// An order that can still change state -- pending, partially filled, or
+/// failed with a status it may resume from -- is waited on until
+/// `deadlines.order`. Past it the remainder is cancelled: a fill that raced
+/// the cancel is a success, a cancelled order with a partial fill is accepted
+/// as-is (callers size downstream amounts from `filled_qty`, not the request),
+/// and a cancelled order with nothing filled is a timeout failure. This is
+/// what keeps a stalled conversion from holding the single-concurrency
+/// transfer worker and the in-flight USDC rebalance guard indefinitely.
 pub(crate) async fn poll_crypto_order_until_filled(
     client: &AlpacaBrokerApiClient,
     order_id: Uuid,
+    deadlines: ConversionPollDeadlines,
 ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
-    use BrokerOrderStatus::*;
+    use TerminalCryptoOutcome::*;
+
+    let settled = poll_until_terminal(client, order_id, deadlines).await?;
+
+    match settled.outcome {
+        Filled => Ok(settled.order),
+        Failed(CryptoOrderFailureReason::Canceled) if settled.deadline_cancelled => {
+            // An absent `filled_qty` is not evidence of a zero fill, which is
+            // exactly what `ConversionTimedOut` asserts, so the unknown is
+            // surfaced as the missing field it is.
+            let filled = settled.order.filled_quantity.ok_or_else(|| {
+                AlpacaBrokerApiError::IncompleteOrder {
+                    order_id: ExecutorOrderId::new(&order_id),
+                    field: MissingOrderField::FilledQty,
+                }
+            })?;
+
+            if filled.is_zero()? {
+                return Err(AlpacaBrokerApiError::ConversionTimedOut { order_id });
+            }
+
+            warn!(
+                target: "broker",
+                order_id = %order_id,
+                filled = ?settled.order.filled_quantity,
+                requested = ?settled.order.quantity,
+                "Accepting partially filled conversion; remainder cancelled"
+            );
+            Ok(settled.order)
+        }
+        Failed(reason) => Err(AlpacaBrokerApiError::CryptoOrderFailed { order_id, reason }),
+    }
+}
+
+/// Poll a crypto order until any terminal state, bounded by `deadlines`.
+///
+/// Unlike [`poll_crypto_order_until_filled`], terminal failures are returned
+/// as `Ok` for the caller to classify (the resume path records its own
+/// failure events). Past the deadline the remainder is cancelled and the
+/// settled terminal order returned; the errors a stall can produce are the
+/// ones `cancel_and_settle` raises when the cancel itself does not resolve.
+pub(crate) async fn poll_crypto_order_to_terminal(
+    client: &AlpacaBrokerApiClient,
+    order_id: Uuid,
+    deadlines: ConversionPollDeadlines,
+) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+    poll_until_terminal(client, order_id, deadlines)
+        .await
+        .map(|settled| settled.order)
+}
+
+/// The deadline-and-cancel loop both polls share: wait for a terminal state,
+/// and past `deadlines.order` force one by cancelling the remainder.
+///
+/// One body on purpose -- the deadline handling is the safety-critical part
+/// (it is what bounds the wait), and a correction applied to one poll but not
+/// the other would reintroduce the unbounded wait for the path it missed.
+/// Callers only interpret the returned outcome.
+async fn poll_until_terminal(
+    client: &AlpacaBrokerApiClient,
+    order_id: Uuid,
+    deadlines: ConversionPollDeadlines,
+) -> Result<SettledConversionOrder, AlpacaBrokerApiError> {
+    let started = tokio::time::Instant::now();
 
     loop {
         let order = client.get_crypto_order(order_id).await?;
 
-        match order.status {
-            Filled => return Ok(order),
-            Canceled => {
-                return Err(AlpacaBrokerApiError::CryptoOrderFailed {
-                    order_id,
-                    reason: CryptoOrderFailureReason::Canceled,
+        match order.classify().terminal() {
+            Some(outcome) => {
+                return Ok(SettledConversionOrder {
+                    order,
+                    outcome,
+                    deadline_cancelled: false,
                 });
             }
-            Expired => {
-                return Err(AlpacaBrokerApiError::CryptoOrderFailed {
-                    order_id,
-                    reason: CryptoOrderFailureReason::Expired,
+            None if started.elapsed() >= deadlines.order => {
+                warn!(
+                    target: "broker",
+                    order_id = %order_id,
+                    deadline = ?deadlines.order,
+                    status = order.status_display(),
+                    filled = ?order.filled_quantity,
+                    "Conversion order still not terminal at the deadline; cancelling the remainder"
+                );
+                let (order, outcome) = cancel_and_settle(client, order_id, deadlines).await?;
+
+                return Ok(SettledConversionOrder {
+                    order,
+                    outcome,
+                    deadline_cancelled: true,
                 });
             }
-            Rejected => {
-                return Err(AlpacaBrokerApiError::CryptoOrderFailed {
-                    order_id,
-                    reason: CryptoOrderFailureReason::Rejected,
-                });
-            }
-            _ => {
+            None => {
                 trace!(
                     target: "broker",
                     order_id = %order_id,
-                    status = ?order.status,
-                    "Crypto order still pending, waiting..."
+                    status = order.status_display(),
+                    "Crypto order can still change state, waiting..."
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(deadlines.interval).await;
             }
+        }
+    }
+}
+
+/// Cancel `order_id` and wait up to `deadlines.cancel_settle` for the broker
+/// to report its terminal state, returning that state alongside the order.
+///
+/// A cancel the broker never accepted is re-issued inside the settle window,
+/// so a single transient failure cannot leave the remainder live. An order
+/// still non-terminal after the settle window errors with
+/// [`AlpacaBrokerApiError::ConversionCancelNotSettled`], carrying how the
+/// broker answered the cancel so the persisted reason does not claim one that
+/// never took effect. See [`request_cancel`] for the per-answer handling.
+async fn cancel_and_settle(
+    client: &AlpacaBrokerApiClient,
+    order_id: Uuid,
+    deadlines: ConversionPollDeadlines,
+) -> Result<(CryptoOrderResponse, TerminalCryptoOutcome), AlpacaBrokerApiError> {
+    let mut cancel = request_cancel(client, order_id).await?;
+
+    let started = tokio::time::Instant::now();
+    let mut filled_quantity = None;
+
+    loop {
+        // A cancel the broker never took leaves the remainder live, so it is
+        // re-issued for as long as the settle window lasts. Retrying is only
+        // meaningful after a transport or 5xx failure: an accepted cancel
+        // needs no repeat, and a declined one is refused for a reason that
+        // will not change.
+        if cancel == DeadlineCancel::Failed {
+            cancel = request_cancel(client, order_id).await?;
+        }
+
+        match client.get_crypto_order(order_id).await {
+            Ok(order) => {
+                if let Some(outcome) = order.classify().terminal() {
+                    return Ok((order, outcome));
+                }
+                filled_quantity = order.filled_quantity;
+            }
+            // A read that fails leaves the order's fate as unknown as a
+            // non-terminal one, so it is retried inside the window rather
+            // than abandoning a cancel that may still settle.
+            Err(error) => warn!(
+                target: "broker",
+                order_id = %order_id,
+                %error,
+                "Failed to read back the cancelled conversion order"
+            ),
+        }
+
+        if started.elapsed() >= deadlines.cancel_settle {
+            error!(
+                target: "broker",
+                order_id = %order_id,
+                filled = ?filled_quantity,
+                "Cancelled conversion order never reached a terminal state and may \
+                 still be live; manual reconciliation required"
+            );
+            return Err(AlpacaBrokerApiError::ConversionCancelNotSettled {
+                order_id,
+                cancel,
+                filled_quantity,
+            });
+        }
+
+        tokio::time::sleep(deadlines.interval).await;
+    }
+}
+
+/// Issue the deadline cancel once, mapping the broker's answer to what may
+/// later be claimed about the remainder.
+///
+/// Only an unrecognised order aborts: reading it back would hit the same id
+/// and 404 again, so its fill state is unobservable. A 422 means the order is
+/// no longer cancelable -- it went terminal between the last poll and the
+/// DELETE -- and a transport or 5xx failure leaves the request unmade; both
+/// fall through to the status read, which observes whatever the order became.
+async fn request_cancel(
+    client: &AlpacaBrokerApiClient,
+    order_id: Uuid,
+) -> Result<DeadlineCancel, AlpacaBrokerApiError> {
+    match client.cancel_order(order_id).await {
+        Ok(CancellationOutcome::Requested) => Ok(DeadlineCancel::Accepted),
+        Ok(CancellationOutcome::OrderNotFound) => {
+            error!(
+                target: "broker",
+                order_id = %order_id,
+                "Broker does not recognise the conversion order being cancelled; \
+                 its fill state cannot be read back"
+            );
+            Err(AlpacaBrokerApiError::ConversionOrderNotFound { order_id })
+        }
+        Err(AlpacaBrokerApiError::ApiError { status, .. })
+            if status == StatusCode::UNPROCESSABLE_ENTITY =>
+        {
+            Ok(DeadlineCancel::Declined)
+        }
+        Err(error) => {
+            warn!(
+                target: "broker",
+                order_id = %order_id,
+                %error,
+                "Cancelling the stalled conversion order failed; retrying inside the settle window"
+            );
+            Ok(DeadlineCancel::Failed)
         }
     }
 }
@@ -883,6 +1189,7 @@ mod tests {
     use proptest::prelude::*;
     use reqwest::StatusCode;
     use serde_json::json;
+    use tracing_test::traced_test;
     use uuid::uuid;
 
     use super::*;
@@ -2578,6 +2885,640 @@ mod tests {
         assert_eq!(order.symbol, "USDCUSD");
         assert!(order.quantity.eq(float!(500)).unwrap());
         assert_eq!(order.status_display(), "filled");
+    }
+
+    const STALLED_ORDER_ID: Uuid = uuid!("61e7b016-9c91-4a97-b912-615c9d365c9d");
+
+    fn crypto_order_path() -> String {
+        format!(
+            "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{STALLED_ORDER_ID}"
+        )
+    }
+
+    fn stalled_order_body(status: &str, filled_qty: &str) -> serde_json::Value {
+        json!({
+            "id": STALLED_ORDER_ID.to_string(),
+            "symbol": "USDCUSD",
+            "qty": "500",
+            "side": "buy",
+            "status": status,
+            "filled_avg_price": "1.0001",
+            "filled_qty": filled_qty,
+            "created_at": "2025-01-06T12:30:00Z"
+        })
+    }
+
+    /// Mocks a broker whose order never progresses past `status`, answers the
+    /// deadline cancel with `cancel_status`, and after the DELETE arrives
+    /// swaps the order to `final_body`. Returns the cancel mock for hit
+    /// assertions.
+    async fn respond_to_deadline_cancel<'server>(
+        server: &'server MockServer,
+        status: &str,
+        filled_qty: &str,
+        cancel_status: u16,
+        final_body: serde_json::Value,
+    ) -> httpmock::Mock<'server> {
+        let mut stalled = server.mock(|when, then| {
+            when.method(GET).path(crypto_order_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(stalled_order_body(status, filled_qty));
+        });
+        let cancel = server.mock(|when, then| {
+            when.method(DELETE).path(crypto_order_path());
+            then.status(cancel_status);
+        });
+
+        // Wait (bounded) for the poll under test to issue the cancel, then
+        // swap the stalled snapshot for the settled terminal one. The swap is
+        // registration-then-delete so there is never a window where the GET
+        // has no matching mock.
+        for _ in 0..100 {
+            if cancel.calls() >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(cancel.calls(), 1, "poll never issued the deadline cancel");
+
+        server.mock(|when, then| {
+            when.method(GET).path(crypto_order_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(final_body);
+        });
+        stalled.delete();
+
+        cancel
+    }
+
+    /// A poll deadline short enough that the tests reach the cancel almost
+    /// immediately, with a settle window wide enough that a mock which answers
+    /// the follow-up GET always beats it. Tests of the settle window itself
+    /// pass their own.
+    const FAST_DEADLINES: ConversionPollDeadlines = ConversionPollDeadlines {
+        order: Duration::from_millis(100),
+        cancel_settle: Duration::from_secs(30),
+        interval: Duration::from_millis(10),
+    };
+
+    /// A conversion order that partially fills and then stops progressing must
+    /// reach a decision rather than polling indefinitely: past the deadline the
+    /// remainder is cancelled and the filled portion is accepted -- downstream
+    /// sizes the withdrawal from `filled_qty`, not the requested amount.
+    #[tokio::test]
+    async fn stalled_partial_fill_is_cancelled_and_the_filled_portion_accepted() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let poll = tokio::spawn(async move {
+            let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+            poll_crypto_order_until_filled(&client, STALLED_ORDER_ID, FAST_DEADLINES).await
+        });
+
+        let cancel = respond_to_deadline_cancel(
+            &server,
+            "partially_filled",
+            "300",
+            204,
+            stalled_order_body("canceled", "300"),
+        )
+        .await;
+
+        let order = tokio::time::timeout(std::time::Duration::from_secs(10), poll)
+            .await
+            .expect("poll must terminate once the cancel settles")
+            .unwrap()
+            .unwrap();
+
+        cancel.assert();
+        assert!(order.filled_quantity.unwrap().eq(float!(300)).unwrap());
+        assert_eq!(
+            order.classify(),
+            CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Canceled)
+        );
+    }
+
+    /// A cancelled order that omits `filled_qty` must surface the missing
+    /// field, not assume a zero fill: `ConversionTimedOut` asserts nothing
+    /// was filled, and an absent field is not evidence of that.
+    #[tokio::test]
+    async fn cancelled_order_without_filled_qty_reports_the_missing_field() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let poll = tokio::spawn(async move {
+            let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+            poll_crypto_order_until_filled(&client, STALLED_ORDER_ID, FAST_DEADLINES).await
+        });
+
+        let cancel = respond_to_deadline_cancel(
+            &server,
+            "new",
+            "0",
+            204,
+            json!({
+                "id": STALLED_ORDER_ID.to_string(),
+                "symbol": "USDCUSD",
+                "qty": "500",
+                "side": "buy",
+                "status": "canceled",
+                "created_at": "2025-01-06T12:30:00Z"
+            }),
+        )
+        .await;
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), poll)
+            .await
+            .expect("poll must terminate once the cancel settles")
+            .unwrap()
+            .unwrap_err();
+
+        cancel.assert();
+        match error {
+            AlpacaBrokerApiError::IncompleteOrder { order_id, field } => {
+                assert_eq!(order_id, ExecutorOrderId::new(&STALLED_ORDER_ID));
+                assert_eq!(field, MissingOrderField::FilledQty);
+            }
+            other => panic!("expected IncompleteOrder, got {other:?}"),
+        }
+    }
+
+    /// The same stall with nothing filled is a timeout failure, not a success
+    /// and not an infinite loop.
+    #[tokio::test]
+    async fn stalled_unfilled_conversion_is_cancelled_and_errors() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let poll = tokio::spawn(async move {
+            let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+            poll_crypto_order_until_filled(&client, STALLED_ORDER_ID, FAST_DEADLINES).await
+        });
+
+        let cancel = respond_to_deadline_cancel(
+            &server,
+            "new",
+            "0",
+            204,
+            stalled_order_body("canceled", "0"),
+        )
+        .await;
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), poll)
+            .await
+            .expect("poll must terminate once the cancel settles")
+            .unwrap()
+            .unwrap_err();
+
+        cancel.assert();
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::ConversionTimedOut { order_id } if order_id == STALLED_ORDER_ID
+        ));
+    }
+
+    /// The cancel races the fill: the order goes `filled` between the last
+    /// poll and the DELETE, so the settle read observes a fill and the
+    /// conversion succeeds instead of being reported as a timeout.
+    #[tokio::test]
+    async fn conversion_that_fills_while_the_cancel_is_in_flight_succeeds() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let poll = tokio::spawn(async move {
+            let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+            poll_crypto_order_until_filled(&client, STALLED_ORDER_ID, FAST_DEADLINES).await
+        });
+
+        let cancel = respond_to_deadline_cancel(
+            &server,
+            "partially_filled",
+            "300",
+            204,
+            stalled_order_body("filled", "500"),
+        )
+        .await;
+
+        let order = tokio::time::timeout(std::time::Duration::from_secs(10), poll)
+            .await
+            .expect("poll must terminate once the cancel settles")
+            .unwrap()
+            .unwrap();
+
+        cancel.assert();
+        assert_eq!(order.classify(), CryptoOrderOutcome::Filled);
+        assert!(order.filled_quantity.unwrap().eq(float!(500)).unwrap());
+    }
+
+    /// Alpaca answers the DELETE with 422 when the order is no longer
+    /// cancelable because it already went terminal. That is not a failure:
+    /// the settle read observes what it became.
+    #[tokio::test]
+    async fn cancel_rejected_as_no_longer_cancelable_settles_on_the_terminal_state() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let poll = tokio::spawn(async move {
+            let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+            poll_crypto_order_until_filled(&client, STALLED_ORDER_ID, FAST_DEADLINES).await
+        });
+
+        let cancel = respond_to_deadline_cancel(
+            &server,
+            "partially_filled",
+            "300",
+            422,
+            stalled_order_body("filled", "500"),
+        )
+        .await;
+
+        let order = tokio::time::timeout(std::time::Duration::from_secs(10), poll)
+            .await
+            .expect("poll must terminate once the cancel settles")
+            .unwrap()
+            .unwrap();
+
+        cancel.assert();
+        assert_eq!(order.classify(), CryptoOrderOutcome::Filled);
+    }
+
+    /// A 404 on the DELETE means the broker does not recognise the order id,
+    /// so the settle read (same URL) could only 404 too. Resolve it as its own
+    /// named condition rather than reading back and surfacing a bare 404.
+    #[tokio::test]
+    async fn cancel_of_an_unknown_order_reports_the_order_as_missing() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET).path(crypto_order_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(stalled_order_body("partially_filled", "300"));
+        });
+        let cancel = server.mock(|when, then| {
+            when.method(DELETE).path(crypto_order_path());
+            then.status(404);
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = poll_crypto_order_until_filled(&client, STALLED_ORDER_ID, FAST_DEADLINES)
+            .await
+            .unwrap_err();
+
+        cancel.assert();
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::ConversionOrderNotFound { order_id }
+                if order_id == STALLED_ORDER_ID
+        ));
+    }
+
+    /// The order goes terminal on a status other than `canceled` after the
+    /// cancel: that is a real broker failure and keeps its reason, rather than
+    /// being flattened into the timeout error.
+    #[tokio::test]
+    async fn conversion_that_expires_after_the_cancel_reports_the_broker_reason() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let poll = tokio::spawn(async move {
+            let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+            poll_crypto_order_until_filled(&client, STALLED_ORDER_ID, FAST_DEADLINES).await
+        });
+
+        let cancel = respond_to_deadline_cancel(
+            &server,
+            "partially_filled",
+            "300",
+            204,
+            stalled_order_body("expired", "300"),
+        )
+        .await;
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), poll)
+            .await
+            .expect("poll must terminate once the cancel settles")
+            .unwrap()
+            .unwrap_err();
+
+        cancel.assert();
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::CryptoOrderFailed {
+                order_id,
+                reason: CryptoOrderFailureReason::Expired
+            } if order_id == STALLED_ORDER_ID
+        ));
+    }
+
+    /// A cancel the broker never settles must not be recorded as a confirmed
+    /// cancellation with nothing filled: the order may still be live, so the
+    /// error carries the last observed fill and says so.
+    #[tokio::test]
+    #[traced_test]
+    async fn cancel_that_never_settles_reports_the_order_as_possibly_live() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET).path(crypto_order_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(stalled_order_body("pending_cancel", "300"));
+        });
+        let cancel = server.mock(|when, then| {
+            when.method(DELETE).path(crypto_order_path());
+            then.status(204);
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = poll_crypto_order_until_filled(
+            &client,
+            STALLED_ORDER_ID,
+            ConversionPollDeadlines {
+                order: Duration::from_millis(50),
+                cancel_settle: Duration::from_millis(200),
+                interval: Duration::from_millis(25),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        cancel.assert();
+        match error {
+            AlpacaBrokerApiError::ConversionCancelNotSettled {
+                order_id,
+                cancel,
+                filled_quantity,
+            } => {
+                assert_eq!(order_id, STALLED_ORDER_ID);
+                assert_eq!(cancel, DeadlineCancel::Accepted);
+                assert!(filled_quantity.unwrap().eq(float!(300)).unwrap());
+            }
+            other => panic!("expected ConversionCancelNotSettled, got {other:?}"),
+        }
+        assert!(logs_contain("may still be live"));
+    }
+
+    /// A cancel the broker never accepts leaves the remainder live, so it must
+    /// be re-issued for the whole settle window rather than abandoned after
+    /// one transient failure -- and the persisted reason must not go on to
+    /// claim a cancellation that never took effect.
+    #[tokio::test]
+    #[traced_test]
+    async fn cancel_that_keeps_failing_is_retried_and_not_reported_as_cancelled() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET).path(crypto_order_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(stalled_order_body("partially_filled", "300"));
+        });
+        let cancel = server.mock(|when, then| {
+            when.method(DELETE).path(crypto_order_path());
+            then.status(500);
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = poll_crypto_order_until_filled(
+            &client,
+            STALLED_ORDER_ID,
+            ConversionPollDeadlines {
+                order: Duration::from_millis(50),
+                cancel_settle: Duration::from_millis(200),
+                interval: Duration::from_millis(25),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            cancel.calls() > 1,
+            "a failed cancel must be re-issued inside the settle window, got {} attempt(s)",
+            cancel.calls()
+        );
+
+        // This message is persisted verbatim as the rebalance's failure
+        // reason, so it is asserted directly rather than only through the
+        // variant that renders it.
+        let message = error.to_string();
+        assert!(
+            message.contains("its remainder was never successfully cancelled"),
+            "the reason must not claim a cancellation the broker never accepted, got: {message}"
+        );
+
+        match error {
+            AlpacaBrokerApiError::ConversionCancelNotSettled {
+                order_id,
+                cancel,
+                filled_quantity,
+            } => {
+                assert_eq!(order_id, STALLED_ORDER_ID);
+                assert_eq!(cancel, DeadlineCancel::Failed);
+                assert!(filled_quantity.unwrap().eq(float!(300)).unwrap());
+            }
+            other => panic!("expected ConversionCancelNotSettled, got {other:?}"),
+        }
+    }
+
+    /// The broker declining the cancel as no longer cancelable is not a
+    /// cancellation either, and is reported as its own answer so an operator
+    /// reconciling the order is not told the remainder was withdrawn.
+    #[tokio::test]
+    async fn cancel_declined_as_uncancelable_is_reported_as_declined() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET).path(crypto_order_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(stalled_order_body("partially_filled", "300"));
+        });
+        let cancel = server.mock(|when, then| {
+            when.method(DELETE).path(crypto_order_path());
+            then.status(422);
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = poll_crypto_order_until_filled(
+            &client,
+            STALLED_ORDER_ID,
+            ConversionPollDeadlines {
+                order: Duration::from_millis(50),
+                cancel_settle: Duration::from_millis(200),
+                interval: Duration::from_millis(25),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            cancel.calls(),
+            1,
+            "a declined cancel is refused for a reason that will not change, so it must not \
+             be retried"
+        );
+        match error {
+            AlpacaBrokerApiError::ConversionCancelNotSettled { cancel, .. } => {
+                assert_eq!(cancel, DeadlineCancel::Declined);
+            }
+            other => panic!("expected ConversionCancelNotSettled, got {other:?}"),
+        }
+    }
+
+    /// `DoneForDay` is the one status the conversion poll deliberately reads
+    /// differently from `terminality()`: terminal for the Day time-in-force
+    /// equity orders, waited on for a `gtc` crypto order Alpaca documents no
+    /// meaning for. This pins the override directly -- dropping the
+    /// `DoneForDay` arm from `terminal()` would keep every poll test green
+    /// while turning a stalled conversion into an immediately recorded
+    /// failure.
+    #[test]
+    fn done_for_day_is_waited_on_by_the_conversion_poll_despite_being_terminal_for_equities() {
+        assert_eq!(
+            CryptoOrderOutcome::Failed(CryptoOrderFailureReason::DoneForDay).terminal(),
+            None
+        );
+        assert_eq!(
+            CryptoOrderFailureReason::DoneForDay.terminality(),
+            OrderFailureTerminality::Terminal
+        );
+    }
+
+    /// `suspended` is a failure status the order can still resume from, so it
+    /// must be waited out and resolved by the deadline cancel -- not turned
+    /// into an immediate terminal failure while the broker may still fill.
+    #[tokio::test]
+    async fn resumable_failure_status_is_cancelled_at_the_deadline_not_failed_on_sight() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let poll = tokio::spawn(async move {
+            let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+            poll_crypto_order_until_filled(&client, STALLED_ORDER_ID, FAST_DEADLINES).await
+        });
+
+        let cancel = respond_to_deadline_cancel(
+            &server,
+            "suspended",
+            "0",
+            204,
+            stalled_order_body("canceled", "0"),
+        )
+        .await;
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), poll)
+            .await
+            .expect("poll must terminate once the cancel settles")
+            .unwrap()
+            .unwrap_err();
+
+        cancel.assert();
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::ConversionTimedOut { order_id } if order_id == STALLED_ORDER_ID
+        ));
+    }
+
+    /// The deadline must not touch a healthy order: one that is still pending
+    /// on the first polls and fills before the deadline is returned as a plain
+    /// fill, with no cancel issued.
+    #[tokio::test]
+    async fn pending_conversion_that_fills_before_the_deadline_is_not_cancelled() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mut pending = server.mock(|when, then| {
+            when.method(GET).path(crypto_order_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(stalled_order_body("new", "0"));
+        });
+        let cancel = server.mock(|when, then| {
+            when.method(DELETE).path(crypto_order_path());
+            then.status(204);
+        });
+
+        let poll = tokio::spawn(async move {
+            let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+            poll_crypto_order_until_filled(
+                &client,
+                STALLED_ORDER_ID,
+                ConversionPollDeadlines {
+                    order: Duration::from_secs(30),
+                    cancel_settle: Duration::from_secs(30),
+                    interval: Duration::from_millis(10),
+                },
+            )
+            .await
+        });
+
+        for _ in 0..100 {
+            if pending.calls() >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(pending.calls() >= 1, "poll never read the pending order");
+
+        server.mock(|when, then| {
+            when.method(GET).path(crypto_order_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(stalled_order_body("filled", "500"));
+        });
+        pending.delete();
+
+        let order = tokio::time::timeout(std::time::Duration::from_secs(10), poll)
+            .await
+            .expect("poll must terminate once the order fills")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(cancel.calls(), 0, "a healthy order must not be cancelled");
+        assert_eq!(order.classify(), CryptoOrderOutcome::Filled);
+    }
+
+    /// The resume-path variant returns the settled terminal order for the
+    /// caller to classify instead of erroring, preserving its contract while
+    /// still refusing to wait forever.
+    #[tokio::test]
+    async fn stalled_conversion_resume_poll_returns_the_cancelled_terminal_order() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let poll = tokio::spawn(async move {
+            let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+            poll_crypto_order_to_terminal(&client, STALLED_ORDER_ID, FAST_DEADLINES).await
+        });
+
+        let cancel = respond_to_deadline_cancel(
+            &server,
+            "partially_filled",
+            "300",
+            204,
+            stalled_order_body("canceled", "300"),
+        )
+        .await;
+
+        let order = tokio::time::timeout(std::time::Duration::from_secs(10), poll)
+            .await
+            .expect("poll must terminate once the cancel settles")
+            .unwrap()
+            .unwrap();
+
+        cancel.assert();
+        assert_eq!(
+            order.classify(),
+            CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Canceled)
+        );
+        assert!(order.filled_quantity.unwrap().eq(float!(300)).unwrap());
     }
 
     #[tokio::test]

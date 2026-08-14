@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::alpaca_market_data::AlpacaMarketDataError;
 use crate::{
     Backpressure, ClientOrderId, CounterTradeCostError, ExecutorOrderId, FractionalShares,
-    Permanence, Positive, Symbol, Usd,
+    OrderFailureTerminality, Permanence, Positive, Symbol, Usd,
 };
 
 /// Time-in-force specifies how long an order remains active before it expires.
@@ -136,6 +136,36 @@ pub enum CryptoOrderFailureReason {
     Calculated,
 }
 
+impl CryptoOrderFailureReason {
+    /// Whether the order can still resume or fill after reporting this
+    /// failure, per Alpaca's order lifecycle
+    /// (https://docs.alpaca.markets/docs/orders-at-alpaca).
+    ///
+    /// The single source for both terminality decisions in this crate: whether
+    /// a caller may release its idempotency key (`classify_broker_status`) and
+    /// whether a conversion poll may stop waiting. Deriving both from here is
+    /// what keeps them from drifting apart -- a `Replaced`/`Suspended`/
+    /// `Calculated` order that is treated as terminal is a rebalance recorded
+    /// as failed while the broker may still move real money.
+    ///
+    /// `DoneForDay` is terminal because every equity order this bot places is
+    /// Day time-in-force, so it cannot resume in a later session. That
+    /// precondition does not hold for the `gtc` conversion order, and Alpaca
+    /// documents no meaning for the status on a 24/7 crypto pair, so the
+    /// conversion poll overrides it (`CryptoOrderOutcome::terminal`) rather
+    /// than declare an order dead that may still fill.
+    fn terminality(self) -> OrderFailureTerminality {
+        match self {
+            Self::Canceled | Self::Expired | Self::Rejected | Self::DoneForDay => {
+                OrderFailureTerminality::Terminal
+            }
+            Self::Replaced | Self::Suspended | Self::Calculated => {
+                OrderFailureTerminality::NotTerminal
+            }
+        }
+    }
+}
+
 /// A field absent from a broker order response that the reported order
 /// status requires.
 ///
@@ -148,6 +178,37 @@ pub enum MissingOrderField {
     FilledAt,
     CanceledAt,
     FailureTerminality,
+}
+
+/// How the broker answered the cancel issued when a conversion order stalls
+/// past its deadline.
+///
+/// Carried into [`AlpacaBrokerApiError::ConversionCancelNotSettled`] so the
+/// persisted failure reason states what actually happened to the remainder. A
+/// cancel that was never accepted leaves it live, which is a materially
+/// different reconciliation than one the broker took and simply never
+/// reported settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadlineCancel {
+    /// The broker accepted the cancel request.
+    Accepted,
+    /// The broker declined it as no longer cancelable (422), so no cancel took
+    /// effect and the order was already leaving the cancelable states.
+    Declined,
+    /// Every cancel request failed, so the remainder was never cancelled.
+    Failed,
+}
+
+impl DeadlineCancel {
+    /// The clause naming what became of the remainder, so a failure message
+    /// never claims a cancellation the broker did not accept.
+    fn clause(self) -> &'static str {
+        match self {
+            Self::Accepted => "its remainder was cancelled",
+            Self::Declined => "the broker declined to cancel its remainder as no longer cancelable",
+            Self::Failed => "its remainder was never successfully cancelled",
+        }
+    }
 }
 
 /// The real Alpaca 422 body for a re-used `client_order_id`: a numeric
@@ -216,6 +277,45 @@ pub enum AlpacaBrokerApiError {
         order_id: Uuid,
         reason: CryptoOrderFailureReason,
     },
+
+    #[error(
+        "Conversion order {order_id} stayed non-terminal past its deadline with nothing \
+         filled; the remainder was cancelled"
+    )]
+    ConversionTimedOut { order_id: Uuid },
+
+    /// The deadline cancel did not resolve: the broker never reported the
+    /// order terminal. Kept separate from [`Self::ConversionTimedOut`] because
+    /// nothing here is confirmed: the order may still be live, and the fill
+    /// quantity is only the last value observed before giving up. The message
+    /// is persisted verbatim as the rebalance's failure reason, so it must not
+    /// claim a cancellation or a zero fill that was never verified -- which is
+    /// why it reports how the broker answered the cancel rather than assuming
+    /// one took effect.
+    #[error(
+        "Conversion order {order_id} never reported a terminal state and may still be live \
+         at the broker: {}, with {} filled when last observed -- manual reconciliation \
+         required",
+        .cancel.clause(),
+        .filled_quantity
+            .as_ref()
+            .map_or_else(|| "an unreported quantity".to_string(), format_float_with_fallback)
+    )]
+    ConversionCancelNotSettled {
+        order_id: Uuid,
+        cancel: DeadlineCancel,
+        filled_quantity: Option<Float>,
+    },
+
+    /// The broker answered the deadline cancel with a 404. Reading the order
+    /// back would hit the same id and 404 again, so its fill state cannot be
+    /// observed at all.
+    #[error(
+        "Conversion order {order_id} was not recognised by the broker when cancelling its \
+         stalled remainder; its fill state cannot be read back -- manual reconciliation \
+         required"
+    )]
+    ConversionOrderNotFound { order_id: Uuid },
 
     #[error(
         "Broker rejected client_order_id {client_order_id} as a duplicate (422) but no \
@@ -370,6 +470,9 @@ impl AlpacaBrokerApiError {
             | Self::IncompleteOrder { .. }
             | Self::AccountNotActive { .. }
             | Self::CryptoOrderFailed { .. }
+            | Self::ConversionTimedOut { .. }
+            | Self::ConversionCancelNotSettled { .. }
+            | Self::ConversionOrderNotFound { .. }
             | Self::DuplicateOrderNotFound { .. }
             | Self::CalendarIterationInvariantViolation
             | Self::CalendarDateMismatch { .. }
@@ -450,7 +553,16 @@ impl AlpacaBrokerApiError {
             | Self::NotPositive(_)
             | Self::NotPositiveLimitPrice(_)
             | Self::FloatConversion(_)
-            | Self::CounterTradeCost(_) => Permanence::Permanent,
+            | Self::CounterTradeCost(_)
+            // The conversion trio are not request failures but concluded
+            // poll outcomes: the deadline ran out, or the cancel's effect
+            // could not be read back. An immediate re-send cannot clear
+            // them, and for the latter two the original order may still be
+            // live, so re-sending is exactly the double-conversion the
+            // resume path exists to prevent.
+            | Self::ConversionTimedOut { .. }
+            | Self::ConversionCancelNotSettled { .. }
+            | Self::ConversionOrderNotFound { .. } => Permanence::Permanent,
 
             Self::LatestTrade(source) | Self::LatestQuote(source) => source.permanence(),
         }

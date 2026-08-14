@@ -2771,10 +2771,28 @@ enum BridgeStage { Burn, Attestation, Mint }
   - Crypto trading is available 24/7 on Alpaca (no market hours restrictions)
   - Market orders are near-instant but NOT guaranteed to fill immediately
   - Slippage: ~17bps observed in live tests (reduces effective USD received)
-  - Partial fills: The system polls until the order is fully filled. Market
-    orders for USDC/USD are expected to fill completely due to high liquidity.
-    If an order enters a terminal failed state before full fill, the conversion
-    fails and requires manual intervention.
+  - Bounded wait: The system polls for a bounded time (5 min) rather than until
+    fully filled. Market orders for USDC/USD are expected to fill completely due
+    to high liquidity; a stall past the deadline means the order will not
+    complete on its own, so the remainder is cancelled.
+  - Partial fills: A cancelled order carrying a partial fill is accepted and
+    downstream steps are sized from the filled quantity, not the request.
+  - Statuses the order can still resume or fill from (`replaced`, `suspended`,
+    `calculated`) are waited on, not failed. `done_for_day` is also waited on
+    for the conversion order: it is terminal for the Day time-in-force equity
+    orders the bot places, but Alpaca documents no meaning for it on a 24/7
+    `gtc` crypto pair, so the order is not assumed dead.
+  - Four outcomes fail the conversion for operator reconciliation: a terminal
+    failure before any fill; a cancel with nothing filled; a cancel the broker
+    never settles (30s, order may still be live); and a cancel the broker
+    answers as an unknown order, whose fill state cannot be read back at all.
+  - Post-deposit (BaseToAlpaca) conversions are the exception: a short fill
+    fails the rebalance, because the unconverted remainder sits as USDC in the
+    Alpaca crypto wallet, which the offchain cash inventory does not read.
+  - An accepted partial fill on the AlpacaToBase leg that lands below the
+    minimum withdrawal threshold fails the transfer before the withdrawal is
+    attempted, naming the converted amount, rather than letting Alpaca reject
+    the withdrawal.
   - Minimum withdrawal threshold ($51) accounts for slippage to ensure $50
     minimum is met after conversion
   - ConversionFailed is a terminal state (requires manual intervention)
