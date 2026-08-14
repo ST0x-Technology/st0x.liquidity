@@ -4975,6 +4975,17 @@ multiple broker-specific contexts.
    configured, but cannot replace it with an adapter carrying a different
    operator.
 
+   History is served from the materialized `onchain_trade_view` and
+   `offchain_order_view` projections, which the event-sourcing framework
+   maintains from the event log and backfills on startup. Both the HTTP endpoint
+   and the WebSocket seed filter, sort, and page in SQL, so a request costs one
+   bounded index scan per venue side rather than a replay of every aggregate.
+   Response shapes, protocol semantics, and the `limit`/`offset` contract are
+   unchanged. The views hold the serialized aggregates, and the conversion to a
+   dashboard trade still runs at read time over the returned page only, so the
+   projections stay pure read keys with no second source of truth for the wire
+   shape.
+
    Offchain counter-trade entries include successful fills, terminal failures,
    and terminal cancellations; each entry carries its terminal outcome
    timestamp. Failed entries expose the broker or placement error. Failed and

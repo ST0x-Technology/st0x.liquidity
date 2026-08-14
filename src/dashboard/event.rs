@@ -217,9 +217,15 @@ impl DashboardTradeDelivery {
 
 impl DashboardTradeEnqueuer {
     async fn reconcile_undelivered(&self) -> anyhow::Result<usize> {
-        let trades = crate::dashboard::trade_loader::load_all_trades(&self.store.pool)
-            .await
-            .context("failed to reconstruct terminal trades for delivery reconciliation")?;
+        // Reconciliation must see every terminal trade, not the protocol
+        // narrowing a client asked for, so it queries with the widest protocol.
+        let trades = crate::dashboard::query_trades(
+            &self.store.pool,
+            &crate::dashboard::TradeQuery::all(crate::dashboard::TradeProtocol::TerminalOutcomesV3),
+        )
+        .await
+        .context("failed to load terminal trades for delivery reconciliation")?
+        .trades;
         let mut undelivered = 0;
 
         for trade in trades {
@@ -1270,7 +1276,7 @@ mod tests {
     use crate::conductor::job::{
         FailureInjector, TerminalFailureSignal, build_supervised_worker, build_worker_inner,
     };
-    use crate::dashboard::trade_loader::load_trades;
+    use crate::dashboard::{TradeQuery, query_trades};
     use crate::offchain::order::{OffchainOrderCommand, OffchainOrderEvent};
     use crate::onchain_trade::{
         InventoryVenue, OnChainTradeCommand, OnChainTradeError, OnChainTradeSource,
@@ -1914,7 +1920,7 @@ mod tests {
     #[tokio::test]
     async fn startup_reconciliation_recovers_terminal_trade_without_job() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let store = StoreBuilder::<OnChainTrade>::new(pool.clone())
+        let (store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -1957,7 +1963,7 @@ mod tests {
     #[tokio::test]
     async fn startup_reconciliation_reclaims_done_job_with_undelivered_ledger() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let store = StoreBuilder::<OnChainTrade>::new(pool.clone())
+        let (store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -2016,7 +2022,7 @@ mod tests {
     #[tokio::test]
     async fn startup_reconciliation_skips_delivered_trade() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let store = StoreBuilder::<OnChainTrade>::new(pool.clone())
+        let (store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -2260,7 +2266,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (broadcaster, mut receiver, queue, delivery_ctx) =
             test_broadcaster(&pool, &apalis_pool);
-        let store = StoreBuilder::<OnChainTrade>::new(pool)
+        let (store, _) = StoreBuilder::<OnChainTrade>::new(pool)
             .with(broadcaster)
             .build(())
             .await
@@ -2319,7 +2325,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (broadcaster, mut receiver, queue, delivery_ctx) =
             test_broadcaster(&pool, &apalis_pool);
-        let store = StoreBuilder::<OnChainTrade>::new(pool)
+        let (store, _) = StoreBuilder::<OnChainTrade>::new(pool)
             .with(broadcaster)
             .build(())
             .await
@@ -2366,7 +2372,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (broadcaster, mut receiver, queue, delivery_ctx) =
             test_broadcaster(&pool, &apalis_pool);
-        let store = StoreBuilder::<OnChainTrade>::new(pool)
+        let (store, _) = StoreBuilder::<OnChainTrade>::new(pool)
             .with(broadcaster)
             .build(())
             .await
@@ -2427,7 +2433,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (broadcaster, mut receiver, queue, delivery_ctx) =
             test_broadcaster(&pool, &apalis_pool);
-        let store = StoreBuilder::<OnChainTrade>::new(pool)
+        let (store, _) = StoreBuilder::<OnChainTrade>::new(pool)
             .with(broadcaster)
             .build(())
             .await
@@ -2482,7 +2488,7 @@ mod tests {
     #[tokio::test]
     async fn source_attribution_reload_failure_retries_corrected_broadcast() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let store = StoreBuilder::<OnChainTrade>::new(pool.clone())
+        let (store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -2553,7 +2559,7 @@ mod tests {
     #[tokio::test]
     async fn source_attribution_reconciliation_runs_after_monitor_restart() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let store = StoreBuilder::<OnChainTrade>::new(pool.clone())
+        let (store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -2654,7 +2660,7 @@ mod tests {
             .await
             .expect("the first monitor must finish startup reconciliation");
 
-        let store = StoreBuilder::<OnChainTrade>::new(pool.clone())
+        let (store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -2940,10 +2946,13 @@ mod tests {
         let message = receiver.recv().await.expect("should receive failure");
         match message {
             Statement::TradeUpdate(trade) => {
-                let history =
-                    load_trades(&pool, crate::dashboard::TradeProtocol::TerminalOutcomesV2)
-                        .await
-                        .unwrap();
+                let history = query_trades(
+                    &pool,
+                    &TradeQuery::newest(crate::dashboard::TradeProtocol::TerminalOutcomesV2),
+                )
+                .await
+                .unwrap()
+                .trades;
                 assert_eq!(
                     &trade.outcome, &history[0].outcome,
                     "live and historical failure provenance must be identical"
@@ -3086,9 +3095,13 @@ mod tests {
         let Statement::TradeUpdate(trade) = receiver.recv().await.unwrap() else {
             panic!("cancelled order must broadcast a trade update");
         };
-        let history = load_trades(&pool, crate::dashboard::TradeProtocol::TerminalOutcomesV2)
-            .await
-            .unwrap();
+        let history = query_trades(
+            &pool,
+            &TradeQuery::newest(crate::dashboard::TradeProtocol::TerminalOutcomesV2),
+        )
+        .await
+        .unwrap()
+        .trades;
         assert_eq!(trade.outcome, history[0].outcome);
         assert!(matches!(
             trade.outcome,

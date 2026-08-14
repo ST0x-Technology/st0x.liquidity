@@ -183,7 +183,7 @@ pub async fn seed_simulated_hedge_latency_history(
             .build(order_placer)
             .await?;
 
-    let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+    let (onchain_trade, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
         .build(())
         .await?;
 

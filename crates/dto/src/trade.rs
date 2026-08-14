@@ -21,6 +21,18 @@ pub enum TradingVenue {
 }
 
 impl TradingVenue {
+    /// Every venue, for callers that must enumerate the domain rather than
+    /// branch on one value -- notably expanding a legacy venue filter to the
+    /// concrete venues that collapse onto it.
+    pub const ALL: [Self; 6] = [
+        Self::Raindex,
+        Self::Bebop,
+        Self::UniswapV4,
+        Self::UnknownOnchain,
+        Self::Alpaca,
+        Self::DryRun,
+    ];
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Raindex => "raindex",
@@ -610,6 +622,27 @@ mod tests {
     fn direction_from_str_rejects_unknown_input() {
         let error = Direction::from_str("hold").unwrap_err();
         assert_eq!(error.direction_provided, "hold");
+    }
+
+    #[test]
+    fn all_venues_lists_every_variant_exactly_once() {
+        // The match makes a new variant a compile error here, and the count
+        // makes it a test failure until `ALL` is extended.
+        for venue in TradingVenue::ALL {
+            match venue {
+                TradingVenue::Raindex
+                | TradingVenue::Bebop
+                | TradingVenue::UniswapV4
+                | TradingVenue::UnknownOnchain
+                | TradingVenue::Alpaca
+                | TradingVenue::DryRun => {}
+            }
+        }
+
+        let mut unique = TradingVenue::ALL.to_vec();
+        unique.sort_by_key(|venue| venue.as_str());
+        unique.dedup();
+        assert_eq!(unique.len(), TradingVenue::ALL.len());
     }
 
     #[test]

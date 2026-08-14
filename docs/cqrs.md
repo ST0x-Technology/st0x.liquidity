@@ -213,7 +213,7 @@ For **non-projected entities** (`type Materialized = Nil`), `build()` returns
 `Arc<Store>`:
 
 ```rust
-let store = StoreBuilder::<OnChainTrade>::new(pool)
+let store = StoreBuilder::<PortfolioSnapshot>::new(pool)
     .build(())
     .await?;
 ```

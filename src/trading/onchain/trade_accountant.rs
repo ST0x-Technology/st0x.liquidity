@@ -806,7 +806,7 @@ mod tests {
     where
         Node: Provider + Clone,
     {
-        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+        let (onchain_trade, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
             .await
             .unwrap();
