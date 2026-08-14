@@ -1782,6 +1782,56 @@ mod tests {
         );
     }
 
+    /// A sustained 429 on the cancel DELETE must be retried in place with the
+    /// bounded CLI budget and then propagate as an error: exactly
+    /// `BACKPRESSURE_RETRY_MAX_ATTEMPTS` DELETEs, no more. This pins the
+    /// cancel path's wiring through the real client (`Retry-After` capture,
+    /// `find_backpressure` classification); the retry-then-succeed half is
+    /// pinned generically in `backpressure_retry`'s unit tests, since
+    /// `httpmock` cannot sequence a 429 followed by a 204.
+    #[tokio::test]
+    async fn cancel_broker_order_retries_429_up_to_budget_then_errors() {
+        let server = MockServer::start();
+        let ctx = create_alpaca_broker_api_test_ctx(&server);
+        let account_mock = mock_active_account(&server);
+
+        let order_id = uuid!("61e7b016-9c91-4a97-b912-615c9d365c9d");
+        let delete_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(429)
+                .header("content-type", "application/json")
+                .header("Retry-After", "0")
+                .json_body(json!({ "message": "rate limited" }));
+        });
+
+        let mut stdout = Vec::new();
+        let error = cancel_broker_order(&ctx, order_id, &mut stdout)
+            .await
+            .unwrap_err();
+
+        account_mock.assert();
+        assert_eq!(
+            delete_mock.calls(),
+            BACKPRESSURE_RETRY_MAX_ATTEMPTS as usize,
+            "must stop after exactly the bounded CLI retry budget"
+        );
+        assert!(
+            matches!(
+                error.downcast_ref::<AlpacaBrokerApiError>(),
+                Some(AlpacaBrokerApiError::ApiError { status, .. })
+                    if *status == StatusCode::TOO_MANY_REQUESTS
+            ),
+            "expected the 429 ApiError to propagate unchanged, got {error:?}"
+        );
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "",
+            "no outcome line may be printed when the cancel ultimately fails"
+        );
+    }
+
     #[tokio::test]
     async fn cancel_broker_order_dry_run_reports_requested() {
         let mut ctx = create_base_test_ctx();
