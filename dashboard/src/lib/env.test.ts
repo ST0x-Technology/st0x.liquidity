@@ -2,8 +2,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { getWebSocketUrl, getExplorerTxUrl } from './env'
 
 const mockEnv = { current: {} as Record<string, string | undefined> }
+const mockDev = { current: true }
 
-vi.mock('$app/environment', () => ({ browser: true, dev: true }))
+vi.mock('$app/environment', () => ({
+  browser: true,
+  get dev() {
+    return mockDev.current
+  }
+}))
 vi.mock('$env/dynamic/public', () => ({
   get env() {
     return mockEnv.current
@@ -13,6 +19,7 @@ vi.mock('$env/dynamic/public', () => ({
 describe('getWebSocketUrl', () => {
   beforeEach(() => {
     mockEnv.current = {}
+    mockDev.current = true
     Object.defineProperty(globalThis, 'window', {
       value: {
         location: {
@@ -106,6 +113,47 @@ describe('getWebSocketUrl', () => {
     })
 
     expect(getWebSocketUrl()).toBe('ws://localhost:5173/api/ws')
+  })
+
+  // The built bundle behind an IAP tunnel: served by nginx at
+  // http://localhost:8080 alongside the bot, so the socket must stay on the
+  // page's own origin. Keying off the hostname sent it to :8001 instead --
+  // a port nobody forwards -- and the dashboard sat "Disconnected".
+  it('uses the page origin for a built bundle served over a localhost tunnel', () => {
+    mockDev.current = false
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        location: {
+          hostname: 'localhost',
+          port: '8080',
+          host: 'localhost:8080',
+          protocol: 'http:'
+        }
+      },
+      writable: true,
+      configurable: true
+    })
+
+    expect(getWebSocketUrl()).toBe('ws://localhost:8080/api/ws')
+  })
+
+  it('still honors an explicit PUBLIC_ALPACA_WS_URL over a localhost tunnel', () => {
+    mockDev.current = false
+    mockEnv.current = { PUBLIC_ALPACA_WS_URL: 'ws://localhost:9999/api/ws' }
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        location: {
+          hostname: 'localhost',
+          port: '8080',
+          host: 'localhost:8080',
+          protocol: 'http:'
+        }
+      },
+      writable: true,
+      configurable: true
+    })
+
+    expect(getWebSocketUrl()).toBe('ws://localhost:9999/api/ws')
   })
 })
 

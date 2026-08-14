@@ -82,8 +82,28 @@ let
           try_files $uri $uri/ /index.html;
         }
 
+        # NO URI after $bot_upstream, in any of these. nginx normally
+        # replaces the matched location prefix with the proxy_pass URI, but
+        # when proxy_pass contains a VARIABLE that rewriting is skipped and
+        # the literal URI is sent instead of the request path. So
+        # `proxy_pass http://$bot_upstream/orders/` sent every /orders/*
+        # request to the bot as plain `/orders/` -- 404 for /orders/pending
+        # and /orders/raindex (the whole Orders tab), and 404 for all four
+        # /performance/* endpoints. Worse than the 404s: /transfers/interrupted
+        # and /trades/{venue}/{id}/events silently returned the plain
+        # /transfers and /trades lists, a wrong answer with a 200.
+        # With no URI part, nginx forwards the original request URI unchanged.
+        # Every location is GET-only (limit_except GET also admits HEAD).
+        # The dashboard is a read surface; the bot's /transfers/resume and
+        # /transfers/recheck/{kind}/{id} are POST mutation endpoints that
+        # src/api.rs marks TODO(auth) -- unauthenticated by design until the
+        # role-gated API work, so they must stay unreachable through any
+        # exposed surface. Forwarding paths correctly (the fix above) would
+        # otherwise have exposed them here. Operators invoke them via an IAP
+        # tunnel to the bot port directly; this proxy refuses the method.
         location /api/ws {
-          proxy_pass http://$bot_upstream/api/ws;
+          limit_except GET { deny all; }
+          proxy_pass http://$bot_upstream;
           proxy_http_version 1.1;
           proxy_set_header Upgrade $http_upgrade;
           proxy_set_header Connection "upgrade";
@@ -92,13 +112,13 @@ let
           proxy_read_timeout 86400;
         }
 
-        location /health      { proxy_pass http://$bot_upstream/health; }
-        location /logs        { proxy_pass http://$bot_upstream/logs; }
-        location /orders/     { proxy_pass http://$bot_upstream/orders/; }
-        location /pnl         { proxy_pass http://$bot_upstream/pnl; }
-        location /trades      { proxy_pass http://$bot_upstream/trades; }
-        location /transfers   { proxy_pass http://$bot_upstream/transfers; }
-        location /performance { proxy_pass http://$bot_upstream/performance; }
+        location /health      { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
+        location /logs        { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
+        location /orders/     { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
+        location /pnl         { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
+        location /trades      { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
+        location /transfers   { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
+        location /performance { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
       }
     }
   '';
