@@ -5,12 +5,13 @@
 //! directly.
 
 use alloy::network::{Ethereum, EthereumWallet};
-use alloy::primitives::{Address, B256, Bytes, TxHash};
+use alloy::primitives::{Address, B256, Bytes, Signature, TxHash};
 use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder, WalletProvider};
 use alloy::rpc::types::TransactionReceipt;
+use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use futures::lock::Mutex;
@@ -64,6 +65,10 @@ pub type SignerProvider<P> = FillProvider<
 pub struct RawPrivateKeyWallet<P: Provider> {
     /// Base provider for read-only chain access.
     provider: P,
+    /// The signing key, kept for detached-digest signing
+    /// ([`Wallet::sign_digest`]); transaction signing goes through the
+    /// `WalletFiller` inside `signing_provider` instead.
+    signer: PrivateKeySigner,
     /// Provider wrapped with gas/nonce/chain-id/wallet fillers for
     /// transaction signing and submission.
     signing_provider: SignerProvider<P>,
@@ -95,7 +100,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> RawPrivateKeyWallet<P> {
         required_confirmations: u64,
     ) -> Result<Self, EvmError> {
         let signer = PrivateKeySigner::from_bytes(private_key)?;
-        let eth_wallet = EthereumWallet::from(signer);
+        let eth_wallet = EthereumWallet::from(signer.clone());
 
         let base_provider = provider.clone();
         let nonce_manager = ResettableNonceManager::default();
@@ -115,6 +120,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> RawPrivateKeyWallet<P> {
 
         Ok(Self {
             provider: base_provider,
+            signer,
             signing_provider,
             nonce_manager,
             in_flight: InFlightNonces::default(),
@@ -149,6 +155,10 @@ where
 {
     fn address(&self) -> Address {
         self.signing_provider.default_signer_address()
+    }
+
+    async fn sign_digest(&self, digest: B256) -> Result<Signature, EvmError> {
+        Ok(self.signer.sign_hash(&digest).await?)
     }
 
     async fn send_pending(
@@ -285,6 +295,24 @@ mod tests {
         let wallet = RawPrivateKeyWallet::try_from_ctx(ctx).await.unwrap();
 
         assert_eq!(wallet.address(), expected_address);
+    }
+
+    /// Recovery-based rather than vector-based: whatever bytes
+    /// `sign_digest` produces must recover to this wallet's address over
+    /// the exact digest signed, which is precisely the check the
+    /// orchestrator's MintAuthV1 verification performs on-chain.
+    #[tokio::test]
+    async fn sign_digest_recovers_to_wallet_address() {
+        let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+
+        let digest = alloy::primitives::keccak256(b"detached digest");
+
+        let signature = wallet.sign_digest(digest).await.unwrap();
+
+        assert_eq!(
+            signature.recover_address_from_prehash(&digest).unwrap(),
+            signer_address
+        );
     }
 
     #[tokio::test]

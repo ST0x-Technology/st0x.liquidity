@@ -18,7 +18,7 @@
 
 use alloy::consensus::Transaction;
 use alloy::eips::BlockId;
-use alloy::primitives::{Address, Bytes, TxHash};
+use alloy::primitives::{Address, B256, Bytes, Signature, TxHash};
 use alloy::providers::Provider;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::sol_types::SolCall;
@@ -225,6 +225,8 @@ pub enum EvmError {
     #[cfg(feature = "local-signer")]
     #[error("invalid private key: {0}")]
     InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
+    #[error("signer error: {0}")]
+    Signer(#[from] alloy::signers::Error),
     #[cfg(feature = "turnkey")]
     #[error("Turnkey error: {0}")]
     Turnkey(#[from] turnkey::TurnkeyError),
@@ -270,7 +272,10 @@ impl EvmError {
             Self::Transport(rpc_error) => rpc_error.as_error_resp().is_some_and(|payload| {
                 payload.code == 3 || payload.message.contains("execution reverted")
             }),
-            Self::Transaction(_) | Self::AbiDecode(_) | Self::WalletConfigParse(_) => false,
+            Self::Transaction(_)
+            | Self::AbiDecode(_)
+            | Self::WalletConfigParse(_)
+            | Self::Signer(_) => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReceiptTimeout { .. } => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
@@ -301,7 +306,8 @@ impl EvmError {
             | Self::AbiDecode(_)
             | Self::DecodedRevert(_)
             | Self::Reverted { .. }
-            | Self::WalletConfigParse(_) => false,
+            | Self::WalletConfigParse(_)
+            | Self::Signer(_) => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReceiptTimeout { .. } => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
@@ -342,6 +348,7 @@ impl EvmError {
             | Self::Transaction(_)
             | Self::AbiDecode(_)
             | Self::WalletConfigParse(_)
+            | Self::Signer(_)
             | Self::NodeBehindRequiredBlock { .. } => None,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReceiptTimeout { .. } => None,
@@ -552,6 +559,16 @@ pub trait Wallet: Evm {
     /// Returns the address this wallet signs transactions from.
     fn address(&self) -> Address;
 
+    /// Signs a precomputed 32-byte digest (e.g. an EIP-712 signing hash)
+    /// with this wallet's key, returning the raw signature.
+    ///
+    /// The digest is signed as-is -- no message prefix and no further
+    /// hashing -- so the caller is responsible for supplying the exact
+    /// digest the verifier expects (typically read from the verifying
+    /// contract itself). Detached-signature counterpart to transaction
+    /// signing: nothing is broadcast and no nonce is consumed.
+    async fn sign_digest(&self, digest: B256) -> Result<Signature, EvmError>;
+
     /// Submit a signed transaction and return the tx hash immediately,
     /// without waiting for confirmation.
     ///
@@ -753,6 +770,10 @@ impl<Inner: Evm + ?Sized> Evm for Arc<Inner> {
 impl<Inner: Wallet + ?Sized> Wallet for Arc<Inner> {
     fn address(&self) -> Address {
         (**self).address()
+    }
+
+    async fn sign_digest(&self, digest: B256) -> Result<Signature, EvmError> {
+        (**self).sign_digest(digest).await
     }
 
     async fn send_pending(
