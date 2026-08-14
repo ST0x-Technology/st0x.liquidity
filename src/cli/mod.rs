@@ -157,6 +157,9 @@ pub enum TokenizationNetwork {
     Base,
     /// Ethereum mainnet
     Ethereum,
+    /// HyperEVM mainnet
+    #[value(name = "hyperevm")]
+    HyperEvm,
 }
 
 /// Manual position-recovery operations for stuck local CQRS state.
@@ -3689,6 +3692,7 @@ mod tests {
                 rpc_url = "http://localhost:8545"
                 base_rpc_url = "https://base.example.com"
                 ethereum_rpc_url = "https://mainnet.infura.io"
+                hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
                 [broker]
                 type = "dry-run"

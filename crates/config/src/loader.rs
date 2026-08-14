@@ -875,6 +875,7 @@ struct WalletInputs {
     secrets: toml::Value,
     base_rpc_url: Url,
     ethereum_rpc_url: Url,
+    hyperevm_rpc_url: Url,
 }
 
 /// Non-secret wallet metadata extracted from the config TOML during
@@ -893,6 +894,7 @@ fn validate_wallet_inputs(
     wallet_secrets: Option<toml::Value>,
     base_rpc_url: Option<Url>,
     ethereum_rpc_url: Option<Url>,
+    hyperevm_rpc_url: Option<Url>,
     config_path: &Path,
 ) -> Result<(WalletInputs, WalletMeta), CtxError> {
     match (wallet_config, wallet_secrets) {
@@ -914,6 +916,9 @@ fn validate_wallet_inputs(
             let ethereum_rpc_url = ethereum_rpc_url.ok_or(CtxError::WalletMissingRpcUrl {
                 field: "ethereum_rpc_url",
             })?;
+            let hyperevm_rpc_url = hyperevm_rpc_url.ok_or(CtxError::WalletMissingRpcUrl {
+                field: "hyperevm_rpc_url",
+            })?;
             let wallet_meta = WalletMeta::deserialize(wallet_config.clone()).map_err(|source| {
                 CtxError::ConfigToml {
                     path: config_path.to_path_buf(),
@@ -927,6 +932,7 @@ fn validate_wallet_inputs(
                     secrets: wallet_secrets,
                     base_rpc_url,
                     ethereum_rpc_url,
+                    hyperevm_rpc_url,
                 },
                 wallet_meta,
             ))
@@ -1001,12 +1007,14 @@ fn parse_and_validate(
     // Extract RPC URLs before EvmCtx consumes secrets.evm.
     let base_rpc_url = secrets.evm.base.take();
     let ethereum_rpc_url = secrets.evm.ethereum.take();
+    let hyperevm_rpc_url = secrets.evm.hyperevm.take();
     let evm = EvmCtx::new(&config.raindex, secrets.evm)?;
     let (wallet_inputs, wallet_meta) = validate_wallet_inputs(
         config.wallet,
         secrets.wallet,
         base_rpc_url,
         ethereum_rpc_url,
+        hyperevm_rpc_url,
         config_path,
     )?;
 
@@ -1258,6 +1266,7 @@ impl Ctx {
             parts.wallet_inputs.secrets,
             parts.wallet_inputs.base_rpc_url,
             parts.wallet_inputs.ethereum_rpc_url,
+            parts.wallet_inputs.hyperevm_rpc_url,
         )
         .await?;
 
@@ -1698,7 +1707,8 @@ pub enum CtxError {
     MissingBotGasValuation,
     #[error(
         "operation requires a configured [wallet] section \
-         (base_rpc_url and ethereum_rpc_url in [evm] secrets)"
+         (base_rpc_url, ethereum_rpc_url, and hyperevm_rpc_url in [evm] \
+         secrets)"
     )]
     WalletNotConfigured,
     #[error(transparent)]
@@ -2120,6 +2130,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "alpaca-broker-api"
@@ -2181,6 +2192,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "dry-run"
@@ -2513,6 +2525,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "dry-run"
@@ -2597,6 +2610,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "dry-run"
@@ -3038,6 +3052,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "alpaca-broker-api"
@@ -3174,6 +3189,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "schwab"
@@ -3549,6 +3565,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.example.com"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "alpaca-broker-api"
@@ -3639,6 +3656,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.example.com"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "alpaca-broker-api"
@@ -3737,6 +3755,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.example.com"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "dry-run"
@@ -3876,6 +3895,7 @@ mod tests {
             rpc_url = "http://localhost:1"
             base_rpc_url = "http://localhost:1"
             ethereum_rpc_url = "http://localhost:1"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "alpaca-broker-api"
@@ -4048,6 +4068,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.example.com"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "alpaca-broker-api"
@@ -4242,6 +4263,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.example.com"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "alpaca-broker-api"
@@ -4302,6 +4324,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.example.com"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "alpaca-broker-api"
@@ -4490,6 +4513,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "alpaca-broker-api"
@@ -4595,6 +4619,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "dry-run"
@@ -4622,6 +4647,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "dry-run"
@@ -4652,6 +4678,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "dry-run"
@@ -4683,6 +4710,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "dry-run"
@@ -4717,6 +4745,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "dry-run"
@@ -4819,6 +4848,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "alpaca-broker-api"
@@ -4861,6 +4891,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "schwab"
@@ -7134,6 +7165,7 @@ mod tests {
             rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
             type = "alpaca-broker-api"

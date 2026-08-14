@@ -10,7 +10,7 @@
 #
 # The encrypted secret (secret/s01-issuer.toml.age) must carry the FULL secret
 # surface the shared validate-config gate checks, or the deploy fails closed:
-#   [evm]       rpc_url, base_rpc_url, ethereum_rpc_url
+#   [evm]       rpc_url, base_rpc_url, ethereum_rpc_url, hyperevm_rpc_url
 #   [broker]    type = "alpaca-broker-api" + api_key/api_secret/account_id
 #   [wallet]    api_private_key (turnkey)
 #   [issuance]  base_url + api_key (required unconditionally by the validator)

@@ -79,6 +79,10 @@ fn tokenization_network_context(
             wallet_ctx.ethereum_wallet().clone(),
             Network::new("ethereum"),
         ),
+        TokenizationNetwork::HyperEvm => (
+            wallet_ctx.hyperevm_wallet().clone(),
+            Network::new("hyperevm"),
+        ),
     }
 }
 
@@ -1072,6 +1076,10 @@ fn resolve_tokenization_token(
         }),
         TokenizationNetwork::Ethereum => Err(anyhow::anyhow!(
             "pass --token with the Ethereum tStock address for {symbol}: \
+             [assets.equities] holds Base addresses only"
+        )),
+        TokenizationNetwork::HyperEvm => Err(anyhow::anyhow!(
+            "pass --token with the HyperEVM tStock address for {symbol}: \
              [assets.equities] holds Base addresses only"
         )),
     }
@@ -2803,16 +2811,19 @@ mod tests {
     }
 
     /// One match yields both the wallet and the wire value, so the pairing is
-    /// pinned here for both networks: ethereum selects the ethereum wallet and
-    /// the "ethereum" wire value, base the base pair.
+    /// pinned here for every network: ethereum selects the ethereum wallet and
+    /// the "ethereum" wire value, base the base pair, hyperevm the hyperevm
+    /// pair.
     #[cfg(feature = "test-support")]
     #[test]
     fn tokenization_network_context_pairs_wallet_and_wire() {
         let base_address = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let ethereum_address = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let hyperevm_address = address!("0xcccccccccccccccccccccccccccccccccccccccc");
         let wallet_ctx = OnchainWalletCtx::from_wallets(
             StubWallet::stub(base_address),
             StubWallet::stub(ethereum_address),
+            StubWallet::stub(hyperevm_address),
         );
 
         let (base_wallet, base_wire) =
@@ -2824,6 +2835,11 @@ mod tests {
             tokenization_network_context(&wallet_ctx, TokenizationNetwork::Ethereum);
         assert_eq!(ethereum_wallet.address(), ethereum_address);
         assert_eq!(ethereum_wire, Network::new("ethereum"));
+
+        let (hyperevm_wallet, hyperevm_wire) =
+            tokenization_network_context(&wallet_ctx, TokenizationNetwork::HyperEvm);
+        assert_eq!(hyperevm_wallet.address(), hyperevm_address);
+        assert_eq!(hyperevm_wire, Network::new("hyperevm"));
     }
 
     async fn seed_to_withdrawal_complete(

@@ -58,10 +58,11 @@ pub enum WalletCtxError {
 pub struct OnchainWalletCtx {
     base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    hyperevm_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
 }
 
 impl OnchainWalletCtx {
-    /// Build wallets for both chains from raw TOML config/secrets and RPC URLs.
+    /// Build wallets for all chains from raw TOML config/secrets and RPC URLs.
     ///
     /// Without wallet features, `WalletKind` is uninhabited so
     /// deserialization always fails at the `?` — making later clones
@@ -75,28 +76,36 @@ impl OnchainWalletCtx {
         wallet_secrets: toml::Value,
         base_rpc_url: Url,
         ethereum_rpc_url: Url,
+        hyperevm_rpc_url: Url,
     ) -> Result<Self, WalletCtxError> {
         let WalletKindTag { kind } = WalletKindTag::deserialize(wallet_config.clone())?;
 
-        let (base_wallet, ethereum_wallet) = tokio::try_join!(
+        let (base_wallet, ethereum_wallet, hyperevm_wallet) = tokio::try_join!(
             build_wallet(
                 &kind,
                 wallet_config.clone(),
                 wallet_secrets.clone(),
                 base_rpc_url,
             ),
-            build_wallet(&kind, wallet_config, wallet_secrets, ethereum_rpc_url,),
+            build_wallet(
+                &kind,
+                wallet_config.clone(),
+                wallet_secrets.clone(),
+                ethereum_rpc_url,
+            ),
+            build_wallet(&kind, wallet_config, wallet_secrets, hyperevm_rpc_url,),
         )?;
 
         info!(
             target: "wallet",
             wallet = %base_wallet.address(),
-            "Initialized onchain wallet (Base + Ethereum)"
+            "Initialized onchain wallet (Base + Ethereum + HyperEVM)"
         );
 
         Ok(Self {
             base_wallet,
             ethereum_wallet,
+            hyperevm_wallet,
         })
     }
 
@@ -106,6 +115,10 @@ impl OnchainWalletCtx {
 
     pub fn ethereum_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
         &self.ethereum_wallet
+    }
+
+    pub fn hyperevm_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
+        &self.hyperevm_wallet
     }
 }
 
@@ -147,7 +160,8 @@ impl OnchainWalletCtx {
 
         Self {
             base_wallet: stub_wallet.clone(),
-            ethereum_wallet: stub_wallet,
+            ethereum_wallet: stub_wallet.clone(),
+            hyperevm_wallet: stub_wallet,
         }
     }
 }
@@ -158,10 +172,12 @@ impl OnchainWalletCtx {
     pub fn from_wallets(
         base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
         ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+        hyperevm_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     ) -> Self {
         Self {
             base_wallet,
             ethereum_wallet,
+            hyperevm_wallet,
         }
     }
 }
