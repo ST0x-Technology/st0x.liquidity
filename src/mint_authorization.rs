@@ -15,6 +15,8 @@
 use alloy::primitives::{Address, B256, Bytes, U256};
 use async_trait::async_trait;
 use rain_math_float::Float;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use st0x_evm::{EvmError, NoOpErrorRegistry, Wallet};
 use st0x_execution::Symbol;
@@ -34,11 +36,49 @@ pub use crate::tokenized_equity_mint::QuantityScalingError;
 ///
 /// `signature` is the raw 65-byte ECDSA signature over the orchestrator's
 /// `mintAuthDigest`; issuance forwards both values verbatim to
-/// `orchestrator.mint`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `orchestrator.mint`. Serde (hex strings for both fields) because the
+/// mint aggregate embeds this in its snapshot-persisted state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedMintAuthorization {
     pub nonce: B256,
     pub signature: Bytes,
+}
+
+/// Mint-authorizer handle for the mint aggregate's services.
+///
+/// `Disabled` when the config has no `[orchestrator]` section -- the bot
+/// runs dark while every asset is vault-direct, and an orchestrator-mode
+/// mint reaching the signing step then fails loudly rather than guessing
+/// an address. Mirrors `BotGasReceiptCostEnqueuer`'s explicit-absence
+/// shape.
+#[derive(Clone)]
+pub enum ConfiguredMintAuthorizer {
+    Enabled(Arc<dyn MintAuthorizer>),
+    Disabled,
+}
+
+impl ConfiguredMintAuthorizer {
+    /// Delegates to the configured authorizer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MintAuthorizationError::NotConfigured`] when disabled, or
+    /// the authorizer's own failure.
+    pub async fn sign(
+        &self,
+        token: Address,
+        quantity: Float,
+        nonce: B256,
+    ) -> Result<SignedMintAuthorization, MintAuthorizationError> {
+        match self {
+            Self::Enabled(authorizer) => {
+                authorizer
+                    .sign_mint_authorization(token, quantity, nonce)
+                    .await
+            }
+            Self::Disabled => Err(MintAuthorizationError::NotConfigured),
+        }
+    }
 }
 
 /// Produces a [`SignedMintAuthorization`] for one orchestrator-mode mint.
@@ -82,6 +122,14 @@ pub enum MintAuthorizationError {
     QuantityScaling(#[from] QuantityScalingError),
     #[error(transparent)]
     Evm(#[from] EvmError),
+    /// An orchestrator-mode mint reached the signing step but the config
+    /// has no `[orchestrator]` section. Fails loudly instead of guessing an
+    /// address; the mint stays `MintAccepted` and resumes once configured.
+    #[error(
+        "orchestrator-mode mint requires an [orchestrator] config section; \
+         the mint authorizer is disabled"
+    )]
+    NotConfigured,
 }
 
 /// [`MintAuthorizer`] backed by the configured orchestrator contract and
@@ -274,6 +322,60 @@ impl VaultModeReader for IssuanceClient {
                 symbol: symbol.clone(),
             }),
         }
+    }
+}
+
+/// Test authorizer that echoes the caller's nonce with a fixed 65-byte
+/// signature, so aggregate tests can assert nonce ownership and event
+/// shapes without chain access.
+#[cfg(any(test, feature = "test-support"))]
+pub struct MockMintAuthorizer;
+
+#[cfg(any(test, feature = "test-support"))]
+#[async_trait]
+impl MintAuthorizer for MockMintAuthorizer {
+    async fn sign_mint_authorization(
+        &self,
+        _token: Address,
+        _quantity: Float,
+        nonce: B256,
+    ) -> Result<SignedMintAuthorization, MintAuthorizationError> {
+        Ok(SignedMintAuthorization {
+            nonce,
+            signature: Bytes::from(vec![0x42; 65]),
+        })
+    }
+}
+
+/// Test vault-mode reader with a fixed outcome, so saga tests can exercise
+/// both minting paths without a live issuance service.
+#[cfg(any(test, feature = "test-support"))]
+pub struct StubVaultModeReader(pub VaultModeTag);
+
+#[cfg(any(test, feature = "test-support"))]
+#[async_trait]
+impl VaultModeReader for StubVaultModeReader {
+    async fn vault_mode(&self, _symbol: &Symbol) -> Result<VaultModeTag, VaultModeCheckError> {
+        let Self(mode) = self;
+        Ok(*mode)
+    }
+}
+
+/// Test deliverer with a fixed scripted outcome, so job tests can exercise
+/// each delivery classification without a live issuance service.
+#[cfg(any(test, feature = "test-support"))]
+pub struct StubMintAuthorizationDeliverer(pub MintAuthorizationDelivery);
+
+#[cfg(any(test, feature = "test-support"))]
+#[async_trait]
+impl MintAuthorizationDeliverer for StubMintAuthorizationDeliverer {
+    async fn deliver(
+        &self,
+        _tokenization_request_id: &TokenizationRequestId,
+        _authorization: &SignedMintAuthorization,
+    ) -> MintAuthorizationDelivery {
+        let Self(outcome) = self;
+        outcome.clone()
     }
 }
 

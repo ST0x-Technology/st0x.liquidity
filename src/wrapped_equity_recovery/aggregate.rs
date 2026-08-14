@@ -634,6 +634,7 @@ mod tests {
 
     use crate::bot_gas::{BotGasChain, pending_bot_gas_jobs};
     use crate::equity_redemption::redemption_aggregate_id;
+    use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::onchain::mock::{DepositBehavior, MockRaindex};
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::vault_lookup::MockVaultLookup;
@@ -677,6 +678,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let mint_store = Arc::new(st0x_event_sorcery::test_store(
             pool.clone(),
@@ -943,6 +945,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let mint_store = Arc::new(st0x_event_sorcery::test_store(
             pool.clone(),

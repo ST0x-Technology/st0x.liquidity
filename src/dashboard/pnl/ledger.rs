@@ -490,6 +490,8 @@ async fn ingest_mint(
         TokenizedEquityMintEvent::MintRejected { .. }
         | TokenizedEquityMintEvent::MintAccepted { .. }
         | TokenizedEquityMintEvent::MintAcceptanceFailed { .. }
+        | TokenizedEquityMintEvent::MintAuthorizationSigned { .. }
+        | TokenizedEquityMintEvent::MintAuthorizationDelivered { .. }
         | TokenizedEquityMintEvent::WrapSubmitted { .. }
         | TokenizedEquityMintEvent::TokensWrapped { .. }
         | TokenizedEquityMintEvent::WrappingFailed { .. }

@@ -69,6 +69,7 @@ use crate::equity_redemption::{
 use crate::inventory::{
     BroadcastingInventory, Inventory, InventoryProjection, InventorySnapshot, Venue,
 };
+use crate::mint_authorization::{ConfiguredMintAuthorizer, MintAuthorizationService};
 use crate::offchain::order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacer,
     PollOrderStatus, PollOrderStatusJobQueue, TerminalPositionFinalization,
@@ -99,7 +100,8 @@ use crate::position::{
 };
 use crate::position_check::{HedgeScanSkipReason, record_scan_skip};
 use crate::rebalancing::equity::{
-    CrossVenueEquityTransfer, EquityTransferServices, ResumeTokenizationAggregate,
+    CrossVenueEquityTransfer, DeliverMintAuthorizationCtx, DeliverMintAuthorizationJobQueue,
+    EquityTransferServices, MintAuthorizationWiring, ResumeTokenizationAggregate,
     ResumeTokenizationCtx, ResumeTokenizationJobQueue, ResumeTokenizationTarget,
     TransferEquityToHedging, TransferEquityToHedgingCtx, TransferEquityToMarketMaking,
     TransferEquityToMarketMakingCtx,
@@ -832,22 +834,7 @@ impl Conductor {
             seed_vault_registry_ctx,
         ) = setup_vault_registry(&pool, &apalis_pool, &ctx).await?;
 
-        // Grant one-time idempotent MAX approvals to the trusted spenders (our
-        // ERC-4626 wrapper vaults and the Raindex orderbook) before any worker
-        // or rebalancer runs, so wrap/deposit never reverts with
-        // ERC20InsufficientAllowance. Fails fast -- the bot must not come up
-        // healthy with these missing. Only runs when a wallet is configured;
-        // without one the bot cannot submit on-chain transactions at all.
-        grant_startup_token_approvals(&ctx).await?;
-
-        // Catch the lifecycle-failure read model up to the event log before
-        // its OffchainOrder reactor (registered below) goes live, in both
-        // modes. Must run BEFORE `PositionAndRebalancing::setup`: setup spawns
-        // resume workers that write the event store concurrently, and this
-        // catch-up's deferred read-then-write transaction surfaces
-        // SQLITE_BUSY_SNAPSHOT immediately (busy_timeout does not apply to
-        // deferred-upgrade conflicts), failing the whole boot.
-        catch_up_lifecycle_failures(&pool).await?;
+        run_startup_maintenance(&ctx, &pool).await?;
 
         let rebalancing = optional_rebalancing_ctx(&ctx)?;
         let notifier = build_alert_notifier(ctx.alerts.as_ref(), "Operational alerting")?;
@@ -871,6 +858,8 @@ impl Conductor {
             transfer_equity_to_market_making_ctx,
             transfer_equity_to_hedging_ctx,
             resume_tokenization_queue,
+            deliver_mint_authorization_queue,
+            deliver_mint_authorization_ctx,
         } = PositionAndRebalancing::setup(
             rebalancing,
             RebalancingDeps {
@@ -1024,6 +1013,8 @@ impl Conductor {
             .seed_vault_registry_ctx(seed_vault_registry_ctx)
             .resume_tokenization_queue(resume_tokenization_queue)
             .maybe_resume_tokenization_ctx(resume_tokenization_ctx)
+            .deliver_mint_authorization_queue(deliver_mint_authorization_queue)
+            .maybe_deliver_mint_authorization_ctx(deliver_mint_authorization_ctx)
             .record_bot_gas_receipt_cost_queue(record_bot_gas_receipt_cost_queue)
             .maybe_record_bot_gas_receipt_cost_ctx(record_bot_gas_receipt_cost_ctx)
             .job_cleanup(job_cleanup)
@@ -1626,6 +1617,8 @@ struct RebalancingInfrastructure {
     transfer_equity_to_market_making_ctx: Arc<TransferEquityToMarketMakingCtx>,
     transfer_equity_to_hedging_ctx: Arc<TransferEquityToHedgingCtx>,
     resume_tokenization_queue: ResumeTokenizationJobQueue,
+    deliver_mint_authorization_queue: DeliverMintAuthorizationJobQueue,
+    deliver_mint_authorization_ctx: Arc<DeliverMintAuthorizationCtx>,
 }
 
 /// Shared infrastructure dependencies needed to spawn rebalancing.
@@ -1674,6 +1667,10 @@ struct PositionAndRebalancing {
     transfer_equity_to_market_making_ctx: Option<Arc<TransferEquityToMarketMakingCtx>>,
     transfer_equity_to_hedging_ctx: Option<Arc<TransferEquityToHedgingCtx>>,
     resume_tokenization_queue: Option<ResumeTokenizationJobQueue>,
+    /// Always present (unlike the ctx): the builder needs a queue handle
+    /// either way, and workers skip registration via the absent ctx.
+    deliver_mint_authorization_queue: DeliverMintAuthorizationJobQueue,
+    deliver_mint_authorization_ctx: Option<Arc<DeliverMintAuthorizationCtx>>,
 }
 
 /// Builds the wrapper service from the single wallet/config source shared by
@@ -1757,10 +1754,13 @@ impl PositionAndRebalancing {
                 ),
                 transfer_equity_to_hedging_ctx: Some(infra.transfer_equity_to_hedging_ctx),
                 resume_tokenization_queue: Some(infra.resume_tokenization_queue),
+                deliver_mint_authorization_queue: infra.deliver_mint_authorization_queue,
+                deliver_mint_authorization_ctx: Some(infra.deliver_mint_authorization_ctx),
             })
         } else {
             let RebalancingDeps {
                 pool,
+                apalis_pool,
                 ctx,
                 inventory,
                 broadcaster,
@@ -1809,6 +1809,10 @@ impl PositionAndRebalancing {
                 transfer_equity_to_market_making_ctx: None,
                 transfer_equity_to_hedging_ctx: None,
                 resume_tokenization_queue: None,
+                deliver_mint_authorization_queue: DeliverMintAuthorizationJobQueue::new(
+                    &apalis_pool,
+                ),
+                deliver_mint_authorization_ctx: None,
             })
         }
     }
@@ -1839,6 +1843,116 @@ fn build_alert_notifier(
         TelegramNotifier::new(&alerts.bot_token, alerts.chat_id, alerts.message_thread_id)?;
     info!("{channel}: Telegram notifier configured");
     Ok(Arc::new(notifier))
+}
+
+/// One-time startup maintenance that must precede
+/// `PositionAndRebalancing::setup`.
+///
+/// Grants the one-time idempotent MAX approvals to the trusted spenders
+/// (our ERC-4626 wrapper vaults and the Raindex orderbook) before any
+/// worker or rebalancer runs, so wrap/deposit never reverts with
+/// ERC20InsufficientAllowance. Fails fast -- the bot must not come up
+/// healthy with these missing; only runs when a wallet is configured.
+///
+/// Then catches the lifecycle-failure read model up to the event log before
+/// its OffchainOrder reactor goes live, in both modes. Must run BEFORE
+/// `PositionAndRebalancing::setup`: setup spawns resume workers that write
+/// the event store concurrently, and this catch-up's deferred
+/// read-then-write transaction surfaces SQLITE_BUSY_SNAPSHOT immediately
+/// (busy_timeout does not apply to deferred-upgrade conflicts), failing the
+/// whole boot.
+async fn run_startup_maintenance(ctx: &Ctx, pool: &SqlitePool) -> anyhow::Result<()> {
+    grant_startup_token_approvals(ctx).await?;
+    catch_up_lifecycle_failures(pool).await?;
+    Ok(())
+}
+
+/// Mint-authorization infrastructure for orchestrator-mode mints
+/// (RAI-1243), built once per conductor start.
+struct MintAuthorizationInfra {
+    /// Signs `MintAuthV1` inside the mint aggregate's command handler.
+    /// `Disabled` without an `[orchestrator]` config section.
+    authorizer: ConfiguredMintAuthorizer,
+    /// Delivery job queue, shared by the saga's enqueue and the worker.
+    queue: DeliverMintAuthorizationJobQueue,
+    /// The saga-side bundle: vault-mode reads, token map, delivery enqueue.
+    wiring: MintAuthorizationWiring,
+    /// One issuance client serves both mint-authorization consumers (the
+    /// saga's vault-mode read and the delivery job), built from the same
+    /// `[issuance]` credentials as the freeze guard's own client instance.
+    issuance_client: Arc<IssuanceClient>,
+}
+
+/// Builds [`MintAuthorizationInfra`]. The authorizer is `Enabled` only when
+/// `[orchestrator]` is configured: while every asset is vault-direct the bot
+/// deploys dark without the section, and an orchestrator-mode mint reaching
+/// the signing step then fails loudly rather than guessing an address.
+///
+/// Also runs the queue's orphan sweep for delivery rows a crash caught
+/// mid-run; pending rows stay queued (still-valid work for the persisted
+/// authorization, unlike resume jobs, which startup re-derives). A failed
+/// sweep fails startup -- an unrepaired orphan would read as a live
+/// delivery and suppress resume.
+async fn build_mint_authorization_infra<Chain>(
+    ctx: &Ctx,
+    apalis_pool: &apalis_sqlite::SqlitePool,
+    base_wallet: &Chain,
+) -> anyhow::Result<MintAuthorizationInfra>
+where
+    Chain: Wallet + Clone + Send + Sync + 'static,
+{
+    let issuance_client = Arc::new(IssuanceClient::new(
+        ctx.issuance.base_url.clone(),
+        ctx.issuance.api_key.header_value(),
+    )?);
+
+    let queue = DeliverMintAuthorizationJobQueue::new(apalis_pool);
+
+    // Fails startup on sweep failure rather than continuing: an unrepaired
+    // `Running` orphan counts as live in `has_live_delivery_job`, which
+    // would suppress the resume path's re-enqueue and stall the mint until
+    // a later restart's sweep succeeded.
+    let orphaned = queue
+        .requeue_orphaned()
+        .await
+        .context("failed to re-queue orphaned mint-authorization delivery jobs at startup")?;
+    if orphaned > 0 {
+        info!(
+            target: "tokenization",
+            count = orphaned,
+            "Re-queued orphaned mint-authorization delivery job(s) for \
+             crash-safe resume"
+        );
+    }
+
+    let token_addresses = ctx
+        .assets
+        .equities
+        .symbols
+        .iter()
+        .map(|(symbol, equity)| (symbol.clone(), equity.tokenized_equity))
+        .collect();
+
+    let authorizer = ctx.orchestrator.as_ref().map_or_else(
+        || ConfiguredMintAuthorizer::Disabled,
+        |orchestrator| {
+            ConfiguredMintAuthorizer::Enabled(Arc::new(MintAuthorizationService::new(
+                base_wallet.clone(),
+                orchestrator.address,
+            )))
+        },
+    );
+
+    Ok(MintAuthorizationInfra {
+        authorizer,
+        wiring: MintAuthorizationWiring {
+            vault_mode_reader: issuance_client.clone(),
+            token_addresses,
+            delivery_queue: queue.clone(),
+        },
+        queue,
+        issuance_client,
+    })
 }
 
 /// Wires the dividend freeze guard onto the rebalancing service when enabled.
@@ -2131,12 +2245,16 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let wrapper = build_wrapper(base_wallet.clone(), &deps.ctx);
 
+        let mint_authorization =
+            build_mint_authorization_infra(&deps.ctx, &deps.apalis_pool, &base_wallet).await?;
+
         let equity_transfer_services = EquityTransferServices {
             raindex: raindex_service.clone(),
             vault_lookup: vault_lookup.clone(),
             tokenizer: tokenizer.clone(),
             wrapper: wrapper.clone(),
             bot_gas_enqueuer: bot_gas_enqueuer.clone(),
+            mint_authorizer: mint_authorization.authorizer,
         };
 
         let transfer_usdc_to_hedging_queue = deps.schedulers.transfer_usdc_to_hedging.clone();
@@ -2197,7 +2315,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
                 built.mint.clone(),
                 built.redemption.clone(),
             )
-            .with_bot_gas_enqueuer(bot_gas_enqueuer.clone()),
+            .with_bot_gas_enqueuer(bot_gas_enqueuer.clone())
+            .with_mint_authorization(mint_authorization.wiring),
         );
 
         // Built outside `QueryManifest`: services depend on mint/redemption stores
@@ -2256,6 +2375,13 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             bot_gas_enqueuer.clone(),
         );
 
+        let deliver_mint_authorization_ctx = Arc::new(DeliverMintAuthorizationCtx {
+            deliverer: mint_authorization.issuance_client,
+            mint_store: built.mint.clone(),
+            notifier: notifier.clone(),
+            job_queue: mint_authorization.queue.clone(),
+        });
+
         let transfer_usdc_to_market_making_ctx = Arc::new(TransferUsdcToMarketMakingCtx {
             transfer: usdc_handles.resume_alpaca_to_base,
             job_queue: transfer_usdc_to_market_making_queue,
@@ -2301,6 +2427,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             transfer_equity_to_market_making_ctx,
             transfer_equity_to_hedging_ctx,
             resume_tokenization_queue,
+            deliver_mint_authorization_queue: mint_authorization.queue,
+            deliver_mint_authorization_ctx,
         })
     })
 }
@@ -5178,6 +5306,7 @@ mod tests {
             tokenizer: tokenizer.clone(),
             wrapper: wrapper.clone(),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(
@@ -5720,6 +5849,7 @@ mod tests {
             tokenizer: tokenizer.clone(),
             wrapper: wrapper.clone(),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(
@@ -5817,6 +5947,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let seeding_mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(

@@ -531,6 +531,8 @@ fn tokenized_equity_mint_failure(
         }
         TokenizedEquityMintEvent::MintRequested { .. }
         | TokenizedEquityMintEvent::MintAccepted { .. }
+        | TokenizedEquityMintEvent::MintAuthorizationSigned { .. }
+        | TokenizedEquityMintEvent::MintAuthorizationDelivered { .. }
         | TokenizedEquityMintEvent::TokensReceived { .. }
         | TokenizedEquityMintEvent::WrapSubmitted { .. }
         | TokenizedEquityMintEvent::TokensWrapped { .. }

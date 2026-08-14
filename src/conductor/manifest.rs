@@ -186,6 +186,7 @@ mod tests {
     use crate::inventory::{
         BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Operator, Venue,
     };
+    use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::onchain::mock::MockRaindex;
     use crate::position::{PositionCommand, TradeId};
     use crate::rebalancing::equity::TransferEquityToMarketMaking;
@@ -265,6 +266,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let frameworks = manifest.build(pool, services).await.unwrap();
@@ -332,6 +334,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let built = manifest.build(pool, services).await.unwrap();
 
@@ -462,6 +465,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let built = manifest.build(pool.clone(), services).await.unwrap();
 

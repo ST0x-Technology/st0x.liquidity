@@ -22,6 +22,8 @@ use st0x_execution::{
     FractionalShares, Network, Symbol, TimeInForce,
 };
 use st0x_finance::Usdc;
+use st0x_issuance_client::IssuanceClient;
+use st0x_issuance_dto::VaultModeTag;
 use st0x_raindex::{RaindexService, RaindexVaultId};
 use st0x_tokenization::{
     AlpacaTokenizationService, IssuerRequestId, TokenizationRequest, TokenizationRequestStatus,
@@ -36,6 +38,7 @@ use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
 };
+use crate::mint_authorization::{ConfiguredMintAuthorizer, VaultModeReader};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
 use crate::rebalancing::to_wrapped_equities;
 use crate::rebalancing::usdc::{CrossVenueCashTransfer, UsdcSettlementParams, UsdcTransferError};
@@ -136,6 +139,14 @@ async fn build_equity_transfer_services(
         tokenizer: tokenization_service.clone(),
         wrapper: wrapper.clone(),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        // The CLI transfer path never signs mint authorizations:
+        // `transfer_equity_command` rejects orchestrator-mode mints up
+        // front (`ensure_vault_direct_mint`), so only vault-direct assets
+        // reach this saga, which also skips `with_mint_authorization` and
+        // therefore never consults this value. Orchestrator-mode mints run
+        // through the server, where the authorizer and vault-mode wiring
+        // come from `[orchestrator]` config.
+        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
 
     let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
@@ -157,6 +168,32 @@ async fn build_equity_transfer_services(
     );
 
     Ok(EquityTransferCliServices { transfer, wallet })
+}
+
+/// Refuses an orchestrator-mode CLI mint before any aggregate is created.
+///
+/// The CLI wires no vault-mode reader, mint authorizer, or delivery
+/// worker: an orchestrator-mode mint initiated here would sit unauthorized
+/// (stalled at polling) until a server restart resumed it. Fails closed --
+/// an indeterminate mode is never treated as vault-direct, mirroring the
+/// server saga's own rule.
+async fn ensure_vault_direct_mint(
+    vault_mode_reader: &dyn VaultModeReader,
+    symbol: &Symbol,
+) -> anyhow::Result<()> {
+    let mode = vault_mode_reader
+        .vault_mode(symbol)
+        .await
+        .context("could not determine the asset's vault mode; refusing to mint blind")?;
+
+    match mode {
+        VaultModeTag::VaultDirect => Ok(()),
+        VaultModeTag::Orchestrator => anyhow::bail!(
+            "{symbol} is orchestrator-mode: its mint needs a signed recipient \
+             authorization, which only the server wires (vault-mode reads, \
+             signing, delivery). Run this transfer through the server instead."
+        ),
+    }
 }
 
 pub(super) async fn transfer_equity_command<Writer: Write>(
@@ -183,6 +220,13 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 
     match direction {
         TransferDirection::ToRaindex => {
+            let issuance = IssuanceClient::new(
+                ctx.issuance.base_url.clone(),
+                ctx.issuance.api_key.header_value(),
+            )
+            .context("failed to build the issuance client for the vault-mode check")?;
+            ensure_vault_direct_mint(&issuance, symbol).await?;
+
             writeln!(stdout, "   Creating mint request...")?;
             writeln!(stdout, "   Receiving Wallet: {}", cli_services.wallet)?;
 
@@ -1784,6 +1828,7 @@ mod tests {
     use super::*;
     use crate::equity_redemption::{EquityRedemptionError, redemption_aggregate_id};
     use crate::inventory::ImbalanceThreshold;
+    use crate::mint_authorization::StubVaultModeReader;
     use crate::onchain::mock::MockRaindex;
     use crate::test_utils::setup_test_db;
     use crate::usdc_rebalance::{ReconcileReason, TransferRef, UsdcRebalanceCommand};
@@ -4068,6 +4113,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         }
     }
 
@@ -4811,5 +4857,32 @@ mod tests {
             err_msg.contains("already failed"),
             "failing an already-failed redemption must refuse; got: {err_msg}"
         );
+    }
+
+    /// The CLI wires no authorization infrastructure, so an
+    /// orchestrator-mode mint must be refused before any aggregate exists
+    /// -- accepting it would strand the mint unauthorized until a server
+    /// restart resumed it.
+    #[tokio::test]
+    async fn cli_mint_refuses_orchestrator_mode_asset() {
+        let reader = StubVaultModeReader(VaultModeTag::Orchestrator);
+
+        let error = ensure_vault_direct_mint(&reader, &Symbol::new("RKLB").unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("orchestrator-mode"),
+            "the refusal must say why and point at the server: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_mint_allows_vault_direct_asset() {
+        let reader = StubVaultModeReader(VaultModeTag::VaultDirect);
+
+        ensure_vault_direct_mint(&reader, &Symbol::new("RKLB").unwrap())
+            .await
+            .unwrap();
     }
 }

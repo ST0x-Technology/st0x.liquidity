@@ -65,6 +65,7 @@ use crate::portfolio_snapshot::{
 use crate::position::Position;
 use crate::position_check::{CheckPositions, CheckPositionsCtx, CheckPositionsJobQueue};
 use crate::rebalancing::equity::{
+    DeliverMintAuthorization, DeliverMintAuthorizationCtx, DeliverMintAuthorizationJobQueue,
     ResumeTokenizationAggregate, ResumeTokenizationCtx, ResumeTokenizationJobQueue,
     TransferEquityToHedging, TransferEquityToHedgingCtx, TransferEquityToHedgingJobQueue,
     TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
@@ -220,6 +221,8 @@ pub(crate) fn spawn<Prov, Exec>(
     seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
     resume_tokenization_queue: ResumeTokenizationJobQueue,
     resume_tokenization_ctx: Option<Arc<ResumeTokenizationCtx>>,
+    deliver_mint_authorization_queue: DeliverMintAuthorizationJobQueue,
+    deliver_mint_authorization_ctx: Option<Arc<DeliverMintAuthorizationCtx>>,
     record_bot_gas_receipt_cost_queue: RecordBotGasReceiptCostJobQueue,
     record_bot_gas_receipt_cost_ctx: Option<Arc<RecordBotGasReceiptCostCtx>>,
     job_cleanup: JoinHandle<()>,
@@ -528,6 +531,8 @@ where
         transfer_equity_to_hedging_ctx,
         resume_tokenization_queue,
         resume_tokenization_ctx,
+        deliver_mint_authorization_queue,
+        deliver_mint_authorization_ctx,
         record_bot_gas_receipt_cost_queue,
         record_bot_gas_receipt_cost_ctx,
         apalis_shutdown_token,
@@ -594,6 +599,8 @@ where
     transfer_equity_to_hedging_ctx: Option<Arc<TransferEquityToHedgingCtx>>,
     resume_tokenization_queue: ResumeTokenizationJobQueue,
     resume_tokenization_ctx: Option<Arc<ResumeTokenizationCtx>>,
+    deliver_mint_authorization_queue: DeliverMintAuthorizationJobQueue,
+    deliver_mint_authorization_ctx: Option<Arc<DeliverMintAuthorizationCtx>>,
     record_bot_gas_receipt_cost_queue: RecordBotGasReceiptCostJobQueue,
     record_bot_gas_receipt_cost_ctx: Option<Arc<RecordBotGasReceiptCostCtx>>,
     apalis_shutdown_token: CancellationToken,
@@ -647,6 +654,8 @@ where
             transfer_equity_to_hedging_ctx,
             resume_tokenization_queue,
             resume_tokenization_ctx,
+            deliver_mint_authorization_queue,
+            deliver_mint_authorization_ctx,
             record_bot_gas_receipt_cost_queue,
             record_bot_gas_receipt_cost_ctx,
             apalis_shutdown_token,
@@ -691,6 +700,8 @@ where
         let failure_injector_for_transfer_equity_to_hedging = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_resume_tokenization = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_deliver_mint_authorization = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_record_bot_gas_receipt_cost = failure_injector.clone();
         let failure_notify = Arc::new(TerminalFailureSignal::default());
@@ -920,6 +931,14 @@ where
                 resume_tokenization_queue,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_resume_tokenization,
+            );
+
+            let apalis_monitor = register_deliver_mint_authorization_worker(
+                apalis_monitor,
+                deliver_mint_authorization_ctx,
+                deliver_mint_authorization_queue,
+                #[cfg(any(test, feature = "test-support"))]
+                failure_injector_for_deliver_mint_authorization,
             );
 
             let apalis_monitor = register_record_bot_gas_receipt_cost_worker(
@@ -1221,6 +1240,37 @@ fn register_resume_tokenization_worker(
     })
 }
 
+/// Conditionally registers the `DeliverMintAuthorization` worker. The ctx
+/// is `None` when rebalancing is disabled: no mints happen, so no
+/// authorization ever needs delivering. Best-effort -- a stuck
+/// authorization must never halt hedging or fill detection.
+fn register_deliver_mint_authorization_worker(
+    monitor: Monitor,
+    delivery_ctx: Option<Arc<DeliverMintAuthorizationCtx>>,
+    delivery_queue: DeliverMintAuthorizationJobQueue,
+    #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
+) -> Monitor {
+    let Some(delivery_ctx) = delivery_ctx else {
+        debug!(
+            "DeliverMintAuthorization worker not registered: rebalancing disabled \
+             (no delivery ctx). Orchestrator-mode mint authorizations will not be \
+             delivered."
+        );
+        return monitor;
+    };
+
+    monitor.register(move |index| {
+        build_best_effort_worker!(
+            ::<DeliverMintAuthorizationCtx, DeliverMintAuthorization>,
+            index,
+            delivery_queue.clone(),
+            delivery_ctx.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            failure_injector.clone(),
+        )
+    })
+}
+
 /// Conditionally registers the `RecordBotGasReceiptCost` worker. The ctx is
 /// `None` when `[bot_gas_valuation]` is not configured, or when it is
 /// configured but no `[wallet]` is (see `build_record_bot_gas_receipt_cost_ctx`);
@@ -1275,6 +1325,7 @@ mod tests {
     use super::*;
     use crate::conductor::job::BackpressureStreak;
     use crate::equity_redemption::RedemptionAggregateId;
+    use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::{
         EquityTransferServices, MintError, MintTransferError, RedemptionError,
@@ -1367,6 +1418,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         Arc::new(TransferEquityToMarketMakingCtx {

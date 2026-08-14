@@ -1993,6 +1993,7 @@ mod tests {
     use st0x_wrapper::MockWrapper;
 
     use super::*;
+    use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::offchain::order::OffchainOrderEvent;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::EquityTransferServices;
@@ -2856,6 +2857,7 @@ mod tests {
                 tokenizer: Arc::new(MockTokenizer::new()),
                 wrapper: Arc::new(MockWrapper::new()),
                 bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
             })
             .await
             .unwrap();

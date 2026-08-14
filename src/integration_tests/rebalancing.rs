@@ -54,6 +54,7 @@ use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
     BroadcastingInventory, ImbalanceThreshold, InventoryView, PollFreshness, Venue,
 };
+use crate::mint_authorization::ConfiguredMintAuthorizer;
 use crate::offchain::order::OffchainOrderId;
 use crate::onchain::mock::MockRaindex;
 use crate::position::{Position, PositionCommand, TradeId};
@@ -471,6 +472,7 @@ fn build_equity_transfer_with_wrapper(
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
@@ -512,6 +514,7 @@ async fn build_equity_transfer_with_service(
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
 
     let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
@@ -688,6 +691,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         },
     ));
     let ctx = TransferEquityToMarketMakingCtx {
@@ -1658,6 +1662,7 @@ async fn mint_api_failure_produces_rejected_event() {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         },
     ));
     let ctx = TransferEquityToMarketMakingCtx {
@@ -2243,6 +2248,7 @@ async fn mint_accepted_sets_offchain_inflight() {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         },
     ));
     let transfer_handle = tokio::spawn({
@@ -2461,6 +2467,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         },
     ));
     let ctx = TransferEquityToMarketMakingCtx {
@@ -2538,6 +2545,7 @@ async fn transfer_failed_cancels_redemption_inflight() {
         tokenizer,
         wrapper: Arc::new(MockWrapper::new()),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
 
     let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
@@ -2663,6 +2671,7 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
@@ -2784,6 +2793,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
@@ -2924,6 +2934,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
@@ -3056,6 +3067,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),

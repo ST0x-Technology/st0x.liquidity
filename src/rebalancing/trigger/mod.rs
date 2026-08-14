@@ -258,6 +258,16 @@ impl MintTracking {
                 self.stage = MintTrackingStage::VaultDepositSubmitted;
                 self.last_progress_at = *submitted_at;
             }
+            // Authorization signing/delivery are genuine forward progress
+            // for an orchestrator-mode mint waiting in `Accepted` (issuance
+            // will not mint until the authorization arrives), so they
+            // refresh the stall clock without advancing the stage.
+            TokenizedEquityMintEvent::MintAuthorizationSigned { signed_at, .. } => {
+                self.last_progress_at = *signed_at;
+            }
+            TokenizedEquityMintEvent::MintAuthorizationDelivered { delivered_at } => {
+                self.last_progress_at = *delivered_at;
+            }
             TokenizedEquityMintEvent::MintRequested { .. }
             | TokenizedEquityMintEvent::MintRejected { .. }
             | TokenizedEquityMintEvent::MintAcceptanceFailed { .. }
@@ -444,6 +454,8 @@ fn mint_event_tokenization_request_id(
         | TokenizedEquityMintEvent::VaultDepositSubmitted { .. }
         | TokenizedEquityMintEvent::DepositedIntoRaindex { .. }
         | TokenizedEquityMintEvent::RaindexDepositFailed { .. }
+        | TokenizedEquityMintEvent::MintAuthorizationSigned { .. }
+        | TokenizedEquityMintEvent::MintAuthorizationDelivered { .. }
         | TokenizedEquityMintEvent::OperatorReconciled { .. } => None,
     }
 }
@@ -2641,6 +2653,11 @@ impl RebalancingService {
             | VaultDepositSubmitted { .. }
             | WrappingFailed { .. }
             | RaindexDepositFailed { .. }
+            // Authorization signing/delivery move no shares: the Hedging
+            // inflight `MintAccepted` started is untouched until tokens
+            // arrive.
+            | MintAuthorizationSigned { .. }
+            | MintAuthorizationDelivered { .. }
             // Reconciliation is a pure bookkeeping terminal transition from
             // `Failed`: the failure already settled inventory, so nothing to do.
             | OperatorReconciled { .. } => None,
@@ -5337,6 +5354,8 @@ impl RebalancingService {
 
             MintRequested { .. }
             | MintAccepted { .. }
+            | MintAuthorizationSigned { .. }
+            | MintAuthorizationDelivered { .. }
             | TokensReceived { .. }
             | ProviderCompletionRecovered { .. }
             | WrapSubmitted { .. }
@@ -5459,6 +5478,7 @@ mod tests {
     };
     use crate::inventory::view::{EquityReconcileBusy, InFlightEquityLocation, Operator};
     use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
+    use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::offchain::order::OffchainOrderId;
     use crate::onchain::mock::MockRaindex;
     use crate::position::{
@@ -5770,6 +5790,8 @@ mod tests {
                     tokenization_request_id: tokenization_request_id("TOK-1"),
                     requested_at: Utc::now(),
                     accepted_at,
+                    authorization: crate::tokenized_equity_mint::MintAuthorizationProgress::default(
+                    ),
                 },
             )
             .await
@@ -14442,6 +14464,7 @@ mod tests {
                 tokenizer: Arc::new(MockTokenizer::new()),
                 wrapper: Arc::new(MockWrapper::new()),
                 bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
             },
         );
         store
@@ -14480,6 +14503,7 @@ mod tests {
                 tokenizer: Arc::new(MockTokenizer::new()),
                 wrapper: Arc::new(MockWrapper::new()),
                 bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
             },
         );
         store
