@@ -4113,10 +4113,8 @@ mod tests {
             "http://[::1]:8545",
         ] {
             let parsed = Url::parse(url).unwrap();
-            assert!(
-                require_secure_wallet_rpc_url(parsed, "base_rpc_url").is_ok(),
-                "{url} must be accepted"
-            );
+            let accepted = require_secure_wallet_rpc_url(parsed.clone(), "base_rpc_url").unwrap();
+            assert_eq!(accepted, parsed, "{url} must be accepted unchanged");
         }
     }
 
