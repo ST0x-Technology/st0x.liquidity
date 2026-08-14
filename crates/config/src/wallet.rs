@@ -19,6 +19,7 @@ const REQUIRED_CONFIRMATIONS: u64 = 3;
 const RPC_MAX_RETRIES: u32 = 10;
 const RPC_INITIAL_BACKOFF_MS: u64 = 1000;
 const RPC_COMPUTE_UNITS_PER_SECOND: u64 = 100;
+const RPC_REQUEST_TIMEOUT_SECS: u64 = 20;
 
 /// Extracts just the `kind` discriminant from the wallet TOML table,
 /// ignoring backend-specific fields that vary by wallet type.
@@ -133,7 +134,9 @@ impl OnchainWalletCtx {
 ///
 /// Redirects are disabled: the RPC URL is validated at config load (https or
 /// loopback), and following a redirect would let the server route signing
-/// traffic to a destination that never passed that validation.
+/// traffic to a destination that never passed that validation. The request
+/// timeout bounds a hung endpoint; the retry layer above it handles the
+/// resulting failures.
 fn http_client_with_retry(url: Url) -> Result<RpcClient, reqwest::Error> {
     let retry_layer = RetryBackoffLayer::new(
         RPC_MAX_RETRIES,
@@ -142,6 +145,7 @@ fn http_client_with_retry(url: Url) -> Result<RpcClient, reqwest::Error> {
     );
     let http_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(RPC_REQUEST_TIMEOUT_SECS))
         .build()?;
     let transport = alloy::transports::http::Http::with_client(http_client, url);
     Ok(RpcClient::builder()
@@ -170,15 +174,23 @@ pub async fn build_wallet(
 #[cfg(any(test, feature = "test-support"))]
 impl OnchainWalletCtx {
     /// Create a stub wallet context for tests.
+    ///
+    /// Each chain gets a distinct marker address so a test that routes
+    /// through the wrong chain's wallet observes the wrong address instead
+    /// of passing by coincidence.
     pub fn stub() -> Self {
-        use alloy::primitives::Address;
-
-        let stub_wallet = st0x_evm::StubWallet::stub(Address::ZERO);
+        use alloy::primitives::address;
 
         Self {
-            base: stub_wallet.clone(),
-            ethereum: stub_wallet.clone(),
-            hyperevm: stub_wallet,
+            base: st0x_evm::StubWallet::stub(address!(
+                "0x0000000000000000000000000000000000000ba5"
+            )),
+            ethereum: st0x_evm::StubWallet::stub(address!(
+                "0x0000000000000000000000000000000000000e78"
+            )),
+            hyperevm: st0x_evm::StubWallet::stub(address!(
+                "0x0000000000000000000000000000000000000999"
+            )),
         }
     }
 }
