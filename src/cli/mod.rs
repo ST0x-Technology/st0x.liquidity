@@ -400,7 +400,7 @@ pub enum Commands {
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
         /// Path to the st0x.registry token list for the selected network
-        /// (token-lists/<network>.json). Required for non Base networks;
+        /// (`token-lists/<network>.json`). Required for non Base networks;
         /// Base resolves from [assets.equities]
         #[arg(long = "registry")]
         registry: Option<std::path::PathBuf>,
@@ -419,7 +419,7 @@ pub enum Commands {
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
         /// Path to the st0x.registry token list for the selected network
-        /// (token-lists/<network>.json). Required for non Base networks;
+        /// (`token-lists/<network>.json`). Required for non Base networks;
         /// Base resolves from [assets.equities]
         #[arg(long = "registry")]
         registry: Option<std::path::PathBuf>,
