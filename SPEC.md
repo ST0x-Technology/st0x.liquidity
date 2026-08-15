@@ -168,6 +168,51 @@ Removing or repricing the standing Raindex orders to avoid stale-NAV arbitrage
 during the freeze window is order-management work external to this bot, and out
 of scope here.
 
+#### Mint Recipient Authorization (Orchestrator Mode)
+
+Issuance is migrating vaults behind an `ST0xOrchestrator` contract. For an
+orchestrator-mode asset, issuance will not mint until the **recipient** has
+authorized the exact mint with an EIP-712
+`MintAuth(token, recipient, amount, nonce)` signature. `MintAuth` names the
+EIP-712 struct; **MintAuthV1** — the term issuance's wire DTOs and this repo's
+module docs use — labels version 1 of the `{nonce, signature}` authorization
+payload delivered to issuance. The recipient of rebalancing mints is this bot,
+so it must sign and deliver that authorization. The point is a two-key security
+property: the mint-signing key (issuance, Turnkey `S01Minter`) and the
+recipient-authorization key (this bot's wallet, a different Turnkey wallet) are
+distinct — neither key alone can both mint and authorize.
+
+- **Mode discovery**: per-asset `vault_mode` (`"vault_direct"` |
+  `"orchestrator"`) comes from issuance's status endpoint — the same
+  InternalAuth endpoint the freeze gate polls. Issuance's config is the single
+  source of truth; this bot keeps no asset-mode list. The mode read is part of
+  every server-side mint initiation and fails closed — an indeterminate mode is
+  never treated as vault-direct. For vault-direct assets the post-discovery
+  execution path is unchanged: no signing, no delivery.
+- **Signing**: the bot reads the digest from the configured orchestrator's
+  `mintAuthDigest(token, recipient, amount, nonce)` view and signs that — never
+  constructing EIP-712 locally, so typehash/domain drift is impossible. `amount`
+  is the mint quantity scaled losslessly to 18-decimal share-wei. The wallet
+  seam is `Wallet::sign_digest`: private-key backend for dev/test, Turnkey
+  `ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2` (no-op hashing, hex payload) in
+  production.
+- **Nonce discipline**: a random `bytes32` generated once per mint, persisted
+  (`MintAuthorizationSigned`) before any delivery attempt, and redelivered
+  byte-identically on every retry. A fresh nonce only ever belongs to a
+  replacement mint (a new aggregate); signing is a no-op when a signed
+  authorization already exists.
+- **Delivery**: a durable job posts `{nonce, signature}` to issuance keyed by
+  `tokenization_request_id`. Outcomes: `200` recorded (idempotent on
+  byte-identical redelivery); `404` (issuance has no mint yet — the initiation
+  race) and transport/`502` failures get bounded delayed redrives; `409`/`422`
+  park the delivery with an operator alert (a conflicting or rejected
+  authorization is never retried automatically — the mint then stalls at polling
+  until an operator resolves it).
+- **Configuration**: `[orchestrator] address = "0x…"` in the plaintext config,
+  optional as a whole — while every asset is vault-direct the bot deploys
+  without the section. An orchestrator-mode mint reaching the signing step
+  without it fails loudly rather than guessing an address.
+
 ## Bot Implementation Specification
 
 The arbitrage bot will be built in Rust to leverage its performance, safety, and
@@ -2119,8 +2164,12 @@ vault for liquidity provision.
 
 **Services**:
 `EquityTransferServices { raindex: Arc<dyn Raindex>, tokenizer:
-Arc<dyn Tokenizer>, wrapper: Arc<dyn Wrapper> }`
--- shared with `EquityRedemption`.
+Arc<dyn Tokenizer>, wrapper: Arc<dyn Wrapper>, mint_authorizer:
+ConfiguredMintAuthorizer, .. }`
+-- shared with `EquityRedemption`. `mint_authorizer` signs MintAuthV1 recipient
+authorizations for orchestrator-mode mints; `Disabled` without an
+`[orchestrator]` config section, so `SignMintAuthorization` fails loudly rather
+than guessing an orchestrator address.
 
 ##### State Flow
 
@@ -2155,13 +2204,22 @@ Terminal states store audit-critical fields not available from earlier events:
 ```rust
 enum TokenizedEquityMint {
     MintRequested { symbol, quantity, wallet, requested_at },
-    MintAccepted { /* + issuer_request_id, tokenization_request_id */ },
+    MintAccepted { /* + issuer_request_id, tokenization_request_id,
+        authorization: MintAuthorizationProgress */ },
     TokensReceived { /* + token_tx_hash, receipt_id, shares_minted */ },
     TokensWrapped { /* + wrap_tx_hash, wrapped_shares */ },
     DepositedIntoRaindex { symbol, quantity, issuer_request_id,
         tokenization_request_id, token_tx_hash, wrap_tx_hash,
         vault_deposit_tx_hash, deposited_at },
     Failed { symbol, quantity, reason, requested_at, failed_at },
+}
+
+/// Orchestrator-mode recipient-authorization progress, tracked on
+/// `MintAccepted`; stays `NotSigned` for vault-direct mints.
+enum MintAuthorizationProgress {
+    NotSigned,
+    Signed { nonce, signature },
+    Delivered { nonce, signature },
 }
 ```
 
@@ -2172,6 +2230,16 @@ enum TokenizedEquityMintCommand {
     /// Initialize: calls tokenizer.request_mint(), emits
     /// MintRequested + MintAccepted (or MintRejected on rejection).
     RequestMint { issuer_request_id, symbol, quantity, wallet },
+    /// Orchestrator mode only: reads the orchestrator digest, signs it,
+    /// emits MintAuthorizationSigned. No-op when already signed -- the
+    /// persisted nonce is the mint's idempotency key and is never
+    /// regenerated for the same mint.
+    SignMintAuthorization { token },
+    /// Records issuance's 200 acknowledgement of the delivered
+    /// authorization; dispatched by the delivery job. Emits
+    /// MintAuthorizationDelivered (also when the mint has already
+    /// advanced past MintAccepted -- see business rules).
+    RecordMintAuthorizationDelivered,
     /// Transition: calls tokenizer.poll_mint_until_complete(),
     /// emits TokensReceived (or MintAcceptanceFailed).
     Poll,
@@ -2190,6 +2258,9 @@ enum TokenizedEquityMintEvent {
 
     MintAccepted { issuer_request_id, tokenization_request_id, accepted_at },
     MintAcceptanceFailed { reason, failed_at },
+
+    MintAuthorizationSigned { nonce, signature, signed_at },
+    MintAuthorizationDelivered { delivered_at },
 
     TokensReceived { tx_hash, receipt_id, shares_minted, received_at },
 
@@ -2213,6 +2284,28 @@ enum TokenizedEquityMintEvent {
   ERC-4626 shares
 - `DepositToVault` only from TokensWrapped state
 - DepositedIntoRaindex and Failed are terminal states
+- `SignMintAuthorization` only in MintAccepted (the saga dispatches it between
+  acceptance and `Poll` for orchestrator-mode assets); a no-op when already
+  signed, so at-least-once saga re-drives reuse the persisted nonce
+  byte-identically. A late signing attempt after tokens arrive is a benign no-op
+  (issuance already consumed the authorization or never needed one); only
+  pre-acceptance and terminal states hard-error
+- `RecordMintAuthorizationDelivered`: in MintAccepted it requires a signed
+  authorization (acknowledging an unsigned mint is a caller bug). It normally
+  executes AFTER the mint advanced past MintAccepted: `Poll` holds the
+  per-aggregate lock for the whole Alpaca wait, and issuance completes the mint
+  only once the authorization arrived, so the acknowledgement queues behind
+  `Poll` and lands on `TokensReceived` or later — recorded there as an audit
+  fact with no state change. Advanced states carry no authorization progress, so
+  the signed-authorization requirement is a delivery-job invariant there, not
+  aggregate validation: the job only fires after `MintAuthorizationSigned`
+  persisted (still durable in the event stream), and the advanced state itself
+  proves issuance accepted the mint. No-op on already-delivered and on terminal
+  states.
+- A mint interrupted between `MintAuthorizationSigned` and
+  `MintAuthorizationDelivered` is resumed by startup recovery, which re-enqueues
+  delivery of the persisted authorization (issuance's `200` is idempotent on
+  byte-identical redelivery)
 
 #### EquityRedemption Aggregate
 
