@@ -8,7 +8,7 @@
 # Image contract (consumed by the stack's docker-compose in t0.devops —
 # keep the two in sync):
 #   bot:       Entrypoint = the `server` binary; env configs baked at
-#              /app/config/{staging,staging-gcp,prod}/st0x-hedge.toml; the compose
+#              /app/config/{staging,staging-gcp,prod,prod-gcp}/st0x-hedge.toml; the compose
 #              command appends --config <baked path> --secrets <mounted
 #              Secret Manager file>. database_url in the configs stays
 #              sqlite:///mnt/data/st0x-hedge.db (the VM mounts its data
@@ -29,7 +29,7 @@
 
 let
   bakedConfigs = pkgs.runCommand "st0x-hedge-configs" { } ''
-    mkdir -p $out/app/config/staging $out/app/config/staging-gcp $out/app/config/prod
+    mkdir -p $out/app/config/staging $out/app/config/staging-gcp $out/app/config/prod $out/app/config/prod-gcp
     cp ${../config/staging/st0x-hedge.toml} $out/app/config/staging/st0x-hedge.toml
     # The GCP VM runs this variant: kms_api_key (keyless Turnkey auth, so
     # the secrets file has no [wallet]) and no [telemetry]. #1182 added the
@@ -37,6 +37,11 @@ let
     # and the bot crash-looped on "failed to read config file" at cutover.
     cp ${../config/staging-gcp/st0x-hedge.toml} $out/app/config/staging-gcp/st0x-hedge.toml
     cp ${../config/prod/st0x-hedge.toml} $out/app/config/prod/st0x-hedge.toml
+    # The GCP production VM's variant, same shape as staging-gcp: kms_api_key
+    # (keyless Turnkey, no [wallet] secret) and no [telemetry]. The plain
+    # prod config remains the droplet's. Baked HERE, not just committed --
+    # the staging cutover crash-looped on exactly that omission (#1182/#1190).
+    cp ${../config/prod-gcp/st0x-hedge.toml} $out/app/config/prod-gcp/st0x-hedge.toml
   '';
 
   dashboardRoot = pkgs.runCommand "st0x-dashboard-root" { } ''
