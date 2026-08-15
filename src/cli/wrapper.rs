@@ -16,54 +16,6 @@ use super::TokenizationNetwork;
 use super::token_list::load_wrapped_equities;
 use crate::rebalancing::to_wrapped_equities;
 
-/// The wallet and symbol to address map a wrap or unwrap runs against.
-struct WrapContext {
-    wallet: Arc<dyn Wallet<Provider = RootProvider>>,
-    equities: HashMap<Symbol, WrappedEquity>,
-}
-
-/// Resolves the wallet and the symbol to address map for a wrap or unwrap.
-///
-/// Base resolves from `[assets.equities]` exactly as before. Non Base
-/// networks have no config source, so the registry token list is required
-/// and a stray one on Base is rejected instead of silently ignored. The
-/// resolved map must contain the requested symbol so a typo fails here with
-/// the available symbols instead of deeper in the vault call.
-fn wrap_context(
-    ctx: &Ctx,
-    network: TokenizationNetwork,
-    registry: Option<&PathBuf>,
-    symbol: &Symbol,
-) -> anyhow::Result<WrapContext> {
-    let wallet_ctx = ctx.wallet()?;
-    let (wallet, _network_wire) =
-        super::rebalancing::tokenization_network_context(wallet_ctx, network);
-
-    let equities = match (network, registry) {
-        (TokenizationNetwork::Base, None) => to_wrapped_equities(&ctx.assets.equities.symbols),
-        (TokenizationNetwork::Base, Some(_)) => anyhow::bail!(
-            "--registry only applies to non Base networks: Base resolves \
-             from [assets.equities]"
-        ),
-        (_, Some(path)) => load_wrapped_equities(path, network.chain_id())?,
-        (_, None) => anyhow::bail!(
-            "pass --registry with the st0x.registry token list for the \
-             selected network (token-lists/<network>.json)"
-        ),
-    };
-
-    if !equities.contains_key(symbol) {
-        let mut available: Vec<String> = equities.keys().map(ToString::to_string).collect();
-        available.sort();
-        anyhow::bail!(
-            "{symbol} is not in the resolved token set; available: [{}]",
-            available.join(", ")
-        );
-    }
-
-    Ok(WrapContext { wallet, equities })
-}
-
 pub(super) async fn wrap_equity_command<Writer: Write>(
     stdout: &mut Writer,
     symbol: Symbol,
@@ -236,6 +188,54 @@ async fn donate_equity_with_wrapper<Writer: Write, WrapperImpl: Wrapper + ?Sized
     writeln!(stdout, "Donation completed successfully!")?;
 
     Ok(())
+}
+
+/// The wallet and symbol to address map a wrap or unwrap runs against.
+struct WrapContext {
+    wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    equities: HashMap<Symbol, WrappedEquity>,
+}
+
+/// Resolves the wallet and the symbol to address map for a wrap or unwrap.
+///
+/// Base resolves from `[assets.equities]` exactly as before. Non Base
+/// networks have no config source, so the registry token list is required
+/// and a stray one on Base is rejected instead of silently ignored. The
+/// resolved map must contain the requested symbol so a typo fails here with
+/// the available symbols instead of deeper in the vault call.
+fn wrap_context(
+    ctx: &Ctx,
+    network: TokenizationNetwork,
+    registry: Option<&PathBuf>,
+    symbol: &Symbol,
+) -> anyhow::Result<WrapContext> {
+    let wallet_ctx = ctx.wallet()?;
+    let (wallet, _network_wire) =
+        super::rebalancing::tokenization_network_context(wallet_ctx, network);
+
+    let equities = match (network, registry) {
+        (TokenizationNetwork::Base, None) => to_wrapped_equities(&ctx.assets.equities.symbols),
+        (TokenizationNetwork::Base, Some(_)) => anyhow::bail!(
+            "--registry only applies to non Base networks: Base resolves \
+             from [assets.equities]"
+        ),
+        (_, Some(path)) => load_wrapped_equities(path, network.chain_id())?,
+        (_, None) => anyhow::bail!(
+            "pass --registry with the st0x.registry token list for the \
+             selected network (token-lists/<network>.json)"
+        ),
+    };
+
+    if !equities.contains_key(symbol) {
+        let mut available: Vec<String> = equities.keys().map(ToString::to_string).collect();
+        available.sort();
+        anyhow::bail!(
+            "{symbol} is not in the resolved token set; available: [{}]",
+            available.join(", ")
+        );
+    }
+
+    Ok(WrapContext { wallet, equities })
 }
 
 #[cfg(test)]

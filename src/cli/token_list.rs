@@ -18,68 +18,6 @@ use st0x_wrapper::WrappedEquity;
 /// Prefix of wrapped token symbols in the registry token lists.
 const WRAPPED_SYMBOL_PREFIX: &str = "wt";
 
-#[derive(Debug, Deserialize)]
-struct TokenList {
-    tokens: Vec<TokenEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TokenEntry {
-    chain_id: u64,
-    address: Address,
-    symbol: String,
-    #[serde(default)]
-    extensions: Option<TokenExtensions>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TokenExtensions {
-    #[serde(default)]
-    unwrapped_address: Option<Address>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(super) enum TokenListError {
-    #[error("failed to read token list {path}: {source}")]
-    Io {
-        path: String,
-        source: std::io::Error,
-    },
-    #[error("failed to parse token list {path}: {source}")]
-    Parse {
-        path: String,
-        source: serde_json::Error,
-    },
-    #[error(
-        "token list entry {symbol} has chain id {found} but the selected \
-         network expects {expected}; pass the token list for the selected \
-         network"
-    )]
-    ChainIdMismatch {
-        symbol: String,
-        found: u64,
-        expected: u64,
-    },
-    #[error(
-        "wrapped token entry {symbol} has no extensions.unwrappedAddress; \
-         cannot resolve the underlying tStock"
-    )]
-    MissingUnwrappedAddress { symbol: String },
-    #[error("invalid symbol {symbol} in token list")]
-    InvalidSymbol {
-        symbol: String,
-        #[source]
-        source: st0x_execution::EmptySymbolError,
-    },
-    #[error(
-        "duplicate wrapped token entry {symbol} in token list; cannot pick \
-         one of the conflicting address sets"
-    )]
-    DuplicateSymbol { symbol: String },
-}
-
 /// Loads a registry token list and builds the symbol to address map the
 /// wrapper service consumes.
 ///
@@ -144,6 +82,68 @@ pub(super) fn load_wrapped_equities(
     }
 
     Ok(equities)
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenList {
+    tokens: Vec<TokenEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenEntry {
+    chain_id: u64,
+    address: Address,
+    symbol: String,
+    #[serde(default)]
+    extensions: Option<TokenExtensions>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenExtensions {
+    #[serde(default)]
+    unwrapped_address: Option<Address>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum TokenListError {
+    #[error("failed to read token list {path}: {source}")]
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("failed to parse token list {path}: {source}")]
+    Parse {
+        path: String,
+        source: serde_json::Error,
+    },
+    #[error(
+        "token list entry {symbol} has chain id {found} but the selected \
+         network expects {expected}; pass the token list for the selected \
+         network"
+    )]
+    ChainIdMismatch {
+        symbol: String,
+        found: u64,
+        expected: u64,
+    },
+    #[error(
+        "wrapped token entry {symbol} has no extensions.unwrappedAddress; \
+         cannot resolve the underlying tStock"
+    )]
+    MissingUnwrappedAddress { symbol: String },
+    #[error("invalid symbol {symbol} in token list")]
+    InvalidSymbol {
+        symbol: String,
+        #[source]
+        source: st0x_execution::EmptySymbolError,
+    },
+    #[error(
+        "duplicate wrapped token entry {symbol} in token list; cannot pick \
+         one of the conflicting address sets"
+    )]
+    DuplicateSymbol { symbol: String },
 }
 
 #[cfg(test)]

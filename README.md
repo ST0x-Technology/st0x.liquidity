@@ -118,6 +118,15 @@ mode and a configured Base liquidity wallet):
 cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml wrap-equity --symbol AAPL --quantity 10.5
 ```
 
+On a non Base network, pass the target network and the st0x.registry token list
+for it:
+
+```bash
+cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml wrap-equity --symbol RKLB --quantity 0.1 --network ethereum --registry path/to/st0x.registry/token-lists/ethereum.json
+```
+
+The same flags apply to unwrap-equity.
+
 Manual unwrap of wrapped equity shares (requires rebalancing mode and a
 configured Base liquidity wallet):
 
