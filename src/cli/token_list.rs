@@ -73,6 +73,11 @@ pub(super) enum TokenListError {
         #[source]
         source: st0x_execution::EmptySymbolError,
     },
+    #[error(
+        "duplicate wrapped token entry {symbol} in token list; cannot pick \
+         one of the conflicting address sets"
+    )]
+    DuplicateSymbol { symbol: String },
 }
 
 /// Loads a registry token list and builds the symbol to address map the
@@ -124,13 +129,18 @@ pub(super) fn load_wrapped_equities(
                 source,
             })?;
 
-        equities.insert(
+        let previous = equities.insert(
             symbol,
             WrappedEquity {
                 underlying,
                 derivative: entry.address,
             },
         );
+        if previous.is_some() {
+            return Err(TokenListError::DuplicateSymbol {
+                symbol: entry.symbol,
+            });
+        }
     }
 
     Ok(equities)
@@ -251,5 +261,38 @@ mod tests {
         let equities = load_wrapped_equities(file.path(), ETHEREUM_CHAIN_ID).unwrap();
 
         assert!(equities.is_empty());
+    }
+
+    #[test]
+    fn duplicate_wrapped_entries_fail_closed() {
+        let file = write_list(
+            r#"{
+                "tokens": [{
+                    "chainId": 1,
+                    "address": "0xF4f8c66085910d583c01f3b4e44Bf731D4e2c565",
+                    "symbol": "wtRKLB",
+                    "extensions": {
+                        "unwrappedAddress": "0xED0c085d92C262FB46937CB0B3C9763Af7fCCf30"
+                    }
+                }, {
+                    "chainId": 1,
+                    "address": "0x8FC87Be766C0cB6f254F1FDc9351D4B85B560FB3",
+                    "symbol": "wtRKLB",
+                    "extensions": {
+                        "unwrappedAddress": "0xED0c085d92C262FB46937CB0B3C9763Af7fCCf30"
+                    }
+                }]
+            }"#,
+        );
+
+        let error = load_wrapped_equities(file.path(), ETHEREUM_CHAIN_ID).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                TokenListError::DuplicateSymbol { ref symbol } if symbol == "wtRKLB"
+            ),
+            "expected DuplicateSymbol, got {error:?}"
+        );
     }
 }
