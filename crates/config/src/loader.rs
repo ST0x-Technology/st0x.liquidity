@@ -244,7 +244,8 @@ struct Config {
     /// ETH/USD valuation source for bot-gas cost recording. See
     /// [`Ctx::bot_gas_valuation`] for when this is required.
     bot_gas_valuation: Option<BotGasValuationConfig>,
-    /// ST0xOrchestrator contract address. See [`Ctx::orchestrator`].
+    /// Per-network ST0xOrchestrator contract addresses. See
+    /// [`Ctx::orchestrator`].
     orchestrator: Option<OrchestratorConfig>,
 }
 
@@ -659,12 +660,13 @@ pub struct Ctx {
     /// including in Standalone mode, where an operator may still configure it
     /// even though no rebalancing path will ever enqueue to it.
     pub bot_gas_valuation: Option<BotGasValuationConfig>,
-    /// ST0xOrchestrator contract address from `[orchestrator]`, needed to
-    /// sign `MintAuthV1` recipient authorizations for orchestrator-mode
-    /// mints. `Some` when the config includes an `[orchestrator]` section.
-    /// Optional so the bot runs unchanged while every asset is
-    /// vault-direct; a mint that discovers an orchestrator-mode asset with
-    /// this absent must fail loudly, never guess an address.
+    /// Per-network ST0xOrchestrator contract addresses from
+    /// `[orchestrator.addresses]`, needed to sign `MintAuthV1` recipient
+    /// authorizations for orchestrator-mode mints. `Some` when the config
+    /// includes an `[orchestrator]` section. Optional so the bot runs
+    /// unchanged while every asset is vault-direct; a mint that discovers an
+    /// orchestrator-mode asset with no address for its chain must fail
+    /// loudly, never guess an address.
     pub orchestrator: Option<OrchestratorConfig>,
 }
 
@@ -3747,8 +3749,8 @@ mod tests {
     fn orchestrator_section_flows_into_parts() {
         let config_str =
             rebalancing_toml_with_bot_gas_valuation(&bot_gas_and_orchestrator_sections(
-                r#"[orchestrator]
-            address = "0x4444444444444444444444444444444444444444""#,
+                r#"[orchestrator.addresses]
+            base = "0x4444444444444444444444444444444444444444""#,
             ));
         let secrets = rebalancing_secrets_toml();
         let secrets_str = std::fs::read_to_string(secrets.path()).unwrap();
@@ -3765,8 +3767,8 @@ mod tests {
             .orchestrator
             .expect("orchestrator should be Some when configured");
         assert_eq!(
-            orchestrator.address,
-            address!("0x4444444444444444444444444444444444444444")
+            orchestrator.addresses.base,
+            Some(address!("0x4444444444444444444444444444444444444444"))
         );
     }
 
@@ -3797,8 +3799,8 @@ mod tests {
     fn zero_orchestrator_address_fails_config_parse() {
         let config_str =
             rebalancing_toml_with_bot_gas_valuation(&bot_gas_and_orchestrator_sections(
-                r#"[orchestrator]
-            address = "0x0000000000000000000000000000000000000000""#,
+                r#"[orchestrator.addresses]
+            base = "0x0000000000000000000000000000000000000000""#,
             ));
         let secrets = rebalancing_secrets_toml();
         let secrets_str = std::fs::read_to_string(secrets.path()).unwrap();
@@ -3818,7 +3820,7 @@ mod tests {
         assert!(
             source
                 .to_string()
-                .contains("address must not be the zero address"),
+                .contains("base must not be the zero address"),
             "expected zero-address rejection, got: {source}"
         );
     }

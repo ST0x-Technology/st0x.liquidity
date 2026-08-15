@@ -46,11 +46,12 @@ pub struct SignedMintAuthorization {
 
 /// Mint-authorizer handle for the mint aggregate's services.
 ///
-/// `Disabled` when the config has no `[orchestrator]` section -- the bot
-/// runs dark while every asset is vault-direct, and an orchestrator-mode
-/// mint reaching the signing step then fails loudly rather than guessing
-/// an address. Mirrors `BotGasReceiptCostEnqueuer`'s explicit-absence
-/// shape.
+/// `Disabled` when the config has no `[orchestrator.addresses]` entry for
+/// Base (the chain every tokenized equity the bot mints lives on) -- the
+/// bot runs dark while every asset is vault-direct, and an
+/// orchestrator-mode mint reaching the signing step then fails loudly
+/// rather than guessing an address. Mirrors `BotGasReceiptCostEnqueuer`'s
+/// explicit-absence shape.
 #[derive(Clone)]
 pub enum ConfiguredMintAuthorizer {
     Enabled(Arc<dyn MintAuthorizer>),
@@ -123,11 +124,13 @@ pub enum MintAuthorizationError {
     #[error(transparent)]
     Evm(#[from] EvmError),
     /// An orchestrator-mode mint reached the signing step but the config
-    /// has no `[orchestrator]` section. Fails loudly instead of guessing an
-    /// address; the mint stays `MintAccepted` and resumes once configured.
+    /// has no `[orchestrator.addresses]` entry for Base -- the chain every
+    /// tokenized equity the bot mints lives on. Fails loudly instead of
+    /// guessing an address (or another chain's address); the mint stays
+    /// `MintAccepted` and resumes once configured.
     #[error(
-        "orchestrator-mode mint requires an [orchestrator] config section; \
-         the mint authorizer is disabled"
+        "orchestrator-mode mint requires an [orchestrator.addresses] base \
+         entry; the mint authorizer is disabled"
     )]
     NotConfigured,
 }

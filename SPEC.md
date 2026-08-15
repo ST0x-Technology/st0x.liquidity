@@ -208,10 +208,16 @@ distinct — neither key alone can both mint and authorize.
   park the delivery with an operator alert (a conflicting or rejected
   authorization is never retried automatically — the mint then stalls at polling
   until an operator resolves it).
-- **Configuration**: `[orchestrator] address = "0x…"` in the plaintext config,
-  optional as a whole — while every asset is vault-direct the bot deploys
-  without the section. An orchestrator-mode mint reaching the signing step
-  without it fails loudly rather than guessing an address.
+- **Configuration**: per-network `[orchestrator.addresses]` entries
+  (`base = "0x…"`, optionally `ethereum = "0x…"`) in the plaintext config,
+  mirroring the issuance bot's shape — each chain carries its own orchestrator
+  deployment. The section is optional as a whole: while every asset is
+  vault-direct the bot deploys without it. Mint authorization signs against the
+  `base` entry (every tokenized equity the bot mints lives on Base); an
+  orchestrator-mode mint reaching the signing step without a base entry fails
+  loudly rather than guessing an address or another chain's deployment, and a
+  section carrying only other networks' entries is flagged with a startup
+  warning instead of staying silently inert.
 
 ## Bot Implementation Specification
 
@@ -2168,8 +2174,8 @@ Arc<dyn Tokenizer>, wrapper: Arc<dyn Wrapper>, mint_authorizer:
 ConfiguredMintAuthorizer, .. }`
 -- shared with `EquityRedemption`. `mint_authorizer` signs MintAuthV1 recipient
 authorizations for orchestrator-mode mints; `Disabled` without an
-`[orchestrator]` config section, so `SignMintAuthorization` fails loudly rather
-than guessing an orchestrator address.
+`[orchestrator.addresses]` base entry, so `SignMintAuthorization` fails loudly
+rather than guessing an orchestrator address.
 
 ##### State Flow
 
