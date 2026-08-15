@@ -67,8 +67,12 @@ pub(super) enum TokenListError {
          cannot resolve the underlying tStock"
     )]
     MissingUnwrappedAddress { symbol: String },
-    #[error("invalid symbol {symbol} in token list: {message}")]
-    InvalidSymbol { symbol: String, message: String },
+    #[error("invalid symbol {symbol} in token list")]
+    InvalidSymbol {
+        symbol: String,
+        #[source]
+        source: st0x_execution::EmptySymbolError,
+    },
 }
 
 /// Loads a registry token list and builds the symbol to address map the
@@ -115,9 +119,9 @@ pub(super) fn load_wrapped_equities(
             })?;
 
         let symbol =
-            Symbol::new(underlying_symbol).map_err(|error| TokenListError::InvalidSymbol {
+            Symbol::new(underlying_symbol).map_err(|source| TokenListError::InvalidSymbol {
                 symbol: entry.symbol.clone(),
-                message: error.to_string(),
+                source,
             })?;
 
         equities.insert(
