@@ -401,6 +401,59 @@ mod tests {
         );
     }
 
+    /// A valid registry resolves through wrap_context into the wrapper: the
+    /// command prints the registry's wrapped and underlying addresses before
+    /// the chain call fails on the stub provider. The stub wallets share one
+    /// address, so wallet identity per network is asserted by the
+    /// tokenization_network_context pairing test, not here.
+    #[tokio::test]
+    async fn unwrap_on_ethereum_resolves_addresses_from_the_registry() {
+        let mut registry = tempfile::NamedTempFile::new().unwrap();
+        registry
+            .write_all(
+                br#"{
+                    "tokens": [{
+                        "chainId": 1,
+                        "address": "0x8FC87Be766C0cB6f254F1FDc9351D4B85B560FB3",
+                        "symbol": "wtRKLB",
+                        "extensions": {
+                            "unwrappedAddress": "0xED0c085d92C262FB46937CB0B3C9763Af7fCCf30"
+                        }
+                    }]
+                }"#,
+            )
+            .unwrap();
+
+        let ctx = create_ctx_with_stub_wallet();
+        let mut stdout = Vec::new();
+
+        let error = unwrap_equity_command(
+            &mut stdout,
+            Symbol::new("RKLB").unwrap(),
+            positive_shares("0.1"),
+            TokenizationNetwork::Ethereum,
+            Some(registry.path().to_path_buf()),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("Wrapped token: 0x8FC87Be766C0cB6f254F1FDc9351D4B85B560FB3"),
+            "derivative must come from the registry, got: {output}"
+        );
+        assert!(
+            output.contains("Underlying token: 0xED0c085d92C262FB46937CB0B3C9763Af7fCCf30"),
+            "underlying must come from the registry, got: {output}"
+        );
+        assert!(
+            !error.to_string().contains("not in the resolved token set")
+                && !error.to_string().contains("pass --registry"),
+            "failure must be past resolution, got: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn wrap_equity_requires_wallet_config() {
         let ctx = create_ctx_without_rebalancing();

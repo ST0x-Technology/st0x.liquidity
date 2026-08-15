@@ -2269,6 +2269,29 @@ mod tests {
     }
 
     #[test]
+    fn classify_forwards_unwrap_equity_network_and_registry() {
+        let command = Commands::UnwrapEquity {
+            symbol: Symbol::new("RKLB").unwrap(),
+            quantity: positive_shares("0.1"),
+            network: TokenizationNetwork::Ethereum,
+            registry: Some(std::path::PathBuf::from("token-lists/ethereum.json")),
+        };
+
+        match classify_command(command) {
+            Ok(SimpleCommand::UnwrapEquity {
+                network, registry, ..
+            }) => {
+                assert_eq!(network, TokenizationNetwork::Ethereum);
+                assert_eq!(
+                    registry,
+                    Some(std::path::PathBuf::from("token-lists/ethereum.json"))
+                );
+            }
+            _ => panic!("expected unwrap-equity simple command, got a different route"),
+        }
+    }
+
+    #[test]
     fn parse_positive_shares_rejects_zero() {
         let error = parse_positive_shares("0").unwrap_err();
         assert!(error.contains("positive"), "unexpected error: {error}");
