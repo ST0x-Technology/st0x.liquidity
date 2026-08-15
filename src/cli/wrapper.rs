@@ -241,6 +241,7 @@ async fn donate_equity_with_wrapper<Writer: Write, WrapperImpl: Wrapper + ?Sized
 #[cfg(test)]
 mod tests {
     use alloy::primitives::Address;
+    use std::io::Write as _;
     use url::Url;
 
     use st0x_config::ExecutionThreshold;
@@ -360,8 +361,6 @@ mod tests {
 
     #[tokio::test]
     async fn wrap_rejects_a_symbol_missing_from_the_resolved_set() {
-        use std::io::Write as _;
-
         let mut registry = tempfile::NamedTempFile::new().unwrap();
         registry
             .write_all(

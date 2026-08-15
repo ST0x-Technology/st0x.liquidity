@@ -149,14 +149,13 @@ pub(super) fn load_wrapped_equities(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
+    use std::io::Write as _;
 
     use super::*;
 
     const ETHEREUM_CHAIN_ID: u64 = 1;
 
     fn write_list(json: &str) -> tempfile::NamedTempFile {
-        use std::io::Write as _;
-
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(json.as_bytes()).unwrap();
         file
