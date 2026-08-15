@@ -219,8 +219,10 @@ fn wrap_context(
             "--registry only applies to non Base networks: Base resolves \
              from [assets.equities]"
         ),
-        (_, Some(path)) => load_wrapped_equities(path, network.chain_id())?,
-        (_, None) => anyhow::bail!(
+        (TokenizationNetwork::Ethereum, Some(path)) => {
+            load_wrapped_equities(path, network.chain_id())?
+        }
+        (TokenizationNetwork::Ethereum, None) => anyhow::bail!(
             "pass --registry with the st0x.registry token list for the \
              selected network (token-lists/<network>.json)"
         ),

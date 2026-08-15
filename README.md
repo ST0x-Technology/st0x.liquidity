@@ -112,26 +112,25 @@ cargo run --bin server -- --config path/to/config.toml --secrets path/to/secrets
 ```
 
 Manual wrap of tokenized equity into wrapped vault shares (requires rebalancing
-mode and a configured Base liquidity wallet):
+mode and a configured liquidity wallet for the selected network):
 
 ```bash
 cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml wrap-equity --symbol AAPL --quantity 10.5
 ```
 
-On a non Base network, pass the target network and the st0x.registry token list
-for it:
-
-```bash
-cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml wrap-equity --symbol RKLB --quantity 0.1 --network ethereum --registry path/to/st0x.registry/token-lists/ethereum.json
-```
-
-The same flags apply to unwrap-equity.
-
 Manual unwrap of wrapped equity shares (requires rebalancing mode and a
-configured Base liquidity wallet):
+configured liquidity wallet for the selected network):
 
 ```bash
 cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml unwrap-equity --symbol AAPL --quantity 10.5
+```
+
+Both commands default to Base and resolve addresses from [assets.equities]. On a
+non Base network, pass the target network and the st0x.registry token list for
+it:
+
+```bash
+cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml wrap-equity --symbol RKLB --quantity 0.1 --network ethereum --registry path/to/st0x.registry/token-lists/ethereum.json
 ```
 
 Manual cancellation of an open Alpaca order by the id printed at placement:
