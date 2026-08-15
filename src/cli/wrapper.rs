@@ -1,27 +1,80 @@
 //! CLI commands for ERC-4626 wrapping and unwrapping operations.
 
 use alloy::primitives::Address;
+use alloy::providers::RootProvider;
+use std::collections::HashMap;
 use std::io::Write;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use st0x_config::Ctx;
+use st0x_evm::Wallet;
 use st0x_execution::{FractionalShares, Positive, Symbol};
-use st0x_wrapper::{Wrapper, WrapperService};
+use st0x_wrapper::{WrappedEquity, Wrapper, WrapperService};
 
+use super::TokenizationNetwork;
+use super::token_list::load_wrapped_equities;
 use crate::rebalancing::to_wrapped_equities;
+
+/// The wallet and symbol to address map a wrap or unwrap runs against.
+struct WrapContext {
+    wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    equities: HashMap<Symbol, WrappedEquity>,
+}
+
+/// Resolves the wallet and the symbol to address map for a wrap or unwrap.
+///
+/// Base resolves from `[assets.equities]` exactly as before. Non Base
+/// networks have no config source, so the registry token list is required
+/// and a stray one on Base is rejected instead of silently ignored. The
+/// resolved map must contain the requested symbol so a typo fails here with
+/// the available symbols instead of deeper in the vault call.
+fn wrap_context(
+    ctx: &Ctx,
+    network: TokenizationNetwork,
+    registry: Option<&PathBuf>,
+    symbol: &Symbol,
+) -> anyhow::Result<WrapContext> {
+    let wallet_ctx = ctx.wallet()?;
+    let (wallet, _network_wire) =
+        super::rebalancing::tokenization_network_context(wallet_ctx, network);
+
+    let equities = match (network, registry) {
+        (TokenizationNetwork::Base, None) => to_wrapped_equities(&ctx.assets.equities.symbols),
+        (TokenizationNetwork::Base, Some(_)) => anyhow::bail!(
+            "--registry only applies to non Base networks: Base resolves \
+             from [assets.equities]"
+        ),
+        (_, Some(path)) => load_wrapped_equities(path, network.chain_id())?,
+        (_, None) => anyhow::bail!(
+            "pass --registry with the st0x.registry token list for the \
+             selected network (token-lists/<network>.json)"
+        ),
+    };
+
+    if !equities.contains_key(symbol) {
+        let mut available: Vec<String> = equities.keys().map(ToString::to_string).collect();
+        available.sort();
+        anyhow::bail!(
+            "{symbol} is not in the resolved token set; available: [{}]",
+            available.join(", ")
+        );
+    }
+
+    Ok(WrapContext { wallet, equities })
+}
 
 pub(super) async fn wrap_equity_command<Writer: Write>(
     stdout: &mut Writer,
     symbol: Symbol,
     quantity: Positive<FractionalShares>,
+    network: TokenizationNetwork,
+    registry: Option<PathBuf>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let wallet_ctx = ctx.wallet()?;
-    let base_wallet = wallet_ctx.base_wallet().clone();
-    let owner = base_wallet.address();
-    let wrapper = WrapperService::new(
-        base_wallet,
-        to_wrapped_equities(&ctx.assets.equities.symbols),
-    );
+    let WrapContext { wallet, equities } = wrap_context(ctx, network, registry.as_ref(), &symbol)?;
+    let owner = wallet.address();
+    let wrapper = WrapperService::new(wallet, equities);
 
     wrap_equity_with_wrapper(stdout, &wrapper, owner, symbol, quantity).await
 }
@@ -77,15 +130,13 @@ pub(super) async fn unwrap_equity_command<Writer: Write>(
     stdout: &mut Writer,
     symbol: Symbol,
     quantity: Positive<FractionalShares>,
+    network: TokenizationNetwork,
+    registry: Option<PathBuf>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let wallet_ctx = ctx.wallet()?;
-    let base_wallet = wallet_ctx.base_wallet().clone();
-    let owner = base_wallet.address();
-    let wrapper = WrapperService::new(
-        base_wallet,
-        to_wrapped_equities(&ctx.assets.equities.symbols),
-    );
+    let WrapContext { wallet, equities } = wrap_context(ctx, network, registry.as_ref(), &symbol)?;
+    let owner = wallet.address();
+    let wrapper = WrapperService::new(wallet, equities);
 
     unwrap_equity_with_wrapper(stdout, &wrapper, owner, symbol, quantity).await
 }
@@ -200,8 +251,9 @@ mod tests {
     use st0x_wrapper::MockWrapper;
 
     use super::{
-        donate_equity_command, donate_equity_with_wrapper, unwrap_equity_command,
-        unwrap_equity_with_wrapper, wrap_equity_command, wrap_equity_with_wrapper,
+        TokenizationNetwork, donate_equity_command, donate_equity_with_wrapper,
+        unwrap_equity_command, unwrap_equity_with_wrapper, wrap_equity_command,
+        wrap_equity_with_wrapper,
     };
     use crate::test_utils::positive_shares;
 
@@ -256,6 +308,100 @@ mod tests {
         }
     }
 
+    fn create_ctx_with_stub_wallet() -> Ctx {
+        let mut ctx = create_ctx_without_rebalancing();
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        ctx
+    }
+
+    #[tokio::test]
+    async fn wrap_on_base_rejects_a_registry() {
+        let ctx = create_ctx_with_stub_wallet();
+        let mut stdout = Vec::new();
+
+        let error = wrap_equity_command(
+            &mut stdout,
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("1"),
+            TokenizationNetwork::Base,
+            Some(std::path::PathBuf::from("token-lists/base.json")),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("only applies to non Base"),
+            "expected registry rejection, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_on_ethereum_requires_a_registry() {
+        let ctx = create_ctx_with_stub_wallet();
+        let mut stdout = Vec::new();
+
+        let error = wrap_equity_command(
+            &mut stdout,
+            Symbol::new("RKLB").unwrap(),
+            positive_shares("0.1"),
+            TokenizationNetwork::Ethereum,
+            None,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("pass --registry"),
+            "expected missing registry error, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_rejects_a_symbol_missing_from_the_resolved_set() {
+        use std::io::Write as _;
+
+        let mut registry = tempfile::NamedTempFile::new().unwrap();
+        registry
+            .write_all(
+                br#"{
+                    "tokens": [{
+                        "chainId": 1,
+                        "address": "0xF4f8c66085910d583c01f3b4e44Bf731D4e2c565",
+                        "symbol": "wtRKLB",
+                        "extensions": {
+                            "unwrappedAddress": "0xED0c085d92C262FB46937CB0B3C9763Af7fCCf30"
+                        }
+                    }]
+                }"#,
+            )
+            .unwrap();
+
+        let ctx = create_ctx_with_stub_wallet();
+        let mut stdout = Vec::new();
+
+        let error = wrap_equity_command(
+            &mut stdout,
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("1"),
+            TokenizationNetwork::Ethereum,
+            Some(registry.path().to_path_buf()),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("not in the resolved token set"),
+            "expected missing symbol error, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("RKLB"),
+            "error must list available symbols, got: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn wrap_equity_requires_wallet_config() {
         let ctx = create_ctx_without_rebalancing();
@@ -265,6 +411,8 @@ mod tests {
             &mut stdout,
             Symbol::new("AAPL").unwrap(),
             positive_shares("10.5"),
+            TokenizationNetwork::Base,
+            None,
             &ctx,
         )
         .await
@@ -285,6 +433,8 @@ mod tests {
             &mut stdout,
             Symbol::new("AAPL").unwrap(),
             positive_shares("10.5"),
+            TokenizationNetwork::Base,
+            None,
             &ctx,
         )
         .await
