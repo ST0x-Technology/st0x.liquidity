@@ -1336,6 +1336,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
             &snapshot_id,
             InventorySnapshotCommand::OnchainUsdc {
                 usdc_balance: Usdc::new(float!(500)),
+                fetched_at: Utc::now(),
                 block_number: None,
             },
         )

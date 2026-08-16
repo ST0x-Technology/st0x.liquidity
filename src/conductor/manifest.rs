@@ -356,6 +356,7 @@ mod tests {
                 &id,
                 InventorySnapshotCommand::OnchainEquity {
                     balances,
+                    fetched_at: chrono::Utc::now(),
                     block_number: None,
                 },
             )
