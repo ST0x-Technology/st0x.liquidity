@@ -32,7 +32,7 @@ use st0x_tokenization::{
 use st0x_wrapper::{Wrapper, WrapperService};
 
 use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpressure};
-use super::{TokenizationNetwork, TransferDirection, TransferType};
+use super::{AuditReason, TokenizationNetwork, TransferDirection, TransferType};
 use crate::api::ResumeResponse;
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::equity_redemption::{
@@ -715,7 +715,7 @@ fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingO
 pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
     stdout: &mut Writer,
     id: Uuid,
-    reason: &str,
+    reason: &AuditReason,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
     let id = UsdcRebalanceId(id);
@@ -1471,7 +1471,7 @@ pub(crate) async fn fail_transfer_command<W: Write>(
     pool: &SqlitePool,
     transfer_type: TransferType,
     id: &str,
-    reason: &str,
+    reason: &AuditReason,
 ) -> anyhow::Result<()> {
     let services = EquityTransferServices::panicking();
 
@@ -1607,7 +1607,7 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
     stdout: &mut W,
     transfer_type: TransferType,
     id: &str,
-    reason: String,
+    reason: AuditReason,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
     let services = EquityTransferServices::panicking();
@@ -1633,7 +1633,9 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
             st0x_event_sorcery::send_command::<TokenizedEquityMint>(
                 pool,
                 &mint_id,
-                TokenizedEquityMintCommand::Reconcile { reason },
+                TokenizedEquityMintCommand::Reconcile {
+                    reason: reason.into(),
+                },
                 services,
             )
             .await?;
@@ -1661,7 +1663,9 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
             st0x_event_sorcery::send_command::<EquityRedemption>(
                 pool,
                 &redemption_id,
-                EquityRedemptionCommand::Reconcile { reason },
+                EquityRedemptionCommand::Reconcile {
+                    reason: reason.into(),
+                },
                 services,
             )
             .await?;
@@ -2943,7 +2947,9 @@ mod tests {
         let unknown_id = Uuid::from_u128(0xCAFE_BABE);
 
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, unknown_id, "reason", &pool).await;
+        let result =
+            fail_usdc_transfer_command(&mut stdout, unknown_id, &"reason".parse().unwrap(), &pool)
+                .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -2966,7 +2972,9 @@ mod tests {
         seed_to_bridging(&store, id).await;
 
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+        let result =
+            fail_usdc_transfer_command(&mut stdout, id, &"should fail".parse().unwrap(), &pool)
+                .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -2998,7 +3006,9 @@ mod tests {
             .unwrap();
 
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+        let result =
+            fail_usdc_transfer_command(&mut stdout, id, &"should fail".parse().unwrap(), &pool)
+                .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3036,7 +3046,9 @@ mod tests {
             .unwrap();
 
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+        let result =
+            fail_usdc_transfer_command(&mut stdout, id, &"should fail".parse().unwrap(), &pool)
+                .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3070,7 +3082,9 @@ mod tests {
             .unwrap();
 
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+        let result =
+            fail_usdc_transfer_command(&mut stdout, id, &"should fail".parse().unwrap(), &pool)
+                .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3107,7 +3121,8 @@ mod tests {
 
         // Now in BridgingFailed { burn_tx_hash: None } -- the early check fires.
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, id, "re-fail", &pool).await;
+        let result =
+            fail_usdc_transfer_command(&mut stdout, id, &"re-fail".parse().unwrap(), &pool).await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3133,7 +3148,9 @@ mod tests {
         seed_to_bridging_submitting(&store, id).await;
 
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, id, "manual fail", &pool).await;
+        let result =
+            fail_usdc_transfer_command(&mut stdout, id, &"manual fail".parse().unwrap(), &pool)
+                .await;
         result.expect("fail_usdc_transfer must succeed from BridgingSubmitting");
 
         let state = store.load(&UsdcRebalanceId(id)).await.unwrap().unwrap();
@@ -3193,9 +3210,10 @@ mod tests {
             .unwrap();
 
         let mut stdout = Vec::new();
-        let error = fail_usdc_transfer_command(&mut stdout, id, "manual fail", &pool)
-            .await
-            .unwrap_err();
+        let error =
+            fail_usdc_transfer_command(&mut stdout, id, &"manual fail".parse().unwrap(), &pool)
+                .await
+                .unwrap_err();
         assert!(
             error.to_string().contains("post-burn"),
             "fail-usdc-transfer must reject a recorded-burn BridgingSubmitting as post-burn; \
@@ -3335,7 +3353,13 @@ mod tests {
         seed_to_withdrawal_complete(&store, id).await;
 
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, id, "wc-distinct-reason", &pool).await;
+        let result = fail_usdc_transfer_command(
+            &mut stdout,
+            id,
+            &"wc-distinct-reason".parse().unwrap(),
+            &pool,
+        )
+        .await;
         result.expect("fail_usdc_transfer must succeed from WithdrawalComplete");
 
         let state = store.load(&UsdcRebalanceId(id)).await.unwrap().unwrap();
@@ -3500,7 +3524,9 @@ mod tests {
         seed_to_bridged(&store, id).await;
 
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+        let result =
+            fail_usdc_transfer_command(&mut stdout, id, &"should fail".parse().unwrap(), &pool)
+                .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3522,7 +3548,9 @@ mod tests {
         seed_to_deposit_initiated(&store, id).await;
 
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+        let result =
+            fail_usdc_transfer_command(&mut stdout, id, &"should fail".parse().unwrap(), &pool)
+                .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3544,7 +3572,9 @@ mod tests {
         seed_to_deposit_confirmed(&store, id).await;
 
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+        let result =
+            fail_usdc_transfer_command(&mut stdout, id, &"should fail".parse().unwrap(), &pool)
+                .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3596,7 +3626,9 @@ mod tests {
         seed_to_conversion_failed_base_to_alpaca(&store, id).await;
 
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+        let result =
+            fail_usdc_transfer_command(&mut stdout, id, &"should fail".parse().unwrap(), &pool)
+                .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3705,7 +3737,9 @@ mod tests {
             .unwrap();
 
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+        let result =
+            fail_usdc_transfer_command(&mut stdout, id, &"should fail".parse().unwrap(), &pool)
+                .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3728,7 +3762,9 @@ mod tests {
         seed_to_deposit_failed(&store, id).await;
 
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+        let result =
+            fail_usdc_transfer_command(&mut stdout, id, &"should fail".parse().unwrap(), &pool)
+                .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3762,7 +3798,9 @@ mod tests {
             .unwrap();
 
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+        let result =
+            fail_usdc_transfer_command(&mut stdout, id, &"should fail".parse().unwrap(), &pool)
+                .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3814,7 +3852,9 @@ mod tests {
         seed_to_conversion_failed_alpaca_to_base(&store, id).await;
 
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+        let result =
+            fail_usdc_transfer_command(&mut stdout, id, &"should fail".parse().unwrap(), &pool)
+                .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3869,7 +3909,9 @@ mod tests {
         seed_to_withdrawal_failed(&store, id).await;
 
         let mut stdout = Vec::new();
-        let result = fail_usdc_transfer_command(&mut stdout, id, "should fail", &pool).await;
+        let result =
+            fail_usdc_transfer_command(&mut stdout, id, &"should fail".parse().unwrap(), &pool)
+                .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -4194,7 +4236,7 @@ mod tests {
             &pool,
             TransferType::Redemption,
             &id.to_string(),
-            "tokens stranded at Alpaca, ticket 42",
+            &"tokens stranded at Alpaca, ticket 42".parse().unwrap(),
         )
         .await
         .unwrap();
@@ -4246,7 +4288,7 @@ mod tests {
             &pool,
             TransferType::Redemption,
             &id.to_string(),
-            "alpaca never completed, ticket 43",
+            &"alpaca never completed, ticket 43".parse().unwrap(),
         )
         .await
         .unwrap();
@@ -4288,7 +4330,7 @@ mod tests {
             &pool,
             TransferType::Redemption,
             &id.to_string(),
-            "withdraw orphaned, ticket 44",
+            &"withdraw orphaned, ticket 44".parse().unwrap(),
         )
         .await
         .unwrap();
@@ -4339,7 +4381,7 @@ mod tests {
             &pool,
             TransferType::Redemption,
             &id.to_string(),
-            "should be refused",
+            &"should be refused".parse().unwrap(),
         )
         .await;
 
@@ -4466,7 +4508,7 @@ mod tests {
             &mut stdout,
             TransferType::Mint,
             &issuer_request_id("cli-no-such-mint").to_string(),
-            "handled out-of-band".to_string(),
+            "handled out-of-band".parse().unwrap(),
             &pool,
         )
         .await;
@@ -4499,7 +4541,7 @@ mod tests {
             &mut stdout,
             TransferType::Mint,
             &id.to_string(),
-            "handled out-of-band".to_string(),
+            "handled out-of-band".parse().unwrap(),
             &pool,
         )
         .await;
@@ -4522,7 +4564,7 @@ mod tests {
             &mut stdout,
             TransferType::Mint,
             &id.to_string(),
-            "wrapped manually via wrap-equity".to_string(),
+            "wrapped manually via wrap-equity".parse().unwrap(),
             &pool,
         )
         .await
@@ -4560,7 +4602,7 @@ mod tests {
             &mut stdout,
             TransferType::Mint,
             &id.to_string(),
-            "second reconcile attempt".to_string(),
+            "second reconcile attempt".parse().unwrap(),
             &pool,
         )
         .await;
@@ -4592,7 +4634,7 @@ mod tests {
             &pool,
             TransferType::Mint,
             &id.to_string(),
-            "should be refused",
+            &"should be refused".parse().unwrap(),
         )
         .await;
 
@@ -4665,7 +4707,7 @@ mod tests {
             &pool,
             TransferType::Mint,
             &id.to_string(),
-            "stuck at provider, never accepted",
+            &"stuck at provider, never accepted".parse().unwrap(),
         )
         .await
         .unwrap();
@@ -4700,7 +4742,7 @@ mod tests {
             &mut stdout,
             TransferType::Redemption,
             &redemption_aggregate_id("cli-no-such-redemption").to_string(),
-            "handled out-of-band".to_string(),
+            "handled out-of-band".parse().unwrap(),
             &pool,
         )
         .await;
@@ -4723,7 +4765,7 @@ mod tests {
             &mut stdout,
             TransferType::Redemption,
             &id.to_string(),
-            "handled out-of-band".to_string(),
+            "handled out-of-band".parse().unwrap(),
             &pool,
         )
         .await;
@@ -4754,7 +4796,7 @@ mod tests {
             &mut stdout,
             TransferType::Redemption,
             &id.to_string(),
-            "deposited manually via vault-deposit".to_string(),
+            "deposited manually via vault-deposit".parse().unwrap(),
             &pool,
         )
         .await
@@ -4790,7 +4832,7 @@ mod tests {
             &mut stdout,
             TransferType::Redemption,
             &id.to_string(),
-            "second reconcile attempt".to_string(),
+            "second reconcile attempt".parse().unwrap(),
             &pool,
         )
         .await;
@@ -4814,7 +4856,7 @@ mod tests {
             &pool,
             TransferType::Redemption,
             &id.to_string(),
-            "should be refused",
+            &"should be refused".parse().unwrap(),
         )
         .await;
 
@@ -4848,7 +4890,7 @@ mod tests {
             &pool,
             TransferType::Redemption,
             &id.to_string(),
-            "should be refused",
+            &"should be refused".parse().unwrap(),
         )
         .await;
 

@@ -4330,7 +4330,9 @@ effect rather than a generic intent:
   value is rejected at parse time. `reconcile --kind usdc` additionally
   constrains its reason to a fixed vocabulary (`funds-moved-manually` /
   `deposit-credited-offline`); `mint`/`redemption` reconcile reasons are free
-  text.
+  text. The surviving legacy `fail-usdc-transfer` command is the sole
+  compatibility exception: omitting `--reason` uses `Manually failed via CLI`,
+  while an explicitly blank value is rejected at parse time.
 - **`fail` and `reconcile` are distinct and must not be conflated.** `fail` is
   for an operation the system is still waiting on (force it to a clean
   terminal); `reconcile` is for an operation that already failed and whose guard

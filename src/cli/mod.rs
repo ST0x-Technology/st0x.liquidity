@@ -1,6 +1,7 @@
 //! CLI commands for trading, asset transfers, and authentication.
 
 mod alpaca_wallet;
+mod audit_reason;
 mod backpressure_retry;
 mod cctp;
 mod dividend;
@@ -9,6 +10,8 @@ mod repair;
 mod trading;
 mod vault;
 mod wrapper;
+
+pub use audit_reason::AuditReason;
 
 use alloy::primitives::{Address, B256, TxHash};
 use alloy::providers::ProviderBuilder;
@@ -175,8 +178,8 @@ pub enum PositionRecoveryCommand {
         order_id: OffchainOrderId,
         /// Reason to persist on the Position::FailOffChainOrder event (required;
         /// the audit record for this manual intervention)
-        #[arg(short = 'r', long = "reason", value_parser = parse_non_empty_reason)]
-        reason: String,
+        #[arg(short = 'r', long = "reason")]
+        reason: AuditReason,
     },
     /// Set a position's net exposure after an operator manual correction.
     ///
@@ -205,8 +208,8 @@ pub enum PositionRecoveryCommand {
         #[arg(long = "price", value_parser = parse_positive_price)]
         price: Option<Float>,
         /// Operator reason to persist on the Position::ManualPositionAdjusted event
-        #[arg(short = 'r', long = "reason", value_parser = parse_non_empty_reason)]
-        reason: String,
+        #[arg(short = 'r', long = "reason")]
+        reason: AuditReason,
     },
 }
 
@@ -230,8 +233,8 @@ pub enum PortfolioSnapshotRecoveryCommand {
         #[arg(long = "source", value_parser = parse_non_empty_source)]
         source: String,
         /// Operator reason persisted with the correction event.
-        #[arg(short = 'r', long = "reason", value_parser = parse_non_empty_reason)]
-        reason: String,
+        #[arg(short = 'r', long = "reason")]
+        reason: AuditReason,
     },
 }
 
@@ -266,19 +269,6 @@ fn parse_non_empty_source(input: &str) -> Result<String, String> {
 fn parse_positive_shares(input: &str) -> Result<Positive<FractionalShares>, String> {
     let shares: FractionalShares = input.parse().map_err(|err| format!("{err}"))?;
     Positive::new(shares).map_err(|err| format!("{err}"))
-}
-
-/// Rejects a blank `--reason` on event-emitting destructive verbs. clap already
-/// requires the flag be present once its default is removed, but a present-but-
-/// empty value (`--reason ""` or `--reason "   "`, easy to hit when a shell
-/// expands `--reason "$REASON"` to nothing) would persist the same audit-hostile
-/// blank reason the requirement exists to prevent.
-fn parse_non_empty_reason(input: &str) -> Result<String, String> {
-    if input.trim().is_empty() {
-        return Err("--reason must not be blank; it is persisted as the audit record".to_string());
-    }
-
-    Ok(input.to_string())
 }
 
 #[derive(Debug, Parser)]
@@ -464,7 +454,7 @@ pub enum Commands {
             long = "reason",
             default_value = "Manually failed via CLI"
         )]
-        reason: String,
+        reason: AuditReason,
     },
 
     /// Clear a recorded pending CCTP burn hash on a transfer stuck at
@@ -821,8 +811,8 @@ pub enum TransferCommand {
         /// Why the transfer is being reconciled (required; persisted as the audit
         /// record). For `usdc` this must be one of `funds-moved-manually` or
         /// `deposit-credited-offline`; for `mint`/`redemption` it is free text.
-        #[arg(short = 'r', long = "reason", value_parser = parse_non_empty_reason)]
-        reason: String,
+        #[arg(short = 'r', long = "reason")]
+        reason: AuditReason,
     },
 
     /// Manually fail a stuck mint or redemption transfer.
@@ -839,8 +829,8 @@ pub enum TransferCommand {
         #[arg(short = 'i', long = "id")]
         id: String,
         /// Reason for failure (required; persisted as the audit record)
-        #[arg(short = 'r', long = "reason", value_parser = parse_non_empty_reason)]
-        reason: String,
+        #[arg(short = 'r', long = "reason")]
+        reason: AuditReason,
     },
 
     /// Re-check a failed mint or redemption and complete it if the provider settled it.
@@ -1049,7 +1039,7 @@ enum SimpleCommand {
     FailTransfer {
         transfer_type: TransferType,
         id: String,
-        reason: String,
+        reason: AuditReason,
     },
     RecheckTransfer {
         transfer_type: TransferType,
@@ -1064,16 +1054,16 @@ enum SimpleCommand {
         /// Raw operator-supplied `--reason` from `transfer reconcile --kind
         /// usdc`, parsed into [`ReconcileReasonArg`] in the handler so an
         /// unknown value surfaces a clear error.
-        reason: String,
+        reason: AuditReason,
     },
     FailUsdcTransfer {
         id: Uuid,
-        reason: String,
+        reason: AuditReason,
     },
     ReconcileEquityTransfer {
         transfer_type: TransferType,
         id: String,
-        reason: String,
+        reason: AuditReason,
     },
     ClearPendingBurn {
         id: Uuid,
@@ -1101,7 +1091,8 @@ pub async fn fail_transfer_for_test(
     reason: &str,
 ) -> anyhow::Result<()> {
     let mut stdout = Vec::new();
-    rebalancing::fail_transfer_command(&mut stdout, pool, transfer_type, id, reason).await
+    let reason = reason.parse::<AuditReason>().map_err(anyhow::Error::msg)?;
+    rebalancing::fail_transfer_command(&mut stdout, pool, transfer_type, id, &reason).await
 }
 
 #[cfg(feature = "test-support")]
@@ -1675,10 +1666,9 @@ async fn run_simple_command<W: Write>(
             let id = id.parse::<Uuid>().map_err(|error| {
                 anyhow::anyhow!("transfer reconcile --kind usdc: invalid id {id:?}: {error}")
             })?;
-            // A blank reason was already rejected by `parse_non_empty_reason` at
-            // clap parse time; this enum-domain parse is the secondary check that
-            // also constrains the value to the usdc vocabulary.
-            let reason = parse_usdc_reconcile_reason(&reason)?;
+            // `AuditReason` rejects blanks at the CLI boundary. This secondary
+            // parse also constrains USDC reconciliation to its fixed vocabulary.
+            let reason = parse_usdc_reconcile_reason(reason.as_ref())?;
             rebalancing::reconcile_usdc_transfer_command(stdout, id, reason.into(), pool).await
         }
         SimpleCommand::FailUsdcTransfer { id, reason } => {
@@ -2217,7 +2207,7 @@ mod tests {
         // must route without an RPC provider.
         let command = Commands::FailUsdcTransfer {
             id: Uuid::from_u128(123),
-            reason: "test reason".to_string(),
+            reason: "test reason".parse().unwrap(),
         };
 
         match classify_command(command) {
@@ -2257,7 +2247,7 @@ mod tests {
                 reason,
             } => {
                 assert_eq!(parsed_id, id);
-                assert_eq!(reason, "stuck pre-burn");
+                assert_eq!(reason.as_ref(), "stuck pre-burn");
             }
             other => panic!("expected fail-usdc-transfer command, got: {other:?}"),
         }
@@ -2272,12 +2262,33 @@ mod tests {
         match cli.command {
             Commands::FailUsdcTransfer { reason, .. } => {
                 assert_eq!(
-                    reason, "Manually failed via CLI",
+                    reason.as_ref(),
+                    "Manually failed via CLI",
                     "omitting --reason must use the default"
                 );
             }
             other => panic!("expected fail-usdc-transfer command, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn fail_usdc_transfer_rejects_whitespace_reason() {
+        let id = Uuid::from_u128(0xDE_AD);
+        let error = Cli::try_parse_from([
+            "st0x-cli",
+            "fail-usdc-transfer",
+            "--id",
+            &id.to_string(),
+            "--reason",
+            "   ",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(
+            error.to_string().contains("must not be blank"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -2563,7 +2574,7 @@ mod tests {
                 assert_eq!(long, None);
                 assert_eq!(short, None);
                 assert!(price.is_none());
-                assert_eq!(reason, "manual rebalance completed");
+                assert_eq!(reason.as_ref(), "manual rebalance completed");
             }
             _ => panic!("expected position set simple command"),
         }
@@ -2690,7 +2701,7 @@ mod tests {
             command: PositionRecoveryCommand::ReleaseHedge {
                 symbol: Symbol::new("MSTR").unwrap(),
                 order_id,
-                reason: "operator repair".to_string(),
+                reason: "operator repair".parse().unwrap(),
             },
         };
 
@@ -2705,7 +2716,7 @@ mod tests {
             }) => {
                 assert_eq!(symbol, Symbol::new("MSTR").unwrap());
                 assert_eq!(parsed_order_id, order_id);
-                assert_eq!(reason, "operator repair");
+                assert_eq!(reason.as_ref(), "operator repair");
             }
             Ok(_) => panic!("expected position simple command"),
             Err(
@@ -2735,7 +2746,7 @@ mod tests {
                 long: Some(positive_shares("100")),
                 short: None,
                 price: None,
-                reason: "manual buy not observed by bot".to_string(),
+                reason: "manual buy not observed by bot".parse().unwrap(),
             },
         };
 
@@ -3129,7 +3140,7 @@ mod tests {
                 reason,
             }) => {
                 assert_eq!(parsed_id, id.to_string());
-                assert_eq!(reason, "deposit-credited-offline");
+                assert_eq!(reason.as_ref(), "deposit-credited-offline");
             }
             _ => panic!("expected reconcile usdc simple command"),
         }
@@ -3158,7 +3169,7 @@ mod tests {
             }) => {
                 assert!(matches!(transfer_type, TransferType::Mint));
                 assert_eq!(id, "ISS001");
-                assert_eq!(reason, "wrapped manually via wrap-equity");
+                assert_eq!(reason.as_ref(), "wrapped manually via wrap-equity");
             }
             _ => panic!("expected reconcile equity (mint) simple command"),
         }
@@ -3187,7 +3198,7 @@ mod tests {
             }) => {
                 assert!(matches!(transfer_type, TransferType::Redemption));
                 assert_eq!(id, "RED-001");
-                assert_eq!(reason, "deposited manually");
+                assert_eq!(reason.as_ref(), "deposited manually");
             }
             _ => panic!("expected reconcile equity (redemption) simple command"),
         }
@@ -3255,7 +3266,7 @@ mod tests {
             }) => {
                 assert!(matches!(transfer_type, TransferType::Mint));
                 assert_eq!(id, "ISS001");
-                assert_eq!(reason, "stuck forever");
+                assert_eq!(reason.as_ref(), "stuck forever");
             }
             _ => panic!("expected transfer fail simple command"),
         }
@@ -3359,7 +3370,8 @@ mod tests {
                 assert_eq!(symbol, Symbol::new("MSTR").unwrap());
                 assert_eq!(parsed_order_id, order_id);
                 assert_eq!(
-                    reason, "operator repair",
+                    reason.as_ref(),
+                    "operator repair",
                     "the supplied --reason must survive classify_command",
                 );
             }

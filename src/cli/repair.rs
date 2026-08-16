@@ -16,7 +16,7 @@ use st0x_execution::{
 };
 use st0x_float_serde::format_float;
 
-use super::PortfolioSnapshotRecoveryCommand;
+use super::{AuditReason, PortfolioSnapshotRecoveryCommand};
 use crate::offchain::order::{
     OffchainOrder, OffchainOrderCommand, OffchainOrderError, OffchainOrderId, OrderPlacementResult,
     OrderPlacer,
@@ -71,7 +71,7 @@ pub(super) async fn set_portfolio_snapshot_mark_command<W: Write>(
                 usd_mark,
                 observed_at,
                 source: source.clone(),
-                reason: reason.clone(),
+                reason: reason.clone().into(),
                 corrected_at: Utc::now(),
             },
         )
@@ -155,7 +155,7 @@ pub(super) async fn fail_pending_offchain_order_command<W: Write>(
     pool: &SqlitePool,
     symbol: &Symbol,
     offchain_order_id: OffchainOrderId,
-    reason: String,
+    reason: AuditReason,
 ) -> anyhow::Result<()> {
     let (position, projection) = StoreBuilder::<Position>::new(pool.clone())
         .build(())
@@ -246,7 +246,7 @@ pub(super) async fn fail_pending_offchain_order_command<W: Write>(
             symbol,
             PositionCommand::FailOffChainOrder {
                 offchain_order_id,
-                error: reason.clone(),
+                error: reason.clone().into(),
                 // The repaired order is typically still live at the broker
                 // (this command force-fails stuck Pending/Submitted orders,
                 // not confirmed broker-terminal ones); releasing here would
@@ -328,7 +328,7 @@ async fn fail_offchain_order_aggregate<W: Write>(
     pool: &SqlitePool,
     order: Option<OffchainOrder>,
     offchain_order_id: OffchainOrderId,
-    reason: String,
+    reason: AuditReason,
 ) -> anyhow::Result<()> {
     use OffchainOrder::{
         Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
@@ -419,7 +419,7 @@ async fn fail_offchain_order_aggregate<W: Write>(
         .send(
             &offchain_order_id,
             OffchainOrderCommand::MarkFailed {
-                error: reason,
+                error: reason.into(),
                 filled_shares: None,
                 failed_at: chrono::Utc::now(),
             },
@@ -492,16 +492,10 @@ pub(super) async fn set_position_command<W: Write>(
     pool: &SqlitePool,
     symbol: &Symbol,
     target_net: FractionalShares,
-    reason: String,
+    reason: AuditReason,
     threshold: ExecutionThreshold,
     price_usdc: Option<Float>,
 ) -> anyhow::Result<()> {
-    if reason.trim().is_empty() {
-        bail!(
-            "--reason must not be empty; it is persisted as the audit record for this adjustment"
-        );
-    }
-
     let (position, projection) = StoreBuilder::<Position>::new(pool.clone())
         .build(())
         .await
@@ -531,7 +525,7 @@ pub(super) async fn set_position_command<W: Write>(
             PositionCommand::ManuallyAdjustPosition {
                 symbol: symbol.clone(),
                 target_net,
-                reason: reason.clone(),
+                reason: reason.clone().into(),
                 threshold,
                 expected_net: Some(previous_net),
                 price_usdc,
@@ -618,7 +612,7 @@ mod tests {
                 usd_mark: Positive::new(float!(150)).unwrap(),
                 observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
                 source: "Nasdaq historical close".to_owned(),
-                reason: "repair missing mark".to_owned(),
+                reason: "repair missing mark".parse().unwrap(),
             },
         )
         .await
@@ -675,7 +669,7 @@ mod tests {
                 usd_mark: Positive::new(float!(150)).unwrap(),
                 observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
                 source: "Nasdaq historical close".to_owned(),
-                reason: "repair missing mark".to_owned(),
+                reason: "repair missing mark".parse().unwrap(),
             },
         )
         .await
@@ -785,7 +779,7 @@ mod tests {
             &pool,
             &symbol,
             order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap();
@@ -817,7 +811,7 @@ mod tests {
             &pool,
             &symbol,
             order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap();
@@ -885,7 +879,7 @@ mod tests {
             &pool,
             &symbol,
             order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap();
@@ -933,7 +927,7 @@ mod tests {
             &pool,
             &symbol,
             order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap_err();
@@ -992,7 +986,7 @@ mod tests {
             &pool,
             stale,
             order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap_err();
@@ -1042,7 +1036,7 @@ mod tests {
             &pool,
             stale,
             order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap_err();
@@ -1208,7 +1202,7 @@ mod tests {
             &pool,
             &symbol,
             order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap_err();
@@ -1251,7 +1245,7 @@ mod tests {
             &pool,
             stale,
             order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap();
@@ -1304,7 +1298,7 @@ mod tests {
             &pool,
             &symbol,
             order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap();
@@ -1368,7 +1362,7 @@ mod tests {
             &pool,
             &symbol,
             order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap();
@@ -1394,7 +1388,7 @@ mod tests {
             &pool,
             &symbol,
             order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap();
@@ -1448,7 +1442,7 @@ mod tests {
             &pool,
             &symbol_a,
             order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap_err();
@@ -1498,7 +1492,7 @@ mod tests {
             &pool,
             &symbol,
             order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap_err();
@@ -1565,7 +1559,7 @@ mod tests {
             &pool,
             &symbol,
             OffchainOrderId::new(),
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await;
 
@@ -1591,7 +1585,7 @@ mod tests {
             &pool,
             &symbol,
             order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap();
@@ -1634,7 +1628,7 @@ mod tests {
             &pool,
             &symbol,
             order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap();
@@ -1651,7 +1645,7 @@ mod tests {
             &pool,
             &symbol,
             order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap_err();
@@ -1675,7 +1669,7 @@ mod tests {
             &pool,
             &symbol,
             requested_order_id,
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap_err();
@@ -1728,7 +1722,7 @@ mod tests {
             &pool,
             &symbol,
             OffchainOrderId::new(),
-            "operator repair".to_string(),
+            "operator repair".parse().unwrap(),
         )
         .await
         .unwrap_err();
@@ -1751,7 +1745,7 @@ mod tests {
             &pool,
             &symbol,
             target_net,
-            "manual long correction".to_string(),
+            "manual long correction".parse().unwrap(),
             ExecutionThreshold::whole_share(),
             None,
         )
@@ -1809,7 +1803,7 @@ mod tests {
             &pool,
             &symbol,
             target_net,
-            "manual short correction".to_string(),
+            "manual short correction".parse().unwrap(),
             ExecutionThreshold::whole_share(),
             None,
         )
@@ -1844,7 +1838,7 @@ mod tests {
             &pool,
             &symbol,
             FractionalShares::new(float!(100)),
-            "manual long correction".to_string(),
+            "manual long correction".parse().unwrap(),
             threshold,
             None,
         )
@@ -1853,39 +1847,6 @@ mod tests {
 
         assert!(
             format!("{error:#}").contains("without a price"),
-            "unexpected error: {error:#}"
-        );
-
-        let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-        assert!(
-            projection.load(&symbol).await.unwrap().is_none(),
-            "rejected adjustment must not persist a position"
-        );
-    }
-
-    #[tokio::test]
-    async fn set_position_rejects_whitespace_only_reason() {
-        let pool = setup_test_db().await;
-        let symbol = Symbol::new("SPYM").unwrap();
-
-        let mut stdout_buffer = Vec::new();
-        let error = set_position_command(
-            &mut stdout_buffer,
-            &pool,
-            &symbol,
-            FractionalShares::ZERO,
-            "   ".to_string(),
-            ExecutionThreshold::whole_share(),
-            None,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(
-            format!("{error:#}").contains("--reason must not be empty"),
             "unexpected error: {error:#}"
         );
 
@@ -1913,7 +1874,7 @@ mod tests {
             &pool,
             &symbol,
             target_net,
-            "manual long correction".to_string(),
+            "manual long correction".parse().unwrap(),
             threshold,
             Some(float!(200)),
         )
@@ -1944,7 +1905,7 @@ mod tests {
             &pool,
             &symbol,
             FractionalShares::ZERO,
-            "manual rebalance completed".to_string(),
+            "manual rebalance completed".parse().unwrap(),
             ExecutionThreshold::whole_share(),
             None,
         )
