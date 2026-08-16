@@ -29,6 +29,36 @@ sol!(
     env!("IST0X_ORCHESTRATOR_V1_ABI")
 );
 
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[allow(clippy::too_many_arguments)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    ST0xOrchestrator,
+    env!("ST0X_ORCHESTRATOR_ABI")
+);
+
+alloy::sol! {
+    /// The EIP-712 struct the orchestrator's `mintAuthDigest` hashes.
+    ///
+    /// Declared locally so the full typed payload can cross Turnkey's
+    /// policy engine, and verified against the deployed contract on every
+    /// signing: the local typehash must equal `MINT_AUTH_TYPEHASH()` and
+    /// the local signing hash must equal `mintAuthDigest(...)` before
+    /// anything is signed, so this declaration can never silently drift
+    /// from the contract.
+    ///
+    /// This is not exposed on the contract, so we need to replicate here.
+    /// Serialize powers `TypedData::from_struct`, which derives the JSON
+    /// payload crossing Turnkey from this same struct.
+    #[derive(serde::Serialize)]
+    struct MintAuth {
+        address token;
+        address recipient;
+        uint256 amount;
+        bytes32 nonce;
+    }
+}
+
 #[cfg(test)]
 sol!(
     #![sol(all_derives = true, rpc)]

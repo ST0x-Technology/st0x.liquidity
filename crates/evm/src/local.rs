@@ -65,9 +65,9 @@ pub type SignerProvider<P> = FillProvider<
 pub struct RawPrivateKeyWallet<P: Provider> {
     /// Base provider for read-only chain access.
     provider: P,
-    /// The signing key, kept for detached-digest signing
-    /// ([`Wallet::sign_digest`]); transaction signing goes through the
-    /// `WalletFiller` inside `signing_provider` instead.
+    /// The signing key, kept for detached typed-data signing
+    /// ([`Wallet::sign_typed_data`]); transaction signing goes through
+    /// the `WalletFiller` inside `signing_provider` instead.
     signer: PrivateKeySigner,
     /// Provider wrapped with gas/nonce/chain-id/wallet fillers for
     /// transaction signing and submission.
@@ -157,8 +157,14 @@ where
         self.signing_provider.default_signer_address()
     }
 
-    async fn sign_digest(&self, digest: B256) -> Result<Signature, EvmError> {
-        Ok(self.signer.sign_hash(&digest).await?)
+    async fn sign_typed_data(
+        &self,
+        _payload_json: String,
+        expected_digest: B256,
+    ) -> Result<Signature, EvmError> {
+        // Local signing hashes nothing itself: the caller-computed digest
+        // IS the payload's signing hash, so signing it directly is exact.
+        Ok(self.signer.sign_hash(&expected_digest).await?)
     }
 
     async fn send_pending(
@@ -298,19 +304,26 @@ mod tests {
     }
 
     /// Recovery-based rather than vector-based: whatever bytes
-    /// `sign_digest` produces must recover to this wallet's address over
-    /// the exact digest signed, which is precisely the check the
-    /// orchestrator's MintAuthV1 verification performs on-chain.
+    /// `sign_typed_data` produces must recover to this wallet's address
+    /// over the caller's expected digest, which is precisely the check
+    /// the orchestrator's MintAuthV1 verification performs on-chain. The
+    /// local backend signs the digest directly, so the payload text plays
+    /// no role here.
     #[tokio::test]
-    async fn sign_digest_recovers_to_wallet_address() {
+    async fn sign_typed_data_recovers_to_wallet_address() {
         let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
 
-        let digest = alloy::primitives::keccak256(b"detached digest");
+        let expected_digest = alloy::primitives::keccak256(b"typed-data signing hash");
 
-        let signature = wallet.sign_digest(digest).await.unwrap();
+        let signature = wallet
+            .sign_typed_data("{}".to_owned(), expected_digest)
+            .await
+            .unwrap();
 
         assert_eq!(
-            signature.recover_address_from_prehash(&digest).unwrap(),
+            signature
+                .recover_address_from_prehash(&expected_digest)
+                .unwrap(),
             signer_address
         );
     }

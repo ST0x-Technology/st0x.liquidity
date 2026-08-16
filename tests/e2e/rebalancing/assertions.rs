@@ -120,8 +120,14 @@ impl Wallet for TestWallet {
         self.address
     }
 
-    async fn sign_digest(&self, digest: B256) -> Result<alloy::primitives::Signature, EvmError> {
-        Ok(self.signer.sign_hash(&digest).await?)
+    async fn sign_typed_data(
+        &self,
+        _payload_json: String,
+        expected_digest: B256,
+    ) -> Result<alloy::primitives::Signature, EvmError> {
+        // Mirrors the local-signer backend: nothing hashes the payload
+        // here, so the caller-computed digest is signed directly.
+        Ok(self.signer.sign_hash(&expected_digest).await?)
     }
 
     async fn send_pending(

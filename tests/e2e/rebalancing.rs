@@ -26,9 +26,9 @@
 
 pub(crate) mod assertions;
 
-use alloy::primitives::{Address, B256, Signature, TxHash};
+use alloy::primitives::{Address, B256, FixedBytes, Signature, TxHash, U256, keccak256};
 use alloy::providers::ext::AnvilApi as _;
-use alloy::sol_types::SolCall;
+use alloy::sol_types::{SolCall, SolValue};
 use rain_math_float::Float;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::collections::HashMap;
@@ -3191,44 +3191,274 @@ async fn interrupted_usdc_base_to_alpaca_resumes_after_restart() -> anyhow::Resu
     Ok(())
 }
 
-/// The constant digest the stub orchestrator reports. The authorization
-/// assertions require the delivered signature to recover to the bot wallet
-/// over exactly this word.
-const E2E_ORCHESTRATOR_DIGEST: [u8; 32] = [0xd1; 32];
+/// The EIP-712 struct string the deployed orchestrator hashes. The stub's
+/// `MINT_AUTH_TYPEHASH()` answer and its digest computation both derive
+/// from it, and the assertions recompose expected digests from it
+/// independently of the service's own encoding.
+const MINT_AUTH_TYPE: &str =
+    "MintAuth(address token,address recipient,uint256 amount,bytes32 nonce)";
+const STUB_DOMAIN_NAME: &str = "ST0xOrchestrator";
+const STUB_DOMAIN_VERSION: &str = "1";
 
-/// Runtime bytecode that returns the given 32-byte word for a well-formed
-/// `mintAuthDigest(address,address,uint256,bytes32)` call and reverts on
-/// anything else.
-///
-/// Stands in for the orchestrator's `mintAuthDigest` view on the e2e chain
-/// (no ST0xOrchestrator artifact is available to deploy here): the
-/// mint-authorization service reads the digest from the configured
-/// orchestrator address and signs whatever it returns, so a constant is
-/// enough to drive the full sign-and-deliver path. The stub still rejects
-/// a wrong selector or mis-sized calldata; argument VALUES cannot be
-/// pinned statically (the nonce is random per mint) -- their exact
-/// encoding is pinned by the mint_authorization unit tests.
-///
-/// Assembly:
-/// `PUSH1 0 CALLDATALOAD PUSH1 224 SHR PUSH4 <selector> EQ PUSH1 20 JUMPI`
-/// `PUSH1 0 PUSH1 0 REVERT` (wrong selector)
-/// `JUMPDEST CALLDATASIZE PUSH1 132 EQ PUSH1 33 JUMPI`
-/// `PUSH1 0 PUSH1 0 REVERT` (calldata is not selector + 4 words)
-/// `JUMPDEST PUSH32 <digest> PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN`
-fn digest_stub_bytecode(digest: [u8; 32]) -> Vec<u8> {
-    let selector = IST0xOrchestratorV1::mintAuthDigestCall::SELECTOR;
+/// Where the stub orchestrator is installed on the e2e chain; also the
+/// verifying contract its domain reports.
+const E2E_ORCHESTRATOR_ADDRESS: Address = Address::repeat_byte(0x77);
 
-    let mut code = Vec::with_capacity(75);
-    code.extend_from_slice(&[0x60, 0x00, 0x35, 0x60, 0xe0, 0x1c, 0x63]);
-    code.extend_from_slice(&selector);
-    code.extend_from_slice(&[0x14, 0x60, 0x14, 0x57, 0x60, 0x00, 0x60, 0x00, 0xfd]);
-    code.extend_from_slice(&[
-        0x5b, 0x36, 0x60, 0x84, 0x14, 0x60, 0x21, 0x57, 0x60, 0x00, 0x60, 0x00, 0xfd,
-    ]);
+/// The stub's EIP-712 domain separator: the standard
+/// name+version+chainId+verifyingContract shape (EIP-5267 fields `0x0f`).
+fn stub_domain_separator(chain_id: u64, orchestrator: Address) -> B256 {
+    keccak256(
+        (
+            keccak256(
+                "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+            ),
+            keccak256(STUB_DOMAIN_NAME),
+            keccak256(STUB_DOMAIN_VERSION),
+            U256::from(chain_id),
+            orchestrator,
+        )
+            .abi_encode_params(),
+    )
+}
+
+/// The EIP-712 signing hash the stub computes for one
+/// `mintAuthDigest(token, recipient, amount, nonce)` call -- used by the
+/// assertions to verify a delivered signature against the mint's own facts.
+fn stub_mint_auth_digest(
+    chain_id: u64,
+    orchestrator: Address,
+    token: Address,
+    recipient: Address,
+    amount: U256,
+    nonce: B256,
+) -> B256 {
+    let hash_struct =
+        keccak256((keccak256(MINT_AUTH_TYPE), token, recipient, amount, nonce).abi_encode_params());
+    let mut preimage = Vec::with_capacity(66);
+    preimage.extend_from_slice(&[0x19, 0x01]);
+    preimage.extend_from_slice(stub_domain_separator(chain_id, orchestrator).as_slice());
+    preimage.extend_from_slice(hash_struct.as_slice());
+    keccak256(preimage)
+}
+
+/// Runtime bytecode standing in for the orchestrator's EIP-712 surface on
+/// the e2e chain (no ST0xOrchestrator artifact is available to deploy
+/// here). Serves the three views the mint-authorization service reads:
+///
+/// - `MINT_AUTH_TYPEHASH()` -- the keccak of [`MINT_AUTH_TYPE`];
+/// - `eip712Domain()` -- the ABI-encoded EIP-5267 answer, embedded as a
+///   trailing data blob and CODECOPYed out (fields `0x0f`, the stub domain
+///   name/version, the e2e chain id, this stub's own address);
+/// - `mintAuthDigest(token, recipient, amount, nonce)` -- a real EIP-712
+///   computation, `keccak(0x1901 ‖ domainSeparator ‖ keccak(typehash ‖
+///   args))` over the calldata arguments. It must be computed rather than
+///   constant because the service's pre-signing guard compares this answer
+///   against its locally composed digest for the mint's random nonce; a
+///   constant would (correctly) be refused as `DigestDiverged`.
+///
+/// Any other selector, or mis-sized `mintAuthDigest` calldata, reverts.
+/// Section byte lengths are fixed by construction (dispatch 44, typehash
+/// 42, domain 14, digest 128), giving constant jump targets; the
+/// `assert_eq!`s pin each section's actual length to its target in every
+/// build profile (a length regression would otherwise dispatch into the
+/// middle of a section and surface as an opaque wrong answer).
+fn orchestrator_stub_bytecode(chain_id: u64, orchestrator: Address) -> Vec<u8> {
+    let digest_selector = IST0xOrchestratorV1::mintAuthDigestCall::SELECTOR;
+    let typehash_selector: [u8; 4] = keccak256("MINT_AUTH_TYPEHASH()")[..4]
+        .try_into()
+        .expect("keccak output is at least 4 bytes");
+    let domain_selector: [u8; 4] = keccak256("eip712Domain()")[..4]
+        .try_into()
+        .expect("keccak output is at least 4 bytes");
+
+    let typehash = keccak256(MINT_AUTH_TYPE);
+    let separator = stub_domain_separator(chain_id, orchestrator);
+    let domain_blob = (
+        FixedBytes::<1>::from([0x0fu8]),
+        STUB_DOMAIN_NAME.to_owned(),
+        STUB_DOMAIN_VERSION.to_owned(),
+        U256::from(chain_id),
+        orchestrator,
+        B256::ZERO,
+        Vec::<U256>::new(),
+    )
+        .abi_encode_params();
+
+    let typehash_target: u16 = 44;
+    let domain_target: u16 = typehash_target + 42;
+    let digest_target: u16 = domain_target + 14;
+    let digest_sized_target: u16 = digest_target + 14;
+    let blob_offset: u16 = digest_target + 128;
+    let blob_len = u16::try_from(domain_blob.len()).expect("domain blob fits in u16");
+
+    let mut code = Vec::with_capacity(usize::from(blob_offset) + domain_blob.len());
+
+    // Dispatch: selector = calldataload(0) >> 224, then one
+    // DUP1 PUSH4 <sel> EQ PUSH2 <target> JUMPI arm per view; fallthrough
+    // reverts.
+    code.extend_from_slice(&[0x60, 0x00, 0x35, 0x60, 0xe0, 0x1c]);
+    for (selector, target) in [
+        (digest_selector, digest_target),
+        (typehash_selector, typehash_target),
+        (domain_selector, domain_target),
+    ] {
+        code.push(0x80);
+        code.push(0x63);
+        code.extend_from_slice(&selector);
+        code.push(0x14);
+        code.push(0x61);
+        code.extend_from_slice(&target.to_be_bytes());
+        code.push(0x57);
+    }
+    code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xfd]);
+    assert_eq!(code.len(), usize::from(typehash_target));
+
+    // MINT_AUTH_TYPEHASH(): JUMPDEST, PUSH32 <typehash>, MSTORE @0,
+    // RETURN(0, 32).
     code.extend_from_slice(&[0x5b, 0x7f]);
-    code.extend_from_slice(&digest);
+    code.extend_from_slice(typehash.as_slice());
     code.extend_from_slice(&[0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    assert_eq!(code.len(), usize::from(domain_target));
+
+    // eip712Domain(): JUMPDEST, PUSH2 <len>, DUP1, PUSH2 <code offset>,
+    // CODECOPY(mem 0, code offset, len), RETURN(0, len).
+    code.extend_from_slice(&[0x5b, 0x61]);
+    code.extend_from_slice(&blob_len.to_be_bytes());
+    code.extend_from_slice(&[0x80, 0x61]);
+    code.extend_from_slice(&blob_offset.to_be_bytes());
+    code.extend_from_slice(&[0x60, 0x00, 0x39, 0x60, 0x00, 0xf3]);
+    assert_eq!(code.len(), usize::from(digest_target));
+
+    // mintAuthDigest(token, recipient, amount, nonce): calldata must be
+    // exactly selector + 4 words (0x84 bytes), else revert.
+    code.extend_from_slice(&[0x5b, 0x36, 0x60, 0x84, 0x14, 0x61]);
+    code.extend_from_slice(&digest_sized_target.to_be_bytes());
+    code.extend_from_slice(&[0x57, 0x60, 0x00, 0x60, 0x00, 0xfd]);
+    // hashStruct = keccak(typehash @0x00 ‖ the four argument words
+    // CALLDATACOPYed to 0x20..0xa0).
+    code.extend_from_slice(&[0x5b, 0x7f]);
+    code.extend_from_slice(typehash.as_slice());
+    code.extend_from_slice(&[0x60, 0x00, 0x52]);
+    code.extend_from_slice(&[0x60, 0x80, 0x60, 0x04, 0x60, 0x20, 0x37]);
+    code.extend_from_slice(&[0x60, 0xa0, 0x60, 0x00, 0x20]);
+    // digest = keccak(0x1901 @0x100 ‖ separator @0x102 ‖ hashStruct
+    // @0x122) = SHA3(0x100, 0x42), returned as one word.
+    code.extend_from_slice(&[0x61, 0x19, 0x01, 0x60, 0xf0, 0x1b, 0x61, 0x01, 0x00, 0x52]);
+    code.push(0x7f);
+    code.extend_from_slice(separator.as_slice());
+    code.extend_from_slice(&[0x61, 0x01, 0x02, 0x52]);
+    code.extend_from_slice(&[0x61, 0x01, 0x22, 0x52]);
+    code.extend_from_slice(&[0x60, 0x42, 0x61, 0x01, 0x00, 0x20]);
+    code.extend_from_slice(&[0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    assert_eq!(code.len(), usize::from(blob_offset));
+
+    code.extend_from_slice(&domain_blob);
     code
+}
+
+/// Pins the hand-assembled stub against the Rust-side helpers over a real
+/// EVM: each of the three views must answer over `eth_call` exactly what
+/// the helpers compute -- including the digest for arbitrary arguments --
+/// and a wrong selector or mis-sized `mintAuthDigest` calldata must
+/// revert. This runs in seconds, so a bytecode regression surfaces here
+/// rather than as an opaque failure deep in the orchestrator-mode e2e.
+#[test_log::test(tokio::test)]
+async fn orchestrator_stub_answers_match_the_rust_helpers() -> anyhow::Result<()> {
+    let anvil = alloy::node_bindings::Anvil::new().spawn();
+    let provider = alloy::providers::ProviderBuilder::new()
+        .connect(&anvil.endpoint())
+        .await?;
+    let chain_id = provider.get_chain_id().await?;
+    provider
+        .anvil_set_code(
+            E2E_ORCHESTRATOR_ADDRESS,
+            orchestrator_stub_bytecode(chain_id, E2E_ORCHESTRATOR_ADDRESS).into(),
+        )
+        .await?;
+
+    let call_stub = |calldata: Vec<u8>| {
+        let provider = provider.clone();
+        async move {
+            provider
+                .call(alloy::rpc::types::TransactionRequest {
+                    to: Some(E2E_ORCHESTRATOR_ADDRESS.into()),
+                    input: calldata.into(),
+                    ..Default::default()
+                })
+                .await
+        }
+    };
+
+    let typehash_answer = call_stub(keccak256("MINT_AUTH_TYPEHASH()")[..4].to_vec()).await?;
+    assert_eq!(
+        typehash_answer.as_ref(),
+        keccak256(MINT_AUTH_TYPE).as_slice(),
+        "MINT_AUTH_TYPEHASH() must answer the keccak of MINT_AUTH_TYPE"
+    );
+
+    let domain_answer = call_stub(keccak256("eip712Domain()")[..4].to_vec()).await?;
+    let expected_domain = (
+        FixedBytes::<1>::from([0x0fu8]),
+        STUB_DOMAIN_NAME.to_owned(),
+        STUB_DOMAIN_VERSION.to_owned(),
+        U256::from(chain_id),
+        E2E_ORCHESTRATOR_ADDRESS,
+        B256::ZERO,
+        Vec::<U256>::new(),
+    )
+        .abi_encode_params();
+    assert_eq!(
+        domain_answer.as_ref(),
+        expected_domain.as_slice(),
+        "eip712Domain() must answer the embedded EIP-5267 blob"
+    );
+
+    let token = Address::repeat_byte(0x21);
+    let recipient = Address::repeat_byte(0x22);
+    let amount = U256::from(7_500_000_000_000_000_000_u128);
+    let nonce = B256::repeat_byte(0x23);
+    let digest_calldata = IST0xOrchestratorV1::mintAuthDigestCall {
+        token,
+        to: recipient,
+        amount,
+        nonce,
+    }
+    .abi_encode();
+    let digest_answer = call_stub(digest_calldata.clone()).await?;
+    assert_eq!(
+        digest_answer.as_ref(),
+        stub_mint_auth_digest(
+            chain_id,
+            E2E_ORCHESTRATOR_ADDRESS,
+            token,
+            recipient,
+            amount,
+            nonce
+        )
+        .as_slice(),
+        "mintAuthDigest must compute the same EIP-712 digest as the helper"
+    );
+
+    let wrong_selector = call_stub(vec![0xde, 0xad, 0xbe, 0xef]).await;
+    assert!(
+        matches!(
+            wrong_selector.as_ref(),
+            Err(alloy::transports::RpcError::ErrorResp(_))
+        ),
+        "an unknown selector must revert (an execution error, not a \
+         transport failure), got {wrong_selector:?}"
+    );
+    let truncated = call_stub(digest_calldata[..digest_calldata.len() - 32].to_vec()).await;
+    assert!(
+        matches!(
+            truncated.as_ref(),
+            Err(alloy::transports::RpcError::ErrorResp(_))
+        ),
+        "mis-sized mintAuthDigest calldata must revert (an execution error, \
+         not a transport failure), got {truncated:?}"
+    );
+
+    Ok(())
 }
 
 /// Test-owned issuance mock reporting `vault_mode` for every asset, so each
@@ -3329,15 +3559,15 @@ async fn drive_mint_with_orchestrator_configured(
 )> {
     let infra = TestInfra::start(vec![("AAPL", float!(110))], vec![("AAPL", float!(7.5))]).await?;
 
-    // Stand-in orchestrator contract: a well-formed `mintAuthDigest` call
-    // returns a constant digest; anything else reverts.
-    let orchestrator_address = Address::repeat_byte(0x77);
+    // Stand-in orchestrator contract serving the typehash, domain, and
+    // digest views the mint-authorization service verifies against.
+    let chain_id = infra.base_chain.provider.get_chain_id().await?;
     infra
         .base_chain
         .provider
         .anvil_set_code(
-            orchestrator_address,
-            digest_stub_bytecode(E2E_ORCHESTRATOR_DIGEST).into(),
+            E2E_ORCHESTRATOR_ADDRESS,
+            orchestrator_stub_bytecode(chain_id, E2E_ORCHESTRATOR_ADDRESS).into(),
         )
         .await?;
 
@@ -3374,7 +3604,7 @@ async fn drive_mint_with_orchestrator_configured(
         .issuance_base_url(issuance_base_url)
         .orchestrator(st0x_config::OrchestratorConfig {
             addresses: st0x_config::OrchestratorAddresses {
-                base: Some(orchestrator_address),
+                base: Some(E2E_ORCHESTRATOR_ADDRESS),
                 ethereum: None,
             },
         })
@@ -3527,12 +3757,39 @@ async fn equity_mint_orchestrator_mode_delivers_exactly_one_authorization() -> a
             .expect("delivered signature must be a hex string"),
     )?;
     assert_eq!(signature_bytes.len(), 65, "the signature must be 65 bytes");
-    let recovered = Signature::from_raw(&signature_bytes)?
-        .recover_address_from_prehash(&B256::from(E2E_ORCHESTRATOR_DIGEST))?;
+
+    // Recompose the digest from the mint's own facts -- the tokenized
+    // equity address, the bot wallet as recipient, the requested quantity
+    // scaled to 18 decimals, and the delivered nonce -- independently of
+    // both the service's encoding and the stub's computation. The
+    // signature recovering over it proves the bot signed exactly the
+    // MintAuth the orchestrator would verify at mint time.
+    let requested = &mint_events[position_of("TokenizedEquityMintEvent::MintRequested")
+        .expect("MintRequested must be persisted")];
+    let requested_quantity = requested.payload["MintRequested"]["quantity"]
+        .as_str()
+        .expect("MintRequested must carry the quantity as a decimal string");
+    let signed_amount = Float::parse(requested_quantity.to_owned())?.to_fixed_decimal(18)?;
+    let token = infra
+        .equity_addresses
+        .iter()
+        .find_map(|(symbol, _wrapped, unwrapped)| (symbol == "AAPL").then_some(*unwrapped))
+        .expect("AAPL equity must be deployed");
+    let chain_id = infra.base_chain.provider.get_chain_id().await?;
+    let expected_digest = stub_mint_auth_digest(
+        chain_id,
+        E2E_ORCHESTRATOR_ADDRESS,
+        token,
+        infra.base_chain.owner,
+        signed_amount,
+        B256::from_slice(&nonce_bytes),
+    );
+    let recovered =
+        Signature::from_raw(&signature_bytes)?.recover_address_from_prehash(&expected_digest)?;
     assert_eq!(
         recovered, infra.base_chain.owner,
         "the delivered signature must recover to the bot wallet over the \
-         orchestrator-reported digest"
+         mint's own EIP-712 digest"
     );
 
     bot.abort();

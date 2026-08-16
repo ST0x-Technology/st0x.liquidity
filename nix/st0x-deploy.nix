@@ -17,5 +17,6 @@ in
   inherit abi;
   abiEnv = {
     IST0X_ORCHESTRATOR_V1_ABI = "${abi}/out/IST0xOrchestratorV1.sol/IST0xOrchestratorV1.json";
+    ST0X_ORCHESTRATOR_ABI = "${abi}/out/ST0xOrchestrator.sol/ST0xOrchestrator.json";
   };
 }

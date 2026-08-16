@@ -585,11 +585,12 @@ mod tests {
             self.address
         }
 
-        async fn sign_digest(
+        async fn sign_typed_data(
             &self,
-            _digest: alloy::primitives::B256,
+            _payload_json: String,
+            _expected_digest: alloy::primitives::B256,
         ) -> Result<alloy::primitives::Signature, EvmError> {
-            panic!("MockWallet::sign_digest should not be called in job tests")
+            panic!("MockWallet::sign_typed_data should not be called in job tests")
         }
 
         async fn send_pending(
