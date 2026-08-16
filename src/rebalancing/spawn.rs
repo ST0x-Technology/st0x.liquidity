@@ -56,6 +56,18 @@ pub(crate) struct UsdcTransferResumeHandles {
     pub(crate) resume_alpaca_to_base: Arc<dyn ResumeAlpacaToBase>,
 }
 
+#[derive(Clone)]
+pub(crate) struct EthereumWallet<Chain>(pub(crate) Chain);
+
+#[derive(Clone)]
+pub(crate) struct BaseWallet<Chain>(pub(crate) Chain);
+
+#[derive(Clone)]
+pub(crate) struct ChainWallets<Chain> {
+    pub(crate) ethereum: EthereumWallet<Chain>,
+    pub(crate) base: BaseWallet<Chain>,
+}
+
 /// External service clients for rebalancing operations.
 ///
 /// Holds connections to Alpaca APIs, CCTP bridge, and vault services.
@@ -77,11 +89,14 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     pub(crate) fn new(
         broker: InstrumentedAlpacaBroker,
         wallet: Arc<AlpacaWalletService>,
-        ethereum_wallet: Chain,
-        base_wallet: Chain,
+        wallets: ChainWallets<Chain>,
         raindex: Arc<RaindexService<Chain>>,
         settlement: UsdcSettlementParams,
     ) -> Result<Self, SpawnRebalancerError> {
+        let ChainWallets {
+            ethereum: EthereumWallet(ethereum_wallet),
+            base: BaseWallet(base_wallet),
+        } = wallets;
         let cctp = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
                 usdc_ethereum: USDC_ETHEREUM,
@@ -150,7 +165,8 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
 mod tests {
     use alloy::network::Ethereum;
     use alloy::node_bindings::Anvil;
-    use alloy::primitives::{B256, address, b256};
+    use alloy::primitives::{B256, U256, address, b256};
+    use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::fillers::{
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
     };
@@ -163,7 +179,9 @@ mod tests {
 
     use st0x_config::{AssetsConfig, EquitiesConfig, OperationMode, RebalancingCtx};
     use st0x_event_sorcery::test_store;
+    use st0x_evm::Evm;
     use st0x_evm::local::RawPrivateKeyWallet;
+    use st0x_evm::test_chain::evm_mapping_slot;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
         AlpacaWalletService, Executor, Symbol, TimeInForce,
@@ -173,6 +191,7 @@ mod tests {
     use st0x_wrapper::WrappedEquity;
 
     use super::*;
+    use crate::bindings::DeployableERC20;
     use crate::inventory::ImbalanceThreshold;
     use crate::rebalancing::RebalancingServiceConfig;
     use crate::rebalancing::usdc::UsdcSettlementParams;
@@ -236,6 +255,64 @@ mod tests {
             .call()
     }
 
+    fn mock_alpaca_account(server: &MockServer) -> (AlpacaAccountId, httpmock::Mock<'_>) {
+        let account_id = AlpacaAccountId::new(Uuid::nil());
+        let account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/trading/accounts/{account_id}/account",));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": account_id.to_string(),
+                    "status": "ACTIVE"
+                }));
+        });
+
+        (account_id, account_mock)
+    }
+
+    async fn make_mock_alpaca_services(
+        server: &MockServer,
+        account_id: AlpacaAccountId,
+    ) -> (InstrumentedAlpacaBroker, Arc<AlpacaWalletService>) {
+        let broker_auth = AlpacaBrokerApiCtx {
+            api_key: "test_key".to_string(),
+            api_secret: "test_secret".to_string(),
+            account_id,
+            mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
+            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        };
+        let broker = InstrumentedAlpacaBroker::new(
+            AlpacaBrokerApi::try_from_ctx(broker_auth)
+                .await
+                .expect("Failed to create test broker API"),
+            TelemetrySender::disabled(),
+        );
+        let wallet = Arc::new(AlpacaWalletService::new(
+            server.base_url(),
+            account_id,
+            "test_key".into(),
+            "test_secret".into(),
+        ));
+
+        (broker, wallet)
+    }
+
+    fn make_test_settlement(rebalancing_ctx: &RebalancingCtx) -> UsdcSettlementParams {
+        UsdcSettlementParams {
+            attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
+            required_confirmations: 0,
+            #[cfg(feature = "test-support")]
+            circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+            #[cfg(feature = "test-support")]
+            token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
+            #[cfg(feature = "test-support")]
+            message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
+        }
+    }
+
     #[test]
     fn trigger_config_uses_equity_from_ctx() {
         let ctx = make_ctx();
@@ -283,7 +360,7 @@ mod tests {
         let base_provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
 
         let rebalancing_ctx = make_ctx();
-        let account_id = AlpacaAccountId::new(Uuid::nil());
+        let (account_id, _account_mock) = mock_alpaca_account(server);
 
         let evm_private_key =
             b256!("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
@@ -293,39 +370,7 @@ mod tests {
         let ethereum_wallet =
             RawPrivateKeyWallet::new(&evm_private_key, base_provider.clone(), 1).unwrap();
 
-        let _account_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/trading/accounts/{account_id}/account",));
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "id": account_id.to_string(),
-                    "status": "ACTIVE"
-                }));
-        });
-
-        let broker_auth = AlpacaBrokerApiCtx {
-            api_key: "test_key".to_string(),
-            api_secret: "test_secret".to_string(),
-            account_id,
-            mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
-            asset_cache_ttl: std::time::Duration::from_secs(3600),
-            time_in_force: TimeInForce::default(),
-            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-        };
-        let broker = InstrumentedAlpacaBroker::new(
-            AlpacaBrokerApi::try_from_ctx(broker_auth)
-                .await
-                .expect("Failed to create test broker API"),
-            TelemetrySender::disabled(),
-        );
-
-        let wallet = Arc::new(AlpacaWalletService::new(
-            server.base_url(),
-            account_id,
-            "test_key".into(),
-            "test_secret".into(),
-        ));
+        let (broker, wallet) = make_mock_alpaca_services(server, account_id).await;
 
         let cctp = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
@@ -358,19 +403,80 @@ mod tests {
             wallet,
             cctp,
             raindex,
-            settlement: UsdcSettlementParams {
-                attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
-                required_confirmations: 0,
-                #[cfg(feature = "test-support")]
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-                #[cfg(feature = "test-support")]
-                token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-                #[cfg(feature = "test-support")]
-                message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
-            },
+            settlement: make_test_settlement(&rebalancing_ctx),
         };
 
         (services, rebalancing_ctx)
+    }
+
+    #[tokio::test]
+    async fn new_maps_ethereum_wallet_to_ethereum_cctp_endpoint() {
+        let server = MockServer::start();
+        let ethereum_anvil = spawn_anvil(Anvil::new());
+        let base_anvil = spawn_anvil(Anvil::new());
+        let ethereum_provider = ProviderBuilder::new().connect_http(ethereum_anvil.endpoint_url());
+        let base_provider = ProviderBuilder::new().connect_http(base_anvil.endpoint_url());
+
+        let evm_private_key =
+            b256!("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let ethereum_wallet =
+            RawPrivateKeyWallet::new(&evm_private_key, ethereum_provider, 1).unwrap();
+        let base_wallet = RawPrivateKeyWallet::new(&evm_private_key, base_provider, 1).unwrap();
+        let ethereum_holder = ethereum_wallet.address();
+
+        // Install a callable USDC contract only on Ethereum. If the named
+        // wallet fields are reversed while constructing CctpCtx, this lookup
+        // fails against Base instead of returning the known balance.
+        ethereum_wallet
+            .provider()
+            .anvil_set_code(USDC_ETHEREUM, DeployableERC20::DEPLOYED_BYTECODE.clone())
+            .await
+            .unwrap();
+        let expected_balance = U256::from(123_456u64);
+        ethereum_wallet
+            .provider()
+            .anvil_set_storage_at(
+                USDC_ETHEREUM,
+                evm_mapping_slot(ethereum_holder, 0),
+                expected_balance.into(),
+            )
+            .await
+            .unwrap();
+
+        let (account_id, _account_mock) = mock_alpaca_account(&server);
+
+        let rebalancing_ctx = make_ctx();
+        let (broker, wallet) = make_mock_alpaca_services(&server, account_id).await;
+        let wallets = ChainWallets {
+            ethereum: EthereumWallet(ethereum_wallet),
+            base: BaseWallet(base_wallet.clone()),
+        };
+        let raindex = Arc::new(RaindexService::new(
+            base_wallet,
+            RaindexContracts {
+                inventory: TEST_ORDERBOOK,
+                orderbook: TEST_ORDERBOOK,
+            },
+            Address::random(),
+        ));
+
+        let services = RebalancerServices::new(
+            broker,
+            wallet,
+            wallets,
+            raindex,
+            make_test_settlement(&rebalancing_ctx),
+        )
+        .unwrap();
+
+        assert_eq!(
+            services
+                .cctp
+                .ethereum_usdc_balance(ethereum_holder)
+                .await
+                .unwrap(),
+            expected_balance
+        );
     }
 
     #[tokio::test]
