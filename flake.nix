@@ -376,7 +376,6 @@
                 st0x-dto
                 st0x-liquidity
                 st0x-cli
-                decodeFloats
                 ;
               inherit (pkgs) datasette;
 
