@@ -733,6 +733,15 @@ impl StoredOperation {
                 );
                 self.status = StoredStatus::Failed;
             }
+            UsdcRebalanceEvent::DepositCompletionRecovered { recovered_at } => {
+                // The deposit demonstrably settled after the fact; the Deposit
+                // stage keeps its recorded failed run (the polling timeout
+                // really happened) and the operation resumes toward the
+                // conversion terminal. `close_open_stages` is defensive here
+                // -- `DepositFailed` already closed every open stage.
+                self.close_open_stages(*recovered_at, StoredStageOutcome::Succeeded);
+                self.status = StoredStatus::InProgress;
+            }
             UsdcRebalanceEvent::OperatorReconciled {
                 direction,
                 amount,
@@ -966,7 +975,8 @@ fn observed_at(event: &UsdcRebalanceEvent) -> DateTime<Utc> {
         UsdcRebalanceEvent::BridgeAttestationReceived { attested_at, .. } => *attested_at,
         UsdcRebalanceEvent::AttestationTimedOut { timed_out_at, .. } => *timed_out_at,
         UsdcRebalanceEvent::Bridged { minted_at, .. } => *minted_at,
-        UsdcRebalanceEvent::BridgingCompletionRecovered { recovered_at, .. } => *recovered_at,
+        UsdcRebalanceEvent::BridgingCompletionRecovered { recovered_at, .. }
+        | UsdcRebalanceEvent::DepositCompletionRecovered { recovered_at } => *recovered_at,
         UsdcRebalanceEvent::DepositInitiated {
             deposit_initiated_at,
             ..
@@ -2264,6 +2274,47 @@ mod tests {
         assert_eq!(operation.total_ms, None);
     }
 
+    #[tokio::test]
+    async fn deposit_recovery_windowed_by_recovered_at_when_first_observed_event() {
+        // A catch-up refold (or an operation whose earlier events predate the
+        // read model) can observe DepositCompletionRecovered as its first
+        // event. The operation must then be windowed by recovered_at -- the
+        // observation time -- so a recent recovery appears in a recent-window
+        // query, mirroring the OperatorReconciled windowing behavior.
+        let pool = setup_test_db().await;
+        let harness = ReactorHarness::new(RebalanceTimingProjection::new(pool.clone()));
+        let operation_id = UsdcRebalanceId(Uuid::new_v4());
+
+        harness
+            .receive::<UsdcRebalance>(
+                operation_id.clone(),
+                UsdcRebalanceEvent::DepositCompletionRecovered {
+                    // recovered_at falls inside the window below.
+                    recovered_at: timestamp(150_000),
+                },
+            )
+            .await
+            .unwrap();
+
+        let recent_window = ReportRange {
+            from: timestamp(100_000),
+            to: timestamp(200_000),
+        };
+        let report = load_rebalance_timings(&pool, &recent_window).await.unwrap();
+
+        // The operation is windowed by recovered_at (its first_seen_at), so
+        // it appears in the recent window.
+        assert_eq!(report.total_operations, 1);
+        let operation = &report.operations[0];
+        let UsdcRebalanceId(expected_id) = operation_id;
+        assert_eq!(operation.operation_id, expected_id);
+        assert_eq!(operation.status, RebalanceTimingStatus::InProgress);
+        // No genuine start event was observed, so nothing is measured.
+        assert_eq!(operation.started_at, None);
+        assert_eq!(operation.completed_at, None);
+        assert_eq!(operation.total_ms, None);
+    }
+
     #[test]
     fn operator_reconcile_as_only_event_has_no_start_and_no_total_ms() {
         // When the reactor only sees OperatorReconciled, there is no genuine
@@ -2634,6 +2685,80 @@ mod tests {
         assert_eq!(
             stage(&operation, RebalanceStageName::Deposit).outcome,
             StageOutcome::Succeeded
+        );
+    }
+
+    #[test]
+    fn deposit_recovery_keeps_failed_stage_and_conversion_completes_operation() {
+        // A late-settled deposit recovery: the Deposit stage keeps its
+        // recorded failed run (the polling timeout really happened), the
+        // operation returns to InProgress with its observation time intact,
+        // and the post-deposit conversion drives it to Completed.
+        let mut events = vec![
+            UsdcRebalanceEvent::DepositInitiated {
+                deposit_ref: TransferRef::OnchainTx(TxHash::random()),
+                deposit_initiated_at: timestamp(0),
+            },
+            UsdcRebalanceEvent::DepositFailed {
+                deposit_ref: Some(TransferRef::OnchainTx(TxHash::random())),
+                reason: "Deposit ended in status: Processing".to_string(),
+                failed_at: timestamp(100),
+            },
+            UsdcRebalanceEvent::DepositCompletionRecovered {
+                recovered_at: timestamp(200),
+            },
+        ];
+
+        let recovered = fold_windowed("op-deposit-recovery", &events).unwrap();
+        // The recovery must not rewrite when the operation was first seen.
+        assert_eq!(recovered.first_seen_at, timestamp(0));
+        assert_eq!(
+            recovered.operation.status,
+            RebalanceTimingStatus::InProgress
+        );
+        assert_eq!(recovered.operation.completed_at, None);
+        assert_eq!(
+            stage(&recovered.operation, RebalanceStageName::Deposit).outcome,
+            StageOutcome::Failed
+        );
+        assert_eq!(
+            stage(&recovered.operation, RebalanceStageName::Deposit).duration_ms,
+            Some(100_000)
+        );
+
+        events.extend([
+            UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(999)),
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                initiated_at: timestamp(210),
+            },
+            UsdcRebalanceEvent::ConversionConfirmed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                conversion: ConversionAmounts::new(Usdc::new(float!(999)), Usdc::new(float!(999))),
+                converted_at: timestamp(250),
+            },
+        ]);
+
+        let completed = fold_operation("op-deposit-recovery", &events).unwrap();
+        assert_eq!(completed.status, RebalanceTimingStatus::Completed);
+        assert_eq!(completed.completed_at, Some(timestamp(250)));
+        // The failed Deposit run stays exactly as recorded.
+        assert_eq!(
+            stage(&completed, RebalanceStageName::Deposit).outcome,
+            StageOutcome::Failed
+        );
+        assert_eq!(
+            stage(&completed, RebalanceStageName::Deposit).duration_ms,
+            Some(100_000)
+        );
+        assert_eq!(
+            stage(&completed, RebalanceStageName::Conversion).outcome,
+            StageOutcome::Succeeded
+        );
+        assert_eq!(
+            stage(&completed, RebalanceStageName::Conversion).duration_ms,
+            Some(40_000)
         );
     }
 

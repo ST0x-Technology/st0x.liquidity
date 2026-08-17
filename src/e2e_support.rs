@@ -11,7 +11,7 @@ use st0x_tokenization::{IssuerRequestId, tokenization_request_id};
 
 pub use crate::operator::equity_transfer::EquityTransferKind as TransferType;
 use crate::operator::equity_transfer::{
-    fail_transfer as fail_equity_transfer, recheck_transfer as recheck_equity_transfer,
+    RecheckKind, fail_transfer as fail_equity_transfer, recheck_transfer as recheck_equity_transfer,
 };
 use crate::test_utils::try_persist_event;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
@@ -30,7 +30,11 @@ pub async fn recheck_transfer(
     transfer_type: TransferType,
     id: &str,
 ) -> anyhow::Result<()> {
-    recheck_equity_transfer(ctx, transfer_type, id).await?;
+    let kind = match transfer_type {
+        TransferType::Mint => RecheckKind::Mint,
+        TransferType::Redemption => RecheckKind::Redemption,
+    };
+    recheck_equity_transfer(ctx, kind, id).await?;
     Ok(())
 }
 

@@ -56,7 +56,9 @@ use st0x_wrapper::{Wrapper, WrapperService};
 
 use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpressure};
 use super::wrapper::{WrapContext, wrap_context};
-use super::{AuditReason, TokenizationNetwork, TransferDirection, TransferType};
+use super::{
+    AuditReason, RecheckTransferType, TokenizationNetwork, TransferDirection, TransferType,
+};
 
 /// One `transfer-equity` invocation.
 pub(super) struct TransferEquity {
@@ -1750,15 +1752,16 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
 /// be running and serving its REST API on the configured `server_port`.
 pub(crate) async fn recheck_transfer_command<W: Write>(
     stdout: &mut W,
-    transfer_type: TransferType,
+    transfer_type: RecheckTransferType,
     id: &str,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     let transfer_kind = match transfer_type {
-        TransferType::Mint => st0x_hedge::operator::equity_transfer::EquityTransferKind::Mint,
-        TransferType::Redemption => {
-            st0x_hedge::operator::equity_transfer::EquityTransferKind::Redemption
+        RecheckTransferType::Mint => st0x_hedge::operator::equity_transfer::RecheckKind::Mint,
+        RecheckTransferType::Redemption => {
+            st0x_hedge::operator::equity_transfer::RecheckKind::Redemption
         }
+        RecheckTransferType::Usdc => st0x_hedge::operator::equity_transfer::RecheckKind::Usdc,
     };
     let url = st0x_hedge::operator::equity_transfer::recheck_url(ctx, transfer_kind, id);
     writeln!(stdout, "Re-checking {transfer_type:?} {id} via {url}")?;
@@ -2122,6 +2125,43 @@ mod tests {
             BACKPRESSURE_RETRY_MAX_ATTEMPTS,
             "a sustained withdrawal-poll 429 must stop at the shared CLI retry budget"
         );
+    }
+
+    /// `transfer recheck` against a mocked bot endpoint: each CLI variant must
+    /// hit the exact kind path the server's `TransferKind::from_str` parses --
+    /// the two sides hardcode the strings independently, so a rename on either
+    /// side must fail here before an operator calls the bot.
+    #[tokio::test]
+    async fn recheck_transfer_posts_exact_kind_path() {
+        for (transfer_type, kind) in [
+            (RecheckTransferType::Mint, "equity_mint"),
+            (RecheckTransferType::Redemption, "equity_redemption"),
+            (RecheckTransferType::Usdc, "usdc_bridge"),
+        ] {
+            let server = httpmock::MockServer::start_async().await;
+            let mock = server
+                .mock_async(|when, then| {
+                    when.method(httpmock::Method::POST)
+                        .path(format!("/transfers/recheck/{kind}/some-id"));
+                    then.status(200).body(r#"{"outcome":"recovered"}"#);
+                })
+                .await;
+            let mut ctx = create_ctx_without_rebalancing();
+            ctx.server_port = server.port();
+
+            let mut stdout = Vec::new();
+            recheck_transfer_command(&mut stdout, transfer_type, "some-id", &ctx)
+                .await
+                .unwrap();
+
+            mock.assert_async().await;
+            let output = String::from_utf8(stdout).unwrap();
+            assert_eq!(
+                output.lines().last(),
+                Some("transfer recheck outcome: recovered"),
+                "unexpected output for {kind}: {output}"
+            );
+        }
     }
 
     /// `transfer resume --kind equity` against a mocked bot endpoint: the

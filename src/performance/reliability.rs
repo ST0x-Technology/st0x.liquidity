@@ -479,6 +479,7 @@ fn usdc_rebalance_failure(event: &UsdcRebalanceEvent) -> Option<(FailureEventTyp
         | UsdcRebalanceEvent::BridgingCompletionRecovered { .. }
         | UsdcRebalanceEvent::DepositInitiated { .. }
         | UsdcRebalanceEvent::DepositConfirmed { .. }
+        | UsdcRebalanceEvent::DepositCompletionRecovered { .. }
         | UsdcRebalanceEvent::OperatorReconciled { .. } => None,
     }
 }
@@ -1461,6 +1462,15 @@ mod tests {
         })
         .unwrap();
         assert_eq!(event_type, FailureEventType::AttestationTimedOut);
+
+        // DepositCompletionRecovered is a recovery, not a failure: it must
+        // never count toward failure metrics.
+        assert_eq!(
+            usdc_rebalance_failure(&UsdcRebalanceEvent::DepositCompletionRecovered {
+                recovered_at: timestamp(0),
+            }),
+            None
+        );
 
         // equity_redemption_failure -- all three failure arms.
         let (event_type, _) = equity_redemption_failure(&EquityRedemptionEvent::TransferFailed {
