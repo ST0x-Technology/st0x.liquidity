@@ -33,6 +33,9 @@ use turnkey_client::generated::{
     SignTransactionIntentV2, SignTransactionRequest,
     immutable::activity::v1::{SignRawPayloadResult, SignTransactionResult, result},
     immutable::common::v1::{HashFunction, PayloadEncoding, TransactionType},
+    services::coordinator::public::v1::{
+        GetPoliciesRequest, GetPoliciesResponse, GetWhoamiRequest, GetWhoamiResponse,
+    },
 };
 use turnkey_client::{RetryConfig, TurnkeyClientError};
 
@@ -51,6 +54,10 @@ pub struct TurnkeyOrganizationId(String);
 impl TurnkeyOrganizationId {
     pub fn new(value: String) -> Self {
         Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -179,6 +186,144 @@ impl std::fmt::Debug for TurnkeyCredentials {
                 &self.api_private_key.as_ref().map(|_| "[REDACTED]"),
             )
             .finish()
+    }
+}
+
+/// Turnkey policy effect relevant to deploy-time coverage verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnkeyPolicyEffect {
+    Allow,
+    Deny,
+    Unspecified,
+}
+
+/// Read-only policy data used by the deploy verifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnkeyPolicy {
+    pub effect: TurnkeyPolicyEffect,
+    pub consensus: Option<String>,
+    pub condition: Option<String>,
+}
+
+/// Policies plus the authenticated Turnkey API user's identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnkeyPolicySnapshot {
+    pub user_id: String,
+    pub policies: Vec<TurnkeyPolicy>,
+}
+
+/// Errors returned while constructing or querying the Turnkey policy client.
+#[derive(Debug, thiserror::Error)]
+pub enum TurnkeyPolicyError {
+    #[error(transparent)]
+    Client(#[from] TurnkeyClientError),
+    #[error(transparent)]
+    KmsStamper(#[from] GcpKmsStamperError),
+    #[error(transparent)]
+    Request(#[from] TurnkeyRequestError),
+    #[error(
+        "Turnkey credentials ambiguous: both [wallet].kms_api_key (config) and \
+         api_private_key (secrets) are set -- keep exactly one"
+    )]
+    AmbiguousCredentials,
+    #[error(
+        "Turnkey credentials missing: set either [wallet].kms_api_key in config \
+         (KMS-stamped, keyless) or api_private_key in [wallet] secrets"
+    )]
+    MissingCredentials,
+}
+
+/// Authenticated read-only client for listing an organization's policies.
+pub struct TurnkeyPolicyClient {
+    organization_id: TurnkeyOrganizationId,
+    client: TracingTurnkeyClient,
+}
+
+impl std::fmt::Debug for TurnkeyPolicyClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnkeyPolicyClient")
+            .field("organization_id", &self.organization_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TurnkeyPolicyClient {
+    pub async fn new(
+        organization_id: TurnkeyOrganizationId,
+        kms_api_key: Option<TurnkeyKmsApiKey>,
+        api_private_key: Option<TurnkeyApiPrivateKey>,
+    ) -> Result<Self, TurnkeyPolicyError> {
+        let stamper = match (kms_api_key, api_private_key) {
+            (Some(TurnkeyKmsApiKey(key_version)), None) => {
+                ApiStamper::GcpKms(GcpKmsStamper::new(key_version).await?)
+            }
+            (None, Some(api_private_key)) => ApiStamper::local(&api_private_key)?,
+            (Some(_), Some(_)) => return Err(TurnkeyPolicyError::AmbiguousCredentials),
+            (None, None) => return Err(TurnkeyPolicyError::MissingCredentials),
+        };
+
+        Ok(Self {
+            organization_id,
+            client: TracingTurnkeyClient::for_stamper(stamper)?,
+        })
+    }
+
+    #[cfg(test)]
+    fn for_base_url(
+        organization_id: TurnkeyOrganizationId,
+        api_key: TurnkeyP256ApiKey,
+        base_url: String,
+    ) -> Result<Self, TurnkeyPolicyError> {
+        Ok(Self {
+            organization_id,
+            client: TracingTurnkeyClient::for_base_url(base_url, api_key)?,
+        })
+    }
+
+    pub async fn list_policies(&self) -> Result<TurnkeyPolicySnapshot, TurnkeyPolicyError> {
+        let organization_id = self.organization_id.as_str().to_owned();
+        let whoami: GetWhoamiResponse = self
+            .client
+            .process_request(
+                &GetWhoamiRequest {
+                    organization_id: organization_id.clone(),
+                },
+                "/public/v1/query/whoami",
+            )
+            .await?;
+        let response: GetPoliciesResponse = self
+            .client
+            .process_request(
+                &GetPoliciesRequest { organization_id },
+                "/public/v1/query/list_policies",
+            )
+            .await?;
+
+        let policies = response
+            .policies
+            .into_iter()
+            .map(|policy| TurnkeyPolicy {
+                effect: match policy.effect {
+                    turnkey_client::generated::immutable::common::v1::Effect::Allow => {
+                        TurnkeyPolicyEffect::Allow
+                    }
+                    turnkey_client::generated::immutable::common::v1::Effect::Deny => {
+                        TurnkeyPolicyEffect::Deny
+                    }
+                    turnkey_client::generated::immutable::common::v1::Effect::Unspecified => {
+                        TurnkeyPolicyEffect::Unspecified
+                    }
+                },
+                consensus: policy.consensus,
+                condition: policy.condition,
+            })
+            .collect();
+
+        Ok(TurnkeyPolicySnapshot {
+            user_id: whoami.user_id,
+            policies,
+        })
     }
 }
 
@@ -1055,6 +1200,107 @@ mod tests {
             ApiStamper::Local(test_api_key()),
             retry_config,
         )
+    }
+
+    #[tokio::test]
+    async fn policy_client_rejects_ambiguous_credentials() {
+        let error = TurnkeyPolicyClient::new(
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            Some(TurnkeyKmsApiKey::new(
+                "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1".to_string(),
+            )),
+            Some(TurnkeyApiPrivateKey::new("api-private-key".to_string())),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, TurnkeyPolicyError::AmbiguousCredentials));
+    }
+
+    #[tokio::test]
+    async fn policy_client_rejects_missing_credentials() {
+        let error = TurnkeyPolicyClient::new(
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, TurnkeyPolicyError::MissingCredentials));
+    }
+
+    #[tokio::test]
+    async fn policy_client_lists_policy_effects_and_conditions() {
+        let server = MockServer::start();
+        let policies_mock = server.mock(|when, then| {
+            when.method("POST")
+                .path("/public/v1/query/list_policies")
+                .body_includes("\"organizationId\":\"org-test\"");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "policies": [
+                        {
+                            "policyId": "policy-allow",
+                            "policyName": "allow approvals",
+                            "effect": "EFFECT_ALLOW",
+                            "notes": "",
+                            "consensus": "approvers.any(user, user.id == 'user-test')",
+                            "condition": "eth.tx.to == '0x1111111111111111111111111111111111111111'"
+                        },
+                        {
+                            "policyId": "policy-deny",
+                            "policyName": "deny transfers",
+                            "effect": "EFFECT_DENY",
+                            "notes": "",
+                            "condition": "eth.tx.function_name == 'transfer'"
+                        }
+                    ]
+                }));
+        });
+        let whoami_mock = server.mock(|when, then| {
+            when.method("POST")
+                .path("/public/v1/query/whoami")
+                .body_includes("\"organizationId\":\"org-test\"");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "organizationId": "org-test",
+                    "organizationName": "Test",
+                    "userId": "user-test",
+                    "username": "Bot"
+                }));
+        });
+        let client = TurnkeyPolicyClient::for_base_url(
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            test_api_key(),
+            server.base_url(),
+        )
+        .unwrap();
+
+        let snapshot = client.list_policies().await.unwrap();
+
+        policies_mock.assert();
+        whoami_mock.assert();
+        assert_eq!(snapshot.user_id, "user-test");
+        assert_eq!(
+            snapshot.policies,
+            vec![
+                TurnkeyPolicy {
+                    effect: TurnkeyPolicyEffect::Allow,
+                    consensus: Some("approvers.any(user, user.id == 'user-test')".to_string()),
+                    condition: Some(
+                        "eth.tx.to == '0x1111111111111111111111111111111111111111'".to_string()
+                    ),
+                },
+                TurnkeyPolicy {
+                    effect: TurnkeyPolicyEffect::Deny,
+                    consensus: None,
+                    condition: Some("eth.tx.function_name == 'transfer'".to_string()),
+                },
+            ]
+        );
     }
 
     /// Builds a well-formed EIP-1559 transaction (the only shape the bot's
