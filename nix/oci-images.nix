@@ -83,6 +83,43 @@ let
         root /usr/share/t0-liquidity-dashboard;
         set $bot_upstream "bot:8001";
 
+        # Cache policy exists because of how this image is BUILT. Every
+        # layer is stamped `created = "1970-01-01T00:00:01Z"` for
+        # reproducibility, so nginx reports `Last-Modified: Thu, 01 Jan
+        # 1970` on every file. With no Cache-Control to override it,
+        # browsers fall back to heuristic freshness (RFC 9111: 10% of the
+        # age), which on a 1970 mtime is roughly five and a half YEARS.
+        #
+        # Behind IAP that is not a staleness annoyance, it is a lockout.
+        # Re-running the sign-in flow requires a top-level navigation that
+        # actually reaches the load balancer; a browser holding an
+        # indefinitely-fresh index.html never makes one. So when the IAP
+        # session expires the tab cannot recover on its own: it serves the
+        # cached shell forever while every XHR is 302'd into sign-in, and
+        # only a hard reload or a private window breaks out. That was the
+        # staging reload loop on 2026-08-17.
+        #
+        # The split below is the standard one. The entry document and the
+        # version poller must never be served from cache; everything under
+        # /_app/immutable/ is content-hashed by the SvelteKit build, so a
+        # changed file is a changed URL and a long TTL is safe.
+        location = /index.html {
+          add_header Cache-Control "no-store" always;
+          try_files $uri =404;
+        }
+
+        location = /_app/version.json {
+          add_header Cache-Control "no-store" always;
+          try_files $uri =404;
+        }
+
+        location /_app/immutable/ {
+          add_header Cache-Control "public, max-age=31536000, immutable" always;
+        }
+
+        # The fallback lands on /index.html as an INTERNAL redirect, which
+        # re-enters location matching, so the exact-match block above still
+        # applies its no-store to every SPA route.
         location / {
           try_files $uri $uri/ /index.html;
         }
