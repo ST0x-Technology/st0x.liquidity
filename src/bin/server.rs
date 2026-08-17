@@ -1,7 +1,7 @@
 use clap::Parser;
+
 use st0x_config::{Ctx, Env};
-use st0x_hedge::run_bot_session;
-use st0x_hedge::{apalis_board_tracing_layer, setup_tracing};
+use st0x_hedge::{apalis_board_tracing_layer, run_server_bot_session, setup_tracing};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
         (file_guard, None)
     };
 
-    let result = run_bot_session(ctx).await;
+    let result = run_server_bot_session(ctx).await;
 
     // Explicitly drop the telemetry guard to ensure TelemetryGuard::drop runs
     // before we return. Drop flushes pending spans and shuts down the tracer
