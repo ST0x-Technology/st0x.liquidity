@@ -72,7 +72,7 @@ fn resolve_redemption_wallet(flag: Option<Address>, ctx: &Ctx) -> anyhow::Result
 /// The bot wallet whose chain matches the selected tokenization network,
 /// paired with that network's Alpaca `network` wire value. One match produces
 /// both so a wallet/wire mismatch cannot be constructed at the call site.
-fn tokenization_network_context(
+pub(super) fn tokenization_network_context(
     wallet_ctx: &OnchainWalletCtx,
     network: TokenizationNetwork,
 ) -> (Arc<dyn Wallet<Provider = RootProvider>>, Network) {

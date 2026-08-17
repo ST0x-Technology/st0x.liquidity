@@ -6,6 +6,7 @@ mod cctp;
 mod dividend;
 mod rebalancing;
 mod repair;
+mod token_list;
 mod trading;
 mod vault;
 mod wrapper;
@@ -160,6 +161,18 @@ pub enum TokenizationNetwork {
     /// HyperEVM mainnet
     #[value(name = "hyperevm")]
     HyperEvm,
+}
+
+impl TokenizationNetwork {
+    /// Canonical EVM chain id of the selected network, used to validate
+    /// registry token lists against the network they claim to serve.
+    const fn chain_id(self) -> u64 {
+        match self {
+            Self::Base => 8453,
+            Self::Ethereum => 1,
+            Self::HyperEvm => 999,
+        }
+    }
 }
 
 /// Manual position-recovery operations for stuck local CQRS state.
@@ -383,6 +396,15 @@ pub enum Commands {
         /// Number of tokenized shares to wrap (must be positive)
         #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
         quantity: Positive<FractionalShares>,
+        /// Target network for the wrap (selects the wallet and therefore the
+        /// chain the vault deposit lands on)
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
+        /// Path to the st0x.registry token list for the selected network
+        /// (`token-lists/<network>.json`). Required for non Base networks;
+        /// Base resolves from [assets.equities]
+        #[arg(long = "registry")]
+        registry: Option<std::path::PathBuf>,
     },
 
     /// Unwrap wrapped ERC-4626 equity shares into the underlying tokenized equity
@@ -393,6 +415,15 @@ pub enum Commands {
         /// Number of wrapped shares to unwrap (must be positive)
         #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
         quantity: Positive<FractionalShares>,
+        /// Target network for the unwrap (selects the wallet and therefore
+        /// the chain the vault redeem lands on)
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
+        /// Path to the st0x.registry token list for the selected network
+        /// (`token-lists/<network>.json`). Required for non Base networks;
+        /// Base resolves from [assets.equities]
+        #[arg(long = "registry")]
+        registry: Option<std::path::PathBuf>,
     },
 
     /// Donate tokenized equity into its ERC-4626 wrapper to bump the wrapper NAV
@@ -986,10 +1017,14 @@ enum SimpleCommand {
     WrapEquity {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
+        network: TokenizationNetwork,
+        registry: Option<std::path::PathBuf>,
     },
     UnwrapEquity {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
+        network: TokenizationNetwork,
+        registry: Option<std::path::PathBuf>,
     },
     DonateEquity {
         symbol: Symbol,
@@ -1302,6 +1337,7 @@ async fn run_command_with_writers<W: Write>(
 // One flat match mapping every CLI command to its internal Simple/Provider
 // dispatch. Kept as a single match (per the repo's "don't split simple-but-long
 // matches" rule) rather than fragmented into per-group helpers.
+#[allow(clippy::too_many_lines)]
 fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand> {
     match command {
         Commands::Buy {
@@ -1344,12 +1380,28 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             issuer_request_id,
             redemption_wallet,
         }),
-        Commands::WrapEquity { symbol, quantity } => {
-            Ok(SimpleCommand::WrapEquity { symbol, quantity })
-        }
-        Commands::UnwrapEquity { symbol, quantity } => {
-            Ok(SimpleCommand::UnwrapEquity { symbol, quantity })
-        }
+        Commands::WrapEquity {
+            symbol,
+            quantity,
+            network,
+            registry,
+        } => Ok(SimpleCommand::WrapEquity {
+            symbol,
+            quantity,
+            network,
+            registry,
+        }),
+        Commands::UnwrapEquity {
+            symbol,
+            quantity,
+            network,
+            registry,
+        } => Ok(SimpleCommand::UnwrapEquity {
+            symbol,
+            quantity,
+            network,
+            registry,
+        }),
         Commands::DonateEquity { symbol, quantity } => {
             Ok(SimpleCommand::DonateEquity { symbol, quantity })
         }
@@ -1580,12 +1632,18 @@ async fn run_simple_command<W: Write>(
             )
             .await
         }
-        SimpleCommand::WrapEquity { symbol, quantity } => {
-            wrapper::wrap_equity_command(stdout, symbol, quantity, ctx).await
-        }
-        SimpleCommand::UnwrapEquity { symbol, quantity } => {
-            wrapper::unwrap_equity_command(stdout, symbol, quantity, ctx).await
-        }
+        SimpleCommand::WrapEquity {
+            symbol,
+            quantity,
+            network,
+            registry,
+        } => wrapper::wrap_equity_command(stdout, symbol, quantity, network, registry, ctx).await,
+        SimpleCommand::UnwrapEquity {
+            symbol,
+            quantity,
+            network,
+            registry,
+        } => wrapper::unwrap_equity_command(stdout, symbol, quantity, network, registry, ctx).await,
         SimpleCommand::DonateEquity { symbol, quantity } => {
             wrapper::donate_equity_command(stdout, symbol, quantity, ctx).await
         }
@@ -2171,11 +2229,66 @@ mod tests {
             Cli::try_parse_from(["st0x-cli", "wrap-equity", "-s", "SPYM", "-q", "6.15"]).unwrap();
 
         match cli.command {
-            Commands::WrapEquity { symbol, quantity } => {
+            Commands::WrapEquity {
+                symbol, quantity, ..
+            } => {
                 assert_eq!(symbol, Symbol::new("SPYM").unwrap());
                 assert_eq!(quantity, positive_shares("6.15"));
             }
             other => panic!("expected wrap-equity command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrap_equity_parses_network_and_registry() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "wrap-equity",
+            "-s",
+            "RKLB",
+            "-q",
+            "0.1",
+            "--network",
+            "ethereum",
+            "--registry",
+            "token-lists/ethereum.json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::WrapEquity {
+                network, registry, ..
+            } => {
+                assert_eq!(network, TokenizationNetwork::Ethereum);
+                assert_eq!(
+                    registry,
+                    Some(std::path::PathBuf::from("token-lists/ethereum.json"))
+                );
+            }
+            other => panic!("expected wrap-equity command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_forwards_unwrap_equity_network_and_registry() {
+        let command = Commands::UnwrapEquity {
+            symbol: Symbol::new("RKLB").unwrap(),
+            quantity: positive_shares("0.1"),
+            network: TokenizationNetwork::Ethereum,
+            registry: Some(std::path::PathBuf::from("token-lists/ethereum.json")),
+        };
+
+        match classify_command(command) {
+            Ok(SimpleCommand::UnwrapEquity {
+                network, registry, ..
+            }) => {
+                assert_eq!(network, TokenizationNetwork::Ethereum);
+                assert_eq!(
+                    registry,
+                    Some(std::path::PathBuf::from("token-lists/ethereum.json"))
+                );
+            }
+            _ => panic!("expected unwrap-equity simple command, got a different route"),
         }
     }
 
