@@ -183,10 +183,13 @@ fn http_client_with_retry(url: Url) -> Result<RpcClient, reqwest::Error> {
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(RPC_REQUEST_TIMEOUT_SECS))
         .build()?;
+    // Same heuristic ClientBuilder::http applies, so local nodes keep
+    // alloy's faster polling defaults.
+    let is_local = alloy::transports::utils::guess_local_url(url.as_str());
     let transport = alloy::transports::http::Http::with_client(http_client, url);
     Ok(RpcClient::builder()
         .layer(retry_layer)
-        .transport(transport, false))
+        .transport(transport, is_local))
 }
 
 pub async fn build_wallet(
