@@ -26,7 +26,6 @@ cross-checking. Current addresses:
 | AMZN   | `0x466cb2e46fa1afc0ab5e22274b34d0391db18efd` |
 | NVDA   | `0x7271a3c91bb6070ed09333b84a815949d4f16d14` |
 | MSTR   | `0x013b782f402d61aa1004cca95b9f5bb402c9d5fe` |
-| QSEP   | `0x4a9a9fc94a507559481270d0bff3315ab92fcefa` |
 | IAU    | `0x9a507314ea2a6c5686c0d07bfecb764dcf324dff` |
 | COIN   | `0x626757e6f50675d17fcad312e82f989ae7a23d38` |
 | SIVR   | `0x58ce5024b89b4f73c27814c0f0abbea331c99be8` |
