@@ -938,7 +938,10 @@ where
 
         let view = recovery.inventory.read().await;
         let tainted = view.is_restart_cash_tainted();
-        let state = if view.cash_reconciliation_busy(fetched_at)?.is_some() {
+        let state = if view
+            .cash_reconciliation_busy(Venue::Hedging, fetched_at)?
+            .is_some()
+        {
             ObservedCashLedgerState::Busy
         } else {
             let ledger = view.usdc_available(Venue::Hedging);
@@ -1030,13 +1033,13 @@ where
             ObservedCashLedgerState::Match => {
                 if *counter != 0 {
                     *counter = 0;
-                    recovery.gate.release_cash();
+                    recovery.gate.release_cash(Venue::Hedging);
                 }
                 None
             }
             ObservedCashLedgerState::Divergence { ledger } => {
                 *counter += 1;
-                recovery.gate.engage_cash();
+                recovery.gate.engage_cash(Venue::Hedging);
 
                 warn!(
                     target: "inventory",
@@ -1097,7 +1100,7 @@ where
 
         if healed {
             *self.lock_cash_divergence_counter() = 0;
-            recovery.gate.release_cash();
+            recovery.gate.release_cash(Venue::Hedging);
             recovery
                 .inventory
                 .write_without_broadcast()
@@ -1227,7 +1230,7 @@ where
                 .iter()
                 .map(|(symbol, fetched)| {
                     let state = if view
-                        .equity_reconciliation_busy(symbol, fetched_at)?
+                        .equity_reconciliation_busy(symbol, Venue::Hedging, fetched_at)?
                         .is_some()
                     {
                         ObservedLedgerState::Busy
@@ -1359,7 +1362,7 @@ where
 
         if healed {
             self.lock_divergence_counters().remove(&escalation.symbol);
-            recovery.gate.release(&escalation.symbol);
+            recovery.gate.release(Venue::Hedging, &escalation.symbol);
             recovery
                 .inventory
                 .write_without_broadcast()
@@ -1413,13 +1416,13 @@ where
                 ObservedLedgerState::Busy => {}
                 ObservedLedgerState::Match => {
                     if counters.remove(&symbol).is_some() {
-                        recovery.gate.release(&symbol);
+                        recovery.gate.release(Venue::Hedging, &symbol);
                     }
                 }
                 ObservedLedgerState::Divergence { ledger } => {
                     let count = counters.entry(symbol.clone()).or_insert(0);
                     *count += 1;
-                    recovery.gate.engage(&symbol);
+                    recovery.gate.engage(Venue::Hedging, &symbol);
 
                     warn!(
                         target: "inventory",
