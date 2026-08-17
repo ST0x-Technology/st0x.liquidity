@@ -22633,7 +22633,7 @@ mod tests {
         let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 
-        trigger.divergence_gate().engage(&symbol);
+        trigger.divergence_gate().engage(Venue::Hedging, &symbol);
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
@@ -22647,7 +22647,7 @@ mod tests {
             "a gated symbol must not dispatch an equity transfer"
         );
 
-        trigger.divergence_gate().release(&symbol);
+        trigger.divergence_gate().release(Venue::Hedging, &symbol);
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
@@ -22785,7 +22785,7 @@ mod tests {
             let view = trigger.inventory.read().await;
             (
                 view.equity_available(&symbol, Venue::Hedging),
-                view.equity_reconciliation_busy(&symbol, Utc::now())
+                view.equity_reconciliation_busy(&symbol, Venue::Hedging, Utc::now())
                     .unwrap(),
             )
         };
@@ -22813,7 +22813,7 @@ mod tests {
         let reactor = make_trigger_with_inventory(inventory).await;
         let trigger = reactor.clone();
 
-        trigger.divergence_gate().engage_cash();
+        trigger.divergence_gate().engage_cash(Venue::Hedging);
 
         trigger.check_and_trigger_usdc().await;
         assert_eq!(
@@ -22822,7 +22822,7 @@ mod tests {
             "an engaged cash gate must not dispatch a USDC transfer"
         );
 
-        trigger.divergence_gate().release_cash();
+        trigger.divergence_gate().release_cash(Venue::Hedging);
 
         trigger.check_and_trigger_usdc().await;
         assert_eq!(
@@ -22963,7 +22963,8 @@ mod tests {
             let view = trigger.inventory.read().await;
             (
                 view.usdc_available(Venue::Hedging),
-                view.cash_reconciliation_busy(Utc::now()).unwrap(),
+                view.cash_reconciliation_busy(Venue::Hedging, Utc::now())
+                    .unwrap(),
             )
         };
         assert_eq!(

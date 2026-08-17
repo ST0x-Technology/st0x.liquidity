@@ -4090,11 +4090,55 @@ skip the events that arrive, and failed USDC-transfer cleanups stamp
   wrong amount and mark the venue busy, freezing the very counter that resolves
   the divergence.
 
+The MarketMaking venue wedges against the vault the same way (the
+`OnchainEquity` and `OnchainUsdc` snapshots dedupe on unchanged values, the
+view's guards skip the events that do arrive, and every failed transfer cleanup
+stamps a fresh `last_rebalancing`), so it carries the same recovery:
+
+- **Detection at the poll boundary**: after emitting the onchain snapshots, the
+  poller compares each polled vault balance against the view's MarketMaking
+  available balance, and the polled vault USDC against the view's MarketMaking
+  USDC. The counters are separate from the Hedging ones: the venues diverge and
+  heal independently, so a match at one venue must not reset the other's count.
+  The equity comparison covers symbols the vault poll omits -- a symbol the view
+  still tracks at MarketMaking is compared against zero, so a phantom credit
+  attributed to a retired vault is detectable rather than invisible. A symbol or
+  the venue is busy -- counter frozen, not reset -- while an equity or USDC
+  transfer is inflight or a mint, redemption, or USDC rebalance aggregate is
+  live. The Hedging-only busy sources do not apply: an open broker order, and
+  the recency of the fill it produces, say nothing about what a vault read
+  holds.
+- **N-confirmation escalation**: at the same `inventory_divergence_threshold`
+  the poller sends `ReconcileOnchainEquity` or `ReconcileOnchainUsdc`. Like
+  their Hedging twins these always emit their event, and it folds into the
+  aggregate's onchain state together with the block the balance was read at, so
+  startup hydration replays the block watermark alongside the balance.
+- **Forced reconcile on apply**: the apply re-validates the same busy taxonomy
+  under the view write lock and additionally aborts when the reading's block
+  number is below the balance's applied block watermark. Block ordering is
+  authoritative for onchain reads (ADR 0018): a read pinned below the watermark
+  lacks fills the watermark already absorbed, so the heal aborts conservatively
+  instead of forcing the older value through and resetting the watermark. A
+  verified heal advances both the time and the block watermark and, as on the
+  Hedging side, never stamps `last_rebalancing`.
+- **Dispatch suppression**: the gate is shared with the Hedging machinery, keyed
+  by `(venue, symbol)` for equity and by venue for cash. The rebalancing trigger
+  reads it venue-agnostically -- a mint, redemption, or bridge moves the balance
+  at both venues, so a divergence at either one makes the transfer unsafe to
+  size -- and suppression lifts only once every engaged venue has released.
+- **No restart taint**: the taint exists because a hedge order straddling a boot
+  leaves the hydrated Hedging balance ambiguous, and the local-clock guard state
+  that refused the mid-order readings does not survive the restart. Neither
+  condition has a MarketMaking counterpart: the venue's second writer is
+  reconciled by block watermarks, which re-seed from the aggregate along with
+  the balance, so a MarketMaking divergence always escalates on the ordinary
+  N-poll confirmation.
+
 Guard-skip starvation is observable: the view tracks consecutive guard-skipped
-Hedging snapshots (per symbol for equity, venue-level for cash) and logs a
+snapshots (per `(venue, symbol)` for equity, per venue for cash) and logs a
 warning every five consecutive skips, so an ADR 0015 guard that starves a
-balance of broker truth surfaces at production log levels before the divergence
-machinery escalates. An applied snapshot resets the streak.
+balance of venue truth surfaces at production log levels before the divergence
+machinery escalates. An applied snapshot resets that venue's streak.
 
 The same machinery closes the restart-across-an-open-order window. The aggregate
 records every poll -- including mid-order broker readings the live view's guards
