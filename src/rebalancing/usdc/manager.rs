@@ -30,6 +30,7 @@ use super::UsdcTransferError;
 use crate::bot_gas::{
     BotGasChain, BotGasOperationCategory, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCost,
 };
+use crate::rebalancing::equity::RecheckOutcome;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::{
     ConversionAmounts, RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand,
@@ -2363,6 +2364,144 @@ impl<
         Ok(())
     }
 
+    /// Operator `transfer recheck` for a USDC rebalance whose Alpaca deposit
+    /// leg failed: verifies the exact transfer at Alpaca by the
+    /// persisted send tx and, when the provider settled it after the polling
+    /// deadline, un-fails the aggregate (`RecoverDeposit`) and drives the
+    /// USDC->USD conversion to the normal `ConversionComplete` terminal.
+    ///
+    /// State matrix:
+    /// - `DepositFailed` (BaseToAlpaca, on-chain deposit ref): the recheck
+    ///   proper -- a single Alpaca query, no polling deadline. Only the
+    ///   provider's status gates recovery, exactly like the normal confirm
+    ///   path (which applies no amount validation; a short credit surfaces
+    ///   downstream as `PostDepositConversionShortFill` on the conversion
+    ///   order). A transfer absent from the list reports `NotDetectedYet`
+    ///   and one not yet Complete reports `LeftUnchanged` -- both retryable
+    ///   outcomes, not errors.
+    /// - `DepositConfirmed`/`Converting` (BaseToAlpaca): a recheck that
+    ///   crashed between recovery and conversion left these mid-flight;
+    ///   re-running the same command continues them (idempotency).
+    /// - `ConversionComplete` (BaseToAlpaca), `DepositConfirmed`
+    ///   (AlpacaToBase), `Reconciled`: terminal -- nothing to do
+    ///   (`reconcile` stays the out-of-band recovery path).
+    /// - Everything else: typed refusal; recheck never guesses.
+    ///
+    /// Idempotent and fund-safe: the withdraw/burn/mint/send legs all sit
+    /// behind states this flow never re-enters, `RecoverDeposit` is valid
+    /// only from `DepositFailed`, and the conversion leg is the existing
+    /// client-order-id-anchored resume machinery.
+    pub(crate) async fn recheck_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<RecheckOutcome, UsdcRecheckError> {
+        let state = self
+            .cqrs
+            .load(id)
+            .await
+            .map_err(|error| Box::new(UsdcTransferError::from(error)))?;
+
+        let (send_tx, amount) = match state {
+            None => return Err(UsdcRecheckError::NotFound(id.clone())),
+            Some(UsdcRebalance::DepositFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_ref: Some(TransferRef::OnchainTx(send_tx)),
+                amount,
+                ..
+            }) => (send_tx, amount),
+            Some(UsdcRebalance::DepositFailed {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            }) => return Err(UsdcRecheckError::AlpacaToBaseDeposit(id.clone())),
+            Some(UsdcRebalance::DepositFailed { .. }) => {
+                return Err(UsdcRecheckError::NoOnchainDepositRef(id.clone()));
+            }
+            Some(
+                UsdcRebalance::DepositConfirmed {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    ..
+                }
+                | UsdcRebalance::Converting {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    ..
+                },
+            ) => {
+                // Past the failed deposit but the conversion leg is still
+                // owed -- continue it rather than reporting a false
+                // already-done.
+                self.resume_base_to_alpaca(id, amount)
+                    .await
+                    .map_err(Box::new)?;
+                return Ok(RecheckOutcome::Resumed);
+            }
+            Some(
+                UsdcRebalance::ConversionComplete {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+                // AlpacaToBase's DepositConfirmed is that direction's
+                // terminal SUCCESS -- report it done, never "cannot
+                // recover".
+                | UsdcRebalance::DepositConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+                | UsdcRebalance::Reconciled { .. },
+            ) => return Ok(RecheckOutcome::AlreadyCompleted),
+            Some(other) => {
+                return Err(UsdcRecheckError::NotDepositFailed {
+                    id: id.clone(),
+                    state: other.state_name(),
+                });
+            }
+        };
+
+        let Some(transfer) = self.alpaca_wallet.find_deposit_by_tx_hash(&send_tx).await? else {
+            info!(
+                target: "rebalance",
+                %id,
+                %send_tx,
+                "no incoming transfer for the deposit tx in Alpaca's \
+                 account-wide list (which is potentially capped -- absence \
+                 is not proof the deposit never landed); nothing recovered, \
+                 retry later"
+            );
+            return Ok(RecheckOutcome::NotDetectedYet);
+        };
+        if transfer.status != TransferStatus::Complete {
+            info!(
+                target: "rebalance",
+                %id,
+                %send_tx,
+                status = ?transfer.status,
+                "Alpaca has not settled the deposit; leaving the rebalance \
+                 failed until the provider reports Complete"
+            );
+            return Ok(RecheckOutcome::LeftUnchanged);
+        }
+
+        info!(
+            target: "rebalance",
+            %id,
+            %send_tx,
+            alpaca_transfer_id = %transfer.id,
+            "Alpaca settled the deposit after the polling deadline; \
+             recovering the failed rebalance"
+        );
+        self.cqrs
+            .send(id, UsdcRebalanceCommand::RecoverDeposit)
+            .await
+            .map_err(|error| Box::new(UsdcTransferError::from(error)))?;
+
+        self.resume_base_to_alpaca(id, amount)
+            .await
+            .map_err(Box::new)?;
+
+        Ok(RecheckOutcome::Recovered)
+    }
+
     /// Non-obvious points the match body below cannot express on its own:
     /// - `Attested` reconstructs the `AttestationResponse` from the persisted
     ///   message envelope and mints with no Circle call. Transfers whose
@@ -4301,6 +4440,71 @@ fn conversion_amounts_from_order(
     })
 }
 
+/// Why an operator `transfer recheck` of a USDC deposit could not proceed.
+///
+/// Provider answers that only mean "not recoverable yet" (deposit not
+/// detected, not settled) are [`RecheckOutcome`]s, not errors. This enum
+/// distinguishes refusals rooted in the persisted aggregate state (retrying
+/// will not help) from transient upstream failures (Alpaca unreachable --
+/// retry later), mirroring the split the API maps onto HTTP statuses for
+/// the equity `RecheckError`.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum UsdcRecheckError {
+    #[error("no USDC rebalance found for {0}")]
+    NotFound(UsdcRebalanceId),
+    #[error(
+        "rebalance {0} is an AlpacaToBase deposit failure: its deposit is \
+         the bot's own on-chain tx, not a provider-settled transfer -- use \
+         `transfer reconcile --kind usdc` instead of rechecking the provider"
+    )]
+    AlpacaToBaseDeposit(UsdcRebalanceId),
+    #[error(
+        "rebalance {0} failed without an on-chain deposit ref; there is no \
+         send tx to verify at Alpaca -- use `transfer reconcile --kind usdc` \
+         instead"
+    )]
+    NoOnchainDepositRef(UsdcRebalanceId),
+    #[error(
+        "rebalance {id} is in state {state}, which recheck cannot recover \
+         (recheck only verifies a failed BaseToAlpaca deposit against Alpaca)"
+    )]
+    NotDepositFailed {
+        id: UsdcRebalanceId,
+        state: &'static str,
+    },
+    /// Reading Alpaca failed -- transient, retry later.
+    #[error("Alpaca wallet error: {0}")]
+    Alpaca(#[from] AlpacaWalletError),
+    /// Loading/advancing the aggregate or resuming the continuation failed.
+    #[error(transparent)]
+    Transfer(#[from] Box<UsdcTransferError>),
+}
+
+/// Trait-erased entry point for the operator `transfer recheck` of a failed
+/// USDC deposit. Erasing the wallet `Chain` generic lets the recovery
+/// handle hold one concrete type regardless of backend (sibling of the
+/// resume traits in `job.rs`).
+#[async_trait::async_trait]
+pub(crate) trait RecheckUsdcDeposit: Send + Sync + 'static {
+    async fn recheck_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<RecheckOutcome, UsdcRecheckError>;
+}
+
+#[async_trait::async_trait]
+impl<Chain> RecheckUsdcDeposit for CrossVenueCashTransfer<Chain>
+where
+    Chain: Wallet + Send + Sync + 'static,
+{
+    async fn recheck_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<RecheckOutcome, UsdcRecheckError> {
+        Self::recheck_deposit(self, id).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::node_bindings::Anvil;
@@ -4340,7 +4544,7 @@ mod tests {
     use crate::telemetry::TelemetrySender;
     use crate::test_utils::{TestAnvilInstance, spawn_anvil, spawn_anvil_pair};
     use crate::usdc_rebalance::{
-        RebalanceDirection, TransferRef, UsdcRebalanceError, UsdcRebalanceEvent,
+        RebalanceDirection, ReconcileReason, TransferRef, UsdcRebalanceError, UsdcRebalanceEvent,
     };
     use st0x_finance::UsdcConversionError;
 
@@ -9652,6 +9856,420 @@ mod tests {
             matches!(final_state, UsdcRebalance::ConversionComplete { .. }),
             "Expected ConversionComplete after resume from DepositInitiated, got: {final_state:?}"
         );
+    }
+
+    /// Seeds a BaseToAlpaca aggregate into the prod-incident shape:
+    /// deposit initiated with the mint tx as send tx, then
+    /// failed by the poller while Alpaca still reported it processing.
+    /// Returns the send tx the recheck verifies at Alpaca.
+    async fn advance_to_deposit_failed_base_to_alpaca(
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        amount_received: Usdc,
+    ) -> TxHash {
+        let (_burn_tx, mint_tx) =
+            advance_to_bridged_base_to_alpaca(cqrs, id, amount, amount_received).await;
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(mint_tx),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::FailDeposit {
+                reason: "Deposit ended in status: Processing".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        mint_tx
+    }
+
+    /// Mocks the Alpaca transfers list with one incoming deposit for
+    /// `send_tx` in the given status and settled amount -- the single-shot
+    /// read `recheck_deposit` performs.
+    fn create_deposit_transfers_mock<'server>(
+        server: &'server MockServer,
+        send_tx: TxHash,
+        status: &str,
+        amount: &str,
+    ) -> httpmock::Mock<'server> {
+        let status = status.to_owned();
+        let amount = amount.to_owned();
+        server.mock(move |when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "direction": "INCOMING",
+                    "amount": amount,
+                    "usd_value": amount,
+                    "chain": "ethereum",
+                    "asset": "USDC",
+                    "from_address": "0x0000000000000000000000000000000000000001",
+                    "to_address": "0x1111111111111111111111111111111111111111",
+                    "status": status,
+                    "tx_hash": format!("{send_tx:#x}"),
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee": "0.5",
+                    "fees": "0"
+                }]));
+        })
+    }
+
+    /// The prod incident, end to end: the poller failed the deposit
+    /// while Alpaca reported it PROCESSING; Alpaca completed it later. The
+    /// recheck verifies the exact transfer by the persisted send tx,
+    /// un-fails the aggregate, and continues the original rebalance through
+    /// the USDC->USD conversion to `ConversionComplete`. A second recheck is
+    /// a pure read reporting the terminal -- the conversion mock's exact-hit
+    /// assert proves no second order was placed.
+    #[tokio::test]
+    async fn recheck_deposit_recovers_late_settled_deposit_and_converts() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let send_tx =
+            advance_to_deposit_failed_base_to_alpaca(&cqrs, &id, usdc("100"), usdc("99.99")).await;
+
+        let transfers_mock = create_deposit_transfers_mock(&server, send_tx, "COMPLETE", "99.99");
+        let conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdcToUsd, "99.99");
+        let _get_order_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "99.99",
+        );
+
+        let outcome = manager.recheck_deposit(&id).await.unwrap();
+
+        assert_eq!(outcome, RecheckOutcome::Recovered);
+        transfers_mock.assert();
+        let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(final_state, UsdcRebalance::ConversionComplete { .. }),
+            "Expected ConversionComplete after recheck recovery, got: {final_state:?}"
+        );
+
+        let second = manager.recheck_deposit(&id).await.unwrap();
+        assert_eq!(second, RecheckOutcome::AlreadyCompleted);
+        conversion_mock.assert();
+    }
+
+    /// A deposit Alpaca still reports PROCESSING is not recoverable yet:
+    /// report `LeftUnchanged` (a retryable outcome, not an error -- the
+    /// operator waits for the provider, nothing is wrong) and leave the
+    /// aggregate exactly where it was.
+    #[tokio::test]
+    async fn recheck_deposit_leaves_still_processing_deposit_unchanged() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let send_tx =
+            advance_to_deposit_failed_base_to_alpaca(&cqrs, &id, usdc("100"), usdc("99.99")).await;
+        let _transfers_mock =
+            create_deposit_transfers_mock(&server, send_tx, "PROCESSING", "99.99");
+
+        let outcome = manager.recheck_deposit(&id).await.unwrap();
+
+        assert_eq!(outcome, RecheckOutcome::LeftUnchanged);
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::DepositFailed { .. }),
+            "an unchanged recheck must leave DepositFailed untouched, got: {state:?}"
+        );
+    }
+
+    /// A COMPLETE deposit recovers even when Alpaca settled it below the
+    /// recorded amount: recheck applies the same validation as the normal
+    /// confirm path (provider status only, no amount gate), and a real
+    /// shortfall surfaces on the conversion leg as
+    /// `PostDepositConversionShortFill`, exactly as it would have without
+    /// the intervening failure.
+    #[tokio::test]
+    async fn recheck_deposit_recovers_short_settled_deposit() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let send_tx =
+            advance_to_deposit_failed_base_to_alpaca(&cqrs, &id, usdc("100"), usdc("99.99")).await;
+        let _transfers_mock = create_deposit_transfers_mock(&server, send_tx, "COMPLETE", "99.98");
+        let _conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdcToUsd, "99.99");
+        let _get_order_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "99.99",
+        );
+
+        let outcome = manager.recheck_deposit(&id).await.unwrap();
+
+        assert_eq!(outcome, RecheckOutcome::Recovered);
+        let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(final_state, UsdcRebalance::ConversionComplete { .. }),
+            "Expected ConversionComplete after recheck recovery, got: {final_state:?}"
+        );
+    }
+
+    /// A deposit Alpaca has not detected at all reports `NotDetectedYet` --
+    /// a retryable outcome, not an error, because the account-wide transfer
+    /// list is potentially capped and absence from it is not proof the
+    /// deposit never landed. The aggregate stays untouched.
+    #[tokio::test]
+    async fn recheck_deposit_reports_undetected_deposit_as_not_detected_yet() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_deposit_failed_base_to_alpaca(&cqrs, &id, usdc("100"), usdc("99.99")).await;
+        let _transfers_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        let outcome = manager.recheck_deposit(&id).await.unwrap();
+
+        assert_eq!(outcome, RecheckOutcome::NotDetectedYet);
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(matches!(state, UsdcRebalance::DepositFailed { .. }));
+    }
+
+    /// An Alpaca outage is transient: surface it without touching the
+    /// aggregate so the operator can simply retry.
+    #[tokio::test]
+    async fn recheck_deposit_surfaces_alpaca_outage_without_state_change() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_deposit_failed_base_to_alpaca(&cqrs, &id, usdc("100"), usdc("99.99")).await;
+        let _transfers_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers");
+            then.status(500);
+        });
+
+        let error = manager.recheck_deposit(&id).await.unwrap_err();
+
+        assert!(matches!(error, UsdcRecheckError::Alpaca(_)));
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(matches!(state, UsdcRebalance::DepositFailed { .. }));
+    }
+
+    /// An AlpacaToBase deposit failure is the bot's own on-chain tx --
+    /// resume territory. The recheck must refuse without querying Alpaca
+    /// (no transfers mock is registered: a query would 404 and fail
+    /// differently).
+    #[tokio::test]
+    async fn recheck_deposit_refuses_alpaca_to_base_failure() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_deposit_initiated_alpaca_to_base(
+            &cqrs,
+            &id,
+            usdc("100"),
+            fixed_bytes!("0xdddd111111111111111111111111111111111111111111111111111111111111"),
+        )
+        .await;
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::FailDeposit {
+                reason: "deposit tx reverted".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = manager.recheck_deposit(&id).await.unwrap_err();
+
+        assert!(matches!(error, UsdcRecheckError::AlpacaToBaseDeposit(_)));
+    }
+
+    /// An AlpacaToBase `DepositConfirmed` is that direction's terminal
+    /// SUCCESS: recheck reports it done rather than refusing with a
+    /// "cannot recover" message about a transfer that completed fine.
+    #[tokio::test]
+    async fn recheck_deposit_reports_already_completed_for_alpaca_to_base_terminal() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_deposit_initiated_alpaca_to_base(
+            &cqrs,
+            &id,
+            usdc("100"),
+            fixed_bytes!("0xdddd111111111111111111111111111111111111111111111111111111111111"),
+        )
+        .await;
+        cqrs.send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .await
+            .unwrap();
+
+        let outcome = manager.recheck_deposit(&id).await.unwrap();
+
+        assert_eq!(outcome, RecheckOutcome::AlreadyCompleted);
+    }
+
+    /// A BaseToAlpaca deposit failure without an on-chain deposit ref has
+    /// no send tx to verify at Alpaca; recheck must refuse with the
+    /// ref-specific guidance, not the generic wrong-state one -- this pins
+    /// the match-arm ordering (the on-chain-ref arm must come first). No
+    /// transfers mock: the refusal must precede any Alpaca query.
+    #[tokio::test]
+    async fn recheck_deposit_refuses_missing_onchain_deposit_ref() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_bridged_base_to_alpaca(&cqrs, &id, usdc("100"), usdc("99.99")).await;
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::FailDeposit {
+                reason: "Deposit ended in status: Processing".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = manager.recheck_deposit(&id).await.unwrap_err();
+
+        assert!(matches!(error, UsdcRecheckError::NoOnchainDepositRef(_)));
+    }
+
+    /// Any state outside the deposit-failure/continuation/terminal matrix
+    /// refuses with the wrong-state guidance naming the actual state --
+    /// pinned for both a pre-deposit `Bridged` and an in-flight
+    /// `DepositInitiated` so a match-arm reordering cannot silently swap
+    /// the operator guidance. No transfers mock: the refusal must precede
+    /// any Alpaca query.
+    #[tokio::test]
+    async fn recheck_deposit_refuses_non_deposit_failed_states() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let bridged = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_bridged_base_to_alpaca(&cqrs, &bridged, usdc("100"), usdc("99.99")).await;
+        let error = manager.recheck_deposit(&bridged).await.unwrap_err();
+        let UsdcRecheckError::NotDepositFailed { state, .. } = error else {
+            panic!("expected NotDepositFailed for Bridged, got: {error:?}");
+        };
+        assert_eq!(state, "Bridged");
+
+        let deposit_initiated = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_bridged_base_to_alpaca(&cqrs, &deposit_initiated, usdc("100"), usdc("99.99"))
+            .await;
+        cqrs.send(
+            &deposit_initiated,
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(fixed_bytes!(
+                    "0xcccc111111111111111111111111111111111111111111111111111111111111"
+                )),
+            },
+        )
+        .await
+        .unwrap();
+        let error = manager
+            .recheck_deposit(&deposit_initiated)
+            .await
+            .unwrap_err();
+        let UsdcRecheckError::NotDepositFailed { state, .. } = error else {
+            panic!("expected NotDepositFailed for DepositInitiated, got: {error:?}");
+        };
+        assert_eq!(state, "DepositInitiated");
+    }
+
+    /// A reconciled rebalance was handled out-of-band; recheck reports it
+    /// done rather than second-guessing the operator.
+    #[tokio::test]
+    async fn recheck_deposit_reports_already_completed_for_reconciled() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_deposit_failed_base_to_alpaca(&cqrs, &id, usdc("100"), usdc("99.99")).await;
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: ReconcileReason::DepositCreditedOffline,
+            },
+        )
+        .await
+        .unwrap();
+
+        let outcome = manager.recheck_deposit(&id).await.unwrap();
+
+        assert_eq!(outcome, RecheckOutcome::AlreadyCompleted);
+    }
+
+    /// A recheck that crashed between `RecoverDeposit` and the conversion
+    /// leaves `DepositConfirmed`; re-running the same command continues to
+    /// the terminal without re-querying Alpaca (no transfers mock).
+    #[tokio::test]
+    async fn recheck_deposit_resumes_interrupted_recovery() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_deposit_failed_base_to_alpaca(&cqrs, &id, usdc("100"), usdc("99.99")).await;
+        cqrs.send(&id, UsdcRebalanceCommand::RecoverDeposit)
+            .await
+            .unwrap();
+
+        let _conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdcToUsd, "99.99");
+        let _get_order_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "99.99",
+        );
+
+        let outcome = manager.recheck_deposit(&id).await.unwrap();
+
+        assert_eq!(outcome, RecheckOutcome::Resumed);
+        let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(final_state, UsdcRebalance::ConversionComplete { .. }),
+            "Expected ConversionComplete after resumed recovery, got: {final_state:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_deposit_refuses_unknown_rebalance() {
+        let server = MockServer::start();
+        let (manager, _cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let error = manager
+            .recheck_deposit(&UsdcRebalanceId(Uuid::new_v4()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, UsdcRecheckError::NotFound(_)));
     }
 
     /// RAI-1494: a classified broker rate-limit (429) on the deposit poll

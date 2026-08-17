@@ -210,7 +210,9 @@ impl UsdcRebalanceStage {
             BridgeAttestationReceived { .. } => Some(Self::BridgeAttestationReceived),
             Bridged { .. } | BridgingCompletionRecovered { .. } => Some(Self::Bridged),
             DepositInitiated { .. } => Some(Self::DepositInitiated),
-            DepositConfirmed { .. } => Some(Self::DepositConfirmed),
+            DepositConfirmed { .. } | DepositCompletionRecovered { .. } => {
+                Some(Self::DepositConfirmed)
+            }
             // Transient intent markers: immediately superseded by Initiated /
             // BridgingInitiated, so they emit no distinct progress stage.
             WithdrawalSubmitting { .. }
@@ -246,7 +248,8 @@ impl UsdcRebalanceStage {
                 Some(*attested_at)
             }
             (Self::Bridged, Bridged { minted_at, .. }) => Some(*minted_at),
-            (Self::Bridged, BridgingCompletionRecovered { recovered_at, .. }) => {
+            (Self::Bridged, BridgingCompletionRecovered { recovered_at, .. })
+            | (Self::DepositConfirmed, DepositCompletionRecovered { recovered_at, .. }) => {
                 Some(*recovered_at)
             }
             (
@@ -769,7 +772,14 @@ impl RebalancingService {
             | ConversionConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
                 ..
-            } => {
+            }
+            // `DepositCompletionRecovered` un-fails a BaseToAlpaca
+            // `DepositFailed` back to `DepositConfirmed`: the Alpaca deposit
+            // is now settled, so advance stage progress just as a first-time
+            // `DepositConfirmed` would. The in-progress guard stays held
+            // (recovery is mid-flight) and clears on the conversion terminal,
+            // exactly like the normal deposit path.
+            | DepositCompletionRecovered { .. } => {
                 self.track_usdc_stage_progress(id, event).await;
                 UsdcSettlementOutcome::Reconciled
             }
@@ -2298,6 +2308,12 @@ mod tests {
         }
     }
 
+    fn deposit_completion_recovered_event() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::DepositCompletionRecovered {
+            recovered_at: ts(113),
+        }
+    }
+
     #[test]
     fn truncate_for_transfer_preserves_value_within_six_decimals() {
         let original = Usdc::new(float!(123.456789));
@@ -2446,6 +2462,14 @@ mod tests {
     }
 
     #[test]
+    fn from_event_maps_deposit_completion_recovered_to_deposit_confirmed_stage() {
+        assert_eq!(
+            UsdcRebalanceStage::from_event(&deposit_completion_recovered_event()),
+            Some(UsdcRebalanceStage::DepositConfirmed)
+        );
+    }
+
+    #[test]
     fn from_event_skips_conversion_failed() {
         assert_eq!(
             UsdcRebalanceStage::from_event(&conversion_failed_event()),
@@ -2553,6 +2577,14 @@ mod tests {
             UsdcRebalanceStage::DepositConfirmed
                 .timestamp(&deposit_confirmed_event(RebalanceDirection::AlpacaToBase)),
             Some(ts(108))
+        );
+    }
+
+    #[test]
+    fn timestamp_extracts_recovered_at_from_deposit_completion_recovered() {
+        assert_eq!(
+            UsdcRebalanceStage::DepositConfirmed.timestamp(&deposit_completion_recovered_event()),
+            Some(ts(113))
         );
     }
 

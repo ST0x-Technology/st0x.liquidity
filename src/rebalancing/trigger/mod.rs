@@ -12865,6 +12865,12 @@ mod tests {
         }
     }
 
+    fn make_usdc_deposit_completion_recovered() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::DepositCompletionRecovered {
+            recovered_at: Utc::now(),
+        }
+    }
+
     fn make_usdc_pre_burn_bridging_failed() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::BridgingFailed {
             burn_tx_hash: None,
@@ -13069,6 +13075,79 @@ mod tests {
         assert!(
             !trigger.usdc_in_progress.load(Ordering::SeqCst),
             "terminal ConversionConfirmed must clear the guard after recovery"
+        );
+    }
+
+    /// Deposit recovery lifecycle through the reactor: a `DepositFailed`
+    /// un-failed by `DepositCompletionRecovered` (non-terminal -> guard
+    /// stays held mid-recovery, stage progress advances like a first-time
+    /// `DepositConfirmed`) clears the guard only on the terminal
+    /// BaseToAlpaca `ConversionConfirmed`, exactly like the normal deposit
+    /// path -- live, no restart.
+    #[tokio::test]
+    async fn recovered_late_settled_deposit_holds_guard_then_clears_on_terminal() {
+        let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // The guard is armed when the rebalance is initiated.
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(1000)),
+            )
+            .await
+            .unwrap();
+
+        // A real recovery follows a terminal DepositFailed. The failure is
+        // post-mint, so the reactor preserves tracking and the guard instead
+        // of cancelling.
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_deposit_failed())
+            .await
+            .unwrap();
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "post-mint DepositFailed must preserve the guard"
+        );
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_deposit_completion_recovered())
+            .await
+            .unwrap();
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "DepositCompletionRecovered is non-terminal and must hold the \
+             guard mid-recovery"
+        );
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(1000),
+            None,
+            usdc::UsdcRebalanceStage::DepositConfirmed,
+        )
+        .await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                make_usdc_conversion_confirmed(
+                    RebalanceDirection::BaseToAlpaca,
+                    usdc(999),
+                    usdc(999),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "terminal ConversionConfirmed must clear the guard after a \
+             recovered deposit"
         );
     }
 
