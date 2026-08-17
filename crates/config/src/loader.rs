@@ -4071,6 +4071,25 @@ mod tests {
     }
 
     #[test]
+    fn wallet_rpc_url_rejects_non_http_loopback_schemes() {
+        for url in ["ftp://localhost:8545", "ws://127.0.0.1:8545"] {
+            let parsed = Url::parse(url).unwrap();
+
+            let result = crate::wallet::require_secure_wallet_rpc_url(&parsed, "base_rpc_url");
+
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::wallet::WalletCtxError::InsecureRpcUrl {
+                        field: "base_rpc_url"
+                    })
+                ),
+                "{url} must be rejected, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn wallet_rpc_url_allows_https_and_loopback_http() {
         for url in [
             "https://rpc.hyperliquid.xyz/evm",

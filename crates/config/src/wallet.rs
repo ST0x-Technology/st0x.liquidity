@@ -78,7 +78,7 @@ pub(crate) fn require_secure_wallet_rpc_url(
         None => false,
     };
 
-    if is_loopback {
+    if is_loopback && url.scheme() == "http" {
         Ok(())
     } else {
         Err(WalletCtxError::InsecureRpcUrl { field })
