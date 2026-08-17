@@ -170,6 +170,7 @@ impl TokenizationNetwork {
         match self {
             Self::Base => 8453,
             Self::Ethereum => 1,
+            Self::HyperEvm => 999,
         }
     }
 }

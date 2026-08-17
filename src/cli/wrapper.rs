@@ -219,10 +219,10 @@ fn wrap_context(
             "--registry only applies to non Base networks: Base resolves \
              from [assets.equities]"
         ),
-        (TokenizationNetwork::Ethereum, Some(path)) => {
+        (TokenizationNetwork::Ethereum | TokenizationNetwork::HyperEvm, Some(path)) => {
             load_wrapped_equities(path, network.chain_id())?
         }
-        (TokenizationNetwork::Ethereum, None) => anyhow::bail!(
+        (TokenizationNetwork::Ethereum | TokenizationNetwork::HyperEvm, None) => anyhow::bail!(
             "pass --registry with the st0x.registry token list for the \
              selected network (token-lists/<network>.json)"
         ),
@@ -404,10 +404,9 @@ mod tests {
     }
 
     /// A valid registry resolves through wrap_context into the wrapper: the
-    /// command prints the registry's wrapped and underlying addresses before
-    /// the chain call fails on the stub provider. The stub wallets share one
-    /// address, so wallet identity per network is asserted by the
-    /// tokenization_network_context pairing test, not here.
+    /// command selects the ethereum stub wallet and prints the registry's
+    /// wrapped and underlying addresses before the chain call fails on the
+    /// stub provider.
     #[tokio::test]
     async fn unwrap_on_ethereum_resolves_addresses_from_the_registry() {
         let mut registry = tempfile::NamedTempFile::new().unwrap();
@@ -448,6 +447,10 @@ mod tests {
         assert!(
             output.contains("Underlying token: 0xED0c085d92C262FB46937CB0B3C9763Af7fCCf30"),
             "underlying must come from the registry, got: {output}"
+        );
+        assert!(
+            output.contains("Liquidity wallet: 0x0000000000000000000000000000000000000E78"),
+            "the ethereum marker wallet must be selected, got: {output}"
         );
         assert!(
             !error.to_string().contains("not in the resolved token set")
