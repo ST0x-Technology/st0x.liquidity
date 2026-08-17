@@ -63,7 +63,10 @@ pub enum WalletCtxError {
 /// (Anvil) keep working while any routable endpoint must be HTTPS. Enforced
 /// both at config load and in [`OnchainWalletCtx::new`], so no caller of the
 /// public constructor can bypass it.
-pub fn require_secure_wallet_rpc_url(url: &Url, field: &'static str) -> Result<(), WalletCtxError> {
+pub(crate) fn require_secure_wallet_rpc_url(
+    url: &Url,
+    field: &'static str,
+) -> Result<(), WalletCtxError> {
     if url.scheme() == "https" {
         return Ok(());
     }
