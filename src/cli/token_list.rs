@@ -49,7 +49,17 @@ pub(super) fn load_wrapped_equities(
             });
         }
 
+        let has_unwrapped_address = entry
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.unwrapped_address)
+            .is_some();
         let Some(underlying_symbol) = entry.symbol.strip_prefix(WRAPPED_SYMBOL_PREFIX) else {
+            if has_unwrapped_address {
+                return Err(TokenListError::UnwrappedAddressWithoutPrefix {
+                    symbol: entry.symbol,
+                });
+            }
             continue;
         };
 
@@ -133,6 +143,12 @@ pub(super) enum TokenListError {
          cannot resolve the underlying tStock"
     )]
     MissingUnwrappedAddress { symbol: String },
+    #[error(
+        "entry {symbol} has extensions.unwrappedAddress but no wt prefix; \
+         it looks wrapped under a naming convention this loader does not \
+         understand"
+    )]
+    UnwrappedAddressWithoutPrefix { symbol: String },
     #[error("invalid symbol {symbol} in token list")]
     InvalidSymbol {
         symbol: String,
@@ -260,6 +276,33 @@ mod tests {
         let equities = load_wrapped_equities(file.path(), ETHEREUM_CHAIN_ID).unwrap();
 
         assert!(equities.is_empty());
+    }
+
+    #[test]
+    fn unwrapped_address_without_the_prefix_fails_closed() {
+        let file = write_list(
+            r#"{
+                "tokens": [{
+                    "chainId": 1,
+                    "address": "0x8FC87Be766C0cB6f254F1FDc9351D4B85B560FB3",
+                    "symbol": "wrappedRKLB",
+                    "extensions": {
+                        "unwrappedAddress": "0xED0c085d92C262FB46937CB0B3C9763Af7fCCf30"
+                    }
+                }]
+            }"#,
+        );
+
+        let error = load_wrapped_equities(file.path(), ETHEREUM_CHAIN_ID).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                TokenListError::UnwrappedAddressWithoutPrefix { ref symbol }
+                    if symbol == "wrappedRKLB"
+            ),
+            "expected UnwrappedAddressWithoutPrefix, got {error:?}"
+        );
     }
 
     #[test]
