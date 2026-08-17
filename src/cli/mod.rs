@@ -157,6 +157,9 @@ pub enum TokenizationNetwork {
     Base,
     /// Ethereum mainnet
     Ethereum,
+    /// HyperEVM mainnet
+    #[value(name = "hyperevm")]
+    HyperEvm,
 }
 
 /// Manual position-recovery operations for stuck local CQRS state.
@@ -2074,6 +2077,28 @@ mod tests {
     }
 
     #[test]
+    fn alpaca_tokenize_parses_hyperevm_network() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "alpaca-tokenize",
+            "-s",
+            "RKLB",
+            "-q",
+            "1",
+            "--network",
+            "hyperevm",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::AlpacaTokenize { network, .. } => {
+                assert_eq!(network, TokenizationNetwork::HyperEvm);
+            }
+            other => panic!("expected alpaca-tokenize command, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn dividend_bump_command_parses_symbol_and_quantity() {
         let cli =
             Cli::try_parse_from(["st0x-cli", "dividend-bump", "-s", "COIN", "-q", "10.5"]).unwrap();
@@ -3692,6 +3717,7 @@ mod tests {
                 rpc_url = "http://localhost:8545"
                 base_rpc_url = "https://base.example.com"
                 ethereum_rpc_url = "https://mainnet.infura.io"
+                hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
                 [broker]
                 type = "dry-run"

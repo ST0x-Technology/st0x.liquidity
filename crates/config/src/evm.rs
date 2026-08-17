@@ -249,6 +249,10 @@ pub struct EvmSecrets {
     /// `[wallet]` is configured.
     #[serde(rename = "ethereum_rpc_url")]
     pub ethereum: Option<Url>,
+    /// HyperEVM mainnet RPC URL for wallet operations. Required when
+    /// `[wallet]` is configured.
+    #[serde(rename = "hyperevm_rpc_url")]
+    pub hyperevm: Option<Url>,
 }
 
 #[derive(Clone)]
@@ -318,6 +322,7 @@ mod tests {
             rpc: Url::parse("http://localhost:8545").unwrap(),
             base: None,
             ethereum: None,
+            hyperevm: None,
         }
     }
 

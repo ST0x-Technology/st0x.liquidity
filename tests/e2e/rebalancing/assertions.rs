@@ -281,7 +281,11 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         .usdc(usdc_rebalancing)
         .call();
 
-    let wallet_ctx = st0x_config::OnchainWalletCtx::from_wallets(base_wallet.clone(), base_wallet);
+    let wallet_ctx = st0x_config::OnchainWalletCtx::from_wallets(
+        base_wallet.clone(),
+        base_wallet.clone(),
+        base_wallet,
+    );
 
     let assets = AssetsConfig {
         equities: EquitiesConfig {
@@ -390,7 +394,11 @@ where
         .with_circle_api_base(cctp.attestation_base_url)
         .with_cctp_addresses(cctp.token_messenger, cctp.message_transmitter);
 
-    let wallet_ctx = st0x_config::OnchainWalletCtx::from_wallets(base_wallet, ethereum_wallet);
+    let wallet_ctx = st0x_config::OnchainWalletCtx::from_wallets(
+        base_wallet,
+        ethereum_wallet.clone(),
+        ethereum_wallet,
+    );
 
     Ctx::for_test()
         .database_url(db_path.display().to_string())
