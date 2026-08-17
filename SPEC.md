@@ -5279,11 +5279,38 @@ skip the events that arrive, and failed USDC-transfer cleanups stamp
   wrong amount and mark the venue busy, freezing the very counter that resolves
   the divergence.
 
-Guard-skip starvation is observable: the view tracks consecutive guard-skipped
-Hedging snapshots (per symbol for equity, venue-level for cash) and logs a
-warning every five consecutive skips, so an ADR 0015 guard that starves a
-balance of broker truth surfaces at production log levels before the divergence
-machinery escalates. An applied snapshot resets the streak.
+The shared guard machinery follows inventory ownership. Hedging is one chainless
+broker scope, so its equity suppression and snapshot-skip streaks are keyed only
+by symbol and its cash suppression is a single membership. MarketMaking is
+chain-owned: equity suppression and skip streaks are keyed by `(chain, symbol)`,
+and cash suppression and skip streaks are keyed by chain. Hedging is one side of
+every equity transfer, so any transfer makes its reading ambiguous. A
+MarketMaking equity reading on one chain is ambiguous only for a transfer that
+moves that chain's slot: inflight in the slot, or an active mint or redemption
+on that chain. Hedging inflight does not record its destination, so it is
+attributed to the active mint's chain; with no active mint it is ambiguous on
+every chain. USDC rebalancing moves cash only between Hedging and the primary
+chain's vault, so Hedging USDC inflight, an active USDC rebalance, or a read
+fetched before the last completed rebalance makes only the primary chain's
+MarketMaking cash reading ambiguous, and inflight in one chain's slot makes only
+that chain's reading ambiguous. An open hedge order or a fill applied after a
+broker read makes only the Hedging reading ambiguous. The scopes are exactly
+Hedging and one MarketMaking scope per chain; wallet transit locations are not
+scopes. Suppression is read across every scope: any engaged venue or chain makes
+a transfer unsafe to size, and a matching poll at one scope cannot release
+another venue's or chain's membership.
+
+Guard-skip starvation is observable at both venues. The view logs a warning
+every five consecutive skipped equity snapshots for one Hedging symbol or one
+MarketMaking `(chain, symbol)`, and every five skipped cash snapshots for the
+Hedging venue or one MarketMaking chain. Every dropped snapshot counts: one
+refused by the inflight or staleness guards, one pinned below the applied block
+watermark, and one withheld because an unresolved reconciliation request owns
+the balance. An applied snapshot or a successful forced reconciliation resets
+only that streak. The active divergence detector and forced-reconcile commands
+remain Hedging-only. MarketMaking `OnchainEquity` and `OnchainUsdc` skip
+warnings are therefore operator signals, not claims that the onchain balance
+self-healed.
 
 The same machinery closes the restart-across-an-open-order window. The aggregate
 records every poll -- including mid-order broker readings the live view's guards
