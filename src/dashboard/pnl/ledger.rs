@@ -590,6 +590,7 @@ async fn ingest_rebalance(
         | UsdcRebalanceEvent::DepositInitiated { .. }
         | UsdcRebalanceEvent::DepositConfirmed { .. }
         | UsdcRebalanceEvent::DepositFailed { .. }
+        | UsdcRebalanceEvent::DepositCompletionRecovered { .. }
         | UsdcRebalanceEvent::OperatorReconciled { .. } => return Ok(()),
     };
 

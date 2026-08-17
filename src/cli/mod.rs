@@ -72,6 +72,21 @@ pub enum TransferType {
     Redemption,
 }
 
+/// Transfer type for the `transfer recheck` command.
+///
+/// Unlike [`TransferType`], it includes USDC: a failed BaseToAlpaca USDC
+/// deposit is recheckable against Alpaca, while forcing a USDC transfer
+/// terminal stays with `transfer reconcile`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RecheckTransferType {
+    /// Tokenized equity mint (Alpaca -> onchain)
+    Mint,
+    /// Equity redemption (onchain -> Alpaca)
+    Redemption,
+    /// USDC rebalance whose Alpaca deposit leg failed (Base -> Alpaca)
+    Usdc,
+}
+
 /// Why an operator is reconciling a stuck post-burn USDC transfer.
 ///
 /// CLI-facing mirror of the crate-internal `usdc_rebalance::ReconcileReason`;
@@ -861,16 +876,18 @@ pub enum TransferCommand {
         reason: AuditReason,
     },
 
-    /// Re-check a failed mint or redemption and complete it if the provider settled it.
+    /// Re-check a failed mint, redemption, or USDC deposit and complete it if
+    /// the provider settled it.
     ///
     /// Delegates to the running bot's REST API so recovery dispatches through the
     /// in-process reactor (correcting live inventory). Requires the bot to be
     /// running and serving its API on the configured `server_port`.
     Recheck {
-        /// Transfer type: "mint" or "redemption"
+        /// Transfer type: "mint", "redemption", or "usdc"
         #[arg(short = 'k', long = "kind", alias = "type", short_alias = 't')]
-        kind: TransferType,
-        /// Aggregate ID (issuer_request_id for mint, redemption ID for redemption)
+        kind: RecheckTransferType,
+        /// Aggregate ID (issuer_request_id for mint, redemption ID for
+        /// redemption, rebalance ID for usdc)
         #[arg(short = 'i', long = "id")]
         id: String,
     },
@@ -1083,7 +1100,7 @@ enum TransferRecoveryCommand {
         reason: AuditReason,
     },
     RecheckTransfer {
-        transfer_type: TransferType,
+        transfer_type: RecheckTransferType,
         id: String,
     },
     ResumeInterruptedTransfers,
@@ -1139,7 +1156,7 @@ pub async fn fail_transfer_for_test(
 #[cfg(feature = "test-support")]
 pub async fn recheck_transfer_for_test(
     ctx: &Ctx,
-    transfer_type: TransferType,
+    transfer_type: RecheckTransferType,
     id: &str,
 ) -> anyhow::Result<()> {
     let mut stdout = Vec::new();
@@ -3575,7 +3592,7 @@ mod tests {
             Ok(SimpleCommand::Transfer {
                 command: TransferRecoveryCommand::RecheckTransfer { transfer_type, id },
             }) => {
-                assert!(matches!(transfer_type, TransferType::Redemption));
+                assert!(matches!(transfer_type, RecheckTransferType::Redemption));
                 assert_eq!(id, "redemption-1");
             }
             _ => panic!("expected recheck simple command"),
@@ -3857,7 +3874,7 @@ mod tests {
             Ok(SimpleCommand::Transfer {
                 command: TransferRecoveryCommand::RecheckTransfer { transfer_type, .. },
             }) => {
-                assert!(matches!(transfer_type, TransferType::Redemption));
+                assert!(matches!(transfer_type, RecheckTransferType::Redemption));
             }
             _ => panic!("expected transfer recheck simple command via --type"),
         }
@@ -3876,10 +3893,54 @@ mod tests {
             Ok(SimpleCommand::Transfer {
                 command: TransferRecoveryCommand::RecheckTransfer { transfer_type, .. },
             }) => {
-                assert!(matches!(transfer_type, TransferType::Redemption));
+                assert!(matches!(transfer_type, RecheckTransferType::Redemption));
             }
             _ => panic!("expected transfer recheck simple command via -t"),
         }
+    }
+
+    /// `transfer recheck` accepts the usdc kind (late-settled deposit
+    /// recovery), while `transfer fail` deliberately does not (a stuck USDC
+    /// transfer is reconciled, never force-failed).
+    #[test]
+    fn transfer_recheck_accepts_usdc_kind_but_fail_does_not() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "recheck",
+            "--kind",
+            "usdc",
+            "--id",
+            "4efa80fb-a9c9-44dd-87bc-a726fee6fa88",
+        ])
+        .unwrap();
+        match classify_command(cli.command) {
+            Ok(SimpleCommand::Transfer {
+                command: TransferRecoveryCommand::RecheckTransfer { transfer_type, id },
+            }) => {
+                assert!(matches!(transfer_type, RecheckTransferType::Usdc));
+                assert_eq!(id, "4efa80fb-a9c9-44dd-87bc-a726fee6fa88");
+            }
+            _ => panic!("expected transfer recheck simple command for usdc"),
+        }
+
+        let fail_error = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "fail",
+            "--kind",
+            "usdc",
+            "--id",
+            "4efa80fb-a9c9-44dd-87bc-a726fee6fa88",
+            "--reason",
+            "x",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            fail_error.kind(),
+            clap::error::ErrorKind::InvalidValue,
+            "transfer fail must reject usdc as an invalid --kind value, got: {fail_error}"
+        );
     }
 
     /// The legacy recovery names were removed (no back-compat). Pin that each

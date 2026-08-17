@@ -2881,6 +2881,12 @@ enum UsdcRebalanceCommand {
     InitiateDeposit { deposit: TransferRef },
     ConfirmDeposit,
     FailDeposit { reason: String },
+    // Operator `transfer recheck`: un-fail a BaseToAlpaca `DepositFailed`
+    // carrying an on-chain deposit ref, after verifying at Alpaca that the
+    // deposit settled past the polling deadline. Emits
+    // `DepositCompletionRecovered`, returning the aggregate to
+    // `DepositConfirmed` so the USDC->USD conversion leg completes.
+    RecoverDeposit,
 
     // Reconcile a stranded post-burn failure to the terminal `Reconciled`
     // state, clearing the rebalancing guard rather than re-driving the failed
@@ -2958,6 +2964,11 @@ enum UsdcRebalanceEvent {
         failed_tx_hash: Option<TxHash>,
         failed_at: DateTime<Utc>,
     },
+    // A BaseToAlpaca `DepositFailed` whose Alpaca deposit settled after the
+    // polling deadline. Un-fails the aggregate back to `DepositConfirmed`
+    // (carrying the original amount and tx hashes) so the conversion leg
+    // completes. Mirrors `BridgingCompletionRecovered`.
+    DepositCompletionRecovered { recovered_at: DateTime<Utc> },
     // Operator reconciled a stranded post-burn failure. Carries `direction` so
     // the reactor derives the source venue without in-memory tracking (which
     // may be absent after a restart), plus `amount` and `initiated_at` so the
@@ -4390,9 +4401,21 @@ named exemptions defined after the list:**
   bot's REST API; each transfer succeeds or fails independently).
 - `recheck` -- re-query the external provider for ground truth and apply it; may
   un-fail a terminal `Failed` operation or resume a non-terminal one along its
-  normal path. Requires the running bot (REST). Realized today for equity mints
-  and redemptions only; USDC rebalances have no provider recheck (use `resume`
-  while non-terminal, `reconcile` after a post-burn terminal failure).
+  normal path. Requires the running bot (REST). Realized for equity mints,
+  redemptions, and BaseToAlpaca USDC deposits (`--kind usdc`, by rebalance id):
+  a `DepositFailed` rebalance whose Alpaca deposit settled after the polling
+  deadline is verified against the exact transfer (single query by the persisted
+  send tx, no polling deadline), un-failed via `DepositCompletionRecovered` back
+  to `DepositConfirmed`, and driven through the USDC->USD conversion to the
+  normal terminal -- clearing the stranded in-progress guard through the live
+  reactor. A transfer Alpaca still reports pending or failed refuses without
+  touching the aggregate. A send tx that is absent from Alpaca's account-wide
+  transfer list is a separate, INCONCLUSIVE result: the list may be capped, so
+  absence is not proof the deposit never settled. The recheck reports
+  `not_detected_yet`, changes nothing, and the operator retries later. Other
+  USDC states keep their existing paths (`resume` while non-terminal,
+  `reconcile` for funds handled out-of-band rather than settled by the
+  provider).
 - `fail` -- force a stuck non-terminal operation to its clean `Failed` terminal
   so the system stops waiting on it; `--reason` required.
 - `reconcile` -- declare an already-terminal-failed operation resolved

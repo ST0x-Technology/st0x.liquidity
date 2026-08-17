@@ -13,7 +13,10 @@ pub(crate) use job::{
     TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
     TransferUsdcToMarketMakingJobQueue,
 };
-pub(crate) use manager::{CrossVenueCashTransfer, UsdcSettlementParams, u256_to_usdc};
+pub(crate) use manager::{
+    CrossVenueCashTransfer, RecheckUsdcDeposit, UsdcRecheckError, UsdcSettlementParams,
+    u256_to_usdc,
+};
 
 use std::time::Duration;
 
