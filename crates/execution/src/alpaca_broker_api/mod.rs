@@ -64,7 +64,7 @@ pub use executor::AlpacaBrokerApi;
 pub use journal::{JournalResponse, JournalStatus};
 pub use order::{
     AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, CryptoOrderOutcome,
-    CryptoOrderResponse, ParseAlpacaLimitPriceError, USDC_CONVERSION_COLLAR_MULTIPLIER,
+    CryptoOrderResponse, ParseAlpacaLimitPriceError,
 };
 
 impl fmt::Display for CryptoOrderFailureReason {

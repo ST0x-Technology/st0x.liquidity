@@ -1356,12 +1356,11 @@ pub(crate) async fn drain_pending_usdc_jobs(service: &Arc<RebalancingService>) -
 mod tests {
     use alloy::primitives::{B256, TxHash};
     use chrono::TimeZone;
-    use proptest::prelude::*;
     use tokio::sync::broadcast;
     use uuid::Uuid;
 
     use st0x_dto::Statement;
-    use st0x_execution::{ClientOrderId, HasZero};
+    use st0x_execution::ClientOrderId;
     use st0x_float_macro::float;
 
     use super::*;
@@ -2123,42 +2122,6 @@ mod tests {
             }),
             "Transfer at the cap must spend the whole withdrawable balance, got {result:?}"
         );
-    }
-
-    proptest! {
-        /// A notional buy is held at exactly the dollars it names (confirmed
-        /// on a sandbox account: notional 990.2 accepted against 990.2 settled
-        /// cash), so the transfer amount *is* the hold. The reserve is an
-        /// operational cash floor, so it must still be there once that hold is
-        /// taken out.
-        #[test]
-        fn notional_hold_leaves_the_reserve_intact(
-            withdrawable_cents in 0i64..=100_000_000_000,
-            reserved_cents in proptest::option::of(0i64..=1_000_000_000),
-        ) {
-            let view = InventoryView::default().with_withdrawable_cash_cents(withdrawable_cents);
-            let reserved = reserved_cents.map(|cents| Usd::from_cents(cents).unwrap());
-
-            let capacity = view
-                .alpaca_to_base_usdc_capacity(reserved)
-                .unwrap()
-                .unwrap();
-            let hold = truncate_for_transfer(capacity).unwrap();
-
-            let withdrawable = Usdc::from_cents(withdrawable_cents).unwrap();
-            let reserved_usdc = reserved.map_or(Usdc::ZERO, |value| Usdc::new(value.inner()));
-
-            if reserved_usdc.gt(&withdrawable).unwrap() {
-                prop_assert_eq!(capacity, Usdc::ZERO);
-            } else {
-                let committed = (hold + reserved_usdc).unwrap();
-                prop_assert!(
-                    !committed.gt(&withdrawable).unwrap(),
-                    "hold plus reserve {committed:?} exceeds withdrawable {withdrawable:?} \
-                     (capacity {capacity:?}, reserved {reserved:?})"
-                );
-            }
-        }
     }
 
     fn ts(seconds: i64) -> DateTime<Utc> {

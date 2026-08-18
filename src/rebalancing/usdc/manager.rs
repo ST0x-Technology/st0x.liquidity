@@ -593,8 +593,10 @@ impl<
     /// Used at the start of AlpacaToBase flow, before withdrawal.
     /// Places a buy order on USDC/USD and polls until filled.
     ///
-    /// Returns the actual filled USDC amount (may differ from requested
-    /// due to slippage).
+    /// `amount` is the USD to spend, not the USDC to receive: the buy names
+    /// dollars so it can be sized at all the cash available. The USDC bought
+    /// is always less -- Alpaca's collar takes ~2% of it, and slippage the
+    /// rest -- so the returned filled amount is what downstream steps use.
     ///
     /// # Event Sourcing Flow
     ///

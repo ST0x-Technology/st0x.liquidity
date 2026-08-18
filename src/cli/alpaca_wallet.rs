@@ -605,13 +605,15 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     amount: Usdc,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let direction_str = match direction {
-        ConvertDirection::ToUsd => "USDC → USD",
-        ConvertDirection::ToUsdc => "USD → USDC",
+    // The two directions are denominated differently: the sell names the
+    // USDC it holds, the buy names the dollars it spends.
+    let (direction_str, amount_str) = match direction {
+        ConvertDirection::ToUsd => ("USDC → USD", format!("{amount} USDC")),
+        ConvertDirection::ToUsdc => ("USD → USDC", format!("${amount}")),
     };
 
     writeln!(stdout, "Converting {direction_str} on Alpaca")?;
-    writeln!(stdout, "   Amount: {amount} USDC")?;
+    writeln!(stdout, "   Amount: {amount_str}")?;
 
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("alpaca-convert requires Alpaca Broker API configuration");
@@ -636,11 +638,20 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     writeln!(stdout, "Conversion completed successfully!")?;
     writeln!(stdout, "   Order ID: {}", order.id)?;
     writeln!(stdout, "   Symbol: {}", order.symbol)?;
-    writeln!(
-        stdout,
-        "   Quantity: {}",
-        format_float_with_fallback(&order.quantity)
-    )?;
+    if let Some(quantity) = order.quantity {
+        writeln!(
+            stdout,
+            "   Quantity: {}",
+            format_float_with_fallback(&quantity)
+        )?;
+    }
+    if let Some(notional) = order.notional {
+        writeln!(
+            stdout,
+            "   Notional: ${}",
+            format_float_with_fallback(&notional)
+        )?;
+    }
     writeln!(stdout, "   Status: {}", order.status_display())?;
     if let Some(price) = order.filled_average_price {
         writeln!(

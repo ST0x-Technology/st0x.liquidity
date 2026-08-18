@@ -230,15 +230,28 @@ pub(super) struct OrderResponse {
     pub failed_at: Option<DateTime<Utc>>,
 }
 
+/// How a crypto order is sized. Alpaca accepts exactly one of `qty` and
+/// `notional`, and which one is sent decides where its ~2% collar lands: a
+/// `qty` buy is held at `quantity x price x 1.02` and refused at 100% of
+/// settled cash, a `notional` buy at the dollars it names.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) enum CryptoOrderSize {
+    /// Base-asset units to trade (e.g. USDC).
+    #[serde(rename = "qty")]
+    Quantity(#[serde(serialize_with = "serialize_float_as_string")] Float),
+    /// USD to spend, letting the broker derive the quantity.
+    #[serde(rename = "notional")]
+    Notional(#[serde(serialize_with = "serialize_float_as_string")] Float),
+}
+
 /// Order request for crypto trading (e.g., USDC/USD conversion).
 /// Uses decimal quantity and trading pair symbol format.
 #[derive(Debug, Serialize)]
 pub(crate) struct CryptoOrderRequest {
     /// Trading pair symbol (e.g., "USDCUSD" for USDC/USD)
     pub symbol: String,
-    /// Quantity of the base asset (e.g., USDC amount)
-    #[serde(rename = "qty", serialize_with = "serialize_float_as_string")]
-    pub quantity: Float,
+    #[serde(flatten)]
+    pub size: CryptoOrderSize,
     pub side: OrderSide,
     #[serde(rename = "type")]
     pub order_type: &'static str,
@@ -253,11 +266,23 @@ pub(crate) struct CryptoOrderRequest {
 pub struct CryptoOrderResponse {
     pub id: Uuid,
     pub symbol: String,
+    /// Base-asset units requested, absent on an order placed by `notional`:
+    /// Alpaca derives the quantity from the fill and answers `"qty": null`
+    /// until then. Read `filled_quantity` for what was actually bought.
     #[serde(
         rename = "qty",
-        deserialize_with = "deserialize_float_from_number_or_string"
+        default,
+        deserialize_with = "deserialize_option_float_from_number_or_string"
     )]
-    pub quantity: Float,
+    pub quantity: Option<Float>,
+    /// USD requested, present only on an order placed by `notional`. Carried
+    /// so the partial-fill warning can still report what was asked for on the
+    /// direction that has no `qty`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_float_from_number_or_string"
+    )]
+    pub notional: Option<Float>,
     status: BrokerOrderStatus,
     #[serde(
         rename = "filled_avg_price",
@@ -869,21 +894,19 @@ fn validate_usdc_amount_for_alpaca_precision(amount: Float) -> Result<Float, Alp
     Ok(amount)
 }
 
-/// Multiplier for the USD that Alpaca reserves against a `USDCUSD` market buy.
-///
-/// Alpaca's documented 2% collar holds `quantity x price x 1.02` until fill,
-/// so callers sizing a buy from available cash must divide by this multiplier
-/// or the order is rejected with `403 40310000: insufficient balance`.
-///
-/// The extra 0.1% is a prod-observed margin: the hold tracks the ask, not par,
-/// and settled cash is all a crypto buy can draw on.
-pub const USDC_CONVERSION_COLLAR_MULTIPLIER: Float = float!(1.021);
-
 /// Convert USDC to/from USD on Alpaca.
 ///
 /// This uses the USDC/USD trading pair:
 /// - To convert USDC to USD buying power: sell USDC/USD
 /// - To convert USD buying power to USDC: buy USDC/USD
+///
+/// Each direction names the quantity it is actually constrained by, which is
+/// what keeps a conversion sized at everything available from being refused.
+/// The sell holds USDC and names USDC (`qty`). The buy is bounded by settled
+/// cash and names dollars (`notional`), so Alpaca's ~2% collar has nothing to
+/// inflate: the hold equals `amount`, and the collar shrinks the fill instead
+/// (`amount / 1.02` of USDC bought). Callers therefore size downstream steps
+/// from the fill, never from `amount`.
 pub(crate) async fn convert_usdc_usd(
     client: &AlpacaBrokerApiClient,
     amount: Float,
@@ -891,16 +914,20 @@ pub(crate) async fn convert_usdc_usd(
     client_order_id: &ClientOrderId,
 ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
     let placed_amount = validate_usdc_amount_for_alpaca_precision(amount)?;
-    let side = match direction {
-        ConversionDirection::UsdcToUsd => OrderSide::Sell,
-        ConversionDirection::UsdToUsdc => OrderSide::Buy,
+    let (side, order_size) = match direction {
+        ConversionDirection::UsdcToUsd => {
+            (OrderSide::Sell, CryptoOrderSize::Quantity(placed_amount))
+        }
+        ConversionDirection::UsdToUsdc => {
+            (OrderSide::Buy, CryptoOrderSize::Notional(placed_amount))
+        }
     };
 
-    debug!(?side, amount = ?placed_amount, %client_order_id, "Placing USDC/USD conversion order");
+    debug!(?side, ?order_size, %client_order_id, "Placing USDC/USD conversion order");
 
     let request = CryptoOrderRequest {
         symbol: "USDCUSD".to_string(),
-        quantity: placed_amount,
+        size: order_size,
         side,
         order_type: "market",
         time_in_force: "gtc",
@@ -1008,7 +1035,8 @@ pub(crate) async fn poll_crypto_order_until_filled(
                 target: "broker",
                 order_id = %order_id,
                 filled = ?settled.order.filled_quantity,
-                requested = ?settled.order.quantity,
+                requested_qty = ?settled.order.quantity,
+                requested_notional = ?settled.order.notional,
                 "Accepting partially filled conversion; remainder cancelled"
             );
             Ok(settled.order)
@@ -2830,7 +2858,7 @@ mod tests {
         mock.assert();
         assert_eq!(order.id.to_string(), "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(order.symbol, "USDCUSD");
-        assert!(order.quantity.eq(float!(1000.5)).unwrap());
+        assert!(order.quantity.unwrap().eq(float!(1000.5)).unwrap());
         assert_eq!(order.status_display(), "filled");
     }
 
@@ -2911,6 +2939,12 @@ mod tests {
         }))
         .unwrap();
 
+        assert!(
+            order.quantity.is_none(),
+            "a notional order names no quantity, got {:?}",
+            order.quantity
+        );
+        assert!(order.notional.unwrap().eq(float!(10)).unwrap());
         assert!(
             order
                 .filled_quantity
@@ -3769,7 +3803,8 @@ mod tests {
         let make_order = |status: BrokerOrderStatus| CryptoOrderResponse {
             id: Uuid::new_v4(),
             symbol: "USDCUSD".to_string(),
-            quantity: float!(100),
+            quantity: Some(float!(100)),
+            notional: None,
             status,
             filled_average_price: None,
             filled_quantity: None,

@@ -12,9 +12,7 @@ use tracing::{debug, error, warn};
 
 use st0x_config::ImbalanceThreshold;
 use st0x_dto::{InFlightCash, InFlightEquity, SymbolInventory, UsdcInventory};
-use st0x_execution::{
-    Direction, FractionalShares, HasZero, Symbol, USDC_CONVERSION_COLLAR_MULTIPLIER,
-};
+use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_finance::{Usd, Usdc};
 use st0x_tokenization::IssuerRequestId;
 use st0x_wrapper::{RatioError, UnderlyingPerWrapped};
@@ -918,11 +916,9 @@ impl InventoryView {
     /// distinct skip reason rather than treating it as "below minimum
     /// withdrawal."
     ///
-    /// The result is sized so the USD->USDC market buy that funds the
-    /// transfer can cover its own collared hold: Alpaca reserves
-    /// [`USDC_CONVERSION_COLLAR_MULTIPLIER`] times the requested quantity
-    /// until the buy fills, so capacity is the cash after the reserve
-    /// *divided by* that multiplier, not the full remainder.
+    /// The whole remainder is available: the USD->USDC buy that funds the
+    /// transfer names dollars, so Alpaca holds exactly the amount transferred
+    /// and there is no collar to leave headroom for.
     pub(crate) fn alpaca_to_base_usdc_capacity(
         &self,
         reserved: Option<Usd>,
@@ -938,10 +934,7 @@ impl InventoryView {
             return Ok(Some(Usdc::ZERO));
         }
 
-        let after_reserve = (withdrawable - reserved)?;
-        let capacity = (after_reserve.inner() / USDC_CONVERSION_COLLAR_MULTIPLIER)?;
-
-        Ok(Some(Usdc::new(capacity)))
+        Ok(Some((withdrawable - reserved)?))
     }
 
     /// Converts the in-memory inventory view to a DTO for dashboard serialization.
