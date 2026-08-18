@@ -6720,21 +6720,19 @@ mod tests {
     }
 
     #[test]
-    fn alpaca_to_base_capacity_divides_withdrawable_by_collar() {
-        // $102.10 withdrawable, no reserve: the USDCUSD market buy reserves
-        // the collar multiple of the requested quantity, so at most $100 of
-        // USDC can be bought.
+    fn alpaca_to_base_capacity_is_the_whole_withdrawable_cash() {
+        // $102.10 withdrawable, no reserve: the conversion names dollars, so
+        // Alpaca holds exactly what is named and every cent is spendable.
         let view = InventoryView::default().with_withdrawable_cash_cents(10_210);
 
         let capacity = view.alpaca_to_base_usdc_capacity(None).unwrap().unwrap();
 
-        assert_eq!(capacity, Usdc::new(float!(100)));
+        assert_eq!(capacity, Usdc::new(float!(102.10)));
     }
 
     #[test]
-    fn alpaca_to_base_capacity_divides_reserve_adjusted_cash_by_collar() {
-        // $352.10 withdrawable - $250 reserve = $102.10; divided by the
-        // collar multiplier leaves exactly $100 of purchasable USDC.
+    fn alpaca_to_base_capacity_is_the_cash_left_after_the_reserve() {
+        // $352.10 withdrawable - $250 reserve = $102.10, all of it spendable.
         let view = InventoryView::default().with_withdrawable_cash_cents(35_210);
 
         let capacity = view
@@ -6742,7 +6740,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(capacity, Usdc::new(float!(100)));
+        assert_eq!(capacity, Usdc::new(float!(102.10)));
     }
 
     #[test]

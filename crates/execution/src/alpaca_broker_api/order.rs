@@ -2847,7 +2847,7 @@ mod tests {
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
                 .json_body(json!({
                     "symbol": "USDCUSD",
-                    "qty": "500",
+                    "notional": "500",
                     "side": "buy",
                     "type": "market",
                     "time_in_force": "gtc",
@@ -2858,11 +2858,12 @@ mod tests {
                 .json_body(json!({
                     "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
                     "symbol": "USDCUSD",
-                    "qty": "500",
+                    "qty": null,
+                    "notional": "500",
                     "side": "buy",
                     "status": "filled",
-                    "filled_avg_price": "0.9999",
-                    "filled_qty": "500",
+                    "filled_avg_price": "1.00101001",
+                    "filled_qty": "489.700985",
                     "created_at": "2025-01-06T12:30:00Z"
                 }));
         });
@@ -2882,7 +2883,41 @@ mod tests {
         mock.assert();
         assert_eq!(order.id.to_string(), "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(order.symbol, "USDCUSD");
-        assert!(order.quantity.eq(float!(500)).unwrap());
+        assert!(
+            order
+                .filled_quantity
+                .unwrap()
+                .eq(float!(489.700985))
+                .unwrap()
+        );
+        assert_eq!(order.status_display(), "filled");
+    }
+
+    /// A notional order names dollars, so Alpaca answers with `qty: null` and
+    /// reports the USDC actually bought in `filled_qty` -- the collar shows up
+    /// as the gap between the two (observed on a sandbox account: notional 10
+    /// filled 9.794019706 at 1.00101001).
+    #[tokio::test]
+    async fn notional_conversion_response_carries_no_requested_quantity() {
+        let order: CryptoOrderResponse = serde_json::from_value(json!({
+            "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "symbol": "USDCUSD",
+            "qty": null,
+            "notional": "10",
+            "status": "filled",
+            "filled_avg_price": "1.00101001",
+            "filled_qty": "9.794019706",
+            "created_at": "2025-01-06T12:30:00Z"
+        }))
+        .unwrap();
+
+        assert!(
+            order
+                .filled_quantity
+                .unwrap()
+                .eq(float!(9.794019706))
+                .unwrap()
+        );
         assert_eq!(order.status_display(), "filled");
     }
 

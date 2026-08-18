@@ -1714,8 +1714,8 @@ mod tests {
 
     #[tokio::test]
     async fn alpaca_to_base_is_capped_by_withdrawable_cash_after_reserve() {
-        // $352.10 withdrawable - $250 reserve = $102.10; divided by the
-        // conversion collar multiplier -> capacity = $100.
+        // $352.10 withdrawable - $250 reserve = $102.10, all of which the
+        // dollar-denominated conversion can spend -> capacity = $102.10.
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default()
@@ -1740,9 +1740,9 @@ mod tests {
         assert_eq!(
             result,
             Ok(UsdcRebalanceOperation::AlpacaToBase {
-                amount: Usdc::new(float!(100))
+                amount: Usdc::new(float!(102.10))
             }),
-            "Expected reserve-adjusted withdrawable capacity to cap transfer to 100, got {result:?}"
+            "Expected reserve-adjusted withdrawable capacity to cap transfer to 102.10, got {result:?}"
         );
     }
 
@@ -1839,8 +1839,8 @@ mod tests {
         );
 
         // Polling-side recovery: withdrawable cash arrives with enough
-        // headroom over the reserve (and the conversion collar) to fund the
-        // transfer: (352.10 - 250) / collar = capacity of exactly $100.
+        // headroom over the reserve to fund the transfer:
+        // 352.10 - 250 = capacity of exactly $102.10.
         {
             let mut guard = inventory.write().await;
             let taken = std::mem::take(&mut *guard);
@@ -1855,7 +1855,7 @@ mod tests {
         assert_eq!(
             after,
             Ok(UsdcRebalanceOperation::AlpacaToBase {
-                amount: Usdc::new(float!(100))
+                amount: Usdc::new(float!(102.10))
             }),
             "Post-recovery trigger must dispatch the reserve-aware capped transfer, got {after:?}"
         );
@@ -1927,7 +1927,7 @@ mod tests {
     async fn alpaca_to_base_is_capped_by_withdrawable_cash_with_no_reserve() {
         // 100 onchain / 500 offchain -> excess = 200; withdrawable = $153.15
         // (below excess). With no reserve, the withdrawable cap must still
-        // apply, collar-adjusted -> transfer capped at 150.
+        // apply -> transfer capped at 153.15.
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default()
@@ -1946,27 +1946,24 @@ mod tests {
         assert_eq!(
             result,
             Ok(UsdcRebalanceOperation::AlpacaToBase {
-                amount: Usdc::new(float!(150))
+                amount: Usdc::new(float!(153.15))
             }),
-            "Withdrawable cap must apply even with no reserve configured; expected 150, got {result:?}"
+            "Withdrawable cap must apply even with no reserve configured; expected 153.15, got {result:?}"
         );
     }
 
     #[tokio::test]
     async fn alpaca_to_base_proceeds_when_capacity_just_clears_minimum_no_reserve() {
-        // 100 onchain / 500 offchain -> excess = 200. $52.08 withdrawable is
-        // the smallest whole-cent balance whose collar-adjusted capacity
-        // clears the $51 minimum, so this pins the proceed side of the
-        // boundary to within one cent of input. (Capacity landing exactly on
-        // $51 is unreachable: no whole-cent balance divides by the collar
-        // multiplier to $51, so `lt` versus `le` is no longer separable from
-        // this entry point.)
+        // 100 onchain / 500 offchain -> excess = 200. Capacity is now the
+        // withdrawable cash itself, so $51.00 lands exactly on the minimum:
+        // this pins the proceed side of the boundary and separates `lt` from
+        // `le` -- a `le` comparison would wrongly skip here.
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default()
                 .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
                 .with_offchain_gross_usd_cents(50_000)
-                .with_withdrawable_cash_cents(5_208),
+                .with_withdrawable_cash_cents(5_100),
             event_sender,
         ));
         let threshold = ImbalanceThreshold {
@@ -1979,22 +1976,22 @@ mod tests {
         assert_eq!(
             result,
             Ok(UsdcRebalanceOperation::AlpacaToBase {
-                amount: Usdc::new(float!(51.008814))
+                amount: Usdc::new(float!(51))
             }),
-            "Capacity just above the $51 minimum must not skip, got {result:?}"
+            "Capacity exactly at the $51 minimum must not skip, got {result:?}"
         );
     }
 
     #[tokio::test]
     async fn alpaca_to_base_skips_one_cent_below_the_capacity_minimum() {
-        // The skip side of the same boundary: $52.07 withdrawable is one cent
-        // less than the test above, leaving capacity a whisker under $51.
+        // The skip side of the same boundary: $50.99 withdrawable is one cent
+        // less than the test above, leaving capacity just under $51.
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default()
                 .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
                 .with_offchain_gross_usd_cents(50_000)
-                .with_withdrawable_cash_cents(5_207),
+                .with_withdrawable_cash_cents(5_099),
             event_sender,
         ));
         let threshold = ImbalanceThreshold {
@@ -2014,9 +2011,9 @@ mod tests {
     #[tokio::test]
     async fn alpaca_to_base_withdrawable_binds_below_operational_limit_with_no_reserve() {
         // 100 onchain / 900 offchain -> excess = 400; usdc_limit = $200;
-        // withdrawable = $153.15 -> collar-adjusted capacity = $150. Both the
-        // $200 operational limit and the $150 capacity are below the $400
-        // excess. Capacity ($150) is the tighter bound and must be the final
+        // withdrawable = $153.15 -> capacity = $153.15. Both the $200
+        // operational limit and the $153.15 capacity are below the $400
+        // excess. Capacity is the tighter bound and must be the final
         // transfer amount.
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
@@ -2038,9 +2035,9 @@ mod tests {
         assert_eq!(
             result,
             Ok(UsdcRebalanceOperation::AlpacaToBase {
-                amount: Usdc::new(float!(150))
+                amount: Usdc::new(float!(153.15))
             }),
-            "Capacity ($150) must bind below the operational limit ($200); expected 150, got {result:?}"
+            "Capacity ($153.15) must bind below the operational limit ($200); expected 153.15, got {result:?}"
         );
     }
 
@@ -2095,21 +2092,15 @@ mod tests {
         );
     }
 
-    /// The worst hold ratio seen in production, used to check sizing against
-    /// observed broker behaviour rather than against the multiplier the code
-    /// itself divides by. Alpaca's hold tracks the ask, not par, so the
-    /// effective ratio runs fractionally above the documented 2% collar; a
-    /// sizing rule that only satisfies the nominal collar is not safe.
-    const OBSERVED_WORST_HOLD_RATIO: Float = float!(1.0201);
-
     #[tokio::test]
-    async fn alpaca_to_base_transfer_at_the_cap_funds_its_own_conversion_collar() {
+    async fn alpaca_to_base_transfer_at_the_cap_spends_the_whole_withdrawable_cash() {
         // Regression for the prod failure behind this sizing rule: a
         // withdrawable balance well below the target transfer, no reserve.
-        // The old sizing requested the full withdrawable balance and the
-        // USDCUSD market buy reserved the collar multiple of it, returning
-        // 403 40310000 (insufficient balance) every time. The transfer must
-        // instead be sized so its collared hold fits inside withdrawable cash.
+        // Sizing the USDCUSD buy by quantity had Alpaca reserve the collar
+        // multiple of it, returning 403 40310000 (insufficient balance) at
+        // 100% of settled cash. Naming dollars instead makes the hold equal
+        // the amount named, so the cap is the withdrawable balance itself and
+        // nothing is left behind for a later cycle.
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default()
@@ -2128,29 +2119,20 @@ mod tests {
         assert_eq!(
             result,
             Ok(UsdcRebalanceOperation::AlpacaToBase {
-                amount: Usdc::new(float!(5726.787463))
+                amount: Usdc::new(float!(5847.05))
             }),
-            "Transfer at the cap must leave room for the conversion collar, got {result:?}"
-        );
-
-        let Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) = result else {
-            unreachable!("asserted above");
-        };
-        let hold = (amount.inner() * OBSERVED_WORST_HOLD_RATIO).unwrap();
-        assert!(
-            !hold.gt(float!(5847.05)).unwrap(),
-            "Hold {hold:?} at the observed worst ratio must not exceed withdrawable cash 5847.05"
+            "Transfer at the cap must spend the whole withdrawable balance, got {result:?}"
         );
     }
 
     proptest! {
-        /// Sizing must survive the hold ratio actually seen at the broker, not
-        /// merely the multiplier the capacity calculation divides by —
-        /// asserting the latter would only restate the implementation. The
-        /// reserve is an operational cash floor, so it must still be there
-        /// once the broker's hold is taken out.
+        /// A notional buy is held at exactly the dollars it names (confirmed
+        /// on a sandbox account: notional 990.2 accepted against 990.2 settled
+        /// cash), so the transfer amount *is* the hold. The reserve is an
+        /// operational cash floor, so it must still be there once that hold is
+        /// taken out.
         #[test]
-        fn hold_at_observed_ratio_leaves_the_reserve_intact(
+        fn notional_hold_leaves_the_reserve_intact(
             withdrawable_cents in 0i64..=100_000_000_000,
             reserved_cents in proptest::option::of(0i64..=1_000_000_000),
         ) {
@@ -2161,9 +2143,8 @@ mod tests {
                 .alpaca_to_base_usdc_capacity(reserved)
                 .unwrap()
                 .unwrap();
-            let amount = truncate_for_transfer(capacity).unwrap();
+            let hold = truncate_for_transfer(capacity).unwrap();
 
-            let hold = Usdc::new((amount.inner() * OBSERVED_WORST_HOLD_RATIO).unwrap());
             let withdrawable = Usdc::from_cents(withdrawable_cents).unwrap();
             let reserved_usdc = reserved.map_or(Usdc::ZERO, |value| Usdc::new(value.inner()));
 
