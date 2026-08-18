@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     CancellationOutcome, ClientOrderId, Direction, ExecutorOrderId, FractionalShares, MarketOrder,
-    OrderFailureTerminality, OrderPlacement, OrderStatus, OrderUpdate, Positive, Symbol, Usd,
+    OrderFailureTerminality, OrderPlacement, OrderStatus, OrderUpdate, Positive, Symbol, Usd, Usdc,
     deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
     serialize_float_as_string,
 };
@@ -63,6 +63,33 @@ pub enum ConversionDirection {
     UsdcToUsd,
     /// Convert USD buying power to USDC (buy USDC/USD)
     UsdToUsdc,
+}
+
+/// A USDC/USD conversion to place, carrying its amount in the unit that
+/// direction is denominated in.
+///
+/// The two directions are not interchangeable quantities -- the sell names the
+/// USDC it holds, the buy names the dollars it spends -- so the amount travels
+/// with the direction that gives it meaning rather than as a bare number
+/// alongside it. A caller cannot hand a USDC balance to the buy leg without
+/// saying, in the type, that it means dollars.
+#[derive(Debug, Clone, Copy)]
+pub enum ConversionOrder {
+    /// Sell this much USDC for USD buying power.
+    SellUsdc(Usdc),
+    /// Spend this many dollars buying USDC.
+    BuyWithUsd(Usd),
+}
+
+impl ConversionOrder {
+    /// The direction this order converts in, for the callers that record the
+    /// settled amounts against it.
+    pub const fn direction(&self) -> ConversionDirection {
+        match self {
+            Self::SellUsdc(_) => ConversionDirection::UsdcToUsd,
+            Self::BuyWithUsd(_) => ConversionDirection::UsdToUsdc,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -936,24 +963,24 @@ fn truncate_notional_to_whole_cents(amount: Float) -> Result<Float, AlpacaBroker
 /// what keeps a conversion sized at everything available from being refused.
 /// The sell holds USDC and names USDC (`qty`). The buy is bounded by settled
 /// cash and names dollars (`notional`), so Alpaca's ~2% collar has nothing to
-/// inflate: the hold equals `amount`, and the collar and execution price
-/// instead bound the fill to less USDC than the dollars named. The buy is also
-/// truncated to whole cents, which is all Alpaca accepts in a notional.
-/// Callers therefore size downstream steps from the fill, never from `amount`.
+/// inflate: the hold equals the dollars named, and the collar and execution
+/// price instead bound the fill to less USDC than those dollars. The buy is
+/// also truncated to whole cents, which is all Alpaca accepts in a notional.
+/// Callers therefore size downstream steps from the fill, never from the
+/// amount requested.
 pub(crate) async fn convert_usdc_usd(
     client: &AlpacaBrokerApiClient,
-    amount: Float,
-    direction: ConversionDirection,
+    order: ConversionOrder,
     client_order_id: &ClientOrderId,
 ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
-    let (side, order_size) = match direction {
-        ConversionDirection::UsdcToUsd => (
+    let (side, order_size) = match order {
+        ConversionOrder::SellUsdc(quantity) => (
             OrderSide::Sell,
-            CryptoOrderSize::Quantity(validate_usdc_amount_for_alpaca_precision(amount)?),
+            CryptoOrderSize::Quantity(validate_usdc_amount_for_alpaca_precision(quantity.inner())?),
         ),
-        ConversionDirection::UsdToUsdc => (
+        ConversionOrder::BuyWithUsd(dollars) => (
             OrderSide::Buy,
-            CryptoOrderSize::Notional(truncate_notional_to_whole_cents(amount)?),
+            CryptoOrderSize::Notional(truncate_notional_to_whole_cents(dollars.inner())?),
         ),
     };
 
@@ -2878,12 +2905,9 @@ mod tests {
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let amount = float!(1000.5);
-
         let order = convert_usdc_usd(
             &client,
-            amount,
-            ConversionDirection::UsdcToUsd,
+            ConversionOrder::SellUsdc(Usdc::new(float!(1000.5))),
             &client_order_id,
         )
         .await
@@ -2931,12 +2955,9 @@ mod tests {
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let amount = float!(500);
-
         let order = convert_usdc_usd(
             &client,
-            amount,
-            ConversionDirection::UsdToUsdc,
+            ConversionOrder::BuyWithUsd(Usd::new(float!(500))),
             &client_order_id,
         )
         .await
@@ -3032,8 +3053,7 @@ mod tests {
 
         convert_usdc_usd(
             &client,
-            float!(5726.787463),
-            ConversionDirection::UsdToUsdc,
+            ConversionOrder::BuyWithUsd(Usd::new(float!(5726.787463))),
             &client_order_id,
         )
         .await
@@ -3050,8 +3070,7 @@ mod tests {
 
         let error = convert_usdc_usd(
             &client,
-            float!(0.004),
-            ConversionDirection::UsdToUsdc,
+            ConversionOrder::BuyWithUsd(Usd::new(float!(0.004))),
             &ClientOrderId::from_uuid(uuid!("44444444-4444-4444-8444-444444444444")),
         )
         .await
@@ -3712,8 +3731,7 @@ mod tests {
 
         let error = convert_usdc_usd(
             &client,
-            float!(1000.1234567),
-            ConversionDirection::UsdcToUsd,
+            ConversionOrder::SellUsdc(Usdc::new(float!(1000.1234567))),
             &ClientOrderId::from_uuid(Uuid::new_v4()),
         )
         .await

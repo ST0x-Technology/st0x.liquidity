@@ -63,7 +63,7 @@ pub use client::HTTP_REQUEST_TIMEOUT;
 pub use executor::AlpacaBrokerApi;
 pub use journal::{JournalResponse, JournalStatus};
 pub use order::{
-    AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, CryptoOrderOutcome,
+    AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, ConversionOrder, CryptoOrderOutcome,
     CryptoOrderResponse, ParseAlpacaLimitPriceError,
 };
 

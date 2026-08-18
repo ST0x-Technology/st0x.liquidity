@@ -7,11 +7,11 @@ use uuid::Uuid;
 
 use st0x_evm::{Evm, IERC20, IntoErrorRegistry, USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA, Wallet};
 use st0x_execution::{
-    AlpacaAccountId, AlpacaBrokerApi, AlpacaWalletService, ClientOrderId, ConversionDirection,
+    AlpacaAccountId, AlpacaBrokerApi, AlpacaWalletService, ClientOrderId, ConversionOrder,
     Executor, FractionalShares, Network, Positive, Symbol, TokenSymbol, TransferStatus,
     TravelRuleInfo, WhitelistEntry, WhitelistStatus,
 };
-use st0x_finance::Usdc;
+use st0x_finance::{Usd, Usdc};
 use st0x_float_serde::format_float_with_fallback;
 
 use super::ConvertDirection;
@@ -624,18 +624,20 @@ pub(super) async fn alpaca_convert_command<W: Write>(
 
     let executor = AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?;
 
-    let conversion_direction = match direction {
-        ConvertDirection::ToUsd => ConversionDirection::UsdcToUsd,
-        ConvertDirection::ToUsdc => ConversionDirection::UsdToUsdc,
+    // The parsed amount is one number either way; which unit it carries is
+    // decided here, once, rather than being implied by the direction further
+    // down the call chain.
+    let conversion = match direction {
+        ConvertDirection::ToUsd => ConversionOrder::SellUsdc(amount),
+        ConvertDirection::ToUsdc => ConversionOrder::BuyWithUsd(Usd::new(amount.inner())),
     };
 
-    let amount_exact = amount.inner();
     let correlation_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
     writeln!(stdout, "   Placing market order...")?;
 
     let order = executor
-        .convert_usdc_usd(amount_exact, conversion_direction, &correlation_id)
+        .convert_usdc_usd(conversion, &correlation_id)
         .await?;
 
     writeln!(stdout, "Conversion completed successfully!")?;
