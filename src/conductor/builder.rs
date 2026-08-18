@@ -138,7 +138,7 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     /// `None` only when no wallet is configured (the bot can then never hold
     /// onchain wrapped equity in the first place). Independent of whether
     /// rebalancing itself is enabled -- a wallet can be configured for
-    /// trading alone (`TradingMode::Standalone`), and market making still
+    /// trading alone (the removed Standalone topology), and market making still
     /// holds wrapped vault shares onchain in that mode.
     pub(crate) wrapper: Option<Arc<dyn Wrapper>>,
     pub(crate) shutdown_token: CancellationToken,

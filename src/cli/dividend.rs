@@ -144,7 +144,7 @@ mod tests {
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
         AssetsConfig, BrokerCtx, EquitiesConfig, EvmCtx, ExecutionThreshold, IngestionCutoff,
-        InventoryAdapters, InventoryMode, LogLevel, TradingMode,
+        InventoryAdapters, InventoryMode, LogLevel,
     };
 
     use super::*;
@@ -225,7 +225,7 @@ mod tests {
             telemetry: None,
             alerts: None,
             pricing: None,
-            trading_mode: TradingMode::Standalone,
+            rebalancing: st0x_config::default_test_rebalancing_ctx(),
             order_owner: Address::ZERO,
             wallet: None,
             wallet_meta: None,
