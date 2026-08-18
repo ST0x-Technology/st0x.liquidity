@@ -518,3 +518,21 @@ extended_hours_counter_trading = "disabled"
 vault_id = "0xfab"
 tokenized_equity = "0xcA1A378F9a250131A2fE51c10f120FeF7EDCa56E"
 tokenized_equity_derivative = "0x295e9eCAb319006900a53b3f8D6Fcb0C131F4ada"
+
+[assets.equities.FTF]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x51d5c8c8040358686952a30fac116aac32390d6a"
+tokenized_equity_derivative = "0x9bDe199Ac6E7E050334306D9267c93e3D6d38333"
+
+[assets.equities.CBRS]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0xbeb0c2011bd5520a0998b69132e9245e39ac5d1d"
+tokenized_equity_derivative = "0xB457cfBF31995d3aAAa704dA9999cC0b011820ca"
