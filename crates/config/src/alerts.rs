@@ -19,9 +19,14 @@ use thiserror::Error;
 pub struct AlertsConfig {
     /// Telegram chat id alerts are delivered to.
     pub chat_id: i64,
-    /// Native-ETH balance threshold, expressed as a decimal-ETH string (e.g.
-    /// `"0.05"`). Parsed to wei at load time so a malformed value fails fast.
-    pub low_balance_threshold: String,
+    /// Base native-ETH balance threshold, expressed as a decimal-ETH string
+    /// (e.g. `"0.05"`). Parsed to wei at load time so a malformed value fails
+    /// fast.
+    pub base_low_balance_threshold: String,
+    /// Ethereum native-ETH balance threshold, expressed as a decimal-ETH
+    /// string. Required independently from the Base threshold so neither chain
+    /// can silently inherit the other's operational limit.
+    pub ethereum_low_balance_threshold: String,
     /// Seconds between native-balance polls.
     pub poll_interval: u64,
     /// Minimum seconds between repeated low-balance alerts while the balance
@@ -59,8 +64,10 @@ impl std::fmt::Debug for AlertsSecrets {
 pub struct AlertsCtx {
     pub chat_id: i64,
     pub bot_token: String,
-    /// Low-balance threshold in wei, parsed from the decimal-ETH config string.
-    pub low_balance_threshold_wei: U256,
+    /// Base low-balance threshold in wei.
+    pub base_low_balance_threshold_wei: U256,
+    /// Ethereum low-balance threshold in wei.
+    pub ethereum_low_balance_threshold_wei: U256,
     pub poll_interval: std::time::Duration,
     pub realert_interval: std::time::Duration,
     /// Forum topic to deliver alerts into, or `None` for the default topic.
@@ -72,7 +79,14 @@ impl std::fmt::Debug for AlertsCtx {
         f.debug_struct("AlertsCtx")
             .field("chat_id", &self.chat_id)
             .field("bot_token", &"[REDACTED]")
-            .field("low_balance_threshold_wei", &self.low_balance_threshold_wei)
+            .field(
+                "base_low_balance_threshold_wei",
+                &self.base_low_balance_threshold_wei,
+            )
+            .field(
+                "ethereum_low_balance_threshold_wei",
+                &self.ethereum_low_balance_threshold_wei,
+            )
             .field("poll_interval", &self.poll_interval)
             .field("realert_interval", &self.realert_interval)
             .field("message_thread_id", &self.message_thread_id)
@@ -99,20 +113,20 @@ impl AlertsCtx {
                     });
                 }
 
-                let low_balance_threshold_wei = parse_ether(&config.low_balance_threshold)
-                    .map_err(|source| AlertsAssemblyError::InvalidThreshold {
-                        value: config.low_balance_threshold.clone(),
-                        source,
-                    })?;
-
-                if low_balance_threshold_wei.is_zero() {
-                    return Err(AlertsAssemblyError::ZeroThreshold);
-                }
+                let base_low_balance_threshold_wei = parse_threshold(
+                    "base_low_balance_threshold",
+                    &config.base_low_balance_threshold,
+                )?;
+                let ethereum_low_balance_threshold_wei = parse_threshold(
+                    "ethereum_low_balance_threshold",
+                    &config.ethereum_low_balance_threshold,
+                )?;
 
                 Ok(Some(Self {
                     chat_id: config.chat_id,
                     bot_token: secrets.bot_token,
-                    low_balance_threshold_wei,
+                    base_low_balance_threshold_wei,
+                    ethereum_low_balance_threshold_wei,
                     poll_interval: std::time::Duration::from_secs(config.poll_interval),
                     realert_interval: std::time::Duration::from_secs(config.realert_interval),
                     message_thread_id: config.message_thread_id,
@@ -125,6 +139,20 @@ impl AlertsCtx {
     }
 }
 
+fn parse_threshold(field: &'static str, value: &str) -> Result<U256, AlertsAssemblyError> {
+    let threshold = parse_ether(value).map_err(|source| AlertsAssemblyError::InvalidThreshold {
+        field,
+        value: value.to_owned(),
+        source,
+    })?;
+
+    if threshold.is_zero() {
+        return Err(AlertsAssemblyError::ZeroThreshold { field });
+    }
+
+    Ok(threshold)
+}
+
 #[derive(Debug, Error)]
 pub enum AlertsAssemblyError {
     #[error("[alerts] config present but [alerts] secrets (bot_token) missing")]
@@ -133,10 +161,11 @@ pub enum AlertsAssemblyError {
     ConfigMissing,
     #[error("[alerts] {field} must be non-zero")]
     ZeroInterval { field: &'static str },
-    #[error("[alerts] low_balance_threshold must be greater than zero")]
-    ZeroThreshold,
-    #[error("[alerts] low_balance_threshold {value} is not a valid decimal-ETH amount")]
+    #[error("[alerts] {field} must be greater than zero")]
+    ZeroThreshold { field: &'static str },
+    #[error("[alerts] {field} {value} is not a valid decimal-ETH amount")]
     InvalidThreshold {
+        field: &'static str,
         value: String,
         #[source]
         source: UnitsError,
@@ -150,7 +179,8 @@ mod tests {
     fn valid_config() -> AlertsConfig {
         AlertsConfig {
             chat_id: -1_001_234_567_890,
-            low_balance_threshold: "0.05".to_owned(),
+            base_low_balance_threshold: "0.05".to_owned(),
+            ethereum_low_balance_threshold: "0.01".to_owned(),
             poll_interval: 300,
             realert_interval: 3600,
             message_thread_id: None,
@@ -164,6 +194,42 @@ mod tests {
     }
 
     #[test]
+    fn config_requires_base_threshold() {
+        let error = toml::from_str::<AlertsConfig>(
+            r#"
+            chat_id = 1
+            ethereum_low_balance_threshold = "0.01"
+            poll_interval = 300
+            realert_interval = 3600
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("base_low_balance_threshold"),
+            "missing Base threshold must fail explicitly, got: {error}"
+        );
+    }
+
+    #[test]
+    fn config_requires_ethereum_threshold() {
+        let error = toml::from_str::<AlertsConfig>(
+            r#"
+            chat_id = 1
+            base_low_balance_threshold = "0.05"
+            poll_interval = 300
+            realert_interval = 3600
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("ethereum_low_balance_threshold"),
+            "missing Ethereum threshold must fail explicitly, got: {error}"
+        );
+    }
+
+    #[test]
     fn new_parses_threshold_and_intervals() {
         let ctx = AlertsCtx::new(Some(valid_config()), Some(valid_secrets()))
             .unwrap()
@@ -173,8 +239,12 @@ mod tests {
         assert_eq!(ctx.bot_token, "123:abc");
         // 0.05 ETH = 5 * 10^16 wei.
         assert_eq!(
-            ctx.low_balance_threshold_wei,
+            ctx.base_low_balance_threshold_wei,
             U256::from(50_000_000_000_000_000_u64)
+        );
+        assert_eq!(
+            ctx.ethereum_low_balance_threshold_wei,
+            U256::from(10_000_000_000_000_000_u64)
         );
         assert_eq!(ctx.poll_interval, std::time::Duration::from_secs(300));
         assert_eq!(ctx.realert_interval, std::time::Duration::from_secs(3600));
@@ -203,15 +273,28 @@ mod tests {
     }
 
     #[test]
-    fn new_fails_fast_on_bad_threshold() {
+    fn new_fails_fast_on_bad_base_threshold() {
         let mut config = valid_config();
-        config.low_balance_threshold = "not-a-number".to_owned();
+        config.base_low_balance_threshold = "not-a-number".to_owned();
 
         let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
 
         assert!(
-            matches!(error, AlertsAssemblyError::InvalidThreshold { ref value, .. } if value == "not-a-number"),
-            "expected InvalidThreshold carrying the offending value, got: {error}"
+            matches!(error, AlertsAssemblyError::InvalidThreshold { field: "base_low_balance_threshold", ref value, .. } if value == "not-a-number"),
+            "expected InvalidThreshold carrying the Base field and offending value, got: {error}"
+        );
+    }
+
+    #[test]
+    fn new_fails_fast_on_bad_ethereum_threshold() {
+        let mut config = valid_config();
+        config.ethereum_low_balance_threshold = "not-a-number".to_owned();
+
+        let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
+
+        assert!(
+            matches!(error, AlertsAssemblyError::InvalidThreshold { field: "ethereum_low_balance_threshold", ref value, .. } if value == "not-a-number"),
+            "expected InvalidThreshold carrying the Ethereum field and offending value, got: {error}"
         );
     }
 
@@ -234,14 +317,36 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_zero_threshold() {
+    fn new_rejects_zero_base_threshold() {
         let mut config = valid_config();
-        config.low_balance_threshold = "0".to_owned();
+        config.base_low_balance_threshold = "0".to_owned();
 
         let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
         assert!(
-            matches!(error, AlertsAssemblyError::ZeroThreshold),
-            "expected ZeroThreshold, got: {error}"
+            matches!(
+                error,
+                AlertsAssemblyError::ZeroThreshold {
+                    field: "base_low_balance_threshold"
+                }
+            ),
+            "expected ZeroThreshold for Base, got: {error}"
+        );
+    }
+
+    #[test]
+    fn new_rejects_zero_ethereum_threshold() {
+        let mut config = valid_config();
+        config.ethereum_low_balance_threshold = "0".to_owned();
+
+        let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AlertsAssemblyError::ZeroThreshold {
+                    field: "ethereum_low_balance_threshold"
+                }
+            ),
+            "expected ZeroThreshold for Ethereum, got: {error}"
         );
     }
 

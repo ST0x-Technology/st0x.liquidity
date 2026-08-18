@@ -34,6 +34,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{error, info, warn};
 
 use crate::alerts::Notifier;
+use crate::bot_gas::BotGasChain;
 
 /// Reads the native balance of an address, abstracted so the monitor's
 /// threshold logic can be driven with canned values in tests instead of a
@@ -49,8 +50,7 @@ pub(crate) trait BalanceReader: Send + Sync {
 #[error("failed to read native balance")]
 pub(crate) struct BalanceReadError(#[source] Box<dyn std::error::Error + Send + Sync>);
 
-/// [`BalanceReader`] backed by an alloy [`Provider`] (the Base/orderbook-chain
-/// provider the conductor already owns).
+/// [`BalanceReader`] backed by the Alloy [`Provider`] for the monitored chain.
 pub(crate) struct ProviderBalanceReader<Prov> {
     provider: Prov,
 }
@@ -142,8 +142,7 @@ pub(crate) struct GasMonitor {
     pub(crate) balance_reader: Arc<dyn BalanceReader>,
     pub(crate) notifier: Arc<dyn Notifier>,
     pub(crate) wallet: Address,
-    /// Human-readable chain label included in logs and alert text.
-    pub(crate) chain: &'static str,
+    pub(crate) chain: BotGasChain,
     pub(crate) threshold_wei: U256,
     pub(crate) poll_interval: Duration,
     pub(crate) realert_interval: Duration,
@@ -161,7 +160,7 @@ impl GasMonitor {
                     target: "gas",
                     ?error,
                     wallet = %self.wallet,
-                    chain = self.chain,
+                    chain = %self.chain,
                     "Failed to read native balance; will retry next tick"
                 );
                 return state;
@@ -184,16 +183,16 @@ impl GasMonitor {
     /// Emits the log line and notification appropriate for `outcome`. Quiet
     /// outcomes (`StillHealthy`, `StillLowSuppressed`) produce no output.
     async fn act_on_outcome(&self, outcome: PollOutcome, balance: U256) {
-        let balance_eth = format_ether(balance);
-        let threshold_eth = format_ether(self.threshold_wei);
-
         match outcome {
             PollOutcome::StillHealthy | PollOutcome::StillLowSuppressed => {}
             PollOutcome::DroppedBelow | PollOutcome::StillLowRealert => {
+                let balance_eth = format_ether(balance);
+                let threshold_eth = format_ether(self.threshold_wei);
+
                 error!(
                     target: "gas",
                     wallet = %self.wallet,
-                    chain = self.chain,
+                    chain = %self.chain,
                     balance_eth = %balance_eth,
                     threshold_eth = %threshold_eth,
                     "Wallet native-gas balance is below threshold"
@@ -206,10 +205,13 @@ impl GasMonitor {
                 self.send(&message).await;
             }
             PollOutcome::Recovered => {
+                let balance_eth = format_ether(balance);
+                let threshold_eth = format_ether(self.threshold_wei);
+
                 info!(
                     target: "gas",
                     wallet = %self.wallet,
-                    chain = self.chain,
+                    chain = %self.chain,
                     balance_eth = %balance_eth,
                     threshold_eth = %threshold_eth,
                     "Wallet native-gas balance recovered above threshold"
@@ -242,7 +244,7 @@ impl SupervisedTask for GasMonitor {
         info!(
             target: "gas",
             wallet = %self.wallet,
-            chain = self.chain,
+            chain = %self.chain,
             threshold_eth = %format_ether(self.threshold_wei),
             "Gas monitor started"
         );
@@ -317,7 +319,7 @@ mod tests {
             balance_reader: Arc::new(StaticBalanceReader { balance, fail }),
             notifier,
             wallet: Address::ZERO,
-            chain: "base",
+            chain: BotGasChain::Base,
             threshold_wei: U256::from(100u64),
             poll_interval: Duration::from_secs(60),
             realert_interval: Duration::from_secs(3600),
@@ -325,9 +327,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn below_threshold_alerts_and_logs_drop() {
+    async fn ethereum_below_threshold_alert_identifies_chain() {
         let notifier = Arc::new(CapturingNotifier::new());
-        let monitor = monitor_with(U256::from(50u64), false, notifier.clone());
+        let mut monitor = monitor_with(U256::from(50u64), false, notifier.clone());
+        monitor.chain = BotGasChain::Ethereum;
 
         let now = Instant::now();
         let next = monitor.poll_once(AlertState::Normal, now).await;
@@ -335,10 +338,13 @@ mod tests {
         assert_eq!(next, AlertState::Low { last_alerted: now });
         let messages = notifier.messages();
         assert_eq!(messages.len(), 1, "drop below threshold must alert once");
-        assert!(
-            messages[0].contains("Low gas"),
-            "alert text should mark a low-gas condition, got: {}",
-            messages[0]
+        assert_eq!(
+            messages[0],
+            concat!(
+                "\u{26a0}\u{fe0f} Low gas: wallet ",
+                "0x0000000000000000000000000000000000000000 on ethereum ",
+                "has 0.000000000000000050 ETH (threshold 0.000000000000000100 ETH)"
+            )
         );
     }
 
@@ -401,23 +407,28 @@ mod tests {
     #[tokio::test]
     async fn recovery_from_low_notifies_once() {
         let low_notifier = Arc::new(CapturingNotifier::new());
-        let low_monitor = monitor_with(U256::from(50u64), false, low_notifier.clone());
+        let mut low_monitor = monitor_with(U256::from(50u64), false, low_notifier.clone());
+        low_monitor.chain = BotGasChain::Ethereum;
         let low_state = low_monitor
             .poll_once(AlertState::Normal, Instant::now())
             .await;
 
         // Same dedup state, but now the balance is healthy again.
         let recover_notifier = Arc::new(CapturingNotifier::new());
-        let recover_monitor = monitor_with(U256::from(150u64), false, recover_notifier.clone());
+        let mut recover_monitor = monitor_with(U256::from(150u64), false, recover_notifier.clone());
+        recover_monitor.chain = BotGasChain::Ethereum;
         let next = recover_monitor.poll_once(low_state, Instant::now()).await;
 
         assert_eq!(next, AlertState::Normal, "recovery returns to Normal");
         let messages = recover_notifier.messages();
         assert_eq!(messages.len(), 1, "recovery must notify exactly once");
-        assert!(
-            messages[0].contains("recovered"),
-            "recovery text should mention recovery, got: {}",
-            messages[0]
+        assert_eq!(
+            messages[0],
+            concat!(
+                "\u{2705} Gas recovered: wallet ",
+                "0x0000000000000000000000000000000000000000 on ethereum ",
+                "has 0.000000000000000150 ETH (threshold 0.000000000000000100 ETH)"
+            )
         );
     }
 

@@ -162,7 +162,8 @@ pub(crate) struct SupervisorStartupTokens {
     pub(crate) inventory_monitor: StartupToken,
     pub(crate) dashboard_trade_handoff_monitor: StartupToken,
     pub(crate) executor_maintenance: StartupToken,
-    pub(crate) gas_monitor: StartupToken,
+    pub(crate) base_gas_monitor: StartupToken,
+    pub(crate) ethereum_gas_monitor: StartupToken,
 }
 
 /// Opens an apalis-side pool (sqlx 0.8) against the same database as the
@@ -13552,7 +13553,8 @@ mod tests {
         let alerts = st0x_config::AlertsCtx {
             chat_id: 123,
             bot_token: "test-bot-token".to_string(),
-            low_balance_threshold_wei: U256::from(0u64),
+            base_low_balance_threshold_wei: U256::from(0u64),
+            ethereum_low_balance_threshold_wei: U256::from(0u64),
             poll_interval: std::time::Duration::from_secs(60),
             realert_interval: std::time::Duration::from_secs(3600),
             message_thread_id: Some(42),

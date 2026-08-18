@@ -2159,6 +2159,41 @@ mod tests {
         file
     }
 
+    fn alerts_config_toml(base_threshold: &str, ethereum_threshold: &str) -> NamedTempFile {
+        toml_file(&format!(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+
+            [alerts]
+            chat_id = 1
+            base_low_balance_threshold = "{base_threshold}"
+            ethereum_low_balance_threshold = "{ethereum_threshold}"
+            poll_interval = 300
+            realert_interval = 3600
+            "#,
+        ))
+    }
+
     /// Minimal config with `[broker.travel_rule]` included, for tests
     /// that use Alpaca Broker API secrets (which now require travel rule
     /// at startup). `close_flatten_cross_max_bps` is a parameter because it is
@@ -2602,7 +2637,8 @@ mod tests {
 
             [alerts]
             chat_id = -1_001_234_567_890
-            low_balance_threshold = "0.05"
+            base_low_balance_threshold = "0.05"
+            ethereum_low_balance_threshold = "0.01"
             poll_interval = 300
             realert_interval = 3600
         "#,
@@ -2637,8 +2673,12 @@ mod tests {
         let alerts = ctx.alerts.unwrap();
         assert_eq!(alerts.chat_id, -1_001_234_567_890);
         assert_eq!(
-            alerts.low_balance_threshold_wei,
+            alerts.base_low_balance_threshold_wei,
             alloy::primitives::U256::from(50_000_000_000_000_000_u64)
+        );
+        assert_eq!(
+            alerts.ethereum_low_balance_threshold_wei,
+            alloy::primitives::U256::from(10_000_000_000_000_000_u64)
         );
         assert_eq!(alerts.poll_interval, std::time::Duration::from_secs(300));
         assert_eq!(
@@ -2660,38 +2700,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alerts_config_fails_fast_on_bad_threshold() {
-        let config = toml_file(
-            r#"
-            database_url = ":memory:"
-            server_port = 8080
-            board_port = 8081
-            apalis_finished_job_cleanup_interval_secs = 3600
-            inventory_divergence_threshold = 10
-
-            [assets.equities]
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
-            required_confirmations = 3
-            ingestion_cutoff = "safe"
-
-            [wallet]
-            kind = "private-key"
-            address = "0x0000000000000000000000000000000000000001"
-
-            [alerts]
-            chat_id = 1
-            low_balance_threshold = "not-a-number"
-            poll_interval = 300
-            realert_interval = 3600
-        "#,
-        );
+    async fn alerts_config_fails_fast_on_bad_thresholds() {
         let secrets = toml_file(
             r#"
             [evm]
@@ -2711,17 +2720,25 @@ mod tests {
         "#,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap_err();
+        for (base_threshold, ethereum_threshold, expected_field) in [
+            ("not-a-number", "0.01", "base_low_balance_threshold"),
+            ("0.05", "not-a-number", "ethereum_low_balance_threshold"),
+        ] {
+            let config = alerts_config_toml(base_threshold, ethereum_threshold);
+            let error = Ctx::load_files(config.path(), secrets.path())
+                .await
+                .unwrap_err();
 
-        assert!(
-            matches!(
-                error,
-                CtxError::Alerts(crate::alerts::AlertsAssemblyError::InvalidThreshold { .. })
-            ),
-            "expected Alerts(InvalidThreshold), got: {error}"
-        );
+            assert!(
+                matches!(
+                    &error,
+                    CtxError::Alerts(
+                        crate::alerts::AlertsAssemblyError::InvalidThreshold { field, .. }
+                    ) if *field == expected_field
+                ),
+                "expected Alerts(InvalidThreshold) for {expected_field}, got: {error}"
+            );
+        }
     }
 
     #[tokio::test]

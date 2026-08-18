@@ -5149,18 +5149,27 @@ dry, those transactions silently stop succeeding. To surface this before it
 halts operations, a supervised **gas monitor** watches the wallet's native-ETH
 balance.
 
-**Scope.** The monitor watches the order-owner wallet (derived from the
-`[wallet]` address) on the orderbook chain — Base in production — using the same
-RPC provider the bot already uses for fill polling and contract reads.
-Monitoring the Ethereum-mainnet wallet is a follow-up; it would require wiring
-the mainnet provider into the conductor.
+**Scope.** Two independently supervised monitors watch the bot's signing wallet
+on Base and Ethereum. Each monitor uses the wallet and RPC provider for its own
+chain: Base monitoring never reads through the Ethereum provider, and Ethereum
+monitoring never reads through the Base provider. The two monitors share the
+configured polling and re-alert intervals but keep separate de-duplication and
+recovery state.
+
+The checked-in production and staging configurations intentionally use a
+`0.05 ETH` threshold on both chains. On Ethereum, that is about 1,450 times the
+failed CCTP burn's `0.000034472457566023 ETH` gas estimate, providing
+substantial L1 headroom without inventing a higher threshold unsupported by
+observed usage.
 
 **Behavior.**
 
 - Every `poll_interval` seconds the monitor reads the wallet's native balance.
-- When the balance drops **below** `low_balance_threshold` (a decimal-ETH amount
-  parsed to wei at startup — a malformed value fails fast), it raises an alert:
-  a structured `error!` log (target `gas`) carrying the wallet, chain, current
+- When the balance drops **below** that chain's explicit threshold
+  (`base_low_balance_threshold` or `ethereum_low_balance_threshold`, each a
+  decimal-ETH amount parsed to wei at startup — a missing, malformed, or zero
+  value fails fast with no cross-chain fallback), it raises an alert: a
+  structured `error!` log (target `gas`) carrying the wallet, chain, current
   balance and threshold, plus a Telegram notification.
 - **De-duplication.** The monitor alerts once on the transition into the low
   state, then re-alerts at most once per `realert_interval` while the balance

@@ -282,7 +282,7 @@ async fn run_bot_session_inner(
         pnl_ledger: pnl_ledger.clone(),
         metrics_handle,
     };
-    let startup_barrier = startup::StartupBarrier::new(10);
+    let startup_barrier = startup::StartupBarrier::new(11);
     let server_supervisor = spawn_server_supervisor(
         state,
         &pools,
@@ -310,7 +310,8 @@ async fn run_bot_session_inner(
                 inventory_monitor: startup_barrier.token(),
                 dashboard_trade_handoff_monitor: startup_barrier.token(),
                 executor_maintenance: startup_barrier.token(),
-                gas_monitor: startup_barrier.token(),
+                base_gas_monitor: startup_barrier.token(),
+                ethereum_gas_monitor: startup_barrier.token(),
             },
         },
         #[cfg(any(test, feature = "test-support"))]
@@ -777,7 +778,7 @@ mod tests {
     }
 
     fn create_test_startup_tokens() -> ConductorStartupTokens {
-        let barrier = startup::StartupBarrier::new(8);
+        let barrier = startup::StartupBarrier::new(9);
         ConductorStartupTokens {
             initialized: barrier.token(),
             apalis_monitor: barrier.token(),
@@ -787,7 +788,8 @@ mod tests {
                 inventory_monitor: barrier.token(),
                 dashboard_trade_handoff_monitor: barrier.token(),
                 executor_maintenance: barrier.token(),
-                gas_monitor: barrier.token(),
+                base_gas_monitor: barrier.token(),
+                ethereum_gas_monitor: barrier.token(),
             },
         }
     }
