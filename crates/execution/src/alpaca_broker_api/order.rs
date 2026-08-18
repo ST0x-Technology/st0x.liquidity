@@ -21,6 +21,11 @@ use crate::{
 
 const ALPACA_CRYPTO_MAX_DECIMAL_PLACES: u8 = 6;
 
+/// Decimal places Alpaca accepts in a `notional`, which is a USD amount rather
+/// than a token quantity: past two it answers `422 / 42210000`, "notional value
+/// must be limited to 2 decimal places".
+const ALPACA_NOTIONAL_MAX_DECIMAL_PLACES: u8 = 2;
+
 /// Order side
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -894,6 +899,33 @@ fn validate_usdc_amount_for_alpaca_precision(amount: Float) -> Result<Float, Alp
     Ok(amount)
 }
 
+/// Truncate a notional to the whole cents Alpaca accepts.
+///
+/// Unlike the `qty` side this truncates rather than rejecting excess precision:
+/// the transfer amount is sized from an imbalance ratio and routinely carries
+/// six decimals, so rejecting would fail the common path outright. Truncation
+/// is always downwards, which is the only safe direction -- the notional is
+/// held in full against settled cash, so rounding up could ask for more than
+/// the transfer was sized against. Sub-cent amounts have nothing left to place
+/// and are refused instead.
+fn truncate_notional_to_whole_cents(amount: Float) -> Result<Float, AlpacaBrokerApiError> {
+    let truncated = crate::truncate_to_decimal_places(amount, ALPACA_NOTIONAL_MAX_DECIMAL_PLACES)?
+        .ok_or(AlpacaBrokerApiError::UsdcBelowPrecision {
+            amount,
+            max_decimals: ALPACA_NOTIONAL_MAX_DECIMAL_PLACES,
+        })?;
+
+    if !truncated.eq(amount)? {
+        debug!(
+            ?amount,
+            ?truncated,
+            "Truncated USD->USDC notional to whole cents for Alpaca"
+        );
+    }
+
+    Ok(truncated)
+}
+
 /// Convert USDC to/from USD on Alpaca.
 ///
 /// This uses the USDC/USD trading pair:
@@ -905,22 +937,24 @@ fn validate_usdc_amount_for_alpaca_precision(amount: Float) -> Result<Float, Alp
 /// The sell holds USDC and names USDC (`qty`). The buy is bounded by settled
 /// cash and names dollars (`notional`), so Alpaca's ~2% collar has nothing to
 /// inflate: the hold equals `amount`, and the collar shrinks the fill instead
-/// (`amount / 1.02` of USDC bought). Callers therefore size downstream steps
-/// from the fill, never from `amount`.
+/// (`amount / 1.02` of USDC bought). The buy is also truncated to whole cents,
+/// which is all Alpaca accepts in a notional. Callers therefore size downstream
+/// steps from the fill, never from `amount`.
 pub(crate) async fn convert_usdc_usd(
     client: &AlpacaBrokerApiClient,
     amount: Float,
     direction: ConversionDirection,
     client_order_id: &ClientOrderId,
 ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
-    let placed_amount = validate_usdc_amount_for_alpaca_precision(amount)?;
     let (side, order_size) = match direction {
-        ConversionDirection::UsdcToUsd => {
-            (OrderSide::Sell, CryptoOrderSize::Quantity(placed_amount))
-        }
-        ConversionDirection::UsdToUsdc => {
-            (OrderSide::Buy, CryptoOrderSize::Notional(placed_amount))
-        }
+        ConversionDirection::UsdcToUsd => (
+            OrderSide::Sell,
+            CryptoOrderSize::Quantity(validate_usdc_amount_for_alpaca_precision(amount)?),
+        ),
+        ConversionDirection::UsdToUsdc => (
+            OrderSide::Buy,
+            CryptoOrderSize::Notional(truncate_notional_to_whole_cents(amount)?),
+        ),
     };
 
     debug!(?side, ?order_size, %client_order_id, "Placing USDC/USD conversion order");
@@ -3667,7 +3701,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_convert_usdc_usd_rejects_excess_precision() {
+    /// The sell names a USDC quantity, so precision past the token's six
+    /// decimals is a caller error rather than something to round away. The buy
+    /// names dollars and truncates instead -- see
+    /// `usd_to_usdc_notional_is_truncated_to_whole_cents`.
+    async fn usdc_to_usd_rejects_excess_quantity_precision() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
@@ -3675,7 +3713,7 @@ mod tests {
         let error = convert_usdc_usd(
             &client,
             float!(1000.1234567),
-            ConversionDirection::UsdToUsdc,
+            ConversionDirection::UsdcToUsd,
             &ClientOrderId::from_uuid(Uuid::new_v4()),
         )
         .await

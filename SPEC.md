@@ -2967,7 +2967,9 @@ enum BridgeStage { Burn, Attestation, Mint }
     quantity it is actually constrained by -- the buy by settled cash, the sell
     by the USDC balance it holds -- so neither can be reserved beyond what is
     available. Alpaca-to-Base transfer capacity is therefore the full
-    `withdrawable cash - reserve`
+    `withdrawable cash - reserve`. The notional is truncated to whole cents,
+    which is all Alpaca accepts in a USD amount, always downwards so the buy
+    cannot ask for more cash than it was sized against
   - Collar: Alpaca prices a USDC/USD market order with a ~2% collar. On a `qty`
     buy the collar inflates the hold to `quantity x price x 1.02`, which rejects
     a buy sized at 100% of settled cash. On a `notional` buy the hold equals the

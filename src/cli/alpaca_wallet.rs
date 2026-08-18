@@ -612,8 +612,11 @@ pub(super) async fn alpaca_convert_command<W: Write>(
         ConvertDirection::ToUsdc => ("USD → USDC", format!("${amount}")),
     };
 
+    // Reported as requested rather than placed: a buy is truncated to the
+    // whole cents Alpaca accepts in a notional, and the order echoes back
+    // what was actually placed.
     writeln!(stdout, "Converting {direction_str} on Alpaca")?;
-    writeln!(stdout, "   Amount: {amount_str}")?;
+    writeln!(stdout, "   Requested: {amount_str}")?;
 
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("alpaca-convert requires Alpaca Broker API configuration");
