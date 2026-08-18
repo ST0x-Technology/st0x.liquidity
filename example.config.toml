@@ -226,8 +226,9 @@ chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 # [orchestrator.addresses]
 # base = "0xcccccccccccccccccccccccccccccccccccccccc"
 
-# Optional — only needed for automatic rebalancing.
-# Without this section the bot runs in Standalone mode (hedging only).
+# Required: the bot does not start without this section. To pause rebalancing
+# work, use the narrow controls instead: per-asset `rebalancing = "disabled"`,
+# the issuance freeze, or `[rebalancing.usdc] mode = "disabled"`.
 [rebalancing]
 # Transfer timeout in seconds before stuck inflight state is tombstoned and cleared.
 # 1800 = 30 minutes.

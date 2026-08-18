@@ -5,8 +5,9 @@ design decisions at a level sufficient to understand the system without
 prescribing exact commands or code. For terminology and naming conventions, see
 [docs/domain.md](docs/domain.md).
 
-Current supported offchain execution backends are `alpaca-broker-api` and
-`dry-run`.
+The supported offchain execution backend is `alpaca-broker-api`. Tests and local
+simulation run it in `mock` mode against a mock Alpaca server (see the
+simulation apps, e.g. `nix run .#simulate`).
 
 ## Background
 
@@ -80,9 +81,6 @@ and the system proves market fit.
   whole-share-only. Fractionable assets retain Alpaca's nine-decimal quantity
   bound. Production can use dollar-value execution thresholds to reduce unhedged
   exposure while still respecting buying-power constraints.
-- **Dry run**: Supports fractional arithmetic for simulation and testing.
-  Operators may still configure whole-share thresholds when that is useful for
-  conservative modeling.
 
 #### Rebalancing Process
 
@@ -107,6 +105,32 @@ and the system proves market fit.
 
 Automated rebalancing is Alpaca Broker API based.
 
+The `[rebalancing]` configuration section is required. If the section is absent,
+the bot does not start: configuration parsing fails with an explicit error.
+There is no global switch that turns rebalancing off, and there is no separate
+hedging-only topology. The rebalancing infrastructure — inventory polling,
+transfer stores and workers, and interrupted-transfer recovery — always starts.
+
+##### Pausing Rebalancing
+
+Operators pause rebalancing with narrow, explicit controls:
+
+- **Per-asset `rebalancing = "disabled"`**: removes the asset from the trigger
+  whitelist. New equity rebalancing flows do not start for that asset.
+- **Issuance freeze (`Frozen`)**: stops new mints for the asset during
+  maintenance or corporate actions. When `freeze_check = "enabled"`, the freeze
+  also stops new liquidity-initiated rebalancing flows for the asset. When
+  `freeze_check = "disabled"`, the bot does not consult issuance and equity
+  rebalancing proceeds. This bypass is an operator escape hatch for an issuance
+  outage.
+- **USDC-specific controls** (`usdc` mode under `[rebalancing]`): stop new USDC
+  rebalancing flows.
+- **Circuit breakers**: stop a transfer after repeated failures and alert the
+  operator.
+
+None of these controls disable hedging, inventory visibility, or the recovery of
+in-flight transfers. A pause stops new rebalancing work only.
+
 ##### Chain Roles: Watched (Primary or Secondary) and Transport
 
 Every chain the bot touches is declared under `[chains.<name>]` with a
@@ -130,22 +154,21 @@ fills came from; the remainder is hedged on a later tick). Startup verifies
 every watched chain (chain-id identity, cutoff support) and any failure is
 fatal; degraded per-chain startup is deferred to the chain-disable work.
 
-When rebalancing is configured, the tokenization services are built once per
-watched chain, never once for Base: each watched chain gets its own issuer
-client, wrapper and mint authorizer bound to that chain's signing wallet,
-orderbook, asset table and issuer redemption wallet, plus that chain's
-`[orchestrator.addresses]` entry when the section carries one; without the entry
-the chain's mint authorizer is disabled with a startup warning and only an
-orchestrator-mode mint fails (see Mint Recipient Authorization). Every watched
-chain must have its own redemption wallet, or startup fails naming the chain.
-Standalone mode builds no tokenization set at all. The rebalancer, the
-equity-recovery jobs and the portfolio snapshot consume the primary chain's set
-until the global rebalancer owns chain selection; the sets exist so that
-selection is a lookup rather than a rewire. The stale-allowance revoke and the
-tokenization preflight (below) run once per watched chain with that chain's
-wallet, orderbook and canonical USDC, as do the startup MAX approvals in either
-mode; a watched chain for which this build has no pinned USDC fails startup
-rather than borrowing another chain's address.
+The tokenization services are built once per watched chain, never once for Base:
+each watched chain gets its own issuer client, wrapper and mint authorizer bound
+to that chain's signing wallet, orderbook, asset table and issuer redemption
+wallet, plus that chain's `[orchestrator.addresses]` entry when the section
+carries one; without the entry the chain's mint authorizer is disabled with a
+startup warning and only an orchestrator-mode mint fails (see Mint Recipient
+Authorization). Every watched chain must have its own redemption wallet, or
+startup fails naming the chain. The rebalancer, the equity-recovery jobs and the
+portfolio snapshot consume the primary chain's set until the global rebalancer
+owns chain selection; the sets exist so that selection is a lookup rather than a
+rewire. The stale-allowance revoke and the tokenization preflight (below) run
+once per watched chain with that chain's wallet, orderbook and canonical USDC,
+as do the startup MAX approvals in either mode; a watched chain for which this
+build has no pinned USDC fails startup rather than borrowing another chain's
+address.
 
 The operator CLI selects its chain the same way. Every command that itself
 submits an onchain operation takes `--network` (default `base`) and runs on that
@@ -1775,7 +1798,7 @@ Feature flags control which implementations are compiled:
 [dependencies]
 st0x-server = { features = ["all-wallets"] }
 
-# Dry-run testing
+# Local simulation and e2e testing (mock Alpaca server)
 st0x-server = { features = ["mock"] }
 
 # Future: crypto + perps fork with different integrations
