@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
 
-use alloy::primitives::{Address, U256, utils::parse_units};
+use alloy::primitives::{Address, B256, U256, utils::parse_units};
 use alloy::providers::Provider;
 use rain_math_float::Float;
 use tempfile::TempDir;
@@ -18,7 +18,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use st0x_bridge::cctp::CctpAttestationMock;
 use st0x_config::mk_env_filter;
-use st0x_config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
+use st0x_config::{
+    AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, OperationMode,
+};
 use st0x_execution::Symbol;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, MockPosition};
 use st0x_hedge::mock_api::{AlpacaTokenizationMock, REDEMPTION_WALLET};
@@ -141,7 +143,17 @@ impl<P> TestInfra<P> {
                 symbols,
                 operational_limit: None,
             },
-            cash: None,
+            // The conductor's rebalancing infrastructure requires one cash
+            // vault id at boot even when every trigger is disabled. Hedging
+            // tests never drive USDC transfers, so a synthetic vault id
+            // satisfies the wiring; reads of a nonexistent vault return a
+            // zero balance without reverting.
+            cash: Some(CashAssetConfig {
+                vault_ids: vec![B256::repeat_byte(0xca)],
+                rebalancing: OperationMode::Disabled,
+                operational_limit: None,
+                reserved: None,
+            }),
         }
     }
 }
