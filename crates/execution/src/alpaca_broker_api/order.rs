@@ -2955,6 +2955,84 @@ mod tests {
         assert_eq!(order.status_display(), "filled");
     }
 
+    /// Alpaca refuses a notional past two decimals (`422 / 42210000`,
+    /// "notional value must be limited to 2 decimal places"), and the transfer
+    /// amount routinely carries six when the imbalance excess is what bounds
+    /// it. The sub-cent remainder is dropped downwards so the buy can never
+    /// ask for more cash than it was sized against.
+    #[tokio::test]
+    async fn usd_to_usdc_notional_is_truncated_to_whole_cents() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let client_order_id =
+            ClientOrderId::from_uuid(uuid!("33333333-3333-4333-8333-333333333333"));
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "USDCUSD",
+                    "notional": "5726.78",
+                    "side": "buy",
+                    "type": "market",
+                    "time_in_force": "gtc",
+                    "client_order_id": "33333333-3333-4333-8333-333333333333"
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "USDCUSD",
+                    "qty": null,
+                    "notional": "5726.78",
+                    "side": "buy",
+                    "status": "filled",
+                    "filled_avg_price": "1.00101001",
+                    "filled_qty": "5608.94436",
+                    "created_at": "2025-01-06T12:30:00Z"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        convert_usdc_usd(
+            &client,
+            float!(5726.787463),
+            ConversionDirection::UsdToUsdc,
+            &client_order_id,
+        )
+        .await
+        .unwrap();
+
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn usd_to_usdc_rejects_a_notional_below_one_cent() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let error = convert_usdc_usd(
+            &client,
+            float!(0.004),
+            ConversionDirection::UsdToUsdc,
+            &ClientOrderId::from_uuid(uuid!("44444444-4444-4444-8444-444444444444")),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::UsdcBelowPrecision { max_decimals, .. }
+                    if max_decimals == 2
+            ),
+            "Expected UsdcBelowPrecision at two decimals, got: {error:?}"
+        );
+    }
+
     const STALLED_ORDER_ID: Uuid = uuid!("61e7b016-9c91-4a97-b912-615c9d365c9d");
 
     fn crypto_order_path() -> String {
