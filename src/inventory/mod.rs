@@ -20,7 +20,6 @@ pub(crate) use polling::{
     InventoryPollingService, PendingRequestOwnership, PendingRequestOwnershipSnapshot, Poller,
     WalletPollingCtx,
 };
-pub(crate) use projection::InventoryProjection;
 pub(crate) use snapshot::{InventorySnapshot, InventorySnapshotId};
 pub(crate) use venue_balance::InventoryError;
 pub(crate) use view::{
