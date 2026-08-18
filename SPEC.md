@@ -2962,13 +2962,19 @@ enum BridgeStage { Burn, Attestation, Mint }
   - BaseToAlpaca requires USDC-to-USD conversion AFTER deposit (USDC arrives in
     crypto wallet, must convert to USD buying power for trading)
   - Conversion uses USDC/USD crypto trading pair on Alpaca (market orders)
-  - Collar reservation: Alpaca prices a market buy for a _quantity_ of USDC with
-    a collar, holding ~102% of the requested amount in USD until the order
-    fills. Alpaca-to-Base transfer capacity is therefore sized as
-    `(withdrawable cash - reserve) / collar multiplier` so a transfer at the cap
-    can always fund its own conversion. The multiplier carries a small margin
-    over the documented collar because the hold tracks the ask rather than par,
-    and crypto buys draw on settled cash only
+  - Order sizing: the AlpacaToBase buy names dollars (`notional`), the
+    BaseToAlpaca sell names USDC (`qty`). Each direction is sized by the
+    quantity it is actually constrained by -- the buy by settled cash, the sell
+    by the USDC balance it holds -- so neither can be reserved beyond what is
+    available. Alpaca-to-Base transfer capacity is therefore the full
+    `withdrawable cash - reserve`
+  - Collar: Alpaca prices a USDC/USD market order with a ~2% collar. On a `qty`
+    buy the collar inflates the hold to `quantity x price x 1.02`, which rejects
+    a buy sized at 100% of settled cash. On a `notional` buy the hold equals the
+    notional and the collar instead bounds the fill, so a notional of N buys
+    `N / 1.02` of USDC. The bot therefore never needs the collar percentage: the
+    received USDC is read from the fill, and no broker constant appears in the
+    sizing
   - Crypto trading is available 24/7 on Alpaca (no market hours restrictions)
   - Market orders are near-instant but NOT guaranteed to fill immediately
   - Slippage: ~17bps observed in live tests (reduces effective USD received)
