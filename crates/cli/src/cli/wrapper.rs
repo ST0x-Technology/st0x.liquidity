@@ -259,7 +259,7 @@ mod tests {
     use st0x_config::ExecutionThreshold;
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
-    use st0x_config::{BrokerCtx, Ctx, LogFormat, LogLevel, TradingMode};
+    use st0x_config::{BrokerCtx, Ctx, LogFormat, LogLevel};
     use st0x_config::{
         ChainAssets, ChainEquities, ChainEquityAsset, InventoryMode, OperationMode, TradingChain,
     };
@@ -278,7 +278,7 @@ mod tests {
         try_positive_shares(value).expect("test shares must be valid and positive")
     }
 
-    fn create_ctx_without_rebalancing() -> Ctx {
+    fn create_base_test_ctx() -> Ctx {
         Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
@@ -313,7 +313,7 @@ mod tests {
             alerts: None,
             startup_notices: Vec::new(),
             pricing: None,
-            trading_mode: TradingMode::Standalone,
+            rebalancing: st0x_config::default_test_rebalancing_ctx(),
             order_owner: Address::ZERO,
             wallet: None,
             wallet_meta: None,
@@ -329,7 +329,7 @@ mod tests {
     }
 
     fn create_ctx_with_stub_wallet() -> Ctx {
-        let mut ctx = create_ctx_without_rebalancing();
+        let mut ctx = create_base_test_ctx();
         ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
         ctx
     }
@@ -337,7 +337,7 @@ mod tests {
     /// AAPL listed on the primary chain but no `[wallet]`: the config checks
     /// pass and the wallet requirement is the first thing to fail.
     fn create_ctx_listing_aapl_without_wallet() -> Ctx {
-        let mut ctx = create_ctx_without_rebalancing();
+        let mut ctx = create_base_test_ctx();
         ctx.chains.primary_mut().assets.equities.symbols.insert(
             Symbol::new("AAPL").unwrap(),
             ChainEquityAsset {
@@ -685,7 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn donate_equity_requires_wallet_config() {
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_base_test_ctx();
         let mut stdout = Vec::new();
 
         let error = donate_equity_command(

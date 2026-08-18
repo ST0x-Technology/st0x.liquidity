@@ -118,8 +118,6 @@ pub use performance::simulated_transfers::{
 #[cfg(any(test, feature = "test-support"))]
 pub use st0x_config::ExecutionThreshold;
 #[cfg(any(test, feature = "test-support"))]
-pub use st0x_config::TradingMode;
-#[cfg(any(test, feature = "test-support"))]
 pub use st0x_config::{
     BotGasValuationConfig, ImbalanceThreshold, RebalancingCtx, RebalancingCtxError, UsdcRebalancing,
 };

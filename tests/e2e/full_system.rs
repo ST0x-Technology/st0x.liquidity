@@ -54,7 +54,7 @@ use st0x_hedge::mock_api::{
 };
 use st0x_hedge::{
     ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, ImbalanceThreshold,
-    OperationMode, Position, RebalancingCtx, TradingMode, UsdcRebalancing,
+    OperationMode, Position, RebalancingCtx, UsdcRebalancing,
     seed_simulated_equity_redemption_history, seed_simulated_hedge_latency_history,
     seed_simulated_mint_history, seed_simulated_usdc_rebalance_history,
 };
@@ -154,7 +154,7 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
         .orderbook(chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)
-        .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
+        .rebalancing(Box::new(rebalancing_ctx))
         .order_owner(chain.owner)
         .wallet(wallet_ctx)
         .assets(ChainAssets {

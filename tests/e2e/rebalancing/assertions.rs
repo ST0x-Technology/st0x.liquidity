@@ -44,8 +44,7 @@ pub(crate) use st0x_hedge::mock_api::REDEMPTION_WALLET;
 use st0x_hedge::mock_api::{AlpacaTokenizationMock, TokenizationStatus};
 pub(crate) use st0x_hedge::mock_api::{RedemptionOutcome, TokenizationRequestType};
 use st0x_hedge::{
-    ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, ImbalanceThreshold,
-    OperationMode, TradingMode,
+    ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, ImbalanceThreshold, OperationMode,
 };
 
 pub(crate) use crate::assert::{ExpectedPosition, assert_event_subsequence};
@@ -344,7 +343,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         .orderbook(chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)
-        .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
+        .rebalancing(Box::new(rebalancing_ctx))
         .order_owner(chain.owner)
         .wallet(wallet_ctx)
         .assets(assets)
@@ -437,7 +436,7 @@ where
         .orderbook(base_chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)
-        .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
+        .rebalancing(Box::new(rebalancing_ctx))
         .order_owner(base_chain.owner)
         .wallet(wallet_ctx)
         .assets(ChainAssets {

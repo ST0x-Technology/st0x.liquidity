@@ -2114,7 +2114,7 @@ mod tests {
     use st0x_config::ExecutionThreshold;
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
-    use st0x_config::{BrokerCtx, LogFormat, LogLevel, TradingMode};
+    use st0x_config::{BrokerCtx, LogFormat, LogLevel};
     use st0x_config::{IngestionCutoff, InventoryMode, TradingChain};
     use st0x_event_sorcery::StoreBuilder;
     use st0x_float_macro::float;
@@ -2185,7 +2185,7 @@ mod tests {
             alerts: None,
             startup_notices: Vec::new(),
             pricing: None,
-            trading_mode: TradingMode::Standalone,
+            rebalancing: st0x_config::default_test_rebalancing_ctx(),
             order_owner: Address::ZERO,
             wallet: None,
             wallet_meta: None,
@@ -4203,7 +4203,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cli_env_loads_dry_run_config() {
+    async fn cli_env_loads_config_files() {
         let config_dir = tempfile::tempdir().unwrap();
         let config_path = config_dir.path().join("config.toml");
         let secrets_path = config_dir.path().join("secrets.toml");
@@ -4235,6 +4235,7 @@ mod tests {
                 ingestion_cutoff = "safe"
                 order_fill_poll_interval_secs = 1
                 primary = true
+                redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
                 [chains.ethereum]
                 lifecycle = "active"
@@ -4243,6 +4244,42 @@ mod tests {
                 [chains.hyperevm]
                 lifecycle = "observe-only"
                 required_confirmations = 1
+
+                [broker]
+                counter_trade_slippage_bps = 100
+                close_flatten_cross_max_bps = 400
+                extended_hours_reprice_timeout_secs = 300
+                close_flatten_reprice_timeout_secs = 60
+                extended_hours_close_flatten_window_secs = 900
+
+                [broker.travel_rule]
+                beneficiary_entity_name = "Test Entity"
+
+                [rebalancing]
+                transfer_timeout_secs = 1800
+                inventory_staleness_bound_secs = 300
+                transfer_attempt_timeout_secs = 3600
+                attestation_retry_deadline_secs = 86400
+                max_burn_revert_redrives = 5
+                freeze_check = "disabled"
+
+                [rebalancing.equity]
+                target = "0.5"
+                deviation = "0.2"
+
+                [rebalancing.usdc]
+                mode = "disabled"
+
+                [alerts]
+                poll_interval = 300
+                realert_interval = 3600
+
+                [alerts.low_balance_thresholds]
+                base = "0.05"
+                ethereum = "0.01"
+
+                [bot_gas_valuation]
+                chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 
                 [wallet]
                 kind = "private-key"
@@ -4264,7 +4301,10 @@ mod tests {
                 rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
                 [broker]
-                type = "dry-run"
+                type = "alpaca-broker-api"
+                api_key = "test-key"
+                api_secret = "test-secret"
+                account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
 
                 [wallet]
                 private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -4303,6 +4343,6 @@ mod tests {
             },
         );
         assert_eq!(ctx.chains.primary().ingestion_cutoff, IngestionCutoff::Safe);
-        assert!(matches!(ctx.broker, BrokerCtx::DryRun));
+        assert!(matches!(ctx.broker, BrokerCtx::AlpacaBrokerApi(_)));
     }
 }
