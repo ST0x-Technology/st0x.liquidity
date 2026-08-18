@@ -591,7 +591,7 @@ async fn run_usdc_transfer<Writer: Write>(
         owner,
     ));
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let rebalancing_ctx = &ctx.rebalancing;
 
     let rebalance_manager = CrossVenueCashTransfer::new(
         alpaca_broker,
@@ -1824,7 +1824,7 @@ mod tests {
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
         AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, LogFormat, LogLevel,
-        OperationMode, TradingMode,
+        OperationMode,
     };
     use st0x_config::{EvmCtx, IngestionCutoff, InventoryAdapters, InventoryMode};
     use st0x_event_sorcery::LifecycleError;
@@ -2070,7 +2070,7 @@ mod tests {
                     then.status(200).body(r#"{"outcome":"recovered"}"#);
                 })
                 .await;
-            let mut ctx = create_ctx_without_rebalancing();
+            let mut ctx = create_base_test_ctx();
             ctx.server_port = server.port();
 
             let mut stdout = Vec::new();
@@ -2101,7 +2101,7 @@ mod tests {
                 );
             })
             .await;
-        let mut ctx = create_ctx_without_rebalancing();
+        let mut ctx = create_base_test_ctx();
         ctx.server_port = server.port();
 
         let mut stdout = Vec::new();
@@ -2130,7 +2130,7 @@ mod tests {
                 );
             })
             .await;
-        let mut ctx = create_ctx_without_rebalancing();
+        let mut ctx = create_base_test_ctx();
         ctx.server_port = server.port();
 
         let mut stdout = Vec::new();
@@ -2161,7 +2161,7 @@ mod tests {
                 );
             })
             .await;
-        let mut ctx = create_ctx_without_rebalancing();
+        let mut ctx = create_base_test_ctx();
         ctx.server_port = server.port();
 
         let mut stdout = Vec::new();
@@ -2191,7 +2191,7 @@ mod tests {
                 then.status(200).body(r#"{"unexpected":1}"#);
             })
             .await;
-        let mut ctx = create_ctx_without_rebalancing();
+        let mut ctx = create_base_test_ctx();
         ctx.server_port = server.port();
 
         let mut stdout = Vec::new();
@@ -2223,7 +2223,7 @@ mod tests {
                     .body(r#"{"error":"A resume operation is already in progress"}"#);
             })
             .await;
-        let mut ctx = create_ctx_without_rebalancing();
+        let mut ctx = create_base_test_ctx();
         ctx.server_port = server.port();
 
         let mut stdout = Vec::new();
@@ -2249,7 +2249,7 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap().port()
         };
-        let mut ctx = create_ctx_without_rebalancing();
+        let mut ctx = create_base_test_ctx();
         ctx.server_port = port;
 
         let mut stdout = Vec::new();
@@ -2264,7 +2264,7 @@ mod tests {
         );
     }
 
-    fn create_ctx_without_rebalancing() -> Ctx {
+    fn create_base_test_ctx() -> Ctx {
         Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
@@ -2300,7 +2300,7 @@ mod tests {
             telemetry: None,
             alerts: None,
             pricing: None,
-            trading_mode: TradingMode::Standalone,
+            rebalancing: st0x_config::default_test_rebalancing_ctx(),
             order_owner: Address::ZERO,
             wallet: None,
             wallet_meta: None,
@@ -2318,8 +2318,8 @@ mod tests {
         }
     }
 
-    fn create_alpaca_ctx_without_rebalancing() -> Ctx {
-        let mut ctx = create_ctx_without_rebalancing();
+    fn create_alpaca_test_ctx() -> Ctx {
+        let mut ctx = create_base_test_ctx();
         ctx.broker = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
@@ -2378,7 +2378,7 @@ mod tests {
             telemetry: None,
             alerts: None,
             pricing: None,
-            trading_mode: TradingMode::Rebalancing(Box::new(
+            rebalancing: Box::new(
                 RebalancingCtx::stub()
                     .equity(ImbalanceThreshold {
                         target: float!(0.5),
@@ -2389,7 +2389,7 @@ mod tests {
                         deviation: float!(0.1),
                     })
                     .call(),
-            )),
+            ),
             order_owner: Address::ZERO,
             wallet: Some(st0x_config::OnchainWalletCtx::stub()),
             wallet_meta: None,
@@ -2409,7 +2409,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_equity_requires_alpaca_broker() {
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_base_test_ctx();
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let quantity = FractionalShares::new(Float::parse("10.5".to_string()).unwrap());
@@ -2436,7 +2436,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_equity_requires_tokenization_config() {
-        let ctx = create_alpaca_ctx_without_rebalancing();
+        let ctx = create_alpaca_test_ctx();
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let quantity = FractionalShares::new(Float::parse("10.5".to_string()).unwrap());
@@ -2463,7 +2463,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_usdc_requires_alpaca_broker() {
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_base_test_ctx();
         let pool = setup_test_db().await;
         let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
 
@@ -2491,7 +2491,7 @@ mod tests {
         // front rather than falling through to the manager's `None` -> fresh-burn
         // path. The existence check runs before any broker/bridge setup, so a bare
         // ctx and an empty pool reach it directly.
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_base_test_ctx();
         let pool = setup_test_db().await;
         let unknown_id = Uuid::from_u128(0xDEAD_BEEF);
 
@@ -2581,7 +2581,7 @@ mod tests {
         // (`--direction to-alpaca` => BaseToAlpaca). The guard must reject it
         // rather than driving the aggregate through the wrong-direction resume
         // path. The check runs before broker setup, so a bare ctx reaches it.
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_base_test_ctx();
         let pool = setup_test_db().await;
         let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
         let id = Uuid::from_u128(99);
@@ -2622,7 +2622,7 @@ mod tests {
         // post-slippage/post-fee effective amount) and reports it to the
         // operator. The preflight guard must accept the correct direction --
         // here it then fails at broker setup, proving the guard accepted it.
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_base_test_ctx();
         let pool = setup_test_db().await;
         let seeded_amount = Usdc::new(Float::parse("100".to_string()).unwrap());
         let id = Uuid::from_u128(123);
@@ -2675,7 +2675,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_usdc_requires_wallet_config() {
-        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        let mut ctx = create_alpaca_test_ctx();
         ctx.assets.cash = Some(CashAssetConfig {
             vault_ids: vec![b256!(
                 "0x00000000000000000000000000000000000000000000000000000000000000ab"
@@ -2706,7 +2706,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_usdc_writes_direction_to_stdout() {
-        let ctx = create_alpaca_ctx_without_rebalancing();
+        let ctx = create_alpaca_test_ctx();
         let pool = setup_test_db().await;
         let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
 
@@ -2863,7 +2863,7 @@ mod tests {
 
     #[test]
     fn resolve_redemption_wallet_flag_takes_precedence() {
-        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        let mut ctx = create_alpaca_test_ctx();
         let config_wallet = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let flag_wallet = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         ctx.redemption_wallet = Some(config_wallet);
@@ -2874,7 +2874,7 @@ mod tests {
 
     #[test]
     fn resolve_redemption_wallet_falls_back_to_config() {
-        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        let mut ctx = create_alpaca_test_ctx();
         let config_wallet = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         ctx.redemption_wallet = Some(config_wallet);
 
@@ -2884,7 +2884,7 @@ mod tests {
 
     #[test]
     fn resolve_redemption_wallet_errors_when_missing() {
-        let ctx = create_alpaca_ctx_without_rebalancing();
+        let ctx = create_alpaca_test_ctx();
         assert_eq!(ctx.redemption_wallet, None);
 
         let result = resolve_redemption_wallet(None, &ctx);
@@ -2899,7 +2899,7 @@ mod tests {
     /// `[tokenization]` config wallet without requiring `--redemption-wallet`.
     #[test]
     fn resolve_redemption_wallet_ethereum_uses_config() {
-        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        let mut ctx = create_alpaca_test_ctx();
         let config_wallet = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         ctx.redemption_wallet = Some(config_wallet);
 
@@ -3986,7 +3986,7 @@ mod tests {
 
     #[test]
     fn tokenized_equity_resolves_from_config() {
-        let mut ctx = create_ctx_without_rebalancing();
+        let mut ctx = create_base_test_ctx();
         let token = address!("0x626757e6f50675d17fcad312e82f989ae7a23d38");
         ctx.assets.equities.symbols.insert(
             Symbol::new("COIN").unwrap(),
@@ -4017,7 +4017,7 @@ mod tests {
 
     #[tokio::test]
     async fn alpaca_tokenize_fails_when_symbol_not_configured() {
-        let ctx = create_alpaca_ctx_without_rebalancing();
+        let ctx = create_alpaca_test_ctx();
         let mut stdout = Vec::new();
 
         let error = alpaca_tokenize_command(
@@ -4042,7 +4042,7 @@ mod tests {
 
     #[tokio::test]
     async fn alpaca_redeem_fails_when_symbol_not_configured() {
-        let ctx = create_alpaca_ctx_without_rebalancing();
+        let ctx = create_alpaca_test_ctx();
         let mut stdout = Vec::new();
 
         let error = alpaca_redeem_command(
@@ -4171,7 +4171,7 @@ mod tests {
 
     #[tokio::test]
     async fn ethereum_network_requires_explicit_token_address() {
-        let ctx = create_alpaca_ctx_without_rebalancing();
+        let ctx = create_alpaca_test_ctx();
         let mut stdout = Vec::new();
 
         let error = alpaca_redeem_command(
@@ -4194,7 +4194,7 @@ mod tests {
 
     #[tokio::test]
     async fn hyperevm_network_requires_explicit_token_address() {
-        let ctx = create_alpaca_ctx_without_rebalancing();
+        let ctx = create_alpaca_test_ctx();
         let mut stdout = Vec::new();
 
         let error = alpaca_redeem_command(
@@ -4217,7 +4217,7 @@ mod tests {
 
     #[test]
     fn token_override_bypasses_assets_config() {
-        let ctx = create_alpaca_ctx_without_rebalancing();
+        let ctx = create_alpaca_test_ctx();
         let token = address!("0xED0c085d92C262FB46937CB0B3C9763Af7fCCf30");
 
         let resolved = resolve_tokenization_token(
