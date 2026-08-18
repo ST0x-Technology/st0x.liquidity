@@ -25214,7 +25214,7 @@ mod tests {
         crate::conductor::restore_inventory_at_boot(
             &pool,
             &trigger.inventory,
-            Some(&trigger),
+            &trigger,
             &projection,
         )
         .await
@@ -25262,7 +25262,7 @@ mod tests {
         crate::conductor::restore_inventory_at_boot(
             &pool,
             &trigger.inventory,
-            Some(&trigger),
+            &trigger,
             &projection,
         )
         .await
@@ -25273,7 +25273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boot_without_rebalancing_hydrates_snapshot_and_clears_pending_orders() {
+    async fn boot_hydrates_snapshot_and_clears_pending_orders() {
         let symbol = Symbol::new("AAPL").unwrap();
         let mut view = InventoryView::default();
         view.mark_offchain_order_pending(symbol.clone(), OffchainOrderId::new());
@@ -25295,9 +25295,14 @@ mod tests {
             .unwrap();
         let projection = Projection::<Position>::sqlite(pool.clone());
 
-        crate::conductor::restore_inventory_at_boot(&pool, &trigger.inventory, None, &projection)
-            .await
-            .unwrap();
+        crate::conductor::restore_inventory_at_boot(
+            &pool,
+            &trigger.inventory,
+            &trigger,
+            &projection,
+        )
+        .await
+        .unwrap();
 
         let (available, has_pending_order) = {
             let inventory = trigger.inventory.read().await;
@@ -25385,7 +25390,7 @@ mod tests {
         crate::conductor::restore_inventory_at_boot(
             &pool,
             &trigger.inventory,
-            Some(&trigger),
+            &trigger,
             &projection,
         )
         .await
@@ -26841,7 +26846,7 @@ mod tests {
         crate::conductor::restore_inventory_at_boot(
             &pool,
             &trigger.inventory,
-            Some(&trigger),
+            &trigger,
             &projection,
         )
         .await
