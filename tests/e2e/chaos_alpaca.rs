@@ -19,7 +19,10 @@ use st0x_float_macro::float;
 
 use crate::chaos::LatencyProxy;
 use crate::hedging::assertions::*;
-use crate::poll::{connect_db, fetch_events_by_type, poll_for_events_with_timeout, spawn_bot};
+use crate::poll::{
+    connect_db, fetch_events_by_type, poll_for_conductor_ready, poll_for_events_with_timeout,
+    spawn_bot,
+};
 
 /// Response arrives before the client times out -- no transport failure.
 /// Held 5s below the timeout (not 1s) so CI scheduling jitter cannot push the
@@ -330,7 +333,10 @@ async fn broker_outage_defers_hedge_until_rescan_after_restore() -> anyhow::Resu
         .call()?;
     let mut bot = spawn_bot(ctx);
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // The outage must land during operation, not during boot: startup makes
+    // its own broker calls (rebalancer account check) through the proxy, so
+    // severing on a timer races the boot sequence.
+    poll_for_conductor_ready(&mut bot, &infra.db_path).await;
 
     latency.sever();
 

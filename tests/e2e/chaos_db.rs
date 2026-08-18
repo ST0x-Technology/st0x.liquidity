@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use crate::chaos::DbLock;
 use crate::hedging::assertions::*;
-use crate::poll::{poll_for_events, poll_for_events_with_timeout, spawn_bot};
+use crate::poll::{
+    poll_for_conductor_ready, poll_for_events, poll_for_events_with_timeout, spawn_bot,
+};
 
 /// Top-level hypothesis: a write lock held for less than the pool's 10s
 /// busy timeout (the documented bot-vs-reporter contention scenario)
@@ -47,7 +49,12 @@ async fn transient_write_lock_within_busy_timeout_rides_through() -> anyhow::Res
         .call()?;
     let mut bot = spawn_bot(ctx);
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Boot must finish before the lock engages: the startup view rebuilds
+    // run read-then-write transactions whose write-lock upgrade fails
+    // immediately under contention (SQLITE_BUSY_SNAPSHOT, outside the busy
+    // timeout), which is the documented "run with the conductor stopped"
+    // constraint -- not the steady-state contention this test asserts.
+    poll_for_conductor_ready(&mut bot, &infra.db_path).await;
 
     // Hold the write lock across the whole fill-processing window: acquire it
     // before the take so it is already held when the bot's next poll detects
