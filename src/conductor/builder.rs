@@ -10,7 +10,7 @@ use task_supervisor::SupervisorBuilder;
 use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use st0x_config::{AlertsCtx, Ctx, ExecutionThreshold, OnchainWalletCtx};
 use st0x_event_sorcery::{Projection, Store};
@@ -133,14 +133,12 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     /// [`PortfolioSnapshotCtx`] job context reads it directly each tick, and
     /// [`InventoryDivergenceRecoveryCtx`] verifies against it on divergence.
     pub(crate) inventory: Arc<BroadcastingInventory>,
-    pub(crate) wallet_polling: Option<WalletPollingCtx>,
-    pub(crate) tokenizer: Option<Arc<dyn Tokenizer>>,
-    /// `None` only when no wallet is configured (the bot can then never hold
-    /// onchain wrapped equity in the first place). Independent of whether
-    /// rebalancing itself is enabled -- a wallet can be configured for
-    /// trading alone (the removed Standalone topology), and market making still
-    /// holds wrapped vault shares onchain in that mode.
-    pub(crate) wrapper: Option<Arc<dyn Wrapper>>,
+    pub(crate) wallet_polling: WalletPollingCtx,
+    pub(crate) tokenizer: Arc<dyn Tokenizer>,
+    /// Ratio source for the portfolio-snapshot capture gate: market making
+    /// holds wrapped vault shares onchain, and the daily capture job resolves
+    /// each wrapped balance through this service.
+    pub(crate) wrapper: Arc<dyn Wrapper>,
     pub(crate) shutdown_token: CancellationToken,
     pub(crate) startup_token: StartupToken,
     pub(crate) supervisor_startup: SupervisorStartupTokens,
@@ -214,28 +212,28 @@ pub(crate) fn spawn<Prov, Exec>(
     portfolio_snapshot_queue: PortfolioSnapshotJobQueue,
     notifier: Arc<dyn Notifier>,
     wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
-    wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
+    wrapped_equity_recovery_ctx: Arc<WrappedEquityRecoveryCtx>,
     unwrapped_equity_recovery_queue: UnwrappedEquityRecoveryJobQueue,
-    unwrapped_equity_recovery_ctx: Option<Arc<UnwrappedEquityRecoveryCtx>>,
+    unwrapped_equity_recovery_ctx: Arc<UnwrappedEquityRecoveryCtx>,
     equity_check_scheduler: EquityRebalancingCheckScheduler,
     usdc_check_scheduler: UsdcRebalancingCheckScheduler,
     transfer_usdc_to_hedging_queue: TransferUsdcToHedgingJobQueue,
-    transfer_usdc_to_hedging_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
+    transfer_usdc_to_hedging_ctx: Arc<TransferUsdcToHedgingCtx>,
     transfer_usdc_to_market_making_queue: TransferUsdcToMarketMakingJobQueue,
-    transfer_usdc_to_market_making_ctx: Option<Arc<TransferUsdcToMarketMakingCtx>>,
+    transfer_usdc_to_market_making_ctx: Arc<TransferUsdcToMarketMakingCtx>,
     transfer_equity_to_market_making_queue: TransferEquityToMarketMakingJobQueue,
-    transfer_equity_to_market_making_ctx: Option<Arc<TransferEquityToMarketMakingCtx>>,
+    transfer_equity_to_market_making_ctx: Arc<TransferEquityToMarketMakingCtx>,
     transfer_equity_to_hedging_queue: TransferEquityToHedgingJobQueue,
-    transfer_equity_to_hedging_ctx: Option<Arc<TransferEquityToHedgingCtx>>,
-    rebalancing_service: Option<Arc<RebalancingService>>,
+    transfer_equity_to_hedging_ctx: Arc<TransferEquityToHedgingCtx>,
+    rebalancing_service: Arc<RebalancingService>,
     seed_vault_registry_queue: SeedVaultRegistryJobQueue,
     seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
     resume_tokenization_queue: ResumeTokenizationJobQueue,
-    resume_tokenization_ctx: Option<Arc<ResumeTokenizationCtx>>,
+    resume_tokenization_ctx: Arc<ResumeTokenizationCtx>,
     deliver_mint_authorization_queue: DeliverMintAuthorizationJobQueue,
-    deliver_mint_authorization_ctx: Option<Arc<DeliverMintAuthorizationCtx>>,
+    deliver_mint_authorization_ctx: Arc<DeliverMintAuthorizationCtx>,
     record_bot_gas_receipt_cost_queue: RecordBotGasReceiptCostJobQueue,
-    record_bot_gas_receipt_cost_ctx: Option<Arc<RecordBotGasReceiptCostCtx>>,
+    record_bot_gas_receipt_cost_ctx: Arc<RecordBotGasReceiptCostCtx>,
     job_cleanup: JoinHandle<()>,
     telemetry_writer: JoinHandle<()>,
     worker_failure_notifier: Arc<dyn Notifier>,
@@ -275,11 +273,10 @@ where
         usdc_vaults: configured_usdc_vaults,
     } = configured_inventory_vaults(&context.ctx);
 
-    let wallet_polling = context.wallet_polling;
-    // Captured before `wallet_polling` moves into `InventoryPollingService`
-    // below: `PortfolioSnapshotCtx`'s hydration gate needs to know whether
-    // wallet-transit locations are polled at all, from the same source the
-    // live poller itself reads.
+    // The snapshot capture gate below must require exactly the wallet slots
+    // this poller populates, so both derive from this single Option: the
+    // poller consumes it, the gate reads its presence.
+    let wallet_polling = Some(context.wallet_polling);
     let wallet_polling_enabled = wallet_polling.is_some();
     let tokenizer = context.tokenizer;
 
@@ -288,37 +285,30 @@ where
     // what this poller has stamped this run.
     let poll_freshness = PollFreshness::new();
 
-    let mut polling_service = InventoryPollingService::new(
-        poll_freshness.clone(),
-        raindex_service,
-        context.executor.clone(),
-        context.frameworks.vault_registry.clone(),
-        snapshot_id,
-        context.ctx.vault_owner(),
-        context.frameworks.snapshot,
-        wallet_polling,
-        tokenizer,
-        reserved_cash,
-    )
-    .with_configured_equity_symbols(configured_equity_symbols.clone())
-    .with_configured_vaults(configured_equity_vaults, configured_usdc_vaults)
-    .with_divergence_recovery(InventoryDivergenceRecoveryCtx {
-        inventory: context.inventory.clone(),
-        threshold: context.ctx.inventory_divergence_threshold,
-        // Share the trigger's gate so transfer suppression and detection
-        // agree; without rebalancing there is no transfer to gate, so a
-        // private gate serves as the counter's bookkeeping only.
-        gate: rebalancing_service
-            .as_ref()
-            .map_or_else(Arc::default, |service| service.divergence_gate()),
-    });
-
-    if let Some(rebalancing_service) = &rebalancing_service {
-        polling_service =
-            polling_service.with_pending_request_ownership(rebalancing_service.clone());
-    }
-
-    let polling_service = Arc::new(polling_service);
+    let polling_service = Arc::new(
+        InventoryPollingService::new(
+            poll_freshness.clone(),
+            raindex_service,
+            context.executor.clone(),
+            context.frameworks.vault_registry.clone(),
+            snapshot_id,
+            context.ctx.vault_owner(),
+            context.frameworks.snapshot,
+            wallet_polling,
+            Some(tokenizer),
+            reserved_cash,
+        )
+        .with_configured_equity_symbols(configured_equity_symbols.clone())
+        .with_configured_vaults(configured_equity_vaults, configured_usdc_vaults)
+        .with_divergence_recovery(InventoryDivergenceRecoveryCtx {
+            inventory: context.inventory.clone(),
+            threshold: context.ctx.inventory_divergence_threshold,
+            // Share the trigger's gate so transfer suppression and
+            // detection agree.
+            gate: rebalancing_service.divergence_gate(),
+        })
+        .with_pending_request_ownership(rebalancing_service.clone()),
+    );
 
     let inventory_monitor = InventoryMonitor {
         poller: polling_service,
@@ -435,9 +425,11 @@ where
         inventory: context.inventory.clone(),
         position_projection: context.frameworks.position_projection.clone(),
         portfolio_snapshot: context.frameworks.portfolio_snapshot.clone(),
-        wrapper: context.wrapper.clone(),
+        wrapper: Some(context.wrapper.clone()),
         configured_equity_symbols,
         usdc_tracking_enabled: context.ctx.assets.cash.is_some(),
+        // Derived from the same Option the poller consumed, so the gate can
+        // never require wallet slots the poller does not populate.
         wallet_polling_enabled,
         poll_freshness,
         notifier,
@@ -644,7 +636,7 @@ where
     rejection_ctx: Arc<HandleOrderRejectionCtx>,
     check_positions_ctx: Arc<CheckPositionsCtx<Exec>>,
     portfolio_snapshot_ctx: Arc<PortfolioSnapshotCtx>,
-    rebalancing_check_ctx: Option<Arc<RebalancingService>>,
+    rebalancing_check_ctx: Arc<RebalancingService>,
     seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
     job_queue: DexTradeAccountingJobQueue,
     hedge_queue: HedgeJobQueue,
@@ -657,25 +649,25 @@ where
     check_positions_queue: CheckPositionsJobQueue,
     portfolio_snapshot_queue: PortfolioSnapshotJobQueue,
     wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
-    wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
+    wrapped_equity_recovery_ctx: Arc<WrappedEquityRecoveryCtx>,
     unwrapped_equity_recovery_queue: UnwrappedEquityRecoveryJobQueue,
-    unwrapped_equity_recovery_ctx: Option<Arc<UnwrappedEquityRecoveryCtx>>,
+    unwrapped_equity_recovery_ctx: Arc<UnwrappedEquityRecoveryCtx>,
     equity_check_scheduler: EquityRebalancingCheckScheduler,
     usdc_check_scheduler: UsdcRebalancingCheckScheduler,
     transfer_usdc_to_hedging_queue: TransferUsdcToHedgingJobQueue,
-    transfer_usdc_to_hedging_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
+    transfer_usdc_to_hedging_ctx: Arc<TransferUsdcToHedgingCtx>,
     transfer_usdc_to_market_making_queue: TransferUsdcToMarketMakingJobQueue,
-    transfer_usdc_to_market_making_ctx: Option<Arc<TransferUsdcToMarketMakingCtx>>,
+    transfer_usdc_to_market_making_ctx: Arc<TransferUsdcToMarketMakingCtx>,
     transfer_equity_to_market_making_queue: TransferEquityToMarketMakingJobQueue,
-    transfer_equity_to_market_making_ctx: Option<Arc<TransferEquityToMarketMakingCtx>>,
+    transfer_equity_to_market_making_ctx: Arc<TransferEquityToMarketMakingCtx>,
     transfer_equity_to_hedging_queue: TransferEquityToHedgingJobQueue,
-    transfer_equity_to_hedging_ctx: Option<Arc<TransferEquityToHedgingCtx>>,
+    transfer_equity_to_hedging_ctx: Arc<TransferEquityToHedgingCtx>,
     resume_tokenization_queue: ResumeTokenizationJobQueue,
-    resume_tokenization_ctx: Option<Arc<ResumeTokenizationCtx>>,
+    resume_tokenization_ctx: Arc<ResumeTokenizationCtx>,
     deliver_mint_authorization_queue: DeliverMintAuthorizationJobQueue,
-    deliver_mint_authorization_ctx: Option<Arc<DeliverMintAuthorizationCtx>>,
+    deliver_mint_authorization_ctx: Arc<DeliverMintAuthorizationCtx>,
     record_bot_gas_receipt_cost_queue: RecordBotGasReceiptCostJobQueue,
-    record_bot_gas_receipt_cost_ctx: Option<Arc<RecordBotGasReceiptCostCtx>>,
+    record_bot_gas_receipt_cost_ctx: Arc<RecordBotGasReceiptCostCtx>,
     apalis_shutdown_token: CancellationToken,
     seed_vault_registry_queue: SeedVaultRegistryJobQueue,
     startup_token: StartupToken,
@@ -916,37 +908,33 @@ where
                     )
                 });
 
-            let apalis_monitor = if let Some(rebalancing_service) = rebalancing_check_ctx {
-                let equity_service = Arc::clone(&rebalancing_service);
-                let usdc_service = rebalancing_service;
-                let equity_queue = equity_check_scheduler.queue().clone();
-                let usdc_queue = usdc_check_scheduler.queue().clone();
-                monitor
-                    .register(move |index| {
-                        build_supervised_worker!(
-                            ::<RebalancingService, EquityRebalancingCheck>,
-                            index,
-                            equity_queue.clone(),
-                            equity_service.clone(),
-                            failure_notify_for_equity_rebalancing_check.clone(),
-                            #[cfg(any(test, feature = "test-support"))]
-                            failure_injector_for_equity_rebalancing_check.clone(),
-                        )
-                    })
-                    .register(move |index| {
-                        build_supervised_worker!(
-                            ::<RebalancingService, UsdcRebalancingCheck>,
-                            index,
-                            usdc_queue.clone(),
-                            usdc_service.clone(),
-                            failure_notify_for_usdc_rebalancing_check.clone(),
-                            #[cfg(any(test, feature = "test-support"))]
-                            failure_injector_for_usdc_rebalancing_check.clone(),
-                        )
-                    })
-            } else {
-                monitor
-            };
+            let equity_service = Arc::clone(&rebalancing_check_ctx);
+            let usdc_service = rebalancing_check_ctx;
+            let equity_queue = equity_check_scheduler.queue().clone();
+            let usdc_queue = usdc_check_scheduler.queue().clone();
+            let apalis_monitor = monitor
+                .register(move |index| {
+                    build_supervised_worker!(
+                        ::<RebalancingService, EquityRebalancingCheck>,
+                        index,
+                        equity_queue.clone(),
+                        equity_service.clone(),
+                        failure_notify_for_equity_rebalancing_check.clone(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        failure_injector_for_equity_rebalancing_check.clone(),
+                    )
+                })
+                .register(move |index| {
+                    build_supervised_worker!(
+                        ::<RebalancingService, UsdcRebalancingCheck>,
+                        index,
+                        usdc_queue.clone(),
+                        usdc_service.clone(),
+                        failure_notify_for_usdc_rebalancing_check.clone(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        failure_injector_for_usdc_rebalancing_check.clone(),
+                    )
+                });
 
             let apalis_monitor = register_wrapped_equity_recovery_worker(
                 apalis_monitor,
@@ -1122,25 +1110,16 @@ fn log_optional_task_status(task_name: &str, is_configured: bool) {
     }
 }
 
-/// Conditionally registers the wrapped-equity recovery worker against the
-/// apalis monitor. Extracted because this is the only `Option`-gated worker
-/// registration and inlining the let-else + debug log keeps
-/// `spawn_apalis_monitor` over the cognitive-complexity limit.
+/// Registers the wrapped-equity recovery worker against the apalis monitor.
+/// Extracted (like every `register_*` sibling below) to keep
+/// `spawn_apalis_monitor` under the cognitive-complexity limit.
 fn register_wrapped_equity_recovery_worker(
     monitor: Monitor,
-    recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
+    recovery_ctx: Arc<WrappedEquityRecoveryCtx>,
     recovery_queue: WrappedEquityRecoveryJobQueue,
     failure_notify: Arc<TerminalFailureSignal>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
-    let Some(recovery_ctx) = recovery_ctx else {
-        debug!(
-            "Wrapped-equity recovery worker not registered: rebalancing disabled \
-             (no recovery ctx). Detected wtSTOCK on the bot wallet will not be recovered."
-        );
-        return monitor;
-    };
-
     monitor.register(move |index| {
         build_supervised_worker!(
             ::<WrappedEquityRecoveryCtx, WrappedEquityRecoveryJob>,
@@ -1154,23 +1133,15 @@ fn register_wrapped_equity_recovery_worker(
     })
 }
 
-/// Conditionally registers the unwrapped-equity recovery worker. Same
-/// pattern as `register_wrapped_equity_recovery_worker`.
+/// Registers the unwrapped-equity recovery worker. Same pattern as
+/// `register_wrapped_equity_recovery_worker`.
 fn register_unwrapped_equity_recovery_worker(
     monitor: Monitor,
-    recovery_ctx: Option<Arc<UnwrappedEquityRecoveryCtx>>,
+    recovery_ctx: Arc<UnwrappedEquityRecoveryCtx>,
     recovery_queue: UnwrappedEquityRecoveryJobQueue,
     failure_notify: Arc<TerminalFailureSignal>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
-    let Some(recovery_ctx) = recovery_ctx else {
-        debug!(
-            "Unwrapped-equity recovery worker not registered: rebalancing disabled \
-             (no recovery ctx). Detected tSTOCK on the bot wallet will not be recovered."
-        );
-        return monitor;
-    };
-
     monitor.register(move |index| {
         build_supervised_worker!(
             ::<UnwrappedEquityRecoveryCtx, UnwrappedEquityRecoveryJob>,
@@ -1184,25 +1155,15 @@ fn register_unwrapped_equity_recovery_worker(
     })
 }
 
-/// Conditionally registers the `TransferUsdcToHedging` worker. The ctx is
-/// `None` when rebalancing is disabled in config; in that case the queue is
-/// still constructed (so tests that build it directly compile) but no worker
-/// consumes it.
+/// Registers the `TransferUsdcToHedging` worker, which processes
+/// Base->Alpaca USDC transfers.
 fn register_transfer_usdc_to_hedging_worker(
     monitor: Monitor,
-    transfer_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
+    transfer_ctx: Arc<TransferUsdcToHedgingCtx>,
     transfer_queue: TransferUsdcToHedgingJobQueue,
     failure_notify: Arc<TerminalFailureSignal>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
-    let Some(transfer_ctx) = transfer_ctx else {
-        warn!(
-            "TransferUsdcToHedging worker not registered: rebalancing disabled \
-             (no transfer ctx). Base->Alpaca USDC transfers will not be processed."
-        );
-        return monitor;
-    };
-
     monitor.register(move |index| {
         build_supervised_worker!(
             ::<TransferUsdcToHedgingCtx, TransferUsdcToHedging>,
@@ -1220,19 +1181,11 @@ fn register_transfer_usdc_to_hedging_worker(
 /// Alpaca->Base direction.
 fn register_transfer_usdc_to_market_making_worker(
     monitor: Monitor,
-    transfer_ctx: Option<Arc<TransferUsdcToMarketMakingCtx>>,
+    transfer_ctx: Arc<TransferUsdcToMarketMakingCtx>,
     transfer_queue: TransferUsdcToMarketMakingJobQueue,
     failure_notify: Arc<TerminalFailureSignal>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
-    let Some(transfer_ctx) = transfer_ctx else {
-        warn!(
-            "TransferUsdcToMarketMaking worker not registered: rebalancing disabled \
-             (no transfer ctx). Alpaca->Base USDC transfers will not be processed."
-        );
-        return monitor;
-    };
-
     monitor.register(move |index| {
         build_supervised_worker!(
             ::<TransferUsdcToMarketMakingCtx, TransferUsdcToMarketMaking>,
@@ -1246,25 +1199,15 @@ fn register_transfer_usdc_to_market_making_worker(
     })
 }
 
-/// Conditionally registers the `TransferEquityToMarketMaking` worker. Same
-/// pattern as the USDC transfer workers: the ctx is `None` when rebalancing
-/// is disabled, in which case the queue exists but no worker consumes it.
-/// Terminal per-transfer failures remain dead-lettered in apalis without
-/// stopping this worker or the conductor.
+/// Registers the `TransferEquityToMarketMaking` worker, which processes
+/// equity mints. Terminal per-transfer failures remain dead-lettered in
+/// apalis without stopping this worker or the conductor.
 fn register_transfer_equity_to_market_making_worker(
     monitor: Monitor,
-    transfer_ctx: Option<Arc<TransferEquityToMarketMakingCtx>>,
+    transfer_ctx: Arc<TransferEquityToMarketMakingCtx>,
     transfer_queue: TransferEquityToMarketMakingJobQueue,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
-    let Some(transfer_ctx) = transfer_ctx else {
-        warn!(
-            "TransferEquityToMarketMaking worker not registered: rebalancing disabled \
-             (no transfer ctx). Equity mints will not be processed."
-        );
-        return monitor;
-    };
-
     monitor.register(move |index| {
         build_best_effort_worker!(
             ::<TransferEquityToMarketMakingCtx, TransferEquityToMarketMaking>,
@@ -1281,18 +1224,10 @@ fn register_transfer_equity_to_market_making_worker(
 /// redemption (market-making -> hedging) direction.
 fn register_transfer_equity_to_hedging_worker(
     monitor: Monitor,
-    transfer_ctx: Option<Arc<TransferEquityToHedgingCtx>>,
+    transfer_ctx: Arc<TransferEquityToHedgingCtx>,
     transfer_queue: TransferEquityToHedgingJobQueue,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
-    let Some(transfer_ctx) = transfer_ctx else {
-        warn!(
-            "TransferEquityToHedging worker not registered: rebalancing disabled \
-             (no transfer ctx). Equity redemptions will not be processed."
-        );
-        return monitor;
-    };
-
     monitor.register(move |index| {
         build_best_effort_worker!(
             ::<TransferEquityToHedgingCtx, TransferEquityToHedging>,
@@ -1305,24 +1240,15 @@ fn register_transfer_equity_to_hedging_worker(
     })
 }
 
-/// Conditionally registers the `ResumeTokenizationAggregate` worker. The ctx is
-/// `None` when rebalancing is disabled; in that case the queue exists but no
-/// worker consumes it. When enabled, runs interrupted mint/redemption aggregates
-/// off the startup path so a slow or down issuer cannot block monitoring.
+/// Registers the `ResumeTokenizationAggregate` worker, which runs
+/// interrupted mint/redemption aggregates off the startup path so a slow or
+/// down issuer cannot block monitoring.
 fn register_resume_tokenization_worker(
     monitor: Monitor,
-    resume_ctx: Option<Arc<ResumeTokenizationCtx>>,
+    resume_ctx: Arc<ResumeTokenizationCtx>,
     resume_queue: ResumeTokenizationJobQueue,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
-    let Some(resume_ctx) = resume_ctx else {
-        debug!(
-            "ResumeTokenizationAggregate worker not registered: rebalancing disabled \
-             (no resume ctx). Interrupted tokenization aggregates will not be resumed."
-        );
-        return monitor;
-    };
-
     monitor.register(move |index| {
         build_best_effort_worker!(
             ::<ResumeTokenizationCtx, ResumeTokenizationAggregate>,
@@ -1335,25 +1261,14 @@ fn register_resume_tokenization_worker(
     })
 }
 
-/// Conditionally registers the `DeliverMintAuthorization` worker. The ctx
-/// is `None` when rebalancing is disabled: no mints happen, so no
-/// authorization ever needs delivering. Best-effort -- a stuck
+/// Registers the `DeliverMintAuthorization` worker. Best-effort -- a stuck
 /// authorization must never halt hedging or fill detection.
 fn register_deliver_mint_authorization_worker(
     monitor: Monitor,
-    delivery_ctx: Option<Arc<DeliverMintAuthorizationCtx>>,
+    delivery_ctx: Arc<DeliverMintAuthorizationCtx>,
     delivery_queue: DeliverMintAuthorizationJobQueue,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
-    let Some(delivery_ctx) = delivery_ctx else {
-        debug!(
-            "DeliverMintAuthorization worker not registered: rebalancing disabled \
-             (no delivery ctx). Orchestrator-mode mint authorizations will not be \
-             delivered."
-        );
-        return monitor;
-    };
-
     monitor.register(move |index| {
         build_best_effort_worker!(
             ::<DeliverMintAuthorizationCtx, DeliverMintAuthorization>,
@@ -1366,28 +1281,15 @@ fn register_deliver_mint_authorization_worker(
     })
 }
 
-/// Conditionally registers the `RecordBotGasReceiptCost` worker. The ctx is
-/// `None` when `[bot_gas_valuation]` is not configured, or when it is
-/// configured but no `[wallet]` is (see `build_record_bot_gas_receipt_cost_ctx`);
-/// in either case the queue exists but no worker consumes it. Best-effort,
-/// matching every other per-item dead-lettering worker: a terminal failure
-/// recording one receipt's cost must never block or slow hedging (see ADR
-/// 0017).
+/// Registers the `RecordBotGasReceiptCost` worker. Best-effort, matching
+/// every other per-item dead-lettering worker: a terminal failure recording
+/// one receipt's cost must never block or slow hedging (see ADR 0017).
 fn register_record_bot_gas_receipt_cost_worker(
     monitor: Monitor,
-    record_ctx: Option<Arc<RecordBotGasReceiptCostCtx>>,
+    record_ctx: Arc<RecordBotGasReceiptCostCtx>,
     record_queue: RecordBotGasReceiptCostJobQueue,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
-    let Some(record_ctx) = record_ctx else {
-        warn!(
-            "RecordBotGasReceiptCost worker not registered: [bot_gas_valuation] is not \
-             configured, or is configured without a [wallet]. Bot-gas costs will not be \
-             recorded."
-        );
-        return monitor;
-    };
-
     monitor.register(move |index| {
         build_best_effort_worker!(
             ::<RecordBotGasReceiptCostCtx, RecordBotGasReceiptCost>,
@@ -1630,7 +1532,7 @@ mod tests {
         });
         let monitor = register_transfer_equity_to_hedging_worker(
             Monitor::new().should_restart(|_ctx, _error, _attempt| false),
-            Some(transfer_ctx),
+            transfer_ctx,
             queue,
             FailureInjector::new(),
         );
@@ -1702,7 +1604,7 @@ mod tests {
         );
         let monitor = register_transfer_equity_to_market_making_worker(
             Monitor::new().should_restart(|_ctx, _error, _attempt| false),
-            Some(transfer_ctx),
+            transfer_ctx,
             queue,
             FailureInjector::new(),
         );
