@@ -3151,6 +3151,10 @@ mod tests {
     }
 
     #[tokio::test]
+    // $52 is the sharp case rather than a trivially small limit: it clears
+    // Alpaca's $51 withdrawal minimum, but every transfer it caps converts to
+    // less than that, so rebalancing configured this way could never complete
+    // a transfer.
     async fn rebalancing_with_low_cash_operational_limit_fails() {
         let secrets = toml_file(
             r#"
@@ -3184,7 +3188,7 @@ mod tests {
 
             [assets.cash]
             rebalancing = "enabled"
-            operational_limit = 5
+            operational_limit = 52
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
@@ -3237,7 +3241,7 @@ mod tests {
                 CtxError::CashOperationalLimitBelowMinimumWithdrawal { .. }
             ),
             "Expected CashOperationalLimitBelowMinimumWithdrawal for \
-             operational_limit=5, got: {error:?}"
+             operational_limit=52, got: {error:?}"
         );
     }
 

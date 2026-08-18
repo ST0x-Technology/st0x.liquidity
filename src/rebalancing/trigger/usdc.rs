@@ -1481,12 +1481,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_excess_at_exactly_minimum_triggers_alpaca_to_base() {
-        // Edge case: excess is exactly $51
-        // Total = 102, target = 51 each
-        // If offchain = 102, onchain = 0, excess = 102 - 51 = 51
+        // Edge case: excess is exactly the arming floor of $53.
+        // Total = 106, target = 53 each
+        // If offchain = 106, onchain = 0, excess = 106 - 53 = 53
         let inventory = InventoryView::default()
-            .with_usdc(Usdc::new(float!(0)), Usdc::new(float!(102)))
-            .with_withdrawable_cash_cents(10_200);
+            .with_usdc(Usdc::new(float!(0)), Usdc::new(float!(106)))
+            .with_withdrawable_cash_cents(10_600);
 
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
@@ -1500,9 +1500,9 @@ mod tests {
         assert_eq!(
             result,
             Ok(UsdcRebalanceOperation::AlpacaToBase {
-                amount: Usdc::new(float!(51))
+                amount: Usdc::new(float!(53))
             }),
-            "Expected AlpacaToBase with amount = 51, got {result:?}"
+            "Expected AlpacaToBase with amount = 53, got {result:?}"
         );
     }
 
@@ -1651,6 +1651,38 @@ mod tests {
                     if excess == Usdc::new(float!(30))
             ),
             "Cap of $30 should produce BelowMinimumWithdrawal, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_amount_between_the_withdrawal_minimum_and_the_arming_floor_skips() {
+        // The operational limit, not capacity, is what lands the transfer in
+        // the dead band: $52 clears Alpaca's $51 withdrawal minimum but buys
+        // only ~$51 of USDC once the collar takes its cut, so the transfer
+        // must be skipped rather than armed and failed after conversion.
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+                .with_withdrawable_cash_cents(50_000),
+            event_sender,
+        ));
+        let threshold = ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        };
+        let usdc_limit = Some(Usdc::new(float!(52)));
+
+        let result =
+            check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit, None).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(UsdcTriggerSkip::BelowMinimumWithdrawal { excess })
+                    if excess == Usdc::new(float!(52))
+            ),
+            "A $52 cap is above Alpaca's withdrawal minimum but below the arming floor, got {result:?}"
         );
     }
 
@@ -1953,16 +1985,17 @@ mod tests {
 
     #[tokio::test]
     async fn alpaca_to_base_proceeds_when_capacity_just_clears_minimum_no_reserve() {
-        // 100 onchain / 500 offchain -> excess = 200. Capacity is now the
-        // withdrawable cash itself, so $51.00 lands exactly on the minimum:
-        // this pins the proceed side of the boundary and separates `lt` from
-        // `le` -- a `le` comparison would wrongly skip here.
+        // 100 onchain / 500 offchain -> excess = 200. The floor is the
+        // withdrawal minimum grossed up for what the conversion consumes, so
+        // $53.00 lands exactly on it: this pins the proceed side of the
+        // boundary and separates `lt` from `le` -- a `le` comparison would
+        // wrongly skip here.
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default()
                 .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
                 .with_offchain_gross_usd_cents(50_000)
-                .with_withdrawable_cash_cents(5_100),
+                .with_withdrawable_cash_cents(5_300),
             event_sender,
         ));
         let threshold = ImbalanceThreshold {
@@ -1975,22 +2008,25 @@ mod tests {
         assert_eq!(
             result,
             Ok(UsdcRebalanceOperation::AlpacaToBase {
-                amount: Usdc::new(float!(51))
+                amount: Usdc::new(float!(53))
             }),
-            "Capacity exactly at the $51 minimum must not skip, got {result:?}"
+            "Capacity exactly at the $53 arming floor must not skip, got {result:?}"
         );
     }
 
     #[tokio::test]
     async fn alpaca_to_base_skips_one_cent_below_the_capacity_minimum() {
-        // The skip side of the same boundary: $50.99 withdrawable is one cent
-        // less than the test above, leaving capacity just under $51.
+        // The skip side of the same boundary: $52.99 withdrawable is one cent
+        // less than the test above. Capacity clears Alpaca's $51 withdrawal
+        // minimum but not the arming floor, and converting it would deliver
+        // ~$51.9 of USDC -- so this is the band that must keep skipping rather
+        // than arm a transfer whose conversion strands the USDC.
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default()
                 .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
                 .with_offchain_gross_usd_cents(50_000)
-                .with_withdrawable_cash_cents(5_099),
+                .with_withdrawable_cash_cents(5_299),
             event_sender,
         ));
         let threshold = ImbalanceThreshold {
