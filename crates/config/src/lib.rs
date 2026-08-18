@@ -27,8 +27,8 @@ pub use loader::*;
 pub use orchestrator::{OrchestratorAddresses, OrchestratorConfig, OrchestratorError};
 pub use order_poller::OrderPollerCtx;
 pub use rebalancing::{
-    ALPACA_MINIMUM_WITHDRAWAL, RebalancingConfig, RebalancingCtx, RebalancingCtxError,
-    UsdcRebalancing,
+    ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, RebalancingConfig, RebalancingCtx,
+    RebalancingCtxError, UsdcRebalancing,
 };
 pub use telemetry::{
     ExtraLayer, FileLogGuard, TelemetryConfig, TelemetryCtx, TelemetryError, TelemetryGuard,

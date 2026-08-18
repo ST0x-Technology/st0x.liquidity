@@ -19,6 +19,18 @@ use crate::{ImbalanceThreshold, OperationMode};
 /// the minimum after conversion slippage.
 pub static ALPACA_MINIMUM_WITHDRAWAL: LazyLock<Usdc> = LazyLock::new(|| Usdc::new(float!(51)));
 
+/// Minimum USD an Alpaca->Base transfer may commit.
+///
+/// Bounds the dollars going *in*, where [`ALPACA_MINIMUM_WITHDRAWAL`] bounds
+/// the USDC coming *out*. They differ because the conversion spends dollars on
+/// a `notional` buy and Alpaca's ~2% collar takes its cut before the USDC
+/// exists: a transfer sized at the withdrawal minimum leaves ~49.95 USDC, which
+/// Alpaca will not withdraw and an operator has to reconcile. So the floor is
+/// that minimum grossed up for the conversion -- `51 x 1.021 x 1.001` is
+/// `52.13` to the cent -- rounded up to a whole dollar.
+pub static ALPACA_TO_BASE_MINIMUM_TRANSFER: LazyLock<Usdc> =
+    LazyLock::new(|| Usdc::new(float!(53)));
+
 /// Error type for rebalancing configuration validation.
 #[derive(Debug, thiserror::Error)]
 pub enum RebalancingCtxError {

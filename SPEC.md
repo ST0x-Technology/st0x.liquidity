@@ -3003,7 +3003,14 @@ enum BridgeStage { Burn, Attestation, Mint }
     attempted, naming the converted amount, rather than letting Alpaca reject
     the withdrawal.
   - Minimum withdrawal threshold ($51) accounts for slippage to ensure $50
-    minimum is met after conversion
+    minimum is met after conversion. It bounds the USDC coming out
+  - Minimum Alpaca-to-Base transfer ($53) bounds the dollars going in, and is
+    the withdrawal threshold grossed up for what the conversion consumes
+    (`51 x 1.021 x 1.001`, which is `52.13` to the cent, rounded up to a whole
+    dollar). Without it the trigger would arm transfers whose conversion lands
+    under the withdrawal threshold, which strands the USDC in the crypto wallet
+    for an operator to reconcile. It also floors
+    `assets.cash.operational_limit`, since that limit caps every transfer
   - ConversionFailed is a terminal state (requires manual intervention)
   - ConversionComplete is terminal for BaseToAlpaca direction
 - Alpaca withdrawals/deposits are asynchronous: initiate with API call (get

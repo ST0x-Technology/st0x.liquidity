@@ -1093,7 +1093,7 @@ fn parse_and_validate(
                 return Err(RebalancingCtxError::NotAlpacaBroker.into());
             };
 
-            let minimum = *crate::ALPACA_MINIMUM_WITHDRAWAL;
+            let minimum = *crate::ALPACA_TO_BASE_MINIMUM_TRANSFER;
 
             if let Some(cash) = &config.assets.cash
                 && cash.rebalancing == OperationMode::Enabled
@@ -1102,7 +1102,7 @@ fn parse_and_validate(
                 let below_minimum = cash_limit.inner().lt(&minimum)?;
 
                 if below_minimum {
-                    return Err(CtxError::CashOperationalLimitBelowMinimumWithdrawal {
+                    return Err(CtxError::CashOperationalLimitBelowMinimumTransfer {
                         configured: cash_limit.inner(),
                         minimum,
                     });
@@ -1805,10 +1805,10 @@ pub enum CtxError {
     #[error("[wallet] config present but [wallet] secrets missing")]
     WalletSecretsMissing,
     #[error(
-        "assets.cash operational_limit {configured} is below Alpaca's \
-         minimum withdrawal of {minimum}"
+        "assets.cash operational_limit {configured} is below the smallest \
+         Alpaca-to-Base transfer that can complete, {minimum}"
     )]
-    CashOperationalLimitBelowMinimumWithdrawal { configured: Usdc, minimum: Usdc },
+    CashOperationalLimitBelowMinimumTransfer { configured: Usdc, minimum: Usdc },
     #[error(
         "assets.cash.vault_ids is required for rebalancing \
          but not configured"
@@ -1882,8 +1882,8 @@ impl CtxError {
             }
             Self::Alerts(_) => "alerts assembly error",
             Self::Evm(_) => "evm configuration error",
-            Self::CashOperationalLimitBelowMinimumWithdrawal { .. } => {
-                "cash operational limit below minimum withdrawal"
+            Self::CashOperationalLimitBelowMinimumTransfer { .. } => {
+                "cash operational limit below minimum transfer"
             }
             Self::MissingCashVaultId => "missing cash vault_ids",
             Self::MissingEquityVaultId { .. } => "missing equity vault_ids",
@@ -3235,14 +3235,18 @@ mod tests {
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                CtxError::CashOperationalLimitBelowMinimumWithdrawal { .. }
-            ),
-            "Expected CashOperationalLimitBelowMinimumWithdrawal for \
-             operational_limit=52, got: {error:?}"
-        );
+        let CtxError::CashOperationalLimitBelowMinimumTransfer {
+            configured,
+            minimum,
+        } = error
+        else {
+            panic!(
+                "Expected CashOperationalLimitBelowMinimumTransfer for \
+                 operational_limit=52, got: {error:?}"
+            );
+        };
+        assert_eq!(configured, Usdc::new(float!(52)));
+        assert_eq!(minimum, Usdc::new(float!(53)));
     }
 
     #[tokio::test]
