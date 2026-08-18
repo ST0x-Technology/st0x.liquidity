@@ -1706,10 +1706,7 @@ impl PositionAndRebalancing {
 
         if let Some(rebalancing_ctx) = rebalancing {
             let wallet_ctx = deps.ctx.wallet()?;
-            let wallets = ChainWallets {
-                ethereum: EthereumWallet(wallet_ctx.ethereum_wallet().clone()),
-                base: BaseWallet(wallet_ctx.base_wallet().clone()),
-            };
+            let wallets = ChainWallets::from_wallet_ctx(wallet_ctx);
             let redemption_wallet = deps.ctx.redemption_wallet()?;
 
             // Computed before `deps` is moved into the spawn call, since
@@ -1727,8 +1724,7 @@ impl PositionAndRebalancing {
             )
             .await?;
 
-            let EthereumWallet(ethereum_wallet) = wallets.ethereum;
-            let BaseWallet(base_wallet) = wallets.base;
+            let (EthereumWallet(ethereum_wallet), BaseWallet(base_wallet)) = wallets.into_parts();
             let wallet_polling = crate::inventory::WalletPollingCtx {
                 ethereum: Arc::new(ethereum_wallet),
                 base: Arc::new(base_wallet),
@@ -2214,7 +2210,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             anyhow::bail!("rebalancing requires Alpaca Broker API configuration");
         };
 
-        let BaseWallet(base_wallet) = &wallets.base;
+        let BaseWallet(base_wallet) = wallets.base();
         let market_maker_wallet = base_wallet.address();
 
         // This function only runs under `TradingMode::Rebalancing`, which

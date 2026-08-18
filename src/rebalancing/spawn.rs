@@ -1,12 +1,13 @@
 //! Builds the rebalancing transfer infrastructure.
 
 use alloy::primitives::Address;
+use alloy::providers::RootProvider;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
-use st0x_config::EquityAssetConfig;
+use st0x_config::{EquityAssetConfig, OnchainWalletCtx};
 use st0x_event_sorcery::Store;
 use st0x_evm::{USDC_BASE, USDC_ETHEREUM, Wallet};
 use st0x_execution::{AlpacaWalletService, EmptySymbolError, Symbol};
@@ -64,8 +65,27 @@ pub(crate) struct BaseWallet<Chain>(pub(crate) Chain);
 
 #[derive(Clone)]
 pub(crate) struct ChainWallets<Chain> {
-    pub(crate) ethereum: EthereumWallet<Chain>,
-    pub(crate) base: BaseWallet<Chain>,
+    ethereum: EthereumWallet<Chain>,
+    base: BaseWallet<Chain>,
+}
+
+impl<Chain> ChainWallets<Chain> {
+    pub(crate) fn base(&self) -> &BaseWallet<Chain> {
+        &self.base
+    }
+
+    pub(crate) fn into_parts(self) -> (EthereumWallet<Chain>, BaseWallet<Chain>) {
+        (self.ethereum, self.base)
+    }
+}
+
+impl ChainWallets<Arc<dyn Wallet<Provider = RootProvider>>> {
+    pub(crate) fn from_wallet_ctx(ctx: &OnchainWalletCtx) -> Self {
+        Self {
+            ethereum: EthereumWallet(ctx.ethereum_wallet().clone()),
+            base: BaseWallet(ctx.base_wallet().clone()),
+        }
+    }
 }
 
 /// External service clients for rebalancing operations.
