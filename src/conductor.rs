@@ -112,8 +112,8 @@ use crate::rebalancing::usdc::{
     TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
 };
 use crate::rebalancing::{
-    RebalancerServices, RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
-    to_wrapped_equities,
+    BaseWallet, ChainWallets, EthereumWallet, RebalancerServices, RebalancingSchedulers,
+    RebalancingService, RebalancingServiceConfig, to_wrapped_equities,
 };
 use crate::startup::StartupToken;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
@@ -1744,8 +1744,7 @@ impl PositionAndRebalancing {
 
         if let Some(rebalancing_ctx) = rebalancing {
             let wallet_ctx = deps.ctx.wallet()?;
-            let ethereum_wallet = wallet_ctx.ethereum_wallet().clone();
-            let base_wallet = wallet_ctx.base_wallet().clone();
+            let wallets = ChainWallets::from_wallet_ctx(wallet_ctx);
             let redemption_wallet = deps.ctx.redemption_wallet()?;
 
             // Computed before `deps` is moved into the spawn call, since
@@ -1758,12 +1757,12 @@ impl PositionAndRebalancing {
             let infra = spawn_rebalancing_infrastructure(
                 rebalancing_ctx,
                 redemption_wallet,
-                ethereum_wallet.clone(),
-                base_wallet.clone(),
+                wallets.clone(),
                 deps,
             )
             .await?;
 
+            let (EthereumWallet(ethereum_wallet), BaseWallet(base_wallet)) = wallets.into_parts();
             let wallet_polling = crate::inventory::WalletPollingCtx {
                 ethereum: Arc::new(ethereum_wallet),
                 base: Arc::new(base_wallet),
@@ -2195,8 +2194,7 @@ async fn build_query_frameworks(
 /// samples, mirroring the hedge executor's own wrapping.
 async fn build_rebalancer_services<Chain: Wallet + Clone>(
     alpaca_auth: &AlpacaBrokerApiCtx,
-    ethereum_wallet: Chain,
-    base_wallet: Chain,
+    wallets: ChainWallets<Chain>,
     raindex_service: Arc<RaindexService<Chain>>,
     rebalancing_ctx: &RebalancingCtx,
     required_confirmations: u64,
@@ -2217,8 +2215,7 @@ async fn build_rebalancer_services<Chain: Wallet + Clone>(
     RebalancerServices::new(
         broker,
         alpaca_wallet,
-        ethereum_wallet,
-        base_wallet,
+        wallets,
         raindex_service,
         UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
@@ -2237,8 +2234,7 @@ async fn build_rebalancer_services<Chain: Wallet + Clone>(
 fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     redemption_wallet: Address,
-    ethereum_wallet: Chain,
-    base_wallet: Chain,
+    wallets: ChainWallets<Chain>,
     deps: RebalancingDeps,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = anyhow::Result<RebalancingInfrastructure>> + Send>,
@@ -2252,6 +2248,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             anyhow::bail!("rebalancing requires Alpaca Broker API configuration");
         };
 
+        let BaseWallet(base_wallet) = wallets.base();
         let market_maker_wallet = base_wallet.address();
 
         // This function only runs under `TradingMode::Rebalancing`, which
@@ -2283,7 +2280,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         ));
 
         let raindex_service =
-            build_rebalancing_raindex_service(&base_wallet, &deps.ctx, market_maker_wallet);
+            build_rebalancing_raindex_service(base_wallet, &deps.ctx, market_maker_wallet);
 
         preflight_inventory_access(&raindex_service, &deps.ctx).await?;
 
@@ -2302,7 +2299,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let wrapper = build_wrapper(base_wallet.clone(), &deps.ctx);
 
         let mint_authorization =
-            build_mint_authorization_infra(&deps.ctx, &deps.apalis_pool, &base_wallet).await?;
+            build_mint_authorization_infra(&deps.ctx, &deps.apalis_pool, base_wallet).await?;
 
         let equity_transfer_services = EquityTransferServices {
             raindex: raindex_service.clone(),
@@ -2407,8 +2404,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let services = build_rebalancer_services(
             alpaca_auth,
-            ethereum_wallet,
-            base_wallet,
+            wallets,
             raindex_service,
             &rebalancing_ctx,
             deps.ctx.evm.required_confirmations,
