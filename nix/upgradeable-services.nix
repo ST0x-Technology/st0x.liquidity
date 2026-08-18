@@ -69,6 +69,13 @@ let
         ExecStart = utils.escapeSystemdExecArgs ([ "${cfg.profilePath}/bin/${cfg.bin}" ] ++ execStartArgs);
         Restart = "always";
         RestartSec = 30;
+      }
+      // lib.optionalAttrs (cfg.kind == "st0x") {
+        # The server writes its PID here only after all essential runtime
+        # components reach their run loops. The per-service deploy activation
+        # waits for that PID before succeeding.
+        RuntimeDirectory = name;
+        Environment = "ST0X_STARTUP_READY_FILE=/run/${name}/startup-ready";
       };
     };
 in

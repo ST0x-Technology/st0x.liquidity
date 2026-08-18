@@ -15,22 +15,23 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use task_supervisor::{
-    SupervisedTask, SupervisorBuilder, SupervisorError, SupervisorHandle, TaskResult,
+    SupervisedTask, SupervisorBuilder, SupervisorError, SupervisorHandle, SupervisorHandleError,
+    TaskResult,
 };
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::Layer;
 
 use st0x_config::{BrokerCtx, Ctx};
 use st0x_dto::Statement;
 use st0x_execution::MockExecutorCtx;
 
+use crate::conductor::{ConductorStartupTokens, DatabasePools, SupervisorStartupTokens};
 use crate::trading::offchain::hedge::HedgeJobQueue;
 use crate::trading::onchain::trade_accountant::DexTradeAccountingJobQueue;
-use conductor::DatabasePools;
 
 /// Outer timeout for the entire graceful shutdown sequence. Must exceed
 /// the rebalancer drain timeout (60s) plus margin for supervisor shutdown
@@ -61,6 +62,7 @@ mod portfolio_snapshot;
 mod position;
 mod position_check;
 mod rebalancing;
+mod startup;
 mod telemetry;
 mod trading;
 #[cfg(feature = "mock")]
@@ -175,6 +177,24 @@ pub async fn run_bot_session(ctx: Ctx) -> anyhow::Result<()> {
 }
 
 #[tracing::instrument(skip_all, target = "startup", level = tracing::Level::INFO)]
+pub async fn run_server_bot_session(ctx: Ctx) -> anyhow::Result<()> {
+    let (event_sender, _) = broadcast::channel::<Statement>(256);
+    let startup_notifier: Arc<dyn startup::StartupNotifier> =
+        match startup::DeploymentStartupNotifier::from_env() {
+            Some(notifier) => Arc::new(notifier),
+            None => Arc::new(startup::NoopStartupNotifier),
+        };
+    run_bot_session_inner(
+        ctx,
+        event_sender,
+        startup_notifier,
+        #[cfg(any(test, feature = "test-support"))]
+        FailureInjector::new(),
+    )
+    .await
+}
+
+#[tracing::instrument(skip_all, target = "startup", level = tracing::Level::INFO)]
 pub async fn run_bot_session_with_event_channel(
     ctx: Ctx,
     event_sender: broadcast::Sender<Statement>,
@@ -182,6 +202,7 @@ pub async fn run_bot_session_with_event_channel(
     run_bot_session_inner(
         ctx,
         event_sender,
+        Arc::new(startup::NoopStartupNotifier),
         #[cfg(any(test, feature = "test-support"))]
         FailureInjector::new(),
     )
@@ -197,12 +218,19 @@ pub async fn run_bot_session_with_injector(
     event_sender: broadcast::Sender<Statement>,
     failure_injector: FailureInjector,
 ) -> anyhow::Result<()> {
-    run_bot_session_inner(ctx, event_sender, failure_injector).await
+    run_bot_session_inner(
+        ctx,
+        event_sender,
+        Arc::new(startup::NoopStartupNotifier),
+        failure_injector,
+    )
+    .await
 }
 
 async fn run_bot_session_inner(
     ctx: Ctx,
     event_sender: broadcast::Sender<Statement>,
+    startup_notifier: Arc<dyn startup::StartupNotifier>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> anyhow::Result<()> {
     let pool = ctx.get_sqlite_pool().await?;
@@ -252,8 +280,16 @@ async fn run_bot_session_inner(
         pnl_ledger: pnl_ledger.clone(),
         metrics_handle,
     };
-    let server_supervisor = spawn_server_supervisor(state, &pools, main_listener, board_listener);
-    let bot_task = tokio::spawn(Box::pin(run_conductor_session(
+    let startup_barrier = startup::StartupBarrier::new(10);
+    let server_supervisor = spawn_server_supervisor(
+        state,
+        &pools,
+        main_listener,
+        board_listener,
+        startup_barrier.token(),
+        startup_barrier.token(),
+    );
+    let mut bot_task = tokio::spawn(Box::pin(run_conductor_session(
         ctx,
         pools,
         conductor::ServerHandles {
@@ -263,6 +299,18 @@ async fn run_bot_session_inner(
             pnl_ledger,
         },
         shutdown_token.clone(),
+        ConductorStartupTokens {
+            initialized: startup_barrier.token(),
+            apalis_monitor: startup_barrier.token(),
+            job_cleanup: startup_barrier.token(),
+            supervisor: SupervisorStartupTokens {
+                order_fill_monitor: startup_barrier.token(),
+                inventory_monitor: startup_barrier.token(),
+                dashboard_trade_handoff_monitor: startup_barrier.token(),
+                executor_maintenance: startup_barrier.token(),
+                gas_monitor: startup_barrier.token(),
+            },
+        },
         #[cfg(any(test, feature = "test-support"))]
         failure_injector,
     )));
@@ -276,9 +324,10 @@ async fn run_bot_session_inner(
     // guard aborts the conductor and shuts the supervisor down on drop, so a
     // cancelled session actually stops. The graceful path already stops both
     // before this guard drops, making it a no-op there.
-    let _session_guard = SessionTaskGuard {
+    let mut session_guard = SessionTaskGuard {
         conductor: bot_task.abort_handle(),
         server_supervisor: server_supervisor.clone(),
+        armed: true,
     };
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -289,15 +338,40 @@ async fn run_bot_session_inner(
             _ = sigterm.recv() => info!(target: "shutdown", "Received SIGTERM"),
         }
     };
+    tokio::pin!(shutdown_signal);
 
-    await_shutdown(
-        server_supervisor,
-        bot_task,
-        shutdown_token,
-        shutdown_signal,
-        GRACEFUL_SHUTDOWN_TIMEOUT,
+    let startup_outcome = report_when_started(
+        &server_supervisor,
+        &mut bot_task,
+        &startup_barrier,
+        startup_notifier.as_ref(),
+        shutdown_signal.as_mut(),
     )
     .await?;
+
+    let shutdown_result = match startup_outcome {
+        StartupOutcome::Started => {
+            await_shutdown(
+                server_supervisor,
+                bot_task,
+                shutdown_token,
+                shutdown_signal,
+                GRACEFUL_SHUTDOWN_TIMEOUT,
+            )
+            .await
+        }
+        StartupOutcome::ShutdownSignal => {
+            drain_for_shutdown_signal(
+                &server_supervisor,
+                bot_task,
+                shutdown_token,
+                GRACEFUL_SHUTDOWN_TIMEOUT,
+            )
+            .await
+        }
+    };
+    session_guard.disarm();
+    shutdown_result?;
 
     info!(target: "startup", "Shutdown complete");
     Ok(())
@@ -319,10 +393,21 @@ async fn run_bot_session_inner(
 struct SessionTaskGuard {
     conductor: AbortHandle,
     server_supervisor: SupervisorHandle,
+    armed: bool,
+}
+
+impl SessionTaskGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for SessionTaskGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
         self.conductor.abort();
         shutdown_supervisor(&self.server_supervisor);
     }
@@ -341,6 +426,7 @@ impl Drop for SessionTaskGuard {
 struct ServerTask {
     router: Router,
     listener: Arc<Mutex<Option<TcpListener>>>,
+    startup_token: startup::StartupToken,
 }
 
 impl SupervisedTask for ServerTask {
@@ -356,7 +442,11 @@ impl SupervisedTask for ServerTask {
             )?;
         let port = listener.local_addr().map(|addr| addr.port()).ok();
         info!(target: "startup", ?port, "Server listening");
-        axum::serve(listener, self.router.clone()).await?;
+        let router = self.router.clone();
+        self.startup_token
+            .clone()
+            .wrap(async move { axum::serve(listener, router).await })
+            .await?;
         Err("axum server exited unexpectedly".into())
     }
 }
@@ -366,6 +456,8 @@ fn spawn_server_supervisor(
     pools: &DatabasePools,
     main_listener: TcpListener,
     board_listener: TcpListener,
+    main_startup_token: startup::StartupToken,
+    board_startup_token: startup::StartupToken,
 ) -> SupervisorHandle {
     let main_router = Router::new()
         .merge(api::routes())
@@ -398,6 +490,7 @@ fn spawn_server_supervisor(
             ServerTask {
                 router: main_router,
                 listener: Arc::new(Mutex::new(Some(main_listener))),
+                startup_token: main_startup_token,
             },
         )
         .with_task(
@@ -405,6 +498,7 @@ fn spawn_server_supervisor(
             ServerTask {
                 router: board_router,
                 listener: Arc::new(Mutex::new(Some(board_listener))),
+                startup_token: board_startup_token,
             },
         )
         .build()
@@ -421,7 +515,6 @@ async fn await_shutdown<S>(
 where
     S: Future<Output = ()>,
 {
-    let bot_abort = bot_task.abort_handle();
     tokio::pin!(shutdown_signal);
 
     let trigger: ShutdownTrigger = tokio::select! {
@@ -432,14 +525,13 @@ where
 
     match trigger {
         ShutdownTrigger::Signal => {
-            info!(target: "shutdown", "Shutdown signal received, draining gracefully");
-            shutdown_token.cancel();
-            shutdown_supervisor(&server_supervisor);
-            drain_bot_with_timeout(bot_task, bot_abort, drain_timeout).await
+            drain_for_shutdown_signal(&server_supervisor, bot_task, shutdown_token, drain_timeout)
+                .await
         }
         ShutdownTrigger::ServerExit(result) => {
             info!(target: "shutdown", "Server supervisor exited, draining bot");
             shutdown_token.cancel();
+            let bot_abort = bot_task.abort_handle();
             drain_bot_with_timeout(bot_task, bot_abort, drain_timeout).await?;
             check_server_result(result)
         }
@@ -448,6 +540,48 @@ where
             check_bot_result(result)
         }
     }
+}
+
+async fn drain_for_shutdown_signal(
+    server_supervisor: &SupervisorHandle,
+    bot_task: JoinHandle<anyhow::Result<()>>,
+    shutdown_token: CancellationToken,
+    drain_timeout: Duration,
+) -> anyhow::Result<()> {
+    info!(target: "shutdown", "Shutdown signal received, draining gracefully");
+    shutdown_token.cancel();
+    shutdown_supervisor(server_supervisor);
+    let bot_abort = bot_task.abort_handle();
+    drain_bot_with_timeout(bot_task, bot_abort, drain_timeout).await
+}
+
+async fn report_when_started(
+    server_supervisor: &SupervisorHandle,
+    bot_task: &mut JoinHandle<anyhow::Result<()>>,
+    startup_barrier: &startup::StartupBarrier,
+    startup_notifier: &dyn startup::StartupNotifier,
+    shutdown_signal: impl Future<Output = ()>,
+) -> anyhow::Result<StartupOutcome> {
+    tokio::select! {
+        biased;
+        result = server_supervisor.wait() => {
+            return check_startup_server_result(result).map(|()| StartupOutcome::Started);
+        }
+        result = bot_task => {
+            return check_startup_bot_result(result).map(|()| StartupOutcome::Started);
+        }
+        () = shutdown_signal => return Ok(StartupOutcome::ShutdownSignal),
+        () = startup_barrier.wait() => {}
+    }
+
+    startup::report_ready(startup_notifier)?;
+    Ok(StartupOutcome::Started)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupOutcome {
+    Started,
+    ShutdownSignal,
 }
 
 enum ShutdownTrigger {
@@ -484,8 +618,14 @@ async fn drain_bot_with_timeout(
 
 fn shutdown_supervisor(handle: &SupervisorHandle) {
     info!(target: "startup", name = "server", "Shutting down supervisor");
-    if let Err(error) = handle.shutdown() {
-        error!(target: "startup", %error, "Failed to shutdown server supervisor");
+    match handle.shutdown() {
+        Ok(()) => {}
+        Err(SupervisorHandleError::SendError) => {
+            debug!(target: "startup", "Server supervisor was already stopped");
+        }
+        Err(error @ SupervisorHandleError::RecvError(_)) => {
+            error!(target: "startup", %error, "Failed to shutdown server supervisor");
+        }
     }
 }
 
@@ -499,6 +639,15 @@ fn check_server_result(result: Result<(), SupervisorError>) -> anyhow::Result<()
             error!(target: "startup", %error, "Server supervisor failed");
             Err(anyhow::anyhow!("Server supervisor failed: {error}"))
         }
+    }
+}
+
+fn check_startup_server_result(result: Result<(), SupervisorError>) -> anyhow::Result<()> {
+    match result {
+        Ok(()) => Err(anyhow::anyhow!(
+            "Server supervisor exited before startup completed"
+        )),
+        Err(error) => check_server_result(Err(error)),
     }
 }
 
@@ -519,6 +668,13 @@ fn check_bot_result(result: Result<anyhow::Result<()>, JoinError>) -> anyhow::Re
     }
 }
 
+fn check_startup_bot_result(result: Result<anyhow::Result<()>, JoinError>) -> anyhow::Result<()> {
+    match result {
+        Ok(Ok(())) => Err(anyhow::anyhow!("Bot exited before startup completed")),
+        other => check_bot_result(other),
+    }
+}
+
 /// Runs a single conductor session with the configured broker executor.
 #[tracing::instrument(skip_all, target = "startup", level = tracing::Level::INFO)]
 async fn run_conductor_session(
@@ -526,6 +682,7 @@ async fn run_conductor_session(
     pools: DatabasePools,
     server: conductor::ServerHandles,
     shutdown_token: tokio_util::sync::CancellationToken,
+    startup_tokens: ConductorStartupTokens,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> anyhow::Result<()> {
     let result = match ctx.broker.clone() {
@@ -538,6 +695,7 @@ async fn run_conductor_session(
                 pools,
                 server,
                 shutdown_token,
+                startup_tokens,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector,
             ))
@@ -551,6 +709,7 @@ async fn run_conductor_session(
                 pools,
                 server,
                 shutdown_token,
+                startup_tokens,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector,
             ))
@@ -573,11 +732,30 @@ async fn run_conductor_session(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::io;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use st0x_config::create_test_ctx_with_order_owner;
 
     use super::*;
+
+    #[derive(Clone)]
+    struct PendingSupervisorTask;
+
+    impl SupervisedTask for PendingSupervisorTask {
+        async fn run(&mut self) -> TaskResult {
+            std::future::pending().await
+        }
+    }
+
+    struct RecordingStartupNotifier<'a>(&'a AtomicUsize);
+
+    impl startup::StartupNotifier for RecordingStartupNotifier<'_> {
+        fn notify_ready(&self) -> io::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     // `Ctx::load_files` parses `orderbook` into `Address`, so runtime tests
     // only exercise already-validated addresses. Invalid orderbook input is
@@ -594,6 +772,161 @@ mod tests {
             inventory::InventoryView::default(),
             sender,
         ))
+    }
+
+    fn create_test_startup_tokens() -> ConductorStartupTokens {
+        let barrier = startup::StartupBarrier::new(8);
+        ConductorStartupTokens {
+            initialized: barrier.token(),
+            apalis_monitor: barrier.token(),
+            job_cleanup: barrier.token(),
+            supervisor: SupervisorStartupTokens {
+                order_fill_monitor: barrier.token(),
+                inventory_monitor: barrier.token(),
+                dashboard_trade_handoff_monitor: barrier.token(),
+                executor_maintenance: barrier.token(),
+                gas_monitor: barrier.token(),
+            },
+        }
+    }
+
+    fn pending_test_supervisor() -> SupervisorHandle {
+        SupervisorBuilder::default()
+            .with_task("pending", PendingSupervisorTask)
+            .build()
+            .run()
+    }
+
+    #[tokio::test]
+    async fn startup_exit_does_not_report_readiness() {
+        let supervisor = pending_test_supervisor();
+        let barrier = startup::StartupBarrier::new(1);
+        let notifications = AtomicUsize::new(0);
+        let notifier = RecordingStartupNotifier(&notifications);
+        let mut bot_task = tokio::spawn(async { anyhow::bail!("startup failed") });
+
+        let error = report_when_started(
+            &supervisor,
+            &mut bot_task,
+            &barrier,
+            &notifier,
+            std::future::pending(),
+        )
+        .await
+        .expect_err("an immediate task exit should fail startup");
+
+        assert_eq!(error.to_string(), "startup failed");
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+        shutdown_supervisor(&supervisor);
+    }
+
+    #[tokio::test]
+    async fn clean_bot_exit_before_startup_does_not_report_readiness() {
+        let supervisor = pending_test_supervisor();
+        let barrier = startup::StartupBarrier::new(1);
+        let notifications = AtomicUsize::new(0);
+        let notifier = RecordingStartupNotifier(&notifications);
+        let mut bot_task = tokio::spawn(async { Ok(()) });
+
+        let error = report_when_started(
+            &supervisor,
+            &mut bot_task,
+            &barrier,
+            &notifier,
+            std::future::pending(),
+        )
+        .await
+        .expect_err("a clean early bot exit should fail startup");
+
+        assert_eq!(error.to_string(), "Bot exited before startup completed");
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+        shutdown_supervisor(&supervisor);
+    }
+
+    #[test]
+    fn clean_server_exit_before_startup_is_an_error() {
+        let error = check_startup_server_result(Ok(()))
+            .expect_err("a clean early server exit should fail startup");
+
+        assert_eq!(
+            error.to_string(),
+            "Server supervisor exited before startup completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_startup_barrier_reports_readiness_once() {
+        let supervisor = pending_test_supervisor();
+        let barrier = startup::StartupBarrier::new(1);
+        barrier.token().acknowledge();
+        let notifications = AtomicUsize::new(0);
+        let notifier = RecordingStartupNotifier(&notifications);
+        let mut bot_task = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+
+        let outcome = report_when_started(
+            &supervisor,
+            &mut bot_task,
+            &barrier,
+            &notifier,
+            std::future::pending(),
+        )
+        .await
+        .expect("completed startup should report readiness");
+
+        assert_eq!(outcome, StartupOutcome::Started);
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        bot_task.abort();
+        shutdown_supervisor(&supervisor);
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_before_startup_does_not_report_readiness() {
+        let supervisor = pending_test_supervisor();
+        let barrier = startup::StartupBarrier::new(1);
+        let notifications = AtomicUsize::new(0);
+        let notifier = RecordingStartupNotifier(&notifications);
+        let mut bot_task = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            report_when_started(
+                &supervisor,
+                &mut bot_task,
+                &barrier,
+                &notifier,
+                std::future::ready(()),
+            ),
+        )
+        .await
+        .expect("the startup wait should observe the shutdown signal")
+        .expect("the shutdown signal should be a clean startup outcome");
+
+        assert_eq!(outcome, StartupOutcome::ShutdownSignal);
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+        bot_task.abort();
+        shutdown_supervisor(&supervisor);
+    }
+
+    #[tokio::test]
+    async fn disarmed_session_guard_leaves_completed_shutdown_untouched() {
+        let conductor_task = tokio::spawn(std::future::pending::<()>());
+        let supervisor = pending_test_supervisor();
+        let mut guard = SessionTaskGuard {
+            conductor: conductor_task.abort_handle(),
+            server_supervisor: supervisor.clone(),
+            armed: true,
+        };
+
+        guard.disarm();
+        drop(guard);
+        tokio::task::yield_now().await;
+
+        assert!(
+            !conductor_task.is_finished(),
+            "a disarmed cleanup guard must not abort an already-managed task"
+        );
+        conductor_task.abort();
+        shutdown_supervisor(&supervisor);
     }
 
     #[tokio::test]
@@ -761,6 +1094,7 @@ mod tests {
                 pnl_ledger: Arc::new(dashboard::pnl::PnlLedger::new(pool)),
             },
             tokio_util::sync::CancellationToken::new(),
+            create_test_startup_tokens(),
             FailureInjector::new(),
         ))
         .await
@@ -794,6 +1128,7 @@ mod tests {
                 pnl_ledger: Arc::new(dashboard::pnl::PnlLedger::new(pool)),
             },
             tokio_util::sync::CancellationToken::new(),
+            create_test_startup_tokens(),
             FailureInjector::new(),
         ))
         .await
