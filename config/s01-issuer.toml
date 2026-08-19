@@ -77,3 +77,28 @@ extended_hours_counter_trading = "disabled"
 vault_id = "0xfab"
 tokenized_equity = "0xc941C1506B7555Ba8C506Fb6c9b9CC259902d612"
 tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"
+
+# Required sections for the single supported topology. The s01 CLI never
+# rebalances (dividend-bump is buy -> tokenize -> donate), so every trigger
+# is inert: no cash asset is configured, USDC rebalancing is disabled, and
+# the freeze guard is off. Present only so config validation passes.
+[rebalancing]
+transfer_timeout_secs = 1800
+transfer_attempt_timeout_secs = 3600
+attestation_retry_deadline_secs = 86400
+max_burn_revert_redrives = 5
+freeze_check = "disabled"
+
+[rebalancing.equity]
+target = "0.5"
+deviation = "0.2"
+
+[rebalancing.usdc]
+mode = "disabled"
+
+# ETH/USD valuation source for bot-gas cost recording (ADR 0017). Public
+# values (Base mainnet Pyth contract + ETH/USD feed id); required by config
+# validation even though the CLI's dividend flow never records bot gas.
+[bot_gas_valuation]
+pyth_contract = "0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a"
+eth_usd_feed_id = "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"

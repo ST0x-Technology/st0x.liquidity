@@ -150,8 +150,9 @@ eth_usd_feed_id = "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634f
 # [orchestrator.addresses]
 # base = "0xcccccccccccccccccccccccccccccccccccccccc"
 
-# Optional — only needed for automatic rebalancing.
-# Without this section the bot runs in Standalone mode (hedging only).
+# Required: the bot does not start without this section. To pause rebalancing
+# work, use the narrow controls instead: per-asset `rebalancing = "disabled"`,
+# the issuance freeze, or `[rebalancing.usdc] mode = "disabled"`.
 [rebalancing]
 # Transfer timeout in seconds before stuck inflight state is tombstoned and cleared.
 # 1800 = 30 minutes.
