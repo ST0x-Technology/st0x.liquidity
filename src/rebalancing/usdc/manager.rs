@@ -5867,6 +5867,131 @@ mod tests {
         order_mock.assert();
     }
 
+    /// A conversion sized at zero or below has nothing to buy: it must be
+    /// refused before anything leaves the process -- no order placement at
+    /// the broker.
+    #[tokio::test]
+    async fn usd_to_usdc_conversion_rejects_a_non_positive_amount() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let cqrs = create_test_store_instance().await;
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs,
+            address!("0x1111111111111111111111111111111111111111"),
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let placement_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "USDCUSD",
+                    "qty": null,
+                    "notional": "0",
+                    "status": "filled",
+                    "filled_avg_price": "1.0001",
+                    "filled_qty": "0",
+                    "created_at": "2024-01-15T10:30:00Z"
+                }));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        manager
+            .execute_usd_to_usdc_conversion(&id, usdc("0"))
+            .await
+            .unwrap_err();
+        manager
+            .execute_usd_to_usdc_conversion(&id, usdc("-5"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            placement_mock.calls(),
+            0,
+            "a non-positive conversion must never reach the broker"
+        );
+    }
+
+    /// The post-deposit sell leg gets the same guard: a zero-amount
+    /// conversion (a zero deposit recorded on the aggregate) must fail
+    /// before placing anything at the broker.
+    #[tokio::test]
+    async fn post_deposit_conversion_rejects_a_non_positive_amount() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let cqrs = create_test_store_instance().await;
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            Arc::clone(&cqrs),
+            address!("0x1111111111111111111111111111111111111111"),
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let placement_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "USDCUSD",
+                    "qty": "0",
+                    "notional": null,
+                    "status": "filled",
+                    "filled_avg_price": "1.0001",
+                    "filled_qty": "0",
+                    "created_at": "2024-01-15T10:30:00Z"
+                }));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_deposit_confirmed_base_to_alpaca(&cqrs, &id, usdc("0"), usdc("0")).await;
+
+        manager
+            .execute_usdc_to_usd_conversion(&id, usdc("0"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            placement_mock.calls(),
+            0,
+            "a non-positive conversion must never reach the broker"
+        );
+    }
+
     #[tokio::test]
     async fn test_execute_usdc_to_usd_conversion_requires_deposit_confirmed_state() {
         let server = MockServer::start();

@@ -1182,6 +1182,56 @@ mod tests {
         );
     }
 
+    /// A non-positive amount must fail before the broker sees anything:
+    /// no order placement request, in either direction.
+    #[tokio::test]
+    async fn test_alpaca_convert_rejects_non_positive_amounts_without_placing() {
+        let server = MockServer::start();
+        let ctx = create_mock_alpaca_ctx(server.base_url());
+
+        let _account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/account"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": TEST_ACCOUNT_ID,
+                    "status": "ACTIVE"
+                }));
+        });
+        let placement_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path(format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/orders"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "USDCUSD",
+                    "qty": "0",
+                    "notional": null,
+                    "status": "filled",
+                    "filled_avg_price": "1.0001",
+                    "filled_qty": "0",
+                    "created_at": "2026-01-06T12:30:00Z"
+                }));
+        });
+
+        for amount in [float!(0), float!(-5)] {
+            for direction in [ConvertDirection::ToUsd, ConvertDirection::ToUsdc] {
+                let mut stdout = Vec::new();
+                alpaca_convert_command(&mut stdout, direction, Usdc::new(amount), &ctx)
+                    .await
+                    .unwrap_err();
+            }
+        }
+
+        assert_eq!(
+            placement_mock.calls(),
+            0,
+            "a non-positive conversion must never reach the broker"
+        );
+    }
+
     #[tokio::test]
     async fn test_alpaca_journal_requires_alpaca_config() {
         let ctx = create_ctx_without_alpaca();
