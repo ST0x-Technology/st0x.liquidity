@@ -2781,4 +2781,55 @@ mod tests {
         assert_eq!(response.status, Some(422));
         assert!(!state.orders.contains_key("order-1"));
     }
+
+    /// The production client sizes the USD->USDC buy as a `notional` order
+    /// with no `qty` field, which the mock used to reject with 400 "missing
+    /// or non-string field: qty" -- timing out every AlpacaToBase rebalancing
+    /// e2e flow. Placement and the status poll must both round-trip through
+    /// the real client with `qty` null and the fill reported in `filled_qty`.
+    #[tokio::test]
+    async fn notional_usd_to_usdc_buy_round_trips_against_the_mock() {
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![(Symbol::new("USDCUSD").unwrap(), float!(1))])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        let client = AlpacaBrokerApiClient::new(&activities_ctx(&mock)).unwrap();
+
+        let placed = crate::alpaca_broker_api::order::convert_usdc_usd(
+            &client,
+            float!(500.25),
+            crate::ConversionDirection::UsdToUsdc,
+            &crate::ClientOrderId::from_uuid(Uuid::new_v4()),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            placed.quantity.is_none(),
+            "a notional order names no qty, got {:?}",
+            placed.quantity
+        );
+        assert!(placed.notional.unwrap().eq(float!(500.25)).unwrap());
+
+        let settled = crate::alpaca_broker_api::order::poll_crypto_order_until_filled(
+            &client,
+            placed.id,
+            crate::alpaca_broker_api::order::ConversionPollDeadlines::PRODUCTION,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            settled.quantity.is_none(),
+            "the status poll must keep qty null on a notional order, got {:?}",
+            settled.quantity
+        );
+        assert!(settled.filled_quantity.unwrap().eq(float!(500.25)).unwrap());
+
+        let orders = mock.orders();
+        assert_eq!(orders.len(), 1);
+        assert!(orders[0].quantity.eq(float!(500.25)).unwrap());
+        assert_eq!(orders[0].side, OrderSide::Buy);
+    }
 }
