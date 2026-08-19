@@ -267,6 +267,9 @@ pub(crate) enum UsdcRebalanceError {
 pub(crate) enum UsdcRebalanceCommand {
     /// Start pre-withdrawal conversion for AlpacaToBase direction.
     /// Converts USD buying power to USDC before withdrawal to Alpaca's crypto wallet.
+    /// `amount` is the USD spent, mirroring `ConversionAmounts::source_amount`.
+    /// The USDC received is whatever the fill delivers and is recorded on
+    /// confirmation.
     /// Valid only from `Uninitialized` state.
     InitiateConversion {
         direction: RebalanceDirection,

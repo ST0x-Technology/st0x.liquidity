@@ -723,7 +723,7 @@ pub enum Commands {
         /// Conversion direction
         #[arg(short = 'd', long = "direction")]
         direction: ConvertDirection,
-        /// Amount of USDC to convert
+        /// Amount to convert: USDC for `to-usd`, USD to spend for `to-usdc`
         #[arg(short = 'a', long = "amount")]
         amount: Usdc,
     },

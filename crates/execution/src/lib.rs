@@ -28,7 +28,7 @@ mod rate_limit;
 pub use alpaca_broker_api::{
     AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError,
     AlpacaBrokerApiMode, ConversionDirection, CryptoOrderOutcome, DeadlineCancel, JournalResponse,
-    JournalStatus, TimeInForce, USDC_CONVERSION_COLLAR_MULTIPLIER,
+    JournalStatus, TimeInForce,
 };
 // `AlpacaMarketDataError` is wrapped by `AlpacaBrokerApiError::LatestTrade`,
 // which delegates its own `backpressure()` classification straight to the

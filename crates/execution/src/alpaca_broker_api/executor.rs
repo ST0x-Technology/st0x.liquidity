@@ -378,9 +378,14 @@ impl TryIntoExecutor for AlpacaBrokerApiCtx {
 impl AlpacaBrokerApi {
     /// Convert USDC to/from USD buying power.
     ///
-    /// This uses the USDC/USD trading pair on Alpaca:
-    /// - `UsdcToUsd`: Sells USDC for USD buying power
-    /// - `UsdToUsdc`: Buys USDC with USD buying power
+    /// This uses the USDC/USD trading pair on Alpaca, and `amount` is read in
+    /// the unit each direction is constrained by:
+    /// - `UsdcToUsd`: sells `amount` USDC for USD buying power
+    /// - `UsdToUsdc`: spends `amount` USD on USDC. Sized as a `notional`
+    ///   order, so Alpaca holds exactly `amount` and its collar bounds the
+    ///   fill rather than the hold -- `amount` at 100% of settled cash is
+    ///   accepted, and the collar and execution price decide how much less
+    ///   USDC than `amount` the fill delivers.
     ///
     /// Returns the settled order once it stops moving: either a filled order,
     /// or -- when it stalled past the poll deadline and its remainder was

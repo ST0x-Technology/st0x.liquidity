@@ -605,13 +605,18 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     amount: Usdc,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let direction_str = match direction {
-        ConvertDirection::ToUsd => "USDC → USD",
-        ConvertDirection::ToUsdc => "USD → USDC",
+    // The two directions are denominated differently: the sell names the
+    // USDC it holds, the buy names the dollars it spends.
+    let (direction_str, amount_str) = match direction {
+        ConvertDirection::ToUsd => ("USDC → USD", format!("{amount} USDC")),
+        ConvertDirection::ToUsdc => ("USD → USDC", format!("${amount}")),
     };
 
+    // Reported as requested rather than placed: a buy is truncated to the
+    // whole cents Alpaca accepts in a notional, and the order echoes back
+    // what was actually placed.
     writeln!(stdout, "Converting {direction_str} on Alpaca")?;
-    writeln!(stdout, "   Amount: {amount} USDC")?;
+    writeln!(stdout, "   Requested: {amount_str}")?;
 
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("alpaca-convert requires Alpaca Broker API configuration");
@@ -636,11 +641,20 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     writeln!(stdout, "Conversion completed successfully!")?;
     writeln!(stdout, "   Order ID: {}", order.id)?;
     writeln!(stdout, "   Symbol: {}", order.symbol)?;
-    writeln!(
-        stdout,
-        "   Quantity: {}",
-        format_float_with_fallback(&order.quantity)
-    )?;
+    if let Some(quantity) = order.quantity {
+        writeln!(
+            stdout,
+            "   Quantity: {}",
+            format_float_with_fallback(&quantity)
+        )?;
+    }
+    if let Some(notional) = order.notional {
+        writeln!(
+            stdout,
+            "   Notional: ${}",
+            format_float_with_fallback(&notional)
+        )?;
+    }
     writeln!(stdout, "   Status: {}", order.status_display())?;
     if let Some(price) = order.filled_average_price {
         writeln!(
@@ -992,6 +1006,177 @@ mod tests {
         assert!(
             output.contains("USD → USDC"),
             "Expected USD to USDC in output, got: {output}"
+        );
+    }
+
+    /// Registers the account-verification and order endpoints a successful
+    /// conversion walks through: `try_from_ctx` verifies the account, the
+    /// command places the order, and `convert_usdc_usd` polls its status.
+    ///
+    /// The placement matcher also rejects any request carrying
+    /// `absent_sizing_field`: Alpaca takes `qty` and `notional` as mutually
+    /// exclusive, so each direction must send exactly one sizing field --
+    /// `json_body_includes` alone would accept a serializer that sends both.
+    fn mock_conversion_endpoints<'mock>(
+        server: &'mock MockServer,
+        request_body_partial: &str,
+        absent_sizing_field: &'static str,
+        order_id: &str,
+        order_response: serde_json::Value,
+    ) -> (httpmock::Mock<'mock>, httpmock::Mock<'mock>) {
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/account"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": TEST_ACCOUNT_ID,
+                    "status": "ACTIVE"
+                }));
+        });
+
+        let place_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path(format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/orders"))
+                .json_body_includes(request_body_partial)
+                .is_true(move |request: &HttpMockRequest| {
+                    serde_json::from_slice::<serde_json::Value>(request.body().as_ref())
+                        .is_ok_and(|body| body.get(absent_sizing_field).is_none())
+                });
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(order_response.clone());
+        });
+
+        let status_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/{TEST_ACCOUNT_ID}/orders/{order_id}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(order_response);
+        });
+
+        (place_mock, status_mock)
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_convert_to_usdc_success_prints_notional_and_no_quantity() {
+        let server = MockServer::start();
+        let ctx = create_mock_alpaca_ctx(server.base_url());
+
+        // A notional buy names dollars: Alpaca answers `qty: null` and
+        // reports the USDC actually bought (shrunk by the collar) in
+        // `filled_qty`.
+        let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d";
+        let (place_mock, status_mock) = mock_conversion_endpoints(
+            &server,
+            r#"{"symbol": "USDCUSD", "notional": "500.25", "side": "buy"}"#,
+            "qty",
+            order_id,
+            json!({
+                "id": order_id,
+                "symbol": "USDCUSD",
+                "qty": null,
+                "notional": "500.25",
+                "side": "buy",
+                "status": "filled",
+                "filled_avg_price": "1.00101001",
+                "filled_qty": "489.7",
+                "created_at": "2026-01-06T12:30:00Z"
+            }),
+        );
+
+        let mut stdout = Vec::new();
+        alpaca_convert_command(
+            &mut stdout,
+            ConvertDirection::ToUsdc,
+            Usdc::new(float!(500.25)),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        place_mock.assert();
+        status_mock.assert();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("   Requested: $500.25"),
+            "Expected the requested dollars in output, got: {output}"
+        );
+        assert!(
+            output.contains("Conversion completed successfully!"),
+            "Expected success message, got: {output}"
+        );
+        assert!(
+            output.contains("   Notional: $500.25"),
+            "Expected the notional line, got: {output}"
+        );
+        assert!(
+            !output.contains("\n   Quantity:"),
+            "A notional order names no quantity, got: {output}"
+        );
+        assert!(
+            output.contains("   Filled Quantity: 489.7"),
+            "Expected the filled quantity, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_convert_to_usd_success_prints_quantity_and_no_notional() {
+        let server = MockServer::start();
+        let ctx = create_mock_alpaca_ctx(server.base_url());
+
+        // The sell names the USDC quantity it holds; `notional` stays null.
+        let order_id = "904837e3-3b76-47ec-b432-046db621571b";
+        let (place_mock, status_mock) = mock_conversion_endpoints(
+            &server,
+            r#"{"symbol": "USDCUSD", "qty": "500.5", "side": "sell"}"#,
+            "notional",
+            order_id,
+            json!({
+                "id": order_id,
+                "symbol": "USDCUSD",
+                "qty": "500.5",
+                "notional": null,
+                "side": "sell",
+                "status": "filled",
+                "filled_avg_price": "0.9999",
+                "filled_qty": "500.5",
+                "created_at": "2026-01-06T12:30:00Z"
+            }),
+        );
+
+        let mut stdout = Vec::new();
+        alpaca_convert_command(
+            &mut stdout,
+            ConvertDirection::ToUsd,
+            Usdc::new(float!(500.5)),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        place_mock.assert();
+        status_mock.assert();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("   Requested: 500.5 USDC"),
+            "Expected the requested USDC in output, got: {output}"
+        );
+        assert!(
+            output.contains("Conversion completed successfully!"),
+            "Expected success message, got: {output}"
+        );
+        assert!(
+            output.contains("   Quantity: 500.5"),
+            "Expected the quantity line, got: {output}"
+        );
+        assert!(
+            !output.contains("   Notional:"),
+            "A quantity order names no notional, got: {output}"
         );
     }
 

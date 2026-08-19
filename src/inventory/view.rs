@@ -12,9 +12,7 @@ use tracing::{debug, error, warn};
 
 use st0x_config::ImbalanceThreshold;
 use st0x_dto::{InFlightCash, InFlightEquity, SymbolInventory, UsdcInventory};
-use st0x_execution::{
-    Direction, FractionalShares, HasZero, Symbol, USDC_CONVERSION_COLLAR_MULTIPLIER,
-};
+use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_finance::{Usd, Usdc};
 use st0x_tokenization::IssuerRequestId;
 use st0x_wrapper::{RatioError, UnderlyingPerWrapped};
@@ -918,11 +916,9 @@ impl InventoryView {
     /// distinct skip reason rather than treating it as "below minimum
     /// withdrawal."
     ///
-    /// The result is sized so the USD->USDC market buy that funds the
-    /// transfer can cover its own collared hold: Alpaca reserves
-    /// [`USDC_CONVERSION_COLLAR_MULTIPLIER`] times the requested quantity
-    /// until the buy fills, so capacity is the cash after the reserve
-    /// *divided by* that multiplier, not the full remainder.
+    /// The whole remainder is available: the USD->USDC buy that funds the
+    /// transfer names dollars, so Alpaca holds exactly the amount transferred
+    /// and there is no collar to leave headroom for.
     pub(crate) fn alpaca_to_base_usdc_capacity(
         &self,
         reserved: Option<Usd>,
@@ -938,10 +934,7 @@ impl InventoryView {
             return Ok(Some(Usdc::ZERO));
         }
 
-        let after_reserve = (withdrawable - reserved)?;
-        let capacity = (after_reserve.inner() / USDC_CONVERSION_COLLAR_MULTIPLIER)?;
-
-        Ok(Some(Usdc::new(capacity)))
+        Ok(Some((withdrawable - reserved)?))
     }
 
     /// Converts the in-memory inventory view to a DTO for dashboard serialization.
@@ -6720,21 +6713,19 @@ mod tests {
     }
 
     #[test]
-    fn alpaca_to_base_capacity_divides_withdrawable_by_collar() {
-        // $102.10 withdrawable, no reserve: the USDCUSD market buy reserves
-        // the collar multiple of the requested quantity, so at most $100 of
-        // USDC can be bought.
+    fn alpaca_to_base_capacity_is_the_whole_withdrawable_cash() {
+        // $102.10 withdrawable, no reserve: the conversion names dollars, so
+        // Alpaca holds exactly what is named and every cent is spendable.
         let view = InventoryView::default().with_withdrawable_cash_cents(10_210);
 
         let capacity = view.alpaca_to_base_usdc_capacity(None).unwrap().unwrap();
 
-        assert_eq!(capacity, Usdc::new(float!(100)));
+        assert_eq!(capacity, Usdc::new(float!(102.10)));
     }
 
     #[test]
-    fn alpaca_to_base_capacity_divides_reserve_adjusted_cash_by_collar() {
-        // $352.10 withdrawable - $250 reserve = $102.10; divided by the
-        // collar multiplier leaves exactly $100 of purchasable USDC.
+    fn alpaca_to_base_capacity_is_the_cash_left_after_the_reserve() {
+        // $352.10 withdrawable - $250 reserve = $102.10, all of it spendable.
         let view = InventoryView::default().with_withdrawable_cash_cents(35_210);
 
         let capacity = view
@@ -6742,7 +6733,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(capacity, Usdc::new(float!(100)));
+        assert_eq!(capacity, Usdc::new(float!(102.10)));
     }
 
     #[test]

@@ -21,6 +21,11 @@ use crate::{
 
 const ALPACA_CRYPTO_MAX_DECIMAL_PLACES: u8 = 6;
 
+/// Decimal places Alpaca accepts in a `notional`, which is a USD amount rather
+/// than a token quantity: past two it answers `422 / 42210000`, "notional value
+/// must be limited to 2 decimal places".
+const ALPACA_NOTIONAL_MAX_DECIMAL_PLACES: u8 = 2;
+
 /// Order side
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -230,15 +235,28 @@ pub(super) struct OrderResponse {
     pub failed_at: Option<DateTime<Utc>>,
 }
 
+/// How a crypto order is sized. Alpaca accepts exactly one of `qty` and
+/// `notional`, and which one is sent decides where its ~2% collar lands: a
+/// `qty` buy is held at `quantity x price x 1.02` and refused at 100% of
+/// settled cash, a `notional` buy at the dollars it names.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) enum CryptoOrderSize {
+    /// Base-asset units to trade (e.g. USDC).
+    #[serde(rename = "qty")]
+    Quantity(#[serde(serialize_with = "serialize_float_as_string")] Float),
+    /// USD to spend, letting the broker derive the quantity.
+    #[serde(rename = "notional")]
+    Notional(#[serde(serialize_with = "serialize_float_as_string")] Float),
+}
+
 /// Order request for crypto trading (e.g., USDC/USD conversion).
 /// Uses decimal quantity and trading pair symbol format.
 #[derive(Debug, Serialize)]
 pub(crate) struct CryptoOrderRequest {
     /// Trading pair symbol (e.g., "USDCUSD" for USDC/USD)
     pub symbol: String,
-    /// Quantity of the base asset (e.g., USDC amount)
-    #[serde(rename = "qty", serialize_with = "serialize_float_as_string")]
-    pub quantity: Float,
+    #[serde(flatten)]
+    pub size: CryptoOrderSize,
     pub side: OrderSide,
     #[serde(rename = "type")]
     pub order_type: &'static str,
@@ -253,11 +271,23 @@ pub(crate) struct CryptoOrderRequest {
 pub struct CryptoOrderResponse {
     pub id: Uuid,
     pub symbol: String,
+    /// Base-asset units requested, absent on an order placed by `notional`:
+    /// Alpaca derives the quantity from the fill and answers `"qty": null`
+    /// until then. Read `filled_quantity` for what was actually bought.
     #[serde(
         rename = "qty",
-        deserialize_with = "deserialize_float_from_number_or_string"
+        default,
+        deserialize_with = "deserialize_option_float_from_number_or_string"
     )]
-    pub quantity: Float,
+    pub quantity: Option<Float>,
+    /// USD requested, present only on an order placed by `notional`. Carried
+    /// so the partial-fill warning can still report what was asked for on the
+    /// direction that has no `qty`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_float_from_number_or_string"
+    )]
+    pub notional: Option<Float>,
     status: BrokerOrderStatus,
     #[serde(
         rename = "filled_avg_price",
@@ -869,38 +899,69 @@ fn validate_usdc_amount_for_alpaca_precision(amount: Float) -> Result<Float, Alp
     Ok(amount)
 }
 
-/// Multiplier for the USD that Alpaca reserves against a `USDCUSD` market buy.
+/// Truncate a notional to the whole cents Alpaca accepts.
 ///
-/// Alpaca's documented 2% collar holds `quantity x price x 1.02` until fill,
-/// so callers sizing a buy from available cash must divide by this multiplier
-/// or the order is rejected with `403 40310000: insufficient balance`.
-///
-/// The extra 0.1% is a prod-observed margin: the hold tracks the ask, not par,
-/// and settled cash is all a crypto buy can draw on.
-pub const USDC_CONVERSION_COLLAR_MULTIPLIER: Float = float!(1.021);
+/// Unlike the `qty` side this truncates rather than rejecting excess precision:
+/// the transfer amount is sized from an imbalance ratio and routinely carries
+/// six decimals, so rejecting would fail the common path outright. Truncation
+/// is always downwards, which is the only safe direction -- the notional is
+/// held in full against settled cash, so rounding up could ask for more than
+/// the transfer was sized against. Sub-cent amounts have nothing left to place
+/// and are refused instead.
+fn truncate_notional_to_whole_cents(amount: Float) -> Result<Float, AlpacaBrokerApiError> {
+    let truncated = crate::truncate_to_decimal_places(amount, ALPACA_NOTIONAL_MAX_DECIMAL_PLACES)?
+        .ok_or(AlpacaBrokerApiError::UsdcBelowPrecision {
+            amount,
+            max_decimals: ALPACA_NOTIONAL_MAX_DECIMAL_PLACES,
+        })?;
+
+    if !truncated.eq(amount)? {
+        debug!(
+            ?amount,
+            ?truncated,
+            "Truncated USD->USDC notional to whole cents for Alpaca"
+        );
+    }
+
+    Ok(truncated)
+}
 
 /// Convert USDC to/from USD on Alpaca.
 ///
 /// This uses the USDC/USD trading pair:
 /// - To convert USDC to USD buying power: sell USDC/USD
 /// - To convert USD buying power to USDC: buy USDC/USD
+///
+/// Each direction names the quantity it is actually constrained by, which is
+/// what keeps a conversion sized at everything available from being refused.
+/// The sell holds USDC and names USDC (`qty`). The buy is bounded by settled
+/// cash and names dollars (`notional`), so Alpaca's ~2% collar has nothing to
+/// inflate: the hold equals `amount`, and the collar and execution price
+/// instead bound the fill to less USDC than the dollars named. The buy is also
+/// truncated to whole cents, which is all Alpaca accepts in a notional.
+/// Callers therefore size downstream steps from the fill, never from `amount`.
 pub(crate) async fn convert_usdc_usd(
     client: &AlpacaBrokerApiClient,
     amount: Float,
     direction: ConversionDirection,
     client_order_id: &ClientOrderId,
 ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
-    let placed_amount = validate_usdc_amount_for_alpaca_precision(amount)?;
-    let side = match direction {
-        ConversionDirection::UsdcToUsd => OrderSide::Sell,
-        ConversionDirection::UsdToUsdc => OrderSide::Buy,
+    let (side, order_size) = match direction {
+        ConversionDirection::UsdcToUsd => (
+            OrderSide::Sell,
+            CryptoOrderSize::Quantity(validate_usdc_amount_for_alpaca_precision(amount)?),
+        ),
+        ConversionDirection::UsdToUsdc => (
+            OrderSide::Buy,
+            CryptoOrderSize::Notional(truncate_notional_to_whole_cents(amount)?),
+        ),
     };
 
-    debug!(?side, amount = ?placed_amount, %client_order_id, "Placing USDC/USD conversion order");
+    debug!(?side, ?order_size, %client_order_id, "Placing USDC/USD conversion order");
 
     let request = CryptoOrderRequest {
         symbol: "USDCUSD".to_string(),
-        quantity: placed_amount,
+        size: order_size,
         side,
         order_type: "market",
         time_in_force: "gtc",
@@ -1008,7 +1069,8 @@ pub(crate) async fn poll_crypto_order_until_filled(
                 target: "broker",
                 order_id = %order_id,
                 filled = ?settled.order.filled_quantity,
-                requested = ?settled.order.quantity,
+                requested_qty = ?settled.order.quantity,
+                requested_notional = ?settled.order.notional,
                 "Accepting partially filled conversion; remainder cancelled"
             );
             Ok(settled.order)
@@ -2830,7 +2892,7 @@ mod tests {
         mock.assert();
         assert_eq!(order.id.to_string(), "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(order.symbol, "USDCUSD");
-        assert!(order.quantity.eq(float!(1000.5)).unwrap());
+        assert!(order.quantity.unwrap().eq(float!(1000.5)).unwrap());
         assert_eq!(order.status_display(), "filled");
     }
 
@@ -2847,7 +2909,7 @@ mod tests {
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
                 .json_body(json!({
                     "symbol": "USDCUSD",
-                    "qty": "500",
+                    "notional": "500",
                     "side": "buy",
                     "type": "market",
                     "time_in_force": "gtc",
@@ -2858,11 +2920,12 @@ mod tests {
                 .json_body(json!({
                     "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
                     "symbol": "USDCUSD",
-                    "qty": "500",
+                    "qty": null,
+                    "notional": "500",
                     "side": "buy",
                     "status": "filled",
-                    "filled_avg_price": "0.9999",
-                    "filled_qty": "500",
+                    "filled_avg_price": "1.00101001",
+                    "filled_qty": "489.700985",
                     "created_at": "2025-01-06T12:30:00Z"
                 }));
         });
@@ -2882,8 +2945,126 @@ mod tests {
         mock.assert();
         assert_eq!(order.id.to_string(), "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(order.symbol, "USDCUSD");
-        assert!(order.quantity.eq(float!(500)).unwrap());
+        assert!(
+            order
+                .filled_quantity
+                .unwrap()
+                .eq(float!(489.700985))
+                .unwrap()
+        );
         assert_eq!(order.status_display(), "filled");
+    }
+
+    /// A notional order names dollars, so Alpaca answers with `qty: null` and
+    /// reports the USDC actually bought in `filled_qty` -- the collar shows up
+    /// as the gap between the two (observed on a sandbox account: notional 10
+    /// filled 9.794019706 at 1.00101001).
+    #[tokio::test]
+    async fn notional_conversion_response_carries_no_requested_quantity() {
+        let order: CryptoOrderResponse = serde_json::from_value(json!({
+            "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "symbol": "USDCUSD",
+            "qty": null,
+            "notional": "10",
+            "status": "filled",
+            "filled_avg_price": "1.00101001",
+            "filled_qty": "9.794019706",
+            "created_at": "2025-01-06T12:30:00Z"
+        }))
+        .unwrap();
+
+        assert!(
+            order.quantity.is_none(),
+            "a notional order names no quantity, got {:?}",
+            order.quantity
+        );
+        assert!(order.notional.unwrap().eq(float!(10)).unwrap());
+        assert!(
+            order
+                .filled_quantity
+                .unwrap()
+                .eq(float!(9.794019706))
+                .unwrap()
+        );
+        assert_eq!(order.status_display(), "filled");
+    }
+
+    /// Alpaca refuses a notional past two decimals (`422 / 42210000`,
+    /// "notional value must be limited to 2 decimal places"), and the transfer
+    /// amount routinely carries six when the imbalance excess is what bounds
+    /// it. The sub-cent remainder is dropped downwards so the buy can never
+    /// ask for more cash than it was sized against.
+    #[tokio::test]
+    async fn usd_to_usdc_notional_is_truncated_to_whole_cents() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let client_order_id =
+            ClientOrderId::from_uuid(uuid!("33333333-3333-4333-8333-333333333333"));
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "USDCUSD",
+                    "notional": "5726.78",
+                    "side": "buy",
+                    "type": "market",
+                    "time_in_force": "gtc",
+                    "client_order_id": "33333333-3333-4333-8333-333333333333"
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "USDCUSD",
+                    "qty": null,
+                    "notional": "5726.78",
+                    "side": "buy",
+                    "status": "filled",
+                    "filled_avg_price": "1.00101001",
+                    "filled_qty": "5608.94436",
+                    "created_at": "2025-01-06T12:30:00Z"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        convert_usdc_usd(
+            &client,
+            float!(5726.787463),
+            ConversionDirection::UsdToUsdc,
+            &client_order_id,
+        )
+        .await
+        .unwrap();
+
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn usd_to_usdc_rejects_a_notional_below_one_cent() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let error = convert_usdc_usd(
+            &client,
+            float!(0.004),
+            ConversionDirection::UsdToUsdc,
+            &ClientOrderId::from_uuid(uuid!("44444444-4444-4444-8444-444444444444")),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::UsdcBelowPrecision { max_decimals, .. }
+                    if max_decimals == 2
+            ),
+            "Expected UsdcBelowPrecision at two decimals, got: {error:?}"
+        );
     }
 
     const STALLED_ORDER_ID: Uuid = uuid!("61e7b016-9c91-4a97-b912-615c9d365c9d");
@@ -3520,7 +3701,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_convert_usdc_usd_rejects_excess_precision() {
+    /// The sell names a USDC quantity, so precision past the token's six
+    /// decimals is a caller error rather than something to round away. The buy
+    /// names dollars and truncates instead -- see
+    /// `usd_to_usdc_notional_is_truncated_to_whole_cents`.
+    async fn usdc_to_usd_rejects_excess_quantity_precision() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
@@ -3528,7 +3713,7 @@ mod tests {
         let error = convert_usdc_usd(
             &client,
             float!(1000.1234567),
-            ConversionDirection::UsdToUsdc,
+            ConversionDirection::UsdcToUsd,
             &ClientOrderId::from_uuid(Uuid::new_v4()),
         )
         .await
@@ -3734,7 +3919,8 @@ mod tests {
         let make_order = |status: BrokerOrderStatus| CryptoOrderResponse {
             id: Uuid::new_v4(),
             symbol: "USDCUSD".to_string(),
-            quantity: float!(100),
+            quantity: Some(float!(100)),
+            notional: None,
             status,
             filled_average_price: None,
             filled_quantity: None,
