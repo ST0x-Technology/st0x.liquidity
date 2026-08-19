@@ -620,6 +620,14 @@ impl<
 
         info!(target: "rebalance", %amount, %correlation_id, "Starting USD to USDC conversion");
 
+        // The aggregate carries this leg's amount as `Usdc` for the shape its
+        // persisted events already have, but the buy spends it as dollars --
+        // named here so the order cannot be read as a USDC quantity. Built
+        // before the intent is recorded so a non-positive amount fails with
+        // no aggregate event and no broker order to reconcile.
+        let conversion_order =
+            ConversionOrder::BuyWithUsd(Positive::new(Usd::new(amount.inner()))?);
+
         // Record intent BEFORE placing order so we can track failures
         self.cqrs
             .send(
@@ -631,11 +639,6 @@ impl<
                 },
             )
             .await?;
-
-        // The aggregate carries this leg's amount as `Usdc` for the shape its
-        // persisted events already have, but the buy spends it as dollars --
-        // named here so the order cannot be read as a USDC quantity.
-        let conversion_order = ConversionOrder::BuyWithUsd(Usd::new(amount.inner()));
 
         let order = match self
             .alpaca_broker
@@ -773,6 +776,10 @@ impl<
 
         info!(target: "rebalance", %amount, %correlation_id, "Starting USDC to USD conversion");
 
+        // Built before the intent is recorded so a non-positive amount fails
+        // with no aggregate event and no broker order to reconcile.
+        let conversion_order = ConversionOrder::SellUsdc(Positive::new(amount)?);
+
         // Record intent BEFORE placing order so we can track failures
         self.cqrs
             .send(
@@ -783,8 +790,6 @@ impl<
                 },
             )
             .await?;
-
-        let conversion_order = ConversionOrder::SellUsdc(amount);
 
         let order = match self
             .alpaca_broker
@@ -5915,14 +5920,23 @@ mod tests {
 
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        manager
+        let zero_error = manager
             .execute_usd_to_usdc_conversion(&id, usdc("0"))
             .await
             .unwrap_err();
-        manager
+        assert!(
+            matches!(zero_error, UsdcTransferError::NotPositiveUsd(_)),
+            "Expected NotPositiveUsd for a zero conversion, got: {zero_error:?}"
+        );
+
+        let negative_error = manager
             .execute_usd_to_usdc_conversion(&id, usdc("-5"))
             .await
             .unwrap_err();
+        assert!(
+            matches!(negative_error, UsdcTransferError::NotPositiveUsd(_)),
+            "Expected NotPositiveUsd for a negative conversion, got: {negative_error:?}"
+        );
 
         assert_eq!(
             placement_mock.calls(),
@@ -5980,10 +5994,14 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
         advance_to_deposit_confirmed_base_to_alpaca(&cqrs, &id, usdc("0"), usdc("0")).await;
 
-        manager
+        let error = manager
             .execute_usdc_to_usd_conversion(&id, usdc("0"))
             .await
             .unwrap_err();
+        assert!(
+            matches!(error, UsdcTransferError::NotPositive(_)),
+            "Expected NotPositive for a zero conversion, got: {error:?}"
+        );
 
         assert_eq!(
             placement_mock.calls(),

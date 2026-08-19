@@ -622,15 +622,18 @@ pub(super) async fn alpaca_convert_command<W: Write>(
         anyhow::bail!("alpaca-convert requires Alpaca Broker API configuration");
     };
 
-    let executor = AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?;
-
     // The parsed amount is one number either way; which unit it carries is
     // decided here, once, rather than being implied by the direction further
-    // down the call chain.
+    // down the call chain. Built before the executor so a non-positive
+    // amount fails without any broker traffic.
     let conversion = match direction {
-        ConvertDirection::ToUsd => ConversionOrder::SellUsdc(amount),
-        ConvertDirection::ToUsdc => ConversionOrder::BuyWithUsd(Usd::new(amount.inner())),
+        ConvertDirection::ToUsd => ConversionOrder::SellUsdc(Positive::new(amount)?),
+        ConvertDirection::ToUsdc => {
+            ConversionOrder::BuyWithUsd(Positive::new(Usd::new(amount.inner()))?)
+        }
     };
+
+    let executor = AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?;
 
     let correlation_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
@@ -1219,9 +1222,13 @@ mod tests {
         for amount in [float!(0), float!(-5)] {
             for direction in [ConvertDirection::ToUsd, ConvertDirection::ToUsdc] {
                 let mut stdout = Vec::new();
-                alpaca_convert_command(&mut stdout, direction, Usdc::new(amount), &ctx)
+                let error = alpaca_convert_command(&mut stdout, direction, Usdc::new(amount), &ctx)
                     .await
                     .unwrap_err();
+                assert!(
+                    error.to_string().contains("must be positive"),
+                    "Expected a positivity error for {direction:?}, got: {error:?}"
+                );
             }
         }
 

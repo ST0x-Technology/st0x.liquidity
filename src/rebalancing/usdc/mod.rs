@@ -27,7 +27,7 @@ use st0x_event_sorcery::SendError;
 use st0x_execution::{
     AlpacaBrokerApiError, AlpacaWalletError, ClientOrderId, InvalidSharesError, NotPositive,
 };
-use st0x_finance::{Usdc, UsdcConversionError};
+use st0x_finance::{Usd, Usdc, UsdcConversionError};
 use st0x_raindex::RaindexError;
 
 use crate::bot_gas::redrive::BotGasFailureClassifier;
@@ -98,6 +98,10 @@ pub(crate) enum UsdcTransferError {
     InvalidShares(#[from] InvalidSharesError),
     #[error(transparent)]
     NotPositive(#[from] NotPositive<Usdc>),
+    /// The USD side of the same guard, produced when the AlpacaToBase buy is
+    /// sized at zero or below; refused before any aggregate event exists.
+    #[error(transparent)]
+    NotPositiveUsd(#[from] NotPositive<Usd>),
     #[error(
         "Conversion order {order_id} filled but \
          filled_quantity is missing"
@@ -428,6 +432,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::Float(_)
             | Self::InvalidShares(_)
             | Self::NotPositive(_)
+            | Self::NotPositiveUsd(_)
             | Self::MissingFilledQuantity { .. }
             | Self::MissingFilledAveragePrice { .. }
             | Self::ResumeIndeterminateConversion { .. }

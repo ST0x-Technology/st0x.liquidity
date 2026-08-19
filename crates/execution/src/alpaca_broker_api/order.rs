@@ -72,13 +72,15 @@ pub enum ConversionDirection {
 /// USDC it holds, the buy names the dollars it spends -- so the amount travels
 /// with the direction that gives it meaning rather than as a bare number
 /// alongside it. A caller cannot hand a USDC balance to the buy leg without
-/// saying, in the type, that it means dollars.
+/// saying, in the type, that it means dollars. Both amounts are [`Positive`],
+/// so a conversion sized at zero or below cannot be constructed and nothing
+/// non-positive ever reaches the broker.
 #[derive(Debug, Clone, Copy)]
 pub enum ConversionOrder {
     /// Sell this much USDC for USD buying power.
-    SellUsdc(Usdc),
+    SellUsdc(Positive<Usdc>),
     /// Spend this many dollars buying USDC.
-    BuyWithUsd(Usd),
+    BuyWithUsd(Positive<Usd>),
 }
 
 impl ConversionOrder {
@@ -976,11 +978,13 @@ pub(crate) async fn convert_usdc_usd(
     let (side, order_size) = match order {
         ConversionOrder::SellUsdc(quantity) => (
             OrderSide::Sell,
-            CryptoOrderSize::Quantity(validate_usdc_amount_for_alpaca_precision(quantity.inner())?),
+            CryptoOrderSize::Quantity(validate_usdc_amount_for_alpaca_precision(
+                quantity.inner().inner(),
+            )?),
         ),
         ConversionOrder::BuyWithUsd(dollars) => (
             OrderSide::Buy,
-            CryptoOrderSize::Notional(truncate_notional_to_whole_cents(dollars.inner())?),
+            CryptoOrderSize::Notional(truncate_notional_to_whole_cents(dollars.inner().inner())?),
         ),
     };
 
@@ -2907,7 +2911,7 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let order = convert_usdc_usd(
             &client,
-            ConversionOrder::SellUsdc(Usdc::new(float!(1000.5))),
+            ConversionOrder::SellUsdc(Positive::new(Usdc::new(float!(1000.5))).unwrap()),
             &client_order_id,
         )
         .await
@@ -2957,7 +2961,7 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let order = convert_usdc_usd(
             &client,
-            ConversionOrder::BuyWithUsd(Usd::new(float!(500))),
+            ConversionOrder::BuyWithUsd(Positive::new(Usd::new(float!(500))).unwrap()),
             &client_order_id,
         )
         .await
@@ -3053,7 +3057,7 @@ mod tests {
 
         convert_usdc_usd(
             &client,
-            ConversionOrder::BuyWithUsd(Usd::new(float!(5726.787463))),
+            ConversionOrder::BuyWithUsd(Positive::new(Usd::new(float!(5726.787463))).unwrap()),
             &client_order_id,
         )
         .await
@@ -3070,7 +3074,7 @@ mod tests {
 
         let error = convert_usdc_usd(
             &client,
-            ConversionOrder::BuyWithUsd(Usd::new(float!(0.004))),
+            ConversionOrder::BuyWithUsd(Positive::new(Usd::new(float!(0.004))).unwrap()),
             &ClientOrderId::from_uuid(uuid!("44444444-4444-4444-8444-444444444444")),
         )
         .await
@@ -3731,7 +3735,7 @@ mod tests {
 
         let error = convert_usdc_usd(
             &client,
-            ConversionOrder::SellUsdc(Usdc::new(float!(1000.1234567))),
+            ConversionOrder::SellUsdc(Positive::new(Usdc::new(float!(1000.1234567))).unwrap()),
             &ClientOrderId::from_uuid(Uuid::new_v4()),
         )
         .await

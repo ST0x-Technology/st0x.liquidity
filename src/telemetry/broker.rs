@@ -131,7 +131,7 @@ mod tests {
 
     use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
     use st0x_execution::{AlpacaAccountId, AlpacaBrokerApi, ClientOrderId, Executor};
-    use st0x_finance::{Usd, Usdc};
+    use st0x_finance::{Positive, Usd, Usdc};
     use st0x_float_macro::float;
 
     use super::*;
@@ -241,7 +241,7 @@ mod tests {
 
         instrumented
             .convert_usdc_usd(
-                ConversionOrder::SellUsdc(Usdc::new(float!(100))),
+                ConversionOrder::SellUsdc(Positive::new(Usdc::new(float!(100))).unwrap()),
                 &client_order_id,
             )
             .await
@@ -284,7 +284,7 @@ mod tests {
 
         instrumented
             .convert_usdc_usd(
-                ConversionOrder::BuyWithUsd(Usd::new(float!(100))),
+                ConversionOrder::BuyWithUsd(Positive::new(Usd::new(float!(100))).unwrap()),
                 &client_order_id,
             )
             .await
@@ -407,7 +407,7 @@ mod tests {
 
         instrumented
             .convert_usdc_usd(
-                ConversionOrder::SellUsdc(Usdc::new(float!(100))),
+                ConversionOrder::SellUsdc(Positive::new(Usdc::new(float!(100))).unwrap()),
                 &client_order_id,
             )
             .await

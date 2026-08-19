@@ -2879,7 +2879,9 @@ mod tests {
 
         let placed = crate::alpaca_broker_api::order::convert_usdc_usd(
             &client,
-            crate::alpaca_broker_api::order::ConversionOrder::BuyWithUsd(Usd::new(float!(500.25))),
+            crate::alpaca_broker_api::order::ConversionOrder::BuyWithUsd(
+                crate::Positive::new(Usd::new(float!(500.25))).unwrap(),
+            ),
             &crate::ClientOrderId::from_uuid(Uuid::new_v4()),
         )
         .await
