@@ -2973,10 +2973,10 @@ enum BridgeStage { Burn, Attestation, Mint }
   - Collar: Alpaca prices a USDC/USD market order with a ~2% collar. On a `qty`
     buy the collar inflates the hold to `quantity x price x 1.02`, which rejects
     a buy sized at 100% of settled cash. On a `notional` buy the hold equals the
-    notional and the collar instead bounds the fill, so a notional of N buys
-    `N / 1.02` of USDC. The bot therefore never needs the collar percentage: the
-    received USDC is read from the fill, and no broker constant appears in the
-    sizing
+    notional and the collar instead bounds the fill: together with the execution
+    price it decides how much USDC a notional of N actually buys, always less
+    than N. The bot therefore never needs the collar percentage: the received
+    USDC is read from the fill, and no broker constant appears in the sizing
   - Crypto trading is available 24/7 on Alpaca (no market hours restrictions)
   - Market orders are near-instant but NOT guaranteed to fill immediately
   - Slippage: ~17bps observed in live tests (reduces effective USD received)

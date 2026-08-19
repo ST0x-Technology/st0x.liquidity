@@ -936,10 +936,10 @@ fn truncate_notional_to_whole_cents(amount: Float) -> Result<Float, AlpacaBroker
 /// what keeps a conversion sized at everything available from being refused.
 /// The sell holds USDC and names USDC (`qty`). The buy is bounded by settled
 /// cash and names dollars (`notional`), so Alpaca's ~2% collar has nothing to
-/// inflate: the hold equals `amount`, and the collar shrinks the fill instead
-/// (`amount / 1.02` of USDC bought). The buy is also truncated to whole cents,
-/// which is all Alpaca accepts in a notional. Callers therefore size downstream
-/// steps from the fill, never from `amount`.
+/// inflate: the hold equals `amount`, and the collar and execution price
+/// instead bound the fill to less USDC than the dollars named. The buy is also
+/// truncated to whole cents, which is all Alpaca accepts in a notional.
+/// Callers therefore size downstream steps from the fill, never from `amount`.
 pub(crate) async fn convert_usdc_usd(
     client: &AlpacaBrokerApiClient,
     amount: Float,
