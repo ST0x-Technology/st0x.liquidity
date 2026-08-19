@@ -4978,8 +4978,9 @@ multiple broker-specific contexts.
    History is served from the materialized `onchain_trade_view` and
    `offchain_order_view` projections, which the event-sourcing framework
    maintains from the event log and backfills on startup. Both the HTTP endpoint
-   and the WebSocket seed filter, sort, and page in SQL, so a request costs one
-   bounded index scan per venue side rather than a replay of every aggregate.
+   and the WebSocket seed filter, sort, and page in SQL, so a request costs a
+   bounded index range per venue side for the page it returns, plus an
+   index-only count of the matches, rather than a replay of every aggregate.
    Response shapes, protocol semantics, and the `limit`/`offset` contract are
    unchanged. The views hold the serialized aggregates, and the conversion to a
    dashboard trade still runs at read time over the returned page only, so the

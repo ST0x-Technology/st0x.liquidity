@@ -4,8 +4,12 @@
 -- DROP + CREATE -- safe here for the same reason the cancelling/cancelled
 -- migration gave: views are rebuilt from events at startup.
 --
--- `status` and its index are preserved verbatim; /api/pending_orders depends
--- on them.
+-- The `status` column and its index are carried over unchanged;
+-- /api/pending_orders depends on both. What a recreate cannot carry over is
+-- rowid: that endpoint also orders by `rowid DESC`, and catch_up reinserts in
+-- aggregate-id order, so pending orders predating this migration come back in
+-- arbitrary order. Precedented by the two earlier recreates of this table, and
+-- self-correcting as new orders take increasing rowids.
 
 DROP TABLE IF EXISTS offchain_order_view;
 CREATE TABLE offchain_order_view (

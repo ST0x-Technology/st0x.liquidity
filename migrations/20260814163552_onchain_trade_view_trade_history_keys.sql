@@ -70,9 +70,13 @@ CREATE TABLE onchain_trade_view (
 );
 
 -- Covers the trade-history sort in full, so the newest-first page is an
--- index range scan with early LIMIT termination and no temp b-tree.
+-- index range scan with early LIMIT termination and no temp b-tree. Partial on
+-- the same predicate every trade-history query opens with, which is what lets
+-- it serve the unbounded COUNT(*) as well as the page -- without that the
+-- count degrades to a full scan of every row and its payload.
 CREATE INDEX idx_onchain_trade_view_order
-    ON onchain_trade_view (occurred_at DESC, tx_hash ASC, log_index DESC);
+    ON onchain_trade_view (occurred_at DESC, tx_hash ASC, log_index DESC)
+    WHERE occurred_at IS NOT NULL;
 
 CREATE INDEX idx_onchain_trade_view_symbol
     ON onchain_trade_view (symbol, occurred_at DESC);

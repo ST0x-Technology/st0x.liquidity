@@ -636,8 +636,11 @@ async fn trades(
     .inspect_err(|error| warn!(target: "dashboard", ?error, "Failed to load trade history"))
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let TradePage { trades, total } = page;
-    let has_more = offset.saturating_add(trades.len()) < total;
+    let TradePage {
+        trades,
+        total,
+        has_more,
+    } = page;
     let entries = trades
         .iter()
         .map(|trade| query.trade_protocol.serialize_trade(trade))

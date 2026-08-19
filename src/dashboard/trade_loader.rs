@@ -3,8 +3,8 @@
 //! `/trades`, the dashboard's initial state, and delivery reconciliation page
 //! terminal trades straight out of `onchain_trade_view` and
 //! `offchain_order_view` -- the projections the event-sourcing framework keeps
-//! current -- so a request costs one bounded index scan per venue side instead
-//! of replaying every aggregate.
+//! current -- so a request costs a bounded index range per venue side for the
+//! page, plus an index-only count, instead of replaying every aggregate.
 //!
 //! Rows carry the serialized aggregate, not a serialized [`Trade`], and
 //! `try_into_trade` converts only the page being returned. The generated
@@ -12,6 +12,7 @@
 //! DTO still has exactly one source of truth, and a key cannot drift from the
 //! payload it is derived from.
 
+use std::num::TryFromIntError;
 use std::str::FromStr;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -28,7 +29,7 @@ use crate::offchain::order::{OffchainOrder, OffchainOrderId, TradeConversionErro
 use crate::onchain_trade::{OnChainTrade, OnChainTradeId, ParseOnChainTradeIdError};
 
 /// Trades returned to a dashboard client that asks for no explicit page.
-pub(crate) const MAX_TRADES: usize = 100;
+const MAX_TRADES: usize = 100;
 
 /// Which materialized view a trade comes from. Onchain and offchain trades
 /// live in separate projections, so every query is a union of the two sides
@@ -120,11 +121,23 @@ impl TradeQuery {
     }
 }
 
-/// A page of trade history alongside how many trades matched the filters.
+/// A page of trade history, with the counts a client needs to page through it.
 #[derive(Debug)]
 pub(crate) struct TradePage {
     pub(crate) trades: Vec<Trade>,
+    /// Rows matching the filters.
+    ///
+    /// A row holding an aggregate with no representable trade is counted here
+    /// but never returned, so this is an upper bound on what a client can
+    /// render rather than an exact count. Making it exact would mean deciding
+    /// representability in SQL, over a serialized `Float` -- the duplication
+    /// the venue cross-check in [`convert_row`] exists to police.
     pub(crate) total: usize,
+    /// Whether a further page exists.
+    ///
+    /// Derived from the rows the query consumed, not the trades it yielded, so
+    /// a skipped row cannot make a final page look like it has a successor.
+    pub(crate) has_more: bool,
 }
 
 /// Loads one page of trade history, newest first.
@@ -145,13 +158,18 @@ pub(crate) async fn query_trades(
         return Ok(TradePage {
             trades: Vec::new(),
             total: 0,
+            has_more: false,
         });
     }
 
     let total = count_matching(pool, &branches).await?;
-    let trades = fetch_page(pool, query, &branches).await?;
+    let (trades, rows_read) = fetch_page(pool, query, &branches).await?;
 
-    Ok(TradePage { trades, total })
+    Ok(TradePage {
+        trades,
+        total,
+        has_more: query.offset.saturating_add(rows_read) < total,
+    })
 }
 
 /// Builds one side's filter, or `None` when the venue filter excludes it
@@ -293,7 +311,7 @@ async fn count_matching(
         total += counted.fetch_one(pool).await?;
     }
 
-    Ok(usize::try_from(total).unwrap_or(usize::MAX))
+    usize::try_from(total).map_err(|source| TradeHistoryError::CountOutOfRange { total, source })
 }
 
 /// Fetches the requested page.
@@ -309,7 +327,7 @@ async fn fetch_page(
     pool: &SqlitePool,
     query: &TradeQuery,
     branches: &[(Side, Filter)],
-) -> Result<Vec<Trade>, TradeHistoryError> {
+) -> Result<(Vec<Trade>, usize), TradeHistoryError> {
     let bound = clamp_to_i64(query.offset.saturating_add(query.limit));
     let sql = format!(
         "SELECT view_id, payload, venue, side FROM ({}) \
@@ -332,18 +350,22 @@ async fn fetch_page(
     page = page.bind(clamp_to_i64(query.limit));
     page = page.bind(clamp_to_i64(query.offset));
 
-    page.fetch_all(pool)
-        .await?
+    let rows = page.fetch_all(pool).await?;
+    let rows_read = rows.len();
+    let trades = rows
         .into_iter()
-        .filter_map(|row| {
-            let view_id: String = row.get("view_id");
-            let payload: String = row.get("payload");
-            let venue: Option<String> = row.get("venue");
-            let side: i64 = row.get("side");
+        .map(|row| {
+            let view_id: String = row.try_get("view_id")?;
+            let payload: String = row.try_get("payload")?;
+            let venue: Option<String> = row.try_get("venue")?;
+            let side: i64 = row.try_get("side")?;
 
-            convert_row(&view_id, &payload, venue.as_deref(), side).transpose()
+            convert_row(&view_id, &payload, venue.as_deref(), side)
         })
-        .collect()
+        .filter_map(Result::transpose)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((trades, rows_read))
 }
 
 fn branch_sql(side: Side, filter: &Filter) -> String {
@@ -401,6 +423,13 @@ fn convert_row(
     // duplication self-policing: an unmapped source variant leaves the column
     // NULL and would otherwise be silently invisible to venue filters while
     // still appearing in unfiltered history.
+    //
+    // This is deliberately fatal rather than a skip, and the blast radius is
+    // wider than history rendering: `query_trades` also backs delivery
+    // reconciliation, so drift here fails that at startup as well as failing
+    // the endpoint. That asymmetry against the unreadable-payload skip above
+    // is the point -- a payload nobody can read is data, a venue nobody
+    // mapped is a bug in this repo.
     if venue != Some(trade.venue.to_string().as_str()) {
         return Err(TradeHistoryError::VenueMismatch {
             view_id: view_id.to_owned(),
@@ -456,6 +485,12 @@ enum TradeRowError {
 pub(crate) enum TradeHistoryError {
     #[error("failed to query trade history: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("trade history matched {total} rows, which does not fit a usize")]
+    CountOutOfRange {
+        total: i64,
+        #[source]
+        source: TryFromIntError,
+    },
     #[error(
         "trade history row {view_id} is indexed under venue {indexed:?} but replays as \
          {replayed}; the view's venue mapping has drifted from OnChainTradeSource"
@@ -540,6 +575,15 @@ mod tests {
     }
 
     async fn place(store: &Store<OffchainOrder>, id: &OffchainOrderId, symbol: &str) {
+        place_with(store, id, symbol, SupportedExecutor::AlpacaBrokerApi).await;
+    }
+
+    async fn place_with(
+        store: &Store<OffchainOrder>,
+        id: &OffchainOrderId,
+        symbol: &str,
+        executor: SupportedExecutor,
+    ) {
         store
             .send(
                 id,
@@ -547,7 +591,7 @@ mod tests {
                     symbol: Symbol::new(symbol).unwrap(),
                     shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
                     direction: Direction::Sell,
-                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    executor,
                     client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
                     kind: CounterTradeOrderKind::Market,
                 },
@@ -573,7 +617,18 @@ mod tests {
     }
 
     async fn fill(store: &Store<OffchainOrder>, id: &OffchainOrderId, at: DateTime<Utc>) {
-        place(store, id, "TSLA").await;
+        fill_with(store, id, at, SupportedExecutor::AlpacaBrokerApi).await;
+    }
+
+    /// Places, accepts and fills in one step -- the whole lifecycle, since a
+    /// trade only reaches history once it is terminal.
+    async fn fill_with(
+        store: &Store<OffchainOrder>,
+        id: &OffchainOrderId,
+        at: DateTime<Utc>,
+        executor: SupportedExecutor,
+    ) {
+        place_with(store, id, "TSLA", executor).await;
         accept(store, id).await;
         store
             .send(
@@ -1172,10 +1227,38 @@ mod tests {
             .await
             .unwrap();
 
-        let trades = page(&pool, &TradeQuery::newest(V3)).await.trades;
+        let page = page(&pool, &TradeQuery::newest(V3)).await;
 
-        assert_eq!(trades.len(), 1);
-        assert_eq!(trades[0].id, valid_id);
+        assert_eq!(page.trades.len(), 1);
+        assert_eq!(page.trades[0].id, valid_id);
+        // `total` counts matching rows, so it still sees the row the page
+        // dropped -- but `has_more` comes from the rows the query consumed, so
+        // the client is not sent back for a page that cannot exist.
+        assert_eq!(page.total, 2);
+        assert!(!page.has_more);
+    }
+
+    /// The page a dashboard client gets on connect is capped, however much
+    /// history exists behind it.
+    #[tokio::test]
+    async fn the_default_page_is_capped_at_max_trades() {
+        let pool = setup_test_db().await;
+        let store = onchain_store(&pool).await;
+        let at = Utc::now();
+
+        for log_index in 0..=u64::try_from(MAX_TRADES).unwrap() {
+            let id = OnChainTradeId {
+                tx_hash: tx_hash(0),
+                log_index,
+            };
+            witness(&store, &id, OnChainTradeSource::Raindex, "AAPL", at).await;
+        }
+
+        let page = page(&pool, &TradeQuery::newest(V3)).await;
+
+        assert_eq!(page.trades.len(), MAX_TRADES);
+        assert_eq!(page.total, MAX_TRADES + 1);
+        assert!(page.has_more);
     }
 
     /// An unmapped source variant would leave `venue` NULL: invisible to venue
@@ -1248,12 +1331,18 @@ mod tests {
     /// index-eligible `status` term makes SQLite prefer
     /// `idx_offchain_order_view_status` and sort every match in a temp b-tree,
     /// which is why the narrowed protocols write `+status`.
+    ///
+    /// The statements come from the production builders rather than literals,
+    /// so losing the `+` in `side_filter` fails here instead of quietly
+    /// regressing the endpoint.
     #[tokio::test]
     async fn every_branch_walks_its_ordering_index_instead_of_sorting() {
         let pool = setup_test_db().await;
         // `EXPLAIN QUERY PLAN` answers four columns -- id, parent, notused,
-        // detail -- and only the last is the human-readable step.
-        let plan_for = async |sql: &str| {
+        // detail -- and only the last is the human-readable step. The
+        // placeholders stay unbound: the planner never sees their values, so
+        // the plan is the one the bound statement gets.
+        let plan_for = async |sql: String| {
             sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
                 .fetch_all(&pool)
                 .await
@@ -1265,37 +1354,75 @@ mod tests {
         };
 
         let branches = [
-            (
-                "onchain",
-                "SELECT view_id FROM onchain_trade_view WHERE occurred_at IS NOT NULL \
-                  ORDER BY occurred_at DESC, tx_hash ASC, log_index DESC LIMIT 100",
-                "idx_onchain_trade_view_order",
-            ),
+            ("onchain", Side::Onchain, V3, "idx_onchain_trade_view_order"),
             (
                 "offchain, protocol carrying every outcome",
-                "SELECT view_id FROM offchain_order_view WHERE occurred_at IS NOT NULL \
-                  ORDER BY occurred_at DESC, view_id ASC LIMIT 100",
+                Side::Offchain,
+                V3,
                 "idx_offchain_order_view_occurred_at",
             ),
             (
                 "offchain, protocol narrowing outcomes",
-                "SELECT view_id FROM offchain_order_view WHERE occurred_at IS NOT NULL \
-                   AND +status IN ('Filled') \
-                  ORDER BY occurred_at DESC, view_id ASC LIMIT 100",
+                Side::Offchain,
+                TradeProtocol::LegacyFills,
                 "idx_offchain_order_view_occurred_at",
             ),
         ];
 
-        for (branch, sql, index) in branches {
-            let plan = plan_for(sql).await;
+        for (branch, side, protocol, index) in branches {
+            let query = TradeQuery::newest(protocol);
+            let filter = side_filter(&query, side).expect("an unfiltered query keeps both sides");
+            let plan = plan_for(branch_sql(side, &filter)).await;
+
             assert!(
                 plan.contains(index),
                 "{branch} branch must use {index}: {plan}"
             );
+            // The offchain branch does carry a `USE TEMP B-TREE FOR LAST TERM
+            // OF ORDER BY` -- its `log_index` is the constant NULL, so the
+            // final term sorts blocks of one row. What must never appear is a
+            // sort of the whole result, which is what losing the index means.
             assert!(
                 !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
                 "{branch} branch must not re-sort its rows: {plan}"
             );
+        }
+    }
+
+    /// The offchain `venue` column restates the `SupportedExecutor` match in
+    /// `OffchainOrder::try_into_trade`, and an unmapped executor is fatal at
+    /// read time -- so it gets the same compile-forcing guard as the onchain
+    /// side.
+    #[tokio::test]
+    async fn indexed_venue_matches_trading_venue_for_every_executor() {
+        let pool = setup_test_db().await;
+        let store = offchain_store(&pool).await;
+
+        for executor in [
+            SupportedExecutor::AlpacaBrokerApi,
+            SupportedExecutor::DryRun,
+        ] {
+            match executor {
+                SupportedExecutor::AlpacaBrokerApi | SupportedExecutor::DryRun => {}
+            }
+
+            let id = OffchainOrderId::new();
+            fill_with(&store, &id, Utc::now(), executor).await;
+
+            let indexed: String =
+                sqlx::query_scalar("SELECT venue FROM offchain_order_view WHERE view_id = ?")
+                    .bind(id.to_string())
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let replayed = page(&pool, &TradeQuery::all(V3))
+                .await
+                .trades
+                .into_iter()
+                .find(|trade| trade.id == id.to_string())
+                .expect("the filled order must reach trade history");
+
+            assert_eq!(indexed, replayed.venue.to_string(), "executor {executor:?}");
         }
     }
 
@@ -1367,13 +1494,34 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_malformed_onchain_view_id_is_a_row_error_not_a_panic() {
-        let error = parse_row("not-a-trade-id", r#"{"Live":{}}"#, Side::Onchain).unwrap_err();
-        assert!(matches!(
-            error,
-            TradeRowError::Payload(_)
-                | TradeRowError::OnchainId(ParseOnChainTradeIdError::MissingDelimiter { .. })
-        ));
+    /// `parse_row` deserializes the payload before it parses the id, so the id
+    /// branch is only reachable with a payload that reads -- and the payload
+    /// comes from the projection rather than a literal, so it cannot drift
+    /// from what the aggregate actually serializes.
+    #[tokio::test]
+    async fn a_malformed_onchain_view_id_is_a_row_error_not_a_panic() {
+        let pool = setup_test_db().await;
+        let store = onchain_store(&pool).await;
+        let id = OnChainTradeId {
+            tx_hash: tx_hash(0),
+            log_index: 0,
+        };
+        witness(&store, &id, OnChainTradeSource::Raindex, "AAPL", Utc::now()).await;
+        let payload: String =
+            sqlx::query_scalar("SELECT payload FROM onchain_trade_view WHERE view_id = ?")
+                .bind(id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let error = parse_row("not-a-trade-id", &payload, Side::Onchain).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                TradeRowError::OnchainId(ParseOnChainTradeIdError::MissingDelimiter { .. })
+            ),
+            "expected a view id error, got {error:?}"
+        );
     }
 }
