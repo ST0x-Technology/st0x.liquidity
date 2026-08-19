@@ -20,10 +20,10 @@ use st0x_evm::{USDC_BASE, Wallet};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
     AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, AlpacaWalletService, ClientOrderId,
-    ConversionDirection, CryptoOrderOutcome, Network, Positive, TokenSymbol, Transfer,
-    TransferStatus,
+    ConversionDirection, ConversionOrder, CryptoOrderOutcome, Network, Positive, TokenSymbol,
+    Transfer, TransferStatus,
 };
-use st0x_finance::Usdc;
+use st0x_finance::{Usd, Usdc};
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
 
 use super::UsdcTransferError;
@@ -620,6 +620,14 @@ impl<
 
         info!(target: "rebalance", %amount, %correlation_id, "Starting USD to USDC conversion");
 
+        // The aggregate carries this leg's amount as `Usdc` for the shape its
+        // persisted events already have, but the buy spends it as dollars --
+        // named here so the order cannot be read as a USDC quantity. Built
+        // before the intent is recorded so a non-positive amount fails with
+        // no aggregate event and no broker order to reconcile.
+        let conversion_order =
+            ConversionOrder::BuyWithUsd(Positive::new(Usd::new(amount.inner()))?);
+
         // Record intent BEFORE placing order so we can track failures
         self.cqrs
             .send(
@@ -632,15 +640,9 @@ impl<
             )
             .await?;
 
-        let alpaca_amount = amount.inner();
-
         let order = match self
             .alpaca_broker
-            .convert_usdc_usd(
-                alpaca_amount,
-                ConversionDirection::UsdToUsdc,
-                &correlation_id,
-            )
+            .convert_usdc_usd(conversion_order, &correlation_id)
             .await
         {
             Ok(order) => order,
@@ -691,7 +693,7 @@ impl<
         };
 
         let conversion = self
-            .record_conversion_or_fail(id, &correlation_id, &order, ConversionDirection::UsdToUsdc)
+            .record_conversion_or_fail(id, &correlation_id, &order, conversion_order.direction())
             .await?;
         let received_amount = conversion.received_amount;
 
@@ -774,6 +776,10 @@ impl<
 
         info!(target: "rebalance", %amount, %correlation_id, "Starting USDC to USD conversion");
 
+        // Built before the intent is recorded so a non-positive amount fails
+        // with no aggregate event and no broker order to reconcile.
+        let conversion_order = ConversionOrder::SellUsdc(Positive::new(amount)?);
+
         // Record intent BEFORE placing order so we can track failures
         self.cqrs
             .send(
@@ -785,15 +791,9 @@ impl<
             )
             .await?;
 
-        let alpaca_amount = amount.inner();
-
         let order = match self
             .alpaca_broker
-            .convert_usdc_usd(
-                alpaca_amount,
-                ConversionDirection::UsdcToUsd,
-                &correlation_id,
-            )
+            .convert_usdc_usd(conversion_order, &correlation_id)
             .await
         {
             Ok(order) => order,
@@ -835,7 +835,7 @@ impl<
         };
 
         let conversion = self
-            .record_conversion_or_fail(id, &correlation_id, &order, ConversionDirection::UsdcToUsd)
+            .record_conversion_or_fail(id, &correlation_id, &order, conversion_order.direction())
             .await?;
         let proceeds = conversion.received_amount;
 
@@ -5250,19 +5250,73 @@ mod tests {
         (cctp_bridge, vault_service)
     }
 
+    /// The placement-request fragment and response `qty`/`notional` pair for
+    /// one conversion direction, shared by the filled and pending placement
+    /// mocks: a USD->USDC buy names dollars (`notional`) and the real API
+    /// keeps `qty` null on it, a USDC->USD sell names USDC (`qty`).
+    fn conversion_wire_shape(
+        direction: ConversionDirection,
+        amount: &str,
+    ) -> (String, serde_json::Value, serde_json::Value) {
+        match direction {
+            ConversionDirection::UsdToUsdc => (
+                format!(r#"{{"symbol":"USDCUSD","side":"buy","notional":"{amount}"}}"#),
+                json!(null),
+                json!(amount),
+            ),
+            ConversionDirection::UsdcToUsd => (
+                format!(r#"{{"symbol":"USDCUSD","side":"sell","qty":"{amount}"}}"#),
+                json!(amount),
+                json!(null),
+            ),
+        }
+    }
+
+    /// The sizing field the opposite direction would use. Alpaca takes `qty`
+    /// and `notional` as mutually exclusive, so a correct request must omit
+    /// this field entirely -- `json_body_includes` alone would accept a
+    /// serializer that sends both.
+    const fn forbidden_sizing_field(direction: ConversionDirection) -> &'static str {
+        match direction {
+            ConversionDirection::UsdToUsdc => "qty",
+            ConversionDirection::UsdcToUsd => "notional",
+        }
+    }
+
+    /// A matcher rejecting any placement request that carries the sizing
+    /// field of the opposite conversion direction.
+    fn omits_forbidden_sizing_field(
+        direction: ConversionDirection,
+    ) -> impl Fn(&HttpMockRequest) -> bool + Send + Sync + 'static {
+        move |request| {
+            serde_json::from_slice::<serde_json::Value>(request.body().as_ref())
+                .is_ok_and(|body| body.get(forbidden_sizing_field(direction)).is_none())
+        }
+    }
+
+    /// Mocks the conversion placement endpoint with an immediately filled
+    /// order, matching the request against the side/size mapping the manager
+    /// must produce for `direction` -- a request that names the wrong side,
+    /// the wrong sizing field, or both sizing fields gets no response and
+    /// fails the test.
     fn create_conversion_order_mock<'a>(
         server: &'a MockServer,
+        direction: ConversionDirection,
         amount: &str,
     ) -> httpmock::Mock<'a> {
+        let (request_fragment, qty, notional) = conversion_wire_shape(direction, amount);
         server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body_includes(request_fragment)
+                .is_true(omits_forbidden_sizing_field(direction));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
                     "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
                     "symbol": "USDCUSD",
-                    "qty": amount,
+                    "qty": qty,
+                    "notional": notional,
                     "status": "filled",
                     "filled_avg_price": "1.0001",
                     "filled_qty": amount,
@@ -5271,19 +5325,27 @@ mod tests {
         })
     }
 
+    /// Same request matching as [`create_conversion_order_mock`], answering
+    /// with a still-pending order so the caller's status polling drives the
+    /// outcome.
     fn create_conversion_order_pending_mock<'a>(
         server: &'a MockServer,
+        direction: ConversionDirection,
         amount: &str,
     ) -> httpmock::Mock<'a> {
+        let (request_fragment, qty, notional) = conversion_wire_shape(direction, amount);
         server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body_includes(request_fragment)
+                .is_true(omits_forbidden_sizing_field(direction));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
                     "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
                     "symbol": "USDCUSD",
-                    "qty": amount,
+                    "qty": qty,
+                    "notional": notional,
                     "status": "new",
                     "created_at": "2024-01-15T10:30:00Z"
                 }));
@@ -5510,7 +5572,8 @@ mod tests {
         );
 
         // Mock conversion order (conversion happens before withdrawal)
-        let _conversion_mock = create_conversion_order_mock(&server, "1000");
+        let _conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdToUsdc, "1000");
         let _get_order_mock = create_get_order_mock(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -5569,7 +5632,8 @@ mod tests {
         );
 
         // Mock conversion order (conversion happens before withdrawal)
-        let _conversion_mock = create_conversion_order_mock(&server, "500");
+        let _conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdToUsdc, "500");
         let _get_order_mock = create_get_order_mock(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -5635,7 +5699,8 @@ mod tests {
         );
 
         // Mock conversion order (conversion happens before withdrawal)
-        let _conversion_mock = create_conversion_order_mock(&server, "100");
+        let _conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdToUsdc, "100");
         let _get_order_mock = create_get_order_mock(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -5786,7 +5851,8 @@ mod tests {
         );
 
         // Mock the conversion order placement (POST)
-        let order_mock = create_conversion_order_mock(&server, "1000");
+        let order_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdToUsdc, "1000");
         // Mock the polling endpoint (convert_usdc_usd always polls after placement)
         let _get_mock = create_get_order_mock(
             &server,
@@ -5804,6 +5870,144 @@ mod tests {
             .unwrap();
 
         order_mock.assert();
+    }
+
+    /// A conversion sized at zero or below has nothing to buy: it must be
+    /// refused before anything leaves the process -- no order placement at
+    /// the broker.
+    #[tokio::test]
+    async fn usd_to_usdc_conversion_rejects_a_non_positive_amount() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let cqrs = create_test_store_instance().await;
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs,
+            address!("0x1111111111111111111111111111111111111111"),
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let placement_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "USDCUSD",
+                    "qty": null,
+                    "notional": "0",
+                    "status": "filled",
+                    "filled_avg_price": "1.0001",
+                    "filled_qty": "0",
+                    "created_at": "2024-01-15T10:30:00Z"
+                }));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let zero_error = manager
+            .execute_usd_to_usdc_conversion(&id, usdc("0"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(zero_error, UsdcTransferError::NotPositiveUsd(_)),
+            "Expected NotPositiveUsd for a zero conversion, got: {zero_error:?}"
+        );
+
+        let negative_error = manager
+            .execute_usd_to_usdc_conversion(&id, usdc("-5"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(negative_error, UsdcTransferError::NotPositiveUsd(_)),
+            "Expected NotPositiveUsd for a negative conversion, got: {negative_error:?}"
+        );
+
+        assert_eq!(
+            placement_mock.calls(),
+            0,
+            "a non-positive conversion must never reach the broker"
+        );
+    }
+
+    /// The post-deposit sell leg gets the same guard: a zero-amount
+    /// conversion (a zero deposit recorded on the aggregate) must fail
+    /// before placing anything at the broker.
+    #[tokio::test]
+    async fn post_deposit_conversion_rejects_a_non_positive_amount() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let cqrs = create_test_store_instance().await;
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            Arc::clone(&cqrs),
+            address!("0x1111111111111111111111111111111111111111"),
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let placement_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "USDCUSD",
+                    "qty": "0",
+                    "notional": null,
+                    "status": "filled",
+                    "filled_avg_price": "1.0001",
+                    "filled_qty": "0",
+                    "created_at": "2024-01-15T10:30:00Z"
+                }));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_deposit_confirmed_base_to_alpaca(&cqrs, &id, usdc("0"), usdc("0")).await;
+
+        let error = manager
+            .execute_usdc_to_usd_conversion(&id, usdc("0"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, UsdcTransferError::NotPositive(_)),
+            "Expected NotPositive for a zero conversion, got: {error:?}"
+        );
+
+        assert_eq!(
+            placement_mock.calls(),
+            0,
+            "a non-positive conversion must never reach the broker"
+        );
     }
 
     #[tokio::test]
@@ -5835,7 +6039,8 @@ mod tests {
         );
 
         // Mock the conversion order - will be called but CQRS command will fail
-        let _order_mock = create_conversion_order_mock(&server, "500");
+        let _order_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdcToUsd, "500");
         let _get_mock = create_get_order_mock(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -5892,7 +6097,8 @@ mod tests {
         );
 
         // Order starts as pending
-        let _place_mock = create_conversion_order_pending_mock(&server, "1000");
+        let _place_mock =
+            create_conversion_order_pending_mock(&server, ConversionDirection::UsdToUsdc, "1000");
 
         // First poll returns filled
         let _get_mock_1 = create_get_order_mock(
@@ -5940,7 +6146,8 @@ mod tests {
         );
 
         // Order starts as pending
-        let _place_mock = create_conversion_order_pending_mock(&server, "1000");
+        let _place_mock =
+            create_conversion_order_pending_mock(&server, ConversionDirection::UsdToUsdc, "1000");
 
         // Poll returns canceled
         let _get_mock = create_get_order_mock(
@@ -6066,7 +6273,8 @@ mod tests {
 
         // Order starts as pending then gets rejected
         let amount_received = usdc("99.99");
-        let _place_mock = create_conversion_order_pending_mock(&server, "99.99");
+        let _place_mock =
+            create_conversion_order_pending_mock(&server, ConversionDirection::UsdcToUsd, "99.99");
 
         let _get_mock = create_get_order_mock(
             &server,
@@ -6356,11 +6564,13 @@ mod tests {
             &test_settlement_params(),
         );
 
-        // Mock conversion order - MUST be called before withdrawal
+        // Mock conversion order - MUST be called before withdrawal, and MUST
+        // be sized as a notional buy (the mapping under test).
         let conversion_mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
-                .json_body_includes(r#"{"symbol":"USDCUSD"}"#);
+                .json_body_includes(r#"{"symbol":"USDCUSD","side":"buy","notional":"1000"}"#)
+                .is_true(omits_forbidden_sizing_field(ConversionDirection::UsdToUsdc));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -6431,10 +6641,13 @@ mod tests {
             &test_settlement_params(),
         );
 
+        // The post-deposit conversion MUST be sized as a qty sell (the
+        // mapping under test).
         let conversion_mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
-                .json_body_includes(r#"{"symbol":"USDCUSD"}"#);
+                .json_body_includes(r#"{"symbol":"USDCUSD","side":"sell","qty":"99.99"}"#)
+                .is_true(omits_forbidden_sizing_field(ConversionDirection::UsdcToUsd));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -6503,7 +6716,8 @@ mod tests {
         );
 
         // Order starts as pending
-        let _place_mock = create_conversion_order_pending_mock(&server, "1000");
+        let _place_mock =
+            create_conversion_order_pending_mock(&server, ConversionDirection::UsdToUsdc, "1000");
 
         // Poll returns expired
         let _get_mock = server.mock(|when, then| {
@@ -6715,7 +6929,8 @@ mod tests {
             &test_settlement_params(),
         );
 
-        let _order_mock = create_conversion_order_mock(&server, "1000");
+        let _order_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdToUsdc, "1000");
         let _get_mock = create_get_order_mock(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -6773,7 +6988,8 @@ mod tests {
         );
 
         // Request 1000, but only 999.5 fills due to slippage
-        let _order_mock = create_conversion_order_pending_mock(&server, "1000");
+        let _order_mock =
+            create_conversion_order_pending_mock(&server, ConversionDirection::UsdToUsdc, "1000");
         let _get_mock = create_get_order_mock_with_fill(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -6826,7 +7042,8 @@ mod tests {
             &test_settlement_params(),
         );
 
-        let _order_mock = create_conversion_order_pending_mock(&server, "1000");
+        let _order_mock =
+            create_conversion_order_pending_mock(&server, ConversionDirection::UsdToUsdc, "1000");
         let _get_mock = create_get_order_mock_missing_average_price(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -6893,7 +7110,8 @@ mod tests {
             &test_settlement_params(),
         );
 
-        let _order_mock = create_conversion_order_pending_mock(&server, "1000");
+        let _order_mock =
+            create_conversion_order_pending_mock(&server, ConversionDirection::UsdToUsdc, "1000");
         let _get_mock = create_get_order_mock_missing_quantity(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -6966,7 +7184,8 @@ mod tests {
             &test_settlement_params(),
         );
 
-        let _order_mock = create_conversion_order_pending_mock(&server, "1000");
+        let _order_mock =
+            create_conversion_order_pending_mock(&server, ConversionDirection::UsdcToUsd, "1000");
         let _get_mock = create_get_order_mock_with_fill(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -7185,7 +7404,8 @@ mod tests {
             &test_settlement_params(),
         );
 
-        let _order_mock = create_conversion_order_pending_mock(&server, "1000");
+        let _order_mock =
+            create_conversion_order_pending_mock(&server, ConversionDirection::UsdcToUsd, "1000");
         let _get_mock = create_get_order_mock_missing_average_price(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -7257,7 +7477,8 @@ mod tests {
             &test_settlement_params(),
         );
 
-        let _order_mock = create_conversion_order_pending_mock(&server, "1000");
+        let _order_mock =
+            create_conversion_order_pending_mock(&server, ConversionDirection::UsdcToUsd, "1000");
         let _get_mock = create_get_order_mock_missing_quantity(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -8256,7 +8477,8 @@ mod tests {
 
         // 500 requested, 20 settled: what a stalled order whose remainder was
         // cancelled delivers, well under Alpaca's withdrawal minimum.
-        let _order_mock = create_conversion_order_pending_mock(&server, "500");
+        let _order_mock =
+            create_conversion_order_pending_mock(&server, ConversionDirection::UsdToUsdc, "500");
         let _get_mock = create_get_order_mock_with_fill(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -8316,7 +8538,8 @@ mod tests {
 
         // 500 requested, 51 settled: the smallest fill Alpaca will still
         // accept a withdrawal for.
-        let _order_mock = create_conversion_order_pending_mock(&server, "500");
+        let _order_mock =
+            create_conversion_order_pending_mock(&server, ConversionDirection::UsdToUsdc, "500");
         let _get_mock = create_get_order_mock_with_fill(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -8456,7 +8679,8 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc("500");
 
-        let _order_mock = create_conversion_order_pending_mock(&server, "500");
+        let _order_mock =
+            create_conversion_order_pending_mock(&server, ConversionDirection::UsdToUsdc, "500");
         let cancel = mock_conversion_whose_cancel_never_settles(&server, "500");
 
         let clock = tokio::spawn(skip_conversion_poll_deadlines());
@@ -8513,7 +8737,8 @@ mod tests {
             .await
             .unwrap();
 
-        let _order_mock = create_conversion_order_pending_mock(&server, "100");
+        let _order_mock =
+            create_conversion_order_pending_mock(&server, ConversionDirection::UsdcToUsd, "100");
         let cancel = mock_conversion_whose_cancel_never_settles(&server, "100");
 
         let clock = tokio::spawn(skip_conversion_poll_deadlines());
@@ -8570,7 +8795,8 @@ mod tests {
             .await
             .unwrap();
 
-        let _conversion_mock = create_conversion_order_mock(&server, "100");
+        let _conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdcToUsd, "100");
         let _get_order_mock = create_get_order_mock_with_fill(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -9082,7 +9308,8 @@ mod tests {
                     "fees": "0"
                 }]));
         });
-        let _conversion_mock = create_conversion_order_mock(&server, "99.99");
+        let _conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdcToUsd, "99.99");
         let _get_order_mock = create_get_order_mock(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -9146,7 +9373,8 @@ mod tests {
                     "fees": "0"
                 }]));
         });
-        let _conversion_mock = create_conversion_order_mock(&server, "99.99");
+        let _conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdcToUsd, "99.99");
         let _get_order_mock = create_get_order_mock(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -9568,7 +9796,8 @@ mod tests {
                     "fees": "0"
                 }]));
         });
-        let _conversion_mock = create_conversion_order_mock(&server, "100");
+        let _conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdcToUsd, "100");
         let _get_order_mock = create_get_order_mock(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -9757,7 +9986,8 @@ mod tests {
                     "fees": "0"
                 }]));
         });
-        let _conversion_mock = create_conversion_order_mock(&server, "100");
+        let _conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdcToUsd, "100");
         let _get_order_mock = create_get_order_mock(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",
@@ -10420,7 +10650,8 @@ mod tests {
                     "fees": "0"
                 }]));
         });
-        let _conversion_mock = create_conversion_order_mock(&server, "99.99");
+        let _conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdcToUsd, "99.99");
         let _get_order_mock = create_get_order_mock(
             &server,
             "61e7b016-9c91-4a97-b912-615c9d365c9d",

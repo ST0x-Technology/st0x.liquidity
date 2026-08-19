@@ -23,11 +23,10 @@
 use std::time::Instant;
 
 use chrono::Utc;
-use rain_math_float::Float;
 use uuid::Uuid;
 
 use st0x_execution::alpaca_broker_api::{CryptoOrderOutcome, CryptoOrderResponse};
-use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, ClientOrderId, ConversionDirection};
+use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, ClientOrderId, ConversionOrder};
 
 use super::{Dependency, DependencyCallSample, TelemetrySender, scrub_secrets};
 
@@ -67,14 +66,13 @@ impl InstrumentedAlpacaBroker {
 
     pub(crate) async fn convert_usdc_usd(
         &self,
-        amount: Float,
-        direction: ConversionDirection,
+        conversion: ConversionOrder,
         client_order_id: &ClientOrderId,
     ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
         let started = Instant::now();
         let result = self
             .inner
-            .convert_usdc_usd(amount, direction, client_order_id)
+            .convert_usdc_usd(conversion, client_order_id)
             .await;
         self.record("convert_usdc_usd", started, &result);
         result
@@ -132,9 +130,8 @@ mod tests {
     use uuid::{Uuid, uuid};
 
     use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
-    use st0x_execution::{
-        AlpacaAccountId, AlpacaBrokerApi, ClientOrderId, ConversionDirection, Executor,
-    };
+    use st0x_execution::{AlpacaAccountId, AlpacaBrokerApi, ClientOrderId, Executor};
+    use st0x_finance::{Positive, Usd, Usdc};
     use st0x_float_macro::float;
 
     use super::*;
@@ -244,8 +241,7 @@ mod tests {
 
         instrumented
             .convert_usdc_usd(
-                float!(100),
-                ConversionDirection::UsdcToUsd,
+                ConversionOrder::SellUsdc(Positive::new(Usdc::new(float!(100))).unwrap()),
                 &client_order_id,
             )
             .await
@@ -288,8 +284,7 @@ mod tests {
 
         instrumented
             .convert_usdc_usd(
-                float!(100),
-                ConversionDirection::UsdToUsdc,
+                ConversionOrder::BuyWithUsd(Positive::new(Usd::new(float!(100))).unwrap()),
                 &client_order_id,
             )
             .await
@@ -412,8 +407,7 @@ mod tests {
 
         instrumented
             .convert_usdc_usd(
-                float!(100),
-                ConversionDirection::UsdcToUsd,
+                ConversionOrder::SellUsdc(Positive::new(Usdc::new(float!(100))).unwrap()),
                 &client_order_id,
             )
             .await

@@ -7,13 +7,10 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use rain_math_float::Float;
-use st0x_float_serde::format_float_with_fallback;
-
 use super::auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx};
 use super::client::AlpacaBrokerApiClient;
 use super::journal::JournalResponse;
-use super::order::{AlpacaLimitOrder, ConversionDirection, CryptoOrderResponse};
+use super::order::{AlpacaLimitOrder, ConversionOrder, CryptoOrderResponse};
 use super::{AlpacaBrokerApiError, AssetStatus, MissingOrderField, TimeInForce};
 use crate::{
     CancellationOutcome, ClientOrderId, CounterTradePreflight, Direction, Executor,
@@ -378,14 +375,14 @@ impl TryIntoExecutor for AlpacaBrokerApiCtx {
 impl AlpacaBrokerApi {
     /// Convert USDC to/from USD buying power.
     ///
-    /// This uses the USDC/USD trading pair on Alpaca, and `amount` is read in
-    /// the unit each direction is constrained by:
-    /// - `UsdcToUsd`: sells `amount` USDC for USD buying power
-    /// - `UsdToUsdc`: spends `amount` USD on USDC. Sized as a `notional`
-    ///   order, so Alpaca holds exactly `amount` and its collar bounds the
-    ///   fill rather than the hold -- `amount` at 100% of settled cash is
+    /// This uses the USDC/USD trading pair on Alpaca, and `order` carries its
+    /// amount in the unit that direction is denominated in:
+    /// - `SellUsdc`: sells that much USDC for USD buying power
+    /// - `BuyWithUsd`: spends that many dollars on USDC. Sized as a `notional`
+    ///   order, so Alpaca holds exactly the dollars named and its collar bounds
+    ///   the fill rather than the hold -- naming 100% of settled cash is
     ///   accepted, and the collar and execution price decide how much less
-    ///   USDC than `amount` the fill delivers.
+    ///   USDC than the dollars named the fill delivers.
     ///
     /// Returns the settled order once it stops moving: either a filled order,
     /// or -- when it stalled past the poll deadline and its remainder was
@@ -394,18 +391,15 @@ impl AlpacaBrokerApi {
     /// than from the requested amount or the status.
     pub async fn convert_usdc_usd(
         &self,
-        amount: Float,
-        direction: ConversionDirection,
+        conversion: ConversionOrder,
         client_order_id: &ClientOrderId,
     ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
         let order =
-            super::order::convert_usdc_usd(&self.client, amount, direction, client_order_id)
-                .await?;
+            super::order::convert_usdc_usd(&self.client, conversion, client_order_id).await?;
 
         info!(
             order_id = %order.id,
-            amount = %format_float_with_fallback(&amount),
-            direction = ?direction,
+            ?conversion,
             "USDC/USD conversion order placed, polling for completion..."
         );
 
@@ -561,6 +555,7 @@ impl AlpacaBrokerApi {
 #[cfg(test)]
 mod tests {
     use httpmock::prelude::*;
+    use rain_math_float::Float;
     use serde_json::json;
     use st0x_float_macro::float;
     use std::thread;

@@ -7,11 +7,11 @@ use uuid::Uuid;
 
 use st0x_evm::{Evm, IERC20, IntoErrorRegistry, USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA, Wallet};
 use st0x_execution::{
-    AlpacaAccountId, AlpacaBrokerApi, AlpacaWalletService, ClientOrderId, ConversionDirection,
+    AlpacaAccountId, AlpacaBrokerApi, AlpacaWalletService, ClientOrderId, ConversionOrder,
     Executor, FractionalShares, Network, Positive, Symbol, TokenSymbol, TransferStatus,
     TravelRuleInfo, WhitelistEntry, WhitelistStatus,
 };
-use st0x_finance::Usdc;
+use st0x_finance::{Usd, Usdc};
 use st0x_float_serde::format_float_with_fallback;
 
 use super::ConvertDirection;
@@ -622,20 +622,25 @@ pub(super) async fn alpaca_convert_command<W: Write>(
         anyhow::bail!("alpaca-convert requires Alpaca Broker API configuration");
     };
 
-    let executor = AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?;
-
-    let conversion_direction = match direction {
-        ConvertDirection::ToUsd => ConversionDirection::UsdcToUsd,
-        ConvertDirection::ToUsdc => ConversionDirection::UsdToUsdc,
+    // The parsed amount is one number either way; which unit it carries is
+    // decided here, once, rather than being implied by the direction further
+    // down the call chain. Built before the executor so a non-positive
+    // amount fails without any broker traffic.
+    let conversion = match direction {
+        ConvertDirection::ToUsd => ConversionOrder::SellUsdc(Positive::new(amount)?),
+        ConvertDirection::ToUsdc => {
+            ConversionOrder::BuyWithUsd(Positive::new(Usd::new(amount.inner()))?)
+        }
     };
 
-    let amount_exact = amount.inner();
+    let executor = AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?;
+
     let correlation_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
     writeln!(stdout, "   Placing market order...")?;
 
     let order = executor
-        .convert_usdc_usd(amount_exact, conversion_direction, &correlation_id)
+        .convert_usdc_usd(conversion, &correlation_id)
         .await?;
 
     writeln!(stdout, "Conversion completed successfully!")?;
@@ -1177,6 +1182,60 @@ mod tests {
         assert!(
             !output.contains("   Notional:"),
             "A quantity order names no notional, got: {output}"
+        );
+    }
+
+    /// A non-positive amount must fail before the broker sees anything:
+    /// no order placement request, in either direction.
+    #[tokio::test]
+    async fn test_alpaca_convert_rejects_non_positive_amounts_without_placing() {
+        let server = MockServer::start();
+        let ctx = create_mock_alpaca_ctx(server.base_url());
+
+        let _account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/account"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": TEST_ACCOUNT_ID,
+                    "status": "ACTIVE"
+                }));
+        });
+        let placement_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path(format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/orders"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "USDCUSD",
+                    "qty": "0",
+                    "notional": null,
+                    "status": "filled",
+                    "filled_avg_price": "1.0001",
+                    "filled_qty": "0",
+                    "created_at": "2026-01-06T12:30:00Z"
+                }));
+        });
+
+        for amount in [float!(0), float!(-5)] {
+            for direction in [ConvertDirection::ToUsd, ConvertDirection::ToUsdc] {
+                let mut stdout = Vec::new();
+                let error = alpaca_convert_command(&mut stdout, direction, Usdc::new(amount), &ctx)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("must be positive"),
+                    "Expected a positivity error for {direction:?}, got: {error:?}"
+                );
+            }
+        }
+
+        assert_eq!(
+            placement_mock.calls(),
+            0,
+            "a non-positive conversion must never reach the broker"
         );
     }
 
