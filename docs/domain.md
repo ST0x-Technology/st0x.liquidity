@@ -170,8 +170,8 @@ based on its configured execution threshold.
 The minimum net exposure required before the system triggers an offsetting
 offchain trade. Two modes:
 
-- **Shares threshold**: Execute when net position reaches N shares (used by
-  DryRun).
+- **Shares threshold**: Execute when net position reaches N shares (used by test
+  fixtures).
 - **Dollar value threshold**: Execute when net position value reaches $N (used
   by Alpaca, which requires a $1 minimum for fractional trading).
 

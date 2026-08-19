@@ -15,9 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
-use st0x_config::{EquitiesConfig, EquityAssetConfig, OperationMode};
+use st0x_config::{BrokerCtx, EquitiesConfig, EquityAssetConfig, OperationMode};
 use st0x_event_sorcery::{DomainEvent, EventSourced};
-use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
+use st0x_execution::{AlpacaBrokerApiMode, Direction, FractionalShares, Positive, Symbol};
 
 use crate::bindings::IRaindexV6::{EvaluableV4, IOV2, OrderV4};
 use crate::onchain::OnchainTrade;
@@ -146,6 +146,17 @@ pub(crate) fn rebalancing_enabled_equities(symbols: &[&str]) -> EquitiesConfig {
             })
             .collect(),
     }
+}
+
+/// Broker ctx whose Alpaca mode points at an in-process mock server (e.g.
+/// `AlpacaBrokerMock`), so constructing a real executor from it stays
+/// network-free. Field values come from `test_alpaca_broker_ctx` -- whose
+/// account id matches the mock's `TEST_ACCOUNT_ID` -- with only the mode
+/// overridden.
+pub(crate) fn mock_alpaca_broker_ctx(base_url: String) -> BrokerCtx {
+    let BrokerCtx::AlpacaBrokerApi(mut alpaca) = st0x_config::test_alpaca_broker_ctx();
+    alpaca.mode = Some(AlpacaBrokerApiMode::Mock(base_url));
+    BrokerCtx::AlpacaBrokerApi(alpaca)
 }
 
 /// Deterministic singleton address of the TOFUTokenDecimals contract. The

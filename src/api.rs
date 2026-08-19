@@ -198,20 +198,17 @@ async fn pnl(
     let permit =
         acquire_pnl_report_permit(&state.pnl_report_admission).map_err(pnl_error_response)?;
 
-    let activities = if let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &state.ctx.broker {
-        alpaca_auth
-            .fetch_account_activities(&AccountActivitiesQuery::pnl(after, until))
-            .await
-            .map_err(|error| {
-                error!(%error, "Failed to fetch Alpaca account activities for PnL");
-                (
-                    StatusCode::BAD_GATEWAY,
-                    "Failed to fetch Alpaca account activities".to_string(),
-                )
-            })?
-    } else {
-        Vec::new()
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &state.ctx.broker;
+    let activities = alpaca_auth
+        .fetch_account_activities(&AccountActivitiesQuery::pnl(after, until))
+        .await
+        .map_err(|error| {
+            error!(%error, "Failed to fetch Alpaca account activities for PnL");
+            (
+                StatusCode::BAD_GATEWAY,
+                "Failed to fetch Alpaca account activities".to_string(),
+            )
+        })?;
 
     build_pnl_report_with_permit(&state.pool, &query, activities, Utc::now(), permit, head)
         .await
@@ -1768,6 +1765,7 @@ mod tests {
     };
     use st0x_dto::TradeOutcome;
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
+    use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletError,
         DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutorOrderId, Positive,
@@ -1842,7 +1840,16 @@ mod tests {
 
     #[tokio::test]
     async fn pnl_route_returns_a_stable_generic_response_for_report_failures() {
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        // The route fetches Alpaca account activities before building the
+        // report; serve them from an in-process mock so the corrupt-row
+        // report failure under test is what actually surfaces.
+        let broker_mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = crate::test_utils::mock_alpaca_broker_ctx(broker_mock.base_url());
         let state = empty_app_state(ctx).await;
         sqlx::query(
             "INSERT INTO portfolio_snapshot ( \
@@ -2937,7 +2944,16 @@ mod tests {
     /// too.
     #[tokio::test]
     async fn pnl_endpoint_reports_capital_from_persisted_portfolio_snapshots() {
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        // The route fetches Alpaca account activities before building the
+        // report; serve an empty ledger from an in-process mock so the
+        // capital figures come purely from the seeded snapshots.
+        let broker_mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = crate::test_utils::mock_alpaca_broker_ctx(broker_mock.base_url());
         let state = empty_app_state(ctx).await;
 
         let portfolio_snapshot_store = StoreBuilder::<PortfolioSnapshot>::new(state.pool.clone())

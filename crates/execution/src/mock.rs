@@ -50,7 +50,7 @@ pub enum MockOrderIdError {
     },
 }
 
-/// Unified test executor for dry-run mode and testing that logs operations without executing real trades
+/// Unified test executor that logs operations without executing real trades
 #[derive(Debug, Clone)]
 pub struct MockExecutor {
     health: Health,
@@ -282,7 +282,7 @@ impl Executor for MockExecutor {
     type Ctx = MockExecutorCtx;
 
     async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
-        info!(target: "broker", "[MOCK] Initializing mock executor - always ready in dry-run mode");
+        info!(target: "broker", "[MOCK] Initializing mock executor - always ready");
         Ok(Self::new())
     }
 
