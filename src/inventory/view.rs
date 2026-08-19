@@ -633,12 +633,12 @@ impl PartialEq for PortfolioBalanceRow {
 
 /// Venues paired with their [`PortfolioLocation`] counterpart, in the fixed
 /// order [`InventoryView::to_portfolio_snapshot_rows`] emits them.
-/// Warn cadence for guard-starved offchain snapshots: every this many
-/// consecutive skips of a symbol's Hedging equity snapshot (or of the
-/// venue-level `OffchainUsd` snapshot), a `warn!` surfaces the starvation
-/// that ADR 0015 accepted but left invisible at production log levels.
+/// Warn cadence for guard-starved snapshots: every this many consecutive
+/// skips of a symbol's equity snapshot at a venue (or of a venue's
+/// cash snapshot), a `warn!` surfaces the starvation that ADR 0015
+/// accepted but left invisible at production log levels.
 /// Observability only -- never changes which snapshots apply.
-const OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY: u32 = 5;
+const SNAPSHOT_SKIP_WARN_EVERY: u32 = 5;
 
 const PORTFOLIO_VENUES: [(Venue, PortfolioLocation); 2] = [
     (Venue::MarketMaking, PortfolioLocation::MarketMaking),
@@ -752,18 +752,25 @@ pub(crate) struct InventoryView {
     /// stamps it.
     #[serde(default)]
     last_offchain_cash_fill_applied_at: Option<DateTime<Utc>>,
-    /// Consecutive skipped Hedging equity snapshots per symbol, reset when
-    /// one applies. Pure observability: ADR 0015 accepted that its guards
-    /// can starve a symbol's snapshots but noted the starvation was
+    /// Consecutive skipped equity snapshots per `(venue, symbol)`, reset
+    /// when one applies. Pure observability: ADR 0015 accepted that its
+    /// guards can starve a symbol's snapshots but noted the starvation was
     /// invisible at production log levels; these streaks surface it as a
-    /// `warn!` every [`OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY`] consecutive
-    /// skips.
+    /// `warn!` every [`SNAPSHOT_SKIP_WARN_EVERY`] consecutive skips. Keyed
+    /// by venue because the venues starve independently: a MarketMaking
+    /// balance wedged behind a stuck inflight is as invisible as a Hedging
+    /// one wedged behind an open hedge order.
     #[serde(default)]
-    offchain_equity_snapshot_skip_streaks: HashMap<Symbol, u32>,
+    equity_snapshot_skip_streaks: HashMap<(Venue, Symbol), u32>,
     /// Consecutive `OffchainUsd` snapshots skipped by the venue-level cash
     /// guards, reset when one passes them.
     #[serde(default)]
     offchain_usd_snapshot_skip_streak: u32,
+    /// The MarketMaking twin of `offchain_usd_snapshot_skip_streak`:
+    /// consecutive `OnchainUsdc` snapshots skipped by the venue-level cash
+    /// guards, reset when one passes them.
+    #[serde(default)]
+    onchain_usdc_snapshot_skip_streak: u32,
     /// `fetched_at` of the freshest applied Hedging cash snapshot (ordinary
     /// or reconciled) -- the venue-level cash twin of
     /// `offchain_equity_snapshot_watermarks`. Consulted by
@@ -1155,8 +1162,9 @@ impl Default for InventoryView {
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
             last_offchain_cash_fill_applied_at: None,
-            offchain_equity_snapshot_skip_streaks: HashMap::new(),
+            equity_snapshot_skip_streaks: HashMap::new(),
             offchain_usd_snapshot_skip_streak: 0,
+            onchain_usdc_snapshot_skip_streak: 0,
             offchain_usd_snapshot_watermark: None,
             buying_power_cents: None,
             withdrawable_cash_cents: None,
@@ -1212,33 +1220,44 @@ impl InventoryView {
         inventory.get_venue(venue).map(VenueBalance::available)
     }
 
-    /// Whether divergence recovery must leave this symbol alone, and why.
-    /// `None` means the symbol is quiet and the broker reading is
+    /// Whether divergence recovery must leave this symbol alone at `venue`,
+    /// and why. `None` means the symbol is quiet and the venue's reading is
     /// comparable. The poller freezes the divergence counter on `Some`;
     /// the forced apply aborts on `Some`. Single predicate for both so
     /// detection and apply can never disagree on what counts as busy.
+    ///
+    /// A transfer is busy at both venues -- it moves the symbol between
+    /// them -- but the hedge-order sources are Hedging-only, mirroring the
+    /// venue split in [`Self::equity_snapshot_would_apply`]: an open broker
+    /// order says nothing about what a vault read at MarketMaking holds.
     pub(crate) fn equity_reconciliation_busy(
         &self,
         symbol: &Symbol,
+        venue: Venue,
         fetched_at: DateTime<Utc>,
     ) -> Result<Option<EquityReconcileBusy>, FloatError> {
         if self.equity_transfer_busy(symbol)? {
             return Ok(Some(EquityReconcileBusy::Transfer));
         }
 
-        if self.has_pending_offchain_order(symbol) {
-            return Ok(Some(EquityReconcileBusy::PendingHedgeOrder));
-        }
+        match venue {
+            Venue::MarketMaking => Ok(None),
+            Venue::Hedging => {
+                if self.has_pending_offchain_order(symbol) {
+                    return Ok(Some(EquityReconcileBusy::PendingHedgeOrder));
+                }
 
-        if self
-            .last_offchain_fill_applied_at
-            .get(symbol)
-            .is_some_and(|filled_at| fetched_at < *filled_at)
-        {
-            return Ok(Some(EquityReconcileBusy::FillAfterFetch));
-        }
+                if self
+                    .last_offchain_fill_applied_at
+                    .get(symbol)
+                    .is_some_and(|filled_at| fetched_at < *filled_at)
+                {
+                    return Ok(Some(EquityReconcileBusy::FillAfterFetch));
+                }
 
-        Ok(None)
+                Ok(None)
+            }
+        }
     }
 
     /// Inflight at either venue, or an active mint/redemption owning the
@@ -1394,8 +1413,9 @@ impl InventoryView {
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
-            offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
+            equity_snapshot_skip_streaks: self.equity_snapshot_skip_streaks,
             offchain_usd_snapshot_skip_streak: self.offchain_usd_snapshot_skip_streak,
+            onchain_usdc_snapshot_skip_streak: self.onchain_usdc_snapshot_skip_streak,
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
@@ -1431,8 +1451,9 @@ impl InventoryView {
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
-            offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
+            equity_snapshot_skip_streaks: self.equity_snapshot_skip_streaks,
             offchain_usd_snapshot_skip_streak: self.offchain_usd_snapshot_skip_streak,
+            onchain_usdc_snapshot_skip_streak: self.onchain_usdc_snapshot_skip_streak,
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
@@ -1703,58 +1724,74 @@ impl InventoryView {
         }
     }
 
-    /// Note a skipped Hedging equity snapshot for `symbol`, warning every
-    /// [`OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY`] consecutive skips. ADR 0015
+    /// Note a skipped equity snapshot for `symbol` at `venue`, warning
+    /// every [`SNAPSHOT_SKIP_WARN_EVERY`] consecutive skips. ADR 0015
     /// accepted guard starvation but left it invisible at production log
-    /// levels; this is the missing signal. MarketMaking skips are not
-    /// tracked: that venue's snapshots are only ever skipped by transfer
-    /// inflight, which is already observable state.
-    fn note_offchain_equity_snapshot_skip(mut self, symbol: &Symbol, venue: Venue) -> Self {
-        if venue != Venue::Hedging {
-            return self;
-        }
-
+    /// levels; this is the missing signal. Tracked at both venues: a
+    /// MarketMaking balance starved behind a stuck inflight is exactly as
+    /// unobservable as a Hedging one starved behind an open hedge order.
+    fn note_equity_snapshot_skip(mut self, symbol: &Symbol, venue: Venue) -> Self {
         let streak = self
-            .offchain_equity_snapshot_skip_streaks
-            .entry(symbol.clone())
+            .equity_snapshot_skip_streaks
+            .entry((venue, symbol.clone()))
             .or_insert(0);
         *streak += 1;
 
-        if streak.is_multiple_of(OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY) {
+        if streak.is_multiple_of(SNAPSHOT_SKIP_WARN_EVERY) {
             warn!(
                 target: "inventory",
                 %symbol,
+                ?venue,
                 consecutive_skips = *streak,
-                "Offchain equity snapshots for this symbol keep being \
-                 skipped; its Hedging balance is not receiving broker truth"
+                "Equity snapshots for this symbol keep being skipped at this \
+                 venue; its balance is not receiving venue truth"
             );
         }
 
         self
     }
 
-    fn reset_offchain_equity_snapshot_skip(mut self, symbol: &Symbol, venue: Venue) -> Self {
-        if venue == Venue::Hedging {
-            self.offchain_equity_snapshot_skip_streaks.remove(symbol);
-        }
+    fn reset_equity_snapshot_skip(mut self, symbol: &Symbol, venue: Venue) -> Self {
+        self.equity_snapshot_skip_streaks
+            .remove(&(venue, symbol.clone()));
         self
     }
 
     /// Note an `OffchainUsd` snapshot skipped by the venue-level cash
-    /// guards, warning every [`OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY`]
-    /// consecutive skips.
+    /// guards, warning every [`SNAPSHOT_SKIP_WARN_EVERY`] consecutive
+    /// skips.
     fn note_offchain_usd_snapshot_skip(mut self) -> Self {
         self.offchain_usd_snapshot_skip_streak += 1;
 
         if self
             .offchain_usd_snapshot_skip_streak
-            .is_multiple_of(OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY)
+            .is_multiple_of(SNAPSHOT_SKIP_WARN_EVERY)
         {
             warn!(
                 target: "inventory",
                 consecutive_skips = self.offchain_usd_snapshot_skip_streak,
                 "Offchain USD snapshots keep being skipped; the Hedging cash \
                  balance is not receiving broker truth"
+            );
+        }
+
+        self
+    }
+
+    /// The MarketMaking twin of [`Self::note_offchain_usd_snapshot_skip`]:
+    /// an `OnchainUsdc` snapshot the venue-level cash guards refused.
+    fn note_onchain_usdc_snapshot_skip(mut self) -> Self {
+        self.onchain_usdc_snapshot_skip_streak += 1;
+
+        if self
+            .onchain_usdc_snapshot_skip_streak
+            .is_multiple_of(SNAPSHOT_SKIP_WARN_EVERY)
+        {
+            warn!(
+                target: "inventory",
+                consecutive_skips = self.onchain_usdc_snapshot_skip_streak,
+                "Onchain USDC snapshots keep being skipped; the MarketMaking \
+                 cash balance is not receiving vault truth"
             );
         }
 
@@ -1933,7 +1970,7 @@ impl InventoryView {
                 let should_record_watermark =
                     view.equity_snapshot_would_apply(symbol, venue, fetched_at)?;
                 if !should_record_watermark {
-                    let view = view.note_offchain_equity_snapshot_skip(symbol, venue);
+                    let view = view.note_equity_snapshot_skip(symbol, venue);
                     return Ok::<_, InventoryViewError>((view, applied_symbols));
                 }
 
@@ -1943,7 +1980,7 @@ impl InventoryView {
                         Inventory::on_snapshot(venue, *snapshot_balance, fetched_at),
                         now,
                     )?
-                    .reset_offchain_equity_snapshot_skip(symbol, venue);
+                    .reset_equity_snapshot_skip(symbol, venue);
 
                 applied_symbols.push(symbol.clone());
 
@@ -2083,8 +2120,9 @@ impl InventoryView {
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
-            offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
+            equity_snapshot_skip_streaks: self.equity_snapshot_skip_streaks,
             offchain_usd_snapshot_skip_streak: self.offchain_usd_snapshot_skip_streak,
+            onchain_usdc_snapshot_skip_streak: self.onchain_usdc_snapshot_skip_streak,
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
@@ -2121,8 +2159,9 @@ impl InventoryView {
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
-            offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
+            equity_snapshot_skip_streaks: self.equity_snapshot_skip_streaks,
             offchain_usd_snapshot_skip_streak: self.offchain_usd_snapshot_skip_streak,
+            onchain_usdc_snapshot_skip_streak: self.onchain_usdc_snapshot_skip_streak,
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
@@ -2383,7 +2422,7 @@ impl InventoryView {
             return Ok(self);
         }
 
-        if let Some(reason) = self.equity_reconciliation_busy(symbol, fetched_at)? {
+        if let Some(reason) = self.equity_reconciliation_busy(symbol, Venue::Hedging, fetched_at)? {
             warn!(
                 target: "inventory",
                 %symbol,
@@ -2425,27 +2464,34 @@ impl InventoryView {
     /// by detection (freezes the counter) and the forced apply (aborts) so
     /// the two can never disagree. Reuses [`EquityReconcileBusy`]: the busy
     /// taxonomy is identical, only the scope widens from one symbol to the
-    /// venue.
+    /// venue. The hedge-order sources are Hedging-only for the same reason
+    /// as in the equity twin.
     pub(crate) fn cash_reconciliation_busy(
         &self,
+        venue: Venue,
         fetched_at: DateTime<Utc>,
     ) -> Result<Option<EquityReconcileBusy>, FloatError> {
         if self.usdc.has_inflight()? || self.active_usdc_rebalance.is_some() {
             return Ok(Some(EquityReconcileBusy::Transfer));
         }
 
-        if !self.pending_offchain_order_symbols.is_empty() {
-            return Ok(Some(EquityReconcileBusy::PendingHedgeOrder));
-        }
+        match venue {
+            Venue::MarketMaking => Ok(None),
+            Venue::Hedging => {
+                if !self.pending_offchain_order_symbols.is_empty() {
+                    return Ok(Some(EquityReconcileBusy::PendingHedgeOrder));
+                }
 
-        if self
-            .last_offchain_cash_fill_applied_at
-            .is_some_and(|filled_at| fetched_at < filled_at)
-        {
-            return Ok(Some(EquityReconcileBusy::FillAfterFetch));
-        }
+                if self
+                    .last_offchain_cash_fill_applied_at
+                    .is_some_and(|filled_at| fetched_at < filled_at)
+                {
+                    return Ok(Some(EquityReconcileBusy::FillAfterFetch));
+                }
 
-        Ok(None)
+                Ok(None)
+            }
+        }
     }
 
     /// The venue-level cash twin of [`Self::reconcile_offchain_equity`]:
@@ -2473,7 +2519,7 @@ impl InventoryView {
             return Ok(self);
         }
 
-        if let Some(reason) = self.cash_reconciliation_busy(fetched_at)? {
+        if let Some(reason) = self.cash_reconciliation_busy(Venue::Hedging, fetched_at)? {
             warn!(
                 target: "inventory",
                 ?reason,
@@ -2580,9 +2626,13 @@ impl InventoryView {
                     now,
                 )?;
                 Ok(if applies {
-                    view.record_onchain_usdc_block_watermark(block_number)
+                    Self {
+                        onchain_usdc_snapshot_skip_streak: 0,
+                        ..view
+                    }
+                    .record_onchain_usdc_block_watermark(block_number)
                 } else {
-                    view
+                    view.note_onchain_usdc_snapshot_skip()
                 })
             }
 
@@ -3171,8 +3221,9 @@ mod tests {
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
             last_offchain_cash_fill_applied_at: None,
-            offchain_equity_snapshot_skip_streaks: HashMap::new(),
+            equity_snapshot_skip_streaks: HashMap::new(),
             offchain_usd_snapshot_skip_streak: 0,
+            onchain_usdc_snapshot_skip_streak: 0,
             offchain_usd_snapshot_watermark: None,
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
@@ -3212,8 +3263,9 @@ mod tests {
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
             last_offchain_cash_fill_applied_at: None,
-            offchain_equity_snapshot_skip_streaks: HashMap::new(),
+            equity_snapshot_skip_streaks: HashMap::new(),
             offchain_usd_snapshot_skip_streak: 0,
+            onchain_usdc_snapshot_skip_streak: 0,
             offchain_usd_snapshot_watermark: None,
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
@@ -5191,8 +5243,9 @@ mod tests {
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
             last_offchain_cash_fill_applied_at: None,
-            offchain_equity_snapshot_skip_streaks: HashMap::new(),
+            equity_snapshot_skip_streaks: HashMap::new(),
             offchain_usd_snapshot_skip_streak: 0,
+            onchain_usdc_snapshot_skip_streak: 0,
             offchain_usd_snapshot_watermark: None,
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
@@ -5254,8 +5307,9 @@ mod tests {
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
             last_offchain_cash_fill_applied_at: None,
-            offchain_equity_snapshot_skip_streaks: HashMap::new(),
+            equity_snapshot_skip_streaks: HashMap::new(),
             offchain_usd_snapshot_skip_streak: 0,
+            onchain_usdc_snapshot_skip_streak: 0,
             offchain_usd_snapshot_watermark: None,
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
@@ -6174,7 +6228,9 @@ mod tests {
 
         let not_busy = InventoryView::default().with_equity(spym.clone(), shares(0), shares(10));
         assert_eq!(
-            not_busy.equity_reconciliation_busy(&spym, now).unwrap(),
+            not_busy
+                .equity_reconciliation_busy(&spym, Venue::Hedging, now)
+                .unwrap(),
             None
         );
 
@@ -6187,15 +6243,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            inflight.equity_reconciliation_busy(&spym, now).unwrap(),
+            inflight
+                .equity_reconciliation_busy(&spym, Venue::Hedging, now)
+                .unwrap(),
             Some(EquityReconcileBusy::Transfer)
+        );
+        assert_eq!(
+            inflight
+                .equity_reconciliation_busy(&spym, Venue::MarketMaking, now)
+                .unwrap(),
+            Some(EquityReconcileBusy::Transfer),
+            "a transfer moves the symbol between venues, so it is busy at both"
         );
 
         let minting = not_busy
             .clone()
             .set_active_mint(spym.clone(), st0x_tokenization::issuer_request_id("mint"));
         assert_eq!(
-            minting.equity_reconciliation_busy(&spym, now).unwrap(),
+            minting
+                .equity_reconciliation_busy(&spym, Venue::Hedging, now)
+                .unwrap(),
             Some(EquityReconcileBusy::Transfer)
         );
 
@@ -6203,15 +6270,26 @@ mod tests {
             .clone()
             .set_active_redemption(spym.clone(), RedemptionAggregateId(Uuid::new_v4()));
         assert_eq!(
-            redeeming.equity_reconciliation_busy(&spym, now).unwrap(),
+            redeeming
+                .equity_reconciliation_busy(&spym, Venue::Hedging, now)
+                .unwrap(),
             Some(EquityReconcileBusy::Transfer)
         );
 
         let mut hedging = not_busy.clone();
         hedging.mark_offchain_order_pending(spym.clone());
         assert_eq!(
-            hedging.equity_reconciliation_busy(&spym, now).unwrap(),
+            hedging
+                .equity_reconciliation_busy(&spym, Venue::Hedging, now)
+                .unwrap(),
             Some(EquityReconcileBusy::PendingHedgeOrder)
+        );
+        assert_eq!(
+            hedging
+                .equity_reconciliation_busy(&spym, Venue::MarketMaking, now)
+                .unwrap(),
+            None,
+            "an open broker order says nothing about what a vault read holds"
         );
 
         let mut fill_applied_after_reading = not_busy;
@@ -6219,13 +6297,20 @@ mod tests {
             .clear_offchain_order_pending(&spym, Some(now + Duration::seconds(1)));
         assert_eq!(
             fill_applied_after_reading
-                .equity_reconciliation_busy(&spym, now)
+                .equity_reconciliation_busy(&spym, Venue::Hedging, now)
                 .unwrap(),
             Some(EquityReconcileBusy::FillAfterFetch)
         );
         assert_eq!(
             fill_applied_after_reading
-                .equity_reconciliation_busy(&spym, now + Duration::seconds(2))
+                .equity_reconciliation_busy(&spym, Venue::MarketMaking, now)
+                .unwrap(),
+            None,
+            "a hedge fill does not make the MarketMaking reading ambiguous"
+        );
+        assert_eq!(
+            fill_applied_after_reading
+                .equity_reconciliation_busy(&spym, Venue::Hedging, now + Duration::seconds(2))
                 .unwrap(),
             None
         );
@@ -6494,7 +6579,12 @@ mod tests {
         let now = Utc::now();
 
         let not_busy = InventoryView::default().with_usdc(Usdc::ZERO, usdc_cents(50_000));
-        assert_eq!(not_busy.cash_reconciliation_busy(now).unwrap(), None);
+        assert_eq!(
+            not_busy
+                .cash_reconciliation_busy(Venue::Hedging, now)
+                .unwrap(),
+            None
+        );
 
         let inflight = not_busy.clone().with_usdc_inflight(
             Usdc::ZERO,
@@ -6503,23 +6593,43 @@ mod tests {
             usdc_cents(1_000),
         );
         assert_eq!(
-            inflight.cash_reconciliation_busy(now).unwrap(),
+            inflight
+                .cash_reconciliation_busy(Venue::Hedging, now)
+                .unwrap(),
             Some(EquityReconcileBusy::Transfer)
+        );
+        assert_eq!(
+            inflight
+                .cash_reconciliation_busy(Venue::MarketMaking, now)
+                .unwrap(),
+            Some(EquityReconcileBusy::Transfer),
+            "a USDC transfer moves cash between venues, so it is busy at both"
         );
 
         let rebalancing = not_busy
             .clone()
             .set_active_usdc_rebalance(UsdcRebalanceId(Uuid::new_v4()));
         assert_eq!(
-            rebalancing.cash_reconciliation_busy(now).unwrap(),
+            rebalancing
+                .cash_reconciliation_busy(Venue::Hedging, now)
+                .unwrap(),
             Some(EquityReconcileBusy::Transfer)
         );
 
         let mut hedging = not_busy.clone();
         hedging.mark_offchain_order_pending(spym.clone());
         assert_eq!(
-            hedging.cash_reconciliation_busy(now).unwrap(),
+            hedging
+                .cash_reconciliation_busy(Venue::Hedging, now)
+                .unwrap(),
             Some(EquityReconcileBusy::PendingHedgeOrder)
+        );
+        assert_eq!(
+            hedging
+                .cash_reconciliation_busy(Venue::MarketMaking, now)
+                .unwrap(),
+            None,
+            "an open broker order says nothing about the vault's USDC balance"
         );
 
         let mut fill_applied_after_reading = not_busy;
@@ -6527,13 +6637,20 @@ mod tests {
             .clear_offchain_order_pending(&spym, Some(now + Duration::seconds(1)));
         assert_eq!(
             fill_applied_after_reading
-                .cash_reconciliation_busy(now)
+                .cash_reconciliation_busy(Venue::Hedging, now)
                 .unwrap(),
             Some(EquityReconcileBusy::FillAfterFetch)
         );
         assert_eq!(
             fill_applied_after_reading
-                .cash_reconciliation_busy(now + Duration::seconds(2))
+                .cash_reconciliation_busy(Venue::MarketMaking, now)
+                .unwrap(),
+            None,
+            "a hedge fill's cash leg does not touch the MarketMaking venue"
+        );
+        assert_eq!(
+            fill_applied_after_reading
+                .cash_reconciliation_busy(Venue::Hedging, now + Duration::seconds(2))
                 .unwrap(),
             None
         );
@@ -6557,12 +6674,12 @@ mod tests {
             fetched_at: now,
         };
 
-        for _ in 0..(OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY - 1) {
+        for _ in 0..(SNAPSHOT_SKIP_WARN_EVERY - 1) {
             view = view.apply_snapshot_event(&snapshot, now).unwrap();
         }
         assert_eq!(
             view.offchain_usd_snapshot_skip_streak,
-            OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY - 1
+            SNAPSHOT_SKIP_WARN_EVERY - 1
         );
         assert!(
             !logs_contain("Offchain USD snapshots keep being skipped"),
@@ -6572,7 +6689,7 @@ mod tests {
         let view = view.apply_snapshot_event(&snapshot, now).unwrap();
         assert_eq!(
             view.offchain_usd_snapshot_skip_streak,
-            OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY
+            SNAPSHOT_SKIP_WARN_EVERY
         );
         assert!(
             logs_contain("Offchain USD snapshots keep being skipped"),
@@ -6595,7 +6712,7 @@ mod tests {
             fetched_at: now,
         };
 
-        for _ in 0..(OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY - 1) {
+        for _ in 0..(SNAPSHOT_SKIP_WARN_EVERY - 1) {
             view = view.apply_snapshot_event(&snapshot, now).unwrap();
         }
 
@@ -6609,7 +6726,7 @@ mod tests {
         );
 
         view.mark_offchain_order_pending(spym);
-        for _ in 0..(OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY - 1) {
+        for _ in 0..(SNAPSHOT_SKIP_WARN_EVERY - 1) {
             view = view.apply_snapshot_event(&snapshot, now).unwrap();
         }
         assert!(
@@ -6632,21 +6749,22 @@ mod tests {
             fetched_at: now,
         };
 
-        for _ in 0..(OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY - 1) {
+        for _ in 0..(SNAPSHOT_SKIP_WARN_EVERY - 1) {
             view = view.apply_snapshot_event(&snapshot, now).unwrap();
         }
         assert!(
-            !logs_contain("Offchain equity snapshots for this symbol keep being"),
+            !logs_contain("Equity snapshots for this symbol keep being skipped"),
             "below the cadence no starvation warning may fire"
         );
 
         view = view.apply_snapshot_event(&snapshot, now).unwrap();
         assert_eq!(
-            view.offchain_equity_snapshot_skip_streaks.get(&spym),
-            Some(&OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY)
+            view.equity_snapshot_skip_streaks
+                .get(&(Venue::Hedging, spym.clone())),
+            Some(&SNAPSHOT_SKIP_WARN_EVERY)
         );
         assert!(
-            logs_contain("Offchain equity snapshots for this symbol keep being"),
+            logs_contain("Equity snapshots for this symbol keep being skipped"),
             "the warn must fire once the symbol's streak reaches the cadence"
         );
 
@@ -6662,9 +6780,113 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            view.offchain_equity_snapshot_skip_streaks.get(&spym),
+            view.equity_snapshot_skip_streaks
+                .get(&(Venue::Hedging, spym)),
             None,
             "an applied snapshot must clear the symbol's skip streak"
+        );
+    }
+
+    /// The MarketMaking twin: a vault balance starved behind a stuck
+    /// inflight is exactly as invisible as a Hedging one starved behind an
+    /// open hedge order, and the streaks must not share a key.
+    #[test]
+    #[tracing_test::traced_test]
+    fn onchain_equity_snapshot_skip_streak_warns_at_cadence() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let now = Utc::now();
+
+        let mut view = InventoryView::default()
+            .with_equity(spym.clone(), shares(10), shares(0))
+            .update_equity(
+                &spym,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, shares(5)),
+                now,
+            )
+            .unwrap();
+
+        let snapshot = InventorySnapshotEvent::OnchainEquity {
+            balances: BTreeMap::from([(spym.clone(), shares(0))]),
+            fetched_at: now,
+            block_number: None,
+        };
+
+        for _ in 0..(SNAPSHOT_SKIP_WARN_EVERY - 1) {
+            view = view.apply_snapshot_event(&snapshot, now).unwrap();
+        }
+        assert_eq!(
+            view.equity_snapshot_skip_streaks
+                .get(&(Venue::MarketMaking, spym.clone())),
+            Some(&(SNAPSHOT_SKIP_WARN_EVERY - 1))
+        );
+        assert_eq!(
+            view.equity_snapshot_skip_streaks
+                .get(&(Venue::Hedging, spym.clone())),
+            None,
+            "MarketMaking skips must not accumulate against the Hedging venue"
+        );
+        assert!(
+            !logs_contain("Equity snapshots for this symbol keep being skipped"),
+            "below the cadence no starvation warning may fire"
+        );
+
+        let view = view.apply_snapshot_event(&snapshot, now).unwrap();
+        assert_eq!(
+            view.equity_snapshot_skip_streaks
+                .get(&(Venue::MarketMaking, spym)),
+            Some(&SNAPSHOT_SKIP_WARN_EVERY)
+        );
+        assert!(
+            logs_contain("Equity snapshots for this symbol keep being skipped"),
+            "the warn must fire once the symbol's streak reaches the cadence"
+        );
+    }
+
+    /// The `OnchainUsdc` arm recorded no skip signal at all before the
+    /// streak existed: a MarketMaking cash balance wedged behind inflight
+    /// starved silently.
+    #[test]
+    #[tracing_test::traced_test]
+    fn onchain_usdc_snapshot_skip_streak_warns_at_cadence() {
+        let now = Utc::now();
+
+        let mut view = InventoryView::default().with_usdc_inflight(
+            usdc_cents(50_000),
+            usdc_cents(1_000),
+            Usdc::ZERO,
+            Usdc::ZERO,
+        );
+
+        let snapshot = InventorySnapshotEvent::OnchainUsdc {
+            usdc_balance: Usdc::ZERO,
+            fetched_at: now,
+            block_number: None,
+        };
+
+        for _ in 0..(SNAPSHOT_SKIP_WARN_EVERY - 1) {
+            view = view.apply_snapshot_event(&snapshot, now).unwrap();
+        }
+        assert_eq!(
+            view.onchain_usdc_snapshot_skip_streak,
+            SNAPSHOT_SKIP_WARN_EVERY - 1
+        );
+        assert_eq!(
+            view.offchain_usd_snapshot_skip_streak, 0,
+            "MarketMaking skips must not accumulate against the Hedging venue"
+        );
+        assert!(
+            !logs_contain("Onchain USDC snapshots keep being skipped"),
+            "below the cadence no starvation warning may fire"
+        );
+
+        let view = view.apply_snapshot_event(&snapshot, now).unwrap();
+        assert_eq!(
+            view.onchain_usdc_snapshot_skip_streak,
+            SNAPSHOT_SKIP_WARN_EVERY
+        );
+        assert!(
+            logs_contain("Onchain USDC snapshots keep being skipped"),
+            "the warn must fire once the streak reaches the cadence"
         );
     }
 
