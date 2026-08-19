@@ -7,8 +7,8 @@
 //! snapshot:
 //!
 //! ```text
-//! prod-status
-//! cargo run --bin verify-migrations -- --db ./claude-local-ctx/<ts>-running/st0x-hedge.db
+//! snapshot="$(nix run .#prodDbSnapshot)"
+//! cargo run --bin verify-migrations -- --db "$snapshot"
 //! ```
 //!
 //! Exits 0 if migrations applied cleanly and every persisted aggregate

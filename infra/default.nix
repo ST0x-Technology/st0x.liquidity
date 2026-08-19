@@ -208,25 +208,11 @@ let
         '';
       };
 
-      "${env}Status" = pkgs.writeShellApplication {
-        name = "${env}-status";
-        runtimeInputs = sshBuildInputs ++ [
-          pkgs.openssh
-          pkgs.nushell
-        ];
-        text = ''
-          ${resolveHost}
-          trap _cleanup_identity EXIT
-          export identity host_ip
-          nu scripts/status.nu "${env}" "$@"
-        '';
-      };
-
       # Downloads a *consistent* copy of the live database: `scp`-ing
-      # /mnt/data/st0x-hedge.db directly (as ${env}-status does for its
-      # bundled DB) can race the bot's live writes and produce a torn,
-      # corrupt file -- SQLite's file format has no atomicity guarantee
-      # against a plain file copy of a database still being written to.
+      # /mnt/data/st0x-hedge.db directly can race the bot's live writes and
+      # produce a torn, corrupt file -- SQLite's file format has no atomicity
+      # guarantee against a plain file copy of a database still being written
+      # to.
       # `VACUUM INTO` runs a normal read transaction against the live DB and
       # writes a guaranteed-consistent copy server-side first; only that
       # copy gets shipped over the wire, then deleted from the remote host.
