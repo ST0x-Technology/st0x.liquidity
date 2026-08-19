@@ -132,8 +132,7 @@ const makeCurrentState = (overrides: Partial<CurrentState> = {}): CurrentState =
     serverPort: 8001,
     orderbook: '0x0',
     deploymentBlock: 0,
-    tradingMode: 'standalone',
-    broker: 'dry_run',
+    broker: 'alpaca',
     orderPollingInterval: 5,
     inventoryPollInterval: 15
   },

@@ -237,8 +237,9 @@ fn test_trigger_config() -> RebalancingServiceConfig {
     }
 }
 
-/// Mirrors the private `build_position_cqrs()` from `src/conductor/mod.rs`,
-/// wiring the `RebalancingService` as a Position CQRS query processor so
+/// Mirrors the conductor's Position CQRS wiring
+/// (`PositionAndRebalancing::setup`), attaching the `RebalancingService` as a
+/// Position CQRS query processor so
 /// that position events flow through it into inventory bookkeeping +
 /// follow-up check enqueueing.
 async fn build_position_cqrs_with_service(

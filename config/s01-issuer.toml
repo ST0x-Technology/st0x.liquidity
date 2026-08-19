@@ -108,10 +108,10 @@ vault_id = "0xfab"
 tokenized_equity = "0xc941C1506B7555Ba8C506Fb6c9b9CC259902d612"
 tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"
 
-# Required by the single supported topology (RAI-1982: there is no global
-# rebalancing off-switch). This CLI-only deployment keeps every trigger
-# inert: per-asset `rebalancing = "disabled"` above, USDC mode disabled,
-# freeze guard disabled.
+# Required sections for the single supported topology. The s01 CLI never
+# rebalances (dividend-bump is buy -> tokenize -> donate), so every trigger
+# is inert: no cash asset is configured, USDC rebalancing is disabled, and
+# the freeze guard is off. Present only so config validation passes.
 [rebalancing]
 transfer_timeout_secs = 1800
 inventory_staleness_bound_secs = 300
@@ -136,7 +136,8 @@ realert_interval = 43200
 base = "0.05"
 ethereum = "0.05"
 
-# ETH/USD valuation source for bot-gas cost recording; same Base mainnet
-# Chainlink feed as prod.
+# ETH/USD valuation source for bot-gas cost recording (ADR 0020). Public
+# value (the same Base mainnet Chainlink ETH/USD feed as prod); required by
+# config validation even though the CLI's dividend flow never records bot gas.
 [bot_gas_valuation]
 chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"

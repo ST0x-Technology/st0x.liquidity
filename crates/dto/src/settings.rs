@@ -27,7 +27,6 @@ pub struct Settings {
     pub orderbook: String,
     #[ts(type = "number")]
     pub deployment_block: u64,
-    pub trading_mode: String,
     pub broker: String,
     #[ts(type = "number")]
     pub order_polling_interval: u64,
