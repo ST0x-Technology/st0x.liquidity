@@ -3990,6 +3990,10 @@ balances and emitting them as events the system can react to:
   vault while retaining the retired vault in the registry for balance polling.
 - **InventorySnapshot** (CQRS aggregate): Records point-in-time snapshots of
   actual balances fetched from onchain vaults and the offchain broker.
+  `OnchainEquity`, `OnchainUsdc`, `OffchainEquity`, and `OffchainUsd` events
+  carry a `fetched_at` captured before their external as-of read begins, so the
+  view can reject a pre-rebalancing balance even when its command arrives after
+  the rebalance.
 - **InventoryPollingService**: Periodically polls actual balances from both
   venues, emitting InventorySnapshot events. InventoryView reacts to these
   events to update tracked inventory. Offchain equity polling normalizes active
@@ -4003,8 +4007,10 @@ balances and emitting them as events the system can react to:
   conductor task. Onchain polling fetches the latest block number once per cycle
   and pins every `vaultBalance2` contract call to it, so multi-vault sums cannot
   straddle a block boundary and the emitted snapshot events carry the exact
-  block their balances were read at (ADR 0018); offchain polling uses the
-  `Executor::get_inventory()` trait method.
+  block their balances were read at (ADR 0018). The onchain cycle captures
+  `fetched_at` before it selects that block because block selection defines the
+  snapshot's as-of point. Offchain polling captures `fetched_at` before it calls
+  the `Executor::get_inventory()` trait method.
 
 ##### Broker Divergence Recovery
 

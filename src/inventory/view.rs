@@ -2982,11 +2982,13 @@ mod tests {
     use rain_math_float::Float;
     use uuid::Uuid;
 
+    use st0x_event_sorcery::TestHarness;
     use st0x_finance::Usdc;
+    use st0x_float_macro::float;
     use st0x_wrapper::RATIO_ONE;
 
     use super::*;
-    use st0x_float_macro::float;
+    use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotCommand};
 
     fn shares(amount: i64) -> FractionalShares {
         FractionalShares::new(float!(&amount.to_string()))
@@ -3018,6 +3020,88 @@ mod tests {
             target: Float::parse(target.to_string()).unwrap(),
             deviation: Float::parse(deviation.to_string()).unwrap(),
         }
+    }
+
+    async fn snapshot_event(command: InventorySnapshotCommand) -> InventorySnapshotEvent {
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given_no_previous_events()
+            .when(command)
+            .await
+            .events();
+
+        let [event] = events.as_slice() else {
+            panic!("expected one snapshot event, got {events:?}");
+        };
+        event.clone()
+    }
+
+    #[tokio::test]
+    async fn onchain_equity_read_fetched_before_rebalance_is_rejected_when_handled_after() {
+        let handled_at = Utc::now();
+        let rebalanced_at = handled_at - Duration::seconds(10);
+        let fetched_at = rebalanced_at - Duration::seconds(10);
+        let symbol = Symbol::new("AAPL").unwrap();
+        let event = snapshot_event(InventorySnapshotCommand::OnchainEquity {
+            balances: BTreeMap::from([(symbol.clone(), shares(999))]),
+            fetched_at,
+            block_number: Some(42),
+        })
+        .await;
+        let mut view = InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50));
+        view.equities.get_mut(&symbol).unwrap().last_rebalancing = Some(rebalanced_at);
+
+        let updated = view.apply_snapshot_event(&event, handled_at).unwrap();
+
+        assert_eq!(
+            updated.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(50))
+        );
+    }
+
+    #[tokio::test]
+    async fn onchain_usdc_read_fetched_before_rebalance_is_rejected_when_handled_after() {
+        let handled_at = Utc::now();
+        let rebalanced_at = handled_at - Duration::seconds(10);
+        let fetched_at = rebalanced_at - Duration::seconds(10);
+        let event = snapshot_event(InventorySnapshotCommand::OnchainUsdc {
+            usdc_balance: Usdc::new(float!(999)),
+            fetched_at,
+            block_number: Some(42),
+        })
+        .await;
+        let mut view =
+            InventoryView::default().with_usdc(Usdc::new(float!(50)), Usdc::new(float!(50)));
+        view.usdc.last_rebalancing = Some(rebalanced_at);
+
+        let updated = view.apply_snapshot_event(&event, handled_at).unwrap();
+
+        assert_eq!(
+            updated.usdc_available(Venue::MarketMaking),
+            Some(Usdc::new(float!(50)))
+        );
+    }
+
+    #[tokio::test]
+    async fn offchain_usd_read_fetched_before_rebalance_is_rejected_when_handled_after() {
+        let handled_at = Utc::now();
+        let rebalanced_at = handled_at - Duration::seconds(10);
+        let fetched_at = rebalanced_at - Duration::seconds(10);
+        let event = snapshot_event(InventorySnapshotCommand::OffchainUsd {
+            usd_balance_cents: 99_900,
+            gross_usd_cents: None,
+            fetched_at,
+        })
+        .await;
+        let mut view =
+            InventoryView::default().with_usdc(Usdc::new(float!(50)), Usdc::new(float!(50)));
+        view.usdc.last_rebalancing = Some(rebalanced_at);
+
+        let updated = view.apply_snapshot_event(&event, handled_at).unwrap();
+
+        assert_eq!(
+            updated.usdc_available(Venue::Hedging),
+            Some(Usdc::new(float!(50)))
+        );
     }
 
     #[test]

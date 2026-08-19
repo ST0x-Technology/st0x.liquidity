@@ -191,17 +191,19 @@ impl EventSourced for InventorySnapshot {
             OnchainEquity {
                 balances,
                 block_number,
+                fetched_at,
             } => InventorySnapshotEvent::OnchainEquity {
                 balances,
-                fetched_at: now,
+                fetched_at,
                 block_number,
             },
             OnchainUsdc {
                 usdc_balance,
                 block_number,
+                fetched_at,
             } => InventorySnapshotEvent::OnchainUsdc {
                 usdc_balance,
-                fetched_at: now,
+                fetched_at,
                 block_number,
             },
             OffchainEquity {
@@ -310,26 +312,28 @@ impl EventSourced for InventorySnapshot {
             OnchainEquity {
                 balances,
                 block_number,
+                fetched_at,
             } => {
                 if self.onchain_equity == balances {
                     return Ok(vec![]);
                 }
                 Ok(vec![InventorySnapshotEvent::OnchainEquity {
                     balances,
-                    fetched_at: now,
+                    fetched_at,
                     block_number,
                 }])
             }
             OnchainUsdc {
                 usdc_balance,
                 block_number,
+                fetched_at,
             } => {
                 if self.onchain_usdc == Some(usdc_balance) {
                     return Ok(vec![]);
                 }
                 Ok(vec![InventorySnapshotEvent::OnchainUsdc {
                     usdc_balance,
-                    fetched_at: now,
+                    fetched_at,
                     block_number,
                 }])
             }
@@ -760,6 +764,8 @@ impl InventorySnapshot {
 pub(crate) enum InventorySnapshotCommand {
     OnchainEquity {
         balances: BTreeMap<Symbol, FractionalShares>,
+        /// Time the onchain cycle began selecting its pinned block.
+        fetched_at: DateTime<Utc>,
         /// Block the poller pinned this cycle's `vaultBalance2` reads to.
         /// Captured with the read (never stamped at command-handling time),
         /// so the view's block watermark exactly bounds which fills the
@@ -768,6 +774,8 @@ pub(crate) enum InventorySnapshotCommand {
     },
     OnchainUsdc {
         usdc_balance: Usdc,
+        /// Time the onchain cycle began selecting its pinned block.
+        fetched_at: DateTime<Utc>,
         /// Block the poller pinned this cycle's `vaultBalance2` reads to.
         block_number: Option<u64>,
     },
@@ -1082,11 +1090,13 @@ mod tests {
     async fn first_command_initializes_aggregate() {
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(100));
+        let fetched_at = Utc::now() - chrono::Duration::seconds(5);
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given_no_previous_events()
             .when(InventorySnapshotCommand::OnchainEquity {
                 balances: balances.clone(),
+                fetched_at,
                 block_number: None,
             })
             .await
@@ -1096,9 +1106,11 @@ mod tests {
         match &events[0] {
             InventorySnapshotEvent::OnchainEquity {
                 balances: event_balances,
-                ..
+                fetched_at: event_fetched_at,
+                block_number: _,
             } => {
                 assert_eq!(event_balances, &balances);
+                assert_eq!(*event_fetched_at, fetched_at);
             }
             _ => panic!("Expected OnchainEquity event"),
         }
@@ -1108,6 +1120,7 @@ mod tests {
     async fn record_onchain_equity_on_existing_aggregate() {
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(100));
+        let fetched_at = Utc::now() - chrono::Duration::seconds(5);
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given(vec![InventorySnapshotEvent::OnchainUsdc {
@@ -1117,6 +1130,7 @@ mod tests {
             }])
             .when(InventorySnapshotCommand::OnchainEquity {
                 balances: balances.clone(),
+                fetched_at,
                 block_number: None,
             })
             .await
@@ -1126,9 +1140,11 @@ mod tests {
         match &events[0] {
             InventorySnapshotEvent::OnchainEquity {
                 balances: event_balances,
-                ..
+                fetched_at: event_fetched_at,
+                block_number: _,
             } => {
                 assert_eq!(event_balances, &balances);
+                assert_eq!(*event_fetched_at, fetched_at);
             }
             _ => panic!("Expected OnchainEquity event"),
         }
@@ -1137,11 +1153,13 @@ mod tests {
     #[tokio::test]
     async fn record_onchain_usdc_emits_event() {
         let usdc_balance = Usdc::from_str("10000.50").unwrap();
+        let fetched_at = Utc::now() - chrono::Duration::seconds(5);
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given_no_previous_events()
             .when(InventorySnapshotCommand::OnchainUsdc {
                 usdc_balance,
+                fetched_at,
                 block_number: None,
             })
             .await
@@ -1151,12 +1169,48 @@ mod tests {
         match &events[0] {
             InventorySnapshotEvent::OnchainUsdc {
                 usdc_balance: event_balance,
-                ..
+                fetched_at: event_fetched_at,
+                block_number: _,
             } => {
                 assert_eq!(*event_balance, usdc_balance);
+                assert_eq!(*event_fetched_at, fetched_at);
             }
             _ => panic!("Expected OnchainUsdc event"),
         }
+    }
+
+    #[tokio::test]
+    async fn record_onchain_usdc_on_existing_aggregate_preserves_fetched_at() {
+        let fetched_at = Utc::now() - chrono::Duration::seconds(5);
+        let usdc_balance = Usdc::from_str("10000.50").unwrap();
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::OnchainUsdc {
+                usdc_balance: Usdc::from_str("5000").unwrap(),
+                fetched_at: fetched_at - chrono::Duration::seconds(5),
+                block_number: Some(41),
+            }])
+            .when(InventorySnapshotCommand::OnchainUsdc {
+                usdc_balance,
+                fetched_at,
+                block_number: Some(42),
+            })
+            .await
+            .events();
+
+        let [
+            InventorySnapshotEvent::OnchainUsdc {
+                usdc_balance: event_balance,
+                fetched_at: event_fetched_at,
+                block_number,
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected one onchain USDC event, got {events:?}");
+        };
+        assert_eq!(*event_balance, usdc_balance);
+        assert_eq!(*event_fetched_at, fetched_at);
+        assert_eq!(*block_number, Some(42));
     }
 
     #[tokio::test]
@@ -1251,6 +1305,7 @@ mod tests {
                 }],
                 InventorySnapshotCommand::OnchainEquity {
                     balances,
+                    fetched_at,
                     block_number: None,
                 },
             ),
@@ -1262,6 +1317,7 @@ mod tests {
                 }],
                 InventorySnapshotCommand::OnchainUsdc {
                     usdc_balance,
+                    fetched_at,
                     block_number: None,
                 },
             ),
@@ -2311,6 +2367,7 @@ mod tests {
             }])
             .when(InventorySnapshotCommand::OnchainUsdc {
                 usdc_balance,
+                fetched_at: Utc::now(),
                 block_number: Some(200),
             })
             .await

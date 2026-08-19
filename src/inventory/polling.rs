@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use futures_util::future::try_join_all;
 use rain_math_float::{Float, FloatError};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::{debug, error, info, warn};
 
@@ -38,6 +39,14 @@ use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 struct PendingRequests {
     mints: BTreeMap<Symbol, FractionalShares>,
     redemptions: BTreeMap<Symbol, FractionalShares>,
+}
+
+async fn timestamp_before<F>(future: F) -> (DateTime<Utc>, F::Output)
+where
+    F: Future,
+{
+    let fetched_at = Utc::now();
+    (fetched_at, future.await)
 }
 
 /// Active bot-owned tokenization provider request identifiers.
@@ -340,12 +349,16 @@ where
         // One pinned block for the whole onchain cycle: every vaultBalance2
         // read below observes this exact chain state, and the snapshot
         // events record it so the view's block watermarks can absorb fill
-        // deltas the balances already contain.
-        let block_number = self.raindex_service.latest_block_number().await?;
+        // deltas the balances already contain. Capture the wall-clock stamp
+        // before selecting that block because block selection defines the
+        // snapshot's external as-of point.
+        let (fetched_at, block_number) =
+            timestamp_before(self.raindex_service.latest_block_number()).await;
+        let block_number = block_number?;
 
-        self.poll_onchain_equity(snapshot_id, &registry, block_number)
+        self.poll_onchain_equity(snapshot_id, &registry, block_number, fetched_at)
             .await?;
-        self.poll_onchain_usdc(snapshot_id, &registry, block_number)
+        self.poll_onchain_usdc(snapshot_id, &registry, block_number, fetched_at)
             .await?;
 
         Ok(())
@@ -367,6 +380,7 @@ where
         snapshot_id: &InventorySnapshotId,
         registry: &VaultRegistry,
         block_number: u64,
+        fetched_at: DateTime<Utc>,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         if registry.equity_vaults.is_empty() {
             debug!(target: "inventory", "No equity vaults discovered, skipping onchain equity polling");
@@ -438,6 +452,7 @@ where
                 snapshot_id,
                 InventorySnapshotCommand::OnchainEquity {
                     balances,
+                    fetched_at,
                     block_number: Some(block_number),
                 },
             )
@@ -460,6 +475,7 @@ where
         snapshot_id: &InventorySnapshotId,
         registry: &VaultRegistry,
         block_number: u64,
+        fetched_at: DateTime<Utc>,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         if registry.usdc_vaults.is_empty() {
             debug!(target: "inventory", "No USDC vaults discovered, skipping onchain cash polling");
@@ -491,6 +507,7 @@ where
                 snapshot_id,
                 InventorySnapshotCommand::OnchainUsdc {
                     usdc_balance,
+                    fetched_at,
                     block_number: Some(block_number),
                 },
             )
@@ -2902,6 +2919,90 @@ mod tests {
             "OnchainEquity must be emitted, proving the vault registry was found \
              via vault_owner rather than snapshot_id.owner",
         );
+    }
+
+    #[tokio::test]
+    async fn timestamp_is_captured_before_the_external_read_future_is_polled() {
+        let read_started_at = Arc::new(Mutex::new(None));
+        let observed_read_start = Arc::clone(&read_started_at);
+        let block_read = async move {
+            *observed_read_start.lock().unwrap() = Some(Utc::now());
+            100u64
+        };
+
+        let (fetched_at, block_number) = timestamp_before(block_read).await;
+        let read_started_at = read_started_at.lock().unwrap().unwrap();
+
+        assert_eq!(block_number, 100);
+        assert!(
+            fetched_at <= read_started_at,
+            "timestamp must be captured before the external read future starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_onchain_uses_one_cycle_timestamp_for_both_balance_arms() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        discover_equity_vault(
+            &pool,
+            orderbook,
+            order_owner,
+            TEST_TOKEN,
+            TEST_VAULT_ID,
+            test_symbol("AAPL"),
+        )
+        .await;
+        discover_usdc_vault(&pool, orderbook, order_owner, TEST_VAULT_ID).await;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::from(100u64));
+        asserter.push_success(&vault_balance_hex(float!(7)));
+        asserter.push_success(&vault_balance_hex(float!(11)));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let service = InventoryPollingService::new(
+            PollFreshness::new(),
+            create_test_raindex_service(provider),
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            order_owner,
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        );
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let poll_started_at = Utc::now();
+
+        service.poll_onchain(&snapshot_id).await.unwrap();
+        let poll_finished_at = Utc::now();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let equity_fetched_at = events
+            .iter()
+            .find_map(|event| match event {
+                InventorySnapshotEvent::OnchainEquity { fetched_at, .. } => Some(*fetched_at),
+                _ => None,
+            })
+            .unwrap();
+        let usdc_fetched_at = events
+            .iter()
+            .find_map(|event| match event {
+                InventorySnapshotEvent::OnchainUsdc { fetched_at, .. } => Some(*fetched_at),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(equity_fetched_at, usdc_fetched_at);
+        assert!(equity_fetched_at >= poll_started_at);
+        assert!(equity_fetched_at <= poll_finished_at);
     }
 
     #[tokio::test]
