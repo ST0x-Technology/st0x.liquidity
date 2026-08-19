@@ -69,6 +69,31 @@ This creates and migrates the local database. Not needed for compilation under
 `SQLX_OFFLINE=true`, but required for running the binary or running
 `cargo sqlx prepare` (which connects to the DB to verify queries).
 
+## Generated columns as projection read keys
+
+A materialized view stores the serialized aggregate in a `payload JSON` column.
+Adding `STORED GENERATED` columns over `json_extract(payload, ...)` gives the
+view sort and filter keys without a second source of truth for the wire shape.
+Three things bite:
+
+- **SQLite cannot `ALTER TABLE ADD` a STORED generated column.** Adding one to
+  an existing view table means DROP + CREATE. That is safe for a projection --
+  views are rebuilt from the event log at startup -- but never for a table
+  holding anything the event log cannot regenerate.
+- **chrono timestamps are not sortable as stored.** Its serde impl emits
+  `SecondsFormat::AutoSi`, padding to 0, 3, 6 or 9 fractional digits depending
+  on the value. Lexicographically `...20.5Z` sorts _before_ `...20Z` ('.' <
+  'Z'), and `...20.500Z` sorts _after_ `...20.500000Z` though they are the same
+  instant. A generated column that orders chronologically has to normalize to a
+  constant width first; the Rust side must format bind values the same way.
+- **An extra indexed predicate can defeat the ordering index.** SQLite happily
+  drives a scan from a narrow equality index (`status IN (...)`) and then sorts
+  every match in a temp b-tree, which throws away the early `LIMIT` termination
+  that paging in SQL exists for. Writing the term `+status` strips its index
+  affinity without changing its meaning, leaving the ordering index to drive the
+  scan. Assert the plan with `EXPLAIN QUERY PLAN` in a test:
+  `SCAN ... USING INDEX` with no `USE TEMP B-TREE FOR ORDER BY`.
+
 ## Pitfall documentation policy
 
 When you encounter a non-obvious sqlx issue (or any tooling footgun), document

@@ -235,7 +235,11 @@
         : data.total + liveExtras
       if (isLoadMore) offset.update(() => requestOffset)
       total.update(() => reconciledTotal)
-      hasMore.update(() => data.hasMore || nextEntries.length < reconciledTotal)
+      // Trust the server's flag rather than re-deriving it from the count:
+      // `total` counts matching rows, and a row holding no representable trade
+      // is counted but never sent, so a length comparison would leave the
+      // control armed for a page that cannot arrive.
+      hasMore.update(() => data.hasMore)
       entries.update(() => nextEntries)
 
       // Accumulate symbols across fetches so the dropdown doesn't shrink

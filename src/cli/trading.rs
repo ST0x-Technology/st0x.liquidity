@@ -741,7 +741,7 @@ pub(super) async fn process_found_trade<W: Write>(
 
     // Build stores. CLI path: per-invocation instances are fine (single-instance
     // rule applies to the server path only; see AGENTS.md).
-    let onchain_trade_store = StoreBuilder::<OnChainTrade>::new(pool.clone())
+    let (onchain_trade_store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
         .build(())
         .await?;
     let (position_store, position_projection) = StoreBuilder::<Position>::new(pool.clone())
@@ -2478,7 +2478,7 @@ mod tests {
         };
 
         // Pre-seed 1: witness + acknowledge the OnChainTrade aggregate.
-        let onchain_store = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+        let (onchain_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -2599,7 +2599,7 @@ mod tests {
         };
 
         // Pre-seed: witness only (not acknowledged — simulates crash window).
-        let store = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+        let (store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -2684,7 +2684,7 @@ mod tests {
         .unwrap();
 
         // The OnChainTrade aggregate must be acknowledged.
-        let store = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+        let (store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -2736,7 +2736,7 @@ mod tests {
 
         // Step 2: Construct TradeProcessingCqrs backed by the same pool so the
         // acknowledged OnChainTrade record written by the CLI is visible.
-        let onchain_trade_store = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+        let (onchain_trade_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3398,7 +3398,7 @@ mod tests {
         // the fill via its own store instance backed by the same pool. When
         // process_found_trade's internal store loads the aggregate, it will see
         // Some(Witnessed) and resume rather than re-witness.
-        let store_a = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+        let (store_a, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3495,7 +3495,7 @@ mod tests {
         };
 
         // Simulate a concurrent writer that has fully processed the fill.
-        let store_a = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+        let (store_a, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3614,7 +3614,7 @@ mod tests {
             log_index: fill_b.log_index,
         };
 
-        let onchain_store = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+        let (onchain_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3760,7 +3760,7 @@ mod tests {
             log_index: fill_b.log_index,
         };
 
-        let onchain_store = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+        let (onchain_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
             .build(())
             .await
             .unwrap();

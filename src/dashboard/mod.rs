@@ -28,9 +28,7 @@ pub(crate) use event::{
     Broadcaster, DashboardTradeDelivery, DashboardTradeDeliveryCtx, DashboardTradeDeliveryJobQueue,
     DashboardTradeHandoffMonitor, DeliverDashboardTrade,
 };
-pub(crate) use trade_loader::{
-    TradeHistoryError as DashboardTradeHistoryError, load_onchain_trades,
-};
+pub(crate) use trade_loader::{TradePage, TradeQuery, query_trades};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,6 +56,22 @@ impl TradeProtocol {
                 | TradeOutcome::Failed { .. }
                 | TradeOutcome::Cancelled { .. } => true,
             },
+        }
+    }
+
+    /// `offchain_order_view.status` values this protocol carries, or `None`
+    /// when it carries every terminal outcome and so needs no predicate at
+    /// all -- a terminal row is exactly one with an outcome timestamp.
+    ///
+    /// The SQL form of [`Self::includes_trade`] for the offchain side, applied
+    /// before the page limit so a client on an older protocol still gets a
+    /// full page. Onchain trades are always fills, so every protocol carries
+    /// them and that side needs no equivalent.
+    pub(crate) const fn narrowed_terminal_statuses(self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::LegacyFills => Some(&["Filled"]),
+            Self::TerminalOutcomesV1 => Some(&["Filled", "Failed"]),
+            Self::TerminalOutcomesV2 | Self::TerminalOutcomesV3 => None,
         }
     }
 
@@ -223,8 +237,8 @@ async fn send_initial_state(
     let inventory_dto = state.inventory.read().await.to_dto();
     let transfers = transfer_loader::load_transfers(&state.pool).await;
     let mut warnings = transfers.warnings;
-    let trades = match trade_loader::load_trades(&state.pool, trade_protocol).await {
-        Ok(trades) => trades,
+    let trades = match query_trades(&state.pool, &TradeQuery::newest(trade_protocol)).await {
+        Ok(page) => page.trades,
         Err(error) => {
             warn!(
                 target: "dashboard",

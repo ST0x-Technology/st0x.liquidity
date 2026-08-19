@@ -253,14 +253,22 @@ async fn setup_vault_registry(
     ))
 }
 
+/// Builds the onchain trade store and its `onchain_trade_view` projection.
+///
+/// `build` catches the view up to the event log before returning, which on the
+/// first boot after the view was wired backfills every pre-existing aggregate.
+/// The projection handle is not retained: the store keeps the view current
+/// from then on, and nothing needs to rebuild it by hand.
 async fn setup_onchain_trade_store(
     pool: &SqlitePool,
     broadcaster: Arc<Broadcaster>,
 ) -> anyhow::Result<Arc<Store<OnChainTrade>>> {
-    Ok(StoreBuilder::<OnChainTrade>::new(pool.clone())
+    let (onchain_trade, _onchain_trade_view) = StoreBuilder::<OnChainTrade>::new(pool.clone())
         .with(broadcaster)
         .build(())
-        .await?)
+        .await?;
+
+    Ok(onchain_trade)
 }
 
 async fn setup_offchain_order_store<E>(
@@ -7008,7 +7016,7 @@ mod tests {
         pool: &SqlitePool,
         order_placer: Arc<dyn OrderPlacer>,
     ) -> (CqrsFrameworks, Arc<Projection<OffchainOrder>>) {
-        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+        let (onchain_trade, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
             .await
             .unwrap();

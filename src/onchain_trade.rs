@@ -17,7 +17,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use st0x_dto::{Direction, Trade, TradeOutcome, TradingVenue};
-use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 use st0x_execution::Symbol;
 use st0x_finance::{FractionalShares, NotPositive, Positive};
 
@@ -97,10 +97,10 @@ impl EventSourced for OnChainTrade {
     type Command = OnChainTradeCommand;
     type Error = OnChainTradeError;
     type Services = ();
-    type Materialized = Nil;
+    type Materialized = Table;
 
     const AGGREGATE_TYPE: &'static str = "OnChainTrade";
-    const PROJECTION: Nil = Nil;
+    const PROJECTION: Table = Table("onchain_trade_view");
     const SCHEMA_VERSION: u64 = 3;
 
     fn originate(event: &Self::Event) -> Option<Self> {

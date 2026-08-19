@@ -13,14 +13,12 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use st0x_config::BrokerCtx;
 use st0x_dto::{
-    EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, Trade,
-    TradingVenue, sort_trades_newest_first,
+    EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, TradingVenue,
 };
 use st0x_execution::Symbol;
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
@@ -33,9 +31,8 @@ use crate::dashboard::pnl::{
     validate_pnl_snapshot_rowid,
 };
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
-use crate::dashboard::{DashboardTradeHistoryError, TradeProtocol, load_onchain_trades};
+use crate::dashboard::{TradePage, TradeProtocol, TradeQuery, query_trades};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
-use crate::offchain::order::{OffchainOrder, OffchainOrderId, TradeConversionError};
 use crate::performance::equity_timing::load_equity_timings;
 use crate::performance::infra::{load_dependency_stats, load_monitor_telemetry};
 use crate::performance::rebalance::load_rebalance_timings;
@@ -623,24 +620,28 @@ async fn trades(
     let venues = parse_trade_venues(query.venue.as_deref())?;
     let symbols = parse_trade_symbols(query.symbol.as_deref())?;
 
-    let trade_filter = TradeFilter {
-        symbols,
-        venues,
-        since: since_dt,
-        until: until_dt,
-        trade_protocol: query.trade_protocol,
-    };
+    let page = query_trades(
+        &state.pool,
+        &TradeQuery {
+            symbols,
+            venues,
+            since: since_dt,
+            until: until_dt,
+            trade_protocol: query.trade_protocol,
+            limit,
+            offset,
+        },
+    )
+    .await
+    .inspect_err(|error| warn!(target: "dashboard", ?error, "Failed to load trade history"))
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let mut all_trades = load_trade_rows(&state.pool, &trade_filter)
-        .await
-        .inspect_err(|error| warn!(target: "dashboard", ?error, "Failed to load trade history"))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    all_trades.retain(|trade| query.trade_protocol.includes_trade(trade));
-    sort_trades_newest_first(&mut all_trades);
-
-    let total = all_trades.len();
-    let end = total.min(offset.saturating_add(limit));
-    let entries = all_trades[offset.min(total)..end]
+    let TradePage {
+        trades,
+        total,
+        has_more,
+    } = page;
+    let entries = trades
         .iter()
         .map(|trade| query.trade_protocol.serialize_trade(trade))
         .collect::<Result<Vec<_>, _>>()
@@ -648,68 +649,12 @@ async fn trades(
             |error| warn!(target: "dashboard", ?error, "Failed to serialize trade history"),
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let has_more = end < total;
 
     Ok(Json(TradeResponse {
         entries,
         total,
         has_more,
     }))
-}
-
-struct TradeFilter {
-    symbols: Option<Vec<Symbol>>,
-    venues: Option<Vec<TradingVenue>>,
-    since: Option<DateTime<Utc>>,
-    until: Option<DateTime<Utc>>,
-    trade_protocol: TradeProtocol,
-}
-
-impl TradeFilter {
-    fn matches_symbol(&self, symbol: &Symbol) -> bool {
-        self.symbols
-            .as_ref()
-            .is_none_or(|symbols| symbols.contains(symbol))
-    }
-
-    fn matches_time(&self, timestamp: DateTime<Utc>) -> bool {
-        if let Some(since) = self.since
-            && timestamp < since
-        {
-            return false;
-        }
-        if let Some(until) = self.until
-            && timestamp > until
-        {
-            return false;
-        }
-        true
-    }
-
-    fn matches_venue(&self, venue: TradingVenue) -> bool {
-        self.venues.as_ref().is_none_or(|venues| {
-            venues.iter().any(|filter| match self.trade_protocol {
-                TradeProtocol::TerminalOutcomesV3 => *filter == venue,
-                TradeProtocol::LegacyFills
-                | TradeProtocol::TerminalOutcomesV1
-                | TradeProtocol::TerminalOutcomesV2 => {
-                    filter.legacy_compatible() == venue.legacy_compatible()
-                }
-            })
-        })
-    }
-
-    fn includes_onchain(&self) -> bool {
-        self.venues
-            .as_ref()
-            .is_none_or(|venues| venues.iter().any(|venue| venue.is_onchain()))
-    }
-
-    fn includes_offchain(&self) -> bool {
-        self.venues
-            .as_ref()
-            .is_none_or(|venues| venues.iter().any(|venue| !venue.is_onchain()))
-    }
 }
 
 fn parse_trade_filter_time(
@@ -761,121 +706,6 @@ fn parse_trade_symbols(value: Option<&str>) -> Result<Option<Vec<Symbol>>, Statu
                 .map_err(|_| StatusCode::BAD_REQUEST)
         })
         .transpose()
-}
-
-async fn load_trade_rows(
-    pool: &SqlitePool,
-    filter: &TradeFilter,
-) -> Result<Vec<Trade>, TradeHistoryError> {
-    let include_onchain = filter.includes_onchain();
-    let include_offchain = filter.includes_offchain();
-
-    let mut trades = Vec::new();
-
-    if include_onchain {
-        trades.extend(load_onchain_trade_rows(pool, filter).await?);
-    }
-
-    if include_offchain {
-        trades.extend(load_offchain_trade_rows(pool, filter).await?);
-    }
-
-    Ok(trades)
-}
-
-async fn load_onchain_trade_rows(
-    pool: &SqlitePool,
-    filter: &TradeFilter,
-) -> Result<Vec<Trade>, TradeHistoryError> {
-    Ok(load_onchain_trades(pool)
-        .await
-        .map_err(|source| TradeHistoryError::Onchain(Box::new(source)))?
-        .into_iter()
-        .filter(|trade| {
-            filter.matches_venue(trade.venue)
-                && filter.matches_symbol(&trade.symbol)
-                && filter.matches_time(trade.occurred_at)
-        })
-        .collect())
-}
-
-async fn load_offchain_trade_rows(
-    pool: &SqlitePool,
-    filter: &TradeFilter,
-) -> Result<Vec<Trade>, TradeHistoryError> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT view_id, payload FROM offchain_order_view \
-         WHERE status IN ('Filled', 'Failed', 'Cancelled')",
-    )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .filter_map(|(view_id, payload)| {
-            parse_offchain_trade_row(view_id, &payload, filter)
-                .inspect_err(|error| {
-                    warn!(
-                        target: "dashboard",
-                        %error,
-                        "Skipping unparseable offchain trade history row"
-                    );
-                })
-                .ok()
-                .flatten()
-        })
-        .collect())
-}
-
-#[derive(Deserialize)]
-enum OffchainOrderProjectionPayload {
-    Live(OffchainOrder),
-}
-
-#[derive(Debug, thiserror::Error)]
-enum OffchainTradeRowError {
-    #[error("invalid offchain order projection payload: {0}")]
-    Payload(#[from] serde_json::Error),
-    #[error("invalid offchain order id: {0}")]
-    Id(#[from] uuid::Error),
-    #[error("offchain order cannot be represented in trade history: {0}")]
-    Conversion(#[from] TradeConversionError),
-}
-
-#[derive(Debug, thiserror::Error)]
-enum TradeHistoryError {
-    #[error("failed to query trade history: {0}")]
-    Database(#[from] sqlx::Error),
-    #[error("failed to replay onchain trade history: {0}")]
-    Onchain(#[source] Box<DashboardTradeHistoryError>),
-    #[error("failed to parse offchain trade history row {view_id}: {source}")]
-    InvalidOffchainRow {
-        view_id: String,
-        #[source]
-        source: OffchainTradeRowError,
-    },
-}
-
-fn parse_offchain_trade_row(
-    view_id: String,
-    payload: &str,
-    filter: &TradeFilter,
-) -> Result<Option<Trade>, TradeHistoryError> {
-    let result = (|| -> Result<Trade, OffchainTradeRowError> {
-        let OffchainOrderProjectionPayload::Live(order) = serde_json::from_str(payload)?;
-        let id = OffchainOrderId::from_str(&view_id)?;
-        Ok(order.try_into_trade(&id)?)
-    })()
-    .map_err(|source| TradeHistoryError::InvalidOffchainRow { view_id, source })?;
-
-    if !filter.matches_symbol(&result.symbol)
-        || !filter.matches_time(result.occurred_at)
-        || !filter.matches_venue(result.venue)
-    {
-        return Ok(None);
-    }
-
-    Ok(Some(result))
 }
 
 #[derive(Deserialize, Default)]
@@ -1875,6 +1705,7 @@ mod tests {
     use chrono::{NaiveDate, TimeZone};
     use chrono_tz::America::New_York;
     use httpmock::Method::GET;
+    use sqlx::SqlitePool;
     use tokio::sync::broadcast;
     use tower::ServiceExt;
     use uuid::uuid;
@@ -2088,18 +1919,17 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = load_offchain_trade_rows(
+        let entries = query_trades(
             &pool,
-            &TradeFilter {
-                symbols: None,
+            &TradeQuery {
                 venues: None,
-                since: None,
-                until: None,
-                trade_protocol: TradeProtocol::TerminalOutcomesV3,
+                limit: usize::MAX,
+                ..TradeQuery::all(TradeProtocol::TerminalOutcomesV3)
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .trades;
 
         assert_eq!(entries.len(), 3);
         let failed = entries
@@ -2282,18 +2112,17 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = load_offchain_trade_rows(
+        let entries = query_trades(
             &pool,
-            &TradeFilter {
-                symbols: None,
+            &TradeQuery {
                 venues: None,
-                since: None,
-                until: None,
-                trade_protocol: TradeProtocol::TerminalOutcomesV3,
+                limit: usize::MAX,
+                ..TradeQuery::all(TradeProtocol::TerminalOutcomesV3)
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .trades;
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, valid_view_id);
@@ -2323,7 +2152,7 @@ mod tests {
             tx_hash: TxHash::ZERO,
             log_index: 194,
         };
-        let store = StoreBuilder::<OnChainTrade>::new(pool.clone())
+        let (store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -2356,30 +2185,28 @@ mod tests {
             .await
             .unwrap();
 
-        let bebop = load_trade_rows(
+        let bebop = query_trades(
             &pool,
-            &TradeFilter {
-                symbols: None,
+            &TradeQuery {
                 venues: Some(vec![TradingVenue::Bebop]),
-                since: None,
-                until: None,
-                trade_protocol: TradeProtocol::TerminalOutcomesV3,
+                limit: usize::MAX,
+                ..TradeQuery::all(TradeProtocol::TerminalOutcomesV3)
             },
         )
         .await
-        .unwrap();
-        let alpaca = load_trade_rows(
+        .unwrap()
+        .trades;
+        let alpaca = query_trades(
             &pool,
-            &TradeFilter {
-                symbols: None,
+            &TradeQuery {
                 venues: Some(vec![TradingVenue::Alpaca]),
-                since: None,
-                until: None,
-                trade_protocol: TradeProtocol::TerminalOutcomesV3,
+                limit: usize::MAX,
+                ..TradeQuery::all(TradeProtocol::TerminalOutcomesV3)
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .trades;
 
         assert_eq!(bebop.len(), 1);
         assert_eq!(bebop[0].venue, TradingVenue::Bebop);
@@ -2402,57 +2229,59 @@ mod tests {
         assert_eq!(body["entries"][0]["venue"], "raindex");
     }
 
-    #[test]
-    fn failed_offchain_trade_history_respects_all_filters() {
+    /// Every filter dimension, asserted against the real SQL rather than an
+    /// in-memory predicate: the matching case uses inclusive `since`/`until`
+    /// set to the trade's exact outcome timestamp, which is the boundary the
+    /// generated `occurred_at` column has to reproduce to the nanosecond.
+    #[tokio::test]
+    async fn failed_offchain_trade_history_respects_all_filters() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let pool = state.pool.clone();
         let payload = r#"{"Live":{"Failed":{"symbol":"SPCX","shares":"1","direction":"Buy","executor":"AlpacaBrokerApi","retained_fill":null,"executor_order_id":null,"error":"asset is not tradable","placed_at":"2026-01-01T00:00:00Z","failed_at":"2026-01-01T00:00:01Z"}}}"#;
         let view_id = "00000000-0000-0000-0000-000000000143";
-        let parse = |filter: TradeFilter| {
-            parse_offchain_trade_row(view_id.to_string(), payload, &filter)
-                .expect("valid failed trade should parse")
-        };
+        sqlx::query("INSERT INTO offchain_order_view (view_id, version, payload) VALUES (?, 1, ?)")
+            .bind(view_id)
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .unwrap();
 
-        assert!(
-            parse(TradeFilter {
+        let matching = query_trades(
+            &pool,
+            &TradeQuery {
                 symbols: Some(vec![Symbol::new("SPCX").unwrap()]),
                 venues: Some(vec![TradingVenue::Alpaca]),
                 since: Some("2026-01-01T00:00:01Z".parse().unwrap()),
                 until: Some("2026-01-01T00:00:01Z".parse().unwrap()),
-                trade_protocol: TradeProtocol::TerminalOutcomesV3,
-            })
-            .is_some()
-        );
+                ..TradeQuery::all(TradeProtocol::TerminalOutcomesV3)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(matching.total, 1);
+        assert_eq!(matching.trades[0].id, view_id);
 
-        for filter in [
-            TradeFilter {
+        for excluding in [
+            TradeQuery {
                 symbols: Some(vec![Symbol::new("AAPL").unwrap()]),
-                venues: None,
-                since: None,
-                until: None,
-                trade_protocol: TradeProtocol::TerminalOutcomesV3,
+                ..TradeQuery::all(TradeProtocol::TerminalOutcomesV3)
             },
-            TradeFilter {
-                symbols: None,
+            TradeQuery {
                 venues: Some(vec![TradingVenue::DryRun]),
-                since: None,
-                until: None,
-                trade_protocol: TradeProtocol::TerminalOutcomesV3,
+                ..TradeQuery::all(TradeProtocol::TerminalOutcomesV3)
             },
-            TradeFilter {
-                symbols: None,
-                venues: None,
+            TradeQuery {
                 since: Some("2026-01-01T00:00:02Z".parse().unwrap()),
-                until: None,
-                trade_protocol: TradeProtocol::TerminalOutcomesV3,
+                ..TradeQuery::all(TradeProtocol::TerminalOutcomesV3)
             },
-            TradeFilter {
-                symbols: None,
-                venues: None,
-                since: None,
+            TradeQuery {
                 until: Some("2026-01-01T00:00:00Z".parse().unwrap()),
-                trade_protocol: TradeProtocol::TerminalOutcomesV3,
+                ..TradeQuery::all(TradeProtocol::TerminalOutcomesV3)
             },
         ] {
-            assert!(parse(filter).is_none());
+            let page = query_trades(&pool, &excluding).await.unwrap();
+            assert_eq!(page.total, 0);
+            assert!(page.trades.is_empty());
         }
     }
 
