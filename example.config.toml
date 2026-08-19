@@ -219,8 +219,10 @@ rebalancing = "enabled"
 # [alerts]
 # Telegram chat the alerts are delivered to (a negative id for group/channel).
 # chat_id = -1001234567890
-# Native-ETH balance below which an alert fires, as a decimal-ETH string.
-# low_balance_threshold = "0.05"
+# Per-chain native-ETH balances below which alerts fire, as decimal-ETH
+# strings. Both are required; neither chain falls back to the other.
+# base_low_balance_threshold = "0.05"
+# ethereum_low_balance_threshold = "0.05"
 # Seconds between native-balance polls.
 # poll_interval = 300
 # Minimum seconds between repeated low-balance alerts while still low; 12h

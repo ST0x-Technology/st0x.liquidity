@@ -12,9 +12,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use st0x_config::{Ctx, ExecutionThreshold};
+use st0x_config::{AlertsCtx, Ctx, ExecutionThreshold, OnchainWalletCtx};
 use st0x_event_sorcery::{Projection, Store};
-use st0x_evm::ReadOnlyEvm;
+use st0x_evm::{Evm, ReadOnlyEvm, Wallet};
 use st0x_execution::{Executor, Symbol};
 use st0x_finance::{HasZero, Positive, Usd};
 use st0x_raindex::RaindexService;
@@ -35,6 +35,7 @@ use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
 use super::{Conductor, SupervisorStartupTokens};
 use crate::alerts::Notifier;
+use crate::bot_gas::BotGasChain;
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::{
@@ -114,6 +115,8 @@ pub(crate) enum ConductorSpawnError {
     CloseFlattenWindow(#[from] chrono::OutOfRangeError),
     #[error(transparent)]
     CloseFlattenCrossRamp(#[from] CloseFlattenCrossRampError),
+    #[error("[alerts] requires a configured [wallet] section")]
+    AlertsRequireWallet,
 }
 
 /// Everything needed to construct a running [`Conductor`].
@@ -317,10 +320,24 @@ where
         interval: std::time::Duration::from_secs(context.ctx.inventory_poll_interval),
     };
 
-    // Build the gas monitor before `context.provider` is consumed by the
+    // Build the gas monitors before `context.provider` is consumed by the
     // order-fill monitor / accountant below. `None` when `[alerts]` is
-    // unconfigured -- the monitor is then simply not spawned.
-    let gas_monitor = build_gas_monitor(&context.ctx, context.provider.clone(), notifier.clone());
+    // unconfigured -- neither monitor is then spawned.
+    let gas_monitors = if let Some((alerts, wallet_ctx)) = alerts_with_wallet(&context.ctx)? {
+        let base_wallet = wallet_ctx.base_wallet();
+        let ethereum_wallet = wallet_ctx.ethereum_wallet();
+
+        Some(build_gas_monitors(
+            alerts,
+            base_wallet.provider().clone(),
+            base_wallet.address(),
+            ethereum_wallet.provider().clone(),
+            ethereum_wallet.address(),
+            notifier.clone(),
+        ))
+    } else {
+        None
+    };
 
     let poll_interval = context.ctx.order_polling_interval();
     info!("Constructing order-job context with poll interval: {poll_interval:?}");
@@ -462,7 +479,8 @@ where
         inventory_monitor: inventory_startup,
         dashboard_trade_handoff_monitor: dashboard_trade_handoff_startup,
         executor_maintenance: executor_maintenance_startup,
-        gas_monitor: gas_monitor_startup,
+        base_gas_monitor: base_gas_monitor_startup,
+        ethereum_gas_monitor: ethereum_gas_monitor_startup,
     } = context.supervisor_startup;
 
     let order_fill_monitor = OrderFillMonitor::new(
@@ -518,18 +536,27 @@ where
         executor_maintenance_startup.acknowledge();
     }
 
-    log_optional_task_status("gas monitor", gas_monitor.is_some());
+    log_optional_task_status("gas monitors", gas_monitors.is_some());
 
-    if let Some(gas_monitor) = gas_monitor {
-        supervisor_builder = supervisor_builder.with_task(
-            "gas-monitor",
-            StartupTask {
-                task: gas_monitor,
-                token: gas_monitor_startup,
-            },
-        );
+    if let Some([base_gas_monitor, ethereum_gas_monitor]) = gas_monitors {
+        supervisor_builder = supervisor_builder
+            .with_task(
+                "gas-monitor-base",
+                StartupTask {
+                    task: base_gas_monitor,
+                    token: base_gas_monitor_startup,
+                },
+            )
+            .with_task(
+                "gas-monitor-ethereum",
+                StartupTask {
+                    task: ethereum_gas_monitor,
+                    token: ethereum_gas_monitor_startup,
+                },
+            );
     } else {
-        gas_monitor_startup.acknowledge();
+        base_gas_monitor_startup.acknowledge();
+        ethereum_gas_monitor_startup.acknowledge();
     }
 
     let supervisor = supervisor_builder.build().run();
@@ -1037,29 +1064,49 @@ where
     }
 }
 
-/// Builds the low-gas balance monitor from the `[alerts]` config, or `None`
-/// when alerting is unconfigured. The monitor watches the order-owner wallet
-/// on the orderbook chain (Base in production), which is the same provider the
-/// conductor already uses for fill polling and contract reads.
-fn build_gas_monitor<Prov>(
+fn alerts_with_wallet(
     ctx: &Ctx,
-    provider: Prov,
-    notifier: Arc<dyn Notifier>,
-) -> Option<GasMonitor>
-where
-    Prov: Provider + Send + Sync + 'static,
-{
-    let alerts = ctx.alerts.as_ref()?;
-
-    Some(GasMonitor {
-        balance_reader: Arc::new(ProviderBalanceReader::new(provider)),
-        notifier,
-        wallet: ctx.order_owner(),
-        chain: "base",
-        threshold_wei: alerts.low_balance_threshold_wei,
-        poll_interval: alerts.poll_interval,
-        realert_interval: alerts.realert_interval,
+) -> Result<Option<(&AlertsCtx, &OnchainWalletCtx)>, ConductorSpawnError> {
+    ctx.alerts.as_ref().map_or(Ok(None), |alerts| {
+        ctx.wallet()
+            .map(|wallet| Some((alerts, wallet)))
+            .map_err(|_| ConductorSpawnError::AlertsRequireWallet)
     })
+}
+
+/// Builds the Base and Ethereum low-gas monitors from `[alerts]`.
+fn build_gas_monitors<BaseProv, EthereumProv>(
+    alerts: &AlertsCtx,
+    base_provider: BaseProv,
+    base_wallet: Address,
+    ethereum_provider: EthereumProv,
+    ethereum_wallet: Address,
+    notifier: Arc<dyn Notifier>,
+) -> [GasMonitor; 2]
+where
+    BaseProv: Provider + Send + Sync + 'static,
+    EthereumProv: Provider + Send + Sync + 'static,
+{
+    [
+        GasMonitor {
+            balance_reader: Arc::new(ProviderBalanceReader::new(base_provider)),
+            notifier: notifier.clone(),
+            wallet: base_wallet,
+            chain: BotGasChain::Base,
+            threshold_wei: alerts.base_low_balance_threshold_wei,
+            poll_interval: alerts.poll_interval,
+            realert_interval: alerts.realert_interval,
+        },
+        GasMonitor {
+            balance_reader: Arc::new(ProviderBalanceReader::new(ethereum_provider)),
+            notifier,
+            wallet: ethereum_wallet,
+            chain: BotGasChain::Ethereum,
+            threshold_wei: alerts.ethereum_low_balance_threshold_wei,
+            poll_interval: alerts.poll_interval,
+            realert_interval: alerts.realert_interval,
+        },
+    ]
 }
 
 fn log_optional_task_status(task_name: &str, is_configured: bool) {
@@ -1355,8 +1402,11 @@ mod tests {
     use std::sync::RwLock;
     use std::time::Duration;
 
+    use alloy::primitives::{U256, address};
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
     use async_trait::async_trait;
-    use st0x_config::EquitiesConfig;
+    use st0x_config::{EquitiesConfig, create_test_ctx_with_order_owner};
     use st0x_event_sorcery::test_store;
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_float_macro::float;
@@ -1376,6 +1426,78 @@ mod tests {
     };
     use crate::test_utils::{setup_test_apalis_pool, setup_test_pools};
     use crate::vault_lookup::MockVaultLookup;
+
+    #[test]
+    fn alerts_require_a_configured_wallet() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.alerts = Some(AlertsCtx {
+            chat_id: 1,
+            bot_token: "token".to_owned(),
+            base_low_balance_threshold_wei: U256::from(100_u64),
+            ethereum_low_balance_threshold_wei: U256::from(200_u64),
+            poll_interval: Duration::from_secs(300),
+            realert_interval: Duration::from_secs(3600),
+            message_thread_id: None,
+        });
+
+        assert!(matches!(
+            alerts_with_wallet(&ctx),
+            Err(ConductorSpawnError::AlertsRequireWallet)
+        ));
+    }
+
+    #[tokio::test]
+    async fn gas_monitors_use_their_chain_provider_wallet_and_threshold() {
+        let base_asserter = Asserter::new();
+        base_asserter.push_success(&U256::from(11_u64));
+        let ethereum_asserter = Asserter::new();
+        ethereum_asserter.push_success(&U256::from(22_u64));
+
+        let alerts = AlertsCtx {
+            chat_id: 1,
+            bot_token: "token".to_owned(),
+            base_low_balance_threshold_wei: U256::from(100_u64),
+            ethereum_low_balance_threshold_wei: U256::from(200_u64),
+            poll_interval: Duration::from_secs(300),
+            realert_interval: Duration::from_secs(3600),
+            message_thread_id: None,
+        };
+        let base_wallet = address!("0x0000000000000000000000000000000000000ba5");
+        let ethereum_wallet = address!("0x0000000000000000000000000000000000000e78");
+        let [base, ethereum] = build_gas_monitors(
+            &alerts,
+            ProviderBuilder::new().connect_mocked_client(base_asserter),
+            base_wallet,
+            ProviderBuilder::new().connect_mocked_client(ethereum_asserter),
+            ethereum_wallet,
+            Arc::new(crate::alerts::NoopNotifier),
+        );
+
+        assert_eq!(base.wallet, base_wallet);
+        assert_eq!(base.chain, BotGasChain::Base);
+        assert_eq!(base.threshold_wei, U256::from(100_u64));
+        assert_eq!(
+            base.balance_reader
+                .native_balance(base.wallet)
+                .await
+                .unwrap(),
+            U256::from(11_u64),
+            "Base monitor must read through the Base provider"
+        );
+
+        assert_eq!(ethereum.wallet, ethereum_wallet);
+        assert_eq!(ethereum.chain, BotGasChain::Ethereum);
+        assert_eq!(ethereum.threshold_wei, U256::from(200_u64));
+        assert_eq!(
+            ethereum
+                .balance_reader
+                .native_balance(ethereum.wallet)
+                .await
+                .unwrap(),
+            U256::from(22_u64),
+            "Ethereum monitor must read through the Ethereum provider"
+        );
+    }
 
     struct PoisonThenHealthyRedemptionResume {
         poison_id: RedemptionAggregateId,
