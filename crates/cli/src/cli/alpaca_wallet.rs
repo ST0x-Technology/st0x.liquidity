@@ -26,9 +26,7 @@ pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write
     writeln!(stdout, "Depositing USDC directly to Alpaca")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!("alpaca-deposit requires Alpaca Broker API configuration");
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     let wallet_ctx = ctx.wallet()?;
     let sender_address = wallet_ctx.base_wallet().address();
@@ -194,9 +192,7 @@ pub(super) async fn alpaca_withdraw_command<Registry: IntoErrorRegistry, W: Writ
     writeln!(stdout, "Withdrawing USDC from Alpaca")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!("alpaca-withdraw requires Alpaca Broker API configuration");
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     let wallet_ctx = ctx.wallet()?;
 
@@ -332,9 +328,7 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     address: Option<Address>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!("alpaca-whitelist requires Alpaca Broker API configuration");
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     let target_address = match address {
         Some(target_address) => target_address,
@@ -408,9 +402,7 @@ pub(super) async fn alpaca_whitelist_list_command<W: Write>(
     stdout: &mut W,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!("alpaca-whitelist-list requires Alpaca Broker API configuration");
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
@@ -446,11 +438,7 @@ pub(super) async fn alpaca_whitelist_patch_travel_rule_command<W: Write>(
     stdout: &mut W,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!(
-            "alpaca-whitelist-patch-travel-rule requires Alpaca Broker API configuration"
-        );
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     let travel_rule_config = ctx.travel_rule.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -495,9 +483,7 @@ pub(super) async fn alpaca_unwhitelist_command<W: Write>(
     address: Address,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!("alpaca-unwhitelist requires Alpaca Broker API configuration");
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     writeln!(stdout, "Removing address from Alpaca whitelist")?;
     writeln!(stdout, "   Address: {address}")?;
@@ -526,9 +512,7 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
     pending_only: bool,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!("alpaca-transfers requires Alpaca Broker API configuration");
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
@@ -598,9 +582,7 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     writeln!(stdout, "Converting {direction_str} on Alpaca")?;
     writeln!(stdout, "   Requested: {amount_str}")?;
 
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!("alpaca-convert requires Alpaca Broker API configuration");
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     // The parsed amount is one number either way; which unit it carries is
     // decided here, once, rather than being implied by the direction further
@@ -667,9 +649,7 @@ pub(super) async fn alpaca_journal_command<W: Write>(
     quantity: Positive<FractionalShares>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!("alpaca-journal requires Alpaca Broker API configuration");
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     writeln!(stdout, "Journaling equities between Alpaca accounts")?;
     writeln!(stdout, "   Symbol: {symbol}")?;
@@ -721,7 +701,7 @@ mod tests {
     use super::*;
     use crate::cli::ConvertDirection;
 
-    fn create_ctx_without_alpaca() -> Ctx {
+    fn create_base_test_ctx() -> Ctx {
         Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
@@ -751,7 +731,7 @@ mod tests {
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,
             apalis_finished_job_cleanup_interval_secs: 3600,
-            broker: BrokerCtx::DryRun,
+            broker: st0x_config::test_alpaca_broker_ctx(),
             telemetry: None,
             alerts: None,
             startup_notices: Vec::new(),
@@ -774,7 +754,7 @@ mod tests {
     const TEST_ACCOUNT_ID: &str = "904837e3-3b76-47ec-b432-046db621571b";
 
     fn create_alpaca_ctx_without_rebalancing() -> Ctx {
-        let mut ctx = create_ctx_without_alpaca();
+        let mut ctx = create_base_test_ctx();
         ctx.broker = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
             auth: st0x_execution::AlpacaBrokerAuth::Basic {
                 api_key: "test-key".to_string(),
@@ -790,7 +770,7 @@ mod tests {
     }
 
     fn create_mock_alpaca_ctx(base_url: String) -> Ctx {
-        let mut ctx = create_ctx_without_alpaca();
+        let mut ctx = create_base_test_ctx();
         ctx.broker = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
             auth: st0x_execution::AlpacaBrokerAuth::Basic {
                 api_key: "test-key".to_string(),
@@ -1213,25 +1193,6 @@ mod tests {
             placement_mock.calls(),
             0,
             "a non-positive conversion must never reach the broker"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_alpaca_journal_requires_alpaca_config() {
-        let ctx = create_ctx_without_alpaca();
-        let destination = AlpacaAccountId::new(uuid!("11111111-2222-3333-4444-555555555555"));
-        let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = Positive::new(FractionalShares::new(float!(10))).unwrap();
-
-        let mut stdout = Vec::new();
-        let err_msg = alpaca_journal_command(&mut stdout, destination, symbol, quantity, &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-
-        assert!(
-            err_msg.contains("alpaca-journal requires Alpaca Broker API"),
-            "Expected Alpaca config error, got: {err_msg}"
         );
     }
 

@@ -214,9 +214,7 @@ async fn build_equity_transfer_services(
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<EquityTransferCliServices> {
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!("transfer-equity requires Alpaca Broker API configuration");
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     let context = trading_chain_context(ctx, network)?;
     let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, network, ctx)?;
@@ -658,9 +656,7 @@ async fn run_usdc_transfer<Writer: Write>(
         }
     };
 
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!("transfer-usdc requires Alpaca Broker API configuration");
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     let wallet_ctx = ctx.wallet()?;
 
@@ -1301,9 +1297,7 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write>(
     let token = resolve_tokenization_token(token_override, network, &symbol, ctx)?;
     writeln!(stdout, "   Token: {token}")?;
 
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!("alpaca-tokenize requires Alpaca Broker API configuration");
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     let wallet_ctx = ctx.wallet()?;
     let (wallet, chain) = tokenization_network_context(wallet_ctx, network);
@@ -1447,9 +1441,7 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
 
     let WrapContext { wallet, equities } = wrap_context(ctx, network, registry.as_ref(), &symbol)?;
 
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!("alpaca-redeem requires Alpaca Broker API configuration");
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, network, ctx)?;
     let (_, chain) = tokenization_network_context(ctx.wallet()?, network);
@@ -1531,9 +1523,7 @@ pub(super) async fn alpaca_tokenization_requests_command<Writer: Write>(
 ) -> anyhow::Result<()> {
     writeln!(stdout, "📋 Listing Alpaca tokenization requests")?;
 
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!("alpaca-tokenization-requests requires Alpaca Broker API configuration");
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     let wallet_ctx = ctx.wallet()?;
 
@@ -2370,7 +2360,7 @@ mod tests {
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,
             apalis_finished_job_cleanup_interval_secs: 3600,
-            broker: BrokerCtx::DryRun,
+            broker: st0x_config::test_alpaca_broker_ctx(),
             telemetry: None,
             alerts: None,
             startup_notices: Vec::new(),
@@ -2485,36 +2475,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_transfer_equity_requires_alpaca_broker() {
-        let ctx = create_base_test_ctx();
-        let pool = setup_test_db().await;
-        let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares::new(Float::parse("10.5".to_string()).unwrap());
-
-        let mut stdout = Vec::new();
-        let result = transfer_equity_command(
-            &mut stdout,
-            TransferEquity {
-                direction: TransferDirection::ToRaindex,
-                symbol,
-                quantity,
-                issuer_request_id: None,
-                redemption_wallet: None,
-                network: TokenizationNetwork::Base,
-            },
-            &ctx,
-            &pool,
-        )
-        .await;
-
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("requires Alpaca Broker API configuration"),
-            "Expected Alpaca Broker API error, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
     async fn test_transfer_equity_requires_tokenization_config() {
         let mut ctx = create_alpaca_test_ctx();
         // The trading table is now resolved first, and resolving it needs a
@@ -2545,29 +2505,6 @@ mod tests {
         assert!(
             err_msg.contains("redemption_wallet"),
             "Expected tokenization config error, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_transfer_usdc_requires_alpaca_broker() {
-        let ctx = create_base_test_ctx();
-        let pool = setup_test_db().await;
-        let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
-
-        let mut stdout = Vec::new();
-        let result = transfer_usdc_command(
-            &mut stdout,
-            TransferDirection::ToRaindex,
-            amount,
-            &ctx,
-            &pool,
-        )
-        .await;
-
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("requires Alpaca Broker API configuration"),
-            "Expected Alpaca Broker API error, got: {err_msg}"
         );
     }
 
@@ -2708,7 +2645,7 @@ mod tests {
         // A resume takes no amount: it loads the persisted state amount (the
         // post-slippage/post-fee effective amount) and reports it to the
         // operator. The preflight guard must accept the correct direction --
-        // here it then fails at broker setup, proving the guard accepted it.
+        // here it then fails at wallet setup, proving the guard accepted it.
         let ctx = create_base_test_ctx();
         let pool = setup_test_db().await;
         let seeded_amount = Usdc::new(Float::parse("100".to_string()).unwrap());
@@ -2749,8 +2686,8 @@ mod tests {
             "the correct direction must pass the guard; got: {err_msg}"
         );
         assert!(
-            err_msg.contains("requires Alpaca Broker API configuration"),
-            "past the guard, the bare ctx must fail at broker setup; got: {err_msg}"
+            err_msg.contains("requires a configured [wallet] section"),
+            "past the guard, the bare ctx must fail at wallet setup; got: {err_msg}"
         );
 
         let output = String::from_utf8(stdout).unwrap();

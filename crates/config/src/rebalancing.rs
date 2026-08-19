@@ -34,12 +34,6 @@ pub static ALPACA_TO_BASE_MINIMUM_TRANSFER: LazyLock<Usdc> =
 /// Error type for rebalancing configuration validation.
 #[derive(Debug, thiserror::Error)]
 pub enum RebalancingCtxError {
-    #[error(
-        "broker type \"dry-run\" is retired and [rebalancing] requires the \
-         alpaca-broker-api broker type; for local whole-system testing use \
-         `nix run .#simulate`"
-    )]
-    NotAlpacaBroker,
     #[error("rebalancing inventory_staleness_bound_secs must be non-zero")]
     ZeroInventoryStalenessBound,
     #[error("rebalancing transfer_timeout_secs must be non-zero")]

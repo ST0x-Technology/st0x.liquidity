@@ -7,7 +7,7 @@ edition = "2024"
 default = []
 # Expose test-only constructors and helpers (MockTokenizer, setup_anvil, ...)
 test-support = ["st0x-evm/local-signer", "st0x-evm/test-support"]
-# Mock tokenization HTTP API for dry-run testing from downstream crates
+# Mock tokenization HTTP API for tests and local simulation in downstream crates
 mock = ["test-support", "dep:httpmock", "dep:anyhow", "st0x-execution/mock"]
 
 [dependencies]
