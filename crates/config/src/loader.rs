@@ -16,7 +16,7 @@ use st0x_execution::{
 };
 use st0x_finance::{Usd, Usdc};
 use std::collections::HashMap;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tracing::{Level, warn};
@@ -488,19 +488,17 @@ impl BrokerConfig {
         Ok(configured)
     }
 
-    fn extended_hours_reprice_timeout_secs(&self) -> Result<u64, CtxError> {
+    fn extended_hours_reprice_timeout_secs(&self) -> Result<NonZeroU64, CtxError> {
         let configured = self
             .extended_hours_reprice_timeout_secs
             .ok_or(CtxError::MissingExtendedHoursRepriceTimeout)?;
 
-        if configured == 0 || configured > MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS {
-            return Err(CtxError::ExtendedHoursRepriceTimeoutOutOfRange {
+        NonZeroU64::new(configured)
+            .filter(|timeout| timeout.get() <= MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS)
+            .ok_or(CtxError::ExtendedHoursRepriceTimeoutOutOfRange {
                 configured,
                 max: MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS,
-            });
-        }
-
-        Ok(configured)
+            })
     }
 
     fn close_flatten_reprice_timeout_secs(&self) -> Result<u64, CtxError> {
@@ -631,8 +629,10 @@ pub struct Ctx {
     /// (capped at the chain's latest finalized block).
     pub order_fill_poll_interval: u64,
     /// Maximum age (seconds) for a live extended-hours limit hedge before it is
-    /// cancelled so the next scan can place a fresh marketable limit.
-    pub extended_hours_reprice_timeout_secs: u64,
+    /// cancelled so the next scan can place a fresh marketable limit. `None`
+    /// is valid only for DryRun with no extended-hours-enabled assets; loaded
+    /// Alpaca and extended-hours-enabled DryRun contexts always contain `Some`.
+    pub extended_hours_reprice_timeout_secs: Option<NonZeroU64>,
     /// Maximum age (seconds) for a close-flatten limit hedge before it is
     /// cancelled and repriced further along the widening cross ramp.
     pub close_flatten_reprice_timeout_secs: u64,
@@ -869,7 +869,7 @@ struct ValidatedParts {
     inventory_poll_interval: u64,
     inventory_divergence_threshold: NonZeroU32,
     order_fill_poll_interval: u64,
-    extended_hours_reprice_timeout_secs: u64,
+    extended_hours_reprice_timeout_secs: Option<NonZeroU64>,
     close_flatten_reprice_timeout_secs: u64,
     extended_hours_close_flatten_window_secs: u64,
     close_flatten_cross_max_bps: u16,
@@ -1213,13 +1213,13 @@ fn parse_and_validate(
     })
 }
 
-/// Result of [`extended_hours_broker_windows`]. Both fields are `u64`
-/// seconds with distinct meanings -- a named struct (rather than a
+/// Result of [`extended_hours_broker_windows`]. The fields have distinct
+/// meanings -- a named struct (rather than a
 /// positional tuple) prevents a future reorder at either the construction or
 /// destructuring site from silently swapping which duration feeds which
 /// `Ctx` field.
 struct ExtendedHoursBrokerWindows {
-    reprice_timeout_secs: u64,
+    reprice_timeout_secs: Option<NonZeroU64>,
     close_flatten_reprice_timeout_secs: u64,
     close_flatten_window_secs: u64,
     close_flatten_cross_max_bps: u16,
@@ -1244,7 +1244,7 @@ fn extended_hours_broker_windows(
 
     if !requires_configured_windows {
         return Ok(ExtendedHoursBrokerWindows {
-            reprice_timeout_secs: 0,
+            reprice_timeout_secs: None,
             close_flatten_reprice_timeout_secs: 0,
             close_flatten_window_secs: 0,
             close_flatten_cross_max_bps: broker.counter_trade_slippage_bps(),
@@ -1254,7 +1254,7 @@ fn extended_hours_broker_windows(
     let broker_config = broker_config.ok_or(CtxError::MissingExtendedHoursRepriceTimeout)?;
 
     Ok(ExtendedHoursBrokerWindows {
-        reprice_timeout_secs: broker_config.extended_hours_reprice_timeout_secs()?,
+        reprice_timeout_secs: Some(broker_config.extended_hours_reprice_timeout_secs()?),
         close_flatten_reprice_timeout_secs: broker_config.close_flatten_reprice_timeout_secs()?,
         close_flatten_window_secs: broker_config.extended_hours_close_flatten_window_secs()?,
         close_flatten_cross_max_bps: broker_config
@@ -1657,7 +1657,7 @@ impl Ctx {
             inventory_poll_interval,
             inventory_divergence_threshold,
             order_fill_poll_interval: 1,
-            extended_hours_reprice_timeout_secs: 300,
+            extended_hours_reprice_timeout_secs: NonZeroU64::new(300),
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,
@@ -2009,7 +2009,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         inventory_poll_interval: 60,
         inventory_divergence_threshold: NonZeroU32::MIN,
         order_fill_poll_interval: 5,
-        extended_hours_reprice_timeout_secs: 300,
+        extended_hours_reprice_timeout_secs: NonZeroU64::new(300),
         close_flatten_reprice_timeout_secs: 60,
         extended_hours_close_flatten_window_secs: 900,
         close_flatten_cross_max_bps: 400,
@@ -2413,6 +2413,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(ctx.broker, BrokerCtx::DryRun));
+        assert_eq!(ctx.extended_hours_reprice_timeout_secs, None);
         assert_eq!(
             ctx.close_flatten_cross_max_bps,
             ctx.broker.counter_trade_slippage_bps(),
@@ -4466,7 +4467,7 @@ mod tests {
 
         assert_eq!(
             broker.extended_hours_reprice_timeout_secs().unwrap(),
-            MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS
+            NonZeroU64::new(MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS).unwrap()
         );
     }
 
@@ -4924,6 +4925,10 @@ mod tests {
             .unwrap();
         let expected = ExecutionThreshold::dollar_value(Usdc::new(float!(2))).unwrap();
         assert_eq!(ctx.execution_threshold, expected);
+        assert_eq!(
+            ctx.extended_hours_reprice_timeout_secs,
+            NonZeroU64::new(300)
+        );
         assert_eq!(ctx.close_flatten_cross_max_bps, 400);
     }
 
@@ -7190,7 +7195,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(ctx.extended_hours_reprice_timeout_secs, 300);
+        assert_eq!(
+            ctx.extended_hours_reprice_timeout_secs,
+            NonZeroU64::new(300)
+        );
         assert_eq!(ctx.close_flatten_reprice_timeout_secs, 60);
         assert_eq!(ctx.extended_hours_close_flatten_window_secs, 900);
     }

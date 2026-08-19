@@ -897,19 +897,25 @@ where
     /// the configured timeout, so the position can be released and re-hedged
     /// with a fresh marketable limit on a later scan.
     async fn request_extended_hours_reprice_timeout_cancellations(&self) {
-        let ordinary_timeout = match chrono::Duration::from_std(Duration::from_secs(
-            self.ctx.extended_hours_reprice_timeout_secs,
-        )) {
-            Ok(timeout) => timeout,
-            Err(error) => {
-                warn!(
-                    %error,
-                    timeout_secs = self.ctx.extended_hours_reprice_timeout_secs,
-                    "Invalid extended-hours reprice timeout; skipping stale limit-order sweep"
-                );
-                return;
-            }
+        let Some(timeout_secs) = self.ctx.extended_hours_reprice_timeout_secs else {
+            warn!(
+                "Extended-hours reprice timeout is absent while extended hours is enabled; \
+                 skipping stale limit-order sweep"
+            );
+            return;
         };
+        let ordinary_timeout =
+            match chrono::Duration::from_std(Duration::from_secs(timeout_secs.get())) {
+                Ok(timeout) => timeout,
+                Err(error) => {
+                    warn!(
+                        %error,
+                        timeout_secs = timeout_secs.get(),
+                        "Invalid extended-hours reprice timeout; skipping stale limit-order sweep"
+                    );
+                    return;
+                }
+            };
         let close_flatten_timeout = match chrono::Duration::from_std(Duration::from_secs(
             self.ctx.close_flatten_reprice_timeout_secs,
         )) {
@@ -1263,6 +1269,7 @@ mod tests {
     use sqlx::SqlitePool;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::Barrier;
 
@@ -1351,7 +1358,6 @@ mod tests {
         let close_flatten_policy =
             CloseFlattenPolicy::from_secs(ctx_cfg.extended_hours_close_flatten_window_secs)
                 .unwrap();
-
         let ctx = CheckPositionsCtx {
             executor,
             position: position.clone(),
@@ -1378,6 +1384,44 @@ mod tests {
 
     struct CoordinatedCancelOrderPlacer {
         barrier: Arc<Barrier>,
+    }
+
+    struct CountingCancelOrderPlacer {
+        cancel_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl OrderPlacer for CountingCancelOrderPlacer {
+        async fn place_market_order(
+            &self,
+            _order: MarketOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("timeout-absence test does not place market orders")
+        }
+
+        async fn place_limit_order(
+            &self,
+            _order: LimitOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("timeout-absence test does not place limit orders")
+        }
+
+        async fn cancel_order(
+            &self,
+            _executor_order_id: &ExecutorOrderId,
+        ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+            self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CancellationOutcome::Requested)
+        }
+
+        async fn get_order_status(
+            &self,
+            executor_order_id: &ExecutorOrderId,
+        ) -> Result<OrderState, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(OrderState::Submitted {
+                order_id: executor_order_id.clone(),
+            })
+        }
     }
 
     #[async_trait]
@@ -1628,7 +1672,6 @@ mod tests {
 
         let close_flatten_policy =
             CloseFlattenPolicy::from_secs(cfg.extended_hours_close_flatten_window_secs).unwrap();
-
         let ctx = CheckPositionsCtx {
             executor,
             position: position.clone(),
@@ -1900,6 +1943,107 @@ mod tests {
             panic!("stale extended-hours order must be cancelling, got: {order:?}");
         };
         assert_eq!(reason, CancellationReason::ExtendedHoursRepriceTimeout);
+    }
+
+    #[tokio::test]
+    async fn missing_reprice_timeout_skips_extended_hours_cancellation() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let mut cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        cfg.extended_hours_reprice_timeout_secs = None;
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(CountingCancelOrderPlacer {
+            cancel_calls: cancel_calls.clone(),
+        });
+        let (ctx, position) = build_ctx_with_order_placer(
+            pool,
+            apalis_pool,
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new().with_market_session(MarketSession::Extended),
+            order_placer,
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &symbol, offchain_order_id).await;
+        record_extended_hours_order_at(
+            &ctx,
+            &symbol,
+            offchain_order_id,
+            Utc::now() - chrono::Duration::seconds(301),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert!(matches!(
+            ctx.offchain_order
+                .load(&offchain_order_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            OffchainOrder::Submitted { .. }
+        ));
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_reprice_timeout_skips_close_flatten_cancellation() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let mut cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        cfg.extended_hours_reprice_timeout_secs = None;
+        cfg.close_flatten_reprice_timeout_secs = 0;
+        let now = Utc::now();
+        let (ctx, position) = build_ctx_with_executor(
+            pool,
+            apalis_pool,
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Extended)
+                .with_extended_session_closes_at(now + chrono::Duration::seconds(300))
+                .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-eh-1"),
+                }),
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &symbol, offchain_order_id).await;
+        record_extended_hours_order_with_close_flatten_at(
+            &ctx,
+            &symbol,
+            offchain_order_id,
+            now - chrono::Duration::seconds(61),
+            true,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert!(matches!(
+            ctx.offchain_order
+                .load(&offchain_order_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            OffchainOrder::Submitted { .. }
+        ));
     }
 
     #[tokio::test]
