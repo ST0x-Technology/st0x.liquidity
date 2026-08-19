@@ -561,6 +561,21 @@
           in
           rainixPkgs // infraPkgs.packages // deployScripts // abis // others // verifyMigrationsPkgs;
 
+        checks.parse-identity-cleanup = pkgs.runCommand "parse-identity-cleanup-test" { } ''
+          ${infraPkgs.parseIdentity}
+          _cleanup_identity
+          _identity_tmpfile="$(mktemp)"
+          _cleanup_identity
+          test ! -e "$_identity_tmpfile"
+          _identity_tmpfile="$(mktemp -d)"
+          if _cleanup_identity; then
+            echo "_cleanup_identity unexpectedly succeeded" >&2
+            exit 1
+          fi
+          rmdir "$_identity_tmpfile"
+          touch $out
+        '';
+
         formatter = pkgs.nixfmt-rfc-style;
 
         devShells =

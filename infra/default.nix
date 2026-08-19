@@ -73,7 +73,11 @@ let
     set -eo pipefail
 
     _identity_tmpfile=""
-    _cleanup_identity() { [ -n "$_identity_tmpfile" ] && rm -f "$_identity_tmpfile"; }
+    _cleanup_identity() {
+      if [ -n "$_identity_tmpfile" ]; then
+        rm -f "$_identity_tmpfile"
+      fi
+    }
 
     if [ "''${1:-}" = "--op" ]; then
       if [ -z "''${2:-}" ]; then
