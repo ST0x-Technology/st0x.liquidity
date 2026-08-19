@@ -381,10 +381,8 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         })
         .collect();
 
-    let broker = match &ctx.broker {
-        st0x_config::BrokerCtx::AlpacaBrokerApi(_) => "alpaca",
-        st0x_config::BrokerCtx::DryRun => "dry_run",
-    };
+    let st0x_config::BrokerCtx::AlpacaBrokerApi(_) = &ctx.broker;
+    let broker = "alpaca";
 
     let cash_reserved = ctx
         .assets
@@ -613,7 +611,7 @@ mod tests {
             server_port: 8001,
             orderbook: "0x0".to_string(),
             deployment_block: 0,
-            broker: "dry_run".to_string(),
+            broker: "alpaca".to_string(),
             order_polling_interval: 5,
             inventory_poll_interval: 15,
         }
@@ -667,6 +665,7 @@ mod tests {
             }
         ));
         assert!(!asset.rebalancing);
+        assert_eq!(settings.broker, "alpaca");
     }
 
     #[test]

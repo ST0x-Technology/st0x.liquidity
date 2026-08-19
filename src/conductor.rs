@@ -35,7 +35,7 @@ use tracing::{debug, error, info, warn};
 
 use st0x_config::{
     AssetsConfig, BrokerCtx, Ctx, CtxError, EvmCtx, ExecutionThreshold, InventoryMode,
-    IssuanceStatusCtx, OperationMode, RebalancingCtx, RebalancingCtxError,
+    IssuanceStatusCtx, OperationMode, RebalancingCtx,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
@@ -2018,16 +2018,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     Box::pin(async move {
         info!("Initializing rebalancing infrastructure");
 
-        // The parse layer already rejects a `[rebalancing]` section without
-        // an Alpaca broker (`RebalancingCtxError::NotAlpacaBroker`), so the
-        // DryRun arm is reachable only from a hand-built ctx (e.g. in a
-        // unit test) and surfaces the same typed error instead of a panic.
-        let alpaca_auth = match &deps.ctx.broker {
-            BrokerCtx::AlpacaBrokerApi(alpaca_auth) => alpaca_auth,
-            BrokerCtx::DryRun => {
-                return Err(CtxError::from(RebalancingCtxError::NotAlpacaBroker).into());
-            }
-        };
+        let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &deps.ctx.broker;
 
         let BaseWallet(base_wallet) = wallets.base();
         let market_maker_wallet = base_wallet.address();
