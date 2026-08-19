@@ -4,6 +4,7 @@
   import * as Card from '$lib/components/ui/card'
   import type { Inventory } from '$lib/api/Inventory'
   import type { Position } from '$lib/api/Position'
+  import type { EquityPrice } from '$lib/api/EquityPrice'
   import type { Settings } from '$lib/api/Settings'
 
   const inventoryQuery = createQuery<Inventory>(() => ({
@@ -16,6 +17,11 @@
     enabled: false
   }))
 
+  const equityPricesQuery = createQuery<EquityPrice[]>(() => ({
+    queryKey: ['equity-prices'],
+    enabled: false
+  }))
+
   const settingsQuery = createQuery<Settings>(() => ({
     queryKey: ['settings'],
     enabled: false
@@ -25,6 +31,7 @@
   const symbols = $derived(inventory?.perSymbol ?? [])
   const usdc = $derived(inventory?.usdc)
   const positions = $derived(positionsQuery.data ?? [])
+  const equityPrices = $derived(equityPricesQuery.data ?? [])
   const settings = $derived(settingsQuery.data)
 
   let glossaryDialogEl: HTMLDialogElement | undefined = $state()
@@ -59,7 +66,7 @@
     { name: 'Alpaca', def: 'Shares held at Alpaca (offchain available).' },
     { name: 'Total', def: 'Raindex + Inflight + Alpaca. Excludes wallet-observed amounts (Unwrapped / Wrapped).' },
     { name: 'Ratio', def: 'Proportion of total shares sitting on Raindex (onchain / total). Bar and percent reflect the current split; colored offset is deviation from target.' },
-    { name: 'Exposure', def: 'Net directional dollar exposure from counterparty fills (Alpaca-reported net position × last price). ▲ green = long, ▼ red = short. Values under $0.01 render as ~$0.' },
+    { name: 'Exposure', def: 'Net directional dollar exposure from counterparty fills (net position × live pricing-service reference price). ▲ green = long, ▼ red = short. An em dash means the live price is unavailable; known values under $0.01 render as $0.' },
     { name: 'Unwrapped', def: 'Wallet-observed tSTOCK parked on the Base wallet between a Raindex withdrawal and an Alpaca redemption transfer (or post-mint, pre-vault deposit). Out-of-band — NOT part of imbalance math.' },
     { name: 'Wrapped', def: 'Wallet-observed wtSTOCK vault shares on the Base wallet (post vault-withdraw, pre-unwrap). Out-of-band — NOT part of imbalance math.' },
   ]
@@ -86,7 +93,7 @@
         Waiting for inventory data…
       </div>
     {:else}
-      <AvailableInventory {symbols} {usdc} {positions} {settings} />
+      <AvailableInventory {symbols} {usdc} {positions} {equityPrices} {settings} />
     {/if}
   </Card.Content>
 </Card.Root>

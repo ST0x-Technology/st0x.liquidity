@@ -18,7 +18,7 @@ describe('equityUsdTooltip', () => {
 
   it('reports missing price data instead of guessing', () => {
     expect(equityUsdTooltip('3.5', null)).toBe(
-      'Current USD value unavailable: missing latest price'
+      'Current USD value unavailable: missing live pricing-service price'
     )
   })
 })

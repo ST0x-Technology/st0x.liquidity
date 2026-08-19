@@ -11,6 +11,7 @@ mod imbalance_threshold;
 mod loader;
 mod orchestrator;
 mod order_poller;
+mod pricing;
 mod rebalancing;
 mod telemetry;
 mod threshold;
@@ -26,6 +27,7 @@ pub use imbalance_threshold::{ImbalanceThreshold, InvalidImbalanceThreshold};
 pub use loader::*;
 pub use orchestrator::{OrchestratorAddresses, OrchestratorConfig, OrchestratorError};
 pub use order_poller::OrderPollerCtx;
+pub use pricing::{PricingApiKey, PricingConfig, PricingCtx, PricingCtxError};
 pub use rebalancing::{
     ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, RebalancingConfig, RebalancingCtx,
     RebalancingCtxError, UsdcRebalancing,

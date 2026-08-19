@@ -782,6 +782,7 @@ mod tests {
             broker: BrokerCtx::DryRun,
             telemetry: None,
             alerts: None,
+            pricing: None,
             trading_mode: TradingMode::Standalone,
             order_owner: Address::ZERO,
             wallet: None,
@@ -877,6 +878,7 @@ mod tests {
             }),
             telemetry: None,
             alerts: None,
+            pricing: None,
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: None,

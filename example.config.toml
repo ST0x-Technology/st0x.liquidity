@@ -12,6 +12,11 @@ inventory_divergence_threshold = 10
 # configured ingestion_cutoff block. The poll interval defaults to 5 seconds when omitted.
 order_fill_poll_interval = 5
 
+# Live dashboard reference prices. The pricing service runs on the private
+# network and authenticates the WebSocket with `[pricing].api_key` from secrets.
+[pricing]
+ws_url = "ws://st0x-pricing:8080/ws"
+
 [telemetry]
 service_name = "st0x-hedge"
 # Deployment environment exported as the `deployment.environment` resource

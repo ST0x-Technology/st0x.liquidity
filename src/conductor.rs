@@ -6278,7 +6278,7 @@ mod tests {
             pool.clone(),
             apalis_pool.clone(),
             Duration::from_secs(60),
-            crate::startup::StartupBarrier::new(1).token(),
+            crate::startup::StartupBarrier::new().token(),
         );
 
         wait_for_job_count(&apalis_pool, 0).await;
@@ -6369,7 +6369,7 @@ mod tests {
             pool.clone(),
             apalis_pool.clone(),
             Duration::from_secs(60),
-            crate::startup::StartupBarrier::new(1).token(),
+            crate::startup::StartupBarrier::new().token(),
         );
 
         // The two non-transfer rows and ordinary completed poll row are pruned;
@@ -10327,13 +10327,6 @@ mod tests {
             Statement::PositionUpdate(position) => {
                 assert_eq!(position.symbol, symbol);
                 assert!(position.net.eq(float!(3)).unwrap());
-                assert!(
-                    position
-                        .last_price_usdc
-                        .expect("position update should include last price")
-                        .eq(float!(150))
-                        .unwrap()
-                );
             }
             other => panic!("expected PositionUpdate message, got {other:?}"),
         }
@@ -10409,13 +10402,6 @@ mod tests {
             Statement::PositionUpdate(position) => {
                 assert_eq!(position.symbol, symbol);
                 assert!(position.net.eq(float!(3)).unwrap());
-                assert!(
-                    position
-                        .last_price_usdc
-                        .expect("position update should include last price")
-                        .eq(float!(150))
-                        .unwrap()
-                );
             }
             other => panic!("expected PositionUpdate message, got {other:?}"),
         }

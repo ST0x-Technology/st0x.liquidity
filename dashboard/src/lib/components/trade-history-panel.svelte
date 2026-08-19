@@ -5,7 +5,7 @@
   import * as Table from '$lib/components/ui/table'
   import HoverTooltip from '$lib/components/hover-tooltip.svelte'
   import CliCommandBlock from '$lib/components/cli-command-block.svelte'
-  import type { Position } from '$lib/api/Position'
+  import type { EquityPrice } from '$lib/api/EquityPrice'
   import type { Trade } from '$lib/api/Trade'
   import type { TradingVenue } from '$lib/api/TradingVenue'
   import TradeOutcomeView from '$lib/components/trade-outcome.svelte'
@@ -20,6 +20,7 @@
   import { formatUtc, toDatetimeLocal, TIME_PRESETS, FETCH_TIMEOUT_MS, toRfc3339 } from '$lib/time'
   import { formatDecimal } from '$lib/decimal'
   import { equityUsdTooltip } from '$lib/inventory-value'
+  import { availablePriceUsd } from '$lib/equity-price'
   import { tradeRecoveryCommands } from '$lib/transfer'
   import {
     TRADING_VENUES,
@@ -65,8 +66,8 @@
   let nextV3ProbeAt = 0
   let historyTradeProtocol: TradeProtocol = 'terminal_outcomes_v3'
 
-  const positionsQuery = createQuery<Position[]>(() => ({
-    queryKey: ['positions'],
+  const equityPricesQuery = createQuery<EquityPrice[]>(() => ({
+    queryKey: ['equity-prices'],
     enabled: false
   }))
   const tradesQuery = createQuery<Trade[]>(() => ({
@@ -76,7 +77,7 @@
 
   const positionPrices = $derived(
     new Map(
-      (positionsQuery.data ?? []).map((position) => [position.symbol, position.last_price_usdc])
+      (equityPricesQuery.data ?? []).map((price) => [price.symbol, availablePriceUsd(price.status)])
     )
   )
 

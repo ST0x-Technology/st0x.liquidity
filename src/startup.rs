@@ -1,9 +1,11 @@
 //! Coordinates startup acknowledgements and deployment readiness reporting.
 //!
 //! [`StartupBarrier`] waits for one acknowledgement from each essential run
-//! loop, while [`StartupToken`] acknowledges only after its wrapped future has
-//! reached a pending state. Once the barrier completes, the deployment notifier
-//! writes the ready process ID that activation validates against systemd.
+//! loop registered through [`StartupBarrier::token`], while [`StartupToken`]
+//! acknowledges only after its wrapped future has reached a pending state. All
+//! tokens are issued before the startup wait begins. Once the barrier completes,
+//! the deployment notifier writes the ready process ID that activation validates
+//! against systemd.
 
 use anyhow::Context;
 use std::future::Future;
@@ -58,21 +60,23 @@ pub(crate) fn report_ready(notifier: &dyn StartupNotifier) -> anyhow::Result<()>
 
 #[derive(Debug)]
 pub(crate) struct StartupBarrier {
-    required: usize,
+    required: AtomicUsize,
     acknowledged: Arc<AtomicUsize>,
     notify: Arc<Notify>,
 }
 
 impl StartupBarrier {
-    pub(crate) fn new(required: usize) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            required,
+            required: AtomicUsize::new(0),
             acknowledged: Arc::new(AtomicUsize::new(0)),
             notify: Arc::new(Notify::new()),
         }
     }
 
     pub(crate) fn token(&self) -> StartupToken {
+        self.required.fetch_add(1, Ordering::AcqRel);
+
         StartupToken {
             acknowledged: Arc::new(AtomicBool::new(false)),
             acknowledged_count: Arc::clone(&self.acknowledged),
@@ -84,7 +88,7 @@ impl StartupBarrier {
         loop {
             let notified = self.notify.notified();
 
-            if self.acknowledged.load(Ordering::Acquire) >= self.required {
+            if self.acknowledged.load(Ordering::Acquire) >= self.required.load(Ordering::Acquire) {
                 return;
             }
 
@@ -228,7 +232,7 @@ mod tests {
 
     #[tokio::test]
     async fn immediately_ready_future_does_not_acknowledge_startup() {
-        let barrier = StartupBarrier::new(1);
+        let barrier = StartupBarrier::new();
         let token = barrier.token();
 
         token.wrap(ready(Ok::<(), Infallible>(()))).await.unwrap();
@@ -240,7 +244,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_future_acknowledges_startup_once_across_clones() {
-        let barrier = StartupBarrier::new(1);
+        let barrier = StartupBarrier::new();
         let token = barrier.token();
         let cloned = token.clone();
         let first = tokio::spawn(token.wrap(pending::<()>()));
@@ -256,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervised_task_acknowledges_after_reaching_its_run_loop() {
-        let barrier = StartupBarrier::new(1);
+        let barrier = StartupBarrier::new();
         let mut task = StartupTask {
             task: PendingTask,
             token: barrier.token(),
@@ -268,5 +272,22 @@ mod tests {
             .expect("a pending supervised task should acknowledge startup");
 
         task_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn barrier_waits_for_every_issued_token() {
+        let barrier = StartupBarrier::new();
+        let first = barrier.token();
+        let second = barrier.token();
+        first.acknowledge();
+
+        tokio::time::timeout(std::time::Duration::from_millis(10), barrier.wait())
+            .await
+            .expect_err("one unacknowledged token must keep startup pending");
+
+        second.acknowledge();
+        tokio::time::timeout(std::time::Duration::from_secs(1), barrier.wait())
+            .await
+            .expect("all issued tokens should complete startup");
     }
 }

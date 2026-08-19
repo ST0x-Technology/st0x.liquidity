@@ -3,21 +3,24 @@
   import type { SymbolInventory } from '$lib/api/SymbolInventory'
   import type { UsdcInventory } from '$lib/api/UsdcInventory'
   import type { Position } from '$lib/api/Position'
+  import type { EquityPrice } from '$lib/api/EquityPrice'
   import type { Settings } from '$lib/api/Settings'
   import InventoryHoverValue from '$lib/components/inventory-hover-value.svelte'
   import { decimalAdd, decimalCompare, decimalIsZero, formatDecimal } from '$lib/decimal'
   import { reactive } from '$lib/frp.svelte'
   import { cashInventoryAmounts } from '$lib/inventory-cash'
   import { cashUsdTooltip, equityUsdTooltip, positionSharesTooltip } from '$lib/inventory-value'
+  import { availablePriceUsd, equityExposureUsd, formatExposureUsd } from '$lib/equity-price'
 
   interface Props {
     symbols: SymbolInventory[]
     usdc: UsdcInventory | undefined
     positions: Position[]
+    equityPrices: EquityPrice[]
     settings: Settings | undefined
   }
 
-  let { symbols, usdc, positions, settings }: Props = $props()
+  let { symbols, usdc, positions, equityPrices, settings }: Props = $props()
 
   const trimTrailingZeros = (formatted: string): string => {
     if (!formatted.includes('.')) return formatted
@@ -97,7 +100,6 @@
 
   const formatRatio = (ratio: number): string => `${(ratio * 100).toFixed(1)}%`
 
-  type PositionInfo = { net: string; priceUsdc: string | null }
   type AssetFlags = {
     counterTrading: boolean
     rebalancing: boolean
@@ -105,15 +107,11 @@
   }
 
   const positionMap = $derived(
-    new Map(
-      positions.map((position) => [
-        position.symbol,
-        {
-          net: position.net,
-          priceUsdc: position.last_price_usdc
-        } satisfies PositionInfo
-      ])
-    )
+    new Map(positions.map((position) => [position.symbol, position.net]))
+  )
+
+  const equityPriceMap = $derived(
+    new Map(equityPrices.map((price) => [price.symbol, price.status]))
   )
 
   const assetFlagsMap = $derived(
@@ -147,7 +145,7 @@
     raindex: Formatted
     total: Formatted
     ratio: number
-    exposure: number
+    exposure: string | null
     netShares: string
     priceUsdc: string | null
     // null when the symbol has no settings entry (unconfigured): the status
@@ -163,7 +161,8 @@
         inflight
       )
       const stripped = stripPrefix(item.symbol)
-      const pos = positionMap.get(stripped)
+      const netShares = positionMap.get(stripped) ?? '0'
+      const priceUsdc = availablePriceUsd(equityPriceMap.get(stripped))
       const flags = assetFlagsMap.get(stripped) ?? null
 
       return {
@@ -175,9 +174,9 @@
         raindex: fmt(item.onchainAvailable),
         total: fmtValue(totalVal),
         ratio: computeRatio(item.onchainAvailable, item.offchainAvailable),
-        exposure: pos?.priceUsdc ? parseFloat(pos.net) * parseFloat(pos.priceUsdc) : 0,
-        netShares: pos?.net ?? '0',
-        priceUsdc: pos?.priceUsdc ?? null,
+        exposure: equityExposureUsd(netShares, equityPriceMap.get(stripped)),
+        netShares,
+        priceUsdc,
         flags
       }
     })
@@ -227,7 +226,11 @@
     raindex: (lhs, rhs) => decimalCompare(lhs.raindex.full, rhs.raindex.full),
     total: (lhs, rhs) => decimalCompare(lhs.total.full, rhs.total.full),
     ratio: (lhs, rhs) => lhs.ratio - rhs.ratio,
-    exposure: (lhs, rhs) => lhs.exposure - rhs.exposure
+    exposure: (lhs, rhs) => {
+      if (lhs.exposure === null) return rhs.exposure === null ? 0 : 1
+      if (rhs.exposure === null) return -1
+      return decimalCompare(lhs.exposure, rhs.exposure)
+    }
   }
 
   const sortedEquities = $derived.by(() => {
@@ -241,6 +244,10 @@
 
       if (sort.current) {
         const { column, dir } = sort.current
+        if (column === 'exposure') {
+          if (lhs.exposure === null) return rhs.exposure === null ? 0 : 1
+          if (rhs.exposure === null) return -1
+        }
         const cmp = equityComparators[column]
         const direction = dir === 'desc' ? -1 : 1
         return direction * cmp(lhs, rhs)
@@ -310,14 +317,11 @@
     return { style: 'normal' }
   }
 
-  const isNegligible = (value: number): boolean => Math.abs(value) < 0.01
+  const exposureDirection = (value: string | null): number =>
+    value === null ? 0 : decimalCompare(value, '0')
 
-  const fmtExposure = (value: number): string => {
-    if (value === 0 || isNegligible(value)) return '$0'
-    const sign = value > 0 ? '+' : '-'
-    const abs = Math.abs(value)
-    return `${sign}$${abs.toFixed(2)}`
-  }
+  const isNegligibleExposure = (value: string | null): boolean =>
+    value !== null && formatExposureUsd(value) === '$0'
 
   const showRebalanceable = $derived(
     cashCells?.rebalanceableUsd !== null && cashCells?.rebalanceableUsd !== undefined
@@ -751,18 +755,20 @@
 
           <Table.Cell>
             <div class="flex items-center gap-1.5 font-mono text-[11px]">
-              {#if !isNegligible(row.exposure) && row.exposure !== 0}
+              {#if exposureDirection(row.exposure) !== 0 && !isNegligibleExposure(row.exposure)}
                 <span
-                  class="text-base leading-none {row.exposure > 0
+                  class="text-base leading-none {exposureDirection(row.exposure) > 0
                     ? 'text-green-500'
-                    : 'text-red-500'}">{row.exposure > 0 ? '▲' : '▼'}</span
+                    : 'text-red-500'}">{exposureDirection(row.exposure) > 0 ? '▲' : '▼'}</span
                 >
               {/if}
               <InventoryHoverValue
-                display={fmtExposure(row.exposure)}
-                tooltip={positionSharesTooltip(row.netShares)}
+                display={formatExposureUsd(row.exposure)}
+                tooltip={row.exposure === null
+                  ? `USD exposure unavailable: missing live price. ${positionSharesTooltip(row.netShares)}`
+                  : positionSharesTooltip(row.netShares)}
                 class={dimClass(
-                  `cursor-help hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4 ${row.exposure === 0 || isNegligible(row.exposure) ? 'text-muted-foreground' : row.exposure > 0 ? 'text-green-500' : 'text-red-500'}`,
+                  `cursor-help hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4 ${row.exposure === null || isNegligibleExposure(row.exposure) ? 'text-muted-foreground' : exposureDirection(row.exposure) > 0 ? 'text-green-500' : 'text-red-500'}`,
                   ctActive
                 )}
               />

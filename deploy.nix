@@ -48,6 +48,7 @@ let
       let
         configFile = ./config/${env}/${name}.toml;
         secretsFile = ./secret/${cfg.encryptedSecret};
+        secretOverlayFiles = map (file: ./secret/${file}) (cfg.encryptedSecretOverlays or [ ]);
         startupReadyFile = "/run/${name}/startup-ready";
         startupWaitCommand = ''
           startup_ready=0
@@ -95,6 +96,13 @@ let
         stopCommand = "systemctl stop ${name}";
         installConfigCommand = "install -D -m 0640 -o root -g st0x ${stagedConfigPath} ${cfg.configPath}";
         installSecretCommand = "install -D -m 0640 -o root -g st0x ${stagedSecretPath} ${cfg.decryptedSecretPath}";
+        stageSecretCommands = [
+          "${rage} -d -i ${hostKey} ${secretsFile} | install -D -m 0640 -o root -g st0x /dev/stdin ${stagedSecretPath}"
+        ]
+        ++ map (
+          overlay:
+          "printf '\n' >> ${stagedSecretPath} && ${rage} -d -i ${hostKey} ${overlay} >> ${stagedSecretPath}"
+        ) secretOverlayFiles;
         beforeStopCommands = [
           # The readiness environment ships in the system profile, while this
           # activation ships the binary and wait loop. Enforce system-first on
@@ -106,7 +114,9 @@ let
           # every success/failure path.
           "trap 'rm -f ${stagedConfigPath} ${stagedSecretPath}' EXIT"
           "install -D -m 0640 -o root -g st0x ${configFile} ${stagedConfigPath}"
-          "${rage} -d -i ${hostKey} ${secretsFile} | install -D -m 0640 -o root -g st0x /dev/stdin ${stagedSecretPath}"
+        ]
+        ++ stageSecretCommands
+        ++ [
           validateCommand
           # Query Turnkey policies read-only before stopping the old process.
           # Missing coverage exits non-zero, leaving both the running bot and
@@ -182,17 +192,26 @@ let
         # st0x services whose plaintext configs live under config/<env>/.
         configFile = ./config/${name}.toml;
         secretsFile = ./secret/${cfg.encryptedSecret};
+        secretOverlayFiles = map (file: ./secret/${file}) (cfg.encryptedSecretOverlays or [ ]);
       in
-      joinCommands [
-        "mkdir -p /run/st0x"
-        "install -D -m 0640 -o root -g st0x ${configFile} ${cfg.configPath}"
-        "${rage} -d -i ${hostKey} ${secretsFile} | install -D -m 0640 -o root -g st0x /dev/stdin ${cfg.decryptedSecretPath}"
-        "${cfg.profilePath}/bin/validate-config --config ${cfg.configPath} --secrets ${cfg.decryptedSecretPath}"
-        # Match st0x's DB ownership so the CLI's SQLite DB is st0x:st0x
-        # regardless of who runs `s01` (glob is a no-op until the DB exists).
-        "(chown st0x:st0x /mnt/data/*.db /mnt/data/*.db-wal /mnt/data/*.db-shm /mnt/data/*.db-journal 2>/dev/null || true)"
-        "echo '${gitRev}' > /run/st0x/${name}.git-rev"
-      ]
+      joinCommands (
+        [
+          "mkdir -p /run/st0x"
+          "install -D -m 0640 -o root -g st0x ${configFile} ${cfg.configPath}"
+          "${rage} -d -i ${hostKey} ${secretsFile} | install -D -m 0640 -o root -g st0x /dev/stdin ${cfg.decryptedSecretPath}"
+        ]
+        ++ map (
+          overlay:
+          "printf '\n' >> ${cfg.decryptedSecretPath} && ${rage} -d -i ${hostKey} ${overlay} >> ${cfg.decryptedSecretPath}"
+        ) secretOverlayFiles
+        ++ [
+          "${cfg.profilePath}/bin/validate-config --config ${cfg.configPath} --secrets ${cfg.decryptedSecretPath}"
+          # Match st0x's DB ownership so the CLI's SQLite DB is st0x:st0x
+          # regardless of who runs `s01` (glob is a no-op until the DB exists).
+          "(chown st0x:st0x /mnt/data/*.db /mnt/data/*.db-wal /mnt/data/*.db-shm /mnt/data/*.db-journal 2>/dev/null || true)"
+          "echo '${gitRev}' > /run/st0x/${name}.git-rev"
+        ]
+      )
     else if cfg.kind == "plain" then
       # Marker must exist BEFORE systemctl restart, because the unit's
       # ConditionPathExists is evaluated when systemd processes the start

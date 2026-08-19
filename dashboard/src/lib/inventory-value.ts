@@ -23,7 +23,7 @@ export const cashUsdTooltip = (amount: string): string =>
 
 export const equityUsdTooltip = (shares: string, priceUsdc: string | null): string => {
   if (priceUsdc === null) {
-    return 'Current USD value unavailable: missing latest price'
+    return 'Current USD value unavailable: missing live pricing-service price'
   }
 
   return `Current USD value: ${formatUsd(toDecimal(shares).mul(toDecimal(priceUsdc)))}`

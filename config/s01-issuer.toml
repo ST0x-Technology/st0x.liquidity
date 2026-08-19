@@ -24,6 +24,9 @@ database_url = "sqlite:///mnt/data/s01-issuer.db"
 apalis_finished_job_cleanup_interval_secs = 3600
 inventory_divergence_threshold = 10
 
+[pricing]
+ws_url = "ws://st0x-pricing:8080/ws"
+
 # On-chain orderbook settings (same Rain Orderbook on Base as the bot).
 [raindex]
 orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"

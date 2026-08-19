@@ -20,6 +20,7 @@ use st0x_finance::Positive;
 use crate::AppState;
 use crate::position::Position;
 
+pub(crate) mod equity_price;
 mod event;
 pub(crate) mod pnl;
 mod trade_loader;
@@ -82,6 +83,7 @@ impl TradeProtocol {
                 Statement::CurrentState(_)
                 | Statement::TradeFill(_)
                 | Statement::PositionUpdate(_)
+                | Statement::EquityPriceUpdate(_)
                 | Statement::InventorySnapshot(_)
                 | Statement::TransferUpdate(_) => true,
             },
@@ -91,6 +93,7 @@ impl TradeProtocol {
                     Statement::TradeUpdate(trade) => self.includes_trade(trade),
                     Statement::CurrentState(_)
                     | Statement::PositionUpdate(_)
+                    | Statement::EquityPriceUpdate(_)
                     | Statement::InventorySnapshot(_)
                     | Statement::TransferUpdate(_) => true,
                 }
@@ -145,6 +148,7 @@ fn serialize_statement(
         || matches!(
             statement,
             Statement::PositionUpdate(_)
+                | Statement::EquityPriceUpdate(_)
                 | Statement::InventorySnapshot(_)
                 | Statement::TransferUpdate(_)
         )
@@ -171,6 +175,7 @@ fn serialize_statement(
         }
         Statement::TradeFill(_)
         | Statement::PositionUpdate(_)
+        | Statement::EquityPriceUpdate(_)
         | Statement::InventorySnapshot(_)
         | Statement::TransferUpdate(_) => {}
     }
@@ -255,6 +260,7 @@ async fn send_initial_state(
         trades,
         inventory: inventory_dto,
         positions,
+        equity_prices: state.equity_prices.snapshot(chrono::Utc::now()).await,
         settings: state.settings.clone(),
         active_transfers: transfers.active,
         recent_transfers: transfers.recent,
@@ -452,7 +458,6 @@ async fn load_positions(pool: &SqlitePool) -> Vec<st0x_dto::Position> {
             Ok(Some(position)) => positions.push(st0x_dto::Position {
                 symbol: position.symbol,
                 net: position.net.inner(),
-                last_price_usdc: position.last_price.map(|observation| observation.price),
             }),
             Ok(None) => {
                 warn!(target: "dashboard", %id, "Position disappeared while loading dashboard state");
@@ -476,7 +481,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::{WebSocketStream, connect_async};
 
-    use st0x_config::{EquityAssetConfig, create_test_ctx_with_order_owner};
+    use st0x_config::{AssetsConfig, EquityAssetConfig, create_test_ctx_with_order_owner};
     use st0x_dto::{Direction, Trade, TradingVenue};
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::{
@@ -628,6 +633,7 @@ mod tests {
             trades: Vec::new(),
             inventory: st0x_dto::Inventory::empty(),
             positions: Vec::new(),
+            equity_prices: Vec::new(),
             settings: empty_settings(),
             active_transfers: Vec::new(),
             recent_transfers: Vec::new(),
@@ -723,6 +729,7 @@ mod tests {
                 inventory::InventoryView::default(),
                 sender,
             )),
+            equity_prices: equity_price::EquityPriceStore::new(&AssetsConfig::default()),
             settings: empty_settings(),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(crate::api::ResumeLock(tokio::sync::Mutex::new(()))),
@@ -779,6 +786,7 @@ mod tests {
             trades: Vec::new(),
             inventory: st0x_dto::Inventory::empty(),
             positions: Vec::new(),
+            equity_prices: Vec::new(),
             settings: empty_settings(),
             active_transfers: Vec::new(),
             recent_transfers: Vec::new(),
@@ -787,6 +795,7 @@ mod tests {
         let json = serde_json::to_value(&state).expect("serialization should succeed");
         assert_eq!(json["trades"], json!([]));
         assert_eq!(json["positions"], json!([]));
+        assert_eq!(json["equityPrices"], json!([]));
         assert_eq!(json["activeTransfers"], json!([]));
         assert_eq!(json["recentTransfers"], json!([]));
         assert_eq!(json["warnings"], json!([]));
@@ -824,6 +833,7 @@ mod tests {
         assert_eq!(parsed["type"], "current_state");
         assert!(parsed["data"]["trades"].is_array());
         assert!(parsed["data"]["inventory"].is_object());
+        assert_eq!(parsed["data"]["equityPrices"], json!([]));
 
         server.shutdown().await;
     }
