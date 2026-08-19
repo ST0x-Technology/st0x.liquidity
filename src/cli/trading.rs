@@ -206,11 +206,13 @@ fn write_order_status<W: Write>(stdout: &mut W, state: OrderState) -> anyhow::Re
         OrderState::Filled {
             executed_at,
             order_id,
+            shares_filled,
             price,
         } => {
             writeln!(stdout, "✅ Order Status: FILLED")?;
             writeln!(stdout, "   Order ID: {order_id}")?;
             writeln!(stdout, "   Executed At: {executed_at}")?;
+            writeln!(stdout, "   Shares Filled: {shares_filled}")?;
             writeln!(stdout, "   Fill Price: ${price}")?;
         }
         OrderState::Cancelled {
@@ -281,10 +283,10 @@ async fn get_broker_order_status<W: Write>(
             )
             .await?)
         }
-        BrokerCtx::DryRun => {
-            let broker = MockExecutorCtx.try_into_executor().await?;
-            Ok(broker.get_order_status(&order_id.to_string()).await?)
-        }
+        BrokerCtx::DryRun => anyhow::bail!(
+            "order status is unavailable in dry-run mode because dry-run does not persist broker \
+             order state"
+        ),
     }
 }
 
@@ -621,7 +623,7 @@ pub(super) async fn execute_market_buy_until_filled<W: Write>(
     symbol: Symbol,
     shares: Positive<FractionalShares>,
     stdout: &mut W,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Positive<FractionalShares>> {
     let market_order = MarketOrder {
         symbol,
         shares,
@@ -645,7 +647,8 @@ async fn place_market_order_until_filled<Exec: Executor, W: Write>(
     broker: &Exec,
     market_order: MarketOrder,
     stdout: &mut W,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Positive<FractionalShares>> {
+    let requested_shares = market_order.shares;
     let placement = retry_on_backpressure(
         || broker.place_market_order(market_order.clone()),
         BACKPRESSURE_RETRY_MAX_ATTEMPTS,
@@ -660,9 +663,27 @@ async fn place_market_order_until_filled<Exec: Executor, W: Write>(
         )
         .await?;
         match order_state {
-            OrderState::Filled { order_id, .. } => {
+            OrderState::Filled {
+                order_id,
+                shares_filled,
+                ..
+            } => {
                 writeln!(stdout, "   Buy filled (order {order_id})")?;
-                return Ok(());
+                let requested_matches_placed = requested_shares
+                    .inner()
+                    .inner()
+                    .eq(placement.shares.inner().inner())?;
+                let placed_matches_filled = placement
+                    .shares
+                    .inner()
+                    .inner()
+                    .eq(shares_filled.inner().inner())?;
+                if !requested_matches_placed || !placed_matches_filled {
+                    writeln!(stdout, "   Requested quantity: {requested_shares}")?;
+                    writeln!(stdout, "   Placed quantity: {}", placement.shares)?;
+                    writeln!(stdout, "   Filled quantity: {shares_filled}")?;
+                }
+                return Ok(shares_filled);
             }
             OrderState::Failed { error_reason, .. } => {
                 anyhow::bail!("buy order failed: {error_reason:?}");
@@ -1282,6 +1303,7 @@ mod tests {
     struct SequencedStatusExecutor {
         statuses: Arc<Vec<OrderState>>,
         status_calls: Arc<AtomicUsize>,
+        placed_shares: Option<Positive<FractionalShares>>,
     }
 
     impl SequencedStatusExecutor {
@@ -1289,7 +1311,13 @@ mod tests {
             Self {
                 statuses: Arc::new(statuses),
                 status_calls: Arc::new(AtomicUsize::new(0)),
+                placed_shares: None,
             }
+        }
+
+        fn with_placed_shares(mut self, placed_shares: Positive<FractionalShares>) -> Self {
+            self.placed_shares = Some(placed_shares);
+            self
         }
 
         fn status_calls(&self) -> usize {
@@ -1315,10 +1343,11 @@ mod tests {
             &self,
             order: MarketOrder,
         ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+            let shares = self.placed_shares.unwrap_or(order.shares);
             Ok(OrderPlacement {
                 order_id: "sequenced-order-id".to_string(),
                 symbol: order.symbol,
-                shares: order.shares,
+                shares,
                 direction: order.direction,
                 placed_at: Utc::now(),
                 extended_hours: false,
@@ -1445,6 +1474,23 @@ mod tests {
             time_in_force: TimeInForce::Day,
         });
         ctx
+    }
+
+    #[tokio::test]
+    async fn order_status_is_unavailable_in_dry_run_mode() {
+        let ctx = create_base_test_ctx();
+        let pool = setup_test_db().await;
+        let mut stdout = Vec::new();
+
+        let error = order_status_command(&mut stdout, "TEST_1", &ctx, &pool)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "order status is unavailable in dry-run mode because dry-run does not persist broker \
+             order state"
+        );
     }
 
     fn cli_order_request(
@@ -2058,9 +2104,11 @@ mod tests {
         };
         let mut stdout = Vec::new();
 
-        place_market_order_until_filled(&broker, order, &mut stdout)
+        let shares_filled = place_market_order_until_filled(&broker, order, &mut stdout)
             .await
             .expect("a filled order must resolve the buy-fill wait");
+
+        assert_eq!(shares_filled, positive_shares("10"));
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(
@@ -2083,6 +2131,7 @@ mod tests {
             OrderState::Filled {
                 executed_at: Utc::now(),
                 order_id: ExecutorOrderId::new("sequenced-order-id"),
+                shares_filled: positive_shares("10"),
                 price: st0x_execution::Usd::new(Float::parse("195.30".to_string()).unwrap()),
             },
         ]);
@@ -2094,7 +2143,7 @@ mod tests {
         };
         let mut stdout = Vec::new();
 
-        place_market_order_until_filled(&broker, order, &mut stdout)
+        let shares_filled = place_market_order_until_filled(&broker, order, &mut stdout)
             .await
             .expect("partial fill should keep polling until the broker reports Filled");
 
@@ -2104,6 +2153,7 @@ mod tests {
             2,
             "the buy-fill wait must poll again after PartiallyFilled"
         );
+        assert_eq!(shares_filled, positive_shares("10"));
         assert!(
             output.contains("Buy filled"),
             "the buy-fill wait must report the final fill, got: {output}"
@@ -2134,6 +2184,41 @@ mod tests {
         assert!(
             error.to_string().contains("buy order failed"),
             "a rejected order must fail the buy-fill wait, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_buy_returns_filled_quantity_and_reports_quantity_adjustments() {
+        let filled_shares = positive_shares("0.0041");
+        let broker = SequencedStatusExecutor::new(vec![OrderState::Filled {
+            executed_at: Utc::now(),
+            order_id: ExecutorOrderId::new("sequenced-order-id"),
+            shares_filled: filled_shares,
+            price: st0x_execution::Usd::new(Float::parse("199.50".to_string()).unwrap()),
+        }])
+        .with_placed_shares(positive_shares("0.004115451"));
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: positive_shares("0.004115451077565126"),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+        };
+        let mut stdout = Vec::new();
+
+        let returned_shares = place_market_order_until_filled(&broker, order, &mut stdout)
+            .await
+            .unwrap();
+
+        assert_eq!(returned_shares, filled_shares);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            concat!(
+                "   Buy order placed: sequenced-order-id\n",
+                "   Buy filled (order sequenced-order-id)\n",
+                "   Requested quantity: 0.004115451077565126\n",
+                "   Placed quantity: 0.004115451\n",
+                "   Filled quantity: 0.0041\n",
+            )
         );
     }
 
@@ -2227,6 +2312,7 @@ mod tests {
             Ok(OrderState::Filled {
                 executed_at: Utc::now(),
                 order_id: ExecutorOrderId::new("backpressure-order-id"),
+                shares_filled: positive_shares("10"),
                 price: st0x_execution::Usd::new(Float::parse("195.30".to_string()).unwrap()),
             })
         }
@@ -3918,6 +4004,28 @@ mod tests {
         assert!(
             error.contains("average price"),
             "a cancelled partial fill with price must report it, got: {error}"
+        );
+    }
+
+    #[test]
+    fn write_order_status_displays_filled_quantity() {
+        let mut stdout = Vec::new();
+
+        write_order_status(
+            &mut stdout,
+            OrderState::Filled {
+                executed_at: Utc::now(),
+                order_id: ExecutorOrderId::new("some-broker-order-id"),
+                shares_filled: positive_shares("1.5"),
+                price: Usd::new(Float::parse("195.25".to_string()).unwrap()),
+            },
+        )
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("Shares Filled: 1.5"),
+            "status output must include the executed quantity, got: {output}"
         );
     }
 

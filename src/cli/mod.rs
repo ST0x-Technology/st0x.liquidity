@@ -1306,7 +1306,7 @@ fn validate_command(command: &Commands) -> anyhow::Result<()> {
     }
 }
 
-async fn run_command_with_writers<W: Write>(
+async fn run_command_with_writers<W: Write + Send>(
     ctx: Ctx,
     command: Commands,
     pool: &SqlitePool,
@@ -1946,7 +1946,7 @@ impl ManualPositionTarget {
     }
 }
 
-async fn run_provider_command<W: Write>(
+async fn run_provider_command<W: Write + Send>(
     command: ProviderCommand,
     ctx: &Ctx,
     pool: &SqlitePool,

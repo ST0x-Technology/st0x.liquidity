@@ -239,6 +239,21 @@ distinct — neither key alone can both mint and authorize.
   section carrying only other networks' entries is flagged with a startup
   warning instead of staying silently inert.
 
+#### Dividend NAV Bump
+
+The issuer's `dividend-bump` command buys the underlying equity, tokenizes the
+acquired shares, and donates the resulting tokenized equity into its ERC-4626
+wrapper. The broker-confirmed filled quantity is authoritative for both the
+tokenization and donation steps; the originally requested quantity must never be
+reused after placement because Alpaca may truncate it to the precision the
+broker supports.
+
+A filled broker order must report a strictly positive `filled_qty` equal to the
+order quantity Alpaca reports. The command fails closed before tokenization if
+the field is absent, non-positive, or inconsistent with the broker-reported
+order quantity. When requested, placed, and filled quantities differ, the CLI
+shows all three so the adjustment is visible to the operator.
+
 ## Bot Implementation Specification
 
 The arbitrage bot will be built in Rust to leverage its performance, safety, and

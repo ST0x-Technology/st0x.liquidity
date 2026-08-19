@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{ExecutorOrderId, FractionalShares, Usd};
+use crate::{ExecutorOrderId, FractionalShares, Positive, Usd};
 
 use super::OrderStatus;
 
@@ -39,6 +39,7 @@ pub enum OrderState {
     Filled {
         executed_at: DateTime<Utc>,
         order_id: ExecutorOrderId,
+        shares_filled: Positive<FractionalShares>,
         price: Usd,
     },
     Cancelled {
@@ -80,6 +81,10 @@ mod tests {
         let state = OrderState::Filled {
             executed_at: Utc::now(),
             order_id: ExecutorOrderId::new("ORDER123"),
+            shares_filled: Positive::new(FractionalShares::new(
+                Float::parse("10".to_string()).unwrap(),
+            ))
+            .unwrap(),
             price: Usd::new(Float::parse("150.00".to_string()).unwrap()),
         };
 
@@ -108,6 +113,10 @@ mod tests {
             OrderState::Filled {
                 executed_at: Utc::now(),
                 order_id: ExecutorOrderId::new("ORDER123"),
+                shares_filled: Positive::new(FractionalShares::new(
+                    Float::parse("10".to_string()).unwrap(),
+                ))
+                .unwrap(),
                 price: Usd::new(Float::parse("150.00".to_string()).unwrap()),
             }
             .status(),

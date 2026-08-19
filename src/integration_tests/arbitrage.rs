@@ -211,7 +211,16 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                 price,
                 order_id: broker_order_id,
                 executed_at,
+                shares_filled,
             } => {
+                let placed_shares = order.shares();
+                if shares_filled != placed_shares {
+                    return Err(format!(
+                        "order {order_id} reported filled quantity {shares_filled}, but the broker-accepted quantity was {placed_shares}"
+                    )
+                    .into());
+                }
+
                 offchain_order
                     .send(
                         &order_id,
@@ -227,7 +236,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                         order.symbol(),
                         PositionCommand::CompleteOffChainOrder {
                             offchain_order_id: order_id,
-                            shares_filled: order.shares(),
+                            shares_filled,
                             direction: order.direction(),
                             executor_order_id: broker_order_id.clone(),
                             price,
@@ -1150,6 +1159,66 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
             .unwrap(),
         order_id_str,
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn poll_helper_rejects_mismatched_filled_quantity() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut orderbook = setup_anvil_orderbook().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
+    let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
+        create_test_cqrs(&pool, &apalis_pool).await;
+    let symbol = Symbol::new(TEST_AAPL).unwrap();
+
+    let trade = orderbook
+        .take_order()
+        .symbol(TEST_AAPL)
+        .amount(float!(1.2))
+        .direction(Direction::Sell)
+        .price(AAPL_PRICE)
+        .call()
+        .await;
+    let order_id = trade.submit(&cqrs).await?.expect("Threshold crossed");
+    let mismatched_executor = MockExecutor::new().with_order_status(OrderState::Filled {
+        executed_at: Utc::now(),
+        order_id: ExecutorOrderId::new("broker-order-id"),
+        shares_filled: Positive::new(FractionalShares::new(float!(1.1))).unwrap(),
+        price: st0x_finance::Usd::new(float!(100)),
+    });
+
+    let error = poll_submitted_orders(
+        &mismatched_executor,
+        offchain_order_projection.as_ref(),
+        &offchain_order,
+        &position,
+    )
+    .await
+    .expect_err("mismatched broker fill must be rejected");
+
+    assert!(
+        error.to_string().contains("reported filled quantity 1.1"),
+        "unexpected error: {error}"
+    );
+    let order = offchain_order
+        .load(&order_id)
+        .await?
+        .expect("offchain order should exist");
+    assert!(
+        matches!(order, OffchainOrder::Submitted { .. }),
+        "a rejected fill must leave the order submitted"
+    );
+    assert_position()
+        .query(&position_query)
+        .symbol(&symbol)
+        .net(FractionalShares::new(float!(-1.2)))
+        .accumulated_long(FractionalShares::ZERO)
+        .accumulated_short(FractionalShares::new(float!(1.2)))
+        .pending(Some(order_id))
+        .last_price_usdc(float!(&AAPL_PRICE.to_string()))
+        .call()
+        .await;
 
     Ok(())
 }
