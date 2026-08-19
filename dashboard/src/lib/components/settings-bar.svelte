@@ -30,11 +30,6 @@
   <div class="shrink-0 border-b bg-card/30 px-2 py-1.5 md:px-4">
     <div class="flex flex-wrap items-center gap-2">
       <span class="inline-flex items-center gap-1.5 rounded-full bg-muted px-2.5 py-0.5 text-xs">
-        <span class="h-1.5 w-1.5 rounded-full {settings.tradingMode === 'rebalancing' ? 'bg-green-500' : 'bg-yellow-500'}"></span>
-        <span class="font-mono">{settings.tradingMode}</span>
-      </span>
-
-      <span class="inline-flex items-center gap-1.5 rounded-full bg-muted px-2.5 py-0.5 text-xs">
         <span class="font-mono">{settings.broker}</span>
       </span>
 
