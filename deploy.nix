@@ -14,6 +14,7 @@ let
 
   rage = "/run/current-system/sw/bin/rage";
   hostKey = "/etc/ssh/ssh_host_ed25519_key";
+  joinCommands = builtins.concatStringsSep "\n";
 
   inherit (import ./services.nix { inherit lib; }) enabled;
 
@@ -38,11 +39,10 @@ let
   # Builds the per-service activation command. Branches by service kind so we
   # don't special-case each new service in this file -- new services land in
   # services.nix and inherit the correct pipeline.
-  mkServiceProfile =
+  mkActivationScript =
     env: name:
     let
       cfg = enabled.${name};
-      pkg = self.packages.${system}.${cfg.package};
     in
     if cfg.kind == "st0x" then
       let
@@ -166,7 +166,7 @@ let
             "st0x activation must install candidate secrets after stopping the service";
           beforeStopCommands ++ [ stopCommand ] ++ afterStopCommands;
       in
-      activate.custom pkg (builtins.concatStringsSep " && " activationCommands)
+      joinCommands activationCommands
     else if cfg.kind == "cli" then
       # On-demand CLI config: install the config, decrypt the secret, and
       # validate -- exactly like the st0x kind, but start no systemd unit. The
@@ -183,18 +183,16 @@ let
         configFile = ./config/${name}.toml;
         secretsFile = ./secret/${cfg.encryptedSecret};
       in
-      activate.custom pkg (
-        builtins.concatStringsSep " && " [
-          "mkdir -p /run/st0x"
-          "install -D -m 0640 -o root -g st0x ${configFile} ${cfg.configPath}"
-          "${rage} -d -i ${hostKey} ${secretsFile} | install -D -m 0640 -o root -g st0x /dev/stdin ${cfg.decryptedSecretPath}"
-          "${cfg.profilePath}/bin/validate-config --config ${cfg.configPath} --secrets ${cfg.decryptedSecretPath}"
-          # Match st0x's DB ownership so the CLI's SQLite DB is st0x:st0x
-          # regardless of who runs `s01` (glob is a no-op until the DB exists).
-          "(chown st0x:st0x /mnt/data/*.db /mnt/data/*.db-wal /mnt/data/*.db-shm /mnt/data/*.db-journal 2>/dev/null || true)"
-          "echo '${gitRev}' > /run/st0x/${name}.git-rev"
-        ]
-      )
+      joinCommands [
+        "mkdir -p /run/st0x"
+        "install -D -m 0640 -o root -g st0x ${configFile} ${cfg.configPath}"
+        "${rage} -d -i ${hostKey} ${secretsFile} | install -D -m 0640 -o root -g st0x /dev/stdin ${cfg.decryptedSecretPath}"
+        "${cfg.profilePath}/bin/validate-config --config ${cfg.configPath} --secrets ${cfg.decryptedSecretPath}"
+        # Match st0x's DB ownership so the CLI's SQLite DB is st0x:st0x
+        # regardless of who runs `s01` (glob is a no-op until the DB exists).
+        "(chown st0x:st0x /mnt/data/*.db /mnt/data/*.db-wal /mnt/data/*.db-shm /mnt/data/*.db-journal 2>/dev/null || true)"
+        "echo '${gitRev}' > /run/st0x/${name}.git-rev"
+      ]
     else if cfg.kind == "plain" then
       # Marker must exist BEFORE systemctl restart, because the unit's
       # ConditionPathExists is evaluated when systemd processes the start
@@ -203,18 +201,24 @@ let
       # actually starts. Touch it first, then remove it on restart failure so
       # a broken unit doesn't satisfy the condition on the next system
       # activation.
-      activate.custom pkg (
-        builtins.concatStringsSep " && " [
-          "systemctl stop ${name} || true"
-          "mkdir -p /run/st0x"
-          "touch ${cfg.markerFile}"
-          "systemctl restart ${name} || { rm -f ${cfg.markerFile}; exit 1; }"
-        ]
-      )
+      joinCommands [
+        "systemctl stop ${name} || true"
+        "mkdir -p /run/st0x"
+        "touch ${cfg.markerFile}"
+        "systemctl restart ${name} || { rm -f ${cfg.markerFile}; exit 1; }"
+      ]
     else if cfg.kind == "static" then
-      activate.custom pkg cfg.activation
+      cfg.activation
     else
       throw "services.${name}: unknown kind ${cfg.kind}";
+
+  mkServiceProfile =
+    env: name:
+    let
+      cfg = enabled.${name};
+      pkg = self.packages.${system}.${cfg.package};
+    in
+    activate.custom pkg (mkActivationScript env name);
 
   mkProfile =
     env: name:
@@ -258,6 +262,18 @@ let
 
 in
 {
+  activationScripts = builtins.listToAttrs (
+    map (env: {
+      name = env;
+      value = builtins.listToAttrs (
+        map (name: {
+          inherit name;
+          value = mkActivationScript env name;
+        }) orderedServices
+      );
+    }) (builtins.attrNames environments)
+  );
+
   config = {
     nodes = builtins.listToAttrs (
       map (
