@@ -115,6 +115,14 @@
         };
       };
       envNames = builtins.attrNames environments;
+      deployment = import ./deploy.nix {
+        inherit
+          lib
+          deploy-rs
+          self
+          environments
+          ;
+      };
     in
     {
       nixosConfigurations =
@@ -162,15 +170,7 @@
           ]) envNames
         );
 
-      deploy =
-        (import ./deploy.nix {
-          inherit
-            lib
-            deploy-rs
-            self
-            environments
-            ;
-        }).config;
+      deploy = deployment.config;
     }
     // flake-utils.lib.eachDefaultSystem (
       system:
@@ -575,6 +575,22 @@
           rmdir "$_identity_tmpfile"
           touch $out
         '';
+
+        checks.deploy-activation-syntax =
+          let
+            activationScriptFiles = lib.flatten (
+              lib.mapAttrsToList (
+                env: scripts:
+                lib.mapAttrsToList (name: script: pkgs.writeText "${env}-${name}-activation" script) scripts
+              ) deployment.activationScripts
+            );
+          in
+          pkgs.runCommand "deploy-activation-syntax-test" { } ''
+            for script in ${lib.escapeShellArgs (map toString activationScriptFiles)}; do
+              ${pkgs.bash}/bin/bash -n "$script"
+            done
+            touch $out
+          '';
 
         formatter = pkgs.nixfmt-rfc-style;
 

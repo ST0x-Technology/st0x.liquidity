@@ -70,6 +70,12 @@ assert_dbus_broker() {
   fi
 }
 
+assert_activation_scripts_parse() {
+  local system
+  system=$(nix eval --impure --raw --expr builtins.currentSystem)
+  nix build --no-link ".#checks.$system.deploy-activation-syntax"
+}
+
 assert_workflow ".github/workflows/deploy-prod.yaml" "prodDeployNixosBoot" "prodDeployAll"
 assert_workflow ".github/workflows/deploy-staging.yaml" "stagingDeployNixosBoot" "stagingDeployAll"
 
@@ -78,3 +84,5 @@ assert_boot_app "stagingDeployNixosBoot" "staging-deploy-nixos-boot" ".#st0x-liq
 
 assert_dbus_broker "st0x-liquidity"
 assert_dbus_broker "st0x-liquidity-staging"
+
+assert_activation_scripts_parse
