@@ -131,6 +131,10 @@ impl std::fmt::Display for OrderStatus {
 struct MockOrder {
     symbol: Symbol,
     quantity: Float,
+    /// USD named by a `notional` placement, `None` for a `qty` placement.
+    /// The real API keeps `qty` null on such orders, so status responses
+    /// must render `notional` instead of `quantity`.
+    notional: Option<Float>,
     side: OrderSide,
     status: OrderStatus,
     /// Quantity executed so far. Zero until a fill applies, the ordered
@@ -1197,9 +1201,6 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                     &json!({"message": "missing or non-string field: symbol"}),
                 );
             };
-            let Some(qty) = body["qty"].as_str() else {
-                return json_response(400, &json!({"message": "missing or non-string field: qty"}));
-            };
             let Some(side) = body["side"].as_str() else {
                 return json_response(
                     400,
@@ -1210,8 +1211,37 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
             let Ok(symbol) = Symbol::new(symbol) else {
                 return json_response(400, &json!({"message": "symbol cannot be empty"}));
             };
-            let Ok(quantity) = Float::parse(qty.to_string()) else {
-                return json_response(400, &json!({"message": format!("invalid qty: {qty}")}));
+            let sizing = match (body["qty"].as_str(), body["notional"].as_str()) {
+                (Some(_), Some(_)) => {
+                    return json_response(
+                        400,
+                        &json!({"message": "qty and notional are mutually exclusive"}),
+                    );
+                }
+                (None, None) => {
+                    return json_response(
+                        400,
+                        &json!({"message": "missing or non-string field: qty"}),
+                    );
+                }
+                (Some(qty), None) => {
+                    let Ok(quantity) = Float::parse(qty.to_string()) else {
+                        return json_response(
+                            400,
+                            &json!({"message": format!("invalid qty: {qty}")}),
+                        );
+                    };
+                    OrderSizing::Quantity(quantity)
+                }
+                (None, Some(notional)) => {
+                    let Ok(amount) = Float::parse(notional.to_string()) else {
+                        return json_response(
+                            400,
+                            &json!({"message": format!("invalid notional: {notional}")}),
+                        );
+                    };
+                    OrderSizing::Notional(amount)
+                }
             };
             let side = match side {
                 "buy" => OrderSide::Buy,
@@ -1244,8 +1274,18 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
             }
 
             if symbol == "USDCUSD" {
-                return handle_crypto_order(&mut state, &order_id, &symbol, quantity, side);
+                return handle_crypto_order(&mut state, &order_id, &symbol, sizing, side);
             }
+
+            // The bot only sizes crypto conversions by notional; equity
+            // orders always name a quantity, so the mock keeps its equity
+            // ledger quantity-only.
+            let OrderSizing::Quantity(quantity) = sizing else {
+                return json_response(
+                    422,
+                    &json!({"message": "notional orders are supported only for USDCUSD in this mock"}),
+                );
+            };
 
             // Real Alpaca rejects a re-used `client_order_id` on an active order
             // with a 422 ("client_order_id must be unique") rather than deduping
@@ -1282,6 +1322,7 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                 MockOrder {
                     symbol: symbol.clone(),
                     quantity,
+                    notional: None,
                     side,
                     status: OrderStatus::New,
                     filled_quantity: float!(0),
@@ -1318,21 +1359,48 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
     });
 }
 
+/// How an order names its size, mirroring the mutually exclusive
+/// `qty`/`notional` fields of the real orders endpoint.
+#[derive(Debug, Clone, Copy)]
+enum OrderSizing {
+    /// Base-asset units to trade (e.g. USDC), at most six decimals.
+    Quantity(Float),
+    /// USD to spend, which the real API caps at whole cents.
+    Notional(Float),
+}
+
 /// Handles crypto (USDCUSD) orders which fill immediately.
+///
+/// A `notional` order fills at the mock's $1 crypto price, so the derived
+/// USDC quantity equals the dollars named; the real API additionally keeps
+/// `qty` null on such orders, which the response mirrors.
 fn handle_crypto_order(
     state: &mut MockState,
     order_id: &str,
     symbol: &Symbol,
-    quantity: Float,
+    sizing: OrderSizing,
     side: OrderSide,
 ) -> HttpMockResponse {
-    let quantized_quantity = match crate::truncate_to_decimal_places(quantity, 6) {
+    let (quantity, max_decimal_places, excess_precision_message, below_precision_message) =
+        match sizing {
+            OrderSizing::Quantity(quantity) => (
+                quantity,
+                6,
+                "crypto quantity exceeds USDC precision",
+                "crypto quantity is below USDC precision",
+            ),
+            OrderSizing::Notional(amount) => (
+                amount,
+                2,
+                "notional value must be limited to 2 decimal places",
+                "notional value must be limited to 2 decimal places",
+            ),
+        };
+
+    let quantized_quantity = match crate::truncate_to_decimal_places(quantity, max_decimal_places) {
         Ok(Some(value)) => value,
         Ok(None) => {
-            return json_response(
-                422,
-                &json!({"message": "crypto quantity is below USDC precision"}),
-            );
+            return json_response(422, &json!({"message": below_precision_message}));
         }
         Err(error) => {
             return json_response(
@@ -1353,10 +1421,7 @@ fn handle_crypto_order(
     };
 
     if !matches_requested_precision {
-        return json_response(
-            422,
-            &json!({"message": "crypto quantity exceeds USDC precision"}),
-        );
+        return json_response(422, &json!({"message": excess_precision_message}));
     }
 
     // Cash ledger is USD-denominated and modeled at cent precision in inventory.
@@ -1430,12 +1495,21 @@ fn handle_crypto_order(
     let fill_price = float!(1);
     let quantity_formatted = format_float_with_fallback(&quantized_quantity);
     let fill_price_formatted = format_float_with_fallback(&fill_price);
+    let (qty_response, notional_response, stored_notional) = match sizing {
+        OrderSizing::Quantity(_) => (json!(quantity_formatted.as_str()), Value::Null, None),
+        OrderSizing::Notional(_) => (
+            Value::Null,
+            json!(quantity_formatted.as_str()),
+            Some(quantized_quantity),
+        ),
+    };
 
     state.orders.insert(
         order_id.to_string(),
         MockOrder {
             symbol: symbol.clone(),
             quantity: quantized_quantity,
+            notional: stored_notional,
             side,
             status: OrderStatus::Filled,
             filled_quantity: quantized_quantity,
@@ -1450,7 +1524,8 @@ fn handle_crypto_order(
         json!({
             "id": order_id,
             "symbol": symbol,
-            "qty": quantity_formatted.as_str(),
+            "qty": qty_response,
+            "notional": notional_response,
             "side": side.to_string(),
             "status": "filled",
             "filled_avg_price": fill_price_formatted.as_str(),
@@ -1535,7 +1610,12 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                 let filled_quantity = format_float_with_fallback(&order.filled_quantity);
                 let filled_price: Option<String> =
                     order.filled_price.as_ref().map(format_float_with_fallback);
-                let quantity = format_float_with_fallback(&order.quantity);
+                // The real API keeps `qty` null on a notional order even
+                // after it fills, reporting only `notional` and `filled_qty`.
+                let notional = order.notional.as_ref().map(format_float_with_fallback);
+                let quantity = notional
+                    .is_none()
+                    .then(|| format_float_with_fallback(&order.quantity));
                 // The real API stamps per-status timestamps; the client fails
                 // fast when a terminal status lacks its specific timestamp.
                 let filled_at =
@@ -1548,6 +1628,7 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                     "id": order_id,
                     "symbol": order.symbol,
                     "qty": quantity,
+                    "notional": notional,
                     "side": order.side.to_string(),
                     "status": order.status.to_string(),
                     "filled_avg_price": filled_price,
@@ -2210,7 +2291,7 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::{
-        AlpacaBrokerMock, MockAccount, MockMode, MockPosition, MockState, OrderSide,
+        AlpacaBrokerMock, MockAccount, MockMode, MockPosition, MockState, OrderSide, OrderSizing,
         TEST_ACCOUNT_ID, TEST_API_KEY, TEST_API_SECRET, format_u256_as_usdc, handle_crypto_order,
     };
     use crate::alpaca_broker_api::auth::{
@@ -2669,7 +2750,7 @@ mod tests {
             &mut state,
             "order-1",
             &Symbol::new("USDCUSD").unwrap(),
-            float!(12.345678),
+            OrderSizing::Quantity(float!(12.345678)),
             OrderSide::Buy,
         );
 
@@ -2718,7 +2799,7 @@ mod tests {
             &mut state,
             "order-1",
             &Symbol::new("USDCUSD").unwrap(),
-            float!(5),
+            OrderSizing::Quantity(float!(5)),
             OrderSide::Sell,
         );
 
@@ -2730,7 +2811,7 @@ mod tests {
             &mut state,
             "order-2",
             &Symbol::new("USDCUSD").unwrap(),
-            float!(16),
+            OrderSizing::Quantity(float!(16)),
             OrderSide::Sell,
         );
 
@@ -2774,7 +2855,7 @@ mod tests {
             &mut state,
             "order-1",
             &Symbol::new("USDCUSD").unwrap(),
-            float!(12.3456789),
+            OrderSizing::Quantity(float!(12.3456789)),
             OrderSide::Buy,
         );
 
@@ -2831,5 +2912,88 @@ mod tests {
         assert_eq!(orders.len(), 1);
         assert!(orders[0].quantity.eq(float!(500.25)).unwrap());
         assert_eq!(orders[0].side, OrderSide::Buy);
+    }
+
+    #[test]
+    fn crypto_notional_buy_debits_the_dollars_named() {
+        let mut state = MockState {
+            account: MockAccount {
+                cash: float!(100),
+                buying_power: float!(100),
+                positions: HashMap::new(),
+            },
+            orders: HashMap::new(),
+            symbol_fill_prices: HashMap::new(),
+            mode: MockMode::HappyPath,
+            rotating_outcome_index: 0,
+            symbol_fill_delays: HashMap::new(),
+            calendar_entries: vec![],
+            wallet_transfers: vec![],
+            alpaca_deposit_address: format!("{:#x}", Address::ZERO),
+            wallet_balances: HashMap::new(),
+            whitelisted_addresses: vec![],
+            transient_placement_failures_remaining: 0,
+            calendar_failures_remaining: 0,
+            unauthorized_placement_failures_remaining: 0,
+            activities: vec![],
+        };
+
+        let response = handle_crypto_order(
+            &mut state,
+            "order-1",
+            &Symbol::new("USDCUSD").unwrap(),
+            OrderSizing::Notional(float!(12.34)),
+            OrderSide::Buy,
+        );
+
+        assert_eq!(response.status, Some(200));
+        assert!(state.account.cash.eq(float!(87.66)).unwrap());
+        assert!(
+            state.wallet_balances["USDC"].eq(float!(12.34)).unwrap(),
+            "a $12.34 notional buy at the mock's $1 fill price must credit 12.34 USDC"
+        );
+
+        let order = state.orders.get("order-1").unwrap();
+        assert!(order.quantity.eq(float!(12.34)).unwrap());
+        assert!(order.notional.unwrap().eq(float!(12.34)).unwrap());
+    }
+
+    /// Mirrors the real API's `422 / 42210000` on a notional with more than
+    /// two decimal places, so a client regression that stops truncating to
+    /// whole cents fails against the mock the same way it would in prod.
+    #[test]
+    fn crypto_notional_with_sub_cent_precision_is_rejected() {
+        let mut state = MockState {
+            account: MockAccount {
+                cash: float!(100),
+                buying_power: float!(100),
+                positions: HashMap::new(),
+            },
+            orders: HashMap::new(),
+            symbol_fill_prices: HashMap::new(),
+            mode: MockMode::HappyPath,
+            rotating_outcome_index: 0,
+            symbol_fill_delays: HashMap::new(),
+            calendar_entries: vec![],
+            wallet_transfers: vec![],
+            alpaca_deposit_address: format!("{:#x}", Address::ZERO),
+            wallet_balances: HashMap::new(),
+            whitelisted_addresses: vec![],
+            transient_placement_failures_remaining: 0,
+            calendar_failures_remaining: 0,
+            unauthorized_placement_failures_remaining: 0,
+            activities: vec![],
+        };
+
+        let response = handle_crypto_order(
+            &mut state,
+            "order-1",
+            &Symbol::new("USDCUSD").unwrap(),
+            OrderSizing::Notional(float!(10.005)),
+            OrderSide::Buy,
+        );
+
+        assert_eq!(response.status, Some(422));
+        assert!(!state.orders.contains_key("order-1"));
     }
 }
