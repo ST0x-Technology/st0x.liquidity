@@ -147,7 +147,7 @@ pub struct AssetsConfig {
 /// Validated, network-free inputs required by the deploy-time Turnkey approval
 /// policy coverage check.
 #[cfg(feature = "wallet-turnkey")]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TurnkeyApprovalPolicyInputs {
     pub organization_id: st0x_evm::turnkey::TurnkeyOrganizationId,
     pub kms_api_key: Option<st0x_evm::turnkey::TurnkeyKmsApiKey>,
@@ -156,6 +156,23 @@ pub struct TurnkeyApprovalPolicyInputs {
     pub owner: Address,
     pub base_rpc_url: Url,
     pub assets: AssetsConfig,
+}
+
+#[cfg(feature = "wallet-turnkey")]
+impl std::fmt::Debug for TurnkeyApprovalPolicyInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // base_rpc_url comes from the secrets file and can carry credentials in
+        // its userinfo, path, or query; print only the host.
+        f.debug_struct("TurnkeyApprovalPolicyInputs")
+            .field("organization_id", &self.organization_id)
+            .field("kms_api_key", &self.kms_api_key)
+            .field("api_private_key", &self.api_private_key)
+            .field("orderbook", &self.orderbook)
+            .field("owner", &self.owner)
+            .field("base_rpc_url", &self.base_rpc_url.host_str())
+            .field("assets", &self.assets)
+            .finish()
+    }
 }
 
 /// Parses a hex string (possibly short, e.g. `"0xfab"`) into a
@@ -7018,6 +7035,26 @@ mod tests {
         assert!(inputs.kms_api_key.is_none());
         assert!(inputs.api_private_key.is_some());
         assert!(!format!("{inputs:?}").contains("secret-p256-key"));
+    }
+
+    #[cfg(feature = "wallet-turnkey")]
+    #[test]
+    fn turnkey_approval_policy_inputs_debug_redacts_base_rpc_url_userinfo() {
+        let inputs = TurnkeyApprovalPolicyInputs {
+            organization_id: st0x_evm::turnkey::TurnkeyOrganizationId::new("org-test".to_string()),
+            kms_api_key: None,
+            api_private_key: None,
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            owner: address!("0x6666666666666666666666666666666666666666"),
+            base_rpc_url: Url::parse("https://user:pass@rpc.example.com/secret-key").unwrap(),
+            assets: AssetsConfig::default(),
+        };
+
+        let debug = format!("{inputs:?}");
+        assert!(!debug.contains("user"));
+        assert!(!debug.contains("pass"));
+        assert!(!debug.contains("secret-key"));
+        assert!(debug.contains("rpc.example.com"));
     }
 
     #[cfg(feature = "wallet-turnkey")]
