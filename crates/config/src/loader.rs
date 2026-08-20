@@ -153,6 +153,8 @@ pub struct TurnkeyApprovalPolicyInputs {
     pub kms_api_key: Option<st0x_evm::turnkey::TurnkeyKmsApiKey>,
     pub api_private_key: Option<st0x_evm::turnkey::TurnkeyApiPrivateKey>,
     pub orderbook: Address,
+    pub owner: Address,
+    pub base_rpc_url: Url,
     pub assets: AssetsConfig,
 }
 
@@ -1414,6 +1416,8 @@ impl Ctx {
             kms_api_key,
             api_private_key,
             orderbook: parts.evm.orderbook,
+            owner: parts.wallet_meta.address,
+            base_rpc_url: parts.wallet_inputs.base_rpc_url,
             assets: parts.assets,
         }))
     }
@@ -7001,6 +7005,11 @@ mod tests {
             inputs.orderbook,
             address!("0x1111111111111111111111111111111111111111")
         );
+        assert_eq!(
+            inputs.owner,
+            address!("0x6666666666666666666666666666666666666666")
+        );
+        assert_eq!(inputs.base_rpc_url.as_str(), "https://base.example.com/");
         assert!(
             inputs
                 .assets
