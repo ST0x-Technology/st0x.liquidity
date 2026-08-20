@@ -7,10 +7,10 @@
 //! reads the block for its timestamp, values the gas in USD (see
 //! `super::valuation`), and records the fact through `BotGasCostLedger`.
 //!
-//! Runs as a best-effort worker (see ADR 0017): a terminal failure
+//! Runs as a best-effort worker (see ADR 0020): a terminal failure
 //! dead-letters that one receipt without blocking or slowing trading.
 
-use alloy::primitives::{Address, B256, TxHash};
+use alloy::primitives::{Address, TxHash};
 use alloy::providers::{Provider, RootProvider};
 use alloy::transports::{RpcError, TransportErrorKind};
 use chrono::DateTime;
@@ -27,7 +27,6 @@ use super::{
     BotGasChain, BotGasCostError, BotGasCostLedger, BotGasOperationCategory, BotGasReceiptCost,
 };
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
-use crate::onchain::pyth::PythError;
 
 /// Persistent job queue for [`RecordBotGasReceiptCost`].
 pub(crate) type RecordBotGasReceiptCostJobQueue = JobQueue<RecordBotGasReceiptCost>;
@@ -221,8 +220,7 @@ const MAX_REDRIVE_ATTEMPTS: u32 = 20;
 pub(crate) struct RecordBotGasReceiptCostCtx {
     pub(crate) base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     pub(crate) ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
-    pub(crate) pyth_contract: Address,
-    pub(crate) eth_usd_feed_id: B256,
+    pub(crate) chainlink_feed: Address,
     pub(crate) ledger: BotGasCostLedger,
     /// Used to delayed-redrive a transient RPC-shaped outcome (a lagging RPC
     /// node or an outright RPC error, not a genuine failure) instead of
@@ -350,7 +348,7 @@ impl Job<RecordBotGasReceiptCostCtx> for RecordBotGasReceiptCost {
         // replace the block at that height, which would silently attach a
         // timestamp from a different block than the one that actually
         // contains this tx. The same hash is forwarded into
-        // `read_eth_usd_price` below so the Pyth price read is pinned at the
+        // `read_eth_usd_price` below so the Chainlink reads are pinned at the
         // same reorg-safe anchor as the timestamp, not just the number.
         let Some(receipt_block_hash) = receipt.block_hash else {
             return self
@@ -365,7 +363,7 @@ impl Job<RecordBotGasReceiptCostCtx> for RecordBotGasReceiptCost {
         // (vault deposit/withdraw, wrap/unwrap, USDC wallet transfer, CCTP
         // burn), which the bot always originates. The payer is knowable from
         // the receipt alone (`receipt.from` vs `bot_wallet`), so check it
-        // here -- before the block fetch and the Pyth valuation `eth_call` --
+        // here -- before the block fetch and the Chainlink valuation calls --
         // rather than after both, so a relayer-paid mint skips cleanly
         // without incurring either RPC read or risking their transient-error
         // redrive/dead-letter path for a receipt whose only correct outcome
@@ -399,8 +397,7 @@ impl Job<RecordBotGasReceiptCostCtx> for RecordBotGasReceiptCost {
 
         let eth_usd_price = match read_eth_usd_price(
             ctx.base_wallet.provider(),
-            ctx.pyth_contract,
-            ctx.eth_usd_feed_id,
+            ctx.chainlink_feed,
             self.chain,
             receipt_block_number,
             receipt_block_hash,
@@ -418,7 +415,7 @@ impl Job<RecordBotGasReceiptCostCtx> for RecordBotGasReceiptCost {
         };
 
         // A relayer-paid CCTP mint is already skipped by the early payer
-        // check above (before the block fetch and Pyth valuation), so any
+        // check above (before the block fetch and Chainlink valuation), so any
         // `NonBotPayer` reaching `from_receipt` here is a genuine invariant
         // violation for every category, including `CctpMint`, and dead-letters
         // like any other error.
@@ -496,17 +493,16 @@ impl RecordBotGasReceiptCost {
 
 /// True when `error` is RPC-shaped (a transport/node problem worth folding
 /// into the same bounded RPC redrive budget as a missing receipt) rather than
-/// a data or validation problem (a genuinely bad Pyth reading, which should
+/// a data or validation problem (a genuinely bad feed reading, which should
 /// dead-letter through the normal apalis retry budget instead).
 fn is_transient_rpc_error(error: &EthUsdValuationError) -> bool {
     match error {
-        EthUsdValuationError::Rpc(_) | EthUsdValuationError::Pyth(PythError::Rpc(_)) => true,
-        EthUsdValuationError::Pyth(PythError::InvalidTimestamp(_))
-        | EthUsdValuationError::NonPositivePrice { .. }
+        EthUsdValuationError::Rpc(_) | EthUsdValuationError::Contract(_) => true,
+        EthUsdValuationError::NonPositivePrice { .. }
         | EthUsdValuationError::Decimal { .. }
         | EthUsdValuationError::Arithmetic(_)
-        | EthUsdValuationError::InvalidPublishTime(_)
-        | EthUsdValuationError::ExponentOutOfRange { .. } => false,
+        | EthUsdValuationError::InvalidUpdatedAt(_)
+        | EthUsdValuationError::DecimalsOutOfRange { .. } => false,
     }
 }
 
@@ -530,7 +526,7 @@ fn block_timestamp(
 #[cfg(test)]
 mod tests {
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
-    use alloy::primitives::{Address, Bloom, U256, address, b256};
+    use alloy::primitives::{Address, B256, Bloom, Bytes, I256, U256, address};
     use alloy::providers::mock::Asserter;
     use alloy::rpc::client::RpcClient;
     use alloy::rpc::types::{Block, BlockTransactions, Header, TransactionReceipt};
@@ -539,21 +535,16 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use st0x_event_sorcery::{Store, StoreBuilder};
-    use st0x_evm::IPyth::getPriceUnsafeCall;
-    use st0x_evm::PythStructs::Price;
     use st0x_evm::{Evm, EvmError};
     use st0x_finance::Symbol;
     use st0x_float_macro::float;
 
     use super::*;
+    use crate::bot_gas::valuation::AggregatorV3Interface;
     use crate::dashboard::pnl::{PnlQuery, build_pnl_report};
     use crate::test_utils::setup_test_pools;
 
-    const PYTH_CONTRACT: Address = address!("0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a");
-    /// Pyth's `Crypto.ETH/USD` feed id, matching prod/staging config. See
-    /// https://www.pyth.network/developers/price-feed-ids#pyth-evm-stable.
-    const FEED_ID: B256 =
-        b256!("0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace");
+    const CHAINLINK_FEED: Address = address!("0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70");
     const BOT_WALLET: Address = address!("0x1111111111111111111111111111111111111111");
 
     struct MockWallet {
@@ -678,17 +669,24 @@ mod tests {
         }
     }
 
-    fn encode_price_return(price: &Price) -> alloy::primitives::Bytes {
-        alloy::primitives::Bytes::from(getPriceUnsafeCall::abi_encode_returns(price))
+    fn encode_decimals_return(decimals: u8) -> alloy::primitives::Bytes {
+        alloy::primitives::Bytes::from(AggregatorV3Interface::decimalsCall::abi_encode_returns(
+            &decimals,
+        ))
     }
 
-    fn fresh_pyth_price(occurred_at: DateTime<Utc>) -> Price {
-        Price {
-            price: 200_000_000_000,
-            conf: 1_000_000,
-            expo: -8,
-            publishTime: U256::from(occurred_at.timestamp()),
-        }
+    fn encode_price_return(answer: I256, occurred_at: DateTime<Utc>) -> alloy::primitives::Bytes {
+        alloy::primitives::Bytes::from(
+            AggregatorV3Interface::latestRoundDataCall::abi_encode_returns(
+                &AggregatorV3Interface::latestRoundDataReturn {
+                    roundId: alloy::primitives::aliases::U80::from_limbs([1, 0]),
+                    answer,
+                    startedAt: U256::from(occurred_at.timestamp()),
+                    updatedAt: U256::from(occurred_at.timestamp()),
+                    answeredInRound: alloy::primitives::aliases::U80::from_limbs([1, 0]),
+                },
+            ),
+        )
     }
 
     async fn ledger_and_store() -> (BotGasCostLedger, Arc<Store<BotGasReceiptCost>>) {
@@ -729,8 +727,7 @@ mod tests {
         RecordBotGasReceiptCostCtx {
             base_wallet: MockWallet::with_asserter(asserter),
             ethereum_wallet: MockWallet::with_asserter(&Asserter::new()),
-            pyth_contract: PYTH_CONTRACT,
-            eth_usd_feed_id: FEED_ID,
+            chainlink_feed: CHAINLINK_FEED,
             ledger,
             job_queue,
         }
@@ -739,7 +736,47 @@ mod tests {
     fn queue_happy_path_responses(asserter: &Asserter, occurred_at: DateTime<Utc>) {
         asserter.push_success(&receipt(BOT_WALLET, Some(123)));
         asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
-        asserter.push_success(&encode_price_return(&fresh_pyth_price(occurred_at)));
+        asserter.push_success(&encode_decimals_return(8));
+        asserter.push_success(&encode_price_return(
+            I256::try_from(200_000_000_000_i64).unwrap(),
+            occurred_at,
+        ));
+    }
+
+    async fn perform_with_terminal_price_response(
+        price_response: Bytes,
+    ) -> (RecordBotGasReceiptCostError, i64) {
+        let occurred_at = Utc.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap();
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt(BOT_WALLET, Some(123)));
+        asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
+        asserter.push_success(&encode_decimals_return(8));
+        asserter.push_success(&price_response);
+        let (ledger, _store) = ledger_and_store().await;
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let job_queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+        let ctx = ctx_with_asserter_and_queue(&asserter, ledger, job_queue);
+
+        let error = RecordBotGasReceiptCost {
+            chain: BotGasChain::Base,
+            tx_hash: TxHash::repeat_byte(0x11),
+            category: BotGasOperationCategory::VaultDeposit,
+            symbol: None,
+            redrive_attempts: 0,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap_err();
+
+        let pending = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<RecordBotGasReceiptCost>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+
+        (error, pending)
     }
 
     #[tokio::test]
@@ -783,7 +820,11 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&receipt(Address::repeat_byte(0x99), Some(123)));
         asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
-        asserter.push_success(&encode_price_return(&fresh_pyth_price(occurred_at)));
+        asserter.push_success(&encode_decimals_return(8));
+        asserter.push_success(&encode_price_return(
+            I256::try_from(200_000_000_000_i64).unwrap(),
+            occurred_at,
+        ));
         let (ledger, _store) = ledger_and_store().await;
         let ctx = ctx_with_asserter(&asserter, ledger).await;
 
@@ -809,8 +850,8 @@ mod tests {
     /// invariant violation -- unlike a non-bot payer on any other category
     /// (see `non_bot_payer_is_terminal_not_skipped`), which the bot always
     /// originates. Only the receipt is queued: the payer check now runs
-    /// right after the receipt fetch, before the block fetch and the Pyth
-    /// valuation `eth_call`, so neither of those RPC reads should happen.
+    /// right after the receipt fetch, before the block fetch and Chainlink
+    /// valuation calls, so none of those RPC reads should happen.
     #[tokio::test]
     async fn relayer_paid_cctp_mint_is_skipped_not_terminal() {
         let asserter = Asserter::new();
@@ -901,7 +942,11 @@ mod tests {
         conflicting_receipt.gas_used += 1;
         second_asserter.push_success(&conflicting_receipt);
         second_asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
-        second_asserter.push_success(&encode_price_return(&fresh_pyth_price(occurred_at)));
+        second_asserter.push_success(&encode_decimals_return(8));
+        second_asserter.push_success(&encode_price_return(
+            I256::try_from(200_000_000_000_i64).unwrap(),
+            occurred_at,
+        ));
         let second_ctx = ctx_with_asserter(&second_asserter, ledger).await;
 
         let error = job.perform(&second_ctx).await.unwrap_err();
@@ -947,9 +992,11 @@ mod tests {
             realistic_receipt.effective_gas_price = 5_000_257;
             asserter.push_success(&realistic_receipt);
             asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
-            let mut realistic_price = fresh_pyth_price(occurred_at);
-            realistic_price.price = 200_012_345_678;
-            asserter.push_success(&encode_price_return(&realistic_price));
+            asserter.push_success(&encode_decimals_return(8));
+            asserter.push_success(&encode_price_return(
+                I256::try_from(200_012_345_678_i64).unwrap(),
+                occurred_at,
+            ));
             let ctx = ctx_with_asserter(&asserter, ledger.clone()).await;
             job.perform(&ctx).await.unwrap();
         }
@@ -1190,15 +1237,12 @@ mod tests {
     /// burn the whole budget on an RPC that will keep returning the same
     /// unusable value.
     #[tokio::test]
-    async fn implausible_price_exponent_dead_letters_without_redrive() {
+    async fn unsupported_feed_decimals_dead_letter_without_redrive() {
         let occurred_at = Utc.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap();
         let asserter = Asserter::new();
         asserter.push_success(&receipt(BOT_WALLET, Some(123)));
         asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
-        asserter.push_success(&encode_price_return(&Price {
-            expo: -30,
-            ..fresh_pyth_price(occurred_at)
-        }));
+        asserter.push_success(&encode_decimals_return(30));
         let (ledger, _store) = ledger_and_store().await;
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         let job_queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
@@ -1216,11 +1260,11 @@ mod tests {
         assert!(
             matches!(
                 error,
-                RecordBotGasReceiptCostError::Valuation(EthUsdValuationError::ExponentOutOfRange {
-                    expo: -30
+                RecordBotGasReceiptCostError::Valuation(EthUsdValuationError::DecimalsOutOfRange {
+                    decimals: 30
                 })
             ),
-            "an implausible exponent must surface as a terminal valuation error, got {error:?}"
+            "unsupported decimals must surface as a terminal valuation error, got {error:?}"
         );
 
         let pending: i64 = sqlx_apalis::query_scalar(
@@ -1233,6 +1277,52 @@ mod tests {
         assert_eq!(
             pending, 0,
             "a data error must dead-letter rather than consume the redrive window"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_positive_feed_price_dead_letters_without_redrive() {
+        let occurred_at = Utc.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap();
+        let (error, pending) =
+            perform_with_terminal_price_response(encode_price_return(I256::ZERO, occurred_at))
+                .await;
+
+        assert!(matches!(
+            error,
+            RecordBotGasReceiptCostError::Valuation(
+                EthUsdValuationError::NonPositivePrice { answer }
+            ) if answer.is_zero()
+        ));
+        assert_eq!(
+            pending, 0,
+            "a non-positive price must not enqueue a redrive"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_feed_update_time_dead_letters_without_redrive() {
+        let response = Bytes::from(
+            AggregatorV3Interface::latestRoundDataCall::abi_encode_returns(
+                &AggregatorV3Interface::latestRoundDataReturn {
+                    roundId: alloy::primitives::aliases::U80::from_limbs([1, 0]),
+                    answer: I256::try_from(200_000_000_000_i64).unwrap(),
+                    startedAt: U256::ZERO,
+                    updatedAt: U256::ZERO,
+                    answeredInRound: alloy::primitives::aliases::U80::from_limbs([1, 0]),
+                },
+            ),
+        );
+        let (error, pending) = perform_with_terminal_price_response(response).await;
+
+        assert!(matches!(
+            error,
+            RecordBotGasReceiptCostError::Valuation(
+                EthUsdValuationError::InvalidUpdatedAt(value)
+            ) if value.is_zero()
+        ));
+        assert_eq!(
+            pending, 0,
+            "an invalid update time must not enqueue a redrive"
         );
     }
 
@@ -1252,7 +1342,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&receipt(BOT_WALLET, Some(123)));
         asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
-        asserter.push_failure_msg("eth_call getPriceUnsafe boom");
+        asserter.push_failure_msg("eth_call decimals boom");
         let (ledger, _store) = ledger_and_store().await;
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         let job_queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
@@ -1322,7 +1412,11 @@ mod tests {
 
         let base_asserter = Asserter::new();
         base_asserter.push_success(&999u64);
-        base_asserter.push_success(&encode_price_return(&fresh_pyth_price(occurred_at)));
+        base_asserter.push_success(&encode_decimals_return(8));
+        base_asserter.push_success(&encode_price_return(
+            I256::try_from(200_000_000_000_i64).unwrap(),
+            occurred_at,
+        ));
 
         let ethereum_asserter = Asserter::new();
         ethereum_asserter.push_success(&receipt(BOT_WALLET, Some(555)));
@@ -1333,8 +1427,7 @@ mod tests {
         let ctx = RecordBotGasReceiptCostCtx {
             base_wallet: MockWallet::with_asserter(&base_asserter),
             ethereum_wallet: MockWallet::with_asserter(&ethereum_asserter),
-            pyth_contract: PYTH_CONTRACT,
-            eth_usd_feed_id: FEED_ID,
+            chainlink_feed: CHAINLINK_FEED,
             ledger,
             job_queue: RecordBotGasReceiptCostJobQueue::new(&apalis_pool),
         };

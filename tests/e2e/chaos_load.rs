@@ -21,7 +21,7 @@ use st0x_execution::alpaca_broker_api::OrderSide;
 use st0x_float_macro::float;
 use std::time::Duration;
 
-use crate::chaos::ChaosProxy;
+use crate::chaos::LatencyProxy;
 use crate::hedging::assertions::*;
 use crate::poll::{
     connect_db, count_events_of_type, poll_for_all_jobs_done, poll_for_broker_fills,
@@ -261,14 +261,14 @@ async fn kill_mid_burst_recovers_every_take_exactly_once() -> anyhow::Result<()>
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
 
-    // Route the bot's RPC through a chaos proxy that holds each
-    // `eth_getTransactionReceipt` -- the first RPC call every accounting job
-    // makes -- for 500ms. With the single-threaded worker this drains the burst
-    // at a controlled rate, so the kill below reliably lands while jobs are
-    // still Queued/Running. Without the throttle the in-memory mocks drain all 8
-    // jobs in under one poll interval and the kill degenerates to a clean,
-    // post-drain restart that never exercises the orphan requeue.
-    let chaos = ChaosProxy::start(infra.base_chain.endpoint().parse()?).await?;
+    // Hold each broker placement response for 500ms. AccountForDexTrade's
+    // single-threaded worker persists the witnessed trade before placing its
+    // hedge, so this drains the burst at a controlled rate and the kill below
+    // reliably lands while jobs are still Queued/Running. Without the throttle
+    // the in-memory mocks drain all 8 jobs in under one poll interval and the
+    // kill degenerates to a clean, post-drain restart that never exercises the
+    // orphan requeue.
+    let latency = LatencyProxy::start(infra.broker_service.base_url().parse()?).await?;
 
     for _ in 0..take_count {
         infra
@@ -282,8 +282,8 @@ async fn kill_mid_burst_recovers_every_take_exactly_once() -> anyhow::Result<()>
             .await?;
     }
 
-    chaos
-        .delay_transaction_receipts(Duration::from_millis(500), 20)
+    latency
+        .delay_order_placements(Duration::from_millis(500), 20)
         .await;
 
     let ctx = build_ctx()
@@ -292,7 +292,7 @@ async fn kill_mid_burst_recovers_every_take_exactly_once() -> anyhow::Result<()>
         .db_path(&infra.db_path)
         .deployment_block(current_block)
         .assets(infra.assets_config())
-        .rpc_url_override(chaos.endpoint.clone())
+        .broker_url_override(latency.endpoint.clone())
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -316,7 +316,7 @@ async fn kill_mid_burst_recovers_every_take_exactly_once() -> anyhow::Result<()>
         .db_path(&infra.db_path)
         .deployment_block(current_block)
         .assets(infra.assets_config())
-        .rpc_url_override(chaos.endpoint.clone())
+        .broker_url_override(latency.endpoint.clone())
         .call()?;
     let mut bot2 = spawn_bot(ctx2);
 
