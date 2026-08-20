@@ -4,7 +4,8 @@ use std::fmt::{Display, Formatter};
 use std::path::Path;
 use std::time::Duration;
 
-use alloy::providers::RootProvider;
+use alloy::primitives::Address;
+use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::client::RpcClient;
 use alloy::transports::http::Http;
 use st0x_config::Ctx;
@@ -113,32 +114,7 @@ pub async fn verify_turnkey_approval_policies(
     let evm = ReadOnlyEvm::new(RootProvider::new(
         RpcClient::builder().transport(transport, is_local),
     ));
-    let allowances = futures_util::future::join_all(targets.iter().map(|target| {
-        let evm = &evm;
-        async move {
-            evm.call::<OpenChainErrorRegistry, _>(
-                target.token,
-                IERC20::allowanceCall {
-                    owner,
-                    spender: target.spender,
-                },
-            )
-            .await
-            .ok()
-        }
-    }))
-    .await;
-    let pending: Vec<ApprovalTarget> = targets
-        .into_iter()
-        .zip(allowances)
-        .filter(|&(_, allowance)| {
-            allowance.is_none_or(|allowance| match approval_decision(allowance) {
-                ApprovalDecision::GrantMax => true,
-                ApprovalDecision::AlreadySufficient => false,
-            })
-        })
-        .map(|(target, _)| target)
-        .collect();
+    let pending = pending_targets(&evm, owner, targets).await;
 
     let client = TurnkeyPolicyClient::new(
         inputs.organization_id,
@@ -157,6 +133,42 @@ pub async fn verify_turnkey_approval_policies(
         target_count: pending.len(),
         policy_count: snapshot.policies.len(),
     })
+}
+
+/// Reads each target's on-chain allowance over `evm` and returns the targets
+/// the startup grant would submit: allowance below the watermark, or a failed
+/// read (kept under verification).
+async fn pending_targets<P>(
+    evm: &ReadOnlyEvm<P>,
+    owner: Address,
+    targets: Vec<ApprovalTarget>,
+) -> Vec<ApprovalTarget>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
+    let allowances = futures_util::future::join_all(targets.iter().map(|target| async move {
+        evm.call::<OpenChainErrorRegistry, _>(
+            target.token,
+            IERC20::allowanceCall {
+                owner,
+                spender: target.spender,
+            },
+        )
+        .await
+        .ok()
+    }))
+    .await;
+    targets
+        .into_iter()
+        .zip(allowances)
+        .filter(|&(_, allowance)| {
+            allowance.is_none_or(|allowance| match approval_decision(allowance) {
+                ApprovalDecision::GrantMax => true,
+                ApprovalDecision::AlreadySufficient => false,
+            })
+        })
+        .map(|(target, _)| target)
+        .collect()
 }
 
 fn missing_policy_coverage(
@@ -358,7 +370,9 @@ fn trim_grouping_parentheses(mut term: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::Address;
+    use alloy::primitives::{Address, U256};
+    use alloy::providers::mock::Asserter;
+    use alloy::sol_types::SolValue;
 
     use st0x_evm::turnkey::{TurnkeyPolicy, TurnkeyPolicyEffect};
 
@@ -604,5 +618,71 @@ mod tests {
         assert!(message.contains("AAPL"));
         assert!(message.contains(&target.token.to_string()));
         assert!(message.contains(&target.spender.to_string()));
+    }
+
+    fn allowance_targets(count: usize) -> Vec<ApprovalTarget> {
+        (0..count)
+            .map(|i| {
+                let i = u8::try_from(i).unwrap();
+                ApprovalTarget {
+                    token: Address::repeat_byte(i + 1),
+                    spender: Address::repeat_byte(i + 0x80),
+                    symbol: None,
+                    purpose: ApprovalPurpose::DepositUsdc,
+                }
+            })
+            .collect()
+    }
+
+    fn mock_evm(asserter: Asserter) -> ReadOnlyEvm<RootProvider> {
+        ReadOnlyEvm::new(RootProvider::new(RpcClient::mocked(asserter)))
+    }
+
+    #[tokio::test]
+    async fn pending_targets_skips_max_allowances() {
+        let targets = allowance_targets(3);
+        let asserter = Asserter::new();
+        let max = alloy::hex::encode_prefixed(U256::MAX.abi_encode());
+        for _ in 0..targets.len() {
+            asserter.push_success(&max);
+        }
+
+        let pending =
+            pending_targets(&mock_evm(asserter), Address::repeat_byte(0xEE), targets).await;
+
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_targets_keeps_below_watermark_allowances() {
+        let targets = allowance_targets(3);
+        let asserter = Asserter::new();
+        let zero = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
+        for _ in 0..targets.len() {
+            asserter.push_success(&zero);
+        }
+        let expected = targets.clone();
+
+        let pending =
+            pending_targets(&mock_evm(asserter), Address::repeat_byte(0xEE), targets).await;
+
+        assert_eq!(pending, expected);
+    }
+
+    #[tokio::test]
+    async fn pending_targets_keeps_targets_when_reads_fail() {
+        let targets = allowance_targets(3);
+        let expected = targets.clone();
+
+        // An empty asserter errors every allowance read, so every target is
+        // kept under verification (fail closed).
+        let pending = pending_targets(
+            &mock_evm(Asserter::new()),
+            Address::repeat_byte(0xEE),
+            targets,
+        )
+        .await;
+
+        assert_eq!(pending, expected);
     }
 }
