@@ -17,7 +17,10 @@
 //! defensive fallback; once the startup grant lands they short-circuit to a
 //! no-op because the allowance already exceeds any operation amount.
 
-use alloy::primitives::{Address, U256};
+use std::future::Future;
+
+use alloy::primitives::{Address, TxHash, U256};
+use futures_util::{StreamExt, TryStreamExt, stream};
 
 use st0x_config::AssetsConfig;
 use st0x_evm::{IERC20, OpenChainErrorRegistry, Wallet};
@@ -35,6 +38,10 @@ const MAX_APPROVAL_WATERMARK: U256 = U256::from_limbs([
     0xffff_ffff_ffff_ffff,
     0x7fff_ffff_ffff_ffff,
 ]);
+
+/// Bounds concurrent RPC reads and confirmation waits without changing the
+/// wallet's nonce-safe transaction broadcast order.
+const STARTUP_APPROVAL_CONCURRENCY: usize = 8;
 
 /// Whether a startup approval needs to be submitted for a `(token, spender)`
 /// pair, given the allowance currently on chain.
@@ -170,96 +177,175 @@ pub(crate) fn build_approval_targets(
     targets
 }
 
-/// Grants idempotent MAX approvals for every target, reading each current
-/// allowance first and submitting `approve(spender, MAX)` only when below the
-/// watermark. Each submitted approve waits for the wallet's configured
-/// confirmation depth (baked into `Wallet::submit`), so allowances are durably
-/// on chain before the routine returns.
+/// Grants idempotent MAX approvals for every target. Allowance reads run with
+/// bounded concurrency. Missing approvals are broadcast sequentially so nonce
+/// assignment stays deterministic, then their configured confirmation waits
+/// run concurrently. Every allowance is durably on chain before this returns.
 ///
 /// Fails fast on the first allowance read or approve submission error -- these
 /// approvals are required for wrap/deposit to function.
-pub(crate) async fn grant_startup_approvals<W: Wallet>(
-    wallet: &W,
+pub(crate) async fn grant_startup_approvals<ChainWallet: Wallet>(
+    wallet: &ChainWallet,
     targets: &[ApprovalTarget],
 ) -> Result<(), StartupApprovalError> {
     let owner = wallet.address();
 
-    for target in targets {
-        let ApprovalTarget {
-            token,
-            spender,
-            symbol,
-            purpose,
-        } = target;
+    grant_startup_approvals_with(
+        targets,
+        |target| async move {
+            wallet
+                .call::<OpenChainErrorRegistry, _>(
+                    target.token,
+                    IERC20::allowanceCall {
+                        owner,
+                        spender: target.spender,
+                    },
+                )
+                .await
+        },
+        |target| async move {
+            wallet
+                .submit_pending(
+                    target.token,
+                    IERC20::approveCall {
+                        spender: target.spender,
+                        amount: U256::MAX,
+                    },
+                    target.purpose.note(),
+                )
+                .await
+        },
+        |tx_hash| async move {
+            wallet
+                .confirm::<OpenChainErrorRegistry>(tx_hash)
+                .await
+                .map(|_| ())
+        },
+    )
+    .await
+}
 
-        let current_allowance: U256 = wallet
-            .call::<OpenChainErrorRegistry, _>(
-                *token,
-                IERC20::allowanceCall {
-                    owner,
-                    spender: *spender,
-                },
-            )
-            .await
-            .map_err(|source| StartupApprovalError::AllowanceRead {
-                token: *token,
-                spender: *spender,
-                symbol: symbol.clone(),
-                source: Box::new(source),
-            })?;
+async fn grant_startup_approvals_with<
+    ReadAllowance,
+    ReadAllowanceFuture,
+    SubmitApproval,
+    SubmitApprovalFuture,
+    ConfirmApproval,
+    ConfirmApprovalFuture,
+>(
+    targets: &[ApprovalTarget],
+    read_allowance: ReadAllowance,
+    submit_approval: SubmitApproval,
+    confirm_approval: ConfirmApproval,
+) -> Result<(), StartupApprovalError>
+where
+    ReadAllowance: Fn(ApprovalTarget) -> ReadAllowanceFuture + Send + Sync,
+    ReadAllowanceFuture: Future<Output = Result<U256, st0x_evm::EvmError>> + Send,
+    SubmitApproval: Fn(ApprovalTarget) -> SubmitApprovalFuture + Send + Sync,
+    SubmitApprovalFuture: Future<Output = Result<TxHash, st0x_evm::EvmError>> + Send,
+    ConfirmApproval: Fn(TxHash) -> ConfirmApprovalFuture + Send + Sync,
+    ConfirmApprovalFuture: Future<Output = Result<(), st0x_evm::EvmError>> + Send,
+{
+    let decisions = stream::iter(targets.iter().cloned())
+        .map(|target| {
+            let allowance = read_allowance(target.clone());
 
-        match approval_decision(current_allowance) {
-            ApprovalDecision::AlreadySufficient => {
-                tracing::info!(
-                    target: "startup",
-                    %token,
-                    %spender,
-                    ?symbol,
-                    purpose = ?purpose,
-                    %current_allowance,
-                    "Startup approval already sufficient, skipping"
-                );
+            async move {
+                let current_allowance =
+                    allowance
+                        .await
+                        .map_err(|source| StartupApprovalError::AllowanceRead {
+                            token: target.token,
+                            spender: target.spender,
+                            symbol: target.symbol.clone(),
+                            source: Box::new(source),
+                        })?;
+
+                match approval_decision(current_allowance) {
+                    ApprovalDecision::AlreadySufficient => {
+                        tracing::info!(
+                            target: "startup",
+                            token = %target.token,
+                            spender = %target.spender,
+                            symbol = ?target.symbol,
+                            purpose = ?target.purpose,
+                            %current_allowance,
+                            "Startup approval already sufficient, skipping"
+                        );
+                        Ok(None)
+                    }
+                    ApprovalDecision::GrantMax => Ok(Some((target, current_allowance))),
+                }
             }
+        })
+        .buffered(STARTUP_APPROVAL_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
 
-            ApprovalDecision::GrantMax => {
-                tracing::info!(
-                    target: "startup",
-                    %token,
-                    %spender,
-                    ?symbol,
-                    purpose = ?purpose,
-                    %current_allowance,
-                    "Granting MAX approval on startup"
-                );
+    let required_approvals = decisions.into_iter().flatten().collect::<Vec<_>>();
+    let mut pending_approvals = Vec::with_capacity(required_approvals.len());
 
-                wallet
-                    .submit::<OpenChainErrorRegistry, _>(
-                        *token,
-                        IERC20::approveCall {
-                            spender: *spender,
-                            amount: U256::MAX,
-                        },
-                        purpose.note(),
-                    )
+    for (target, current_allowance) in required_approvals {
+        tracing::info!(
+            target: "startup",
+            token = %target.token,
+            spender = %target.spender,
+            symbol = ?target.symbol,
+            purpose = ?target.purpose,
+            %current_allowance,
+            "Granting MAX approval on startup"
+        );
+
+        let tx_hash = submit_approval(target.clone()).await.map_err(|source| {
+            StartupApprovalError::ApproveSubmit {
+                token: target.token,
+                spender: target.spender,
+                symbol: target.symbol.clone(),
+                source: Box::new(source),
+            }
+        })?;
+
+        tracing::info!(
+            target: "startup",
+            token = %target.token,
+            spender = %target.spender,
+            symbol = ?target.symbol,
+            purpose = ?target.purpose,
+            %tx_hash,
+            "MAX approval submitted"
+        );
+        pending_approvals.push((target, tx_hash));
+    }
+
+    stream::iter(pending_approvals)
+        .map(|(target, tx_hash)| {
+            let confirmation = confirm_approval(tx_hash);
+
+            async move {
+                confirmation
                     .await
                     .map_err(|source| StartupApprovalError::ApproveSubmit {
-                        token: *token,
-                        spender: *spender,
-                        symbol: symbol.clone(),
+                        token: target.token,
+                        spender: target.spender,
+                        symbol: target.symbol.clone(),
                         source: Box::new(source),
                     })?;
 
                 tracing::info!(
                     target: "startup",
-                    %token,
-                    %spender,
-                    ?symbol,
-                    purpose = ?purpose,
+                    token = %target.token,
+                    spender = %target.spender,
+                    symbol = ?target.symbol,
+                    purpose = ?target.purpose,
+                    %tx_hash,
                     "MAX approval granted"
                 );
+                Ok(())
             }
-        }
-    }
+        })
+        .buffer_unordered(STARTUP_APPROVAL_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
 
     Ok(())
 }
@@ -270,6 +356,9 @@ mod tests {
     use alloy::primitives::{B256, U256};
     use alloy::providers::{Provider, ProviderBuilder};
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use st0x_config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
     use st0x_evm::Evm;
@@ -278,6 +367,79 @@ mod tests {
     use super::*;
     use crate::bindings::TestERC20;
     use crate::test_utils::{TestAnvilInstance, spawn_anvil};
+
+    #[derive(Default)]
+    struct ConcurrencyProbe {
+        active: AtomicUsize,
+        maximum: AtomicUsize,
+    }
+
+    impl ConcurrencyProbe {
+        fn enter(&self) {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(active, Ordering::SeqCst);
+        }
+
+        fn exit(&self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct MockStartupApprovalWallet {
+        target_count: usize,
+        allowance_reads: ConcurrencyProbe,
+        submissions: AtomicUsize,
+        confirmations: ConcurrencyProbe,
+        confirmation_started_before_all_submissions: AtomicBool,
+    }
+
+    impl MockStartupApprovalWallet {
+        fn new(target_count: usize) -> Self {
+            Self {
+                target_count,
+                allowance_reads: ConcurrencyProbe::default(),
+                submissions: AtomicUsize::new(0),
+                confirmations: ConcurrencyProbe::default(),
+                confirmation_started_before_all_submissions: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl MockStartupApprovalWallet {
+        async fn allowance(
+            &self,
+            _token: Address,
+            _owner: Address,
+            _spender: Address,
+        ) -> Result<U256, st0x_evm::EvmError> {
+            self.allowance_reads.enter();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.allowance_reads.exit();
+            Ok(U256::ZERO)
+        }
+
+        fn submit_approval(
+            &self,
+            _token: Address,
+            _spender: Address,
+            _purpose: ApprovalPurpose,
+        ) -> TxHash {
+            let submission = self.submissions.fetch_add(1, Ordering::SeqCst) + 1;
+            TxHash::repeat_byte(u8::try_from(submission).unwrap())
+        }
+
+        async fn confirm_approval(&self, _tx_hash: TxHash) -> Result<(), st0x_evm::EvmError> {
+            if self.submissions.load(Ordering::SeqCst) != self.target_count {
+                self.confirmation_started_before_all_submissions
+                    .store(true, Ordering::SeqCst);
+            }
+
+            self.confirmations.enter();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.confirmations.exit();
+            Ok(())
+        }
+    }
 
     /// Watermark sits exactly at `U256::MAX / 2`, the midpoint between a bounded
     /// per-operation allowance and an already-granted MAX approval.
@@ -516,6 +678,65 @@ mod tests {
                 "every target must end at MAX allowance",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn reads_allowances_and_confirms_approvals_concurrently_after_submission() {
+        let targets = usdc_targets(
+            &[
+                Address::repeat_byte(0x11),
+                Address::repeat_byte(0x22),
+                Address::repeat_byte(0x33),
+                Address::repeat_byte(0x44),
+            ],
+            Address::repeat_byte(0xaa),
+        );
+        let wallet = Arc::new(MockStartupApprovalWallet::new(targets.len()));
+        let allowance_wallet = Arc::clone(&wallet);
+        let submission_wallet = Arc::clone(&wallet);
+        let confirmation_wallet = Arc::clone(&wallet);
+
+        grant_startup_approvals_with(
+            &targets,
+            move |target| {
+                let wallet = Arc::clone(&allowance_wallet);
+                async move {
+                    wallet
+                        .allowance(target.token, Address::ZERO, target.spender)
+                        .await
+                }
+            },
+            move |target| {
+                let wallet = Arc::clone(&submission_wallet);
+                async move {
+                    Ok(wallet.submit_approval(target.token, target.spender, target.purpose))
+                }
+            },
+            move |tx_hash| {
+                let wallet = Arc::clone(&confirmation_wallet);
+                async move { wallet.confirm_approval(tx_hash).await }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            wallet.allowance_reads.maximum.load(Ordering::SeqCst),
+            targets.len(),
+            "all independent allowance reads should overlap",
+        );
+        assert_eq!(wallet.submissions.load(Ordering::SeqCst), targets.len(),);
+        assert_eq!(
+            wallet.confirmations.maximum.load(Ordering::SeqCst),
+            targets.len(),
+            "confirmation waits should overlap",
+        );
+        assert!(
+            !wallet
+                .confirmation_started_before_all_submissions
+                .load(Ordering::SeqCst),
+            "every nonce-safe broadcast must finish before confirmation waits start",
+        );
     }
 
     #[tokio::test]
