@@ -58,7 +58,6 @@ use crate::offchain::order::{
     PollOrderStatusJobQueue, ReconcileOrderFill, ReconcileOrderFillJobQueue,
 };
 use crate::onchain::backfill::{BackfillJobQueue, BackfillRange};
-use crate::onchain::pyth::PythFeedIds;
 use crate::onchain_trade::OnChainTrade;
 use crate::portfolio_snapshot::{
     PortfolioSnapshot, PortfolioSnapshotCtx, PortfolioSnapshotJob, PortfolioSnapshotJobQueue,
@@ -462,7 +461,6 @@ where
         contracts: crate::onchain::raindex_contracts(&context.ctx.evm),
         ctx: context.ctx.clone(),
         cache: context.cache,
-        pyth_feed_ids: PythFeedIds::new(context.ctx.pyth_feed_ids()),
         evm: ReadOnlyEvm::new(context.provider.clone()),
         cqrs: trade_cqrs,
         vault_registry: context.frameworks.vault_registry,

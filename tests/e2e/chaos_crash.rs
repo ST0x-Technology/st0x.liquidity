@@ -418,17 +418,15 @@ async fn crash_mid_accounting_job_recovers_the_fill_after_restart() -> anyhow::R
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Pin the accounting job mid-perform: the receipt fetch is its first
-    // RPC call, so holding the response keeps the job Running with zero
-    // CQRS events persisted. The hold must outlast the worst-case time to
-    // reach the abort below -- the Running-job poll and the checkpoint poll
-    // can each take their full 60s timeout (120s combined) -- or a slow run
-    // would deliver the receipt before the crash and let the job complete,
-    // defeating the test. The receipt is never actually awaited (the crash
-    // lands first), so the larger hold does not slow the test.
-    chaos
-        .delay_transaction_receipts(Duration::from_secs(150), 4)
-        .await;
+    // Pin the accounting job mid-perform: resolving the first-seen token
+    // symbols happens before the trade is witnessed, so holding those exact
+    // eth_call responses keeps the job Running with zero CQRS events persisted.
+    // The hold must outlast the worst-case time to reach the abort below -- the
+    // Running-job poll and checkpoint poll can each take their full 60s timeout
+    // (120s combined) -- or a slow run would let the job complete and defeat
+    // the test. The held responses are never awaited because the crash lands
+    // first, so the larger hold does not slow the test.
+    chaos.delay_symbol_calls(Duration::from_secs(150), 2).await;
 
     let take_result = infra
         .base_chain

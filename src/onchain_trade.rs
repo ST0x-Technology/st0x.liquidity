@@ -1,8 +1,8 @@
 //! OnChainTrade CQRS/ES aggregate for recording direct Raindex orderbook fills
 //! and fills routed through shared-inventory adapters.
 //!
-//! Keyed by `(tx_hash, log_index)`. Can be enriched after
-//! the fact with gas costs and Pyth oracle price data.
+//! Keyed by `(tx_hash, log_index)`. Historical enrichment events remain
+//! replayable, but current trade accounting no longer emits them (ADR 0020).
 
 use std::num::ParseIntError;
 use std::str::FromStr;
@@ -224,9 +224,7 @@ impl EventSourced for OnChainTrade {
                 filled_at,
             }]),
 
-            AttributeSource { .. } | Enrich { .. } | Acknowledge => {
-                Err(OnChainTradeError::NotFilled)
-            }
+            AttributeSource { .. } | Acknowledge => Err(OnChainTradeError::NotFilled),
         }
     }
 
@@ -262,31 +260,6 @@ impl EventSourced for OnChainTrade {
                 }])
             }
 
-            Enrich {
-                gas_used,
-                effective_gas_price,
-                pyth_price,
-            } => {
-                if self.is_enriched() {
-                    return Err(OnChainTradeError::AlreadyEnriched);
-                }
-
-                // SQLite stores integers as i64; reject values that would
-                // violate the CHECK constraint on the onchain_trades table.
-                if effective_gas_price > i64::MAX as u128 {
-                    return Err(OnChainTradeError::GasPriceOutOfRange {
-                        effective_gas_price,
-                    });
-                }
-
-                Ok(vec![Enriched {
-                    gas_used,
-                    effective_gas_price,
-                    pyth_price,
-                    enriched_at: Utc::now(),
-                }])
-            }
-
             Acknowledge => {
                 if self.is_acknowledged() {
                     return Err(OnChainTradeError::AlreadyAcknowledged);
@@ -301,10 +274,6 @@ impl EventSourced for OnChainTrade {
 }
 
 impl OnChainTrade {
-    pub(crate) fn is_enriched(&self) -> bool {
-        self.enrichment.is_some()
-    }
-
     /// Whether the `Position` aggregate has acknowledged this fill --
     /// the condition under which the trade-accounting dedupe treats the
     /// trade as fully processed.
@@ -419,10 +388,8 @@ fn log_unrecognized_inventory_source(source: OnChainTradeSource) {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum OnChainTradeError {
-    #[error("Cannot enrich trade that hasn't been filled yet")]
+    #[error("Cannot update trade that hasn't been filled yet")]
     NotFilled,
-    #[error("Trade has already been enriched")]
-    AlreadyEnriched,
     #[error("Trade has already been filled")]
     AlreadyFilled,
     #[error("Trade source has already been attributed")]
@@ -433,11 +400,6 @@ pub(crate) enum OnChainTradeError {
     LegacySourceWitness,
     #[error("Trade has already been acknowledged by the position")]
     AlreadyAcknowledged,
-    #[error(
-        "Effective gas price {effective_gas_price} exceeds i64::MAX \
-         and cannot be stored in SQLite"
-    )]
-    GasPriceOutOfRange { effective_gas_price: u128 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,11 +446,6 @@ pub(crate) enum OnChainTradeCommand {
         block_number: u64,
         block_timestamp: DateTime<Utc>,
         filled_at: DateTime<Utc>,
-    },
-    Enrich {
-        gas_used: u64,
-        effective_gas_price: u128,
-        pyth_price: PythPrice,
     },
     /// Marks the fill as acknowledged by the `Position` aggregate.
     /// Sent only after `AcknowledgeOnChainFill` succeeded, so the
@@ -725,150 +682,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_command_creates_enriched_event() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let now = Utc::now();
-
-        let pyth_price = PythPrice {
-            value: "150250000".to_string(),
-            expo: -6,
-            conf: "50000".to_string(),
-            publish_time: now,
-        };
-
-        let events = TestHarness::<OnChainTrade>::with(())
-            .given(vec![OnChainTradeEvent::Filled {
-                source: OnChainTradeSource::Raindex,
-                symbol: symbol.clone(),
-                amount: float!(10.5),
-                direction: Direction::Buy,
-                price_usdc: float!(150.25),
-                block_number: 12345,
-                block_timestamp: now,
-                filled_at: now,
-            }])
-            .when(OnChainTradeCommand::Enrich {
-                gas_used: 50000,
-                effective_gas_price: 1_000_000_000,
-                pyth_price,
-            })
-            .await
-            .events();
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], OnChainTradeEvent::Enriched { .. }));
-    }
-
-    #[tokio::test]
-    async fn cannot_enrich_twice() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let now = Utc::now();
-
-        let pyth_price = PythPrice {
-            value: "150250000".to_string(),
-            expo: -6,
-            conf: "50000".to_string(),
-            publish_time: now,
-        };
-
-        let error = TestHarness::<OnChainTrade>::with(())
-            .given(vec![
-                OnChainTradeEvent::Filled {
-                    source: OnChainTradeSource::Raindex,
-                    symbol: symbol.clone(),
-                    amount: float!(10.5),
-                    direction: Direction::Buy,
-                    price_usdc: float!(150.25),
-                    block_number: 12345,
-                    block_timestamp: now,
-                    filled_at: now,
-                },
-                OnChainTradeEvent::Enriched {
-                    gas_used: 50000,
-                    effective_gas_price: 1_000_000_000,
-                    pyth_price: pyth_price.clone(),
-                    enriched_at: now,
-                },
-            ])
-            .when(OnChainTradeCommand::Enrich {
-                gas_used: 50000,
-                effective_gas_price: 1_000_000_000,
-                pyth_price,
-            })
-            .await
-            .then_expect_error();
-
-        assert!(matches!(
-            error,
-            LifecycleError::Apply(OnChainTradeError::AlreadyEnriched)
-        ));
-    }
-
-    #[tokio::test]
-    async fn cannot_enrich_before_fill() {
-        let now = Utc::now();
-
-        let pyth_price = PythPrice {
-            value: "150250000".to_string(),
-            expo: -6,
-            conf: "50000".to_string(),
-            publish_time: now,
-        };
-
-        let error = TestHarness::<OnChainTrade>::with(())
-            .given_no_previous_events()
-            .when(OnChainTradeCommand::Enrich {
-                gas_used: 50000,
-                effective_gas_price: 1_000_000_000,
-                pyth_price,
-            })
-            .await
-            .then_expect_error();
-
-        assert!(matches!(
-            error,
-            LifecycleError::Apply(OnChainTradeError::NotFilled)
-        ));
-    }
-
-    #[tokio::test]
-    async fn rejects_gas_price_exceeding_i64_max() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let now = Utc::now();
-
-        let pyth_price = PythPrice {
-            value: "150250000".to_string(),
-            expo: -6,
-            conf: "50000".to_string(),
-            publish_time: now,
-        };
-
-        let error = TestHarness::<OnChainTrade>::with(())
-            .given(vec![OnChainTradeEvent::Filled {
-                source: OnChainTradeSource::Raindex,
-                symbol,
-                amount: float!("10.5"),
-                direction: Direction::Buy,
-                price_usdc: float!("150.25"),
-                block_number: 12345,
-                block_timestamp: now,
-                filled_at: now,
-            }])
-            .when(OnChainTradeCommand::Enrich {
-                gas_used: 50000,
-                effective_gas_price: (i64::MAX as u128) + 1,
-                pyth_price,
-            })
-            .await
-            .then_expect_error();
-
-        assert!(matches!(
-            error,
-            LifecycleError::Apply(OnChainTradeError::GasPriceOutOfRange { .. })
-        ));
-    }
-
-    #[tokio::test]
     async fn acknowledge_marks_witnessed_trade() {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
@@ -939,10 +752,8 @@ mod tests {
         ));
     }
 
-    /// Production emits `Enriched` before `Acknowledged`: enrichment runs
-    /// in the fresh-trade path, then the position acknowledges the fill.
-    /// The `Acknowledged` evolve handler must preserve the enrichment it
-    /// finds so both markers survive in the live aggregate.
+    /// Persisted trades may contain a legacy `Enriched` event. Replaying a
+    /// later acknowledgement must preserve that historical data.
     #[tokio::test]
     async fn acknowledge_after_enrich_preserves_both_markers() {
         let symbol = Symbol::new("AAPL").unwrap();
@@ -978,7 +789,7 @@ mod tests {
         .expect("replay must produce a live trade");
 
         assert!(trade.is_acknowledged());
-        assert!(trade.is_enriched());
+        assert!(trade.enrichment.is_some());
     }
 
     #[tokio::test]
@@ -1085,7 +896,7 @@ mod tests {
         assert_eq!(trade.symbol, Symbol::new("AAPL").unwrap());
         assert!(trade.amount.eq(float!(10.5)).unwrap());
         assert_eq!(trade.direction, Direction::Buy);
-        assert!(!trade.is_enriched());
+        assert!(trade.enrichment.is_none());
     }
 
     #[test]
@@ -1350,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn enriched_updates_live_state() {
+    fn legacy_enriched_event_updates_live_state() {
         let now = Utc::now();
 
         let pyth_price = PythPrice {
@@ -1381,7 +1192,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(trade.is_enriched());
+        assert!(trade.enrichment.is_some());
         let enrichment = trade.enrichment.unwrap();
         assert_eq!(enrichment.gas_used, 50000);
         assert_eq!(enrichment.effective_gas_price, 1_000_000_000);

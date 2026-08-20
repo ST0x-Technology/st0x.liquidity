@@ -8,7 +8,7 @@
 
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::node_bindings::{Anvil, AnvilInstance};
-use alloy::primitives::{Address, B256, Bytes, U256, address, utils::parse_units};
+use alloy::primitives::{Address, B256, Bytes, I256, U256, address, utils::parse_units};
 use alloy::providers::ext::AnvilApi as _;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
@@ -118,14 +118,12 @@ sol!(
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    MockPyth, "tests/e2e/MockPyth.json"
+    MockChainlinkFeed, "tests/e2e/MockChainlinkFeed.json"
 );
 
-/// Fixed ETH/USD price the e2e `MockPyth` returns for every feed id: $2000.00
-/// (Pyth encodes `price * 10^expo`, so `200_000_000_000 * 10^-8`).
-pub const MOCK_PYTH_ETH_USD_PRICE: i64 = 200_000_000_000;
-pub const MOCK_PYTH_ETH_USD_CONF: u64 = 1_000_000;
-pub const MOCK_PYTH_ETH_USD_EXPO: i32 = -8;
+/// Fixed ETH/USD price returned by the e2e Chainlink feed: $2000.00.
+pub const MOCK_CHAINLINK_ETH_USD_ANSWER: i64 = 200_000_000_000;
+pub const MOCK_CHAINLINK_ETH_USD_DECIMALS: u8 = 8;
 
 /// OpenZeppelin ERC20 `_balances` mapping storage slot.
 ///
@@ -208,10 +206,9 @@ pub struct BaseChain<P> {
     interpreter: Address,
     store: Address,
     equity_tokens: HashMap<String, Address>,
-    /// Minimal `getPriceUnsafe` stub deployed for every e2e chain (see ADR
-    /// 0017), so a test that enables rebalancing can wire
-    /// `[bot_gas_valuation] pyth_contract` at this address.
-    pub mock_pyth: Address,
+    /// Minimal Chainlink feed deployed for every e2e chain (ADR 0020), so a
+    /// test that enables rebalancing can wire `[bot_gas_valuation]` here.
+    pub mock_chainlink_feed: Address,
 }
 
 impl BaseChain<()> {
@@ -303,14 +300,14 @@ impl BaseChain<()> {
 
         provider.anvil_set_balance(minter, hundred_eth).await?;
 
-        let mock_pyth = MockPyth::deploy(
+        let mock_chainlink_feed = MockChainlinkFeed::deploy(
             &provider,
-            MOCK_PYTH_ETH_USD_PRICE,
-            MOCK_PYTH_ETH_USD_CONF,
-            MOCK_PYTH_ETH_USD_EXPO,
+            I256::try_from(MOCK_CHAINLINK_ETH_USD_ANSWER)
+                .expect("fixed e2e price must fit in int256"),
+            MOCK_CHAINLINK_ETH_USD_DECIMALS,
         )
         .await?;
-        let mock_pyth = *mock_pyth.address();
+        let mock_chainlink_feed = *mock_chainlink_feed.address();
 
         Ok(BaseChain {
             anvil,
@@ -326,7 +323,7 @@ impl BaseChain<()> {
             interpreter,
             store,
             equity_tokens: HashMap::new(),
-            mock_pyth,
+            mock_chainlink_feed,
         })
     }
 }

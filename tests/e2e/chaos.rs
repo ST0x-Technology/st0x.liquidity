@@ -72,6 +72,7 @@ pub(crate) enum ChaosBehaviour {
 #[derive(Debug, Clone)]
 pub(crate) struct ChaosConfig {
     pub method: String,
+    pub call_data: Option<String>,
     pub behaviour: ChaosBehaviour,
     pub remaining: usize,
     pub pending_stale_tips: usize,
@@ -193,6 +194,7 @@ impl ChaosProxy {
     pub(crate) async fn empty_get_logs(&self, count: usize) {
         *self.config.lock().await = Some(ChaosConfig {
             method: "eth_getLogs".to_owned(),
+            call_data: None,
             behaviour: ChaosBehaviour::EmptyResult,
             remaining: count,
             pending_stale_tips: 0,
@@ -206,20 +208,21 @@ impl ChaosProxy {
     pub(crate) async fn delay_get_logs(&self, duration: Duration, count: usize) {
         *self.config.lock().await = Some(ChaosConfig {
             method: "eth_getLogs".to_owned(),
+            call_data: None,
             behaviour: ChaosBehaviour::Delay { duration },
             remaining: count,
             pending_stale_tips: 0,
         });
     }
 
-    /// Convenience: hold the responses of the next `count`
-    /// `eth_getTransactionReceipt` calls for `duration` each. The receipt
-    /// fetch is the first RPC call the trade-accounting job makes, so a
-    /// held receipt pins that job mid-`perform` -- used by crash tests to
-    /// widen the in-flight window they kill the bot inside.
-    pub(crate) async fn delay_transaction_receipts(&self, duration: Duration, count: usize) {
+    /// Holds the next `count` ERC20 `symbol()` call responses for `duration`.
+    /// A first-seen trade token resolves its symbol before the trade is
+    /// witnessed, so this pins accounting inside `perform` without delaying
+    /// unrelated background `eth_call` traffic.
+    pub(crate) async fn delay_symbol_calls(&self, duration: Duration, count: usize) {
         *self.config.lock().await = Some(ChaosConfig {
-            method: "eth_getTransactionReceipt".to_owned(),
+            method: "eth_call".to_owned(),
+            call_data: Some("0x95d89b41".to_owned()),
             behaviour: ChaosBehaviour::Delay { duration },
             remaining: count,
             pending_stale_tips: 0,
@@ -233,6 +236,7 @@ impl ChaosProxy {
     pub(crate) async fn replay_get_logs(&self, count: usize) {
         *self.config.lock().await = Some(ChaosConfig {
             method: "eth_getLogs".to_owned(),
+            call_data: None,
             behaviour: ChaosBehaviour::ReplayLogs,
             remaining: count,
             pending_stale_tips: 0,
@@ -608,7 +612,7 @@ async fn process_one(state: &ProxyState, request: Value) -> Value {
     let is_get_logs = method.as_deref() == Some("eth_getLogs");
 
     let perturbation = match method {
-        Some(method) => perturb(state, &method, &id).await,
+        Some(method) => perturb(state, &method, &request, &id).await,
         None => None,
     };
 
@@ -738,7 +742,12 @@ async fn forward_or_rpc_error(state: &ProxyState, request: &Value, id: Value) ->
 
 /// Returns the perturbation the active chaos config applies to this
 /// method, or `None` to forward untouched.
-async fn perturb(state: &ProxyState, method: &str, id: &Value) -> Option<Perturbation> {
+async fn perturb(
+    state: &ProxyState,
+    method: &str,
+    request: &Value,
+    id: &Value,
+) -> Option<Perturbation> {
     let mut guard = state.config.lock().await;
 
     let result = match guard.as_mut() {
@@ -759,7 +768,15 @@ async fn perturb(state: &ProxyState, method: &str, id: &Value) -> Option<Perturb
                 Some(Perturbation::Synthesize(
                     json!({ "jsonrpc": "2.0", "id": id, "result": "0x0" }),
                 ))
-            } else if cfg.method == method && cfg.remaining > 0 {
+            } else if cfg.method == method
+                && cfg.remaining > 0
+                && cfg.call_data.as_deref().is_none_or(|expected| {
+                    request["params"][0]["data"]
+                        .as_str()
+                        .or_else(|| request["params"][0]["input"].as_str())
+                        == Some(expected)
+                })
+            {
                 match cfg.behaviour {
                     ChaosBehaviour::EmptyResult => {
                         cfg.remaining -= 1;

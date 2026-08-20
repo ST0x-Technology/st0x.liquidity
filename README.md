@@ -72,7 +72,7 @@ cargo check       # verify setup
 ```
 
 Solidity ABIs are produced as per-feature Nix derivations under `nix/`
-(`forge-std.nix`, `pyth.nix`, `rain-math-float.nix`, `rain-orderbook.nix`,
+(`forge-std.nix`, `rain-math-float.nix`, `rain-orderbook.nix`, and
 `raindex-governance.nix` -- the shared `RaindexInventory` ABI) and exposed to
 `cargo` through environment variables set by the dev shell -- no submodule
 checkout, no manual `forge build` required.

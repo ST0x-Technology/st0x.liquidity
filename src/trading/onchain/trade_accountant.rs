@@ -32,7 +32,6 @@ use crate::conductor::{
     TradeProcessingCqrs, VaultDiscoveryCtx, discover_vaults_for_trade, process_queued_trade,
 };
 use crate::offchain::order::PlaceOffchainOrderError;
-use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::{RaindexTradeEvent, TradeValidationError};
 use crate::onchain::{OnChainError, OnchainTrade};
 use crate::vault_registry::VaultRegistry;
@@ -69,7 +68,6 @@ pub struct AccountForDexTrade {
 pub(crate) struct AccountantCtx<Node, Exec> {
     pub(crate) ctx: Ctx,
     pub(crate) cache: SymbolCache,
-    pub(crate) pyth_feed_ids: PythFeedIds,
     /// Orderbook and shared `RaindexInventory` addresses -- the latter is the
     /// source contract for `InventoryTrade` events
     /// (`OperatorDeposit`/`OperatorWithdraw`). Used to reconstruct the
@@ -127,7 +125,6 @@ where
                     &ctx.evm,
                     *clear_event.clone(),
                     reconstructed_log,
-                    &ctx.pyth_feed_ids,
                     order_owner,
                 )
                 .await
@@ -140,15 +137,15 @@ where
                     *take_event.clone(),
                     reconstructed_log,
                     order_owner,
-                    &ctx.pyth_feed_ids,
                 )
                 .await
             }
 
             InventoryTrade(inv) => {
                 // No pre-fetched receipt here (this event may be reconstructed
-                // from a stored backfill log, not a fresh RPC round-trip), so
-                // `try_from_inventory_trade` fetches its own receipt metadata.
+                // from a stored backfill log, not a fresh RPC round-trip).
+                // `try_from_inventory_trade` uses the log's block number and
+                // fetches receipt metadata only if that number is absent.
                 OnchainTrade::try_from_inventory_trade(
                     &ctx.cache,
                     &ctx.evm,
@@ -156,7 +153,6 @@ where
                     &ctx.ctx.inventory_adapters,
                     inv.as_ref(),
                     reconstructed_log,
-                    &ctx.pyth_feed_ids,
                     None,
                 )
                 .await
@@ -854,7 +850,6 @@ mod tests {
             contracts: crate::onchain::raindex_contracts(&ctx.evm),
             ctx,
             cache,
-            pyth_feed_ids: PythFeedIds::default(),
             evm: st0x_evm::ReadOnlyEvm::new(provider),
             cqrs,
             vault_registry,
@@ -960,26 +955,6 @@ mod tests {
             trade: EmittedOnChain::from_log(event, &log).unwrap(),
             backpressure_streak: BackpressureStreak::default(),
         };
-
-        // Mock EVM responses: receipt first, then decimals()+symbol() for each token.
-        let tx_hash = alloy::primitives::fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
-        asserter.push_success(&serde_json::json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x1",
-            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
-            "blockNumber": "0x1",
-            "from": "0x1234567890123456789012345678901234567890",
-            "to": "0x5678901234567890123456789012345678901234",
-            "gasUsed": "0x5208",
-            "effectiveGasPrice": "0x77359400",
-            "cumulativeGasUsed": "0x5208",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "logs": []
-        }));
 
         // Input token (order's output due to TakeOrder perspective swap)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
@@ -1098,28 +1073,13 @@ mod tests {
             removed: false,
         };
 
-        // get_logs returns the AfterClearV2, then a receipt for gas. Symbols come
-        // from the pre-seeded address cache below (not RPC mocks): resolving
+        // get_logs returns the AfterClearV2. Symbols come from the pre-seeded
+        // address cache below (not RPC mocks): resolving
         // input/output concurrently via tokio::try_join! means two positional
         // decimals()+symbol() mocks are not guaranteed to land on the token that
         // actually queried them, which can silently swap which side is "equity"
         // and mask the very zero-price case this test exists to catch.
         asserter.push_success(&serde_json::json!([after_clear_log]));
-        asserter.push_success(&serde_json::json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x1",
-            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
-            "blockNumber": "0x1",
-            "from": "0x1234567890123456789012345678901234567890",
-            "to": "0x5678901234567890123456789012345678901234",
-            "gasUsed": "0x5208",
-            "effectiveGasPrice": "0x77359400",
-            "cumulativeGasUsed": "0x5208",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "logs": []
-        }));
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
@@ -1189,26 +1149,6 @@ mod tests {
             backpressure_streak: BackpressureStreak::default(),
         };
 
-        // Reconstructed log's tx_hash is get_test_log's; the parser fetches the
-        // receipt, then the deposit- then withdraw-token decimals() (both 18).
-        let tx_hash = alloy::primitives::fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
-        asserter.push_success(&serde_json::json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x1",
-            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
-            "blockNumber": "0x1",
-            "from": "0x1234567890123456789012345678901234567890",
-            "to": "0x5678901234567890123456789012345678901234",
-            "gasUsed": "0x5208",
-            "effectiveGasPrice": "0x77359400",
-            "cumulativeGasUsed": "0x5208",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "logs": []
-        }));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
 
@@ -1281,24 +1221,6 @@ mod tests {
             backpressure_streak: BackpressureStreak::default(),
         };
 
-        let tx_hash = alloy::primitives::fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
-        asserter.push_success(&serde_json::json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x1",
-            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
-            "blockNumber": "0x1",
-            "from": "0x1234567890123456789012345678901234567890",
-            "to": "0x5678901234567890123456789012345678901234",
-            "gasUsed": "0x5208",
-            "effectiveGasPrice": "0x77359400",
-            "cumulativeGasUsed": "0x5208",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "logs": []
-        }));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
 
@@ -1369,24 +1291,6 @@ mod tests {
             backpressure_streak: BackpressureStreak::default(),
         };
 
-        let tx_hash = alloy::primitives::fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
-        asserter.push_success(&serde_json::json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x1",
-            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
-            "blockNumber": "0x1",
-            "from": "0x1234567890123456789012345678901234567890",
-            "to": "0x5678901234567890123456789012345678901234",
-            "gasUsed": "0x5208",
-            "effectiveGasPrice": "0x77359400",
-            "cumulativeGasUsed": "0x5208",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "logs": []
-        }));
         // Both token symbols are preloaded into the cache below, so the only
         // RPC introspection left is the two decimals() calls, each of which
         // makes 1 + INVENTORY_TOKEN_DECIMALS_MAX_RETRIES attempts. Seed a
@@ -1467,24 +1371,6 @@ mod tests {
             backpressure_streak: BackpressureStreak::default(),
         };
 
-        let tx_hash = alloy::primitives::fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
-        asserter.push_success(&serde_json::json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x1",
-            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
-            "blockNumber": "0x1",
-            "from": "0x1234567890123456789012345678901234567890",
-            "to": "0x5678901234567890123456789012345678901234",
-            "gasUsed": "0x5208",
-            "effectiveGasPrice": "0x77359400",
-            "cumulativeGasUsed": "0x5208",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "logs": []
-        }));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
 
@@ -1578,23 +1464,6 @@ mod tests {
             backpressure_streak: BackpressureStreak::default(),
         };
 
-        // The parser fetches the receipt, then the deposit- (USDC, 6dp)
-        // then withdraw-token (wtCOIN, 18dp) decimals().
-        asserter.push_success(&serde_json::json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x3b",
-            "blockHash": "0x373307a0e2154c2de6b046e349fc27f9bb02b01fdddbb15eeba57f3ce3b24973",
-            "blockNumber": "0x2dce2cf",
-            "from": "0x679df30b30ac2947aa3143490add6717af81dcc3",
-            "to": "0xbeb0009aca35087ce7ccf11637e24dd1aad3bf2a",
-            "gasUsed": "0x7a62d",
-            "effectiveGasPrice": "0x57bcf0",
-            "cumulativeGasUsed": "0xa00b4e",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": format!("0x{}", "0".repeat(512)),
-            "logs": []
-        }));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtCOIN
 
@@ -1615,7 +1484,6 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: equity_token,
-                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
@@ -1837,21 +1705,6 @@ mod tests {
             backpressure_streak: BackpressureStreak::default(),
         };
 
-        asserter.push_success(&serde_json::json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x3b",
-            "blockHash": "0x373307a0e2154c2de6b046e349fc27f9bb02b01fdddbb15eeba57f3ce3b24973",
-            "blockNumber": "0x2dce2cf",
-            "from": "0x679df30b30ac2947aa3143490add6717af81dcc3",
-            "to": "0xbeb0009aca35087ce7ccf11637e24dd1aad3bf2a",
-            "gasUsed": "0x7a62d",
-            "effectiveGasPrice": "0x57bcf0",
-            "cumulativeGasUsed": "0xa00b4e",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": format!("0x{}", "0".repeat(512)),
-            "logs": []
-        }));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
 
@@ -1865,7 +1718,6 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: equity_token,
-                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
@@ -1984,23 +1836,6 @@ mod tests {
             backpressure_streak: BackpressureStreak::default(),
         };
 
-        // The parser fetches the receipt, then the deposit- (wtCOIN, 18dp)
-        // then withdraw-token (USDC, 6dp) decimals().
-        asserter.push_success(&serde_json::json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x41",
-            "blockHash": "0x4fb86ed2edeee5845f379874a140df6ed78a5553877a4a480878f2eb70f0efeb",
-            "blockNumber": "0x2dd36e4",
-            "from": "0x679df30b30ac2947aa3143490add6717af81dcc3",
-            "to": "0xe23457189a0186b23e9f325eb11364b3733c2c89",
-            "gasUsed": "0x54025",
-            "effectiveGasPrice": "0x59a538",
-            "cumulativeGasUsed": "0xa481c7",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": format!("0x{}", "0".repeat(512)),
-            "logs": []
-        }));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtCOIN
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC
 
@@ -2021,7 +1856,6 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: equity_token,
-                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
