@@ -431,7 +431,7 @@ pub mod usdc_rebalance {
     };
 
     #[cfg(feature = "test-support")]
-    pub use crate::usdc_rebalance::TransferRef;
+    pub use crate::usdc_rebalance::{ConversionAmounts, TransferRef};
 }
 
 pub mod vault_lookup {

@@ -42,6 +42,8 @@ pub enum RebalancingCtxError {
     ZeroTransferAttemptTimeout,
     #[error("rebalancing attestation_retry_deadline_secs must be non-zero")]
     ZeroAttestationRetryDeadline,
+    #[error("rebalancing settlement_retry_deadline_secs must be non-zero")]
+    ZeroSettlementRetryDeadline,
     #[error(
         "rebalancing max_burn_revert_redrives must be non-zero when USDC rebalancing \
          is enabled; set it to the maximum number of burn-revert redrive attempts \
@@ -88,6 +90,19 @@ pub struct RebalancingConfig {
     /// At the production default (24h) the overshoot is negligible; set with
     /// that granularity in mind, not as a hard millisecond cutoff.
     pub attestation_retry_deadline_secs: u64,
+    /// How long an Alpaca->Base transfer may wait for the withdrawn USDC to
+    /// settle on-chain after the withdrawal confirmed at Alpaca, before the
+    /// redrive gives up and marks the bridge failed for operator
+    /// reconciliation. Anchored on the durable `WithdrawalComplete`
+    /// `confirmed_at`, so the bound survives restarts.
+    ///
+    /// Like `attestation_retry_deadline_secs`, this is a soft bound checked
+    /// between redrive attempts (~30 s apart), not a hard cutoff. Settlement
+    /// normally completes in minutes; the deadline only exists so a
+    /// withdrawal that never settles (deep reorg, wrong tx hash from Alpaca,
+    /// funds that never arrive) cannot keep the single-rebalance guard
+    /// latched forever with no operator signal.
+    pub settlement_retry_deadline_secs: u64,
     /// Maximum number of burn-revert redrive attempts for a single Base->Alpaca
     /// USDC transfer job before the circuit-breaker opens and the operator is
     /// alerted.
@@ -145,6 +160,10 @@ pub struct RebalancingCtx {
     /// [`RebalancingConfig::transfer_attempt_timeout_secs`].
     pub transfer_attempt_timeout: Duration,
     pub attestation_retry_deadline: Duration,
+    /// Upper bound on the retryable settlement wait after an Alpaca
+    /// withdrawal confirmed. See
+    /// [`RebalancingConfig::settlement_retry_deadline_secs`].
+    pub settlement_retry_deadline: Duration,
     /// Maximum consecutive burn-revert redrives before the circuit opens.
     /// See [`RebalancingConfig::max_burn_revert_redrives`].
     pub max_burn_revert_redrives: u32,
@@ -175,6 +194,9 @@ impl RebalancingCtx {
         if config.attestation_retry_deadline_secs == 0 {
             return Err(RebalancingCtxError::ZeroAttestationRetryDeadline);
         }
+        if config.settlement_retry_deadline_secs == 0 {
+            return Err(RebalancingCtxError::ZeroSettlementRetryDeadline);
+        }
 
         if config.transfer_attempt_timeout_secs == 0 {
             return Err(RebalancingCtxError::ZeroTransferAttemptTimeout);
@@ -198,6 +220,7 @@ impl RebalancingCtx {
             inventory_staleness_bound: Duration::from_secs(config.inventory_staleness_bound_secs),
             transfer_attempt_timeout: Duration::from_secs(config.transfer_attempt_timeout_secs),
             attestation_retry_deadline: Duration::from_secs(config.attestation_retry_deadline_secs),
+            settlement_retry_deadline: Duration::from_secs(config.settlement_retry_deadline_secs),
             max_burn_revert_redrives: config.max_burn_revert_redrives,
             freeze_check: config.freeze_check,
             #[cfg(feature = "test-support")]
@@ -226,6 +249,7 @@ impl RebalancingCtx {
         #[builder(default = Duration::from_secs(60 * 60))] transfer_attempt_timeout: Duration,
         #[builder(default = Duration::from_secs(24 * 60 * 60))]
         attestation_retry_deadline: Duration,
+        #[builder(default = Duration::from_secs(24 * 60 * 60))] settlement_retry_deadline: Duration,
         #[builder(default = 5)] max_burn_revert_redrives: u32,
         #[builder(default = OperationMode::Enabled)] freeze_check: OperationMode,
     ) -> Self {
@@ -236,6 +260,7 @@ impl RebalancingCtx {
             inventory_staleness_bound,
             transfer_attempt_timeout,
             attestation_retry_deadline,
+            settlement_retry_deadline,
             max_burn_revert_redrives,
             freeze_check,
             #[cfg(feature = "test-support")]
@@ -262,6 +287,7 @@ impl RebalancingCtx {
         #[builder(default = Duration::from_secs(60 * 60))] transfer_attempt_timeout: Duration,
         #[builder(default = Duration::from_secs(24 * 60 * 60))]
         attestation_retry_deadline: Duration,
+        #[builder(default = Duration::from_secs(24 * 60 * 60))] settlement_retry_deadline: Duration,
         #[builder(default = 5)] max_burn_revert_redrives: u32,
         #[builder(default = OperationMode::Enabled)] freeze_check: OperationMode,
     ) -> Self {
@@ -279,6 +305,7 @@ impl RebalancingCtx {
             inventory_staleness_bound,
             transfer_attempt_timeout,
             attestation_retry_deadline,
+            settlement_retry_deadline,
             max_burn_revert_redrives,
             freeze_check,
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
@@ -331,6 +358,7 @@ mod tests {
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
@@ -372,6 +400,7 @@ mod tests {
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "disabled"
 
@@ -400,6 +429,7 @@ mod tests {
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
 
             [equity]
@@ -427,6 +457,7 @@ mod tests {
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 7200
+            settlement_retry_deadline_secs = 7200
             max_burn_revert_redrives = 3
             freeze_check = "enabled"
 
@@ -459,6 +490,7 @@ mod tests {
         let toml_str = r#"
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
@@ -485,6 +517,7 @@ mod tests {
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
@@ -509,6 +542,7 @@ mod tests {
             inventory_staleness_bound_secs = 0
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
@@ -562,6 +596,7 @@ mod tests {
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 0
+            settlement_retry_deadline_secs = 0
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
@@ -585,12 +620,98 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_missing_settlement_retry_deadline_secs_fails() {
+        let toml_str = r#"
+            transfer_timeout_secs = 1800
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+            freeze_check = "enabled"
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#;
+
+        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
+        assert!(
+            error.message().contains("settlement_retry_deadline_secs"),
+            "Expected missing settlement_retry_deadline_secs error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn zero_settlement_retry_deadline_secs_fails_validation() {
+        let config: RebalancingConfig = toml::from_str(
+            r#"
+            transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 0
+            max_burn_revert_redrives = 5
+            freeze_check = "enabled"
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#,
+        )
+        .unwrap();
+
+        let error = RebalancingCtx::new(&config).unwrap_err();
+        assert!(matches!(
+            error,
+            RebalancingCtxError::ZeroSettlementRetryDeadline
+        ));
+    }
+
+    #[test]
+    fn settlement_retry_deadline_secs_propagates_to_ctx() {
+        let config: RebalancingConfig = toml::from_str(
+            r#"
+            transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 7200
+            max_burn_revert_redrives = 5
+            freeze_check = "enabled"
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#,
+        )
+        .unwrap();
+
+        let ctx = RebalancingCtx::new(&config).unwrap();
+        assert_eq!(ctx.settlement_retry_deadline, Duration::from_secs(7200));
+    }
+
+    #[test]
     fn deserialize_missing_equity_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
@@ -614,6 +735,7 @@ mod tests {
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
@@ -635,6 +757,7 @@ mod tests {
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
             attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
@@ -663,6 +786,7 @@ mod tests {
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 0
             attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
@@ -693,6 +817,7 @@ mod tests {
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
             max_burn_revert_redrives = 0
             freeze_check = "enabled"
 
@@ -723,6 +848,7 @@ mod tests {
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
             max_burn_revert_redrives = 0
             freeze_check = "enabled"
 
@@ -747,6 +873,7 @@ mod tests {
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
             freeze_check = "enabled"
 
             [equity]

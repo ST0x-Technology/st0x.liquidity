@@ -743,6 +743,7 @@ async fn run_usdc_transfer<Writer: Write>(
         MarketMakingUsdcEndpoints::new(owner, RaindexVaultId(usdc_vault_id)),
         &UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
+            settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
             required_confirmations: ctx.chains.primary().required_confirmations,
             reserved_cash: ctx
                 .assets
@@ -1205,31 +1206,16 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
         );
     };
 
-    // Authoritative gate is the aggregate command; this preflight mirrors its
-    // accepted set (DepositFailed, post-burn BridgingFailed, BaseToAlpaca
-    // ConversionFailed) only to give the operator a clearer error first.
-    let is_post_burn_failure = matches!(
-        state,
-        UsdcRebalance::DepositFailed { .. }
-            | UsdcRebalance::BridgingFailed {
-                burn_tx_hash: Some(_),
-                ..
-            }
-            | UsdcRebalance::BridgingFailed {
-                cctp_nonce: Some(_),
-                ..
-            }
-            | UsdcRebalance::ConversionFailed {
-                direction: RebalanceDirection::BaseToAlpaca,
-                ..
-            }
-    );
-
-    if !is_post_burn_failure {
+    // Authoritative gate is the aggregate command; this preflight shares its
+    // predicate (`is_reconcilable_failure`, the single source of the
+    // reconcile-eligibility rule) only to give the operator a clearer error
+    // first.
+    if !state.is_reconcilable_failure() {
         anyhow::bail!(
-            "transfer reconcile: transfer {id} is in state {state:?}, not a post-burn \
-             terminal failure that strands the in-progress guard (DepositFailed, post-burn \
-             BridgingFailed, or a BaseToAlpaca ConversionFailed). Refusing to act."
+            "transfer reconcile: transfer {id} is in state {state:?}, not a terminal \
+             failure that strands the in-progress guard or off-venue funds (DepositFailed, \
+             post-burn BridgingFailed, AlpacaToBase BridgingFailed, or a BaseToAlpaca \
+             ConversionFailed). Refusing to act."
         );
     }
 
@@ -1860,7 +1846,7 @@ mod tests {
     use st0x_hedge::operator::onchain::mock::MockRaindex;
     use st0x_hedge::operator::test_utils::try_setup_test_db;
     use st0x_hedge::operator::usdc_rebalance::{
-        ReconcileReason, TransferRef, UsdcRebalanceCommand,
+        ConversionAmounts, ReconcileReason, TransferRef, UsdcRebalanceCommand,
     };
     use st0x_hedge::operator::vault_lookup::MockVaultLookup;
     use st0x_tokenization::mock::MockTokenizer;
@@ -2594,8 +2580,98 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("not a post-burn terminal failure that strands the in-progress guard"),
-            "reconcile of an in-progress aggregate must refuse; got: {err_msg}"
+            err_msg.starts_with(&format!(
+                "transfer reconcile: transfer {}",
+                UsdcRebalanceId(id)
+            )),
+            "the refusal must name the transfer; got: {err_msg}"
+        );
+        // The state's Debug output carries timestamps, so the assertion pins
+        // the exact contract text around it instead of the whole message.
+        assert!(
+            err_msg.ends_with(
+                ", not a terminal failure that strands the in-progress guard or \
+                 off-venue funds (DepositFailed, post-burn BridgingFailed, \
+                 AlpacaToBase BridgingFailed, or a BaseToAlpaca ConversionFailed). \
+                 Refusing to act."
+            ),
+            "reconcile of an in-progress aggregate must refuse with the exact \
+             contract text; got: {err_msg}"
+        );
+    }
+
+    /// The widened reconcile set: an AlpacaToBase `BridgingFailed` with NO
+    /// burn evidence (the settlement-retry-deadline terminal) must pass the
+    /// CLI preflight and reconcile to the clearing `Reconciled` terminal,
+    /// which no longer holds the durable guard.
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_succeeds_from_alpaca_to_base_no_burn_bridging_failed() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xB0B0);
+
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        // Seed the production AlpacaToBase history: the conversion leg runs
+        // first, and `Initiate` (the withdrawal intent) is only valid from
+        // `ConversionComplete` for this direction.
+        let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
+        for command in [
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::from_u128(0xB0B1)),
+            },
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: ConversionAmounts::new(amount, amount),
+            },
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::OnchainTx(b256!(
+                    "0x00000000000000000000000000000000000000000000000000000000000000b2"
+                )),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::FailBridging {
+                reason: "settlement retry deadline elapsed".to_string(),
+            },
+        ] {
+            store.send(&UsdcRebalanceId(id), command).await.unwrap();
+        }
+
+        let mut stdout = Vec::new();
+        reconcile_usdc_transfer_command(
+            &mut stdout,
+            id,
+            ReconcileReason::FundsMovedManually,
+            &pool,
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains(&format!("Reconciled USDC transfer {}", UsdcRebalanceId(id))),
+            "the CLI must report the reconciliation; got: {output}"
+        );
+
+        let state = store
+            .load(&UsdcRebalanceId(id))
+            .await
+            .unwrap()
+            .expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::Reconciled { .. }),
+            "reconcile must land at the clearing Reconciled terminal; got: {state:?}"
+        );
+        assert!(
+            !state.holds_rebalance_guard(),
+            "Reconciled must not hold the durable guard, so a restart does \
+             not re-latch it"
         );
     }
 

@@ -334,6 +334,7 @@ mod tests {
     fn make_test_settlement(rebalancing_ctx: &RebalancingCtx) -> UsdcSettlementParams {
         UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
+            settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
             required_confirmations: 0,
             reserved_cash: None,
             #[cfg(feature = "test-support")]
