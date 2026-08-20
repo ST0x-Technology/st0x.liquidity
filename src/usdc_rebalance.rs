@@ -119,6 +119,34 @@ pub(crate) enum RebalanceDirection {
     BaseToAlpaca,
 }
 
+/// Wire form for the `/transfers/usdc/resume/{direction}/{id}` path segment.
+/// The server route parses ([`FromStr`]) exactly what the CLI renders
+/// ([`Display`]), so the two sides of the wire contract cannot drift.
+impl std::fmt::Display for RebalanceDirection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlpacaToBase => formatter.write_str("alpaca_to_base"),
+            Self::BaseToAlpaca => formatter.write_str("base_to_alpaca"),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unknown direction: {0} (expected alpaca_to_base or base_to_alpaca)")]
+pub(crate) struct UnknownRebalanceDirection(String);
+
+impl std::str::FromStr for RebalanceDirection {
+    type Err = UnknownRebalanceDirection;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "alpaca_to_base" => Ok(Self::AlpacaToBase),
+            "base_to_alpaca" => Ok(Self::BaseToAlpaca),
+            other => Err(UnknownRebalanceDirection(other.to_owned())),
+        }
+    }
+}
+
 impl From<RebalanceDirection> for st0x_dto::UsdcBridgeDirection {
     fn from(direction: RebalanceDirection) -> Self {
         match direction {
@@ -1700,13 +1728,16 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
 }
 
 /// Whether any persisted USDC rebalance currently holds the single-rebalance
-/// guard. Mirrors startup guard recovery's defensive posture: unparseable
-/// candidate ids and aggregates that fail to load count as holders, because
-/// treating them as clear could release a latch that still protects a
-/// possibly post-burn rebalance.
+/// guard, optionally ignoring one id (`except` -- so a manual resume of that
+/// very id does not count its own latch as a conflict). Mirrors startup
+/// guard recovery's defensive posture: unparseable candidate ids and
+/// aggregates that fail to load count as holders, because treating them as
+/// clear could release a latch that still protects a possibly post-burn
+/// rebalance.
 pub(crate) async fn any_rebalance_holds_guard(
     pool: &SqlitePool,
     store: &Store<UsdcRebalance>,
+    except: Option<&UsdcRebalanceId>,
 ) -> Result<bool, sqlx::Error> {
     let InterruptedUsdcRebalances { ids, unparseable } =
         interrupted_usdc_rebalance_ids(pool).await?;
@@ -1721,6 +1752,10 @@ pub(crate) async fn any_rebalance_holds_guard(
     }
 
     for id in ids {
+        if Some(&id) == except {
+            continue;
+        }
+
         match store.load(&id).await {
             Ok(Some(entity)) => {
                 if entity.holds_rebalance_guard() {
@@ -10498,7 +10533,11 @@ mod tests {
         let pool = crate::test_utils::setup_test_db().await;
         let store = test_store::<UsdcRebalance>(pool.clone(), ());
 
-        assert!(!any_rebalance_holds_guard(&pool, &store).await.unwrap());
+        assert!(
+            !any_rebalance_holds_guard(&pool, &store, None)
+                .await
+                .unwrap()
+        );
     }
 
     /// A post-burn `BridgingFailed` (burn tx recorded) holds the guard, so
@@ -10527,7 +10566,11 @@ mod tests {
         )
         .await;
 
-        assert!(any_rebalance_holds_guard(&pool, &store).await.unwrap());
+        assert!(
+            any_rebalance_holds_guard(&pool, &store, None)
+                .await
+                .unwrap()
+        );
     }
 
     /// A pre-burn `WithdrawalFailed` clears the guard on its own, so the
@@ -10552,7 +10595,11 @@ mod tests {
         )
         .await;
 
-        assert!(!any_rebalance_holds_guard(&pool, &store).await.unwrap());
+        assert!(
+            !any_rebalance_holds_guard(&pool, &store, None)
+                .await
+                .unwrap()
+        );
     }
 
     /// A candidate whose events exist but replay to no aggregate state is a
@@ -10594,9 +10641,59 @@ mod tests {
         );
 
         assert!(
-            any_rebalance_holds_guard(&pool, &store).await.unwrap(),
+            any_rebalance_holds_guard(&pool, &store, None)
+                .await
+                .unwrap(),
             "a candidate with events but no materialized state must count as \
              a guard holder"
+        );
+    }
+
+    /// The `except` parameter exists for the manual-resume path: the
+    /// requested id's OWN guard-holding state must not block its own resume,
+    /// while any other holder still must.
+    #[tokio::test]
+    async fn any_rebalance_holds_guard_except_skips_only_the_requested_id() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+
+        let holder_commands = || {
+            vec![
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(400.0)),
+                    withdrawal: TransferRef::OnchainTx(BURN_TX),
+                },
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+                UsdcRebalanceCommand::InitiateBridging { burn_tx: BURN_TX },
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "x".to_string(),
+                },
+            ]
+        };
+
+        let requested = seed_through(&store, holder_commands()).await;
+        assert!(
+            any_rebalance_holds_guard(&pool, &store, None)
+                .await
+                .unwrap(),
+            "without an exclusion the holder must block"
+        );
+        assert!(
+            !any_rebalance_holds_guard(&pool, &store, Some(&requested))
+                .await
+                .unwrap(),
+            "the requested id's own hold must be excluded"
+        );
+
+        let _other_holder = seed_through(&store, holder_commands()).await;
+        assert!(
+            any_rebalance_holds_guard(&pool, &store, Some(&requested))
+                .await
+                .unwrap(),
+            "a DIFFERENT guard holder must still block despite the exclusion"
         );
     }
 

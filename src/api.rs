@@ -40,11 +40,11 @@ use crate::performance::reliability::{
     aggregate_log_entries, load_failure_events, load_job_queue_health,
 };
 use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performance};
-use crate::rebalancing::RebalancingService;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, RecheckError, RecheckOutcome};
 use crate::rebalancing::usdc::{RecheckUsdcDeposit, UsdcRecheckError};
+use crate::rebalancing::{RebalancingService, UsdcResumeError};
 use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
-use crate::usdc_rebalance::UsdcRebalanceId;
+use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceId};
 
 /// Comma-separated filter for transfer kinds in query parameters.
 ///
@@ -1569,6 +1569,105 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
     }
 }
 
+/// Wire contract for `/transfers/usdc/resume/{direction}/{id}`.
+#[derive(Serialize)]
+struct UsdcResumeResponse {
+    outcome: &'static str,
+}
+
+/// The endpoint's single success outcome: the resume was enqueued on the
+/// bot's transfer worker. Shared with the CLI tests so the wire value has
+/// one definition.
+pub(crate) const USDC_RESUME_ENQUEUED_OUTCOME: &str = "enqueued";
+
+/// Enqueues a manual resume of an existing USDC rebalance on the bot's own
+/// transfer worker. Runs in the bot process so the resume shares the bot's
+/// single-flight gates (job-row dedupe, durable guard-holder scan, in-memory
+/// guard) and cannot race the bot's own driving of the same aggregate.
+async fn resume_usdc_transfer(
+    State(state): State<AppState>,
+    Path((direction_str, id)): Path<(String, String)>,
+) -> Result<Json<UsdcResumeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let direction: RebalanceDirection = direction_str.parse().map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("{error}"),
+            }),
+        )
+    })?;
+
+    let rebalance_id: UsdcRebalanceId = id.parse().map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Invalid USDC rebalance ID: {error}"),
+            }),
+        )
+    })?;
+
+    let _guard = state.resume_lock.0.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "A resume or recheck operation is already in progress".to_string(),
+            }),
+        )
+    })?;
+
+    let handle = state.recovery.get().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Recovery not ready yet (conductor still starting)".to_string(),
+            }),
+        )
+    })?;
+
+    handle
+        .rebalancing_service
+        .resume_usdc_transfer(&state.pool, &rebalance_id, direction)
+        .await
+        .map_err(|error| {
+            error!(?error, %rebalance_id, "Failed to enqueue USDC resume");
+            let (status, message) = usdc_resume_error_response(&error);
+            (status, Json(ErrorResponse { error: message }))
+        })?;
+
+    info!(%rebalance_id, ?direction, "USDC resume enqueued via API");
+
+    Ok(Json(UsdcResumeResponse {
+        outcome: USDC_RESUME_ENQUEUED_OUTCOME,
+    }))
+}
+
+/// Maps a [`UsdcResumeError`] to an HTTP status and operator-facing message,
+/// with the same recoverability split as [`usdc_recheck_error_response`]:
+/// aggregate-rooted refusals carry the typed message (they only reference
+/// aggregate ids and states), single-flight conflicts map to 409 so the
+/// operator knows to wait or resolve the other transfer, not-ready maps to
+/// 503 (retry once the conductor finishes starting), and internal failures
+/// stay generic (the full error is logged at the call site).
+fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
+    use UsdcResumeError::{
+        Aggregate, AlreadyInFlight, AlreadyTerminal, ApalisDatabase, Database, DirectionMismatch,
+        GuardHeldElsewhere, NotFound, NotReady, Queue,
+    };
+
+    match error {
+        NotFound(_) => (StatusCode::NOT_FOUND, error.to_string()),
+        DirectionMismatch { .. } | AlreadyTerminal { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+        }
+        AlreadyInFlight { .. } | GuardHeldElsewhere => (StatusCode::CONFLICT, error.to_string()),
+        NotReady => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+        Aggregate(_) | Database(_) | ApalisDatabase(_) | Queue(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to enqueue USDC resume".to_string(),
+        ),
+    }
+}
+
 /// Date-range query window shared by the `/performance/*` endpoints.
 /// Defaults to the last 7 days ending now.
 #[derive(Debug, Deserialize)]
@@ -1742,6 +1841,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/orders/raindex", get(raindex_orders))
         .route("/transfers/interrupted", get(interrupted_transfers))
         .route("/transfers/resume", post(resume_transfers))
+        .route(
+            "/transfers/usdc/resume/{direction}/{id}",
+            post(resume_usdc_transfer),
+        )
         .route("/transfers/recheck/{kind}/{id}", post(recheck_transfer))
 }
 
@@ -4420,6 +4523,120 @@ mod tests {
             recheck_error_response(&RecheckError::Database(sqlx::Error::RowNotFound));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "Failed to recheck transfer");
+    }
+
+    /// The USDC resume endpoint must refuse with 503 until the conductor
+    /// publishes the recovery handle, mirroring the recheck endpoint.
+    #[tokio::test]
+    async fn resume_usdc_transfer_returns_503_before_conductor_ready() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let id = uuid::Uuid::new_v4();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/transfers/usdc/resume/alpaca_to_base/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = body_to_string(response).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["error"],
+            "Recovery not ready yet (conductor still starting)"
+        );
+    }
+
+    /// An unknown direction segment must be a 400 with a message naming the
+    /// accepted values, before any lock or recovery-handle access.
+    #[tokio::test]
+    async fn resume_usdc_transfer_rejects_unknown_direction() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let id = uuid::Uuid::new_v4();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/transfers/usdc/resume/sideways/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = body_to_string(response).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["error"],
+            "unknown direction: sideways (expected alpaca_to_base or base_to_alpaca)"
+        );
+    }
+
+    /// `UsdcResumeResponse` is the wire contract the CLI parses, so its
+    /// serialization is pinned against a literal.
+    #[test]
+    fn usdc_resume_response_serializes_the_enqueued_outcome() {
+        let json = serde_json::to_value(UsdcResumeResponse {
+            outcome: USDC_RESUME_ENQUEUED_OUTCOME,
+        })
+        .unwrap();
+        assert_eq!(json, serde_json::json!({ "outcome": "enqueued" }));
+    }
+
+    /// Maps every constructible `UsdcResumeError` variant to its documented
+    /// status: 404 unknown id, 422 aggregate-state refusals, 409
+    /// single-flight conflicts, 503 not-ready, and a generic 500 for
+    /// internal failures.
+    #[test]
+    fn usdc_resume_error_response_distinguishes_recoverability() {
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+
+        let (status, message) = usdc_resume_error_response(&UsdcResumeError::NotFound(id.clone()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            message.contains("refusing to start a new burn"),
+            "the 404 must carry the fresh-burn warning; got: {message}"
+        );
+
+        let (status, _) = usdc_resume_error_response(&UsdcResumeError::DirectionMismatch {
+            id: id.clone(),
+            persisted: crate::usdc_rebalance::RebalanceDirection::AlpacaToBase,
+        });
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, _) = usdc_resume_error_response(&UsdcResumeError::AlreadyTerminal {
+            id,
+            state: "Reconciled",
+        });
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, _) = usdc_resume_error_response(&UsdcResumeError::AlreadyInFlight {
+            row_id: "row-1".to_string(),
+            age_secs: 30,
+        });
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, _) = usdc_resume_error_response(&UsdcResumeError::GuardHeldElsewhere);
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, _) = usdc_resume_error_response(&UsdcResumeError::NotReady);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let (status, message) =
+            usdc_resume_error_response(&UsdcResumeError::Database(sqlx::Error::RowNotFound));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "Failed to enqueue USDC resume");
     }
 
     /// Mirrors `recheck_error_response_distinguishes_recoverability` for the

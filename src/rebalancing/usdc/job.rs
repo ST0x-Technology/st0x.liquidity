@@ -1343,7 +1343,7 @@ pub(crate) struct DurableCheckedGuardRelease {
 #[async_trait]
 impl UsdcGuardRelease for DurableCheckedGuardRelease {
     async fn release_unless_durably_held(&self) {
-        match any_rebalance_holds_guard(&self.pool, &self.store).await {
+        match any_rebalance_holds_guard(&self.pool, &self.store, None).await {
             Ok(false) => self.usdc_in_progress.store(false, Ordering::SeqCst),
             Ok(true) => warn!(
                 target: "rebalance",
