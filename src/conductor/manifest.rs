@@ -521,13 +521,6 @@ mod tests {
             Statement::PositionUpdate(position) => {
                 assert_eq!(position.symbol, symbol);
                 assert!(position.net.eq(float!(2)).unwrap());
-                assert!(
-                    position
-                        .last_price_usdc
-                        .expect("position update should include last price")
-                        .eq(float!(150))
-                        .unwrap()
-                );
             }
             other => panic!("expected PositionUpdate message, got {other:?}"),
         }

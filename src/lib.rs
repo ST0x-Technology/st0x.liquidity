@@ -164,6 +164,7 @@ pub(crate) struct AppState {
     pub(crate) pool: SqlitePool,
     pub(crate) event_sender: broadcast::Sender<Statement>,
     pub(crate) inventory: Arc<inventory::BroadcastingInventory>,
+    pub(crate) equity_prices: dashboard::equity_price::EquityPriceStore,
     pub(crate) settings: st0x_dto::Settings,
     pub(crate) recovery: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
     pub(crate) resume_lock: Arc<api::ResumeLock>,
@@ -246,6 +247,15 @@ async fn run_bot_session_inner(
         inventory::InventoryView::default(),
         event_sender.clone(),
     ));
+    let equity_prices = dashboard::equity_price::EquityPriceStore::new(&ctx.assets);
+    let equity_price_monitor = ctx.pricing.clone().map(|pricing| {
+        dashboard::equity_price::EquityPriceMonitor::new(
+            pricing,
+            &ctx.assets,
+            equity_prices.clone(),
+            event_sender.clone(),
+        )
+    });
 
     let shutdown_token = CancellationToken::new();
     let recovery_cell = Arc::new(tokio::sync::OnceCell::new());
@@ -275,6 +285,7 @@ async fn run_bot_session_inner(
         pool: pools.cqrs.clone(),
         event_sender: event_sender.clone(),
         inventory: inventory.clone(),
+        equity_prices,
         settings: dashboard::settings_from_ctx(&ctx),
         recovery: recovery_cell.clone(),
         resume_lock,
@@ -282,7 +293,11 @@ async fn run_bot_session_inner(
         pnl_ledger: pnl_ledger.clone(),
         metrics_handle,
     };
-    let startup_barrier = startup::StartupBarrier::new(11);
+    let startup_barrier = startup::StartupBarrier::new();
+    let equity_price_task = equity_price_monitor.map(|task| startup::StartupTask {
+        task,
+        token: startup_barrier.token(),
+    });
     let server_supervisor = spawn_server_supervisor(
         state,
         &pools,
@@ -291,6 +306,12 @@ async fn run_bot_session_inner(
         startup_barrier.token(),
         startup_barrier.token(),
     );
+    let equity_price_supervisor = equity_price_task.map(|task| {
+        non_escalating_supervisor_builder()
+            .with_task("dashboard-equity-prices", task)
+            .build()
+            .run()
+    });
     let mut bot_task = tokio::spawn(Box::pin(run_conductor_session(
         ctx,
         pools,
@@ -321,15 +342,16 @@ async fn run_bot_session_inner(
     // If this session future is cancelled before `await_shutdown` reaches its
     // own graceful path (the spawned session task being aborted -- how the e2e
     // chaos tests simulate a process crash), the conductor `JoinHandle` and the
-    // server supervisor handle would simply be dropped. Dropping a `JoinHandle`
+    // runtime supervisor handles would simply be dropped. Dropping a `JoinHandle`
     // detaches its task rather than aborting it, so the conductor would keep
     // trading against the database and the bound server port would leak. This
-    // guard aborts the conductor and shuts the supervisor down on drop, so a
+    // guard aborts the conductor and shuts both supervisors down on drop, so a
     // cancelled session actually stops. The graceful path already stops both
     // before this guard drops, making it a no-op there.
     let mut session_guard = SessionTaskGuard {
         conductor: bot_task.abort_handle(),
         server_supervisor: server_supervisor.clone(),
+        equity_price_supervisor: equity_price_supervisor.clone(),
         armed: true,
     };
 
@@ -356,6 +378,7 @@ async fn run_bot_session_inner(
         StartupOutcome::Started => {
             await_shutdown(
                 server_supervisor,
+                equity_price_supervisor,
                 bot_task,
                 shutdown_token,
                 shutdown_signal,
@@ -364,6 +387,7 @@ async fn run_bot_session_inner(
             .await
         }
         StartupOutcome::ShutdownSignal => {
+            shutdown_equity_price_supervisor(equity_price_supervisor.as_ref());
             drain_for_shutdown_signal(
                 &server_supervisor,
                 bot_task,
@@ -380,7 +404,7 @@ async fn run_bot_session_inner(
     Ok(())
 }
 
-/// Drop guard that aborts the conductor task and shuts the server supervisor
+/// Drop guard that aborts the conductor task and shuts the runtime supervisors
 /// down when a bot session is cancelled before [`await_shutdown`] runs.
 ///
 /// Dropping a `JoinHandle` detaches its task rather than aborting it, so without
@@ -396,6 +420,7 @@ async fn run_bot_session_inner(
 struct SessionTaskGuard {
     conductor: AbortHandle,
     server_supervisor: SupervisorHandle,
+    equity_price_supervisor: Option<SupervisorHandle>,
     armed: bool,
 }
 
@@ -413,6 +438,7 @@ impl Drop for SessionTaskGuard {
 
         self.conductor.abort();
         shutdown_supervisor(&self.server_supervisor);
+        shutdown_equity_price_supervisor(self.equity_price_supervisor.as_ref());
     }
 }
 
@@ -508,8 +534,13 @@ fn spawn_server_supervisor(
         .run()
 }
 
+fn non_escalating_supervisor_builder() -> SupervisorBuilder {
+    SupervisorBuilder::default().with_unlimited_restarts()
+}
+
 async fn await_shutdown<S>(
     server_supervisor: SupervisorHandle,
+    equity_price_supervisor: Option<SupervisorHandle>,
     mut bot_task: JoinHandle<anyhow::Result<()>>,
     shutdown_token: CancellationToken,
     shutdown_signal: S,
@@ -525,6 +556,7 @@ where
         result = server_supervisor.wait() => ShutdownTrigger::ServerExit(result),
         result = &mut bot_task => ShutdownTrigger::BotExit(result),
     };
+    shutdown_equity_price_supervisor(equity_price_supervisor.as_ref());
 
     match trigger {
         ShutdownTrigger::Signal => {
@@ -620,14 +652,24 @@ async fn drain_bot_with_timeout(
 }
 
 fn shutdown_supervisor(handle: &SupervisorHandle) {
-    info!(target: "startup", name = "server", "Shutting down supervisor");
+    shutdown_named_supervisor("server", handle);
+}
+
+fn shutdown_equity_price_supervisor(handle: Option<&SupervisorHandle>) {
+    if let Some(handle) = handle {
+        shutdown_named_supervisor("dashboard-equity-prices", handle);
+    }
+}
+
+fn shutdown_named_supervisor(name: &'static str, handle: &SupervisorHandle) {
+    info!(target: "startup", name, "Shutting down supervisor");
     match handle.shutdown() {
         Ok(()) => {}
         Err(SupervisorHandleError::SendError) => {
-            debug!(target: "startup", "Server supervisor was already stopped");
+            debug!(target: "startup", name, "Supervisor was already stopped");
         }
         Err(error @ SupervisorHandleError::RecvError(_)) => {
-            error!(target: "startup", %error, "Failed to shutdown server supervisor");
+            error!(target: "startup", name, %error, "Failed to shutdown supervisor");
         }
     }
 }
@@ -751,6 +793,18 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct PanickingSupervisorTask {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl SupervisedTask for PanickingSupervisorTask {
+        async fn run(&mut self) -> TaskResult {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            panic!("dashboard pricing task failed");
+        }
+    }
+
     struct RecordingStartupNotifier<'a>(&'a AtomicUsize);
 
     impl startup::StartupNotifier for RecordingStartupNotifier<'_> {
@@ -778,7 +832,7 @@ mod tests {
     }
 
     fn create_test_startup_tokens() -> ConductorStartupTokens {
-        let barrier = startup::StartupBarrier::new(9);
+        let barrier = startup::StartupBarrier::new();
         ConductorStartupTokens {
             initialized: barrier.token(),
             apalis_monitor: barrier.token(),
@@ -802,9 +856,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_essential_supervisor_keeps_restarting_after_panics() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let supervisor = non_escalating_supervisor_builder()
+            .with_health_check_interval(Duration::from_millis(1))
+            .with_base_restart_delay(Duration::from_millis(1))
+            .with_task(
+                "dashboard-equity-prices",
+                PanickingSupervisorTask {
+                    attempts: Arc::clone(&attempts),
+                },
+            )
+            .build()
+            .run();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while attempts.load(Ordering::SeqCst) < 7 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the dashboard task should restart beyond the default retry budget");
+
+        tokio::time::timeout(Duration::from_millis(10), supervisor.wait())
+            .await
+            .expect_err("a repeatedly panicking dashboard task must not stop its supervisor");
+        shutdown_supervisor(&supervisor);
+    }
+
+    #[tokio::test]
     async fn startup_exit_does_not_report_readiness() {
         let supervisor = pending_test_supervisor();
-        let barrier = startup::StartupBarrier::new(1);
+        let barrier = startup::StartupBarrier::new();
+        let _pending_startup = barrier.token();
         let notifications = AtomicUsize::new(0);
         let notifier = RecordingStartupNotifier(&notifications);
         let mut bot_task = tokio::spawn(async { anyhow::bail!("startup failed") });
@@ -827,7 +911,8 @@ mod tests {
     #[tokio::test]
     async fn clean_bot_exit_before_startup_does_not_report_readiness() {
         let supervisor = pending_test_supervisor();
-        let barrier = startup::StartupBarrier::new(1);
+        let barrier = startup::StartupBarrier::new();
+        let _pending_startup = barrier.token();
         let notifications = AtomicUsize::new(0);
         let notifier = RecordingStartupNotifier(&notifications);
         let mut bot_task = tokio::spawn(async { Ok(()) });
@@ -861,7 +946,7 @@ mod tests {
     #[tokio::test]
     async fn completed_startup_barrier_reports_readiness_once() {
         let supervisor = pending_test_supervisor();
-        let barrier = startup::StartupBarrier::new(1);
+        let barrier = startup::StartupBarrier::new();
         barrier.token().acknowledge();
         let notifications = AtomicUsize::new(0);
         let notifier = RecordingStartupNotifier(&notifications);
@@ -886,7 +971,8 @@ mod tests {
     #[tokio::test]
     async fn shutdown_signal_before_startup_does_not_report_readiness() {
         let supervisor = pending_test_supervisor();
-        let barrier = startup::StartupBarrier::new(1);
+        let barrier = startup::StartupBarrier::new();
+        let _pending_startup = barrier.token();
         let notifications = AtomicUsize::new(0);
         let notifier = RecordingStartupNotifier(&notifications);
         let mut bot_task = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
@@ -918,6 +1004,7 @@ mod tests {
         let mut guard = SessionTaskGuard {
             conductor: conductor_task.abort_handle(),
             server_supervisor: supervisor.clone(),
+            equity_price_supervisor: None,
             armed: true,
         };
 
@@ -948,6 +1035,8 @@ mod tests {
 
         let supervisor = SupervisorBuilder::default().build().run();
         let supervisor_handle_for_assert = supervisor.clone();
+        let equity_price_supervisor = pending_test_supervisor();
+        let equity_price_handle_for_assert = equity_price_supervisor.clone();
 
         let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
         let signal_fut = async move {
@@ -961,6 +1050,7 @@ mod tests {
 
         await_shutdown(
             supervisor,
+            Some(equity_price_supervisor),
             bot_task,
             shutdown_token,
             signal_fut,
@@ -980,6 +1070,15 @@ mod tests {
             post_wait.is_ok(),
             "supervisor.wait() should return after signal-triggered shutdown"
         );
+        let equity_price_post_wait = tokio::time::timeout(
+            Duration::from_secs(1),
+            equity_price_handle_for_assert.wait(),
+        )
+        .await;
+        assert!(
+            equity_price_post_wait.is_ok(),
+            "equity price supervisor should stop during signal-triggered shutdown"
+        );
     }
 
     #[tokio::test]
@@ -993,6 +1092,7 @@ mod tests {
 
         await_shutdown(
             supervisor,
+            None,
             bot_task,
             shutdown_token,
             signal_fut,
@@ -1033,6 +1133,7 @@ mod tests {
 
         await_shutdown(
             supervisor,
+            None,
             bot_task,
             shutdown_token,
             signal_fut,
@@ -1067,6 +1168,7 @@ mod tests {
 
         await_shutdown(
             supervisor,
+            None,
             bot_task,
             shutdown_token,
             signal_fut,

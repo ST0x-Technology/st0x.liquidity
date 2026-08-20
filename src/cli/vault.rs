@@ -242,6 +242,7 @@ mod tests {
             broker: BrokerCtx::DryRun,
             telemetry: None,
             alerts: None,
+            pricing: None,
             trading_mode: TradingMode::Standalone,
             order_owner: Address::ZERO,
             wallet: None,
@@ -293,6 +294,7 @@ mod tests {
             broker: BrokerCtx::DryRun,
             telemetry: None,
             alerts: None,
+            pricing: None,
             trading_mode: TradingMode::Rebalancing(Box::new(
                 RebalancingCtx::stub()
                     .equity(ImbalanceThreshold {

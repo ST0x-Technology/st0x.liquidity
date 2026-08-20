@@ -5,7 +5,7 @@
   import * as Table from '$lib/components/ui/table'
   import HoverTooltip from '$lib/components/hover-tooltip.svelte'
   import CliCommandBlock from '$lib/components/cli-command-block.svelte'
-  import type { Position } from '$lib/api/Position'
+  import type { EquityPrice } from '$lib/api/EquityPrice'
   import type { TransferCategory } from '$lib/transfer'
   import type { UsdcBridgeDirection } from '$lib/api/UsdcBridgeDirection'
   import MultiSelect from '$lib/components/multi-select.svelte'
@@ -19,6 +19,7 @@
   import { formatUtc, toDatetimeLocal, TIME_PRESETS, FETCH_TIMEOUT_MS, toRfc3339 } from '$lib/time'
   import { formatDecimal } from '$lib/decimal'
   import { cashUsdTooltip, equityUsdTooltip } from '$lib/inventory-value'
+  import { availablePriceUsd } from '$lib/equity-price'
   import {
     kindLabel,
     transferTypeLabel,
@@ -99,14 +100,14 @@
   let sinceInput: HTMLInputElement | undefined
   let untilInput: HTMLInputElement | undefined
 
-  const positionsQuery = createQuery<Position[]>(() => ({
-    queryKey: ['positions'],
+  const equityPricesQuery = createQuery<EquityPrice[]>(() => ({
+    queryKey: ['equity-prices'],
     enabled: false
   }))
 
   const positionPrices = $derived(
     new Map(
-      (positionsQuery.data ?? []).map((position) => [position.symbol, position.last_price_usdc])
+      (equityPricesQuery.data ?? []).map((price) => [price.symbol, availablePriceUsd(price.status)])
     )
   )
 

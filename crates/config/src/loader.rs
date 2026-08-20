@@ -9,26 +9,28 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
+use std::collections::HashMap;
+use std::num::{NonZeroU32, NonZeroU64};
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use tracing::{Level, warn};
+use url::Url;
+
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, FractionalShares, Positive, SupportedExecutor,
     Symbol, TimeInForce,
 };
 use st0x_finance::{Usd, Usdc};
-use std::collections::HashMap;
-use std::num::{NonZeroU32, NonZeroU64};
-use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
-use tracing::{Level, warn};
+use st0x_float_macro::float;
 
-use url::Url;
-
+use crate::pricing::PricingSecrets;
 use crate::{
     AlertsConfig, AlertsCtx, AlertsSecrets, BotGasValuationConfig, EvmConfig, EvmCtx, EvmSecrets,
     ExecutionThreshold, InvalidThresholdError, InventoryAdapters, OrchestratorConfig,
-    RebalancingConfig, RebalancingCtx, RebalancingCtxError, TelemetryConfig, TelemetryCtx,
+    PricingConfig, PricingCtx, PricingCtxError, RebalancingConfig, RebalancingCtx,
+    RebalancingCtxError, TelemetryConfig, TelemetryCtx,
 };
-use st0x_float_macro::float;
 
 /// Alpaca minimum execution threshold: $2.
 static ALPACA_MIN_DOLLARS: LazyLock<Usdc> = LazyLock::new(|| Usdc::new(float!(2)));
@@ -247,6 +249,7 @@ struct Config {
     apalis_finished_job_cleanup_interval_secs: u64,
     telemetry: Option<TelemetryConfig>,
     alerts: Option<AlertsConfig>,
+    pricing: Option<PricingConfig>,
     rebalancing: Option<RebalancingConfig>,
     tokenization: Option<TokenizationConfig>,
     wallet: Option<toml::Value>,
@@ -571,6 +574,7 @@ struct Secrets {
     evm: EvmSecrets,
     broker: BrokerSecrets,
     alerts: Option<AlertsSecrets>,
+    pricing: Option<PricingSecrets>,
     wallet: Option<toml::Value>,
     rest_api: Option<RestApiSecrets>,
     issuance: Option<IssuanceSecretsToml>,
@@ -649,6 +653,8 @@ pub struct Ctx {
     /// Optional gas-balance alerting context. `Some` when both `[alerts]`
     /// config and the Telegram `bot_token` secret are present.
     pub alerts: Option<AlertsCtx>,
+    /// Live reference prices used exclusively by dashboard USD valuations.
+    pub pricing: Option<PricingCtx>,
     pub trading_mode: TradingMode,
     /// The onchain address that owns orders on the orderbook.
     /// Always derived from the configured `[wallet]` address.
@@ -802,6 +808,7 @@ impl std::fmt::Debug for Ctx {
             .field("broker", &self.broker)
             .field("telemetry", &self.telemetry)
             .field("alerts", &self.alerts)
+            .field("pricing", &self.pricing)
             .field("trading_mode", &self.trading_mode)
             .field("order_owner", &self.order_owner)
             .field("wallet_configured", &self.wallet.is_some())
@@ -877,6 +884,7 @@ struct ValidatedParts {
     broker: BrokerCtx,
     telemetry: Option<TelemetryCtx>,
     alerts: Option<AlertsCtx>,
+    pricing: Option<PricingCtx>,
     execution_threshold: ExecutionThreshold,
     trading_mode: TradingMode,
     assets: AssetsConfig,
@@ -1066,6 +1074,11 @@ fn parse_and_validate(
     let broker = BrokerCtx::from_parts(secrets.broker, config.broker.as_ref())?;
     let telemetry = config.telemetry.map(TelemetryCtx::from);
     let alerts = AlertsCtx::new(config.alerts, secrets.alerts)?;
+    let pricing = PricingCtx::assemble(
+        config.pricing,
+        secrets.pricing,
+        !config.assets.equities.symbols.is_empty(),
+    )?;
 
     // Execution threshold is determined by broker capabilities:
     // - Alpaca requires $1 minimum for fractional trading. We use $2 to provide buffer
@@ -1178,6 +1191,7 @@ fn parse_and_validate(
         broker,
         telemetry,
         alerts,
+        pricing,
         execution_threshold,
         trading_mode,
         assets: config.assets,
@@ -1331,6 +1345,7 @@ impl Ctx {
             broker: parts.broker,
             telemetry: parts.telemetry,
             alerts: parts.alerts,
+            pricing: parts.pricing,
             trading_mode: parts.trading_mode,
             order_owner,
             wallet: Some(wallet),
@@ -1665,6 +1680,7 @@ impl Ctx {
             broker,
             telemetry: None,
             alerts: None,
+            pricing: None,
             trading_mode,
             order_owner,
             wallet,
@@ -1685,6 +1701,8 @@ impl Ctx {
 pub enum CtxError {
     #[error(transparent)]
     Rebalancing(Box<RebalancingCtxError>),
+    #[error(transparent)]
+    Pricing(#[from] PricingCtxError),
     #[error("failed to build REST API HTTP client")]
     RestApiClient(#[source] reqwest::Error),
     #[error("[issuance] section is required in secrets but was not configured")]
@@ -1850,6 +1868,7 @@ impl CtxError {
     fn kind(&self) -> &'static str {
         match self {
             Self::Rebalancing(_) => "rebalancing configuration error",
+            Self::Pricing(_) => "pricing configuration error",
             Self::NotRebalancing => "operation requires rebalancing mode",
             Self::MissingTokenization => "operation requires tokenization config",
             Self::MissingBotGasValuation => "missing bot gas valuation config",
@@ -2017,6 +2036,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         broker: BrokerCtx::DryRun,
         telemetry: None,
         alerts: None,
+        pricing: None,
         trading_mode: TradingMode::Standalone,
         order_owner,
         wallet: None,
@@ -2330,6 +2350,64 @@ mod tests {
         )
         .unwrap();
         file
+    }
+
+    fn dry_run_pricing_secrets_toml() -> NamedTempFile {
+        let mut file = dry_run_secrets_toml();
+        file.write_all(
+            br#"
+
+            [pricing]
+            api_key = "pricing-oracle-test-key"
+        "#,
+        )
+        .unwrap();
+        file
+    }
+
+    fn equity_pricing_config_toml(include_pricing: bool) -> NamedTempFile {
+        let pricing = if include_pricing {
+            r#"
+                [pricing]
+                ws_url = "wss://pricing.test/ws"
+                "#
+        } else {
+            ""
+        };
+
+        toml_file(&format!(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+
+            [assets.equities.AAPL]
+            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
+
+            {pricing}
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+            "#,
+        ))
     }
 
     fn unsupported_schwab_secrets_toml() -> NamedTempFile {
@@ -6937,6 +7015,50 @@ mod tests {
         Ctx::validate_files(config.path(), secrets.path()).unwrap();
     }
 
+    #[tokio::test]
+    async fn load_files_assembles_pricing_for_configured_equities() {
+        let config = equity_pricing_config_toml(true);
+        let secrets = dry_run_pricing_secrets_toml();
+
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        let pricing = ctx.pricing.expect("pricing context should be assembled");
+        assert_eq!(pricing.ws_url.as_str(), "wss://pricing.test/ws");
+        assert!(!format!("{pricing:?}").contains("pricing-oracle-test-key"));
+    }
+
+    #[tokio::test]
+    async fn load_files_requires_pricing_config_for_configured_equities() {
+        let config = equity_pricing_config_toml(false);
+        let secrets = dry_run_pricing_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CtxError::Pricing(PricingCtxError::MissingConfig)
+        ));
+    }
+
+    #[tokio::test]
+    async fn load_files_requires_pricing_secrets_for_configured_equities() {
+        let config = equity_pricing_config_toml(true);
+        let secrets = dry_run_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CtxError::Pricing(PricingCtxError::MissingSecrets)
+        ));
+    }
+
     #[cfg(feature = "wallet-turnkey")]
     #[test]
     fn load_turnkey_approval_policy_inputs_extracts_validated_deploy_inputs() {
@@ -6955,6 +7077,9 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "disabled"
+
+            [pricing]
+            ws_url = "wss://pricing.test/ws"
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
@@ -6989,6 +7114,9 @@ mod tests {
             [issuance]
             base_url = "http://issuance.test:8000"
             api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+
+            [pricing]
+            api_key = "pricing-oracle-test-key"
             "#,
         );
 
@@ -7046,6 +7174,9 @@ mod tests {
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "enabled"
 
+            [pricing]
+            ws_url = "wss://pricing.test/ws"
+
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
@@ -7060,7 +7191,7 @@ mod tests {
             address = "0x0000000000000000000000000000000000000001"
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = dry_run_pricing_secrets_toml();
 
         let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
         assert!(
@@ -7091,6 +7222,9 @@ mod tests {
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "enabled"
 
+            [pricing]
+            ws_url = "wss://pricing.test/ws"
+
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
@@ -7111,7 +7245,7 @@ mod tests {
             address = "0x0000000000000000000000000000000000000001"
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = dry_run_pricing_secrets_toml();
 
         Ctx::validate_files(config.path(), secrets.path()).unwrap();
     }
@@ -7134,6 +7268,9 @@ mod tests {
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "enabled"
 
+            [pricing]
+            ws_url = "wss://pricing.test/ws"
+
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
@@ -7148,7 +7285,7 @@ mod tests {
             address = "0x0000000000000000000000000000000000000001"
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = dry_run_pricing_secrets_toml();
 
         let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
 
@@ -7177,6 +7314,9 @@ mod tests {
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "enabled"
 
+            [pricing]
+            ws_url = "wss://pricing.test/ws"
+
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
@@ -7197,7 +7337,7 @@ mod tests {
             address = "0x0000000000000000000000000000000000000001"
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = dry_run_pricing_secrets_toml();
 
         let ctx = Ctx::load_files(config.path(), secrets.path())
             .await
@@ -7239,6 +7379,9 @@ mod tests {
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "enabled"
 
+            [pricing]
+            ws_url = "wss://pricing.test/ws"
+
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
@@ -7268,7 +7411,7 @@ mod tests {
     #[test]
     fn dry_run_close_flatten_cross_max_bps_below_the_executor_default_is_rejected() {
         let config = dry_run_extended_hours_config_toml(Some(50), 50);
-        let secrets = dry_run_secrets_toml();
+        let secrets = dry_run_pricing_secrets_toml();
 
         let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
         let message = err.to_string();
@@ -7295,7 +7438,7 @@ mod tests {
     async fn dry_run_close_flatten_cross_max_bps_accepts_the_executor_default_as_its_floor() {
         let config =
             dry_run_extended_hours_config_toml(Some(50), DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS);
-        let secrets = dry_run_secrets_toml();
+        let secrets = dry_run_pricing_secrets_toml();
 
         let ctx = Ctx::load_files(config.path(), secrets.path())
             .await
@@ -7329,6 +7472,9 @@ mod tests {
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "enabled"
 
+            [pricing]
+            ws_url = "wss://pricing.test/ws"
+
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
@@ -7347,7 +7493,7 @@ mod tests {
             address = "0x0000000000000000000000000000000000000001"
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = dry_run_pricing_secrets_toml();
 
         let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
 

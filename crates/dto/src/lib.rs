@@ -9,6 +9,7 @@ use serde::Serialize;
 use std::path::Path;
 use ts_rs::TS;
 
+mod equity_price;
 mod inventory;
 mod performance;
 mod position;
@@ -17,6 +18,7 @@ mod statement;
 mod trade;
 mod transfer;
 
+pub use equity_price::*;
 pub use inventory::*;
 pub use performance::*;
 pub use position::*;
@@ -32,6 +34,7 @@ pub struct CurrentState {
     pub trades: Vec<Trade>,
     pub inventory: Inventory,
     pub positions: Vec<Position>,
+    pub equity_prices: Vec<EquityPrice>,
     pub settings: Settings,
     pub active_transfers: Vec<TransferOperation>,
     pub recent_transfers: Vec<TransferOperation>,
@@ -58,6 +61,8 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     LegacyTrade::export_all_to(out_dir)?;
     TradeOutcome::export_all_to(out_dir)?;
     Position::export_all_to(out_dir)?;
+    EquityPrice::export_all_to(out_dir)?;
+    EquityPriceStatus::export_all_to(out_dir)?;
     SymbolInventory::export_all_to(out_dir)?;
     InFlightEquity::export_all_to(out_dir)?;
     Inventory::export_all_to(out_dir)?;
@@ -133,6 +138,7 @@ mod tests {
             trades: Vec::new(),
             inventory: Inventory::empty(),
             positions: Vec::new(),
+            equity_prices: Vec::new(),
             settings: Settings {
                 equity_target: 0.5,
                 equity_deviation: 0.2,
@@ -158,6 +164,7 @@ mod tests {
         let json = serde_json::to_value(&state).expect("serialization should succeed");
         assert_eq!(json["trades"], json!([]));
         assert_eq!(json["positions"], json!([]));
+        assert_eq!(json["equityPrices"], json!([]));
         assert_eq!(json["activeTransfers"], json!([]));
         assert_eq!(json["recentTransfers"], json!([]));
         assert_eq!(json["warnings"], json!([]));

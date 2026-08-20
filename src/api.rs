@@ -1752,7 +1752,7 @@ mod tests {
 
         AppState {
             settings: dashboard::settings_from_ctx(&ctx),
-            ctx,
+            ctx: ctx.clone(),
             pnl_ledger: Arc::new(crate::dashboard::pnl::PnlLedger::new(pool.clone())),
             pool,
             event_sender: sender.clone(),
@@ -1760,6 +1760,7 @@ mod tests {
                 inventory::InventoryView::default(),
                 sender,
             )),
+            equity_prices: crate::dashboard::equity_price::EquityPriceStore::new(&ctx.assets),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
             pnl_report_admission: crate::dashboard::pnl::pnl_report_admission(),

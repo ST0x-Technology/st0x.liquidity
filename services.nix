@@ -51,6 +51,9 @@ let
       kind = "st0x";
       package = "st0x-liquidity";
       bin = "server";
+      # Kept separate from the long-lived main secret so a pricing-service
+      # consumer key can rotate without decrypting unrelated credentials.
+      encryptedSecretOverlays = [ "st0x-hedge-pricing.toml.age" ];
     };
 
     # Issuer / dividend-ops CLI config. The `cli` kind installs the
@@ -62,6 +65,7 @@ let
       order = 35;
       kind = "cli";
       package = "st0x-liquidity";
+      encryptedSecretOverlays = [ "st0x-hedge-pricing.toml.age" ];
     };
 
     dashboard = {

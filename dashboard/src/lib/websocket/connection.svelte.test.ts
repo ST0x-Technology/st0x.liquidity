@@ -5,6 +5,7 @@ import type { CurrentState } from '$lib/api/CurrentState'
 import type { Statement } from '$lib/api/Statement'
 import type { Trade } from '$lib/api/Trade'
 import type { TransferOperation } from '$lib/api/TransferOperation'
+import type { EquityPrice } from '$lib/api/EquityPrice'
 
 class MockWebSocket {
   url: string
@@ -117,6 +118,7 @@ const makeCurrentState = (overrides: Partial<CurrentState> = {}): CurrentState =
     }
   },
   positions: [],
+  equityPrices: [],
   settings: {
     equityTarget: 0.5,
     equityDeviation: 0.2,
@@ -244,7 +246,7 @@ describe('createWebSocket', () => {
   })
 
   describe('message handling', () => {
-    it('seeds trades and transfers from initial message', () => {
+    it('seeds trades, transfers, and equity prices from initial message', () => {
       const { getInstance } = setupWebSocketTest()
       const queryClient = createMockQueryClient()
       const ws = createWebSocket(WS_URL, queryClient)
@@ -258,13 +260,18 @@ describe('createWebSocket', () => {
         id: 'recent-1',
         status: { status: 'completed', completedAt: '2024-01-01T13:00:00Z' }
       })
+      const equityPrice: EquityPrice = {
+        symbol: 'AAPL',
+        status: { status: 'unavailable' }
+      }
 
       const message: Statement = {
         type: 'current_state',
         data: makeCurrentState({
           trades: [trade],
           activeTransfers: [activeTransfer],
-          recentTransfers: [recentTransfer]
+          recentTransfers: [recentTransfer],
+          equityPrices: [equityPrice]
         })
       }
 
@@ -285,6 +292,176 @@ describe('createWebSocket', () => {
         | undefined
       expect(recent).toBeDefined()
       expect(recent).toEqual([recentTransfer])
+      expect(queryClient.cache.get('["equity-prices"]')).toEqual([equityPrice])
+    })
+
+    it('upserts live equity-price updates', () => {
+      const { getInstance } = setupWebSocketTest()
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      getInstance(0).simulateOpen()
+      queryClient.cache.set('["equity-prices"]', [
+        { symbol: 'AAPL', status: { status: 'unavailable' } }
+      ])
+      const price: EquityPrice = {
+        symbol: 'AAPL',
+        status: {
+          status: 'available',
+          priceUsd: '187.25',
+          observedAt: '2026-08-19T10:00:00Z',
+          expiresAt: '2026-08-19T10:00:30Z'
+        }
+      }
+
+      getInstance(0).simulateMessage({ type: 'equity_price_update', data: price })
+
+      expect(queryClient.cache.get('["equity-prices"]')).toEqual([price])
+    })
+
+    it('marks a cached live price unavailable when it expires', () => {
+      vi.setSystemTime('2099-08-19T10:00:00Z')
+      const { getInstance } = setupWebSocketTest()
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
+      const price: EquityPrice = {
+        symbol: 'AAPL',
+        status: {
+          status: 'available',
+          priceUsd: '187.25',
+          observedAt: '2099-08-19T10:00:00Z',
+          expiresAt: '2099-08-19T10:00:30Z'
+        }
+      }
+
+      ws.connect()
+      getInstance(0).simulateOpen()
+      getInstance(0).simulateMessage({ type: 'equity_price_update', data: price })
+      vi.advanceTimersByTime(30_000)
+
+      expect(queryClient.cache.get('["equity-prices"]')).toEqual([
+        { symbol: 'AAPL', status: { status: 'unavailable' } }
+      ])
+    })
+
+    it('marks a snapshot price unavailable when it expires', () => {
+      vi.setSystemTime('2099-08-19T10:00:00Z')
+      const { getInstance } = setupWebSocketTest()
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
+      const price: EquityPrice = {
+        symbol: 'AAPL',
+        status: {
+          status: 'available',
+          priceUsd: '187.25',
+          observedAt: '2099-08-19T10:00:00Z',
+          expiresAt: '2099-08-19T10:00:30Z'
+        }
+      }
+
+      ws.connect()
+      getInstance(0).simulateOpen()
+      getInstance(0).simulateMessage({
+        type: 'current_state',
+        data: makeCurrentState({ equityPrices: [price] })
+      })
+      vi.advanceTimersByTime(30_000)
+
+      expect(queryClient.cache.get('["equity-prices"]')).toEqual([
+        { symbol: 'AAPL', status: { status: 'unavailable' } }
+      ])
+    })
+
+    it('rejects a malformed live equity price without replacing the cache', () => {
+      const { getInstance } = setupWebSocketTest()
+      const queryClient = createMockQueryClient()
+      const knownGood: EquityPrice = {
+        symbol: 'AAPL',
+        status: { status: 'unavailable' }
+      }
+      queryClient.cache.set('["equity-prices"]', [knownGood])
+      vi.spyOn(console, 'error').mockImplementation(() => undefined)
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      getInstance(0).simulateOpen()
+      getInstance(0).simulateRawMessage(
+        JSON.stringify({
+          type: 'equity_price_update',
+          data: {
+            symbol: 'AAPL',
+            status: {
+              status: 'available',
+              priceUsd: 'not-a-number',
+              observedAt: '2026-08-19T10:00:00Z',
+              expiresAt: '2026-08-19T10:00:30Z'
+            }
+          }
+        })
+      )
+
+      expect(queryClient.cache.get('["equity-prices"]')).toEqual([knownGood])
+      expect(ws.state).toBe('error')
+      expect(ws.error?.message).toContain('Invalid equity price payload')
+      expect(getInstance(0).closeCalls).toBe(1)
+    })
+
+    it('rejects malformed snapshot equity prices without replacing the cache', () => {
+      const { getInstance } = setupWebSocketTest()
+      const queryClient = createMockQueryClient()
+      const knownGood: EquityPrice = {
+        symbol: 'AAPL',
+        status: { status: 'unavailable' }
+      }
+      queryClient.cache.set('["equity-prices"]', [knownGood])
+      const knownInventory = makeCurrentState().inventory
+      queryClient.cache.set('["inventory"]', knownInventory)
+      vi.spyOn(console, 'error').mockImplementation(() => undefined)
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      getInstance(0).simulateOpen()
+      getInstance(0).simulateRawMessage(
+        JSON.stringify({
+          type: 'current_state',
+          data: makeCurrentState({
+            inventory: {
+              ...knownInventory,
+              perSymbol: [
+                {
+                  symbol: 'AAPL',
+                  onchainAvailable: '1',
+                  onchainInflight: '0',
+                  offchainAvailable: '2',
+                  offchainInflight: '0',
+                  inflightEquity: {
+                    baseWalletUnwrapped: '0',
+                    baseWalletWrapped: '0'
+                  }
+                }
+              ]
+            },
+            equityPrices: [
+              {
+                symbol: 'AAPL',
+                status: {
+                  status: 'available',
+                  priceUsd: '100',
+                  observedAt: 'not-a-time',
+                  expiresAt: '2026-08-19T10:00:30Z'
+                }
+              } as EquityPrice
+            ]
+          })
+        })
+      )
+
+      expect(queryClient.cache.get('["equity-prices"]')).toEqual([knownGood])
+      expect(queryClient.cache.get('["inventory"]')).toEqual(knownInventory)
+      expect(ws.state).toBe('error')
+      expect(ws.error?.message).toContain('Invalid equity price payload')
+      expect(getInstance(0).closeCalls).toBe(1)
     })
 
     it('prepends trade updates to the trades cache', () => {

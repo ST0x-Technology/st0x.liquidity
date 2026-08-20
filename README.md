@@ -93,6 +93,13 @@ nonzero, as must `inventory_divergence_threshold` (the number of consecutive
 offchain polls that must diverge from the inventory view before the poller
 escalates a forced snapshot reconciliation).
 
+When equities are configured, `[pricing].ws_url` and the encrypted
+`[pricing].api_key` are also required. Remote endpoints must use `wss://`;
+plaintext `ws://` is limited to `st0x-pricing` and loopback. The server
+subscribes to the pricing service's Raindex `wt<symbol>` stream for
+dashboard-only USD values; an outage leaves those values unavailable without
+stopping hedging or falling back to a trade fill.
+
 The `[raindex]` section requires an explicit `inventory_mode` (`"legacy"` or
 `"managed"`) and a `vault_owner` address (the on-chain owner the vaults are
 keyed by; no fallback). `"managed"` additionally requires an `inventory` address
@@ -490,7 +497,8 @@ infra/
 ├── secrets.nix            # ragenix secret declarations
 └── ...                    # Terraform (DigitalOcean)
 secret/
-└── st0x-hedge.toml.age   # encrypted service secrets
+├── st0x-hedge.toml.age           # encrypted core service secrets
+└── st0x-hedge-pricing.toml.age   # encrypted pricing credential overlay
 dashboard/                 # SvelteKit operations dashboard
 .github/workflows/
 ├── ci.yaml                # Build, test, clippy, dashboard

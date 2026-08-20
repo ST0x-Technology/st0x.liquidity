@@ -4982,6 +4982,40 @@ multiple broker-specific contexts.
    (`tSTOCK`) vs wrapped (`wtSTOCK`) equity tokens. Includes an "Inventory
    Transfers" section showing active and recent transfer operations with status.
 
+   Dashboard equity USD values are live reference values from the st0x pricing
+   service, independent of whether a `Position` aggregate exists or when the
+   asset last filled onchain. The server uses the pricing service's existing
+   `oracle` consumer identity, which selects Raindex quotes, and subscribes to
+   the wrapped symbol for every configured equity (`AAPL` -> `wtAAPL`) so the
+   quote is denominated per wrapped vault share, including any wrapper NAV
+   scaling applied by the pricing service. It validates the returned Base token
+   pair against the configured wrapped token and Base USDC, rejects future or
+   non-increasing source/expiry timestamps, and only then publishes a dashboard
+   price.
+
+   A pricing-service quote contains directional rates rather than a neutral
+   mark. For display only, the dashboard reference price is the midpoint of the
+   two executable directions expressed as quote per base:
+   `bid = rate_base_to_quote`, `ask = 1 / rate_quote_to_base`, and
+   `price = (bid + ask) / 2`. This calculation uses Rain `Float` throughout.
+   Missing, rejected, crossed, disconnected, or expired quotes are unavailable;
+   the dashboard never falls back to `Position.last_price`. Inventory tooltips
+   then say the value is unavailable and Exposure renders unknown rather than
+   `$0`. A valid live price with a genuinely zero net position still renders
+   `$0`.
+
+   The pricing WebSocket uses TLS for remote endpoints. Plaintext WebSocket is
+   accepted only for the private `st0x-pricing` service name and loopback test
+   endpoints, where the connection does not leave the deployment host or test
+   environment.
+
+   `Position.last_price` remains the last fill-derived observation used by the
+   trading domain and historical accounting. Dashboard pricing is a separate,
+   process-local read model streamed in the initial WebSocket state and in live
+   price updates; it does not mutate a Position or the event store. Pricing
+   transport failures are retried and degrade only dashboard USD values, not
+   hedging or rebalancing.
+
 3. **Spreads**: Last realized spreads per asset (buy/sell prices, Pyth
    reference, spread bps) and per-symbol price charts over time.
 

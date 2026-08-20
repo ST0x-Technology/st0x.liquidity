@@ -224,6 +224,7 @@ mod tests {
             broker: BrokerCtx::DryRun,
             telemetry: None,
             alerts: None,
+            pricing: None,
             trading_mode: TradingMode::Standalone,
             order_owner: Address::ZERO,
             wallet: None,

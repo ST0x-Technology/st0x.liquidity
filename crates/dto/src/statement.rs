@@ -10,7 +10,7 @@ use ts_rs::TS;
 
 use crate::inventory::InventorySnapshot;
 use crate::transfer::TransferOperation;
-use crate::{CurrentState, LegacyTrade, Position, Trade};
+use crate::{CurrentState, EquityPrice, LegacyTrade, Position, Trade};
 
 /// Server-to-client WebSocket statements.
 ///
@@ -31,6 +31,7 @@ pub enum Statement {
     TradeUpdate(Trade),
     TradeFill(LegacyTrade),
     PositionUpdate(Position),
+    EquityPriceUpdate(EquityPrice),
     InventorySnapshot(Box<InventorySnapshot>),
     TransferUpdate(TransferOperation),
 }
@@ -103,6 +104,7 @@ mod tests {
                 "trade_update",
                 "trade_fill",
                 "position_update",
+                "equity_price_update",
                 "inventory_snapshot",
                 "transfer_update"
             ]
@@ -147,6 +149,7 @@ mod tests {
             trades: Vec::new(),
             inventory: Inventory::empty(),
             positions: Vec::new(),
+            equity_prices: Vec::new(),
             settings: Settings {
                 equity_target: 0.5,
                 equity_deviation: 0.2,
@@ -180,7 +183,6 @@ mod tests {
         let msg = Statement::PositionUpdate(Position {
             symbol: Symbol::new("AAPL").unwrap(),
             net: rain_math_float::Float::parse("5.5".to_string()).unwrap(),
-            last_price_usdc: None,
         });
         let json = serde_json::to_value(&msg).expect("serialization should succeed");
         assert_eq!(json["type"], json!("position_update"));

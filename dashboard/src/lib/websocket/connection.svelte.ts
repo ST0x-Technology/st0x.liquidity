@@ -14,6 +14,7 @@ import {
 import { seedTrades, appendTrade } from './trades'
 import { seedInventory, updateSnapshot, upsertPosition } from './inventory'
 import { seedTransfers, upsertTransfer } from './transfers'
+import { parseStateEquityPrices, seedEquityPrices, upsertEquityPrice } from './equity-prices'
 
 const matchMessage = matcher<Statement>()('type')
 
@@ -54,7 +55,11 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
   const handleMessage = (msg: Statement) => {
     matchMessage(msg, {
       current_state: ({ data }) => {
+        const equityPrices = parseStateEquityPrices(data)
+        if (equityPrices.tag === 'err') throw equityPrices.error
+
         seedInventory(queryClient, data)
+        seedEquityPrices(queryClient, equityPrices.value)
         seedTransfers(queryClient, data)
         seedTrades(queryClient, parseTradeEntries(data.trades))
       },
@@ -69,6 +74,11 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
 
       position_update: ({ data }) => {
         upsertPosition(queryClient, data)
+      },
+
+      equity_price_update: ({ data }) => {
+        const price = upsertEquityPrice(queryClient, data)
+        if (price.tag === 'err') throw price.error
       },
 
       inventory_snapshot: ({ data }) => {
