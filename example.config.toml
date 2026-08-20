@@ -173,6 +173,12 @@ transfer_attempt_timeout_secs = 3600
 # CCTP attestation polling timeouts stay retryable until this deadline.
 # 86400 = 24 hours.
 attestation_retry_deadline_secs = 86400
+# How long an Alpaca->Base transfer waits for the withdrawn USDC to settle
+# on-chain after the withdrawal confirmed at Alpaca. Past this deadline the
+# redrive marks the bridge failed for operator reconciliation instead of
+# retrying forever. Settlement normally completes in minutes; this is the
+# never-settles backstop. 86400 = 24 hours.
+settlement_retry_deadline_secs = 86400
 # Maximum number of consecutive revert-class CCTP burn failures that will be
 # reclassified as safe redrives (scan-or-reburn path) before the circuit
 # opens and the operator is alerted. Required when usdc.mode = "enabled".

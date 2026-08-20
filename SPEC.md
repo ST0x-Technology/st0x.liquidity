@@ -3187,17 +3187,21 @@ enum BridgeStage { Burn, Attestation, Mint }
 - Can mark failed from any non-terminal state
 - Each rebalancing has unique UUID allowing multiple parallel operations
 - **Operator reconciliation** (`ReconcileStuckRebalance` -> `OperatorReconciled`
-  -> `Reconciled`): valid ONLY from a post-burn terminal failure that strands
-  the rebalancing guard with no other exit -- `DepositFailed`, a post-burn
-  `BridgingFailed` (a `burn_tx_hash` or `cctp_nonce` is recorded), or a
-  `BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg). Every
-  other state is rejected: an in-progress transfer must be resumed, and a
-  pre-burn failure already reconciles to source on its own. `Reconciled` is a
-  clearing terminal -- it carries **post-burn semantics**, meaning the reactor
-  zeroes source-venue inflight WITHOUT crediting `available` (the USDC was
-  already burned via CCTP, so the funds genuinely left the source venue; this is
-  NOT a cancel, which would wrongly credit `available`). See "Operator
-  reconciliation of a stranded post-burn failure" under Failure Handling.
+  -> `Reconciled`): valid ONLY from a terminal failure that strands the
+  rebalancing guard with no other exit -- `DepositFailed`, a `BridgingFailed`
+  with burn evidence (a `burn_tx_hash` or `cctp_nonce` is recorded), any
+  `AlpacaToBase` `BridgingFailed` (reachable only after the withdrawal
+  completed, so the funds are off Alpaca even without burn evidence), or a
+  `BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg). The
+  `is_reconcilable_failure` predicate is the single source of this eligibility
+  rule. Every other state is rejected: an in-progress transfer must be resumed,
+  and a failure whose funds never left the source venue reconciles to source on
+  its own. `Reconciled` is a clearing terminal -- it carries **post-burn
+  semantics**, meaning the reactor zeroes source-venue inflight WITHOUT
+  crediting `available` (the USDC was already burned via CCTP, so the funds
+  genuinely left the source venue; this is NOT a cancel, which would wrongly
+  credit `available`). See "Operator reconciliation of a stranded post-burn
+  failure" under Failure Handling.
 
 ##### Integration Points
 
@@ -3399,6 +3403,26 @@ Alpaca to Base:
      "Complete" before the on-chain tx is settled network-wide on load-balanced
      RPC nodes; burning against an unconfirmed balance causes an ERC20
      transfer-exceeds-balance revert. This gate is retryable.
+   - **Settlement retry deadline:** the retryable settlement wait
+     (under-confirmed tx, or zero wallet balance after a confirmed withdrawal)
+     is bounded. The deadline is `confirmed_at` (the durable
+     `WithdrawalComplete` timestamp) plus the required
+     `[rebalancing] settlement_retry_deadline_secs` config value. The bound also
+     covers persistent settlement-check RPC failures (for example a malformed tx
+     hash from Alpaca), not only clean not-settled answers. At or after the
+     deadline, the redrive emits `FailBridging` instead of re-enqueueing, and
+     the worker pages the operator with `SettlementRetryDeadlineElapsed`. The
+     aggregate becomes a pre-burn `BridgingFailed` that KEEPS the
+     single-rebalance guard held: the withdrawn funds are off Alpaca and may
+     still land on-chain late, so a fresh transfer must not start and
+     mis-attribute them. The operator verifies where the funds sit (Alpaca
+     balance vs the market-maker wallet) and settles them with
+     `transfer reconcile --kind usdc`, which releases the guard. An AlpacaToBase
+     `BridgingFailed` is reconcile-eligible even without burn evidence:
+     `FailBridging` is only reachable after the withdrawal completed, so the
+     funds are provably off Alpaca. Without this deadline, a withdrawal that
+     never settles on-chain redrives every 30 seconds forever, with the guard
+     latched and no operator signal.
    - **Balance read:** after confirmation, read the market-maker Ethereum wallet
      USDC balance. Three cases:
      - **balance == 0**: delayed redrive (withdrawal not yet reflected;
@@ -4044,16 +4068,16 @@ know about cross-venue inventory.
   moves from inflight to destination available
 - `UsdcRebalanceEvent::ConversionConfirmed` - Terminal success for BaseToAlpaca;
   moves from inflight to destination available
-- `UsdcRebalanceEvent::WithdrawalFailed`, pre-burn `BridgingFailed`, and
-  AlpacaToBase `ConversionFailed` (the pre-withdrawal USD->USDC leg) -
-  Reconciles inflight back to source available, because the failure happened
-  before the CCTP burn so the funds are still on the source venue
-- Post-burn `UsdcRebalanceEvent::BridgingFailed`, `DepositFailed`, and
-  BaseToAlpaca `ConversionFailed` (the post-deposit USDC->USD leg) - Keeps
-  source inflight and the USDC rebalancing guard active because the funds were
-  burned (and, for the deposit/conversion failures, already minted) by CCTP and
-  are not available on the source venue. The same applies to any transfer that
-  times out at or after the burn
+- `UsdcRebalanceEvent::WithdrawalFailed`, BaseToAlpaca pre-burn
+  `BridgingFailed`, and AlpacaToBase `ConversionFailed` (the pre-withdrawal
+  USD->USDC leg) - Reconciles inflight back to source available, because the
+  failure happened before any funds left the source venue
+- Post-burn `UsdcRebalanceEvent::BridgingFailed`, any AlpacaToBase
+  `BridgingFailed` (post-withdrawal, so the funds are off Alpaca even without
+  burn evidence), `DepositFailed`, and BaseToAlpaca `ConversionFailed` (the
+  post-deposit USDC->USD leg) - Keeps source inflight and the USDC rebalancing
+  guard active because the funds left the source venue and are not available
+  there. The same applies to any transfer that times out at or after the burn
 - `InventorySnapshotEvent::OnchainEquity` - Onchain equity balances fetched from
   vaults
 - `InventorySnapshotEvent::OnchainCash` - Onchain USDC balance fetched from
@@ -4286,11 +4310,13 @@ or manual operator recovery.
 rebalance while one is unsettled is reconstructed from persisted `UsdcRebalance`
 event state on startup, so a restart between a post-burn failure and settlement
 cannot re-open the re-burn window. Any aggregate not in a clearable-terminal
-state (success, or a pre-burn failure that reconciles to source) re-asserts the
-guard at boot and blocks new USDC rebalancing until it settles or an operator
-recovers it. Supported stranded states are re-armed with idempotent transfer
-jobs on startup; unsupported states keep the guard held and page the operator
-for manual recovery.
+state (success, or a failure whose funds never left the source venue) re-asserts
+the guard at boot and blocks new USDC rebalancing until it settles or an
+operator recovers it. The `holds_rebalance_guard` classifier decides this at
+boot; it is a separate, more defensive rule than the `is_reconcilable_failure`
+predicate that gates operator reconciliation. Supported stranded states are
+re-armed with idempotent transfer jobs on startup; unsupported states keep the
+guard held and page the operator for manual recovery.
 
 **Operator recovery of a pre-burn stranded guard latch**: A USDC rebalance can
 become stranded in `WithdrawalComplete` (pre-bridging, no burn intent recorded)
@@ -4299,8 +4325,9 @@ fails before the `BridgingInitiated` event is persisted.
 
 `WithdrawalComplete` is pre-CCTP-burn: no burn has been broadcast. However, the
 source withdrawal has already completed and the USDC is sitting in the
-market-maker wallet awaiting bridging. After clearing the guard with this
-command, the operator must reconcile or handle those funds separately.
+market-maker wallet awaiting bridging. The command does not release the guard
+for this state: the resulting AlpacaToBase `BridgingFailed` keeps the guard, and
+the operator settles those funds with `transfer reconcile --kind usdc`.
 
 `BridgingSubmitting` records burn intent but does NOT guarantee that no burn was
 broadcast. A crash at this state may have already submitted a CCTP burn whose
@@ -4311,16 +4338,20 @@ using `fail-usdc-transfer` on a `BridgingSubmitting` transfer. Using it when a
 burn was already broadcast will strand the burned funds.
 
 The `fail-usdc-transfer` CLI command sends `FailBridging { reason }`, which
-emits `BridgingFailed { burn_tx_hash: None, cctp_nonce: None }`. Because this is
-a pre-burn `BridgingFailed`, `holds_rebalance_guard()` returns false (no burn tx
-recorded), and the guard is NOT re-latched on the next startup. The command is
-valid ONLY from `BridgingSubmitting` or `WithdrawalComplete` -- it is refused
-for all post-burn states (`Bridging`, `AwaitingAttestation`, `Attested`,
-`Bridged`, `DepositInitiated`, `DepositConfirmed`, `DepositFailed`,
-`Reconciled`, or any `BridgingFailed` with a recorded `burn_tx_hash`). The live
-in-memory guard is NOT cleared without a restart: `recover_usdc_guard` on boot
-skips non-guard-holding aggregates, so automatic USDC rebalancing resumes on the
-next restart.
+emits `BridgingFailed { burn_tx_hash: None, cctp_nonce: None }`. The guard
+outcome depends on the direction. For a BaseToAlpaca transfer no funds left the
+source venue: `holds_rebalance_guard()` returns false, and the guard is NOT
+re-latched on the next startup. For an AlpacaToBase transfer the withdrawal
+already completed, so the funds are off Alpaca: `holds_rebalance_guard()`
+returns true, the guard IS re-latched on the next startup, and the operator
+settles the funds with `transfer reconcile --kind usdc`, which releases the
+guard. The command is valid ONLY from `BridgingSubmitting` or
+`WithdrawalComplete` -- it is refused for all post-burn states (`Bridging`,
+`AwaitingAttestation`, `Attested`, `Bridged`, `DepositInitiated`,
+`DepositConfirmed`, `DepositFailed`, `Reconciled`, or any `BridgingFailed` with
+a recorded `burn_tx_hash`). The live in-memory guard is NOT cleared without a
+restart: `recover_usdc_guard` on boot skips non-guard-holding aggregates, so
+automatic USDC rebalancing resumes on the next restart.
 
 **Operator reconciliation of a stranded post-burn failure**: A USDC rebalance
 that fails after the CCTP burn holds the rebalancing guard, blocking further
@@ -4337,14 +4368,16 @@ tick, finds `Reconciled`, applies the source-venue inflight reconciliation with
 **post-burn semantics** (zeroing source-venue inflight WITHOUT crediting
 `available`, because the funds already left the source venue -- it is NOT a
 cancel, which would wrongly credit available), and clears the guard. No restart
-is required. The command is valid ONLY from a post-burn terminal failure that
-strands the guard: `DepositFailed` (the CCTP mint landed but the destination
-deposit failed), a post-burn `BridgingFailed` (a `burn_tx_hash` is recorded), or
+is required. The command is valid ONLY from a terminal failure that strands the
+guard: `DepositFailed` (the CCTP mint landed but the destination deposit
+failed), a `BridgingFailed` with burn evidence (a `burn_tx_hash` is recorded),
+any `AlpacaToBase` `BridgingFailed` (post-withdrawal, so the funds are off
+Alpaca even without burn evidence -- the settlement-retry-deadline terminal), or
 a `BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg). Every
 other state is rejected -- an in-progress transfer must be resumed, and a
-pre-burn failure already reconciles to source on its own. Because `Reconciled`
-is a clearable terminal, a restart does not re-latch the guard, and automatic
-USDC rebalancing resumes.
+failure whose funds never left the source venue reconciles to source on its own.
+Because `Reconciled` is a clearable terminal, a restart does not re-latch the
+guard, and automatic USDC rebalancing resumes.
 
 Reconcile also applies to the equity transfer aggregates (`TokenizedEquityMint`,
 `EquityRedemption`): a mint or redemption stuck in its `Failed` terminal whose

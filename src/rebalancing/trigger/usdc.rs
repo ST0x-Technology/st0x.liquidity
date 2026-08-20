@@ -719,7 +719,14 @@ impl RebalancingService {
         //     AlpacaToBase pre-burn leg clears without needing a restart. Only
         //     when the durable state cannot be consulted does it preserve
         //     conservatively (fail closed).
-        //   - `WithdrawalFailed` / pre-burn `BridgingFailed` are always pre-burn,
+        //   - `BridgingFailed` for an AlpacaToBase transfer preserves even
+        //     without burn evidence: FailBridging is only reachable after the
+        //     withdrawal completed, so the withdrawn funds are off Alpaca and
+        //     may land late (the settlement-retry-deadline terminal). Clearing
+        //     would let a fresh transfer mis-attribute them; the guard stays
+        //     held until `transfer reconcile`. Absent tracking falls back to
+        //     the durable classifier, which encodes the same rule.
+        //   - `WithdrawalFailed` is always pre-burn (nothing left the source),
         //     so absent tracking correctly clears.
         match event {
             DepositFailed { .. } => true,
@@ -727,7 +734,14 @@ impl RebalancingService {
                 Some(tracking) => tracking.is_post_burn(),
                 None => self.durable_guard_hold(id).await,
             },
-            WithdrawalFailed { .. } | BridgingFailed { .. } => self
+            BridgingFailed { .. } => match self.usdc_tracking.read().await.get(id) {
+                Some(tracking) => {
+                    tracking.is_post_burn()
+                        || tracking.direction == RebalanceDirection::AlpacaToBase
+                }
+                None => self.durable_guard_hold(id).await,
+            },
+            WithdrawalFailed { .. } => self
                 .usdc_tracking
                 .read()
                 .await

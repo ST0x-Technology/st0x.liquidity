@@ -396,8 +396,10 @@ describe('transferRecoveryCommands', () => {
   })
 
   it('shows reconcile for a post-burn failed usdc bridge (any casing)', () => {
-    // The CLI accepts `transfer reconcile --kind usdc` only for post-burn
-    // failures, which the postBurn discriminator marks true.
+    // The CLI accepts `transfer reconcile --kind usdc` only for
+    // reconcile-eligible failures (funds provably off their source venue),
+    // which the postBurn discriminator marks true (historical name, kept
+    // for wire compatibility).
     for (const status of ['failed', 'Failed', 'FAILED']) {
       const commands = transferRecoveryCommands({
         deployment: PROD,

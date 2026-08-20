@@ -1994,6 +1994,7 @@ async fn build_rebalancer_services<Chain: Wallet + Clone>(
         raindex_service,
         UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
+            settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
             required_confirmations,
             #[cfg(feature = "test-support")]
             circle_api_base: rebalancing_ctx.circle_api_base.clone(),
