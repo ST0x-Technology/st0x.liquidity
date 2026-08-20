@@ -287,7 +287,7 @@ fn policy_term_applicability(
     let term = trim_grouping_parentheses(term);
 
     if let Some(value) = equality_value(term, "eth.tx.to") {
-        return address_applicability(value, target.token, true);
+        return lowercase_address_applicability(value, target.token, true);
     }
 
     if let Some(values) = membership_values(term, "eth.tx.to") {
@@ -326,11 +326,11 @@ fn policy_term_applicability(
     }
 
     if let Some(value) = equality_value(term, "wallet_account.address") {
-        return address_applicability(value, context.wallet_address, true);
+        return checksummed_address_applicability(value, context.wallet_address);
     }
 
     if let Some(value) = equality_value(term, "eth.tx.data[34..74]") {
-        return address_applicability(value, target.spender, false);
+        return lowercase_address_applicability(value, target.spender, false);
     }
 
     if let Some(values) = membership_values(term, "eth.tx.data[34..74]") {
@@ -351,7 +351,7 @@ fn address_membership_applicability(
     let mut saw_unknown = false;
 
     for value in values {
-        match address_applicability(value, expected, prefixed) {
+        match lowercase_address_applicability(value, expected, prefixed) {
             Applicability::Applies => return Applicability::Applies,
             Applicability::Unknown => saw_unknown = true,
             Applicability::DoesNotApply => {}
@@ -365,14 +365,34 @@ fn address_membership_applicability(
     }
 }
 
-fn address_applicability(actual: &str, expected: Address, prefixed: bool) -> Applicability {
+fn lowercase_address_applicability(
+    actual: &str,
+    expected: Address,
+    prefixed: bool,
+) -> Applicability {
+    if actual != actual.to_ascii_lowercase() {
+        return Applicability::Unknown;
+    }
+
     let value = if prefixed {
         actual.to_owned()
     } else {
         format!("0x{actual}")
     };
 
-    Address::parse_checksummed(&value, None).map_or(Applicability::Unknown, |value| {
+    value
+        .parse::<Address>()
+        .map_or(Applicability::Unknown, |value| {
+            if value == expected {
+                Applicability::Applies
+            } else {
+                Applicability::DoesNotApply
+            }
+        })
+}
+
+fn checksummed_address_applicability(actual: &str, expected: Address) -> Applicability {
+    Address::parse_checksummed(actual, None).map_or(Applicability::Unknown, |value| {
         if value == expected {
             Applicability::Applies
         } else {
@@ -510,6 +530,31 @@ mod tests {
         let target = target();
 
         assert!(missing(&[target], &[tag_allow(p2_condition())]).is_empty());
+    }
+
+    #[test]
+    fn p2_lowercase_address_literals_with_hex_letters_cover_target() {
+        let target = ApprovalTarget {
+            token: "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+                .parse()
+                .unwrap(),
+            spender: "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+                .parse()
+                .unwrap(),
+            symbol: Some("RKLB".parse().unwrap()),
+            purpose: ApprovalPurpose::WrapUnderlying,
+        };
+        let condition = "activity.type == 'ACTIVITY_TYPE_SIGN_TRANSACTION_V2' && \
+                         eth.tx.chain_id == 8453 && \
+                         eth.tx.to in \
+                         ['0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b'] && \
+                         eth.tx.data[2..10] == '095ea7b3' && \
+                         wallet_account.address == \
+                         '0x52908400098527886E0F7030069857D2E4169EE7' && \
+                         eth.tx.data[34..74] in \
+                         ['f4f8c66085910d583c01f3b4e44bf731d4e2c565']";
+
+        assert!(missing(&[target], &[tag_allow(condition)]).is_empty());
     }
 
     #[test]
