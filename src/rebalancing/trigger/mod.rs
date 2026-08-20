@@ -19095,10 +19095,13 @@ mod tests {
         let store = test_store::<UsdcRebalance>(pool.clone(), ());
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        // Persist a guard-relevant event that cannot originate an aggregate (the
-        // first event must be ConversionInitiated/Initiated). The candidate
-        // query returns this id, but Store::load replays to None -- exactly the
-        // store/event inconsistency the recovery must fail safe on.
+        // Direct INSERT into `events`, normally forbidden: the CQRS framework
+        // can never produce this corrupt shape (no command emits an
+        // unoriginated first event -- the first event must be
+        // ConversionInitiated/Initiated), so bypassing it is the only way to
+        // construct the store inconsistency this test guards against. The
+        // candidate query returns this id, but Store::load replays to None --
+        // exactly the inconsistency the recovery must fail safe on.
         let event = UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash: fixed_bytes!(
                 "0x00000000000000000000000000000000000000000000000000000000000000aa"

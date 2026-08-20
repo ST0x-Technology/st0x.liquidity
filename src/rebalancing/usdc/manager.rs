@@ -1740,6 +1740,54 @@ impl<
     ) -> Result<(), UsdcTransferError> {
         info!(target: "rebalance", %amount, "Starting Alpaca to Base rebalance");
 
+        // Pre-flight wallet-empty check: any ambient USDC in the market-maker
+        // wallet breaks the wallet-empty invariant at burn time, and enforcing
+        // it only at settlement would pull cash out of Alpaca first and strand
+        // the withdrawn USDC on Ethereum. Refuse BEFORE the conversion (the
+        // first aggregate event), so the transfer is a true no-op: nothing to
+        // resume or reconcile, only a wallet sweep for the operator.
+        //
+        // Every failure inside this block maps to a pre-flight variant whose
+        // worker arm releases the guard: no aggregate exists yet, so any
+        // error that escaped to a generic terminal arm would latch the guard
+        // with nothing to ever clear it. Deliberately NOT
+        // `read_ethereum_usdc_balance`, whose `SettlementCheckTransient`
+        // contract assumes a durable post-withdrawal aggregate to redrive.
+        let ambient = self
+            .cctp_bridge
+            .ethereum_usdc_balance(self.market_maker_wallet)
+            .await
+            .map_err(|error| UsdcTransferError::PreflightBalanceUnavailable {
+                id: id.clone(),
+                source: Box::new(UsdcTransferError::Cctp(Box::new(error))),
+            })?;
+        if ambient > U256::ZERO {
+            // The non-zero balance is already established, so a failing
+            // display conversion must stay an ambient REFUSAL (page, release,
+            // no redrive) -- rerouting to the warn-only "balance could not be
+            // determined" would silently loop on a deterministic failure.
+            let balance = u256_to_usdc(ambient).map_err(|error| {
+                UsdcTransferError::WalletUsdcAmbientPreflightUnrepresentable {
+                    id: id.clone(),
+                    raw: ambient,
+                    source: Box::new(error),
+                }
+            })?;
+            error!(
+                target: "rebalance",
+                %id,
+                %balance,
+                nominal = %amount,
+                "Market-maker wallet already holds USDC; refusing to start \
+                 the Alpaca->Base rebalance before any Alpaca call"
+            );
+            return Err(UsdcTransferError::WalletUsdcAmbientPreflight {
+                id: id.clone(),
+                balance,
+                nominal: amount,
+            });
+        }
+
         // Convert USD to USDC - use the actual received amount for subsequent steps
         let usdc_amount = self.execute_usd_to_usdc_conversion(id, amount).await?;
 
@@ -5813,29 +5861,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_alpaca_to_base_withdrawal_not_whitelisted() {
         let server = MockServer::start();
-        let (_anvil, endpoint, private_key) = setup_anvil();
-
-        let alpaca_broker = InstrumentedAlpacaBroker::new(
-            create_test_broker_service(&server).await,
-            TelemetrySender::disabled(),
-        );
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
-        let wallet = create_test_wallet(&endpoint, &private_key);
-        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
-        let cqrs = create_test_store_instance().await;
-
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
-
-        let manager = CrossVenueCashTransfer::new(
-            alpaca_broker,
-            alpaca_wallet,
-            Arc::new(cctp_bridge),
-            Arc::new(vault_service),
-            cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
-            &test_settlement_params(),
-        );
+        let (manager, _cqrs, _chain) =
+            build_manager_with_wallet_balance(&server, market_maker_wallet, U256::ZERO).await;
 
         // Mock conversion order (conversion happens before withdrawal)
         let _conversion_mock =
@@ -5873,29 +5901,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_alpaca_to_base_withdrawal_pending_whitelist() {
         let server = MockServer::start();
-        let (_anvil, endpoint, private_key) = setup_anvil();
-
-        let alpaca_broker = InstrumentedAlpacaBroker::new(
-            create_test_broker_service(&server).await,
-            TelemetrySender::disabled(),
-        );
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
-        let wallet = create_test_wallet(&endpoint, &private_key);
-        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
-        let cqrs = create_test_store_instance().await;
-
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
-
-        let manager = CrossVenueCashTransfer::new(
-            alpaca_broker,
-            alpaca_wallet,
-            Arc::new(cctp_bridge),
-            Arc::new(vault_service),
-            cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
-            &test_settlement_params(),
-        );
+        let (manager, _cqrs, _chain) =
+            build_manager_with_wallet_balance(&server, market_maker_wallet, U256::ZERO).await;
 
         // Mock conversion order (conversion happens before withdrawal)
         let _conversion_mock =
@@ -5940,29 +5948,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_alpaca_to_base_api_error() {
         let server = MockServer::start();
-        let (_anvil, endpoint, private_key) = setup_anvil();
-
-        let alpaca_broker = InstrumentedAlpacaBroker::new(
-            create_test_broker_service(&server).await,
-            TelemetrySender::disabled(),
-        );
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
-        let wallet = create_test_wallet(&endpoint, &private_key);
-        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
-        let cqrs = create_test_store_instance().await;
-
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
-
-        let manager = CrossVenueCashTransfer::new(
-            alpaca_broker,
-            alpaca_wallet,
-            Arc::new(cctp_bridge),
-            Arc::new(vault_service),
-            cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
-            &test_settlement_params(),
-        );
+        let (manager, _cqrs, _chain) =
+            build_manager_with_wallet_balance(&server, market_maker_wallet, U256::ZERO).await;
 
         // Mock conversion order (conversion happens before withdrawal)
         let _conversion_mock =
@@ -6863,29 +6851,9 @@ mod tests {
     #[tokio::test]
     async fn alpaca_to_base_calls_usd_to_usdc_conversion() {
         let server = MockServer::start();
-        let (_anvil, endpoint, private_key) = setup_anvil();
-
-        let alpaca_broker = InstrumentedAlpacaBroker::new(
-            create_test_broker_service(&server).await,
-            TelemetrySender::disabled(),
-        );
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
-        let wallet = create_test_wallet(&endpoint, &private_key);
-        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
-        let cqrs = create_test_store_instance().await;
-
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
-
-        let manager = CrossVenueCashTransfer::new(
-            alpaca_broker,
-            alpaca_wallet,
-            Arc::new(cctp_bridge),
-            Arc::new(vault_service),
-            cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
-            &test_settlement_params(),
-        );
+        let (manager, _cqrs, _chain) =
+            build_manager_with_wallet_balance(&server, market_maker_wallet, U256::ZERO).await;
 
         // Mock conversion order - MUST be called before withdrawal, and MUST
         // be sized as a notional buy (the mapping under test).
@@ -11858,6 +11826,29 @@ mod tests {
         (manager, cqrs)
     }
 
+    /// Deploys an Ethereum chain whose USDC token holds `balance` for the
+    /// market-maker wallet and builds a manager against it. The pre-flight
+    /// wallet-empty check reads this balance before any Alpaca call, so any
+    /// test that enters `execute_alpaca_to_base` needs real token code even
+    /// when the balance is zero (a codeless USDC address errors the read).
+    /// The chain rides along in the return value to keep its anvil alive.
+    async fn build_manager_with_wallet_balance(
+        server: &MockServer,
+        market_maker_wallet: Address,
+        balance: U256,
+    ) -> (
+        CrossVenueCashTransfer<
+            RawPrivateKeyWallet<impl alloy::providers::Provider + Clone + use<>>,
+        >,
+        Arc<Store<UsdcRebalance>>,
+        EthereumUsdcChain,
+    ) {
+        let chain = deploy_ethereum_usdc_chain_with_balance(balance, market_maker_wallet).await;
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, server, market_maker_wallet).await;
+        (manager, cqrs, chain)
+    }
+
     /// Like [`build_manager_with_ethereum_chain`] but applies the fast burn-drop
     /// policy so an absent recorded burn tx classifies as `Dropped` immediately
     /// (no production 30 s grace), letting the dropped-burn resume test run fast.
@@ -12283,6 +12274,161 @@ mod tests {
                 }
             ),
             "Aggregate must stay in WithdrawalComplete (retryable); got: {state:?}"
+        );
+    }
+
+    /// Hypothesis: `execute_alpaca_to_base` refuses BEFORE any
+    /// Alpaca call when the market-maker wallet already holds USDC. Enforcing
+    /// the wallet-empty invariant only at settlement time pulls cash out of
+    /// Alpaca first and then strands the withdrawn USDC on Ethereum (the
+    /// 2026-07-10 incident: four aborted attempts, 5,359.671063 USDC
+    /// stranded). The pre-flight refusal must be a true no-op: no conversion
+    /// order, no withdrawal request, and no aggregate event -- nothing to
+    /// resume or reconcile.
+    ///
+    /// The ambient balance is deliberately BELOW the nominal: the pre-flight
+    /// rule is "refuse on ANY ambient USDC", unlike the settlement-time rule
+    /// that only trips on balance > nominal.
+    #[tokio::test]
+    async fn execute_alpaca_to_base_refuses_ambient_wallet_balance_before_any_alpaca_call() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+
+        let ambient_balance = U256::from(50_000_000u64); // 50 USDC, 6 decimals
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(ambient_balance, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        // Register the endpoints the flow would hit next; their hit counts
+        // prove no Alpaca call was made before the refusal.
+        let conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdToUsdc, "1000");
+        let withdrawal_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({}));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let nominal = usdc("1000");
+
+        let error = manager
+            .execute_alpaca_to_base(&id, nominal)
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::WalletUsdcAmbientPreflight {
+            id: err_id,
+            balance,
+            nominal: err_nominal,
+        } = error
+        else {
+            panic!(
+                "Expected WalletUsdcAmbientPreflight from the pre-flight check \
+                 (ambient USDC must refuse before any Alpaca call); got: {error:?}"
+            );
+        };
+        assert_eq!(err_id, id);
+        assert_eq!(err_nominal, nominal);
+        assert_eq!(balance, usdc("50"));
+
+        conversion_mock.assert_calls(0);
+        withdrawal_mock.assert_calls(0);
+
+        let state = cqrs.load(&id).await.unwrap();
+        assert!(
+            state.is_none(),
+            "a pre-flight refusal must emit NO aggregate event (true no-op, \
+             nothing to resume or reconcile); got: {state:?}"
+        );
+    }
+
+    /// Hypothesis: a zero wallet balance satisfies the pre-flight
+    /// wallet-empty check and the flow proceeds into the conversion and
+    /// withdrawal legs. The downstream whitelist rejection proves the
+    /// pre-flight was passed: the conversion order was placed and the
+    /// withdrawal path was reached.
+    #[tokio::test]
+    async fn execute_alpaca_to_base_proceeds_past_preflight_when_wallet_empty() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, _cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdToUsdc, "1000");
+        let _get_order_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "1000",
+        );
+        let whitelist_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let error = manager
+            .execute_alpaca_to_base(&id, usdc("1000"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::AlpacaWallet(AlpacaWalletError::AddressNotWhitelisted { .. })
+            ),
+            "an empty wallet must pass pre-flight and fail downstream at the \
+             whitelist; got: {error:?}"
+        );
+        conversion_mock.assert();
+        whitelist_mock.assert();
+    }
+
+    /// Hypothesis: when the pre-flight balance read itself fails (RPC down),
+    /// the transfer surfaces `PreflightBalanceUnavailable` and stays a true
+    /// no-op -- no Alpaca call, no aggregate event -- so the trigger can
+    /// simply retry on its next cycle.
+    #[tokio::test]
+    async fn execute_alpaca_to_base_returns_preflight_balance_unavailable_on_rpc_failure() {
+        let server = MockServer::start();
+        let (manager, cqrs) = build_manager_with_dead_rpc(&server).await;
+
+        let conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdToUsdc, "1000");
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let error = manager
+            .execute_alpaca_to_base(&id, usdc("1000"))
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::PreflightBalanceUnavailable { id: err_id, .. } = error else {
+            panic!(
+                "a pre-flight balance-read failure must surface \
+                 PreflightBalanceUnavailable; got: {error:?}"
+            );
+        };
+        assert_eq!(err_id, id);
+
+        conversion_mock.assert_calls(0);
+
+        let state = cqrs.load(&id).await.unwrap();
+        assert!(
+            state.is_none(),
+            "a pre-flight read failure must emit no aggregate event; got: {state:?}"
         );
     }
 

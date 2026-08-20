@@ -9,9 +9,9 @@ mod job;
 mod manager;
 
 pub(crate) use job::{
-    ResumeAlpacaToBase, ResumeBaseToAlpaca, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
-    TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
-    TransferUsdcToMarketMakingJobQueue,
+    DurableCheckedGuardRelease, PreflightAlertGate, ResumeAlpacaToBase, ResumeBaseToAlpaca,
+    TransferUsdcToHedging, TransferUsdcToHedgingCtx, TransferUsdcToHedgingJobQueue,
+    TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx, TransferUsdcToMarketMakingJobQueue,
 };
 pub(crate) use manager::{
     CrossVenueCashTransfer, RecheckUsdcDeposit, UsdcRecheckError, UsdcSettlementParams,
@@ -310,6 +310,68 @@ pub(crate) enum UsdcTransferError {
         balance: Usdc,
         nominal: Usdc,
     },
+    /// The market-maker wallet already holds USDC before the Alpaca leg
+    /// starts. The wallet-empty invariant cannot hold at burn time, so the
+    /// transfer refuses up front -- before the conversion, so no cash leaves
+    /// Alpaca and NO aggregate event is emitted. Unlike
+    /// [`Self::WalletUsdcAmbientBalance`] (settlement-time, aggregate moved
+    /// to `BridgingFailed`, guard cleared by the terminal event), this
+    /// refusal has no aggregate, so the job layer must release the
+    /// in-progress guard itself and alert the operator to sweep the wallet.
+    ///
+    /// Refuses on ANY non-zero balance, dust included. The wallet address is
+    /// public on-chain, so third-party dust can force refusals (one alert
+    /// per trigger cycle until swept) -- an accepted fail-closed trade-off:
+    /// proceeding with ambient funds is what stranded real withdrawals, and
+    /// a sweep restores service with no funds at risk.
+    #[error(
+        "cannot start Alpaca->Base rebalance {id}: market-maker wallet \
+         already holds {balance} USDC before the withdrawal (nominal \
+         {nominal}); wallet-empty invariant cannot hold at burn time -- \
+         sweep the wallet, the transfer was refused before any Alpaca call"
+    )]
+    WalletUsdcAmbientPreflight {
+        id: UsdcRebalanceId,
+        balance: Usdc,
+        nominal: Usdc,
+    },
+    /// [`Self::WalletUsdcAmbientPreflight`]'s sibling for a non-zero balance
+    /// so extreme it cannot be represented as [`Usdc`]: the wallet provably
+    /// holds ambient USDC (the established fact), so this stays an ambient
+    /// REFUSAL -- page the operator, release the guard, never redrive --
+    /// rather than rerouting to the warn-only
+    /// [`Self::PreflightBalanceUnavailable`] ("could not be determined",
+    /// which would be false) just because the display conversion failed.
+    /// Near-impossible to hit; when it fires, the strongest evidence of the
+    /// invariant break must get the loudest response.
+    #[error(
+        "cannot start Alpaca->Base rebalance {id}: market-maker wallet \
+         already holds ambient USDC (raw balance {raw}) too large to \
+         represent for display; wallet-empty invariant cannot hold at burn \
+         time -- sweep the wallet, the transfer was refused before any \
+         Alpaca call"
+    )]
+    WalletUsdcAmbientPreflightUnrepresentable {
+        id: UsdcRebalanceId,
+        raw: U256,
+        source: Box<Self>,
+    },
+    /// The pre-flight wallet balance could not be determined (RPC read
+    /// failed, or the returned balance did not decode) before the transfer
+    /// started: no Alpaca call was made and no aggregate exists. Distinct
+    /// from [`Self::SettlementCheckTransient`], whose contract assumes a
+    /// durable post-withdrawal aggregate to redrive against; here there is
+    /// nothing to redrive, so the worker releases the guard (durable-state
+    /// checked) and the trigger re-attempts on its next cycle.
+    #[error(
+        "cannot start Alpaca->Base rebalance {id}: pre-flight wallet balance \
+         could not be determined before any Alpaca call; the trigger retries \
+         on its next cycle"
+    )]
+    PreflightBalanceUnavailable {
+        id: UsdcRebalanceId,
+        source: Box<Self>,
+    },
     #[error(
         "USDC rebalance {id}: withdrawal tx {tx} has only {actual} confirmations, \
          need {required}; waiting for on-chain settlement"
@@ -455,6 +517,9 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::WithdrawalRefMustBeAlpacaId { .. }
             | Self::WalletUsdcInsufficient { .. }
             | Self::WalletUsdcAmbientBalance { .. }
+            | Self::WalletUsdcAmbientPreflight { .. }
+            | Self::WalletUsdcAmbientPreflightUnrepresentable { .. }
+            | Self::PreflightBalanceUnavailable { .. }
             | Self::WithdrawalTxUnderconfirmed { .. }
             | Self::SettlementCheckTransient { .. }
             | Self::MintRecoveryInconclusive { .. }
