@@ -3,13 +3,17 @@
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
+use alloy::primitives::U256;
+use alloy::providers::ProviderBuilder;
 use st0x_config::Ctx;
-use st0x_evm::USDC_BASE;
 use st0x_evm::turnkey::{
     TurnkeyPolicy, TurnkeyPolicyClient, TurnkeyPolicyEffect, TurnkeyPolicyError,
 };
+use st0x_evm::{Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, USDC_BASE};
 
-use crate::onchain::approvals::{ApprovalTarget, build_approval_targets};
+use crate::onchain::approvals::{
+    ApprovalDecision, ApprovalTarget, approval_decision, build_approval_targets,
+};
 
 /// Successful result of a deploy-time policy verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +88,39 @@ pub async fn verify_turnkey_approval_policies(
         return Ok(ApprovalPolicyVerification::SkippedNonTurnkey);
     };
     let targets = build_approval_targets(&inputs.assets, inputs.orderbook, USDC_BASE);
+
+    // The startup grant is idempotent: it skips a (token, spender) whose
+    // allowance is already at or above the watermark. Read each allowance over
+    // the base RPC and keep only the targets the grant would submit; a read
+    // failure keeps the target under verification.
+    let owner = inputs.owner;
+    let evm = ReadOnlyEvm::new(
+        ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(inputs.base_rpc_url.clone()),
+    );
+    let allowances = futures_util::future::join_all(targets.iter().map(|target| {
+        let evm = &evm;
+        async move {
+            evm.call::<OpenChainErrorRegistry, _>(
+                target.token,
+                IERC20::allowanceCall {
+                    owner,
+                    spender: target.spender,
+                },
+            )
+            .await
+            .ok()
+        }
+    }))
+    .await;
+    let pending: Vec<ApprovalTarget> = targets
+        .into_iter()
+        .zip(allowances)
+        .filter(|(_, allowance)| requires_policy(*allowance))
+        .map(|(target, _)| target)
+        .collect();
+
     let client = TurnkeyPolicyClient::new(
         inputs.organization_id,
         inputs.kms_api_key,
@@ -91,14 +128,14 @@ pub async fn verify_turnkey_approval_policies(
     )
     .await?;
     let snapshot = client.list_policies().await?;
-    let missing = missing_policy_coverage(&targets, &snapshot.policies, &snapshot.user_id);
+    let missing = missing_policy_coverage(&pending, &snapshot.policies, &snapshot.user_id);
 
     if !missing.is_empty() {
         return Err(MissingPolicyCoverage::new(missing).into());
     }
 
     Ok(ApprovalPolicyVerification::Verified {
-        target_count: targets.len(),
+        target_count: pending.len(),
         policy_count: snapshot.policies.len(),
     })
 }
@@ -113,6 +150,13 @@ fn missing_policy_coverage(
         .filter(|target| !policies_cover_target(policies, target, user_id))
         .cloned()
         .collect()
+}
+
+/// Whether a startup approval still needs a Turnkey policy: its on-chain
+/// allowance is below the watermark, or the allowance read failed.
+fn requires_policy(allowance: Option<U256>) -> bool {
+    allowance
+        .is_none_or(|allowance| matches!(approval_decision(allowance), ApprovalDecision::GrantMax))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -548,5 +592,26 @@ mod tests {
         assert!(message.contains("AAPL"));
         assert!(message.contains(&target.token.to_string()));
         assert!(message.contains(&target.spender.to_string()));
+    }
+
+    #[test]
+    fn requires_policy_skips_max_allowance() {
+        assert!(!requires_policy(Some(U256::MAX)));
+    }
+
+    #[test]
+    fn requires_policy_flags_zero_allowance() {
+        assert!(requires_policy(Some(U256::ZERO)));
+    }
+
+    #[test]
+    fn requires_policy_flags_bounded_allowance() {
+        let bounded = U256::from(1000u64) * U256::from(10u64).pow(U256::from(18u64));
+        assert!(requires_policy(Some(bounded)));
+    }
+
+    #[test]
+    fn requires_policy_fails_closed_on_read_failure() {
+        assert!(requires_policy(None));
     }
 }
