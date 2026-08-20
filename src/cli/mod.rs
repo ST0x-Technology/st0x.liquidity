@@ -803,13 +803,14 @@ pub enum Commands {
 pub enum TransferCommand {
     /// Resume interrupted transfers.
     ///
-    /// `--kind usdc` re-drives a single USDC transfer whose CLI invocation was
-    /// interrupted after the burn: pass `--id` (printed by `transfer-usdc`) and
-    /// the original `--direction`. An unknown id is rejected (never starts a
-    /// fresh burn); the resume uses the persisted amount. Operates on the local
-    /// CQRS state plus a live RPC provider
-    /// (re-drives the on-chain burn/mint/deposit flow itself); the bot must not
-    /// be concurrently driving the same id.
+    /// `--kind usdc` enqueues a single interrupted USDC transfer on the
+    /// running bot: pass `--id` (printed by `transfer-usdc`) and the original
+    /// `--direction`. The bot validates server-side (an unknown id is
+    /// rejected and never starts a fresh burn, a direction mismatch is
+    /// rejected, a clean terminal is rejected), applies its single-flight
+    /// gates, and its worker drives the transfer with the aggregate's
+    /// persisted amount. Requires the bot to be running and serving its API
+    /// on the configured `server_port`.
     ///
     /// `--kind equity` resumes ALL interrupted mints and redemptions via the
     /// running bot's REST API: there is no per-id filter (`--id`/`--direction`
@@ -833,9 +834,11 @@ pub enum TransferCommand {
 
     /// Reconcile a transfer stuck in a terminal failure to a resolved terminal.
     ///
-    /// `--kind usdc` drives a USDC rebalance stranded in a post-burn terminal
-    /// failure that strands the in-progress guard (`DepositFailed`, a post-burn
-    /// `BridgingFailed`, or a `BaseToAlpaca` `ConversionFailed`) to the clearing
+    /// `--kind usdc` drives a USDC rebalance stranded in a terminal failure
+    /// whose funds left their source venue (`DepositFailed`, a post-burn
+    /// `BridgingFailed`, any `AlpacaToBase` `BridgingFailed` -- its
+    /// withdrawal completed, so the funds are off Alpaca even without burn
+    /// evidence -- or a `BaseToAlpaca` `ConversionFailed`) to the clearing
     /// terminal `Reconciled` state (the funds were handled out-of-band).
     /// `--kind mint` / `--kind redemption` mark an equity transfer stuck in
     /// `Failed` as `Reconciled` once its residue was handled out-of-band (e.g.
@@ -2063,7 +2066,7 @@ async fn run_provider_command<W: Write + Send>(
             rebalancing::transfer_usdc_command(stdout, direction, amount, ctx, pool).await
         }
         ProviderCommand::ResumeUsdcTransfer { id, direction } => {
-            rebalancing::resume_usdc_transfer_command(stdout, id, direction, ctx, pool).await
+            rebalancing::resume_usdc_transfer_command(stdout, id, direction, ctx).await
         }
         ProviderCommand::CctpBridge { amount, all, from } => {
             cctp::cctp_bridge_command::<OpenChainErrorRegistry, _>(stdout, amount, all, from, ctx)

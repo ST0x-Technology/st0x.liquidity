@@ -4,11 +4,8 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::RootProvider;
 use anyhow::Context;
 use sqlx::SqlitePool;
-use std::future::Future;
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::time::Duration;
-use tracing::warn;
 use uuid::Uuid;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
@@ -272,128 +269,82 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
     Ok(())
 }
 
-/// Per-retry delay for the manual CLI redrive loop when Circle's attestation is
-/// not yet ready. Mirrors the apalis job's redrive cadence.
-const CLI_ATTESTATION_REDRIVE_DELAY: Duration = Duration::from_secs(60);
-
-/// Drives a manual USDC transfer to a terminal outcome, redriving on the same
-/// retryable waits the apalis worker delayed-redrives -- Circle attestation
-/// timeouts and the AlpacaToBase on-chain settlement gate -- so a single CLI
-/// invocation cannot strand after the burn (or before it, during settlement
-/// lag).
-///
-/// `resume` is re-invoked with the same `UsdcRebalanceId` on every attempt, so a
-/// retry resumes the existing transfer instead of starting a second
-/// fund-moving one. The retryable set mirrors the worker: `AttestationTimedOut`,
-/// `WithdrawalPollInconclusive` (Alpaca API unreachable or returned a transient
-/// error), `MintRecoveryInconclusive` (CCTP mint recovery could not resolve a
-/// conclusive nonce/receipt), plus the settlement-wait errors
-/// (`WithdrawalTxUnderconfirmed`, `WalletUsdcInsufficient`,
-/// `SettlementCheckTransient`). Errors not in this set -- including
-/// `AttestationRetryDeadlineElapsed` and a previously-failed aggregate -- are
-/// terminal and returned to the caller.
-async fn redrive_transfer_until_settled<Resume, Fut>(
-    redrive_delay: Duration,
-    mut resume: Resume,
-) -> Result<(), UsdcTransferError>
-where
-    Resume: FnMut() -> Fut,
-    Fut: Future<Output = Result<(), UsdcTransferError>>,
-{
-    loop {
-        match retry_on_backpressure(&mut resume, BACKPRESSURE_RETRY_MAX_ATTEMPTS).await {
-            Ok(()) => return Ok(()),
-            Err(UsdcTransferError::AttestationTimedOut { id }) => {
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    ?redrive_delay,
-                    "Circle attestation not ready for manual USDC transfer; retrying after delay"
-                );
-                tokio::time::sleep(redrive_delay).await;
-            }
-            Err(
-                UsdcTransferError::WithdrawalTxUnderconfirmed { id, .. }
-                | UsdcTransferError::WalletUsdcInsufficient { id, .. }
-                | UsdcTransferError::SettlementCheckTransient { id, .. },
-            ) => {
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    ?redrive_delay,
-                    "USDC transfer settlement not yet durable for manual transfer; \
-                     retrying after delay"
-                );
-                tokio::time::sleep(redrive_delay).await;
-            }
-            // WithdrawalPollInconclusive and MintRecoveryInconclusive are
-            // non-terminal: Alpaca was unreachable or returned an error, or the
-            // CCTP mint recovery window could not get a conclusive nonce/receipt
-            // read. The aggregate stays in its durable pre-terminal state (guard
-            // held); the automatic delayed redrive continues in the background.
-            // Retry here so the CLI polls periodically without spinning, matching
-            // the behaviour of AttestationTimedOut for Circle unavailability --
-            // otherwise a manual transfer would exit on this outcome, leaving the
-            // operator unable to drive the stuck transfer to completion via the CLI
-            // (the exact command the operator alert for this outcome recommends
-            // running).
-            Err(error) => {
-                let withdrawal_poll_backpressure = match &error {
-                    UsdcTransferError::WithdrawalPollInconclusive { source, .. } => {
-                        source.backpressure().is_some()
-                    }
-                    _ => false,
-                };
-                if withdrawal_poll_backpressure {
-                    return Err(error);
-                }
-
-                match error {
-                    UsdcTransferError::WithdrawalPollInconclusive { id, .. } => {
-                        warn!(
-                            target: "rebalance",
-                            %id,
-                            ?redrive_delay,
-                            "Alpaca withdrawal poll inconclusive; Alpaca may be unreachable -- \
-                             retrying after delay (aggregate stays in Withdrawing, guard held)"
-                        );
-                        tokio::time::sleep(redrive_delay).await;
-                    }
-                    UsdcTransferError::MintRecoveryInconclusive { id, source, .. } => {
-                        warn!(
-                            target: "rebalance",
-                            %id,
-                            %source,
-                            ?redrive_delay,
-                            "CCTP mint recovery inconclusive; retrying after delay \
-                             (aggregate stays in its durable pre-mint state, guard held)"
-                        );
-                        tokio::time::sleep(redrive_delay).await;
-                    }
-                    error => return Err(error),
-                }
-            }
+/// Whether a manual-transfer outcome is a retryable wait the BOT's worker
+/// should drive, not the CLI. The set mirrors the apalis worker's own
+/// delayed-redrive outcomes: `AttestationTimedOut`, the settlement-wait
+/// errors (`WithdrawalTxUnderconfirmed`, `WalletUsdcInsufficient`,
+/// `SettlementCheckTransient`), a non-backpressure
+/// `WithdrawalPollInconclusive` (Alpaca unreachable), and
+/// `MintRecoveryInconclusive`. The CLI must NOT keep redriving these itself:
+/// its process would race the bot's worker on the same aggregate (the
+/// CLI-vs-server race), so the first such outcome hands the transfer off to
+/// the running bot instead. Errors outside this set -- including
+/// `AttestationRetryDeadlineElapsed` and a previously-failed aggregate --
+/// are terminal for the CLI invocation.
+fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
+    match error {
+        UsdcTransferError::AttestationTimedOut { .. }
+        | UsdcTransferError::WithdrawalTxUnderconfirmed { .. }
+        | UsdcTransferError::WalletUsdcInsufficient { .. }
+        | UsdcTransferError::SettlementCheckTransient { .. }
+        | UsdcTransferError::MintRecoveryInconclusive { .. } => true,
+        UsdcTransferError::WithdrawalPollInconclusive { source, .. } => {
+            source.backpressure().is_none()
         }
+        // Terminal for this CLI invocation: deadlines elapsed, terminal
+        // aggregate states, pre-flight refusals, and genuine errors.
+        // Enumerated exhaustively so a new variant forces a conscious
+        // classification here instead of silently defaulting to "do not hand
+        // off" -- a new worker-redriven wait that lands in this arm by
+        // accident would exit the CLI as a hard error instead of enqueueing
+        // on the bot.
+        UsdcTransferError::AlpacaWallet(_)
+        | UsdcTransferError::AlpacaBrokerApi(_)
+        | UsdcTransferError::Cctp(_)
+        | UsdcTransferError::BotGasEnqueue(_)
+        | UsdcTransferError::BurnRevert(_)
+        | UsdcTransferError::Vault(_)
+        | UsdcTransferError::InsufficientVaultLiquidity { .. }
+        | UsdcTransferError::Aggregate(_)
+        | UsdcTransferError::WithdrawalFailed { .. }
+        | UsdcTransferError::DepositFailed { .. }
+        | UsdcTransferError::UsdcConversion(_)
+        | UsdcTransferError::Float(_)
+        | UsdcTransferError::InvalidShares(_)
+        | UsdcTransferError::NotPositive(_)
+        | UsdcTransferError::NotPositiveUsd(_)
+        | UsdcTransferError::MissingFilledQuantity { .. }
+        | UsdcTransferError::MissingFilledAveragePrice { .. }
+        | UsdcTransferError::ResumeIndeterminateConversion { .. }
+        | UsdcTransferError::ConversionPlacementFailed { .. }
+        | UsdcTransferError::ResumeWithoutMintScanBound { .. }
+        | UsdcTransferError::AttestationRetryDeadlineElapsed { .. }
+        | UsdcTransferError::AttestationRetryDeadlineOverflow { .. }
+        | UsdcTransferError::AttestationNonceMismatch { .. }
+        | UsdcTransferError::PreviouslyFailedAggregate { .. }
+        | UsdcTransferError::DepositRefMustBeOnchain { .. }
+        | UsdcTransferError::ResumeDirectionMismatch { .. }
+        | UsdcTransferError::AdoptedWithdrawalAmountMismatch { .. }
+        | UsdcTransferError::ConversionBelowWithdrawalMinimum { .. }
+        | UsdcTransferError::ConversionOutcomeUnresolved { .. }
+        | UsdcTransferError::PostDepositConversionShortFill { .. }
+        | UsdcTransferError::WithdrawalRefMustBeAlpacaId { .. }
+        | UsdcTransferError::WalletUsdcAmbientBalance { .. }
+        | UsdcTransferError::WalletUsdcAmbientPreflight { .. }
+        | UsdcTransferError::WalletUsdcAmbientPreflightUnrepresentable { .. }
+        | UsdcTransferError::PreflightBalanceUnavailable { .. }
+        | UsdcTransferError::SettlementRetryDeadlineElapsed { .. }
+        | UsdcTransferError::BurnRecordTaskFailed { .. }
+        | UsdcTransferError::BurnRecordFailed { .. }
+        | UsdcTransferError::BurnSubmitInconclusive { .. }
+        | UsdcTransferError::BurnTxDropped { .. } => false,
     }
-}
-
-/// Whether a USDC transfer command may start a fresh transfer or must resume an
-/// existing one. Drives the `None`-state policy in [`run_usdc_transfer`]: a
-/// freshly generated id is expected to have no state (first run), but an
-/// operator-supplied resume id that loads to `None` is a wrong/typoed id and
-/// must be rejected -- never burned into a brand-new transfer.
-#[derive(Clone, Copy)]
-enum UsdcTransferStartMode {
-    /// First run of a brand-new transfer; the operator supplies the amount.
-    Fresh { amount: Usdc },
-    /// Re-entry on an existing id; the amount always comes from the persisted
-    /// aggregate, never from the CLI.
-    Resume,
 }
 
 /// Starts a fresh manual USDC transfer. Surfaces the generated id up front so an
 /// operator can resume it (via `transfer resume`) if the process is interrupted,
-/// then drives it to terminal with attestation-timeout redrive.
+/// then drives it until the first bot-resumable wait, at which point the running
+/// bot's worker takes over (see [`hand_off_to_bot`]).
 pub(super) async fn transfer_usdc_command<Writer: Write>(
     stdout: &mut Writer,
     direction: TransferDirection,
@@ -402,10 +353,7 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
     let id = UsdcRebalanceId(Uuid::new_v4());
-    let dir_flag = match direction {
-        TransferDirection::ToRaindex => "to-raindex",
-        TransferDirection::ToAlpaca => "to-alpaca",
-    };
+    let dir_flag = direction_flag(direction);
     writeln!(
         stdout,
         "USDC transfer id: {id}\n   If this is interrupted after the burn, resume with:\n   \
@@ -415,46 +363,148 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
     // story depends on the operator still having this id if the process is killed
     // after burning, and buffered/redirected stdout could otherwise lose it.
     stdout.flush()?;
-    run_usdc_transfer(
-        stdout,
-        direction,
-        id,
-        UsdcTransferStartMode::Fresh { amount },
-        ctx,
-        pool,
-    )
-    .await
+    run_usdc_transfer(stdout, direction, id, amount, ctx, pool).await
 }
 
-/// Resumes an interrupted manual USDC transfer by its id, driving it to terminal
-/// with the same attestation-timeout redrive as a fresh transfer. Refuses to run
-/// if the id has no persisted transfer (a wrong/typoed id would otherwise start a
-/// brand-new burn) or if `--direction` disagrees with the persisted transfer.
-/// The amount always comes from the persisted aggregate, never from the CLI.
+/// Resumes an interrupted manual USDC transfer by enqueueing it on the
+/// RUNNING bot's `/transfers/usdc/resume` endpoint. Resuming must run in the
+/// bot process so it shares the bot's single-flight gates (job-row dedupe,
+/// durable guard-holder scan, in-memory guard) and cannot race the bot's own
+/// driving of the same aggregate. The endpoint rejects an unknown id (a
+/// wrong/typoed id would otherwise start a brand-new burn) and a
+/// `--direction` that disagrees with the persisted transfer; the worker uses
+/// the aggregate's persisted amount. Requires the bot to be running and
+/// serving its REST API on the configured `server_port`.
 pub(super) async fn resume_usdc_transfer_command<Writer: Write>(
     stdout: &mut Writer,
     id: Uuid,
     direction: TransferDirection,
     ctx: &Ctx,
-    pool: &SqlitePool,
 ) -> anyhow::Result<()> {
     let id = UsdcRebalanceId(id);
-    run_usdc_transfer(
+    let outcome = post_usdc_resume(ctx, &id, direction).await?;
+    writeln!(
         stdout,
-        direction,
-        id,
-        UsdcTransferStartMode::Resume,
-        ctx,
-        pool,
-    )
-    .await
+        "transfer resume outcome: {outcome}\n   The bot's transfer worker now drives {id} to \
+         terminal; monitor the logs or the dashboard."
+    )?;
+    Ok(())
+}
+
+fn direction_flag(direction: TransferDirection) -> &'static str {
+    match direction {
+        TransferDirection::ToRaindex => "to-raindex",
+        TransferDirection::ToAlpaca => "to-alpaca",
+    }
+}
+
+/// Enqueues a resume of `id` on the running bot's USDC resume endpoint and
+/// returns the reported outcome.
+async fn post_usdc_resume(
+    ctx: &Ctx,
+    id: &UsdcRebalanceId,
+    direction: TransferDirection,
+) -> anyhow::Result<String> {
+    // The CLI's transfer direction maps onto the shared wire form
+    // (`RebalanceDirection`'s `Display`), which the server route parses.
+    let direction = match direction {
+        TransferDirection::ToRaindex => RebalanceDirection::AlpacaToBase,
+        TransferDirection::ToAlpaca => RebalanceDirection::BaseToAlpaca,
+    };
+    let url = format!(
+        "http://127.0.0.1:{}/transfers/usdc/resume/{direction}/{id}",
+        ctx.server_port
+    );
+
+    post_bot_recovery_endpoint(&url, "usdc resume").await
+}
+
+/// POSTs to one of the running bot's recovery endpoints and returns the
+/// reported `{"outcome":"<snake_case>"}` value, falling back to the raw body
+/// when the envelope does not parse. Shared by the recheck and USDC-resume
+/// commands so the timeout, connection-error mapping, and outcome extraction
+/// cannot drift between them.
+///
+/// The endpoints only validate and enqueue (the worker does the driving), so
+/// the bounded total timeout cannot cancel real recovery work.
+async fn post_bot_recovery_endpoint(url: &str, operation: &str) -> anyhow::Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let response = client
+        .post(url)
+        .send()
+        .await
+        .map_err(|error| connect_error(url, error))?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    if !status.is_success() {
+        anyhow::bail!("{operation} failed ({status}): {body}");
+    }
+
+    let outcome = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("outcome")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or(body);
+    Ok(outcome)
+}
+
+/// Hands a manual transfer waiting on a retryable outcome to the running
+/// bot, closing the CLI-vs-server race: the CLI stops driving after the
+/// first wait, and the bot's worker (sharing the single-flight gates) drives
+/// the durable aggregate to terminal. A failed handoff exits NON-ZERO --
+/// nobody is driving the transfer at that point, and a wrapping script must
+/// not read the exit as "handled" -- while the printed guidance still holds:
+/// the state is durable, a bot restart re-arms it automatically, and
+/// `transfer resume --kind usdc` enqueues it on demand.
+async fn hand_off_to_bot<Writer: Write>(
+    stdout: &mut Writer,
+    ctx: &Ctx,
+    id: &UsdcRebalanceId,
+    direction: TransferDirection,
+    wait: &UsdcTransferError,
+) -> anyhow::Result<()> {
+    writeln!(stdout, "Transfer {id} is waiting on: {wait}")?;
+    writeln!(
+        stdout,
+        "Handing off to the running bot so this CLI cannot race its worker..."
+    )?;
+
+    match post_usdc_resume(ctx, id, direction).await {
+        Ok(outcome) => {
+            writeln!(
+                stdout,
+                "Bot accepted the resume ({outcome}); its worker drives the transfer to \
+                 terminal. Monitor the logs or the dashboard."
+            )?;
+            Ok(())
+        }
+        Err(error) => {
+            writeln!(stdout, "Handoff failed: {error}")?;
+            writeln!(
+                stdout,
+                "The transfer is durable. A bot restart re-arms it automatically, or run:\n   \
+                 transfer resume --kind usdc --id {id} --direction {}",
+                direction_flag(direction)
+            )?;
+            Err(error.context(format!(
+                "transfer {id} is mid-flight and was NOT handed off to the bot"
+            )))
+        }
+    }
 }
 
 async fn run_usdc_transfer<Writer: Write>(
     stdout: &mut Writer,
     direction: TransferDirection,
     id: UsdcRebalanceId,
-    mode: UsdcTransferStartMode,
+    amount: Usdc,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
@@ -467,50 +517,7 @@ async fn run_usdc_transfer<Writer: Write>(
         .build(())
         .await?;
 
-    // A resume must target an existing transfer, checked up front before any
-    // broker/bridge setup. The manager's `resume_*` path treats a `None`-state id
-    // as a first run and burns a brand-new transfer -- correct for a freshly
-    // generated `transfer-usdc` id, but a fund-moving foot-gun for an
-    // operator-supplied resume id that is mistyped or points at the wrong
-    // database. Reject `None`, and reject a `--direction` that disagrees with the
-    // persisted transfer (driving the opposite-direction resume path would
-    // mis-drive the aggregate). A resume uses the aggregate's persisted amount --
-    // the post-conversion/post-fee effective amount, not the original requested
-    // one -- so the CLI never fabricates a financial value for it.
-    let amount = match mode {
-        UsdcTransferStartMode::Fresh { amount } => {
-            writeln!(stdout, "Transferring USDC: {dir}, Amount: {amount} USDC")?;
-            amount
-        }
-        UsdcTransferStartMode::Resume => {
-            let Some(state) = usdc_store.load(&id).await? else {
-                anyhow::bail!(
-                    "transfer resume: no transfer found for id {id}. Refusing to start a new \
-                     burn -- check the id and that you are pointed at the right database."
-                );
-            };
-
-            let expected_direction = match direction {
-                TransferDirection::ToRaindex => RebalanceDirection::AlpacaToBase,
-                TransferDirection::ToAlpaca => RebalanceDirection::BaseToAlpaca,
-            };
-
-            if state.direction() != expected_direction {
-                anyhow::bail!(
-                    "transfer resume: --direction does not match the persisted transfer for \
-                     id {id} (persisted {:?}). Refusing to mis-drive the transfer.",
-                    state.direction()
-                );
-            }
-
-            let amount = state.amount();
-            writeln!(
-                stdout,
-                "Resuming USDC transfer {id}: {dir}, persisted amount: {amount} USDC"
-            )?;
-            amount
-        }
-    };
+    writeln!(stdout, "Transferring USDC: {dir}, Amount: {amount} USDC")?;
 
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
@@ -613,39 +620,42 @@ async fn run_usdc_transfer<Writer: Write>(
     writeln!(stdout, "   Transfer may take several minutes...")?;
 
     // Drive through `resume_*` (not `execute_*`): a fresh id with no prior state
-    // takes the execute path inside `resume_*`, and an attestation timeout
-    // re-enters from the persisted state on the same id -- so this single
-    // invocation covers both the first run and every redrive without ever
-    // minting a second `UsdcRebalanceId` against the already-burned funds.
-    // Bounded in-call retry (RAI-1494): a classified broker rate-limit (429)
-    // retries the whole redrive-until-settled attempt (bounded), rather than
-    // surfacing immediately as a CLI failure. Re-invoking `resume_*` on the
-    // same `id` is exactly as safe as `redrive_transfer_until_settled`'s own
-    // existing redrives -- both re-enter the same persisted aggregate state.
-    retry_on_backpressure(
-        || {
-            redrive_transfer_until_settled(CLI_ATTESTATION_REDRIVE_DELAY, || async {
-                match direction {
-                    TransferDirection::ToRaindex => {
-                        rebalance_manager.resume_alpaca_to_base(&id, amount).await
-                    }
-                    TransferDirection::ToAlpaca => {
-                        rebalance_manager.resume_base_to_alpaca(&id, amount).await
-                    }
+    // takes the execute path inside `resume_*`. Bounded in-call retry
+    // (RAI-1494): a classified broker rate-limit (429) retries the attempt
+    // (bounded) rather than surfacing immediately as a CLI failure. The CLI
+    // drives exactly ONE attempt: the first bot-resumable wait (attestation
+    // timeout, settlement lag, inconclusive poll) hands the durable transfer
+    // off to the running bot's worker instead of redriving here, so the CLI
+    // process can never race the bot on the same aggregate.
+    let result = retry_on_backpressure(
+        || async {
+            match direction {
+                TransferDirection::ToRaindex => {
+                    rebalance_manager.resume_alpaca_to_base(&id, amount).await
                 }
-            })
+                TransferDirection::ToAlpaca => {
+                    rebalance_manager.resume_base_to_alpaca(&id, amount).await
+                }
+            }
         },
         BACKPRESSURE_RETRY_MAX_ATTEMPTS,
     )
-    .await?;
+    .await;
 
-    let completion = match direction {
-        TransferDirection::ToRaindex => "USDC transfer to Raindex completed successfully",
-        TransferDirection::ToAlpaca => "USDC transfer to Alpaca completed successfully",
-    };
-    writeln!(stdout, "{completion}")?;
-
-    Ok(())
+    match result {
+        Ok(()) => {
+            let completion = match direction {
+                TransferDirection::ToRaindex => "USDC transfer to Raindex completed successfully",
+                TransferDirection::ToAlpaca => "USDC transfer to Alpaca completed successfully",
+            };
+            writeln!(stdout, "{completion}")?;
+            Ok(())
+        }
+        Err(error) if is_bot_resumable_wait(&error) => {
+            hand_off_to_bot(stdout, ctx, &id, direction, &error).await
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Outcome of reloading a USDC rebalance immediately after sending `FailBridging`.
@@ -1692,35 +1702,9 @@ pub(crate) async fn recheck_transfer_command<W: Write>(
     );
     writeln!(stdout, "Re-checking {transfer_type:?} {id} via {url}")?;
 
-    // Bound the request so the CLI cannot hang indefinitely if the local bot
-    // stalls after accepting the connection.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-    let response = client
-        .post(url.as_str())
-        .send()
-        .await
-        .map_err(|error| connect_error(&url, error))?;
-    let status = response.status();
-    let body = response.text().await?;
-
-    if !status.is_success() {
-        anyhow::bail!("transfer recheck failed ({status}): {body}");
-    }
-
-    // The endpoint returns `{"outcome":"<snake_case>"}`; surface the outcome
-    // name (the operator-facing value documented in docs/cli-ops.md) rather
-    // than the raw JSON envelope, falling back to the body if it can't be parsed.
-    let outcome = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("outcome")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or(body);
+    // The outcome name is the operator-facing value documented in
+    // docs/cli-ops.md.
+    let outcome = post_bot_recovery_endpoint(&url, "transfer recheck").await?;
     writeln!(stdout, "transfer recheck outcome: {outcome}")?;
     Ok(())
 }
@@ -1825,205 +1809,186 @@ mod tests {
     use crate::usdc_rebalance::{ReconcileReason, TransferRef, UsdcRebalanceCommand};
     use crate::vault_lookup::MockVaultLookup;
 
-    /// RAI-835: the manual redrive loop must re-invoke `resume` on the same id
-    /// after an attestation timeout and drive through to success -- so a single
-    /// CLI invocation cannot strand a burned transfer.
-    #[tokio::test]
-    async fn redrive_loop_retries_attestation_timeout_then_succeeds() {
-        let calls = std::cell::Cell::new(0u32);
+    /// Every wait outcome the apalis worker delayed-redrives must classify as
+    /// bot-resumable: the CLI hands these to the running bot instead of
+    /// redriving them itself, so a single CLI process can never race the
+    /// bot's worker on the same aggregate (the RAI-835-era loop is gone).
+    #[test]
+    fn bot_resumable_waits_cover_the_worker_redrive_set() {
+        let id = UsdcRebalanceId(Uuid::from_u128(7));
 
-        let result = redrive_transfer_until_settled(Duration::from_millis(0), || {
-            let attempt = calls.get() + 1;
-            calls.set(attempt);
-            async move {
-                if attempt == 1 {
-                    Err(UsdcTransferError::AttestationTimedOut {
-                        id: UsdcRebalanceId(Uuid::from_u128(7)),
-                    })
-                } else {
-                    Ok(())
-                }
-            }
-        })
-        .await;
-
-        result.expect("redrive must succeed once the attestation arrives");
-        assert_eq!(
-            calls.get(),
-            2,
-            "the loop must retry exactly once after the timeout, then succeed",
-        );
-    }
-
-    /// The manual redrive loop must also retry the on-chain settlement-wait
-    /// errors the apalis worker delayed-redrives -- otherwise a manual transfer
-    /// would exit on normal settlement lag instead of continuing to completion.
-    #[tokio::test]
-    async fn redrive_loop_retries_settlement_wait_then_succeeds() {
-        let calls = std::cell::Cell::new(0u32);
-
-        let result = redrive_transfer_until_settled(Duration::from_millis(0), || {
-            let attempt = calls.get() + 1;
-            calls.set(attempt);
-            async move {
-                if attempt == 1 {
-                    Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
-                        id: UsdcRebalanceId(Uuid::from_u128(9)),
-                        tx: b256!(
-                            "0x0000000000000000000000000000000000000000000000000000000000000001"
-                        ),
-                        required: 3,
-                        actual: 1,
-                    })
-                } else {
-                    Ok(())
-                }
-            }
-        })
-        .await;
-
-        result.expect("redrive must succeed once the withdrawal tx settles");
-        assert_eq!(
-            calls.get(),
-            2,
-            "the loop must retry exactly once after the settlement wait, then succeed",
-        );
-    }
-
-    /// RAI-835: a non-timeout terminal outcome (deadline elapsed) must end the
-    /// loop immediately, not spin forever.
-    #[tokio::test]
-    async fn redrive_loop_returns_terminal_error_without_looping() {
-        let calls = std::cell::Cell::new(0u32);
-
-        let result = redrive_transfer_until_settled(Duration::from_millis(0), || {
-            calls.set(calls.get() + 1);
-            async move {
-                Err(UsdcTransferError::AttestationRetryDeadlineElapsed {
-                    id: UsdcRebalanceId(Uuid::from_u128(7)),
-                })
-            }
-        })
-        .await;
-
-        let error = result.unwrap_err();
-        assert!(
-            matches!(
-                error,
-                UsdcTransferError::AttestationRetryDeadlineElapsed { .. }
-            ),
-            "a deadline-elapsed outcome must surface, not be retried; got {error:?}",
-        );
-        assert_eq!(calls.get(), 1, "a terminal error must not be retried");
-    }
-
-    /// The manual redrive loop must also retry `WithdrawalPollInconclusive` --
-    /// otherwise a manual `stox transfer resume --kind usdc --direction to-raindex`
-    /// invocation would exit when Alpaca is temporarily unreachable instead of
-    /// waiting for recovery, leaving the operator unable to drive the stuck
-    /// withdrawal to completion via the CLI.
-    #[tokio::test]
-    async fn redrive_loop_retries_withdrawal_poll_inconclusive_then_succeeds() {
-        let calls = std::cell::Cell::new(0u32);
-
-        let result = redrive_transfer_until_settled(Duration::from_millis(0), || {
-            let attempt = calls.get() + 1;
-            calls.set(attempt);
-            async move {
-                if attempt == 1 {
-                    Err(UsdcTransferError::WithdrawalPollInconclusive {
-                        id: UsdcRebalanceId(Uuid::from_u128(42)),
-                        initiated_at: chrono::Utc::now(),
-                        source: AlpacaWalletError::TransferTimeout {
-                            transfer_id: AlpacaTransferId::from(Uuid::from_u128(1)),
-                            elapsed: std::time::Duration::from_secs(1800),
-                        },
-                    })
-                } else {
-                    Ok(())
-                }
-            }
-        })
-        .await;
-
-        result.expect("redrive must succeed once Alpaca becomes reachable again");
-        assert_eq!(
-            calls.get(),
-            2,
-            "the loop must retry exactly once after the inconclusive poll, then succeed",
-        );
-    }
-
-    /// The manual redrive loop must also retry `MintRecoveryInconclusive` --
-    /// otherwise a manual `stox transfer resume --kind usdc` invocation (the
-    /// exact command the operator alert for this outcome recommends running)
-    /// would exit immediately instead of continuing to drive the stuck mint
-    /// recovery to completion via the CLI.
-    #[tokio::test]
-    async fn redrive_loop_retries_mint_recovery_inconclusive_then_succeeds() {
-        let calls = std::cell::Cell::new(0u32);
-
-        let result = redrive_transfer_until_settled(Duration::from_millis(0), || {
-            let attempt = calls.get() + 1;
-            calls.set(attempt);
-            async move {
-                if attempt == 1 {
-                    Err(UsdcTransferError::MintRecoveryInconclusive {
-                        id: UsdcRebalanceId(Uuid::from_u128(43)),
-                        initiated_at: Utc::now(),
-                        source: Box::new(CctpError::ScanInconclusive { from_block: 99 }),
-                    })
-                } else {
-                    Ok(())
-                }
-            }
-        })
-        .await;
-
-        result.expect("redrive must succeed once the mint recovery resolves");
-        assert_eq!(
-            calls.get(),
-            2,
-            "the loop must retry exactly once after the inconclusive mint recovery, \
-             then succeed",
-        );
-    }
-
-    #[tokio::test]
-    async fn redrive_loop_bounds_withdrawal_poll_backpressure_retries() {
-        let calls = std::cell::Cell::new(0u32);
-
-        let error = redrive_transfer_until_settled(Duration::from_millis(0), || {
-            calls.set(calls.get() + 1);
-            async move {
-                Err(UsdcTransferError::WithdrawalPollInconclusive {
-                    id: UsdcRebalanceId(Uuid::from_u128(43)),
-                    initiated_at: chrono::Utc::now(),
-                    source: AlpacaWalletError::ApiError {
-                        status: reqwest::StatusCode::TOO_MANY_REQUESTS,
-                        message: "rate limited".to_string(),
-                        retry_after: Some(Duration::from_millis(1)),
-                    },
-                })
-            }
-        })
-        .await
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
+        let waits = [
+            UsdcTransferError::AttestationTimedOut { id: id.clone() },
+            UsdcTransferError::WithdrawalTxUnderconfirmed {
+                id: id.clone(),
+                tx: b256!("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                required: 3,
+                actual: 1,
+            },
+            UsdcTransferError::WalletUsdcInsufficient {
+                id: id.clone(),
+                nominal: Usdc::new(float!(100)),
+            },
+            UsdcTransferError::SettlementCheckTransient {
+                id: id.clone(),
+                source: Box::new(CctpError::ScanInconclusive { from_block: 99 }),
+            },
+            UsdcTransferError::MintRecoveryInconclusive {
+                id: id.clone(),
+                initiated_at: Utc::now(),
+                source: Box::new(CctpError::ScanInconclusive { from_block: 99 }),
+            },
             UsdcTransferError::WithdrawalPollInconclusive {
+                id,
+                initiated_at: chrono::Utc::now(),
+                source: AlpacaWalletError::TransferTimeout {
+                    transfer_id: AlpacaTransferId::from(Uuid::from_u128(1)),
+                    elapsed: std::time::Duration::from_secs(1800),
+                },
+            },
+        ];
+
+        for wait in &waits {
+            assert!(
+                is_bot_resumable_wait(wait),
+                "{wait} must hand off to the bot, not exit the CLI as terminal"
+            );
+        }
+    }
+
+    /// Terminal outcomes -- a deadline elapsed, and a rate-limited withdrawal
+    /// poll (which must surface through the bounded backpressure budget, not
+    /// a hand-off) -- must NOT classify as bot-resumable waits.
+    #[test]
+    fn terminal_outcomes_are_not_bot_resumable_waits() {
+        let id = UsdcRebalanceId(Uuid::from_u128(7));
+
+        assert!(!is_bot_resumable_wait(
+            &UsdcTransferError::AttestationRetryDeadlineElapsed { id: id.clone() }
+        ));
+        assert!(!is_bot_resumable_wait(
+            &UsdcTransferError::SettlementRetryDeadlineElapsed { id: id.clone() }
+        ));
+        assert!(!is_bot_resumable_wait(
+            &UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() }
+        ));
+        assert!(
+            !is_bot_resumable_wait(&UsdcTransferError::WithdrawalPollInconclusive {
+                id,
+                initiated_at: chrono::Utc::now(),
                 source: AlpacaWalletError::ApiError {
                     status: reqwest::StatusCode::TOO_MANY_REQUESTS,
-                    ..
+                    message: "rate limited".to_string(),
+                    retry_after: Some(std::time::Duration::from_millis(1)),
                 },
-                ..
-            }
-        ));
-        assert_eq!(
-            calls.get(),
-            BACKPRESSURE_RETRY_MAX_ATTEMPTS,
-            "a sustained withdrawal-poll 429 must stop at the shared CLI retry budget"
+            }),
+            "a backpressure-classified poll error stays in the bounded retry \
+             budget rather than handing off"
+        );
+    }
+
+    /// `transfer resume --kind usdc` posts to the running bot's resume
+    /// endpoint (direction and id in the path) and surfaces the outcome; it
+    /// never drives the aggregate from the CLI process.
+    #[tokio::test]
+    async fn resume_usdc_command_posts_to_bot_endpoint() {
+        let id = Uuid::from_u128(77);
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                // The path segment comes from `RebalanceDirection`'s
+                // `Display` and the body value from the server's shared
+                // outcome const, so this test pins the real wire contract
+                // instead of a hand-copied string.
+                when.method(httpmock::Method::POST).path(format!(
+                    "/transfers/usdc/resume/{}/{id}",
+                    RebalanceDirection::AlpacaToBase
+                ));
+                then.status(200).body(format!(
+                    r#"{{"outcome":"{}"}}"#,
+                    crate::api::USDC_RESUME_ENQUEUED_OUTCOME
+                ));
+            })
+            .await;
+        let mut ctx = create_base_test_ctx();
+        ctx.server_port = server.port();
+
+        let mut stdout = Vec::new();
+        resume_usdc_transfer_command(&mut stdout, id, TransferDirection::ToRaindex, &ctx)
+            .await
+            .unwrap();
+
+        mock.assert_async().await;
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains(&format!(
+                "transfer resume outcome: {}",
+                crate::api::USDC_RESUME_ENQUEUED_OUTCOME
+            )),
+            "unexpected output: {output}"
+        );
+    }
+
+    /// A non-success endpoint answer (here 409: another transfer in flight)
+    /// must surface as a CLI error carrying the server's message.
+    #[tokio::test]
+    async fn resume_usdc_command_surfaces_endpoint_refusal() {
+        let id = Uuid::from_u128(78);
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path(format!("/transfers/usdc/resume/base_to_alpaca/{id}"));
+                then.status(409)
+                    .body(r#"{"error":"another USDC transfer is already in flight"}"#);
+            })
+            .await;
+        let mut ctx = create_base_test_ctx();
+        ctx.server_port = server.port();
+
+        let mut stdout = Vec::new();
+        let error =
+            resume_usdc_transfer_command(&mut stdout, id, TransferDirection::ToAlpaca, &ctx)
+                .await
+                .unwrap_err();
+
+        assert!(
+            error.to_string().contains("usdc resume failed (409"),
+            "the refusal must surface with its status; got: {error}"
+        );
+    }
+
+    /// A failed handoff must exit non-zero: at that point the transfer is
+    /// mid-flight and NOBODY is driving it, so a wrapping script must not
+    /// read exit 0 as "handled". The durable-state guidance still prints.
+    #[tokio::test]
+    async fn hand_off_failure_exits_non_zero_with_guidance() {
+        // No mock for the resume path: the server answers 404, a
+        // refusal-shaped handoff failure (an unreachable bot takes the same
+        // branch).
+        let server = httpmock::MockServer::start_async().await;
+        let mut ctx = create_base_test_ctx();
+        ctx.server_port = server.port();
+        let id = UsdcRebalanceId(Uuid::from_u128(0xAB));
+        let wait = UsdcTransferError::AttestationTimedOut { id: id.clone() };
+
+        let mut stdout = Vec::new();
+        let error = hand_off_to_bot(&mut stdout, &ctx, &id, TransferDirection::ToRaindex, &wait)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("was NOT handed off"),
+            "the error must state the transfer was not handed off; got: {error}"
+        );
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("Handoff failed"),
+            "the failure must print; got: {output}"
+        );
+        assert!(
+            output.contains(&format!("transfer resume --kind usdc --id {id}")),
+            "the recovery command must print; got: {output}"
         );
     }
 
@@ -2411,34 +2376,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_usdc_transfer_rejects_unknown_id_without_burning() {
-        // The core safety contract of `transfer resume`: an id that has no
-        // persisted transfer (a typo, or the wrong database) MUST be rejected up
-        // front rather than falling through to the manager's `None` -> fresh-burn
-        // path. The existence check runs before any broker/bridge setup, so a bare
-        // ctx and an empty pool reach it directly.
-        let ctx = create_base_test_ctx();
-        let pool = setup_test_db().await;
-        let unknown_id = Uuid::from_u128(0xDEAD_BEEF);
-
-        let mut stdout = Vec::new();
-        let result = resume_usdc_transfer_command(
-            &mut stdout,
-            unknown_id,
-            TransferDirection::ToRaindex,
-            &ctx,
-            &pool,
-        )
-        .await;
-
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("no transfer found for id"),
-            "resume of an unknown id must refuse, not start a new burn; got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
     async fn reconcile_usdc_transfer_rejects_unknown_id() {
         let pool = setup_test_db().await;
         let unknown_id = Uuid::from_u128(0xFEED_FACE);
@@ -2576,104 +2513,6 @@ mod tests {
             !state.holds_rebalance_guard(),
             "Reconciled must not hold the durable guard, so a restart does \
              not re-latch it"
-        );
-    }
-
-    #[tokio::test]
-    async fn resume_usdc_transfer_rejects_direction_mismatch() {
-        // Seed an AlpacaToBase transfer, then resume with the opposite direction
-        // (`--direction to-alpaca` => BaseToAlpaca). The guard must reject it
-        // rather than driving the aggregate through the wrong-direction resume
-        // path. The check runs before broker setup, so a bare ctx reaches it.
-        let ctx = create_base_test_ctx();
-        let pool = setup_test_db().await;
-        let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
-        let id = Uuid::from_u128(99);
-
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-        store
-            .send(
-                &UsdcRebalanceId(id),
-                UsdcRebalanceCommand::Initiate {
-                    direction: RebalanceDirection::AlpacaToBase,
-                    amount,
-                    withdrawal: TransferRef::OnchainTx(b256!(
-                        "0x00000000000000000000000000000000000000000000000000000000000000a1"
-                    )),
-                },
-            )
-            .await
-            .unwrap();
-
-        let mut stdout = Vec::new();
-        let result =
-            resume_usdc_transfer_command(&mut stdout, id, TransferDirection::ToAlpaca, &ctx, &pool)
-                .await;
-
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("does not match the persisted transfer"),
-            "resume with the wrong direction must be rejected, not mis-drive; got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn resume_usdc_transfer_reports_persisted_amount() {
-        // A resume takes no amount: it loads the persisted state amount (the
-        // post-slippage/post-fee effective amount) and reports it to the
-        // operator. The preflight guard must accept the correct direction --
-        // here it then fails at wallet setup, proving the guard accepted it.
-        let ctx = create_base_test_ctx();
-        let pool = setup_test_db().await;
-        let seeded_amount = Usdc::new(Float::parse("100".to_string()).unwrap());
-        let id = Uuid::from_u128(123);
-
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-        store
-            .send(
-                &UsdcRebalanceId(id),
-                UsdcRebalanceCommand::Initiate {
-                    direction: RebalanceDirection::AlpacaToBase,
-                    amount: seeded_amount,
-                    withdrawal: TransferRef::OnchainTx(b256!(
-                        "0x00000000000000000000000000000000000000000000000000000000000000a2"
-                    )),
-                },
-            )
-            .await
-            .unwrap();
-
-        // ToRaindex maps to AlpacaToBase -- the correct direction for the seed.
-        let mut stdout = Vec::new();
-        let result = resume_usdc_transfer_command(
-            &mut stdout,
-            id,
-            TransferDirection::ToRaindex,
-            &ctx,
-            &pool,
-        )
-        .await;
-
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            !err_msg.contains("does not match"),
-            "the correct direction must pass the guard; got: {err_msg}"
-        );
-        assert!(
-            err_msg.contains("requires a configured [wallet] section"),
-            "past the guard, the bare ctx must fail at wallet setup; got: {err_msg}"
-        );
-
-        let output = String::from_utf8(stdout).unwrap();
-        assert!(
-            output.contains("persisted amount: 100 USDC"),
-            "the resume must report the persisted effective amount; got: {output}"
         );
     }
 
