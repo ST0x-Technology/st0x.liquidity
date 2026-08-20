@@ -154,6 +154,7 @@ pub struct TurnkeyApprovalPolicyInputs {
     pub organization_id: st0x_evm::turnkey::TurnkeyOrganizationId,
     pub kms_api_key: Option<st0x_evm::turnkey::TurnkeyKmsApiKey>,
     pub api_private_key: Option<st0x_evm::turnkey::TurnkeyApiPrivateKey>,
+    pub wallet_address: Address,
     pub orderbook: Address,
     pub assets: AssetsConfig,
 }
@@ -1408,9 +1409,9 @@ impl Ctx {
         }
 
         let st0x_evm::turnkey::TurnkeySettings {
+            address: wallet_address,
             organization_id,
             kms_api_key,
-            ..
         } = st0x_evm::turnkey::TurnkeySettings::deserialize(parts.wallet_inputs.config).map_err(
             |source| CtxError::ConfigToml {
                 path: config_path.to_path_buf(),
@@ -1428,6 +1429,7 @@ impl Ctx {
             organization_id,
             kms_api_key,
             api_private_key,
+            wallet_address,
             orderbook: parts.evm.orderbook,
             assets: parts.assets,
         }))
@@ -7125,6 +7127,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(inputs.organization_id.as_str(), "org-test");
+        assert_eq!(
+            inputs.wallet_address,
+            address!("0x6666666666666666666666666666666666666666")
+        );
         assert_eq!(
             inputs.orderbook,
             address!("0x1111111111111111111111111111111111111111")

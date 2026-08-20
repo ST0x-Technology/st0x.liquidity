@@ -34,7 +34,8 @@ use turnkey_client::generated::{
     immutable::activity::v1::{SignRawPayloadResult, SignTransactionResult, result},
     immutable::common::v1::{HashFunction, PayloadEncoding, TransactionType},
     services::coordinator::public::v1::{
-        GetPoliciesRequest, GetPoliciesResponse, GetWhoamiRequest, GetWhoamiResponse,
+        GetPoliciesRequest, GetPoliciesResponse, GetUserRequest, GetUserResponse, GetWhoamiRequest,
+        GetWhoamiResponse,
     },
 };
 use turnkey_client::{RetryConfig, TurnkeyClientError};
@@ -205,10 +206,11 @@ pub struct TurnkeyPolicy {
     pub condition: Option<String>,
 }
 
-/// Policies plus the authenticated Turnkey API user's identity.
+/// Policies plus the authenticated Turnkey API user's identity and tags.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnkeyPolicySnapshot {
     pub user_id: String,
+    pub user_tags: Vec<String>,
     pub policies: Vec<TurnkeyPolicy>,
 }
 
@@ -231,9 +233,13 @@ pub enum TurnkeyPolicyError {
          (KMS-stamped, keyless) or api_private_key in [wallet] secrets"
     )]
     MissingCredentials,
+    #[error("Turnkey get_user response omitted the authenticated user")]
+    AuthenticatedUserMissing,
+    #[error("Turnkey get_user response did not match the authenticated user")]
+    AuthenticatedUserMismatch,
 }
 
-/// Authenticated read-only client for listing an organization's policies.
+/// Authenticated read-only client for an organization's policies and user tags.
 pub struct TurnkeyPolicyClient {
     organization_id: TurnkeyOrganizationId,
     client: TracingTurnkeyClient,
@@ -292,6 +298,24 @@ impl TurnkeyPolicyClient {
                 "/public/v1/query/whoami",
             )
             .await?;
+        let user: GetUserResponse = self
+            .client
+            .process_request(
+                &GetUserRequest {
+                    organization_id: organization_id.clone(),
+                    user_id: whoami.user_id.clone(),
+                },
+                "/public/v1/query/get_user",
+            )
+            .await?;
+        let user = user
+            .user
+            .ok_or(TurnkeyPolicyError::AuthenticatedUserMissing)?;
+
+        if user.user_id != whoami.user_id {
+            return Err(TurnkeyPolicyError::AuthenticatedUserMismatch);
+        }
+
         let response: GetPoliciesResponse = self
             .client
             .process_request(
@@ -322,6 +346,7 @@ impl TurnkeyPolicyClient {
 
         Ok(TurnkeyPolicySnapshot {
             user_id: whoami.user_id,
+            user_tags: user.user_tags,
             policies,
         })
     }
@@ -1272,6 +1297,21 @@ mod tests {
                     "username": "Bot"
                 }));
         });
+        let user_mock = server.mock(|when, then| {
+            when.method("POST")
+                .path("/public/v1/query/get_user")
+                .body_includes("\"organizationId\":\"org-test\"")
+                .body_includes("\"userId\":\"user-test\"");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "user": {
+                        "userId": "user-test",
+                        "userName": "Bot",
+                        "userTags": ["tag-liquidity-bot"]
+                    }
+                }));
+        });
         let client = TurnkeyPolicyClient::for_base_url(
             TurnkeyOrganizationId::new("org-test".to_string()),
             test_api_key(),
@@ -1283,7 +1323,9 @@ mod tests {
 
         policies_mock.assert();
         whoami_mock.assert();
+        user_mock.assert();
         assert_eq!(snapshot.user_id, "user-test");
+        assert_eq!(snapshot.user_tags, ["tag-liquidity-bot"]);
         assert_eq!(
             snapshot.policies,
             vec![
@@ -1301,6 +1343,96 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn policy_client_rejects_missing_authenticated_user() {
+        let server = MockServer::start();
+        let whoami_mock = server.mock(|when, then| {
+            when.method("POST")
+                .path("/public/v1/query/whoami")
+                .body_includes("\"organizationId\":\"org-test\"");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "organizationId": "org-test",
+                    "organizationName": "Test",
+                    "userId": "user-test",
+                    "username": "Bot"
+                }));
+        });
+        let user_mock = server.mock(|when, then| {
+            when.method("POST")
+                .path("/public/v1/query/get_user")
+                .body_includes("\"organizationId\":\"org-test\"")
+                .body_includes("\"userId\":\"user-test\"");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "user": null }));
+        });
+        let client = TurnkeyPolicyClient::for_base_url(
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            test_api_key(),
+            server.base_url(),
+        )
+        .unwrap();
+
+        let error = client.list_policies().await.unwrap_err();
+
+        whoami_mock.assert();
+        user_mock.assert();
+        assert!(matches!(
+            error,
+            TurnkeyPolicyError::AuthenticatedUserMissing
+        ));
+    }
+
+    #[tokio::test]
+    async fn policy_client_rejects_mismatched_authenticated_user() {
+        let server = MockServer::start();
+        let whoami_mock = server.mock(|when, then| {
+            when.method("POST")
+                .path("/public/v1/query/whoami")
+                .body_includes("\"organizationId\":\"org-test\"");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "organizationId": "org-test",
+                    "organizationName": "Test",
+                    "userId": "user-test",
+                    "username": "Bot"
+                }));
+        });
+        let user_mock = server.mock(|when, then| {
+            when.method("POST")
+                .path("/public/v1/query/get_user")
+                .body_includes("\"organizationId\":\"org-test\"")
+                .body_includes("\"userId\":\"user-test\"");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "user": {
+                        "userId": "different-user",
+                        "userName": "Another Bot",
+                        "userTags": ["tag-liquidity-bot"]
+                    }
+                }));
+        });
+        let client = TurnkeyPolicyClient::for_base_url(
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            test_api_key(),
+            server.base_url(),
+        )
+        .unwrap();
+
+        let error = client.list_policies().await.unwrap_err();
+
+        whoami_mock.assert();
+        user_mock.assert();
+        assert!(matches!(
+            error,
+            TurnkeyPolicyError::AuthenticatedUserMismatch
+        ));
     }
 
     /// Builds a well-formed EIP-1559 transaction (the only shape the bot's
