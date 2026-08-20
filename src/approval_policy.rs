@@ -8,6 +8,7 @@ use alloy::primitives::Address;
 use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::client::RpcClient;
 use alloy::transports::http::Http;
+use futures_util::stream::StreamExt;
 use st0x_config::Ctx;
 use st0x_evm::turnkey::{
     TurnkeyPolicy, TurnkeyPolicyClient, TurnkeyPolicyEffect, TurnkeyPolicyError,
@@ -87,6 +88,9 @@ pub enum ApprovalPolicyVerificationError {
 /// deploy; a read that exceeds it is treated as a failed read.
 const ALLOWANCE_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bounds the number of concurrent allowance reads issued against the base RPC.
+const ALLOWANCE_READ_CONCURRENCY: usize = 8;
+
 /// Validates deploy inputs, lists Turnkey policies, and fails unless every
 /// startup MAX approval has a provably matching allow policy.
 pub async fn verify_turnkey_approval_policies(
@@ -146,7 +150,7 @@ async fn pending_targets<P>(
 where
     P: Provider + Clone + Send + Sync + 'static,
 {
-    let allowances = futures_util::future::join_all(targets.iter().map(|target| async move {
+    let allowances = futures_util::stream::iter(targets.iter().map(|target| async move {
         match evm
             .call::<OpenChainErrorRegistry, _>(
                 target.token,
@@ -170,6 +174,8 @@ where
             }
         }
     }))
+    .buffered(ALLOWANCE_READ_CONCURRENCY)
+    .collect::<Vec<_>>()
     .await;
     targets
         .into_iter()
