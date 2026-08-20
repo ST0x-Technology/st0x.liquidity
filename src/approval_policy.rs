@@ -4,7 +4,9 @@ use std::fmt::{Display, Formatter};
 use std::path::Path;
 use std::time::Duration;
 
-use alloy::providers::ProviderBuilder;
+use alloy::providers::RootProvider;
+use alloy::rpc::client::RpcClient;
+use alloy::transports::http::Http;
 use st0x_config::Ctx;
 use st0x_evm::turnkey::{
     TurnkeyPolicy, TurnkeyPolicyClient, TurnkeyPolicyEffect, TurnkeyPolicyError,
@@ -76,6 +78,8 @@ pub enum ApprovalPolicyVerificationError {
     Turnkey(#[from] TurnkeyPolicyError),
     #[error(transparent)]
     MissingCoverage(#[from] MissingPolicyCoverage),
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
 }
 
 /// Bounds each allowance read so an unresponsive base RPC cannot stall the
@@ -98,25 +102,29 @@ pub async fn verify_turnkey_approval_policies(
     // the base RPC and keep only the targets the grant would submit; a read
     // failure keeps the target under verification.
     let owner = inputs.owner;
-    let evm = ReadOnlyEvm::new(
-        ProviderBuilder::new()
-            .disable_recommended_fillers()
-            .connect_http(inputs.base_rpc_url.clone()),
-    );
+    // Disable redirects so the validated base RPC scheme and host cannot be
+    // bounced elsewhere by a 3xx response.
+    let http_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(ALLOWANCE_READ_TIMEOUT)
+        .build()?;
+    let is_local = alloy::transports::utils::guess_local_url(inputs.base_rpc_url.as_str());
+    let transport = Http::with_client(http_client, inputs.base_rpc_url.clone());
+    let evm = ReadOnlyEvm::new(RootProvider::new(
+        RpcClient::builder().transport(transport, is_local),
+    ));
     let allowances = futures_util::future::join_all(targets.iter().map(|target| {
         let evm = &evm;
         async move {
-            let read = evm.call::<OpenChainErrorRegistry, _>(
+            evm.call::<OpenChainErrorRegistry, _>(
                 target.token,
                 IERC20::allowanceCall {
                     owner,
                     spender: target.spender,
                 },
-            );
-            tokio::time::timeout(ALLOWANCE_READ_TIMEOUT, read)
-                .await
-                .ok()
-                .and_then(Result::ok)
+            )
+            .await
+            .ok()
         }
     }))
     .await;
