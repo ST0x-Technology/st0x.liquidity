@@ -1,9 +1,8 @@
 //! Onchain trade conversion and persistence. Converts raw blockchain events
 //! ([`RaindexTradeEvent`]) into structured [`OnchainTrade`]s with symbol
-//! resolution, price calculation, and Pyth oracle pricing. Also provides
+//! resolution and price calculation. Also provides
 //! vault extraction utilities for the vault registry.
 
-use alloy::eips::BlockId;
 use alloy::primitives::ruint::FromUintError;
 use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::providers::Provider;
@@ -17,11 +16,10 @@ use tracing::{debug, warn};
 
 use st0x_config::{AssetsConfig, EvmCtx, InventoryAdapterVenue, InventoryAdapters};
 use st0x_evm::{Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE};
-use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
+use st0x_execution::{Direction, FractionalShares, HasZero};
 use st0x_float_serde::format_float_with_fallback;
 use st0x_registry::SymbolCache;
 
-use super::pyth::{BASE_PYTH_CONTRACT_ADDRESS, extract_pyth_price_at, raw_price_to_pyth_price};
 use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
 use crate::bindings::IRaindexV6::{ClearV3, OrderV4, TakeOrderV3};
 use crate::onchain::OnChainError;
@@ -29,8 +27,7 @@ use crate::onchain::backfill::{bucket_inventory_logs, pair_inventory_settlements
 use crate::onchain::io::{
     InputToken, OutputToken, TokenizedSymbol, TradeDetails, Usdc, WrappedTokenizedShares,
 };
-use crate::onchain::pyth::PythFeedIds;
-use crate::onchain_trade::{InventoryVenue, OnChainTradeSource, PythPrice};
+use crate::onchain_trade::{InventoryVenue, OnChainTradeSource};
 
 /// Onchain trade event feeding the hedge pipeline.
 ///
@@ -211,62 +208,6 @@ pub struct OnchainTrade {
     /// neither the log nor the receipt carried a block number.
     pub(crate) block_number: Option<u64>,
     pub(crate) block_timestamp: Option<DateTime<Utc>>,
-    pub(crate) gas_used: Option<u64>,
-    pub(crate) effective_gas_price: Option<u128>,
-    pub(crate) pyth_price: Option<PythPrice>,
-}
-
-/// Reads the Pyth reference price for a trade, returning `None` (after a
-/// warning) when enrichment cannot proceed. Enrichment is best-effort: a missing
-/// feed, an unknown block number (absent from both the log and its receipt), or
-/// an RPC failure all skip enrichment without affecting the trade or its hedge.
-async fn enrich_with_pyth_price<P: Provider>(
-    provider: &P,
-    pyth_feed_ids: &PythFeedIds,
-    base_symbol: &Symbol,
-    block_number: Option<u64>,
-    tx_hash: TxHash,
-) -> Option<PythPrice> {
-    let Some(feed_id) = pyth_feed_ids.get(base_symbol) else {
-        // A symbol with no configured feed is an intentional configuration
-        // choice, not an anomaly, so this is logged at debug to avoid
-        // per-trade warn spam for unconfigured symbols.
-        debug!(
-            target: "hedge",
-            symbol = %base_symbol,
-            %tx_hash,
-            "No configured Pyth feed for symbol; skipping trade enrichment"
-        );
-        return None;
-    };
-
-    let Some(block_number) = block_number else {
-        warn!(
-            target: "hedge",
-            symbol = %base_symbol,
-            %tx_hash,
-            "No block number available from log or receipt; skipping Pyth enrichment"
-        );
-        return None;
-    };
-
-    match extract_pyth_price_at(
-        provider,
-        BASE_PYTH_CONTRACT_ADDRESS,
-        feed_id,
-        BlockId::number(block_number),
-    )
-    .await
-    .and_then(|raw_price| raw_price_to_pyth_price(&raw_price))
-    {
-        Ok(pyth_price) => Some(pyth_price),
-        Err(error) => {
-            // `?error` preserves the full source chain (PythError::Rpc boxes
-            // the underlying transport error, which Display alone drops).
-            warn!(target: "hedge", %tx_hash, ?error, "Pyth price extraction failed");
-            None
-        }
-    }
 }
 
 /// Number of retries for `fetch_inventory_token_decimals`'s `decimals()`
@@ -344,36 +285,28 @@ async fn resolve_inventory_token_symbol<E: Evm>(
         .map_err(|source| classify_inventory_token_introspection_error(source, token))
 }
 
-/// Gas/price/block-number metadata derived from a transaction receipt, used
-/// by both `OnchainTrade` constructors to fill in `TradeMetadata`. Also lets
-/// a caller that already fetched the receipt (the `process-tx` recovery
-/// path) pass it into `try_from_inventory_trade` instead of triggering a
+/// Block-number metadata derived from a transaction receipt. The constructors
+/// use it only when the triggering log has no block number. A caller that
+/// already fetched the receipt (the `process-tx` recovery path) can pass it
+/// through both orderbook and inventory conversion instead of triggering a
 /// second `eth_getTransactionReceipt` for the same tx.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReceiptMetadata {
-    gas_used: Option<u64>,
-    effective_gas_price: Option<u128>,
     block_number: Option<u64>,
 }
 
-/// Fetches the triggering transaction's gas/price/block-number metadata,
-/// tolerating a missing receipt (all `None`) rather than failing the trade.
-/// Shared by both `OnchainTrade` constructors.
+/// Fetches the triggering transaction's block number, tolerating a missing
+/// receipt rather than failing the trade. Shared by both `OnchainTrade`
+/// constructors when the log itself has no block number.
 async fn fetch_receipt_metadata<P: Provider>(
     provider: &P,
     tx_hash: TxHash,
 ) -> Result<ReceiptMetadata, OnChainError> {
     Ok(match provider.get_transaction_receipt(tx_hash).await? {
         Some(receipt) => ReceiptMetadata {
-            gas_used: Some(receipt.gas_used),
-            effective_gas_price: Some(receipt.effective_gas_price),
             block_number: receipt.block_number,
         },
-        None => ReceiptMetadata {
-            gas_used: None,
-            effective_gas_price: None,
-            block_number: None,
-        },
+        None => ReceiptMetadata { block_number: None },
     })
 }
 
@@ -385,16 +318,17 @@ impl OnchainTrade {
         order: OrderV4,
         fill: OrderFill,
         log: Log,
-        pyth_feed_ids: &PythFeedIds,
     ) -> Result<Option<Self>, OnChainError> {
         let tx_hash = log.transaction_hash.ok_or(TradeValidationError::NoTxHash)?;
         let log_index = log.log_index.ok_or(TradeValidationError::NoLogIndex)?;
 
-        let ReceiptMetadata {
-            gas_used,
-            effective_gas_price,
-            block_number: receipt_block_number,
-        } = fetch_receipt_metadata(evm.provider(), tx_hash).await?;
+        let receipt_block_number = if log.block_number.is_none() {
+            fetch_receipt_metadata(evm.provider(), tx_hash)
+                .await?
+                .block_number
+        } else {
+            None
+        };
 
         let input = order
             .validInputs
@@ -431,14 +365,11 @@ impl OnchainTrade {
 
         finalize_onchain_trade(
             evm.provider(),
-            pyth_feed_ids,
             trade_details,
             TradeMetadata {
                 source: OnChainTradeSource::Raindex,
                 tx_hash,
                 log_index,
-                gas_used,
-                effective_gas_price,
                 block_number: log.block_number.or(receipt_block_number),
                 log_timestamp: log.block_timestamp,
             },
@@ -457,11 +388,10 @@ impl OnchainTrade {
     /// validated against `assets`' configured canonical addresses -- see
     /// [`validate_inventory_token_addresses`].
     ///
-    /// `receipt_metadata`: `None` fetches the tx receipt internally (the
-    /// batch backfill/live-monitor path, which has no receipt in hand yet);
-    /// `Some` reuses a receipt the caller already fetched (the `process-tx`
-    /// recovery path via `try_from_tx_hash`), avoiding a second
-    /// `eth_getTransactionReceipt` round-trip for the same tx.
+    /// `receipt_metadata`: `None` fetches the tx receipt internally only when
+    /// the log has no block number; `Some` reuses a receipt the caller already
+    /// fetched (the `process-tx` recovery path via `try_from_tx_hash`), avoiding
+    /// a second `eth_getTransactionReceipt` round-trip for the same tx.
     pub(crate) async fn try_from_inventory_trade<EvmImpl: Evm>(
         cache: &SymbolCache,
         evm: &EvmImpl,
@@ -469,19 +399,19 @@ impl OnchainTrade {
         inventory_adapters: &InventoryAdapters,
         trade: &InventoryTrade,
         log: Log,
-        pyth_feed_ids: &PythFeedIds,
         receipt_metadata: Option<ReceiptMetadata>,
     ) -> Result<Option<Self>, OnChainError> {
         let tx_hash = log.transaction_hash.ok_or(TradeValidationError::NoTxHash)?;
         let log_index = log.log_index.ok_or(TradeValidationError::NoLogIndex)?;
 
-        let ReceiptMetadata {
-            gas_used,
-            effective_gas_price,
-            block_number: receipt_block_number,
-        } = match receipt_metadata {
-            Some(metadata) => metadata,
-            None => fetch_receipt_metadata(evm.provider(), tx_hash).await?,
+        let receipt_block_number = match receipt_metadata {
+            Some(metadata) => metadata.block_number,
+            None if log.block_number.is_none() => {
+                fetch_receipt_metadata(evm.provider(), tx_hash)
+                    .await?
+                    .block_number
+            }
+            None => None,
         };
 
         // Deposit is IN (pool received), Withdraw is OUT (pool sent) --
@@ -543,7 +473,6 @@ impl OnchainTrade {
 
         finalize_onchain_trade(
             evm.provider(),
-            pyth_feed_ids,
             trade_details,
             TradeMetadata {
                 // Pairing quarantines settlements whose deposit and withdrawal
@@ -551,8 +480,6 @@ impl OnchainTrade {
                 source: inventory_trade_source(trade.deposit.operator, inventory_adapters),
                 tx_hash,
                 log_index,
-                gas_used,
-                effective_gas_price,
                 block_number: log.block_number.or(receipt_block_number),
                 log_timestamp: log.block_timestamp,
             },
@@ -574,7 +501,6 @@ impl OnchainTrade {
         ctx: &EvmCtx,
         assets: &AssetsConfig,
         inventory_adapters: &InventoryAdapters,
-        pyth_feed_ids: &PythFeedIds,
         actors: RecoveryActors,
     ) -> Result<Option<Self>, OnChainError> {
         let receipt = evm
@@ -604,13 +530,17 @@ impl OnchainTrade {
             );
         }
 
+        let receipt_metadata = ReceiptMetadata {
+            block_number: receipt.block_number,
+        };
+
         for log in trades {
             if let Some(trade) = try_convert_log_to_onchain_trade(
                 log,
                 evm,
                 cache,
                 ctx,
-                pyth_feed_ids,
+                receipt_metadata,
                 actors.order_owner,
             )
             .await?
@@ -619,20 +549,14 @@ impl OnchainTrade {
             }
         }
 
-        // The receipt is already in hand here, so pass its gas/price/block
+        // The receipt is already in hand here, so pass its block-number
         // metadata through instead of letting `try_from_inventory_trade`
         // re-fetch the same receipt via a second `eth_getTransactionReceipt`.
-        let receipt_metadata = ReceiptMetadata {
-            gas_used: Some(receipt.gas_used),
-            effective_gas_price: Some(receipt.effective_gas_price),
-            block_number: receipt.block_number,
-        };
         let recovery_config = InventoryRecoveryConfig {
             cache,
             evm_ctx: ctx,
             assets,
             inventory_adapters,
-            pyth_feed_ids,
         };
 
         Self::try_inventory_trade_from_receipt_logs(
@@ -701,7 +625,6 @@ impl OnchainTrade {
             config.inventory_adapters,
             &inv,
             withdraw_log,
-            config.pyth_feed_ids,
             Some(receipt_metadata),
         )
         .await
@@ -715,7 +638,6 @@ struct InventoryRecoveryConfig<'config> {
     evm_ctx: &'config EvmCtx,
     assets: &'config AssetsConfig,
     inventory_adapters: &'config InventoryAdapters,
-    pyth_feed_ids: &'config PythFeedIds,
 }
 
 fn inventory_trade_source(
@@ -805,18 +727,15 @@ struct TradeMetadata {
     source: OnChainTradeSource,
     tx_hash: TxHash,
     log_index: u64,
-    gas_used: Option<u64>,
-    effective_gas_price: Option<u128>,
     block_number: Option<u64>,
     log_timestamp: Option<u64>,
 }
 
 /// Shared tail of `try_from_order_and_fill_details` and
 /// `try_from_inventory_trade`: validates the resolved `TradeDetails`, prices
-/// the fill, resolves the block timestamp, and enriches with Pyth.
+/// the fill and resolves the block timestamp.
 async fn finalize_onchain_trade<P: Provider>(
     provider: &P,
-    pyth_feed_ids: &PythFeedIds,
     trade_details: TradeDetails,
     metadata: TradeMetadata,
 ) -> Result<Option<OnchainTrade>, OnChainError> {
@@ -824,8 +743,6 @@ async fn finalize_onchain_trade<P: Provider>(
         source,
         tx_hash,
         log_index,
-        gas_used,
-        effective_gas_price,
         block_number,
         log_timestamp,
     } = metadata;
@@ -858,15 +775,6 @@ async fn finalize_onchain_trade<P: Provider>(
 
     let block_timestamp = resolve_block_timestamp(provider, log_timestamp, block_number).await?;
 
-    let pyth_price = enrich_with_pyth_price(
-        provider,
-        pyth_feed_ids,
-        equity_symbol.base(),
-        block_number,
-        tx_hash,
-    )
-    .await;
-
     let price = Usdc::new(price_per_share_usdc)?;
 
     Ok(Some(OnchainTrade {
@@ -880,9 +788,6 @@ async fn finalize_onchain_trade<P: Provider>(
         price,
         block_timestamp,
         block_number,
-        gas_used,
-        effective_gas_price,
-        pyth_price,
     }))
 }
 
@@ -899,13 +804,13 @@ async fn try_convert_log_to_onchain_trade<EvmImpl: Evm>(
     evm: &EvmImpl,
     cache: &SymbolCache,
     ctx: &EvmCtx,
-    pyth_feed_ids: &PythFeedIds,
+    receipt_metadata: ReceiptMetadata,
     order_owner: Address,
 ) -> Result<Option<OnchainTrade>, OnChainError> {
     let log_with_metadata = Log {
         inner: log.inner.clone(),
         block_hash: log.block_hash,
-        block_number: log.block_number,
+        block_number: log.block_number.or(receipt_metadata.block_number),
         block_timestamp: log.block_timestamp,
         transaction_hash: log.transaction_hash,
         transaction_index: log.transaction_index,
@@ -920,7 +825,6 @@ async fn try_convert_log_to_onchain_trade<EvmImpl: Evm>(
             evm,
             clear_event.data().clone(),
             log_with_metadata,
-            pyth_feed_ids,
             order_owner,
         )
         .await;
@@ -933,7 +837,6 @@ async fn try_convert_log_to_onchain_trade<EvmImpl: Evm>(
             take_order_event.data().clone(),
             log_with_metadata,
             order_owner,
-            pyth_feed_ids,
         )
         .await;
     }
@@ -1069,7 +972,7 @@ pub(crate) enum TradeValidationError {
 mod tests {
     use std::collections::HashMap;
 
-    use alloy::primitives::{Address, Bytes, IntoLogData, U256, address, b256, fixed_bytes, uint};
+    use alloy::primitives::{Address, IntoLogData, U256, address, b256, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::{Block, Transaction};
     use alloy::sol_types::SolCall;
@@ -1080,15 +983,16 @@ mod tests {
         InventoryAdapterVenue, InventoryAdapters, InventoryMode, OperationMode,
     };
     use st0x_evm::IERC20::decimalsCall;
-    use st0x_evm::IPyth::getPriceUnsafeCall;
-    use st0x_evm::PythStructs::Price;
     use st0x_evm::ReadOnlyEvm;
+    use st0x_execution::Symbol;
     use st0x_float_macro::float;
     use st0x_registry::SymbolCache;
 
     use super::*;
     use crate::bindings::IRaindexV6;
-    use crate::test_utils::panic_revert_payload;
+    use crate::test_utils::{
+        get_test_order, panic_revert_payload, seed_get_test_order_token_symbols,
+    };
 
     #[tokio::test]
     async fn resolve_block_timestamp_fetches_header_when_log_timestamp_missing() {
@@ -1108,122 +1012,6 @@ mod tests {
             DateTime::from_timestamp(1_700_000_123, 0),
             "receipt logs without block_timestamp should use the block header timestamp"
         );
-    }
-
-    #[tokio::test]
-    async fn enrich_with_pyth_price_returns_price_when_feed_configured() {
-        let price = Price {
-            price: 15_445_005,
-            conf: 21_005,
-            expo: -5,
-            publishTime: U256::from(1_781_166_017u64),
-        };
-        let asserter = Asserter::new();
-        asserter.push_success(&Bytes::from(getPriceUnsafeCall::abi_encode_returns(&price)));
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let symbol = Symbol::new("COIN").unwrap();
-        let feed_ids = PythFeedIds::new(HashMap::from([(symbol.clone(), B256::random())]));
-
-        let pyth_price = enrich_with_pyth_price(
-            &provider,
-            &feed_ids,
-            &symbol,
-            Some(47_198_127),
-            TxHash::random(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(pyth_price.value, "15445005");
-        assert_eq!(pyth_price.conf, "21005");
-        assert_eq!(pyth_price.expo, -5);
-        assert_eq!(
-            pyth_price.publish_time,
-            DateTime::from_timestamp(1_781_166_017, 0).unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn enrich_with_pyth_price_skips_when_no_feed_configured() {
-        // No responses pushed: an unconfigured feed must not trigger any RPC.
-        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
-        let feed_ids = PythFeedIds::default();
-
-        let result = enrich_with_pyth_price(
-            &provider,
-            &feed_ids,
-            &Symbol::new("COIN").unwrap(),
-            Some(1),
-            TxHash::random(),
-        )
-        .await;
-
-        assert_eq!(result, None);
-    }
-
-    #[tokio::test]
-    async fn enrich_with_pyth_price_returns_none_on_invalid_timestamp() {
-        // The eth_call succeeds but decodes to an unrepresentable publishTime;
-        // raw_price_to_pyth_price rejects it, and enrichment swallows the error.
-        let price = Price {
-            price: 15_445_005,
-            conf: 21_005,
-            expo: -5,
-            publishTime: U256::MAX,
-        };
-        let asserter = Asserter::new();
-        asserter.push_success(&Bytes::from(getPriceUnsafeCall::abi_encode_returns(&price)));
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let symbol = Symbol::new("COIN").unwrap();
-        let feed_ids = PythFeedIds::new(HashMap::from([(symbol.clone(), B256::random())]));
-
-        let result = enrich_with_pyth_price(
-            &provider,
-            &feed_ids,
-            &symbol,
-            Some(47_198_127),
-            TxHash::random(),
-        )
-        .await;
-
-        assert_eq!(result, None);
-    }
-
-    #[tokio::test]
-    async fn enrich_with_pyth_price_returns_none_on_rpc_error() {
-        // A configured feed and a valid block, but the eth_call fails: enrichment
-        // must swallow the error and return None so trade recording is unaffected.
-        let asserter = Asserter::new();
-        asserter.push_failure_msg("eth_call boom");
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let symbol = Symbol::new("COIN").unwrap();
-        let feed_ids = PythFeedIds::new(HashMap::from([(symbol.clone(), B256::random())]));
-
-        let result = enrich_with_pyth_price(
-            &provider,
-            &feed_ids,
-            &symbol,
-            Some(47_198_127),
-            TxHash::random(),
-        )
-        .await;
-
-        assert_eq!(result, None);
-    }
-
-    #[tokio::test]
-    async fn enrich_with_pyth_price_skips_when_block_number_missing() {
-        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
-        let symbol = Symbol::new("COIN").unwrap();
-        let feed_ids = PythFeedIds::new(HashMap::from([(symbol.clone(), B256::random())]));
-
-        let result =
-            enrich_with_pyth_price(&provider, &feed_ids, &symbol, None, TxHash::random()).await;
-
-        assert_eq!(result, None);
     }
 
     #[test]
@@ -1418,7 +1206,6 @@ mod tests {
         asserter.push_success(&serde_json::Value::Null);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
-        let pyth_feed_ids = PythFeedIds::default();
         let ctx = EvmCtx {
             rpc_url: "http://localhost:8545".parse().unwrap(),
             orderbook: Address::ZERO,
@@ -1442,7 +1229,6 @@ mod tests {
             &ctx,
             &AssetsConfig::default(),
             &InventoryAdapters::default(),
-            &pyth_feed_ids,
             RecoveryActors {
                 order_owner: Address::ZERO,
                 bot_operator: BotOperator(Address::ZERO),
@@ -1454,6 +1240,99 @@ mod tests {
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::TransactionNotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn try_from_tx_hash_reuses_receipt_block_for_orderbook_log() {
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let tx_hash =
+            fixed_bytes!("0x4545454545454545454545454545454545454545454545454545454545454545");
+        let order = get_test_order();
+        let order_owner = order.owner;
+        let take_order = IRaindexV6::TakeOrderV3 {
+            sender: address!("0x2222222222222222222222222222222222222222"),
+            config: IRaindexV6::TakeOrderConfigV4 {
+                order,
+                inputIOIndex: U256::from(0),
+                outputIOIndex: U256::from(1),
+                signedContext: vec![IRaindexV6::SignedContextV1 {
+                    signer: Address::ZERO,
+                    signature: Vec::new().into(),
+                    context: Vec::new(),
+                }],
+            },
+            input: Float::from_fixed_decimal_lossy(uint!(9_U256), 0)
+                .unwrap()
+                .0
+                .get_inner(),
+            output: Float::from_fixed_decimal_lossy(uint!(100_U256), 0)
+                .unwrap()
+                .0
+                .get_inner(),
+        };
+        let orderbook_log = Log {
+            inner: alloy::primitives::Log {
+                address: orderbook,
+                data: take_order.to_log_data(),
+            },
+            block_hash: None,
+            block_number: None,
+            block_timestamp: Some(1_700_000_000),
+            transaction_hash: Some(tx_hash),
+            transaction_index: None,
+            log_index: Some(7),
+            removed: false,
+        };
+        let receipt = serde_json::json!({
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x1",
+            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
+            "blockNumber": "0x2a",
+            "from": "0x1234567890123456789012345678901234567890",
+            "to": orderbook,
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x77359400",
+            "cumulativeGasUsed": "0x5208",
+            "status": "0x1",
+            "type": "0x2",
+            "logsBloom": format!("0x{}", "0".repeat(512)),
+            "logs": [orderbook_log]
+        });
+
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let cache = SymbolCache::default();
+        seed_get_test_order_token_symbols(&cache);
+        let ctx = EvmCtx {
+            rpc_url: "http://localhost:8545".parse().unwrap(),
+            orderbook,
+            inventory: InventoryMode::Managed {
+                inventory: Address::ZERO,
+            },
+            vault_owner: order_owner,
+            deployment_block: 0,
+            required_confirmations: 0,
+            ingestion_cutoff: IngestionCutoff::Safe,
+        };
+
+        let trade = OnchainTrade::try_from_tx_hash(
+            tx_hash,
+            &ReadOnlyEvm::new(provider),
+            &cache,
+            &ctx,
+            &AssetsConfig::default(),
+            &InventoryAdapters::default(),
+            RecoveryActors {
+                order_owner,
+                bot_operator: BotOperator(Address::ZERO),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(trade.block_number, Some(42));
     }
 
     /// `try_from_tx_hash` must recover an `InventoryTrade` settlement (no
@@ -1559,7 +1438,6 @@ mod tests {
             &ctx,
             &assets,
             &InventoryAdapters::default(),
-            &PythFeedIds::default(),
             RecoveryActors {
                 order_owner: inventory,
                 bot_operator: BotOperator(bot_operator),
@@ -1689,7 +1567,6 @@ mod tests {
             &ctx,
             &AssetsConfig::default(),
             &InventoryAdapters::default(),
-            &PythFeedIds::default(),
             RecoveryActors {
                 order_owner: inventory,
                 bot_operator: BotOperator(bot_operator),
@@ -1800,7 +1677,6 @@ mod tests {
             &ctx,
             &AssetsConfig::default(),
             &InventoryAdapters::default(),
-            &PythFeedIds::default(),
             RecoveryActors {
                 order_owner: inventory,
                 bot_operator: BotOperator(bot_operator),
@@ -2009,7 +1885,6 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative,
-                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
@@ -2045,31 +1920,14 @@ mod tests {
         }
     }
 
-    fn inventory_receipt(tx_hash: TxHash) -> serde_json::Value {
-        serde_json::json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x1",
-            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
-            "blockNumber": "0x1",
-            "from": "0x1234567890123456789012345678901234567890",
-            "to": "0x5678901234567890123456789012345678901234",
-            "gasUsed": "0x5208",
-            "effectiveGasPrice": "0x77359400",
-            "cumulativeGasUsed": "0x5208",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "logs": []
-        })
-    }
-
     fn inventory_adapters(venue: InventoryAdapterVenue, operator: Address) -> InventoryAdapters {
         InventoryAdapters::try_new(vec![InventoryAdapter { venue, operator }]).unwrap()
     }
 
     /// Drives `try_from_inventory_trade` with a pre-seeded symbol cache (so
-    /// symbol resolution makes no RPC) and a deterministic mock queue:
-    /// receipt, then the deposit-token then withdraw-token `decimals()` calls.
+    /// symbol resolution makes no RPC) and a deterministic mock queue containing
+    /// only the deposit-token then withdraw-token `decimals()` calls. The log
+    /// already carries its block number, so parsing must not fetch a receipt.
     async fn run_inventory_parser(
         deposit: OperatorDeposit,
         deposit_decimals: u8,
@@ -2081,10 +1939,7 @@ mod tests {
         cache.preload_symbol(INVENTORY_EQUITY, "wtAAPL");
         let assets = assets_config_with_equity("AAPL", INVENTORY_EQUITY);
 
-        let tx_hash =
-            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         let asserter = Asserter::new();
-        asserter.push_success(&inventory_receipt(tx_hash));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(
             &deposit_decimals,
         ));
@@ -2103,14 +1958,13 @@ mod tests {
             &InventoryAdapters::default(),
             &inv,
             log,
-            &PythFeedIds::default(),
             None,
         )
         .await
     }
 
     #[tokio::test]
-    async fn try_from_inventory_trade_happy_path_usdc_withdraw_is_buy() {
+    async fn block_numbered_inventory_trade_does_not_fetch_receipt() {
         // Pool received 2 wtAAPL (deposit) and sent 160 USDC (withdraw): it
         // bought equity onchain, so the bot is now long and must hedge Buy.
         let trade = run_inventory_parser(
@@ -2134,11 +1988,62 @@ mod tests {
         assert_eq!(trade.equity_token, INVENTORY_EQUITY);
         assert_eq!(trade.amount, FractionalShares::new(float!(2)));
         assert!(trade.price.value().eq(float!(80)).unwrap());
+        assert_eq!(trade.block_number, Some(12345));
         // block_timestamp resolves from the log's timestamp (no header fetch).
         assert_eq!(
             trade.block_timestamp,
             DateTime::from_timestamp(1_700_000_000, 0)
         );
+    }
+
+    #[tokio::test]
+    async fn missing_inventory_log_block_number_uses_receipt_block_number() {
+        let cache = SymbolCache::default();
+        cache.preload_symbol(INVENTORY_USDC, "USDC");
+        cache.preload_symbol(INVENTORY_EQUITY, "wtAAPL");
+        let assets = assets_config_with_equity("AAPL", INVENTORY_EQUITY);
+        let mut log = crate::test_utils::create_log(7);
+        log.block_number = None;
+        let tx_hash = log.transaction_hash.unwrap();
+
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x1",
+            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
+            "blockNumber": "0x2a",
+            "from": "0x1234567890123456789012345678901234567890",
+            "to": "0x5678901234567890123456789012345678901234",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x77359400",
+            "cumulativeGasUsed": "0x5208",
+            "status": "0x1",
+            "type": "0x2",
+            "logsBloom": format!("0x{}", "0".repeat(512)),
+            "logs": []
+        }));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
+        let inventory_trade = InventoryTrade {
+            deposit: operator_deposit(INVENTORY_EQUITY, uint!(2000000000000000000_U256)),
+            withdraw: operator_withdraw(INVENTORY_USDC, uint!(160000000_U256)),
+        };
+
+        let trade = OnchainTrade::try_from_inventory_trade(
+            &cache,
+            &evm,
+            &assets,
+            &InventoryAdapters::default(),
+            &inventory_trade,
+            log,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(trade.block_number, Some(42));
     }
 
     #[tokio::test]
@@ -2176,10 +2081,7 @@ mod tests {
         cache.preload_symbol(INVENTORY_EQUITY, "wtAAPL");
         let assets = assets_config_with_equity("AAPL", INVENTORY_EQUITY);
 
-        let tx_hash =
-            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         let asserter = Asserter::new();
-        asserter.push_success(&inventory_receipt(tx_hash));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
@@ -2197,7 +2099,6 @@ mod tests {
             &InventoryAdapters::default(),
             &inv,
             log,
-            &PythFeedIds::default(),
             None,
         )
         .await
@@ -2227,10 +2128,7 @@ mod tests {
         cache.preload_symbol(spoof_equity, "wtCOIN");
         let assets = assets_config_with_equity("COIN", REAL_WTCOIN_BASE);
 
-        let tx_hash =
-            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         let asserter = Asserter::new();
-        asserter.push_success(&inventory_receipt(tx_hash));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
@@ -2248,7 +2146,6 @@ mod tests {
             &InventoryAdapters::default(),
             &inv,
             log,
-            &PythFeedIds::default(),
             None,
         )
         .await
@@ -2339,24 +2236,7 @@ mod tests {
             amount: uint!(34_172_366_621_067_031_U256), // 0.034172366621067031 wtCOIN, 18 decimals
         };
 
-        let receipt = serde_json::json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x3b",
-            "blockHash": "0x373307a0e2154c2de6b046e349fc27f9bb02b01fdddbb15eeba57f3ce3b24973",
-            "blockNumber": "0x2dce2cf",
-            "from": "0x679df30b30ac2947aa3143490add6717af81dcc3",
-            "to": "0xbeb0009aca35087ce7ccf11637e24dd1aad3bf2a",
-            "gasUsed": "0x7a62d",
-            "effectiveGasPrice": "0x57bcf0",
-            "cumulativeGasUsed": "0xa00b4e",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": format!("0x{}", "0".repeat(512)),
-            "logs": []
-        });
-
         let asserter = Asserter::new();
-        asserter.push_success(&receipt);
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtCOIN
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
@@ -2371,14 +2251,7 @@ mod tests {
         let adapters = inventory_adapters(InventoryAdapterVenue::Bebop, operator);
 
         let trade = OnchainTrade::try_from_inventory_trade(
-            &cache,
-            &evm,
-            &assets,
-            &adapters,
-            &inv,
-            log,
-            &PythFeedIds::default(),
-            None,
+            &cache, &evm, &assets, &adapters, &inv, log, None,
         )
         .await
         .unwrap()
@@ -2433,24 +2306,7 @@ mod tests {
             amount: uint!(2_000_000_U256), // 2 USDC, 6 decimals
         };
 
-        let receipt = serde_json::json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x41",
-            "blockHash": "0x4fb86ed2edeee5845f379874a140df6ed78a5553877a4a480878f2eb70f0efeb",
-            "blockNumber": "0x2dd36e4",
-            "from": "0x679df30b30ac2947aa3143490add6717af81dcc3",
-            "to": "0xe23457189a0186b23e9f325eb11364b3733c2c89",
-            "gasUsed": "0x54025",
-            "effectiveGasPrice": "0x59a538",
-            "cumulativeGasUsed": "0xa481c7",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": format!("0x{}", "0".repeat(512)),
-            "logs": []
-        });
-
         let asserter = Asserter::new();
-        asserter.push_success(&receipt);
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtCOIN
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
@@ -2465,14 +2321,7 @@ mod tests {
         let adapters = inventory_adapters(InventoryAdapterVenue::UniswapV4, operator);
 
         let trade = OnchainTrade::try_from_inventory_trade(
-            &cache,
-            &evm,
-            &assets,
-            &adapters,
-            &inv,
-            log,
-            &PythFeedIds::default(),
-            None,
+            &cache, &evm, &assets, &adapters, &inv, log, None,
         )
         .await
         .unwrap()

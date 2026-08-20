@@ -727,7 +727,6 @@ mod tests {
                     EquityAssetConfig {
                         tokenized_equity: address!("0x2222222222222222222222222222222222222222"),
                         tokenized_equity_derivative: expected().base,
-                        pyth_feed_id: None,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Enabled,
                         rebalancing: OperationMode::Disabled,

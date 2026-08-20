@@ -1,6 +1,6 @@
 # ADR 0017: Value bot-paid gas in USD via Pyth ETH/USD on Base, block-pinned
 
-- **Status:** Proposed
+- **Status:** Superseded by ADR 0020
 - **Date:** 2026-07-23
 - **Amends:** ADR 0015
 - **Linear:** RAI-1520 (parent RAI-1406 -- Extended-hours PnL leaks)

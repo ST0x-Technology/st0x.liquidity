@@ -32,7 +32,6 @@ use crate::offchain::order::{
     position_command_for_finalization, terminal_position_finalization,
 };
 use crate::onchain::accumulator::check_execution_readiness;
-use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::{BotOperator, RecoveryActors};
 use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
@@ -507,7 +506,6 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
     let evm_ctx = &ctx.evm;
-    let pyth_feed_ids = PythFeedIds::new(ctx.pyth_feed_ids());
     // Matches ClearV3/TakeOrderV3 fills to our Raindex orders -- owned by the
     // inventory contract post-migration, the bot EOA before it.
     let actors = RecoveryActors {
@@ -527,7 +525,6 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
         evm_ctx,
         &ctx.assets,
         &ctx.inventory_adapters,
-        &pyth_feed_ids,
         actors,
     )
     .await
@@ -2457,7 +2454,6 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
-                pyth_feed_id: None,
                 vault_ids: vec![],
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
@@ -2917,7 +2913,6 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
-                pyth_feed_id: None,
                 vault_ids: vec![],
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
@@ -3478,7 +3473,6 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
-                pyth_feed_id: None,
                 vault_ids: vec![],
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
@@ -3870,7 +3864,6 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
-                pyth_feed_id: None,
                 vault_ids: vec![],
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,

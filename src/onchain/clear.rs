@@ -13,7 +13,6 @@ use st0x_registry::SymbolCache;
 
 use super::OnChainError;
 use crate::bindings::IRaindexV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
-use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::TradeValidationError;
 use crate::onchain::trade::{OnchainTrade, OrderFill};
 
@@ -26,7 +25,6 @@ impl OnchainTrade {
         evm: &E,
         event: ClearV3,
         log: Log,
-        pyth_feed_ids: &PythFeedIds,
         order_owner: Address,
     ) -> Result<Option<Self>, OnChainError> {
         let ClearV3 {
@@ -93,9 +91,7 @@ impl OnchainTrade {
             (bob_order, fill)
         };
 
-        let result =
-            Self::try_from_order_and_fill_details(cache, evm, order, fill, log, pyth_feed_ids)
-                .await;
+        let result = Self::try_from_order_and_fill_details(cache, evm, order, fill, log).await;
 
         if let Ok(Some(ref trade)) = result {
             debug!(
@@ -260,7 +256,6 @@ mod tests {
     use crate::bindings::IRaindexV6;
     use crate::bindings::IRaindexV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2};
     use crate::onchain::io::WrappedTokenizedShares;
-    use crate::onchain::pyth::PythFeedIds;
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
 
@@ -387,11 +382,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
-        asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
         // No token-metadata RPC here: symbols come from the pre-seeded address
         // cache and decimal scales are constants in TradeDetails::try_from_io.
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -399,7 +392,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -468,11 +460,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
-        asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
         // No token-metadata RPC here: symbols come from the pre-seeded address
         // cache and decimal scales are constants in TradeDetails::try_from_io.
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -480,7 +470,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -583,7 +572,6 @@ mod tests {
         asserter.push_success(&json!([later_log, immediate_log]));
         asserter.push_success(&mocked_receipt_hex(tx_hash));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let trade = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -591,7 +579,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -643,7 +630,6 @@ mod tests {
         asserter.push_success(&json!([after_clear_log]));
         asserter.push_success(&mocked_receipt_hex(tx_hash));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let error = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -651,7 +637,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -685,7 +670,6 @@ mod tests {
 
         let asserter = Asserter::new();
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -693,7 +677,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -722,7 +705,6 @@ mod tests {
 
         let asserter = Asserter::new();
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -730,7 +712,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -778,7 +759,6 @@ mod tests {
         asserter.push_success(&json!([])); // No after clear logs found
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // Receipt with no logs
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -786,7 +766,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -851,7 +830,6 @@ mod tests {
         asserter.push_success(&json!([wrong_after_clear_log])); // Wrong transaction hash
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // Receipt with no logs
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -859,7 +837,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -922,7 +899,6 @@ mod tests {
         asserter.push_success(&json!([wrong_after_clear_log])); // Wrong log index ordering
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // Receipt with no logs
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -930,7 +906,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -986,11 +961,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
-        asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
         // No token-metadata RPC here: symbols come from the pre-seeded address
         // cache and decimal scales are constants in TradeDetails::try_from_io.
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -998,7 +971,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -1142,10 +1114,7 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&json!([later_after_clear_log, immediate_after_clear_log]));
-        let receipt_json = create_receipt_json_with_logs(tx_hash, &[]);
-        asserter.push_success(&receipt_json); // receipt for gas info
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1153,7 +1122,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -1219,7 +1187,6 @@ mod tests {
         asserter.push_success(&json!([after_clear_log_equal_index])); // get_logs returns log with equal index (not valid)
         asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt has no logs
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1227,7 +1194,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -1281,11 +1247,7 @@ mod tests {
         let asserter = Asserter::new();
         // get_logs returns a log with wrong tx_hash but also the correct one
         asserter.push_success(&json!([wrong_tx_log, correct_log]));
-        // Receipt mock needed for gas info in try_from_order_and_fill_details (empty is fine)
-        let receipt_json = create_receipt_json_with_logs(target_tx_hash, &[]);
-        asserter.push_success(&receipt_json);
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1293,7 +1255,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -1346,9 +1307,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
         asserter.push_success(&receipt); // receipt for fallback AfterClearV2 extraction
-        asserter.push_success(&receipt); // receipt for gas info in try_from_order_and_fill_details
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1356,7 +1315,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -1415,9 +1373,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([])); // get_logs returns empty
         asserter.push_success(&receipt); // receipt for fallback AfterClearV2 extraction
-        asserter.push_success(&receipt); // receipt for gas info in try_from_order_and_fill_details
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1425,7 +1381,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -1489,9 +1444,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([])); // get_logs returns empty -> receipt fallback
         asserter.push_success(&receipt); // receipt for fallback AfterClearV2 extraction
-        asserter.push_success(&receipt); // receipt for gas info in try_from_order_and_fill_details
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1499,7 +1452,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
@@ -1550,7 +1502,6 @@ mod tests {
         asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
         asserter.push_success(&receipt); // receipt for fallback - has log but wrong contract address
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1558,7 +1509,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -1604,7 +1554,6 @@ mod tests {
         asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
         asserter.push_success(&receipt); // receipt for fallback - has AfterClearV2 but log_index < clear's
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1612,7 +1561,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -1654,7 +1602,6 @@ mod tests {
         asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
         asserter.push_success(&receipt); // receipt for fallback - has ClearV3 but no AfterClearV2
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1662,7 +1609,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -1711,7 +1657,6 @@ mod tests {
         asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
         asserter.push_success(&receipt); // receipt for fallback - has log but unrecognized event signature
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1719,7 +1664,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await;
@@ -1772,9 +1716,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([wrong_tx_log])); // get_logs returns wrong tx
         asserter.push_success(&receipt); // receipt for fallback AfterClearV2 extraction
-        asserter.push_success(&receipt); // receipt for gas info in try_from_order_and_fill_details
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_clear_v3(
             &ctx,
@@ -1782,7 +1724,6 @@ mod tests {
             &evm,
             clear_event,
             clear_log,
-            &pyth_feed_ids,
             get_test_order().owner,
         )
         .await
