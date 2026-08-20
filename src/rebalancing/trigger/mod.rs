@@ -19310,6 +19310,158 @@ mod tests {
         );
     }
 
+    /// Hypothesis: a running-time `ConversionFailed` with NO in-memory
+    /// tracking but a loadable durable aggregate must fall back to the
+    /// durable `holds_rebalance_guard` classifier instead of blanket
+    /// preserving. An AlpacaToBase pre-burn conversion failure does not hold
+    /// the guard durably (restart proves it: `recover_usdc_guard` leaves it
+    /// clear), so the running bot must clear it too -- otherwise the guard
+    /// wedges until restart, suppressing all USDC rebalancing.
+    #[tokio::test]
+    async fn conversion_failed_without_tracking_clears_guard_from_durable_pre_burn_state() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // AlpacaToBase pre-burn ConversionFailed: the conversion is that
+        // direction's FIRST leg, before any withdrawal or burn.
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: usdc(400),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailConversion {
+                    reason: "conversion rejected".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                store,
+            )
+            .await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        // Restart-re-armed state: guard latched, no tracking entry.
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_conversion_failed())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "with tracking absent the durable classifier must decide: an \
+             AlpacaToBase pre-burn ConversionFailed does not hold the guard, \
+             so the running bot must clear it without a restart"
+        );
+    }
+
+    /// Regression guard for the durable fallback: a BaseToAlpaca
+    /// post-deposit `ConversionFailed` is post-burn, so with tracking absent
+    /// the durable classifier must PRESERVE the guard -- the fallback must
+    /// not weaken the genuinely post-burn cases.
+    #[tokio::test]
+    async fn conversion_failed_without_tracking_preserves_guard_from_durable_post_burn_state() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000011");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111112");
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // BaseToAlpaca post-deposit ConversionFailed: withdrawal, burn, mint,
+        // and deposit all completed; the USDC->USD conversion failed last.
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: usdc(400),
+                withdrawal: TransferRef::OnchainTx(burn_tx),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::InitiateBridging { burn_tx },
+            UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: vec![0x01],
+                cctp_nonce: alloy::primitives::B256::left_padding_from(&42u64.to_be_bytes()),
+                message: valid_cctp_message(),
+                mint_scan_from_block: 100,
+            },
+            UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx,
+                amount_received: usdc(399),
+                fee_collected: usdc(1),
+            },
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(mint_tx),
+            },
+            UsdcRebalanceCommand::ConfirmDeposit,
+            UsdcRebalanceCommand::InitiatePostDepositConversion {
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                amount: usdc(399),
+            },
+            UsdcRebalanceCommand::FailConversion {
+                reason: "conversion rejected".to_string(),
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+
+        let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                store,
+            )
+            .await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_conversion_failed())
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "the durable fallback must preserve the guard for a genuinely \
+             post-burn (BaseToAlpaca post-deposit) conversion failure"
+        );
+    }
+
     #[tokio::test]
     async fn conversion_failed_without_tracking_preserves_guard_conservatively() {
         let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
