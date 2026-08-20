@@ -381,12 +381,16 @@ const usdcDirectionToCliFlag = (direction: UsdcBridgeDirection | null): string |
 }
 
 /// Recovery commands for a USDC bridge, gated by status:
-///   - failed (terminal): `reconcile`, but ONLY for a post-burn failure. The CLI
-///     accepts `transfer reconcile --kind usdc` only when USDC was actually
-///     stranded on-chain (`DepositFailed`, a post-burn `BridgingFailed`, or a
-///     `BaseToAlpaca ConversionFailed`) and rejects pre-burn failures, which
-///     strand nothing. The `postBurn` discriminator on `UsdcBridgeStatus::Failed`
-///     tells the two apart; when it is not `true` we surface nothing rather than
+///   - failed (terminal): `reconcile`, but ONLY for a reconcile-eligible
+///     failure. The CLI accepts `transfer reconcile --kind usdc` when the
+///     funds provably left their source venue (`DepositFailed`, a post-burn
+///     `BridgingFailed`, any `AlpacaToBase BridgingFailed` -- its withdrawal
+///     completed, so the funds are off Alpaca even without a burn, e.g. the
+///     settlement-retry-deadline terminal -- or a `BaseToAlpaca
+///     ConversionFailed`) and rejects failures whose funds never moved. The
+///     `postBurn` discriminator on `UsdcBridgeStatus::Failed` carries this
+///     reconcile-eligibility flag (the name is historical, kept for wire
+///     compatibility); when it is not `true` we surface nothing rather than
 ///     a false affordance the CLI would reject.
 ///   - completed (terminal): none.
 ///   - in-flight pre-burn (`converting`/`withdrawing`): `fail-usdc-transfer` --
@@ -408,8 +412,8 @@ const usdcBridgeRecoveryCommands = (
         command: `${prefix} transfer reconcile --kind usdc --id ${id} -r "<reason>"`,
         label: 'Reconcile',
         description:
-          'Mark this post-burn failed USDC bridge as Reconciled once its stranded USDC was ' +
-          'recovered out-of-band (bookkeeping).',
+          'Mark this failed USDC bridge as Reconciled once its off-venue funds were ' +
+          'settled out-of-band (bookkeeping). Verify where the funds sit first.',
         mode: 'direct-db'
       }
     ]

@@ -10936,23 +10936,12 @@ mod tests {
                     make_usdc_withdrawal_failed(),
                 ],
             },
-            Scenario {
-                name: "bridging_failed_before_burn",
-                events: vec![
-                    make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
-                    make_usdc_conversion_confirmed(
-                        RebalanceDirection::AlpacaToBase,
-                        usdc(399),
-                        usdc(399),
-                    ),
-                    make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(399)),
-                    make_usdc_withdrawal_confirmed(),
-                    make_usdc_pre_burn_bridging_failed(),
-                ],
-            },
             // NOTE: a post-burn `deposit_failed` no longer cancels -- it is
             // post-mint and preserves inflight + the guard. That behavior is
             // covered by `post_burn_deposit_failure_preserves_inflight_and_guard`.
+            // A pre-burn AlpacaToBase `bridging_failed` (post-withdrawal) also
+            // preserves; see
+            // `alpaca_to_base_pre_burn_bridging_failure_preserves_guard_and_inflight`.
         ];
 
         for scenario in scenarios {
@@ -10979,6 +10968,51 @@ mod tests {
             assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(900), Usdc::ZERO)
                 .await;
         }
+    }
+
+    /// A pre-burn AlpacaToBase `BridgingFailed` happens AFTER the withdrawal
+    /// completed (the settlement-retry-deadline terminal): the withdrawn
+    /// funds are off Alpaca and may still land late, so the reactor must
+    /// PRESERVE the guard, the tracking entry, and the source inflight
+    /// reservation. Cancelling would credit the amount back to Alpaca
+    /// available -- fabricating funds the venue does not hold -- and a
+    /// released guard would let a fresh transfer mis-attribute the late
+    /// arrival. `transfer reconcile` is the exit that settles the funds.
+    #[tokio::test]
+    async fn alpaca_to_base_pre_burn_bridging_failure_preserves_guard_and_inflight() {
+        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        for event in [
+            make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
+            make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399), usdc(399)),
+            make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(399)),
+            make_usdc_withdrawal_confirmed(),
+            make_usdc_pre_burn_bridging_failed(),
+        ] {
+            harness
+                .receive::<UsdcRebalance>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "the guard must stay held: the withdrawn funds are off Alpaca and \
+             a fresh transfer could mis-attribute their late arrival"
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must be preserved so the reconcile sweep can clear the \
+             guard after the operator settles the funds"
+        );
+        // The withdrawal reserved 399 from Hedging available into inflight;
+        // preserving must NOT credit it back.
+        assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(501), usdc(399)).await;
     }
 
     #[tokio::test]

@@ -212,6 +212,23 @@ impl MintRecoveryDirection {
 /// still using `initiated_at` as the alert deadline -- anchoring the deadline
 /// to when the mint phase itself began would need a new durable timestamp,
 /// which is out of scope here (see the finding this addresses).
+/// Best-effort operator alert delivery: a failed delivery is logged with the
+/// alert kind and never propagated -- alerting must never fail the job.
+async fn deliver_market_making_alert(
+    notifier: &Arc<dyn Notifier>,
+    message: &str,
+    alert_kind: &str,
+) {
+    if let Err(error) = notifier.notify(message).await {
+        warn!(
+            target: "rebalance",
+            ?error,
+            alert_kind,
+            "Failed to deliver USDC market-making alert"
+        );
+    }
+}
+
 async fn schedule_mint_recovery_redrive<Task>(
     notifier: &Arc<dyn Notifier>,
     job_queue: &mut JobQueue<Task>,
@@ -1237,9 +1254,7 @@ async fn settle_preflight_ambient(
              holds {balance} USDC (nominal {nominal}). No cash left Alpaca. \
              Sweep the wallet to unblock USDC rebalancing."
         );
-        if let Err(error) = ctx.notifier.notify(&message).await {
-            warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making pre-flight ambient alert");
-        }
+        deliver_market_making_alert(&ctx.notifier, &message, "pre-flight-ambient").await;
     }
     ctx.usdc_guard.release_unless_durably_held().await;
 }
@@ -1264,9 +1279,7 @@ async fn settle_preflight_unrepresentable(
          call was made and no aggregate exists"
     );
     let message = format!("{error}");
-    if let Err(error) = ctx.notifier.notify(&message).await {
-        warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making pre-flight ambient alert");
-    }
+    deliver_market_making_alert(&ctx.notifier, &message, "pre-flight-ambient").await;
     ctx.usdc_guard.release_unless_durably_held().await;
 }
 
@@ -1294,9 +1307,7 @@ async fn settle_preflight_unavailable(
              transfer {id}: {source}). Alpaca->Base USDC rebalancing is \
              halted until the RPC recovers."
         );
-        if let Err(error) = ctx.notifier.notify(&message).await {
-            warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making pre-flight outage alert");
-        }
+        deliver_market_making_alert(&ctx.notifier, &message, "pre-flight-outage").await;
     }
     ctx.usdc_guard.release_unless_durably_held().await;
 }
@@ -1549,9 +1560,27 @@ impl TransferUsdcToMarketMaking {
                     "USDC transfer {id} attestation retry deadline elapsed. \
                      Bridge marked failed; manual operator reconciliation required."
                 );
-                if let Err(error) = ctx.notifier.notify(&message).await {
-                    warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making deadline-elapsed alert");
-                }
+                deliver_market_making_alert(&ctx.notifier, &message, "deadline-elapsed").await;
+            }
+            // Settlement retry deadline elapsed: `FailBridging` already
+            // committed (pre-burn `BridgingFailed`, reconcile-eligible since
+            // the withdrawal completed), so end the attempt with no retry and
+            // page the operator to settle the withdrawn funds.
+            Err(UsdcTransferError::SettlementRetryDeadlineElapsed { id }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    "Alpaca->Base USDC transfer settlement retry deadline elapsed; \
+                     bridge marked failed for operator reconciliation"
+                );
+                let message = format!(
+                    "USDC transfer {id} settlement retry deadline elapsed: the withdrawal \
+                     completed at Alpaca but its on-chain settlement could not be verified. \
+                     Bridge marked failed and the rebalance guard stays held. Verify where \
+                     the funds actually sit (Alpaca balance vs the market-maker wallet), \
+                     then settle them with `transfer reconcile --kind usdc`."
+                );
+                deliver_market_making_alert(&ctx.notifier, &message, "settlement-deadline").await;
             }
             Err(UsdcTransferError::PreviouslyFailedAggregate { id }) => {
                 warn!(
@@ -1582,9 +1611,7 @@ impl TransferUsdcToMarketMaking {
                     "USDC transfer {id} failed: ambient USDC ({balance}) exceeds nominal ({nominal}). \
                      Wallet-empty invariant broken; bridge marked failed, manual operator reconciliation required."
                 );
-                if let Err(error) = ctx.notifier.notify(&message).await {
-                    warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making ambient-balance alert");
-                }
+                deliver_market_making_alert(&ctx.notifier, &message, "ambient-balance").await;
             }
             // Pre-flight refusals (see the variants' docs): no aggregate
             // exists, so each settles worker-side -- log, page through its
@@ -1681,9 +1708,7 @@ impl TransferUsdcToMarketMaking {
                     "{error}. Latched for operator reconciliation; verify \
                      on-chain before any reburn."
                 );
-                if let Err(error) = ctx.notifier.notify(&message).await {
-                    warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making burn-safety alert");
-                }
+                deliver_market_making_alert(&ctx.notifier, &message, "burn-safety").await;
             }
             // Both outcomes are deterministic across retries and neither has a
             // safe automatic next step, so they latch for an operator instead
@@ -1740,9 +1765,7 @@ impl TransferUsdcToMarketMaking {
         error!(target: "rebalance", id = %self.id, %error, "Alpaca->Base USDC transfer: {context}");
 
         let message = format!("USDC transfer {}: {detail}", self.id);
-        if let Err(notify_error) = ctx.notifier.notify(&message).await {
-            warn!(target: "rebalance", ?notify_error, "Failed to deliver USDC market-making conversion-latch alert");
-        }
+        deliver_market_making_alert(&ctx.notifier, &message, "conversion-latch").await;
     }
 
     /// `reason` is supplied by the caller, where the concrete settlement
@@ -1850,9 +1873,7 @@ impl TransferUsdcToMarketMaking {
         let message = format!(
             "USDC transfer {id} failed: {error}. Check if apalis will retry before acting."
         );
-        if let Err(error) = ctx.notifier.notify(&message).await {
-            warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making terminal-error alert");
-        }
+        deliver_market_making_alert(&ctx.notifier, &message, "terminal-error").await;
         Err(error.into())
     }
 
@@ -2048,9 +2069,7 @@ impl TransferUsdcToMarketMaking {
                  manual operator action will be required if it fails to enqueue or also reverts.",
                 max = ctx.max_burn_revert_redrives
             );
-            if let Err(error) = ctx.notifier.notify(&message).await {
-                warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making burn-revert-limit alert");
-            }
+            deliver_market_making_alert(&ctx.notifier, &message, "burn-revert-limit").await;
         } else if warn_threshold(ctx.max_burn_revert_redrives) == Some(next_attempts) {
             // Warn threshold: alert exactly once so operators can investigate
             // before the limit is reached, avoiding a silent infinite loop.
@@ -2068,9 +2087,7 @@ impl TransferUsdcToMarketMaking {
                  (max: {}). Possible transient or persistent RPC/contract issue.",
                 ctx.max_burn_revert_redrives
             );
-            if let Err(error) = ctx.notifier.notify(&message).await {
-                warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making burn-revert-warn alert");
-            }
+            deliver_market_making_alert(&ctx.notifier, &message, "burn-revert-warn").await;
         } else {
             warn!(
                 target: "rebalance",
@@ -2463,6 +2480,9 @@ mod tests {
     #[derive(Clone, Copy)]
     enum TerminalOutcome {
         DeadlineElapsed,
+        /// Settlement retry deadline elapsed: FailBridging already committed,
+        /// the job pages and must not redrive.
+        SettlementDeadlineElapsed,
         PreviouslyFailed,
         AmbientBalance,
         /// Fail-closed burn-submission terminals: a burn may be in flight, so the
@@ -2488,6 +2508,9 @@ mod tests {
             match self {
                 Self::DeadlineElapsed => {
                     UsdcTransferError::AttestationRetryDeadlineElapsed { id: id.clone() }
+                }
+                Self::SettlementDeadlineElapsed => {
+                    UsdcTransferError::SettlementRetryDeadlineElapsed { id: id.clone() }
                 }
                 Self::PreviouslyFailed => {
                     UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() }
@@ -4639,6 +4662,19 @@ mod tests {
         .await;
     }
 
+    /// Hypothesis: a settlement-retry-deadline terminal ends the job cleanly
+    /// with one operator page and no redrive -- `FailBridging` already
+    /// committed, so retrying would re-enter a terminal aggregate.
+    #[tokio::test]
+    async fn market_making_job_fails_closed_on_settlement_deadline_elapsed() {
+        assert_market_making_fail_closed(
+            TerminalOutcome::SettlementDeadlineElapsed,
+            "SettlementRetryDeadlineElapsed (market-making)",
+            None,
+        )
+        .await;
+    }
+
     /// An unresolved conversion outcome must latch on both legs. A redrive
     /// would re-enter the resume while the broker order may still be live,
     /// and on the Alpaca->Base leg that reaches the `Converting` arm and
@@ -5299,6 +5335,86 @@ mod tests {
             pending_job_count::<TransferUsdcToHedging>(&pool).await,
             1,
             "failing notifier must not prevent the redrive job from being enqueued"
+        );
+    }
+
+    /// The market-making leg's alerts flow through
+    /// `deliver_market_making_alert`: a failing notifier must be swallowed
+    /// with a warning there too, preserving the clean-terminal outcome (Ok,
+    /// no redrive) the job would have with a working notifier.
+    #[tokio::test]
+    async fn market_making_job_failing_notifier_does_not_abort_job() {
+        let pool = setup_queue_pool().await;
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(TerminalAlpacaToBase(
+                TerminalOutcome::SettlementDeadlineElapsed,
+            )),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: Arc::new(FailingNotifier),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        Job::perform(&job, &ctx)
+            .await
+            .expect("a failing notifier must not turn a clean terminal into a job error");
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            0,
+            "the deadline terminal must still not redrive when alert delivery fails"
+        );
+    }
+
+    /// The settlement-deadline alert must carry the operator's exact next
+    /// action: the reconcile command and the guard-retention wording. A
+    /// regression could drop those instructions while the generic fail-closed
+    /// assertions still pass.
+    #[tokio::test]
+    async fn market_making_settlement_deadline_alert_instructs_reconcile() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(TerminalAlpacaToBase(
+                TerminalOutcome::SettlementDeadlineElapsed,
+            )),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        Job::perform(&job, &ctx).await.unwrap();
+
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "the deadline terminal must fire exactly one alert"
+        );
+        assert!(
+            messages[0].contains("transfer reconcile --kind usdc"),
+            "the alert must name the reconcile command; got: {:?}",
+            messages[0]
+        );
+        assert!(
+            messages[0].contains("guard stays held"),
+            "the alert must state the guard is retained; got: {:?}",
+            messages[0]
         );
     }
 

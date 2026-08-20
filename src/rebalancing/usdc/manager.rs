@@ -72,6 +72,11 @@ const BURN_BROADCAST_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Debug)]
 pub(crate) struct UsdcSettlementParams {
     pub(crate) attestation_retry_deadline: Duration,
+    /// Upper bound on the retryable settlement wait after an Alpaca
+    /// withdrawal confirmed, anchored on the durable `WithdrawalComplete`
+    /// `confirmed_at`. Past it the redrive terminalizes via `FailBridging`
+    /// instead of re-enqueueing forever.
+    pub(crate) settlement_retry_deadline: Duration,
     pub(crate) required_confirmations: u64,
     /// Circle attestation/fee API base URL (test-only override; production
     /// builds use the [`st0x_bridge::cctp::CIRCLE_API_BASE`] constant).
@@ -203,6 +208,7 @@ pub(crate) struct CrossVenueCashTransfer<Chain: Wallet, B = CctpBridge<Chain, Ch
     market_maker_wallet: Address,
     vault_id: RaindexVaultId,
     attestation_retry_deadline: Duration,
+    settlement_retry_deadline: Duration,
     required_confirmations: u64,
     /// Enqueues bot-gas cost recording after CCTP burn/mint confirmations and
     /// the USDC-to-Alpaca wallet transfer succeed (ADR 0017).
@@ -258,6 +264,47 @@ impl std::fmt::Display for MintScanCallSite {
     }
 }
 
+/// The settlement-phase observation that kept an AlpacaToBase transfer from
+/// settling, interpolated into the deadline terminal's `FailBridging` reason
+/// and log line by `check_settlement_deadline`. An enum rather than a free
+/// string so a new call site cannot drift the operator-facing wording
+/// (mirrors `MintCallSite`/`MintScanCallSite`).
+#[derive(Debug, Clone, Copy)]
+enum SettlementStall {
+    /// `ethereum_tx_confirmations` kept failing at the RPC layer.
+    ConfirmationCheckFailing,
+    /// The withdrawal tx hash never resolved to a mined receipt.
+    TxNeverMined,
+    /// The withdrawal tx mined but never reached the required depth.
+    TxUnderconfirmed,
+    /// The market-maker wallet balance read kept failing at the RPC layer.
+    BalanceReadFailing,
+    /// The wallet balance stayed zero after the confirmed withdrawal.
+    FundsNeverArrived,
+}
+
+impl std::fmt::Display for SettlementStall {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConfirmationCheckFailing => {
+                write!(formatter, "the settlement confirmation check kept failing")
+            }
+            Self::TxNeverMined => write!(formatter, "the withdrawal tx never mined"),
+            Self::TxUnderconfirmed => write!(
+                formatter,
+                "the withdrawal tx never reached the required confirmation depth"
+            ),
+            Self::BalanceReadFailing => {
+                write!(formatter, "the wallet balance read kept failing")
+            }
+            Self::FundsNeverArrived => write!(
+                formatter,
+                "the withdrawn funds never arrived in the market-maker wallet"
+            ),
+        }
+    }
+}
+
 impl<
     Chain: Wallet,
     B: Bridge<Error = CctpError, Attestation = AttestationResponse> + UsdcBridgeHelper,
@@ -282,6 +329,7 @@ impl<
             market_maker_wallet,
             vault_id,
             attestation_retry_deadline: settlement.attestation_retry_deadline,
+            settlement_retry_deadline: settlement.settlement_retry_deadline,
             required_confirmations: settlement.required_confirmations,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         }
@@ -325,6 +373,48 @@ impl<
             })
             .await
             .map_err(UsdcTransferError::BotGasEnqueue)
+    }
+
+    /// Bounds the retryable settlement wait: past the settlement retry
+    /// deadline (anchored on the durable `WithdrawalComplete`
+    /// `confirmed_at`; a negative elapsed from clock skew counts as not
+    /// elapsed), sends `FailBridging` (a pre-burn `BridgingFailed`,
+    /// reconcile-eligible because the withdrawal completed and the funds
+    /// are off Alpaca) and errs with `SettlementRetryDeadlineElapsed` so
+    /// the job pages the operator instead of redriving. Before the
+    /// deadline this is a no-op and the caller raises its retryable
+    /// redrive error.
+    async fn check_settlement_deadline(
+        &self,
+        id: &UsdcRebalanceId,
+        confirmed_at: DateTime<Utc>,
+        situation: SettlementStall,
+    ) -> Result<(), UsdcTransferError> {
+        let elapsed = (Utc::now() - confirmed_at)
+            .to_std()
+            .is_ok_and(|elapsed| elapsed >= self.settlement_retry_deadline);
+        if !elapsed {
+            return Ok(());
+        }
+
+        error!(
+            target: "rebalance",
+            %id,
+            %confirmed_at,
+            %situation,
+            "Settlement retry deadline elapsed; failing the bridge for \
+             operator reconciliation"
+        );
+        let reason = format!(
+            "settlement retry deadline elapsed: withdrawal confirmed at \
+             {confirmed_at}, but {situation}; settle the withdrawn funds with \
+             `transfer reconcile --kind usdc`"
+        );
+        self.cqrs
+            .send(id, UsdcRebalanceCommand::FailBridging { reason })
+            .await?;
+
+        Err(UsdcTransferError::SettlementRetryDeadlineElapsed { id: id.clone() })
     }
 
     fn attestation_retry_deadline_at(
@@ -992,11 +1082,15 @@ impl<
                     .await?;
                 // Thread the confirmed withdrawal_tx so the burn-scan lower bound
                 // is derived from the withdrawal tx block (not the raw chain head).
+                // The withdrawal confirmed moments ago, so `Utc::now()` is the
+                // settlement-deadline anchor here; redrives read the exact
+                // persisted `confirmed_at` from the WithdrawalComplete arm below.
                 self.continue_alpaca_to_base_from_withdrawal_complete(
                     id,
                     amount,
                     withdrawal_tx,
                     initiated_at,
+                    Utc::now(),
                 )
                 .await
             }
@@ -1006,15 +1100,19 @@ impl<
                 amount,
                 withdrawal_tx,
                 initiated_at,
+                confirmed_at,
                 ..
             }) => {
                 // Thread the persisted withdrawal_tx so the durable re-check fires
-                // on apalis redrive (primary gate does not re-run from this arm).
+                // on apalis redrive (primary gate does not re-run from this arm),
+                // and the persisted confirmed_at so the settlement retry deadline
+                // survives restarts.
                 self.continue_alpaca_to_base_from_withdrawal_complete(
                     id,
                     amount,
                     withdrawal_tx,
                     initiated_at,
+                    confirmed_at,
                 )
                 .await
             }
@@ -1318,6 +1416,7 @@ impl<
             filled_amount,
             withdrawal_tx,
             initiated_at,
+            Utc::now(),
         )
         .await
     }
@@ -1330,6 +1429,7 @@ impl<
         amount: Usdc,
         withdrawal_tx: Option<TxHash>,
         initiated_at: DateTime<Utc>,
+        confirmed_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
         // A legacy aggregate can carry a >6-decimal Alpaca fill recorded
         // before fills were floored at derivation, and `usdc_to_u256` below
@@ -1343,18 +1443,31 @@ impl<
         // is transient (the aggregate is already in the durable
         // `WithdrawalComplete` state), so we return `SettlementCheckTransient`
         // so the job delayed-redrives instead of consuming the apalis retry
-        // budget. None means Alpaca returned no tx hash; fall through to the
-        // balance gate.
+        // budget -- but deadline-gated first: a DETERMINISTIC RPC failure
+        // (e.g. Alpaca returned a malformed tx hash) would otherwise redrive
+        // forever through this arm with no operator signal, the exact wedge
+        // the settlement deadline exists to bound. None means Alpaca
+        // returned no tx hash; fall through to the balance gate.
         if let Some(tx) = withdrawal_tx {
-            match self
-                .cctp_bridge
-                .ethereum_tx_confirmations(tx)
-                .await
-                .map_err(|error| UsdcTransferError::SettlementCheckTransient {
-                    id: id.clone(),
-                    source: Box::new(error),
-                })? {
+            let confirmations = match self.cctp_bridge.ethereum_tx_confirmations(tx).await {
+                Ok(confirmations) => confirmations,
+                Err(error) => {
+                    self.check_settlement_deadline(
+                        id,
+                        confirmed_at,
+                        SettlementStall::ConfirmationCheckFailing,
+                    )
+                    .await?;
+                    return Err(UsdcTransferError::SettlementCheckTransient {
+                        id: id.clone(),
+                        source: Box::new(error),
+                    });
+                }
+            };
+            match confirmations {
                 None => {
+                    self.check_settlement_deadline(id, confirmed_at, SettlementStall::TxNeverMined)
+                        .await?;
                     warn!(
                         target: "rebalance",
                         %id,
@@ -1369,6 +1482,12 @@ impl<
                     });
                 }
                 Some(confirmations) if confirmations < self.required_confirmations => {
+                    self.check_settlement_deadline(
+                        id,
+                        confirmed_at,
+                        SettlementStall::TxUnderconfirmed,
+                    )
+                    .await?;
                     warn!(
                         target: "rebalance",
                         %id,
@@ -1411,12 +1530,28 @@ impl<
         //                            invariant broken; ambient/residual USDC present;
         //                            cannot distinguish withdrawal from residual)
         let nominal_u256 = usdc_to_u256(amount)?;
-        let actual_balance = self.read_ethereum_usdc_balance(id).await?;
+        // Deadline-gated like the confirmation check above: a persistent
+        // balance-read failure must not redrive forever unbounded.
+        let actual_balance = match self.read_ethereum_usdc_balance(id).await {
+            Ok(balance) => balance,
+            Err(error) => {
+                self.check_settlement_deadline(
+                    id,
+                    confirmed_at,
+                    SettlementStall::BalanceReadFailing,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
 
         let burn_amount = if actual_balance == U256::ZERO {
             // Zero balance after a confirmed withdrawal is unexpected: either the
             // funds haven't settled (rare timing) or the wallet invariant is broken.
-            // Delayed-redrive so the job retries once settlement completes.
+            // Delayed-redrive so the job retries once settlement completes --
+            // bounded by the settlement retry deadline.
+            self.check_settlement_deadline(id, confirmed_at, SettlementStall::FundsNeverArrived)
+                .await?;
             warn!(
                 target: "rebalance",
                 %id,
@@ -1809,6 +1944,7 @@ impl<
             usdc_amount,
             withdrawal_tx,
             initiated_at,
+            Utc::now(),
         )
         .await?;
 
@@ -5112,10 +5248,12 @@ mod tests {
         "0x0000000000000000000000000000000000000000000000000000000000000001"
     ));
     const TEST_ATTESTATION_RETRY_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
+    const TEST_SETTLEMENT_RETRY_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
 
     fn test_settlement_params() -> UsdcSettlementParams {
         UsdcSettlementParams {
             attestation_retry_deadline: TEST_ATTESTATION_RETRY_DEADLINE,
+            settlement_retry_deadline: TEST_SETTLEMENT_RETRY_DEADLINE,
             required_confirmations: 3,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
@@ -11981,7 +12119,13 @@ mod tests {
         // The burn attempt fails (Cctp error from the fee query or the REVERT
         // contract). Either way the error must not be a balance-gate wedge.
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, nominal, None, Utc::now())
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                nominal,
+                None,
+                Utc::now(),
+                Utc::now(),
+            )
             .await
             .unwrap_err();
 
@@ -12040,7 +12184,13 @@ mod tests {
         advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
 
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None, Utc::now())
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                amount,
+                None,
+                Utc::now(),
+                Utc::now(),
+            )
             .await
             .unwrap_err();
 
@@ -12119,7 +12269,13 @@ mod tests {
         // tx-confirmation endpoint registered), producing SettlementCheckTransient.
         // A BurnRevert error proves the gate was skipped and the burn was attempted.
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, nominal, None, Utc::now())
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                nominal,
+                None,
+                Utc::now(),
+                Utc::now(),
+            )
             .await
             .unwrap_err();
 
@@ -12171,7 +12327,13 @@ mod tests {
         advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, nominal).await;
 
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, nominal, None, Utc::now())
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                nominal,
+                None,
+                Utc::now(),
+                Utc::now(),
+            )
             .await
             .unwrap_err();
 
@@ -12248,6 +12410,7 @@ mod tests {
                 amount,
                 Some(confirmed_tx),
                 Utc::now(),
+                Utc::now(),
             )
             .await
             .unwrap_err();
@@ -12274,6 +12437,201 @@ mod tests {
                 }
             ),
             "Aggregate must stay in WithdrawalComplete (retryable); got: {state:?}"
+        );
+    }
+
+    /// Hypothesis: the retryable settlement wait is bounded by the settlement
+    /// retry deadline (anchored on the durable `confirmed_at`). Past the
+    /// deadline with the wallet still empty, the redrive must emit
+    /// `FailBridging` (a pre-burn terminal, operator-reconcilable) and
+    /// surface `SettlementRetryDeadlineElapsed` instead of re-enqueueing
+    /// forever with the guard latched.
+    #[tokio::test]
+    async fn settlement_deadline_elapsed_fails_bridging_when_balance_missing() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let server = MockServer::start();
+        let (manager, cqrs, _chain) =
+            build_manager_with_wallet_balance(&server, market_maker_wallet, U256::ZERO).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
+
+        let confirmed_at = Utc::now() - chrono::Duration::hours(48);
+        let error = manager
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                amount,
+                None,
+                Utc::now(),
+                confirmed_at,
+            )
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::SettlementRetryDeadlineElapsed { id: err_id } = error else {
+            panic!("Expected SettlementRetryDeadlineElapsed past the deadline; got: {error:?}");
+        };
+        assert_eq!(err_id, id);
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingFailed {
+                    burn_tx_hash: None,
+                    ..
+                }
+            ),
+            "deadline-elapsed settlement must land at pre-burn BridgingFailed \
+             for operator reconciliation; got: {state:?}"
+        );
+    }
+
+    /// Same deadline, never-mined branch: a withdrawal tx hash that no node
+    /// ever resolves (Alpaca reported it, the chain never mined it) must
+    /// terminalize past the deadline instead of redriving forever.
+    #[tokio::test]
+    async fn settlement_deadline_elapsed_fails_bridging_when_tx_never_mined() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let server = MockServer::start();
+        let (manager, cqrs, _chain) =
+            build_manager_with_wallet_balance(&server, market_maker_wallet, U256::ZERO).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
+
+        // A hash that exists nowhere on the chain: the receipt lookup
+        // resolves to None (not mined), the never-mined branch.
+        let unknown_tx =
+            fixed_bytes!("0xdeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddead");
+        let confirmed_at = Utc::now() - chrono::Duration::hours(48);
+        let error = manager
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                amount,
+                Some(unknown_tx),
+                Utc::now(),
+                confirmed_at,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::SettlementRetryDeadlineElapsed { .. }
+            ),
+            "a never-mined tx past the deadline must terminalize; got: {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingFailed {
+                    burn_tx_hash: None,
+                    ..
+                }
+            ),
+            "deadline-elapsed settlement must land at pre-burn BridgingFailed; \
+             got: {state:?}"
+        );
+    }
+
+    /// Same deadline, under-confirmed-tx branch: a withdrawal tx that never
+    /// reaches the required confirmation depth must also terminalize past
+    /// the deadline instead of redriving forever.
+    #[tokio::test]
+    async fn settlement_deadline_elapsed_fails_bridging_when_tx_underconfirmed() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let server = MockServer::start();
+        let (manager, cqrs, chain) =
+            build_manager_with_wallet_balance(&server, market_maker_wallet, U256::ZERO).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
+
+        // chain.mint_tx sits at the chain tip (1 confirmation < required 3).
+        let confirmed_at = Utc::now() - chrono::Duration::hours(48);
+        let error = manager
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                amount,
+                Some(chain.mint_tx),
+                Utc::now(),
+                confirmed_at,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::SettlementRetryDeadlineElapsed { .. }
+            ),
+            "an under-confirmed tx past the deadline must terminalize; got: {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingFailed {
+                    burn_tx_hash: None,
+                    ..
+                }
+            ),
+            "deadline-elapsed settlement must land at pre-burn BridgingFailed; \
+             got: {state:?}"
+        );
+    }
+
+    /// Same deadline, confirmation-check-failure branch: a persistently
+    /// failing confirmations RPC past the deadline must terminalize instead
+    /// of redriving forever as `SettlementCheckTransient`.
+    #[tokio::test]
+    async fn settlement_deadline_elapsed_fails_bridging_when_confirmation_check_fails() {
+        let server = MockServer::start();
+        let (manager, cqrs) = build_manager_with_dead_rpc(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
+
+        let withdrawal_tx =
+            fixed_bytes!("0xdeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddead");
+        let confirmed_at = Utc::now() - chrono::Duration::hours(48);
+        let error = manager
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                amount,
+                Some(withdrawal_tx),
+                Utc::now(),
+                confirmed_at,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::SettlementRetryDeadlineElapsed { .. }
+            ),
+            "a failing confirmation check past the deadline must terminalize; \
+             got: {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingFailed {
+                    burn_tx_hash: None,
+                    ..
+                }
+            ),
+            "deadline-elapsed settlement must land at pre-burn BridgingFailed; \
+             got: {state:?}"
         );
     }
 
@@ -12481,7 +12839,13 @@ mod tests {
         // emitted before the burn attempt; the REVERT leaves the aggregate at
         // BridgingSubmitting with no FailBridging.
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None, Utc::now())
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                amount,
+                None,
+                Utc::now(),
+                Utc::now(),
+            )
             .await
             .unwrap_err();
 
@@ -13040,7 +13404,13 @@ mod tests {
         // zero USDC. No FailBridging is emitted; the aggregate stays in
         // WithdrawalComplete for the next delayed-redrive attempt.
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None, Utc::now())
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                amount,
+                None,
+                Utc::now(),
+                Utc::now(),
+            )
             .await
             .unwrap_err();
 
@@ -13783,7 +14153,13 @@ mod tests {
         advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
 
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None, Utc::now())
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                amount,
+                None,
+                Utc::now(),
+                Utc::now(),
+            )
             .await
             .unwrap_err();
 
@@ -14208,6 +14584,7 @@ mod tests {
                 amount,
                 Some(under_confirmed_tx),
                 Utc::now(),
+                Utc::now(),
             )
             .await
             .unwrap_err();
@@ -14261,7 +14638,13 @@ mod tests {
         advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
 
         let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None, Utc::now())
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                amount,
+                None,
+                Utc::now(),
+                Utc::now(),
+            )
             .await
             .unwrap_err();
 
@@ -14425,6 +14808,7 @@ mod tests {
                 &id,
                 amount,
                 Some(withdrawal_tx),
+                Utc::now(),
                 Utc::now(),
             )
             .await
@@ -17702,6 +18086,7 @@ mod tests {
                 &id,
                 amount,
                 Some(fake_tx),
+                Utc::now(),
                 Utc::now(),
             )
             .await

@@ -329,6 +329,7 @@ mod tests {
     fn make_test_settlement(rebalancing_ctx: &RebalancingCtx) -> UsdcSettlementParams {
         UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
+            settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
             required_confirmations: 0,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
