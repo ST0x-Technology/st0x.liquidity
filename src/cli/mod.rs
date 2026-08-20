@@ -2,6 +2,7 @@
 
 mod alpaca_wallet;
 mod audit_reason;
+mod audit_source;
 mod backpressure_retry;
 mod cctp;
 mod dividend;
@@ -13,6 +14,7 @@ mod vault;
 mod wrapper;
 
 pub use audit_reason::AuditReason;
+pub use audit_source::AuditSource;
 
 use alloy::primitives::{Address, B256, TxHash};
 use alloy::providers::ProviderBuilder;
@@ -246,8 +248,8 @@ pub enum PortfolioSnapshotRecoveryCommand {
         #[arg(long = "observed-at")]
         observed_at: DateTime<Utc>,
         /// Source used to verify the historical price.
-        #[arg(long = "source", value_parser = parse_non_empty_source)]
-        source: String,
+        #[arg(long = "source")]
+        source: AuditSource,
         /// Operator reason persisted with the correction event.
         #[arg(short = 'r', long = "reason")]
         reason: AuditReason,
@@ -272,14 +274,6 @@ fn parse_positive_price(input: &str) -> Result<Float, String> {
 
 fn parse_positive_mark(input: &str) -> Result<Positive<Float>, String> {
     Positive::new(parse_positive_price(input)?).map_err(|error| format!("{error}"))
-}
-
-fn parse_non_empty_source(input: &str) -> Result<String, String> {
-    if input.trim().is_empty() {
-        return Err("--source must not be blank; it is persisted as audit provenance".to_string());
-    }
-
-    Ok(input.to_string())
 }
 
 fn parse_positive_shares(input: &str) -> Result<Positive<FractionalShares>, String> {
