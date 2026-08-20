@@ -32,11 +32,10 @@ use url::Url;
 
 use crate::LogLevel;
 
-/// Number of daily log files the rolling appender retains. Older files are
-/// pruned automatically as new ones roll, bounding on-disk log growth so a
-/// long-running deployment cannot fill the disk (root cause of the 2026-06-08
-/// SQLITE_FULL incident).
-const LOG_RETENTION_DAYS: usize = 14;
+/// Retain one week of daily log files. Older files are pruned automatically as
+/// new ones roll, bounding on-disk log growth so a long-running deployment
+/// cannot fill the disk (root cause of the 2026-06-08 SQLITE_FULL incident).
+const LOG_RETENTION_DAYS: usize = 7;
 
 /// Build the daily-rolling file appender used by every file-logging path.
 ///
@@ -486,6 +485,8 @@ mod tests {
 
     #[test]
     fn build_log_file_appender_prunes_files_beyond_retention_limit() {
+        assert_eq!(LOG_RETENTION_DAYS, 7, "production keeps seven daily logs");
+
         let dir = tempdir().unwrap();
 
         // Seed more dated log files than the retention window. tracing-appender
