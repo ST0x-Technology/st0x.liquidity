@@ -3,7 +3,6 @@
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
-use alloy::primitives::U256;
 use alloy::providers::ProviderBuilder;
 use st0x_config::Ctx;
 use st0x_evm::turnkey::{
@@ -117,7 +116,12 @@ pub async fn verify_turnkey_approval_policies(
     let pending: Vec<ApprovalTarget> = targets
         .into_iter()
         .zip(allowances)
-        .filter(|(_, allowance)| requires_policy(*allowance))
+        .filter(|&(_, allowance)| {
+            allowance.is_none_or(|allowance| match approval_decision(allowance) {
+                ApprovalDecision::GrantMax => true,
+                ApprovalDecision::AlreadySufficient => false,
+            })
+        })
         .map(|(target, _)| target)
         .collect();
 
@@ -150,13 +154,6 @@ fn missing_policy_coverage(
         .filter(|target| !policies_cover_target(policies, target, user_id))
         .cloned()
         .collect()
-}
-
-/// Whether a startup approval still needs a Turnkey policy: its on-chain
-/// allowance is below the watermark, or the allowance read failed.
-fn requires_policy(allowance: Option<U256>) -> bool {
-    allowance
-        .is_none_or(|allowance| matches!(approval_decision(allowance), ApprovalDecision::GrantMax))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -592,26 +589,5 @@ mod tests {
         assert!(message.contains("AAPL"));
         assert!(message.contains(&target.token.to_string()));
         assert!(message.contains(&target.spender.to_string()));
-    }
-
-    #[test]
-    fn requires_policy_skips_max_allowance() {
-        assert!(!requires_policy(Some(U256::MAX)));
-    }
-
-    #[test]
-    fn requires_policy_flags_zero_allowance() {
-        assert!(requires_policy(Some(U256::ZERO)));
-    }
-
-    #[test]
-    fn requires_policy_flags_bounded_allowance() {
-        let bounded = U256::from(1000u64) * U256::from(10u64).pow(U256::from(18u64));
-        assert!(requires_policy(Some(bounded)));
-    }
-
-    #[test]
-    fn requires_policy_fails_closed_on_read_failure() {
-        assert!(requires_policy(None));
     }
 }
