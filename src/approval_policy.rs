@@ -635,20 +635,16 @@ mod tests {
 
     fn allowance_targets(count: usize) -> Vec<ApprovalTarget> {
         (0..count)
-            .map(|i| {
-                let i = u8::try_from(i).unwrap();
+            .map(|index| {
+                let byte = u8::try_from(index).unwrap();
                 ApprovalTarget {
-                    token: Address::repeat_byte(i + 1),
-                    spender: Address::repeat_byte(i + 0x80),
+                    token: Address::repeat_byte(byte + 1),
+                    spender: Address::repeat_byte(byte + 0x80),
                     symbol: None,
                     purpose: ApprovalPurpose::DepositUsdc,
                 }
             })
             .collect()
-    }
-
-    fn mock_evm(asserter: Asserter) -> ReadOnlyEvm<RootProvider> {
-        ReadOnlyEvm::new(RootProvider::new(RpcClient::mocked(asserter)))
     }
 
     #[tokio::test]
@@ -660,8 +656,8 @@ mod tests {
             asserter.push_success(&max);
         }
 
-        let pending =
-            pending_targets(&mock_evm(asserter), Address::repeat_byte(0xEE), targets).await;
+        let evm = ReadOnlyEvm::new(RootProvider::new(RpcClient::mocked(asserter)));
+        let pending = pending_targets(&evm, Address::repeat_byte(0xEE), targets).await;
 
         assert!(pending.is_empty());
     }
@@ -676,8 +672,8 @@ mod tests {
         }
         let expected = targets.clone();
 
-        let pending =
-            pending_targets(&mock_evm(asserter), Address::repeat_byte(0xEE), targets).await;
+        let evm = ReadOnlyEvm::new(RootProvider::new(RpcClient::mocked(asserter)));
+        let pending = pending_targets(&evm, Address::repeat_byte(0xEE), targets).await;
 
         assert_eq!(pending, expected);
     }
@@ -689,12 +685,8 @@ mod tests {
 
         // An empty asserter errors every allowance read, so every target is
         // kept under verification (fail closed).
-        let pending = pending_targets(
-            &mock_evm(Asserter::new()),
-            Address::repeat_byte(0xEE),
-            targets,
-        )
-        .await;
+        let evm = ReadOnlyEvm::new(RootProvider::new(RpcClient::mocked(Asserter::new())));
+        let pending = pending_targets(&evm, Address::repeat_byte(0xEE), targets).await;
 
         assert_eq!(pending, expected);
     }
