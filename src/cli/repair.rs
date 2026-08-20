@@ -70,7 +70,7 @@ pub(super) async fn set_portfolio_snapshot_mark_command<W: Write>(
                 symbol: symbol.clone(),
                 usd_mark,
                 observed_at,
-                source: source.clone(),
+                source: source.clone().into(),
                 reason: reason.clone().into(),
                 corrected_at: Utc::now(),
             },
@@ -611,7 +611,7 @@ mod tests {
                 symbol: symbol.clone(),
                 usd_mark: Positive::new(float!(150)).unwrap(),
                 observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
-                source: "Nasdaq historical close".to_owned(),
+                source: "Nasdaq historical close".parse().unwrap(),
                 reason: "repair missing mark".parse().unwrap(),
             },
         )
@@ -633,15 +633,26 @@ mod tests {
                 .is_none(),
             "historical repair must not create or update live Position state"
         );
-        let event_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'PortfolioSnapshot' \
+        let payloads: Vec<String> = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE aggregate_type = 'PortfolioSnapshot' \
              AND aggregate_id = ? AND event_type = 'PortfolioSnapshotEvent::EquityMarkSet'",
         )
         .bind(day.to_string())
-        .fetch_one(&pool)
+        .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(event_count, 1);
+        assert_eq!(payloads.len(), 1);
+
+        // `source` and `reason` are adjacent `String` fields on the event, so
+        // both are asserted: swapping them at the call site would otherwise
+        // compile and satisfy every other assertion here.
+        let event: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        let fields = &event["EquityMarkSet"];
+        assert_eq!(
+            fields["source"],
+            serde_json::json!("Nasdaq historical close")
+        );
+        assert_eq!(fields["reason"], serde_json::json!("repair missing mark"));
     }
 
     #[tokio::test]
@@ -668,7 +679,7 @@ mod tests {
                 symbol,
                 usd_mark: Positive::new(float!(150)).unwrap(),
                 observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
-                source: "Nasdaq historical close".to_owned(),
+                source: "Nasdaq historical close".parse().unwrap(),
                 reason: "repair missing mark".parse().unwrap(),
             },
         )
