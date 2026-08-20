@@ -2,6 +2,7 @@
 
 use std::fmt::{Display, Formatter};
 use std::path::Path;
+use std::time::Duration;
 
 use alloy::providers::ProviderBuilder;
 use st0x_config::Ctx;
@@ -77,6 +78,10 @@ pub enum ApprovalPolicyVerificationError {
     MissingCoverage(#[from] MissingPolicyCoverage),
 }
 
+/// Bounds each allowance read so an unresponsive base RPC cannot stall the
+/// deploy; a read that exceeds it is treated as a failed read.
+const ALLOWANCE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Validates deploy inputs, lists Turnkey policies, and fails unless every
 /// startup MAX approval has a provably matching allow policy.
 pub async fn verify_turnkey_approval_policies(
@@ -101,15 +106,17 @@ pub async fn verify_turnkey_approval_policies(
     let allowances = futures_util::future::join_all(targets.iter().map(|target| {
         let evm = &evm;
         async move {
-            evm.call::<OpenChainErrorRegistry, _>(
+            let read = evm.call::<OpenChainErrorRegistry, _>(
                 target.token,
                 IERC20::allowanceCall {
                     owner,
                     spender: target.spender,
                 },
-            )
-            .await
-            .ok()
+            );
+            tokio::time::timeout(ALLOWANCE_READ_TIMEOUT, read)
+                .await
+                .ok()
+                .and_then(Result::ok)
         }
     }))
     .await;
