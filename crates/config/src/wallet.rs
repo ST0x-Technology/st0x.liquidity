@@ -59,8 +59,9 @@ pub enum WalletCtxError {
 }
 
 /// Rejects wallet RPC URLs that would carry signing traffic over cleartext
-/// HTTP. HTTP is allowed only for loopback hosts, so local test nodes
-/// (Anvil) keep working while any routable endpoint must be HTTPS. Enforced
+/// HTTP. HTTP is allowed only for loopback hosts without embedded credentials,
+/// so local test nodes (Anvil) keep working while any routable endpoint must be
+/// HTTPS. Enforced
 /// both at config load and in [`OnchainWalletCtx::new`], so no caller of the
 /// public constructor can bypass it.
 pub(crate) fn require_secure_wallet_rpc_url(
@@ -78,7 +79,9 @@ pub(crate) fn require_secure_wallet_rpc_url(
         None => false,
     };
 
-    if is_loopback && url.scheme() == "http" {
+    let has_credentials = !url.username().is_empty() || url.password().is_some();
+
+    if is_loopback && url.scheme() == "http" && !has_credentials {
         Ok(())
     } else {
         Err(WalletCtxError::InsecureRpcUrl { field })
@@ -247,5 +250,27 @@ impl OnchainWalletCtx {
             ethereum: ethereum_wallet,
             hyperevm: hyperevm_wallet,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_credentials_on_loopback_http() {
+        let url = Url::parse("http://user:pass@localhost:8545").unwrap();
+        assert!(matches!(
+            require_secure_wallet_rpc_url(&url, "base_rpc_url"),
+            Err(WalletCtxError::InsecureRpcUrl {
+                field: "base_rpc_url"
+            })
+        ));
+    }
+
+    #[test]
+    fn allows_credential_free_loopback_http() {
+        let url = Url::parse("http://localhost:8545").unwrap();
+        assert!(require_secure_wallet_rpc_url(&url, "base_rpc_url").is_ok());
     }
 }
