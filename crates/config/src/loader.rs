@@ -16,7 +16,7 @@ use st0x_execution::{
 };
 use st0x_finance::{Usd, Usdc};
 use std::collections::HashMap;
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tracing::{Level, warn};
@@ -155,6 +155,8 @@ pub struct TurnkeyApprovalPolicyInputs {
     pub orderbook: Address,
     pub owner: Address,
     pub base_rpc_url: Url,
+    pub allowance_read_timeout_secs: NonZeroU64,
+    pub allowance_read_concurrency: NonZeroUsize,
     pub assets: AssetsConfig,
 }
 
@@ -171,6 +173,14 @@ impl std::fmt::Debug for TurnkeyApprovalPolicyInputs {
             .field("owner", &self.owner)
             .field("base_rpc_url", &self.base_rpc_url.host_str())
             .field("assets", &self.assets)
+            .field(
+                "allowance_read_timeout_secs",
+                &self.allowance_read_timeout_secs,
+            )
+            .field(
+                "allowance_read_concurrency",
+                &self.allowance_read_concurrency,
+            )
             .finish()
     }
 }
@@ -264,6 +274,12 @@ struct Config {
     inventory_divergence_threshold: NonZeroU32,
     order_fill_poll_interval: Option<u64>,
     apalis_finished_job_cleanup_interval_secs: u64,
+    /// Timeout (seconds) for each approval policy allowance read at deploy time.
+    /// Required by `verify-approvals`; the running bot does not use it.
+    allowance_read_timeout_secs: Option<NonZeroU64>,
+    /// Concurrency limit for the approval policy allowance reads at deploy time.
+    /// Required by `verify-approvals`; the running bot does not use it.
+    allowance_read_concurrency: Option<NonZeroUsize>,
     telemetry: Option<TelemetryConfig>,
     alerts: Option<AlertsConfig>,
     rebalancing: Option<RebalancingConfig>,
@@ -893,6 +909,8 @@ struct ValidatedParts {
     extended_hours_close_flatten_window_secs: u64,
     close_flatten_cross_max_bps: u16,
     apalis_finished_job_cleanup_interval_secs: u64,
+    allowance_read_timeout_secs: Option<NonZeroU64>,
+    allowance_read_concurrency: Option<NonZeroUsize>,
     broker: BrokerCtx,
     telemetry: Option<TelemetryCtx>,
     alerts: Option<AlertsCtx>,
@@ -1182,6 +1200,8 @@ fn parse_and_validate(
         board_port: config.board_port,
         evm,
         inventory_adapters: config.raindex.inventory_adapters,
+        allowance_read_timeout_secs: config.allowance_read_timeout_secs,
+        allowance_read_concurrency: config.allowance_read_concurrency,
         order_polling_interval: polling_intervals.order_polling_interval,
         order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
         position_check_interval: polling_intervals.position_check_interval,
@@ -1428,6 +1448,19 @@ impl Ctx {
                     source,
                 })?;
 
+        let allowance_read_timeout_secs =
+            parts
+                .allowance_read_timeout_secs
+                .ok_or(CtxError::MissingApprovalPolicyConfig {
+                    field: "allowance_read_timeout_secs",
+                })?;
+        let allowance_read_concurrency =
+            parts
+                .allowance_read_concurrency
+                .ok_or(CtxError::MissingApprovalPolicyConfig {
+                    field: "allowance_read_concurrency",
+                })?;
+
         Ok(Some(TurnkeyApprovalPolicyInputs {
             organization_id,
             kms_api_key,
@@ -1435,6 +1468,8 @@ impl Ctx {
             orderbook: parts.evm.orderbook,
             owner: parts.wallet_meta.address,
             base_rpc_url: parts.wallet_inputs.base_rpc_url,
+            allowance_read_timeout_secs,
+            allowance_read_concurrency,
             assets: parts.assets,
         }))
     }
@@ -1823,6 +1858,8 @@ pub enum CtxError {
     Wallet(#[from] crate::wallet::WalletCtxError),
     #[error("[evm] {field} is required when [wallet] is configured")]
     WalletMissingRpcUrl { field: &'static str },
+    #[error("{field} is required in config for the approval policy check at deploy time")]
+    MissingApprovalPolicyConfig { field: &'static str },
     #[error("[wallet] config present but [wallet] secrets missing")]
     WalletSecretsMissing,
     #[error(
@@ -1919,6 +1956,7 @@ impl CtxError {
             Self::WalletNotConfigured => "wallet not configured",
             Self::Wallet(_) => "wallet construction error",
             Self::WalletMissingRpcUrl { .. } => "wallet missing RPC URL",
+            Self::MissingApprovalPolicyConfig { .. } => "missing approval policy config",
             Self::WalletSecretsMissing => "wallet secrets missing",
             Self::RestApiClient(_) => "failed to build REST API HTTP client",
             Self::MissingIssuanceConfig => "missing issuance config",
@@ -6968,6 +7006,8 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            allowance_read_timeout_secs = 10
+            allowance_read_concurrency = 8
 
             [assets.equities.AAPL]
             tokenized_equity = "0x4444444444444444444444444444444444444444"
@@ -7027,6 +7067,8 @@ mod tests {
             address!("0x6666666666666666666666666666666666666666")
         );
         assert_eq!(inputs.base_rpc_url.as_str(), "https://base.example.com/");
+        assert_eq!(inputs.allowance_read_timeout_secs.get(), 10);
+        assert_eq!(inputs.allowance_read_concurrency.get(), 8);
         assert!(
             inputs
                 .assets
@@ -7039,6 +7081,72 @@ mod tests {
 
     #[cfg(feature = "wallet-turnkey")]
     #[test]
+    fn load_turnkey_approval_policy_inputs_requires_allowance_read_config() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+
+            [assets.equities.AAPL]
+            tokenized_equity = "0x4444444444444444444444444444444444444444"
+            tokenized_equity_derivative = "0x5555555555555555555555555555555555555555"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [wallet]
+            kind = "turnkey"
+            address = "0x6666666666666666666666666666666666666666"
+            organization_id = "org-test"
+            "#,
+        );
+        let secrets = toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://ethereum.example.com"
+            hyperevm_rpc_url = "https://hyperevm.example.com"
+
+            [broker]
+            type = "dry-run"
+
+            [wallet]
+            api_private_key = "secret-p256-key"
+
+            [issuance]
+            base_url = "http://issuance.test:8000"
+            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+            "#,
+        );
+
+        let error = Ctx::load_turnkey_approval_policy_inputs(config.path(), secrets.path())
+            .expect_err("missing allowance read config must fail");
+
+        assert!(matches!(
+            error,
+            CtxError::MissingApprovalPolicyConfig {
+                field: "allowance_read_timeout_secs"
+            }
+        ));
+    }
+
+    #[cfg(feature = "wallet-turnkey")]
+    #[test]
     fn turnkey_approval_policy_inputs_debug_redacts_base_rpc_url_userinfo() {
         let inputs = TurnkeyApprovalPolicyInputs {
             organization_id: st0x_evm::turnkey::TurnkeyOrganizationId::new("org-test".to_string()),
@@ -7047,6 +7155,8 @@ mod tests {
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             owner: address!("0x6666666666666666666666666666666666666666"),
             base_rpc_url: Url::parse("https://user:pass@rpc.example.com/secret-key").unwrap(),
+            allowance_read_timeout_secs: NonZeroU64::new(10).unwrap(),
+            allowance_read_concurrency: NonZeroUsize::new(8).unwrap(),
             assets: AssetsConfig::default(),
         };
 

@@ -14,6 +14,10 @@ apalis_finished_job_cleanup_interval_secs = 3600
 # Hedging balance for a symbol before the poller escalates a forced snapshot
 # reconciliation.
 inventory_divergence_threshold = 10
+# Turnkey approval policy coverage check (verify-approvals) at deploy time:
+# timeout (seconds) and concurrency for each onchain allowance read.
+allowance_read_timeout_secs = 10
+allowance_read_concurrency = 8
 [telemetry]
 service_name = "st0x-liquidity"
 environment = "production"

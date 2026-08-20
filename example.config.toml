@@ -11,6 +11,11 @@ inventory_divergence_threshold = 10
 # Each tick enqueues a backfill range over the unprocessed blocks, capped at the
 # configured ingestion_cutoff block. The poll interval defaults to 5 seconds when omitted.
 order_fill_poll_interval = 5
+# Turnkey approval policy coverage check (`verify-approvals`) at deploy time.
+# Timeout (seconds) and concurrency for each onchain allowance read.
+# Both required when the wallet is Turnkey; positive integers, never defaulted.
+allowance_read_timeout_secs = 10
+allowance_read_concurrency = 8
 
 [telemetry]
 service_name = "st0x-hedge"

@@ -84,13 +84,6 @@ pub enum ApprovalPolicyVerificationError {
     Http(#[from] reqwest::Error),
 }
 
-/// Bounds each allowance read so an unresponsive base RPC cannot stall the
-/// deploy; a read that exceeds it is treated as a failed read.
-const ALLOWANCE_READ_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Bounds the number of concurrent allowance reads issued against the base RPC.
-const ALLOWANCE_READ_CONCURRENCY: usize = 8;
-
 /// Validates deploy inputs, lists Turnkey policies, and fails unless every
 /// startup MAX approval has a provably matching allow policy.
 pub async fn verify_turnkey_approval_policies(
@@ -111,14 +104,22 @@ pub async fn verify_turnkey_approval_policies(
     // bounced elsewhere by a 3xx response.
     let http_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(ALLOWANCE_READ_TIMEOUT)
+        .timeout(Duration::from_secs(
+            inputs.allowance_read_timeout_secs.get(),
+        ))
         .build()?;
     let is_local = alloy::transports::utils::guess_local_url(inputs.base_rpc_url.as_str());
     let transport = Http::with_client(http_client, inputs.base_rpc_url.clone());
     let evm = ReadOnlyEvm::new(RootProvider::new(
         RpcClient::builder().transport(transport, is_local),
     ));
-    let pending = pending_targets(&evm, owner, targets).await;
+    let pending = pending_targets(
+        &evm,
+        owner,
+        targets,
+        inputs.allowance_read_concurrency.get(),
+    )
+    .await;
 
     let client = TurnkeyPolicyClient::new(
         inputs.organization_id,
@@ -139,13 +140,14 @@ pub async fn verify_turnkey_approval_policies(
     })
 }
 
-/// Reads each target's on-chain allowance over `evm` and returns the targets
+/// Reads each target's onchain allowance over `evm` and returns the targets
 /// the startup grant would submit: allowance below the watermark, or a failed
 /// read (kept under verification).
 async fn pending_targets<P>(
     evm: &ReadOnlyEvm<P>,
     owner: Address,
     targets: Vec<ApprovalTarget>,
+    concurrency: usize,
 ) -> Vec<ApprovalTarget>
 where
     P: Provider + Clone + Send + Sync + 'static,
@@ -174,7 +176,7 @@ where
             }
         }
     }))
-    .buffered(ALLOWANCE_READ_CONCURRENCY)
+    .buffered(concurrency)
     .collect::<Vec<_>>()
     .await;
     targets
@@ -663,7 +665,7 @@ mod tests {
         }
 
         let evm = ReadOnlyEvm::new(RootProvider::new(RpcClient::mocked(asserter)));
-        let pending = pending_targets(&evm, Address::repeat_byte(0xEE), targets).await;
+        let pending = pending_targets(&evm, Address::repeat_byte(0xEE), targets, 2).await;
 
         assert!(pending.is_empty());
     }
@@ -679,7 +681,7 @@ mod tests {
         let expected = targets.clone();
 
         let evm = ReadOnlyEvm::new(RootProvider::new(RpcClient::mocked(asserter)));
-        let pending = pending_targets(&evm, Address::repeat_byte(0xEE), targets).await;
+        let pending = pending_targets(&evm, Address::repeat_byte(0xEE), targets, 2).await;
 
         assert_eq!(pending, expected);
     }
@@ -692,7 +694,7 @@ mod tests {
         // An empty asserter errors every allowance read, so every target is
         // kept under verification (fail closed).
         let evm = ReadOnlyEvm::new(RootProvider::new(RpcClient::mocked(Asserter::new())));
-        let pending = pending_targets(&evm, Address::repeat_byte(0xEE), targets).await;
+        let pending = pending_targets(&evm, Address::repeat_byte(0xEE), targets, 2).await;
 
         assert_eq!(pending, expected);
     }
