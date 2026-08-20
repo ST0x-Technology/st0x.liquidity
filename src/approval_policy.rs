@@ -147,15 +147,28 @@ where
     P: Provider + Clone + Send + Sync + 'static,
 {
     let allowances = futures_util::future::join_all(targets.iter().map(|target| async move {
-        evm.call::<OpenChainErrorRegistry, _>(
-            target.token,
-            IERC20::allowanceCall {
-                owner,
-                spender: target.spender,
-            },
-        )
-        .await
-        .ok()
+        match evm
+            .call::<OpenChainErrorRegistry, _>(
+                target.token,
+                IERC20::allowanceCall {
+                    owner,
+                    spender: target.spender,
+                },
+            )
+            .await
+        {
+            Ok(allowance) => Some(allowance),
+            Err(error) => {
+                tracing::warn!(
+                    target: "startup",
+                    token = %target.token,
+                    spender = %target.spender,
+                    %error,
+                    "Failed to read startup approval allowance; keeping target under verification"
+                );
+                None
+            }
+        }
     }))
     .await;
     targets
