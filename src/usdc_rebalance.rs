@@ -138,6 +138,24 @@ pub(crate) struct ConversionAmounts {
     pub(crate) received_amount: Usdc,
 }
 
+/// Durable Alpaca-to-Base pre-burn state needed to reconstruct the source
+/// inventory reservation after a process restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AlpacaToBaseReservationRecovery {
+    pub(crate) amount: Usdc,
+    pub(crate) stage: AlpacaToBaseReservationStage,
+    pub(crate) last_progress_at: DateTime<Utc>,
+}
+
+/// The durable lifecycle point represented by a recovered source reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlpacaToBaseReservationStage {
+    ConversionComplete,
+    Withdrawing,
+    WithdrawalComplete,
+    BridgingSubmitting,
+}
+
 impl ConversionAmounts {
     pub(crate) const fn new(source_amount: Usdc, received_amount: Usdc) -> Self {
         Self {
@@ -1536,6 +1554,80 @@ impl UsdcRebalance {
             | Self::BridgingFailed { .. }
             | Self::Reconciled { .. } => None,
         }
+    }
+
+    /// Returns the exact source reservation that an Alpaca-to-Base pre-burn
+    /// aggregate must regain after restart, or `None` when the aggregate is not
+    /// in a recoverable source-reservation state.
+    pub(crate) fn alpaca_to_base_reservation_recovery(
+        &self,
+    ) -> Option<AlpacaToBaseReservationRecovery> {
+        let (amount, stage, last_progress_at) = match self {
+            Self::ConversionComplete {
+                direction: RebalanceDirection::AlpacaToBase,
+                conversion,
+                converted_at,
+                ..
+            } => (
+                conversion.received_amount,
+                AlpacaToBaseReservationStage::ConversionComplete,
+                *converted_at,
+            ),
+            Self::Withdrawing {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                initiated_at,
+                ..
+            } => (
+                *amount,
+                AlpacaToBaseReservationStage::Withdrawing,
+                *initiated_at,
+            ),
+            Self::WithdrawalComplete {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                confirmed_at,
+                ..
+            } => (
+                *amount,
+                AlpacaToBaseReservationStage::WithdrawalComplete,
+                *confirmed_at,
+            ),
+            Self::BridgingSubmitting {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                initiated_at,
+                pending_burn_tx: None,
+                ..
+            } => (
+                *amount,
+                AlpacaToBaseReservationStage::BridgingSubmitting,
+                *initiated_at,
+            ),
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::BridgingSubmitting { .. }
+            | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => return None,
+        };
+
+        Some(AlpacaToBaseReservationRecovery {
+            amount,
+            stage,
+            last_progress_at,
+        })
     }
 }
 
@@ -5211,6 +5303,26 @@ mod tests {
             failed_at: now,
         };
         assert_eq!(deposit_failed.direction(), RebalanceDirection::AlpacaToBase);
+    }
+
+    /// A recorded burn is no longer safely reconstructable from the fresh
+    /// offchain source balance and must retain guard-only recovery.
+    #[test]
+    fn reservation_recovery_rejects_bridging_submitting_with_pending_burn() {
+        let state = UsdcRebalance::BridgingSubmitting {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc::new(float!(321)),
+            from_block: 100,
+            initiated_at: Utc::now(),
+            burn_amount: Some(Usdc::new(float!(320))),
+            pending_burn_tx: Some(fixed_bytes!(
+                "0x0000000000000000000000000000000000000000000000000000000000000002"
+            )),
+        };
+
+        let None = state.alpaca_to_base_reservation_recovery() else {
+            panic!("a recorded burn must retain guard-only recovery");
+        };
     }
 
     /// `amount()` must return the persisted EFFECTIVE amount: the conversion
