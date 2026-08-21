@@ -695,12 +695,7 @@ impl<
         let conversion = self
             .record_conversion_or_fail(id, &correlation_id, &order, conversion_order.direction())
             .await?;
-        // Alpaca's notional USD->USDC buy fills with up to 9 decimals; USDC
-        // on-chain has 6. Floor at the fill boundary so every downstream step
-        // (withdrawal, burn) works on a representable amount. The persisted
-        // `ConversionConfirmed` event keeps the exact fill for audit; the
-        // sub-6-decimal remainder stays in the Alpaca crypto wallet.
-        let received_amount = conversion.received_amount.floor_to_6_decimals()?;
+        let received_amount = conversion.received_amount;
 
         // The trigger's floor only covers the amount it *requests*; a stalled
         // conversion whose remainder was cancelled delivers whatever filled,
@@ -965,12 +960,16 @@ impl<
                 initiated_at,
                 ..
             }) => {
-                // Floor here and in every arm below: a persisted aggregate
-                // can carry an Alpaca fill amount with more than 6 decimals,
-                // which `usdc_to_u256` rejects on every resume.
+                // Passed through UNfloored: `initiate_alpaca_withdrawal`
+                // sends `Initiate` with this amount, and the aggregate refuses
+                // any amount that differs from the recorded conversion. New
+                // conversions are floored at derivation; a legacy aggregate
+                // that recorded a >6-decimal fill must keep withdrawing that
+                // exact value -- it is floored before any on-chain use by
+                // `continue_alpaca_to_base_from_withdrawal_complete`.
                 self.continue_alpaca_to_base_from_conversion_complete(
                     id,
-                    conversion.received_amount.floor_to_6_decimals()?,
+                    conversion.received_amount,
                     initiated_at,
                 )
                 .await
@@ -994,7 +993,7 @@ impl<
                 // is derived from the withdrawal tx block (not the raw chain head).
                 self.continue_alpaca_to_base_from_withdrawal_complete(
                     id,
-                    amount.floor_to_6_decimals()?,
+                    amount,
                     withdrawal_tx,
                     initiated_at,
                 )
@@ -1012,7 +1011,7 @@ impl<
                 // on apalis redrive (primary gate does not re-run from this arm).
                 self.continue_alpaca_to_base_from_withdrawal_complete(
                     id,
-                    amount.floor_to_6_decimals()?,
+                    amount,
                     withdrawal_tx,
                     initiated_at,
                 )
@@ -1331,6 +1330,12 @@ impl<
         withdrawal_tx: Option<TxHash>,
         initiated_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
+        // A legacy aggregate can carry a >6-decimal Alpaca fill recorded
+        // before fills were floored at derivation, and `usdc_to_u256` below
+        // refuses off-grid amounts. Floor at this choke point so every entry
+        // -- the resume arms and the in-memory continuation from
+        // `ConversionComplete` -- burns an on-chain-representable amount.
+        let amount = amount.floor_to_6_decimals()?;
         // DURABLE confirmation re-check: fires on the redrive path
         // (`WithdrawalComplete` -> resume) when the primary gate in
         // `poll_and_confirm_withdrawal` does not re-run. An RPC failure here
@@ -4282,7 +4287,16 @@ fn conversion_amounts_from_order(
     let cash_proceeds = std::ops::Mul::mul(filled_quantity, filled_average_price)?;
 
     Ok(match direction {
-        ConversionDirection::UsdToUsdc => ConversionAmounts::new(cash_proceeds, filled_quantity),
+        // Alpaca reports a notional buy's fill with up to 9 decimals;
+        // on-chain USDC has 6. Floor where the received amount is derived, so
+        // the persisted conversion, the withdrawal commands, and the burn all
+        // carry the same on-grid value -- the aggregate refuses a withdrawal
+        // whose amount differs from the recorded conversion. The sub-grid
+        // remainder stays in the Alpaca crypto wallet. Cash proceeds keep the
+        // exact fill: they record what the buy actually spent.
+        ConversionDirection::UsdToUsdc => {
+            ConversionAmounts::new(cash_proceeds, filled_quantity.floor_to_6_decimals()?)
+        }
         ConversionDirection::UsdcToUsd => ConversionAmounts::new(filled_quantity, cash_proceeds),
     })
 }
@@ -5523,6 +5537,46 @@ mod tests {
         assert_eq!(usdc_to_u256(amount).unwrap(), U256::from(1_000_123_456u64));
     }
 
+    /// A notional USD->USDC buy names dollars, so Alpaca decides the quantity
+    /// and reports it to nine decimal places -- observed on a sandbox account
+    /// as notional 10 filling 9.794019706 at 1.00101001. USDC carries six
+    /// decimals on-chain, so the received amount must be bounded here, where
+    /// it is derived and persisted: every consumer downstream treats it as an
+    /// on-chain quantity, and `usdc_to_u256` is lossless (see
+    /// `test_usdc_to_u256_rejects_excess_precision`), so an unbounded fill
+    /// strands the transfer with the in-progress guard held.
+    ///
+    /// Truncation is downwards, never rounding: the fill is all the USDC that
+    /// exists, so rounding up would ask Alpaca to withdraw, and CCTP to burn,
+    /// more than was bought.
+    #[test]
+    fn usd_to_usdc_received_amount_is_bounded_to_usdc_precision() {
+        let order: CryptoOrderResponse = serde_json::from_value(json!({
+            "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "symbol": "USDCUSD",
+            "qty": null,
+            "notional": "10",
+            "status": "filled",
+            "filled_avg_price": "1.00101001",
+            "filled_qty": "9.794019706",
+            "created_at": "2025-01-06T12:30:00Z"
+        }))
+        .unwrap();
+
+        let conversion = conversion_amounts_from_order(
+            &order,
+            &ClientOrderId::from_uuid(uuid!("33333333-3333-4333-8333-333333333333")),
+            ConversionDirection::UsdToUsdc,
+        )
+        .unwrap();
+
+        assert_eq!(conversion.received_amount, usdc("9.794019"));
+        assert_eq!(
+            usdc_to_u256(conversion.received_amount).unwrap(),
+            U256::from(9_794_019u64)
+        );
+    }
+
     #[test]
     fn test_usdc_to_u256_minimum_amount() {
         // Test near-minimum amounts (smallest USDC unit is 0.000001)
@@ -5878,6 +5932,63 @@ mod tests {
             .unwrap();
 
         order_mock.assert();
+    }
+
+    /// The fresh-fill path proven end to end: a 9-decimal Alpaca fill is
+    /// floored where it is derived, so the confirmed conversion records the
+    /// on-grid amount and the aggregate accepts an `Initiate` for exactly the
+    /// amount the conversion returned. Flooring after `ConfirmConversion`
+    /// instead would persist the exact fill and make the aggregate refuse the
+    /// floored withdrawal amount -- with a real Alpaca withdrawal already in
+    /// flight.
+    #[tokio::test]
+    async fn nine_decimal_fresh_fill_confirms_floored_and_accepts_initiate() {
+        let server = MockServer::start();
+        let _account_mock = create_broker_account_mock(&server);
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d";
+        let _order_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": order_id,
+                    "symbol": "USDCUSD",
+                    "qty": null,
+                    "notional": "9794.02",
+                    "status": "filled",
+                    "filled_avg_price": "1.0001",
+                    "filled_qty": "9794.019706861",
+                    "created_at": "2024-01-15T10:30:00Z"
+                }));
+        });
+        let _get_mock = create_get_order_mock_with_fill(
+            &server,
+            order_id,
+            "9794.02",
+            "9794.019706861",
+            "1.0001",
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let received = manager
+            .execute_usd_to_usdc_conversion(&id, usdc("9794.02"))
+            .await
+            .unwrap();
+        assert_eq!(received, usdc("9794.019706"));
+
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: received,
+                withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            },
+        )
+        .await
+        .unwrap();
     }
 
     /// A conversion sized at zero or below has nothing to buy: it must be
@@ -8518,6 +8629,101 @@ mod tests {
             UsdcTransferError::SettlementCheckTransient { .. } => {}
             other => panic!("expected SettlementCheckTransient after flooring, got {other:?}"),
         }
+    }
+
+    /// A legacy aggregate can hold `ConversionComplete` with the exact
+    /// 9-decimal fill recorded before fills were floored at derivation. The
+    /// resume arm must withdraw that exact recorded amount: the aggregate
+    /// refuses an `Initiate` whose amount differs from the recorded
+    /// conversion, so flooring here would strand the transfer at
+    /// `ConversionComplete` while initiating a real Alpaca withdrawal on
+    /// every redrive.
+    #[tokio::test]
+    async fn resume_from_conversion_complete_withdraws_the_exact_legacy_amount() {
+        let server = MockServer::start();
+        let _account_mock = create_broker_account_mock(&server);
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let exact = usdc("9794.019706861");
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: usdc("9794.02"),
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: ConversionAmounts::new(usdc("9794.02"), exact),
+            },
+        )
+        .await
+        .unwrap();
+
+        let _whitelist_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "id": "whitelist-123",
+                    "address": "0x1111111111111111111111111111111111111111",
+                    "asset": "USDC",
+                    "chain": "ethereum",
+                    "status": "APPROVED",
+                    "created_at": "2024-01-01T00:00:00Z"
+                }]));
+        });
+
+        let transfer_id = "7e4b9c0a-2f6d-4b0e-9c3a-1d2e3f4a5b6c";
+        // FAILED with no tx hash is Alpaca's determinate terminal failure, so
+        // the flow ends deterministically right after the withdrawal poll.
+        let transfer_body = json!({
+            "id": transfer_id,
+            "direction": "OUTGOING",
+            "amount": "9794.019706861",
+            "usd_value": "9794.02",
+            "chain": "ethereum",
+            "asset": "USDC",
+            "from_address": "0x2222222222222222222222222222222222222222",
+            "to_address": "0x1111111111111111111111111111111111111111",
+            "status": "FAILED",
+            "created_at": "2024-01-01T00:00:00Z",
+            "network_fee": "0.5",
+            "fees": "0"
+        });
+
+        // Matches only a withdrawal for the exact recorded amount; a floored
+        // request would miss this mock and fail the withdrawal initiation.
+        let withdrawal_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers")
+                .json_body_includes(r#"{"amount": "9794.019706861"}"#);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(transfer_body.clone());
+        });
+        let _poll_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers/{transfer_id}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(transfer_body.clone());
+        });
+
+        let error = manager.resume_alpaca_to_base(&id, exact).await.unwrap_err();
+
+        withdrawal_mock.assert();
+        assert!(
+            matches!(error, UsdcTransferError::WithdrawalFailed { .. }),
+            "expected the mocked FAILED transfer to surface as WithdrawalFailed, got {error:?}"
+        );
     }
 
     /// The fresh conversion path must refuse a sub-minimum fill before it
