@@ -2904,6 +2904,108 @@ mod tests {
         );
     }
 
+    /// Dropping an unconfigured symbol's rows must not leave the day looking
+    /// complete. `read.rs` states the rule its own way: "Per-row exclusion of
+    /// a row that does count would understate capital and mechanically
+    /// inflate the reported return -- the dangerous direction for a financial
+    /// metric to be wrong in -- so a single bad counted row excludes the whole
+    /// day instead." Positive equity counts at every location, so a retired
+    /// symbol still holding shares is exactly such a row.
+    ///
+    /// The read layer cannot enforce that here: the rows never reach the
+    /// table, so the day parses as complete and is Included with a total that
+    /// silently omits them. Average deployed capital then comes out low, and
+    /// since the return is realized PnL over that average, the reported return
+    /// is inflated.
+    ///
+    /// Before #1279 this day was excluded either way -- the capture crashed
+    /// (MissingSnapshot), and had it not, the unmarked balance would have
+    /// excluded it (MissingMark). #1279 turned both into a wrong number.
+    /// Once the residual reaches zero the drop is harmless, because
+    /// `evaluate_day` skips zero balances outright.
+    #[tokio::test]
+    async fn unconfigured_symbol_holding_value_must_not_be_dropped_from_capital() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let unconfigured = Symbol::new("QSEP").unwrap();
+        let view = freshly_polled_view(
+            aapl(),
+            FractionalShares::new(float!(10)),
+            FractionalShares::new(float!(5)),
+            Usdc::new(float!(1000)),
+            Usdc::new(float!(500)),
+        )
+        .with_equity(
+            unconfigured.clone(),
+            FractionalShares::new(float!(3)),
+            FractionalShares::new(float!(2)),
+        );
+        let (ctx, position) = build_ctx(
+            pool.clone(),
+            apalis_pool,
+            view,
+            HashSet::from([aapl()]),
+            true,
+            false,
+            Some(Arc::new(MockWrapper::new())),
+        )
+        .await;
+        mark_all_required_fresh(&ctx);
+
+        // Give the configured symbol a fresh mark so every OTHER counted row
+        // is complete. Without this the day is excluded on AAPL's missing
+        // mark and the assertion below would pass for the wrong reason.
+        let block_timestamp = Utc::now();
+        position
+            .send(
+                &aapl(),
+                PositionCommand::AcknowledgeOnChainFillAt {
+                    symbol: aapl(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::ZERO,
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp,
+                    block_number: None,
+                    seen_at: block_timestamp,
+                },
+            )
+            .await
+            .unwrap();
+
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+
+        let today = et_day(Utc::now());
+        let days = load_portfolio_days(
+            &pool,
+            EtDayRange {
+                from: Some(today),
+                to: Some(today),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The exact reason, not merely "excluded": AAPL and USDC are marked,
+        // so any other exclusion would mean something unrelated broke and
+        // this test would pass without pinning anything.
+        assert_eq!(days.len(), 1);
+        assert_eq!(
+            days[0].capital,
+            DayCapital::Excluded(DayExclusionReason::MissingMark(PortfolioAsset::Equity(
+                unconfigured.clone()
+            ))),
+            "a counted balance dropped at capture leaves the day looking complete, so it is \
+             included with a total that omits it -- understated capital inflates the return"
+        );
+    }
+
     /// Onchain MarketMaking equity and BaseWalletWrapped-transit equity are
     /// WRAPPED ERC-4626 vault shares, not underlying shares. With a non-1:1
     /// ratio (1.5, simulating vault NAV accrual from dividends/splits), both
