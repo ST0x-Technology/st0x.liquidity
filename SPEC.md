@@ -1039,6 +1039,13 @@ suppresses events, and their watermarks, on unchanged balances, so tying
 freshness to that watermark freezes on a static book and the window would
 eventually block every future capture.
 
+Equity rows whose symbol has no `[assets.equities]` entry are dropped from the
+capture with a warning rather than failing it: a vault-registry symbol can
+outlive its config entry (registry seeds are permanent events, config entries
+are not), and such a symbol has no wrapper entry to resolve a vault ratio with
+and no `Position` to mark against. Its residual balance is excluded from the
+day's rows; USDC rows always pass through.
+
 **Poll-driven freshness gate**: an additional, independent freshness check now
 closes the gap presence alone leaves open. An ephemeral `PollFreshness` tracker
 (`src/inventory/freshness.rs`) records the timestamp of each `(location,

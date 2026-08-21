@@ -43,7 +43,7 @@
 //! across entirely (no wake before the next boundary) is simply absent from
 //! the series -- coverage is sparse by design, not backfilled.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -374,6 +374,7 @@ impl PortfolioSnapshotJob {
             let view = ctx.inventory.read().await;
             view.to_portfolio_snapshot_rows()?
         };
+        let rows = retain_configured_equity_rows(rows, &ctx.configured_equity_symbols);
 
         if let Some(gap) = hydration_gap(&rows, ctx) {
             warn!(
@@ -903,6 +904,34 @@ fn capped_retry_backoff(boundary: Option<DateTime<Utc>>, now: DateTime<Utc>) -> 
         .map_or(HYDRATION_RETRY_BACKOFF, |remaining| {
             remaining.min(HYDRATION_RETRY_BACKOFF)
         })
+}
+
+/// Drops equity rows whose symbol has no `[assets.equities]` entry, so a
+/// vault-registry symbol deliberately removed from config (a retired asset)
+/// degrades to a warning instead of failing the whole day's capture. Such a
+/// symbol has no wrapper entry to resolve a vault ratio with and no
+/// `Position` to mark against; its residual balance is out of the configured
+/// portfolio's scope. USDC rows always pass through.
+fn retain_configured_equity_rows(
+    rows: Vec<PortfolioBalanceRow>,
+    configured_equity_symbols: &HashSet<Symbol>,
+) -> Vec<PortfolioBalanceRow> {
+    let (kept, skipped): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| match &row.asset {
+        PortfolioAsset::Equity(symbol) => configured_equity_symbols.contains(symbol),
+        PortfolioAsset::Usdc => true,
+    });
+
+    if !skipped.is_empty() {
+        let skipped_symbols: BTreeSet<String> =
+            skipped.iter().map(|row| row.asset.to_string()).collect();
+        warn!(
+            ?skipped_symbols,
+            "Skipping portfolio snapshot rows for registry symbols absent from \
+             [assets.equities]; their balances are excluded from the day's capture"
+        );
+    }
+
+    kept
 }
 
 /// Converts MarketMaking-venue and BaseWalletWrapped-transit equity balances
@@ -2796,6 +2825,69 @@ mod tests {
             portfolio_snapshot_row_count(&pool, &et_day).await,
             0,
             "a failed capture must never persist a partial or incorrectly-valued row"
+        );
+    }
+
+    /// A vault-registry symbol with live balances but no `[assets.equities]`
+    /// entry (an asset deliberately removed from config) must not fail the
+    /// day's capture: its rows are dropped with a warning and every
+    /// configured row still persists.
+    #[tokio::test]
+    async fn unconfigured_registry_symbol_is_skipped_not_fatal() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let unconfigured = Symbol::new("QSEP").unwrap();
+        let view = freshly_polled_view(
+            aapl(),
+            FractionalShares::new(float!(10)),
+            FractionalShares::new(float!(5)),
+            Usdc::new(float!(1000)),
+            Usdc::new(float!(500)),
+        )
+        .with_equity(
+            unconfigured.clone(),
+            FractionalShares::new(float!(3)),
+            FractionalShares::ZERO,
+        );
+        let (ctx, _position) = build_ctx(
+            pool.clone(),
+            apalis_pool,
+            view,
+            HashSet::from([aapl()]),
+            true,
+            false,
+            Some(Arc::new(MockWrapper::new())),
+        )
+        .await;
+        mark_all_required_fresh(&ctx);
+
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+
+        let et_day = et_day(Utc::now()).to_string();
+        let unconfigured_rows = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM portfolio_snapshot WHERE et_day = ? AND asset = 'QSEP'",
+        )
+        .bind(&et_day)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            unconfigured_rows, 0,
+            "rows for a symbol absent from config must not be persisted"
+        );
+
+        let aapl_rows = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM portfolio_snapshot WHERE et_day = ? AND asset = 'AAPL'",
+        )
+        .bind(&et_day)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            aapl_rows > 0,
+            "configured rows must still be captured when an unconfigured symbol is present"
         );
     }
 
