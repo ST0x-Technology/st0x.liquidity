@@ -1039,12 +1039,30 @@ suppresses events, and their watermarks, on unchanged balances, so tying
 freshness to that watermark freezes on a static book and the window would
 eventually block every future capture.
 
-Equity rows whose symbol has no `[assets.equities]` entry are dropped from the
-capture with a warning rather than failing it: a vault-registry symbol can
-outlive its config entry (registry seeds are permanent events, config entries
-are not), and such a symbol has no wrapper entry to resolve a vault ratio with
-and no `Position` to mark against. Its residual balance is excluded from the
-day's rows; USDC rows always pass through.
+A vault-registry symbol can outlive its config entry (registry seeds are
+permanent events, config entries are not), and such a symbol has no wrapper
+entry to resolve a vault ratio with. It never fails the capture, and what
+happens to its rows depends on whether it still holds anything.
+
+Rows drained to zero are dropped with a warning. They contribute nothing -- zero
+balances are skipped when the day is evaluated -- so dropping them changes no
+number, and a fully reconciled retired asset stops affecting the series
+entirely.
+
+Rows still holding a balance are kept, and forced unpriceable: no USD mark, so
+the day is excluded with a stated reason. Positive equity counts toward capital
+at every location, and a counted row must never be dropped -- understated
+capital divides the return and inflates it, the dangerous direction for the
+number to be wrong in. Dropping such a row at capture would defeat that rule
+from outside the reader's sight, because the row never reaches the table and the
+day then parses as complete. Their wrapped-location balances are also left
+unconverted, since no ratio is resolvable; the forced-absent mark is what
+guarantees such a balance is never multiplied by a price.
+
+The remedy for a day excluded this way is to reconcile the holding, not to
+supply a mark: a historical-mark repair prices every row of the symbol, so it is
+refused while any wrapped-location row survives, which would otherwise be valued
+as underlying shares. USDC rows always pass through.
 
 **Poll-driven freshness gate**: an additional, independent freshness check now
 closes the gap presence alone leaves open. An ephemeral `PollFreshness` tracker

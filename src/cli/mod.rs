@@ -1704,7 +1704,7 @@ async fn run_simple_command<W: Write>(
             run_position_command(stdout, pool, command, ctx.execution_threshold).await
         }
         SimpleCommand::PortfolioSnapshot { command } => {
-            repair::set_portfolio_snapshot_mark_command(stdout, pool, command).await
+            repair::set_portfolio_snapshot_mark_command(stdout, pool, command, ctx).await
         }
         SimpleCommand::FailTransfer {
             transfer_type,
