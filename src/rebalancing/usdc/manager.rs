@@ -5523,6 +5523,46 @@ mod tests {
         assert_eq!(usdc_to_u256(amount).unwrap(), U256::from(1_000_123_456u64));
     }
 
+    /// A notional USD->USDC buy names dollars, so Alpaca decides the quantity
+    /// and reports it to nine decimal places -- observed on a sandbox account
+    /// as notional 10 filling 9.794019706 at 1.00101001. USDC carries six
+    /// decimals on-chain, so the received amount must be bounded here, where
+    /// it is derived and persisted: every consumer downstream treats it as an
+    /// on-chain quantity, and `usdc_to_u256` is lossless (see
+    /// `test_usdc_to_u256_rejects_excess_precision`), so an unbounded fill
+    /// strands the transfer with the in-progress guard held.
+    ///
+    /// Truncation is downwards, never rounding: the fill is all the USDC that
+    /// exists, so rounding up would ask Alpaca to withdraw, and CCTP to burn,
+    /// more than was bought.
+    #[test]
+    fn usd_to_usdc_received_amount_is_bounded_to_usdc_precision() {
+        let order: CryptoOrderResponse = serde_json::from_value(json!({
+            "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "symbol": "USDCUSD",
+            "qty": null,
+            "notional": "10",
+            "status": "filled",
+            "filled_avg_price": "1.00101001",
+            "filled_qty": "9.794019706",
+            "created_at": "2025-01-06T12:30:00Z"
+        }))
+        .unwrap();
+
+        let conversion = conversion_amounts_from_order(
+            &order,
+            &ClientOrderId::from_uuid(uuid!("33333333-3333-4333-8333-333333333333")),
+            ConversionDirection::UsdToUsdc,
+        )
+        .unwrap();
+
+        assert_eq!(conversion.received_amount, usdc("9.794019"));
+        assert_eq!(
+            usdc_to_u256(conversion.received_amount).unwrap(),
+            U256::from(9_794_019u64)
+        );
+    }
+
     #[test]
     fn test_usdc_to_u256_minimum_amount() {
         // Test near-minimum amounts (smallest USDC unit is 0.000001)
