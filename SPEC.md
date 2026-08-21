@@ -1060,7 +1060,9 @@ unconverted, since no ratio is resolvable; the forced-absent mark is what
 guarantees such a balance is never multiplied by a price.
 
 The remedy for a day excluded this way is to reconcile the holding, not to
-change the capture. USDC rows always pass through.
+supply a mark: a historical-mark repair prices every row of the symbol, so it is
+refused while any wrapped-location row survives, which would otherwise be valued
+as underlying shares. USDC rows always pass through.
 
 **Poll-driven freshness gate**: an additional, independent freshness check now
 closes the gap presence alone leaves open. An ephemeral `PollFreshness` tracker

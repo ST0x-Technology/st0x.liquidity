@@ -2,6 +2,8 @@
 //! and trade processing. [`Conductor::run`] is the entry point.
 
 mod builder;
+
+pub(crate) use builder::configured_equity_symbols;
 mod exit;
 pub(crate) mod job;
 mod manifest;
