@@ -225,6 +225,7 @@ impl std::ops::Sub for Usdc {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use st0x_float_macro::float;
 
     use super::*;
@@ -348,5 +349,26 @@ mod tests {
         let usdc = Usdc::new(float!(-1.1234567));
         let error = usdc.floor_to_6_decimals().unwrap_err();
         assert!(matches!(error, UsdcConversionError::NegativeValue(_)));
+    }
+
+    proptest! {
+        /// Flooring a nonnegative 9-decimal amount never increases it,
+        /// always lands on the 6-decimal grid (strict conversion succeeds
+        /// and round-trips), and is idempotent.
+        #[test]
+        fn floor_is_sound_for_nonnegative_amounts(raw in 0u64..=u64::MAX) {
+            let amount = Usdc::new(Float::from_fixed_decimal(U256::from(raw), 9).unwrap());
+
+            let floored = amount.floor_to_6_decimals().unwrap();
+
+            prop_assert!(floored <= amount);
+            let fixed = floored.to_u256_6_decimals().unwrap();
+            prop_assert_eq!(fixed, U256::from(raw / 1_000));
+            prop_assert_eq!(
+                Usdc::new(Float::from_fixed_decimal(fixed, 6).unwrap()),
+                floored
+            );
+            prop_assert_eq!(floored.floor_to_6_decimals().unwrap(), floored);
+        }
     }
 }

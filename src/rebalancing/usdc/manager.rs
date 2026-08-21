@@ -1233,9 +1233,9 @@ impl<
                 initiated_at,
                 ..
             }) => {
-                let nominal_u256 = usdc_to_u256(amount)?;
+                let nominal_u256 = usdc_to_u256(amount.floor_to_6_decimals()?)?;
                 let scan_amount = if let Some(burn_amount) = burn_amount {
-                    usdc_to_u256(burn_amount)?
+                    usdc_to_u256(burn_amount.floor_to_6_decimals()?)?
                 } else {
                     warn!(
                         target: "rebalance",
