@@ -178,10 +178,10 @@ let
       in
       joinCommands activationCommands
     else if cfg.kind == "cli" then
-      # On-demand CLI config: install the config, decrypt the secret, and
-      # validate -- exactly like the st0x kind, but start no systemd unit. The
-      # files land at the paths the wrapper in os.nix reads (e.g. `s01`). A
-      # validation failure exits non-zero, so deploy-rs rolls the profile back.
+      # On-demand CLI config: install the config and decrypt the secret, but do
+      # not assemble the full service context during deployment. The selected
+      # CLI command validates what it needs when an operator invokes it. The
+      # files land at the paths the wrapper in os.nix reads (e.g. `s01`).
       #
       # config + secret live under /run (tmpfs), populated only by this
       # deploy-time activation (no unit, no tmpfiles rule). A host reboot clears
@@ -205,7 +205,6 @@ let
           "printf '\n' >> ${cfg.decryptedSecretPath} && ${rage} -d -i ${hostKey} ${overlay} >> ${cfg.decryptedSecretPath}"
         ) secretOverlayFiles
         ++ [
-          "${cfg.profilePath}/bin/validate-config --config ${cfg.configPath} --secrets ${cfg.decryptedSecretPath}"
           # Match st0x's DB ownership so the CLI's SQLite DB is st0x:st0x
           # regardless of who runs `s01` (glob is a no-op until the DB exists).
           "(chown st0x:st0x /mnt/data/*.db /mnt/data/*.db-wal /mnt/data/*.db-shm /mnt/data/*.db-journal 2>/dev/null || true)"

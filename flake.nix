@@ -592,6 +592,21 @@
             touch $out
           '';
 
+        checks.cli-activation-skips-config-validation =
+          let
+            enabledServices = (import ./services.nix { inherit lib; }).enabled;
+            cliNames = builtins.attrNames (lib.filterAttrs (_: cfg: cfg.kind == "cli") enabledServices);
+            cliActivationScripts = lib.flatten (
+              map (env: map (name: deployment.activationScripts.${env}.${name}) cliNames) envNames
+            );
+          in
+          assert lib.assertMsg (builtins.all (
+            script: !(lib.hasInfix "validate-config" script)
+          ) cliActivationScripts) "CLI activation must not run the full service config validator";
+          pkgs.runCommand "cli-activation-skips-config-validation-test" { } ''
+            touch $out
+          '';
+
         formatter = pkgs.nixfmt-rfc-style;
 
         devShells =
