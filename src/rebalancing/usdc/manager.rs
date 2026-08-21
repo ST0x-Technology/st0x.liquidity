@@ -695,7 +695,12 @@ impl<
         let conversion = self
             .record_conversion_or_fail(id, &correlation_id, &order, conversion_order.direction())
             .await?;
-        let received_amount = conversion.received_amount;
+        // Alpaca's notional USD->USDC buy fills with up to 9 decimals; USDC
+        // on-chain has 6. Floor at the fill boundary so every downstream step
+        // (withdrawal, burn) works on a representable amount. The persisted
+        // `ConversionConfirmed` event keeps the exact fill for audit; the
+        // sub-6-decimal remainder stays in the Alpaca crypto wallet.
+        let received_amount = conversion.received_amount.floor_to_6_decimals()?;
 
         // The trigger's floor only covers the amount it *requests*; a stalled
         // conversion whose remainder was cancelled delivers whatever filled,
@@ -960,9 +965,12 @@ impl<
                 initiated_at,
                 ..
             }) => {
+                // Floor here and in every arm below: a persisted aggregate
+                // can carry an Alpaca fill amount with more than 6 decimals,
+                // which `usdc_to_u256` rejects on every resume.
                 self.continue_alpaca_to_base_from_conversion_complete(
                     id,
-                    conversion.received_amount,
+                    conversion.received_amount.floor_to_6_decimals()?,
                     initiated_at,
                 )
                 .await
@@ -986,7 +994,7 @@ impl<
                 // is derived from the withdrawal tx block (not the raw chain head).
                 self.continue_alpaca_to_base_from_withdrawal_complete(
                     id,
-                    amount,
+                    amount.floor_to_6_decimals()?,
                     withdrawal_tx,
                     initiated_at,
                 )
@@ -1004,7 +1012,7 @@ impl<
                 // on apalis redrive (primary gate does not re-run from this arm).
                 self.continue_alpaca_to_base_from_withdrawal_complete(
                     id,
-                    amount,
+                    amount.floor_to_6_decimals()?,
                     withdrawal_tx,
                     initiated_at,
                 )
@@ -1027,7 +1035,7 @@ impl<
                 // on-chain mint receipt, so supplying the nominal here is harmless.
                 self.continue_alpaca_to_base_from_bridging(
                     id,
-                    usdc_to_u256(amount)?,
+                    usdc_to_u256(amount.floor_to_6_decimals()?)?,
                     burn_tx_hash,
                     initiated_at,
                 )
@@ -1044,7 +1052,7 @@ impl<
             }) => {
                 self.continue_alpaca_to_base_from_awaiting_attestation(
                     id,
-                    amount,
+                    amount.floor_to_6_decimals()?,
                     burn_tx_hash,
                     AwaitingAttestationTimestamps {
                         retry_deadline_at,
@@ -1225,9 +1233,9 @@ impl<
                 initiated_at,
                 ..
             }) => {
-                let nominal_u256 = usdc_to_u256(amount)?;
+                let nominal_u256 = usdc_to_u256(amount.floor_to_6_decimals()?)?;
                 let scan_amount = if let Some(burn_amount) = burn_amount {
-                    usdc_to_u256(burn_amount)?
+                    usdc_to_u256(burn_amount.floor_to_6_decimals()?)?
                 } else {
                     warn!(
                         target: "rebalance",
@@ -8461,6 +8469,55 @@ mod tests {
             "the resume path has no legal failure transition from ConversionComplete, so it \
              must leave the aggregate there for reconciliation, got: {state:?}"
         );
+    }
+
+    /// An Alpaca->Base amount persisted with more than 6 decimals (an Alpaca
+    /// notional-buy fill delivers up to 9) must be floored to USDC's on-chain
+    /// grid on resume instead of failing `usdc_to_u256` on every retry. Post
+    /// floor, the flow proceeds to the wallet-balance read -- a transient
+    /// redrive, not a terminal conversion error.
+    #[tokio::test]
+    async fn resume_from_withdrawal_complete_floors_nine_decimal_fill() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("9794.019706861");
+
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = manager
+            .resume_alpaca_to_base(&id, amount)
+            .await
+            .unwrap_err();
+
+        // The balance read runs against a bare anvil with no USDC contract,
+        // so a floored amount reaches it and surfaces
+        // `SettlementCheckTransient`; an unfloored amount fails earlier, at
+        // `usdc_to_u256`, with `UsdcConversion`. The exact floored value is
+        // pinned by `floor_truncates_nine_decimal_fill_to_six` in
+        // `st0x-finance`.
+        match error {
+            UsdcTransferError::SettlementCheckTransient { .. } => {}
+            other => panic!("expected SettlementCheckTransient after flooring, got {other:?}"),
+        }
     }
 
     /// The fresh conversion path must refuse a sub-minimum fill before it
