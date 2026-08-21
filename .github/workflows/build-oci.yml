@@ -3,10 +3,16 @@ name: build-oci
 # Liquidity bot + dashboard OCI images → t0-artifacts Artifact Registry
 # (t0-liquidity repo), mirroring st0x.bebop's deploy-cloudrun.yml: nix build
 # the flake's dockerTools images → push digests → sign (GitHub/Sigstore +
-# the t0-artifacts liquidity-image KMS attestor). NO deploy job: the staging
-# GCE VM rolls by pulling t0.devops terraform/staging-liquidity/images.yaml
-# state and verifying the attestation itself — promoting a digest is a PR
-# there, not a push here.
+# the t0-artifacts liquidity-image KMS attestor) → roll staging.
+#
+# A MERGE TO MASTER DEPLOYS STAGING (roll-staging job at the bottom), like
+# pricing, bebop and the oracle. The difference is only the mechanism: those
+# planes are Cloud Run, this one is a GCE VM that pulls its deploy state, so
+# the job writes the digests into that state object instead of calling
+# `gcloud run deploy`. The VM still verifies the liquidity-image attestation
+# of everything it adopts. (Until 2026-08-21 there was no deploy job here and
+# promoting a digest was a PR in t0.devops; the gates that stay a PR there are
+# listed in terraform/staging-liquidity/README.md.)
 #
 # Auth: GitHub OIDC → the t0-artifacts WIF provider, bound to
 # liquidity-deployer (master only — the WIF binding lives in t0.devops
@@ -162,3 +168,128 @@ jobs:
             fi
             exit "$status"
           fi
+
+  # STAGING ROLLS ON EVERY MASTER MERGE — the same fast path pricing, bebop and
+  # the oracle have. Those planes are Cloud Run, so their deploy is a `gcloud
+  # run deploy`; this one is a GCE VM (exclusive-writer SQLite), so the deploy
+  # is a write to the images.env object the VM's roll timer polls every 2
+  # minutes. The box then verifies the liquidity-image attestation of every
+  # digest before it adopts anything, so this job cannot make it run an
+  # unsigned image — the provenance gate is on the consumer, not here.
+  #
+  # What this job may touch is exactly one object: the IAM grant behind
+  # DEPLOYER_SA is objectAdmin conditioned to
+  # gs://t0-liquidity-staging-config/images.env (t0.devops
+  # terraform/staging-liquidity). It rewrites the three first-party digest
+  # lines in place and preserves every other line byte for byte — in
+  # particular GATED_SERVICE_REPLICAS, the workload gate, which is
+  # Terraform's and must never be settable from this repo. Terraform reads
+  # the digests back on every plan (images.yaml `ci_rolls: true`), so an
+  # apply recomposes what this job wrote instead of undoing it.
+  #
+  # PRODUCTION IS NOT DEPLOYED FROM THIS REPO: promote a staging-proven digest
+  # into t0.devops terraform/production-liquidity/images.yaml and merge (PAM
+  # -gated apply). This SA holds nothing in the production project.
+  roll-staging:
+    needs: build-push
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      CONFIG_BUCKET: t0-liquidity-staging-config
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Rewrite images.env with the digests just built
+        id: roll
+        run: |
+          set -euo pipefail
+
+          # Resolve digests from the tag this run pushed rather than passing
+          # them out of the matrix (matrix jobs share one `outputs` map, so
+          # the last leg to finish would win).
+          resolve() {
+            gcloud artifacts docker images describe "${AR_REPO}/$1:${GITHUB_SHA}" \
+              --format='value(image_summary.digest)'
+          }
+
+          gcloud storage cat "gs://${CONFIG_BUCKET}/images.env" > current.env
+          cp current.env next.env
+
+          # Refuse to write a file that is missing anything: a dropped
+          # GATED_SERVICE_REPLICAS makes the VM's `compose --scale bot=` fail
+          # with `strconv.Atoi: invalid syntax` and takes the whole stack unit
+          # down, and an empty image ref fails `compose pull` on the box.
+          for key in BOT_IMAGE DASHBOARD_IMAGE DATASETTE_IMAGE EXPORTER_IMAGE GATED_SERVICE_REPLICAS; do
+            grep -q "^${key}=" current.env \
+              || { echo "::error::images.env has no ${key} — refusing to write"; exit 1; }
+          done
+
+          for pair in t0-liquidity:BOT_IMAGE \
+                      t0-liquidity-dashboard:DASHBOARD_IMAGE \
+                      t0-liquidity-datasette:DATASETTE_IMAGE; do
+            image="${pair%%:*}"
+            key="${pair##*:}"
+            digest="$(resolve "$image")"
+            case "$digest" in
+              sha256:[0-9a-f]*) ;;
+              *) echo "::error::could not resolve a digest for ${image}:${GITHUB_SHA} (got '${digest}')"; exit 1 ;;
+            esac
+            sed -i "s|^${key}=.*|${key}=${AR_REPO}/${image}@${digest}|" next.env
+          done
+
+          echo "--- images.env ---"
+          cat next.env
+
+          if cmp -s current.env next.env; then
+            echo "::notice::staging already runs these digests — nothing to roll"
+            echo "rolled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          gcloud storage cp next.env "gs://${CONFIG_BUCKET}/images.env"
+
+          # Read back: Terraform writes this object too (on a t0.devops merge),
+          # and a plan taken before this push would apply older digests. Losing
+          # that race must be a red job, not a box that quietly rolls backwards.
+          gcloud storage cat "gs://${CONFIG_BUCKET}/images.env" > readback.env
+          cmp -s next.env readback.env || {
+            echo "::error::images.env was overwritten by another writer (a concurrent t0.devops apply?) — re-run this job"
+            diff -u next.env readback.env || true
+            exit 1
+          }
+
+          echo "rolled=true" >> "$GITHUB_OUTPUT"
+          grep -q '^GATED_SERVICE_REPLICAS=0$' next.env \
+            && echo "gated=true" >> "$GITHUB_OUTPUT" \
+            || echo "gated=false" >> "$GITHUB_OUTPUT"
+          echo "bot=$(grep '^BOT_IMAGE=' next.env)" >> "$GITHUB_OUTPUT"
+
+      # The roll is only real once the box has taken it. The timer publishes
+      # deployed.env after a SUCCESSFUL stack restart, so this turns a refused
+      # attestation or a crash-looping image into a failed deploy here instead
+      # of a green build over a box still running the old digests. Skipped when
+      # the workload is gated off (nothing runs, so nothing is published).
+      - name: Wait for the VM to adopt it
+        if: steps.roll.outputs.rolled == 'true' && steps.roll.outputs.gated == 'false'
+        run: |
+          set -euo pipefail
+          want="${{ steps.roll.outputs.bot }}"
+          for _ in $(seq 1 40); do
+            if gcloud storage cat "gs://${CONFIG_BUCKET}/deployed.env" 2>/dev/null | grep -qxF "$want"; then
+              echo "::notice::t0-liquidity-staging rolled to ${GITHUB_SHA}"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::the VM has not published this digest after 10 minutes." \
+            "Check the roll timer: gcloud compute ssh t0-liquidity-staging --project t0-liquidity-staging" \
+            "--zone europe-west3-b --tunnel-through-iap --command 'journalctl -u t0-liquidity-staging-roll -n 50'"
+          exit 1
