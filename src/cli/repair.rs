@@ -603,9 +603,25 @@ mod tests {
         day: chrono::NaiveDate,
         symbol: &Symbol,
     ) {
+        seed_missing_portfolio_marks_at(
+            pool,
+            day,
+            symbol,
+            &[PortfolioLocation::MarketMaking, PortfolioLocation::Hedging],
+        )
+        .await;
+    }
+
+    async fn seed_missing_portfolio_marks_at(
+        pool: &SqlitePool,
+        day: chrono::NaiveDate,
+        symbol: &Symbol,
+        locations: &[PortfolioLocation],
+    ) {
         let captured_at = Utc.with_ymd_and_hms(2026, 7, 20, 4, 5, 0).unwrap();
-        let rows = [PortfolioLocation::MarketMaking, PortfolioLocation::Hedging]
-            .into_iter()
+        let rows = locations
+            .iter()
+            .copied()
             .map(|location| PortfolioBalanceRowWithMark {
                 row: PortfolioBalanceRow {
                     location,
@@ -629,6 +645,91 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// The refusal keys on the LOCATION holding vault shares, not on
+    /// `MarketMaking` specifically: `BaseWalletWrapped` is the other
+    /// unconverted location, and a symbol whose only wrapped rows sit there
+    /// must be refused the same way.
+    #[tokio::test]
+    async fn portfolio_snapshot_repair_refuses_unconfigured_symbol_with_base_wallet_wrapped_rows() {
+        let pool = setup_test_db().await;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let symbol = Symbol::new("QSEP").unwrap();
+        seed_missing_portfolio_marks_at(
+            &pool,
+            day,
+            &symbol,
+            &[
+                PortfolioLocation::BaseWalletWrapped,
+                PortfolioLocation::Hedging,
+            ],
+        )
+        .await;
+
+        let ctx = ctx_with_equities(&["AAPL"]);
+        let error = set_portfolio_snapshot_mark_command(
+            &mut Vec::new(),
+            &pool,
+            PortfolioSnapshotRecoveryCommand::Set {
+                day,
+                symbol: symbol.clone(),
+                usd_mark: Positive::new(float!(150)).unwrap(),
+                observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
+                source: "Nasdaq historical close".parse().unwrap(),
+                reason: "repair missing mark".parse().unwrap(),
+            },
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("vault shares, not underlying shares"),
+            "a BaseWalletWrapped-only holding must refuse like MarketMaking; got: {error}"
+        );
+    }
+
+    /// The guard must not over-block: an unconfigured symbol whose wrapped
+    /// rows are gone holds only underlying-unit balances (`Hedging` is never
+    /// converted), so a mark values them correctly and the repair proceeds.
+    /// This is what makes reconciling the on-chain side restore repairability.
+    #[tokio::test]
+    async fn portfolio_snapshot_repair_allows_unconfigured_symbol_without_wrapped_rows() {
+        let pool = setup_test_db().await;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let symbol = Symbol::new("QSEP").unwrap();
+        seed_missing_portfolio_marks_at(&pool, day, &symbol, &[PortfolioLocation::Hedging]).await;
+
+        let ctx = ctx_with_equities(&["AAPL"]);
+        set_portfolio_snapshot_mark_command(
+            &mut Vec::new(),
+            &pool,
+            PortfolioSnapshotRecoveryCommand::Set {
+                day,
+                symbol: symbol.clone(),
+                usd_mark: Positive::new(float!(150)).unwrap(),
+                observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
+                source: "Nasdaq historical close".parse().unwrap(),
+                reason: "repair missing mark".parse().unwrap(),
+            },
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let (location, mark): (String, Option<String>) = sqlx::query_as(
+            "SELECT location, usd_mark FROM portfolio_snapshot WHERE et_day = ? AND asset = ?",
+        )
+        .bind(day.to_string())
+        .bind(symbol.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(location, "hedging");
+        assert_eq!(mark.as_deref(), Some("150"));
     }
 
     /// `EquityMarkSet` prices every row of the symbol, and a symbol with no
