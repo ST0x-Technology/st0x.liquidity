@@ -2885,9 +2885,22 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert!(
-            aapl_rows > 0,
-            "configured rows must still be captured when an unconfigured symbol is present"
+        assert_eq!(
+            aapl_rows, 2,
+            "configured rows (both venues) must still be captured when an unconfigured \
+             symbol is present"
+        );
+
+        let total_rows = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM portfolio_snapshot WHERE et_day = ?",
+        )
+        .bind(&et_day)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            total_rows, 4,
+            "the capture must persist exactly the configured rows: AAPL and USDC at both venues"
         );
     }
 
