@@ -9,7 +9,7 @@ use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
 
-use st0x_config::ExecutionThreshold;
+use st0x_config::{Ctx, ExecutionThreshold};
 use st0x_event_sorcery::{AggregateError, LifecycleError, RetryOnBusy, StoreBuilder, load_entity};
 use st0x_execution::{
     CancellationOutcome, ExecutorOrderId, FractionalShares, LimitOrder, MarketOrder, Symbol,
@@ -17,6 +17,7 @@ use st0x_execution::{
 use st0x_float_serde::format_float;
 
 use super::{AuditReason, PortfolioSnapshotRecoveryCommand};
+use crate::conductor::configured_equity_symbols;
 use crate::offchain::order::{
     OffchainOrder, OffchainOrderCommand, OffchainOrderError, OffchainOrderId, OrderPlacementResult,
     OrderPlacer,
@@ -30,6 +31,7 @@ pub(super) async fn set_portfolio_snapshot_mark_command<W: Write>(
     stdout: &mut W,
     pool: &SqlitePool,
     command: PortfolioSnapshotRecoveryCommand,
+    ctx: &Ctx,
 ) -> anyhow::Result<()> {
     let PortfolioSnapshotRecoveryCommand::Set {
         day,
@@ -53,6 +55,31 @@ pub(super) async fn set_portfolio_snapshot_mark_command<W: Write>(
             "--observed-at must identify the regular-session close before the {day} 00:05 ET \
              capture boundary ({capture_boundary})"
         );
+    }
+
+    // `EquityMarkSet` prices EVERY row of the symbol (the projection's UPDATE
+    // has no location filter). A symbol with no `[assets.equities]` entry has
+    // no wrapper entry either, so the capture leaves its MarketMaking and
+    // BaseWalletWrapped rows in vault-share units -- applying an underlying
+    // share price to those misvalues the day, which is exactly what the
+    // capture's forced-absent mark prevents. Refuse rather than let one repair
+    // reintroduce it. Rows at those locations exist only when nonzero: the
+    // capture drops the empty ones.
+    if !configured_equity_symbols(ctx).contains(&symbol) {
+        let unconverted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM portfolio_snapshot              WHERE et_day = ? AND asset = ?              AND location IN ('market_making', 'base_wallet_wrapped')",
+        )
+        .bind(day.to_string())
+        .bind(symbol.to_string())
+        .fetch_one(pool)
+        .await
+        .context("failed to check for unconverted wrapped-equity rows")?;
+
+        if unconverted > 0 {
+            bail!(
+                "{symbol} has no [assets.equities] entry, so its {unconverted}                  wrapped-location row(s) on {day} hold vault shares, not underlying shares.                  A mark would price them as underlying and misstate the day's capital.                  Reconcile the holding instead, or restore the config entry so the capture                  can resolve a vault ratio."
+            );
+        }
     }
 
     let store = StoreBuilder::<PortfolioSnapshot>::new(pool.clone())
@@ -562,14 +589,39 @@ mod tests {
         Arc::new(RepairOrderPlacer)
     }
 
+    /// Ctx configuring `symbols` as equities, so the repair's
+    /// unconverted-wrapped-rows guard sees them as configured.
+    fn ctx_with_equities(symbols: &[&str]) -> Ctx {
+        let mut ctx =
+            st0x_config::create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
+        ctx.assets.equities = crate::test_utils::rebalancing_enabled_equities(symbols);
+        ctx
+    }
+
     async fn seed_missing_portfolio_marks(
         pool: &SqlitePool,
         day: chrono::NaiveDate,
         symbol: &Symbol,
     ) {
+        seed_missing_portfolio_marks_at(
+            pool,
+            day,
+            symbol,
+            &[PortfolioLocation::MarketMaking, PortfolioLocation::Hedging],
+        )
+        .await;
+    }
+
+    async fn seed_missing_portfolio_marks_at(
+        pool: &SqlitePool,
+        day: chrono::NaiveDate,
+        symbol: &Symbol,
+        locations: &[PortfolioLocation],
+    ) {
         let captured_at = Utc.with_ymd_and_hms(2026, 7, 20, 4, 5, 0).unwrap();
-        let rows = [PortfolioLocation::MarketMaking, PortfolioLocation::Hedging]
-            .into_iter()
+        let rows = locations
+            .iter()
+            .copied()
             .map(|location| PortfolioBalanceRowWithMark {
                 row: PortfolioBalanceRow {
                     location,
@@ -595,6 +647,139 @@ mod tests {
             .unwrap();
     }
 
+    /// The refusal keys on the LOCATION holding vault shares, not on
+    /// `MarketMaking` specifically: `BaseWalletWrapped` is the other
+    /// unconverted location, and a symbol whose only wrapped rows sit there
+    /// must be refused the same way.
+    #[tokio::test]
+    async fn portfolio_snapshot_repair_refuses_unconfigured_symbol_with_base_wallet_wrapped_rows() {
+        let pool = setup_test_db().await;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let symbol = Symbol::new("QSEP").unwrap();
+        seed_missing_portfolio_marks_at(
+            &pool,
+            day,
+            &symbol,
+            &[
+                PortfolioLocation::BaseWalletWrapped,
+                PortfolioLocation::Hedging,
+            ],
+        )
+        .await;
+
+        let ctx = ctx_with_equities(&["AAPL"]);
+        let error = set_portfolio_snapshot_mark_command(
+            &mut Vec::new(),
+            &pool,
+            PortfolioSnapshotRecoveryCommand::Set {
+                day,
+                symbol: symbol.clone(),
+                usd_mark: Positive::new(float!(150)).unwrap(),
+                observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
+                source: "Nasdaq historical close".parse().unwrap(),
+                reason: "repair missing mark".parse().unwrap(),
+            },
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("vault shares, not underlying shares"),
+            "a BaseWalletWrapped-only holding must refuse like MarketMaking; got: {error}"
+        );
+    }
+
+    /// The guard must not over-block: an unconfigured symbol whose wrapped
+    /// rows are gone holds only underlying-unit balances (`Hedging` is never
+    /// converted), so a mark values them correctly and the repair proceeds.
+    /// This is what makes reconciling the on-chain side restore repairability.
+    #[tokio::test]
+    async fn portfolio_snapshot_repair_allows_unconfigured_symbol_without_wrapped_rows() {
+        let pool = setup_test_db().await;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let symbol = Symbol::new("QSEP").unwrap();
+        seed_missing_portfolio_marks_at(&pool, day, &symbol, &[PortfolioLocation::Hedging]).await;
+
+        let ctx = ctx_with_equities(&["AAPL"]);
+        set_portfolio_snapshot_mark_command(
+            &mut Vec::new(),
+            &pool,
+            PortfolioSnapshotRecoveryCommand::Set {
+                day,
+                symbol: symbol.clone(),
+                usd_mark: Positive::new(float!(150)).unwrap(),
+                observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
+                source: "Nasdaq historical close".parse().unwrap(),
+                reason: "repair missing mark".parse().unwrap(),
+            },
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let (location, mark): (String, Option<String>) = sqlx::query_as(
+            "SELECT location, usd_mark FROM portfolio_snapshot WHERE et_day = ? AND asset = ?",
+        )
+        .bind(day.to_string())
+        .bind(symbol.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(location, "hedging");
+        assert_eq!(mark.as_deref(), Some("150"));
+    }
+
+    /// `EquityMarkSet` prices every row of the symbol, and a symbol with no
+    /// config entry has its wrapped-location rows captured in vault-share
+    /// units. Pricing those as underlying is the misvaluation the capture's
+    /// forced-absent mark exists to prevent, so the repair must refuse rather
+    /// than reintroduce it through the operator path.
+    #[tokio::test]
+    async fn portfolio_snapshot_repair_refuses_unconfigured_symbol_with_wrapped_rows() {
+        let pool = setup_test_db().await;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let symbol = Symbol::new("QSEP").unwrap();
+        seed_missing_portfolio_marks(&pool, day, &symbol).await;
+
+        // AAPL configured, QSEP retired -- the state after a config removal.
+        let ctx = ctx_with_equities(&["AAPL"]);
+        let error = set_portfolio_snapshot_mark_command(
+            &mut Vec::new(),
+            &pool,
+            PortfolioSnapshotRecoveryCommand::Set {
+                day,
+                symbol: symbol.clone(),
+                usd_mark: Positive::new(float!(150)).unwrap(),
+                observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
+                source: "Nasdaq historical close".parse().unwrap(),
+                reason: "repair missing mark".parse().unwrap(),
+            },
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("vault shares, not underlying shares"),
+            "the refusal must name the unit mismatch; got: {message}"
+        );
+
+        let marked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM portfolio_snapshot \
+             WHERE et_day = ? AND asset = ? AND usd_mark IS NOT NULL",
+        )
+        .bind(day.to_string())
+        .bind(symbol.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(marked, 0, "a refused repair must not price any row");
+    }
+
     #[tokio::test]
     async fn portfolio_snapshot_repair_updates_all_symbol_rows_without_touching_position() {
         let pool = setup_test_db().await;
@@ -602,6 +787,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         seed_missing_portfolio_marks(&pool, day, &symbol).await;
 
+        let ctx = ctx_with_equities(&["AAPL"]);
         let mut output = Vec::new();
         set_portfolio_snapshot_mark_command(
             &mut output,
@@ -614,6 +800,7 @@ mod tests {
                 source: "Nasdaq historical close".parse().unwrap(),
                 reason: "repair missing mark".parse().unwrap(),
             },
+            &ctx,
         )
         .await
         .unwrap();
@@ -671,6 +858,7 @@ mod tests {
         .await
         .unwrap();
 
+        let ctx = ctx_with_equities(&["AAPL"]);
         let error = set_portfolio_snapshot_mark_command(
             &mut Vec::new(),
             &pool,
@@ -682,6 +870,7 @@ mod tests {
                 source: "Nasdaq historical close".parse().unwrap(),
                 reason: "repair missing mark".parse().unwrap(),
             },
+            &ctx,
         )
         .await
         .unwrap_err();

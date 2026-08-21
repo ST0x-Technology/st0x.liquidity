@@ -174,6 +174,11 @@ pub(crate) enum PortfolioSnapshotJobError {
     Inventory(#[from] InventoryViewError),
     #[error("failed to evaluate portfolio snapshot mark usability: {0}")]
     MarkEvaluation(#[from] rain_math_float::FloatError),
+    #[error(
+        "failed to total the balance of a portfolio row for a symbol absent from \
+         [assets.equities]: {0}"
+    )]
+    UnconfiguredRowTotal(#[source] rain_math_float::FloatError),
     #[error("failed to load an already-captured portfolio snapshot: {0}")]
     SnapshotLoad(#[source] SendError<PortfolioSnapshot>),
     #[error("portfolio snapshot was already captured but its aggregate state is missing")]
@@ -374,7 +379,8 @@ impl PortfolioSnapshotJob {
             let view = ctx.inventory.read().await;
             view.to_portfolio_snapshot_rows()?
         };
-        let rows = retain_configured_equity_rows(rows, &ctx.configured_equity_symbols);
+        let rows = drop_empty_unconfigured_equity_rows(rows, &ctx.configured_equity_symbols)
+            .map_err(PortfolioSnapshotJobError::UnconfiguredRowTotal)?;
 
         if let Some(gap) = hydration_gap(&rows, ctx) {
             warn!(
@@ -393,8 +399,19 @@ impl PortfolioSnapshotJob {
                 .await;
         }
 
-        let rows = convert_wrapped_equity_rows(rows, ctx.wrapper.as_deref()).await?;
-        let marked_rows = resolve_marks(&ctx.position_projection, now, rows).await?;
+        let rows = convert_wrapped_equity_rows(
+            rows,
+            ctx.wrapper.as_deref(),
+            &ctx.configured_equity_symbols,
+        )
+        .await?;
+        let marked_rows = resolve_marks(
+            &ctx.position_projection,
+            now,
+            rows,
+            &ctx.configured_equity_symbols,
+        )
+        .await?;
 
         match ctx
             .portfolio_snapshot
@@ -906,32 +923,63 @@ fn capped_retry_backoff(boundary: Option<DateTime<Utc>>, now: DateTime<Utc>) -> 
         })
 }
 
-/// Drops equity rows whose symbol has no `[assets.equities]` entry, so a
-/// vault-registry symbol deliberately removed from config (a retired asset)
-/// degrades to a warning instead of failing the whole day's capture. Such a
-/// symbol has no wrapper entry to resolve a vault ratio with and no
-/// `Position` to mark against; its residual balance is out of the configured
-/// portfolio's scope. USDC rows always pass through.
-fn retain_configured_equity_rows(
+/// Drops the EMPTY rows of a symbol absent from `[assets.equities]`; USDC and
+/// held rows pass through.
+///
+/// Empty rows change no number -- `evaluate_day` (`read.rs`) skips zero
+/// balances. A held row counts toward capital, and dropping it here is
+/// invisible to `read.rs`: the row never reaches the table, so the day parses
+/// as complete and is included with a total that omits it, understating
+/// capital and inflating the return. [`resolve_marks`] forces held rows
+/// unpriceable instead, excluding the day visibly.
+fn drop_empty_unconfigured_equity_rows(
     rows: Vec<PortfolioBalanceRow>,
     configured_equity_symbols: &HashSet<Symbol>,
-) -> Vec<PortfolioBalanceRow> {
-    let (kept, skipped): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| match &row.asset {
-        PortfolioAsset::Equity(symbol) => configured_equity_symbols.contains(symbol),
-        PortfolioAsset::Usdc => true,
-    });
+) -> Result<Vec<PortfolioBalanceRow>, rain_math_float::FloatError> {
+    let mut kept = Vec::with_capacity(rows.len());
+    let mut dropped_empty: BTreeSet<String> = BTreeSet::new();
+    let mut held: BTreeSet<String> = BTreeSet::new();
 
-    if !skipped.is_empty() {
-        let skipped_symbols: BTreeSet<String> =
-            skipped.iter().map(|row| row.asset.to_string()).collect();
+    for row in rows {
+        let PortfolioAsset::Equity(symbol) = &row.asset else {
+            kept.push(row);
+            continue;
+        };
+        if configured_equity_symbols.contains(symbol) {
+            kept.push(row);
+            continue;
+        }
+
+        // `evaluate_day`'s own definition of empty, so the two layers cannot
+        // disagree about which rows contribute nothing.
+        let balance = (row.available + row.inflight)?;
+        if balance.is_zero()? {
+            dropped_empty.insert(row.asset.to_string());
+            continue;
+        }
+
+        held.insert(row.asset.to_string());
+        kept.push(row);
+    }
+
+    if !dropped_empty.is_empty() {
         warn!(
-            ?skipped_symbols,
-            "Skipping portfolio snapshot rows for registry symbols absent from \
-             [assets.equities]; their balances are excluded from the day's capture"
+            dropped_symbols = ?dropped_empty,
+            "Dropping empty portfolio snapshot rows for registry symbols absent from \
+             [assets.equities]; they hold nothing, so no balance is excluded"
         );
     }
 
-    kept
+    if !held.is_empty() {
+        warn!(
+            held_symbols = ?held,
+            "Registry symbols absent from [assets.equities] still hold a balance; they \
+             cannot be priced, so today's capital is not computable and the day will be \
+             excluded. Reconcile these holdings to restore the capital series"
+        );
+    }
+
+    Ok(kept)
 }
 
 /// Converts MarketMaking-venue and BaseWalletWrapped-transit equity balances
@@ -953,6 +1001,7 @@ fn retain_configured_equity_rows(
 async fn convert_wrapped_equity_rows(
     mut rows: Vec<PortfolioBalanceRow>,
     wrapper: Option<&dyn Wrapper>,
+    configured_equity_symbols: &HashSet<Symbol>,
 ) -> Result<Vec<PortfolioBalanceRow>, PortfolioSnapshotJobError> {
     let mut ratios: HashMap<Symbol, UnderlyingPerWrapped> = HashMap::new();
 
@@ -960,6 +1009,13 @@ async fn convert_wrapped_equity_rows(
         let PortfolioAsset::Equity(symbol) = &row.asset else {
             continue;
         };
+        // No config entry means no wrapper entry, and asking anyway is the
+        // `Symbol not configured` failure that used to lose the day. The
+        // balance stays in wrapped units, which is safe only because
+        // `resolve_marks` forces it unpriceable.
+        if !configured_equity_symbols.contains(symbol) {
+            continue;
+        }
         if !matches!(
             row.location,
             PortfolioLocation::MarketMaking | PortfolioLocation::BaseWalletWrapped
@@ -1008,6 +1064,7 @@ async fn resolve_marks(
     position_projection: &Projection<Position>,
     captured_at: DateTime<Utc>,
     rows: Vec<PortfolioBalanceRow>,
+    configured_equity_symbols: &HashSet<Symbol>,
 ) -> Result<Vec<PortfolioBalanceRowWithMark>, PortfolioSnapshotJobError> {
     let mut marked_rows = Vec::with_capacity(rows.len());
     let mut equity_marks = HashMap::new();
@@ -1015,6 +1072,14 @@ async fn resolve_marks(
     for row in rows {
         let (usd_mark, mark_captured_at) = match &row.asset {
             PortfolioAsset::Usdc => (Some(USDC_PAR), Some(captured_at)),
+            // A retired symbol keeps its last traded price, and its wrapped
+            // rows were left unconverted above -- pricing one with the other
+            // values wrapped shares at an underlying price. Forcing None
+            // excludes the day deterministically, not once the price goes
+            // stale.
+            PortfolioAsset::Equity(symbol) if !configured_equity_symbols.contains(symbol) => {
+                (None, None)
+            }
             PortfolioAsset::Equity(symbol) => {
                 if let Some(mark) = equity_marks.get(symbol) {
                     *mark
@@ -2828,10 +2893,17 @@ mod tests {
         );
     }
 
-    /// A vault-registry symbol with live balances but no `[assets.equities]`
-    /// entry (an asset deliberately removed from config) must not fail the
-    /// day's capture: its rows are dropped with a warning and every
+    /// A vault-registry symbol with no `[assets.equities]` entry (an asset
+    /// deliberately removed from config), drained to zero, must not fail the
+    /// day's capture: its empty rows are dropped with a warning and every
     /// configured row still persists.
+    ///
+    /// Drained to zero is the case where dropping is free -- `evaluate_day`
+    /// skips zero balances anyway, so no number changes. A retired symbol
+    /// still HOLDING shares is the opposite case and is covered by
+    /// `unconfigured_symbol_holding_value_must_not_be_dropped_from_capital`:
+    /// there the rows are kept, because dropping a counted balance would
+    /// understate capital.
     #[tokio::test]
     async fn unconfigured_registry_symbol_is_skipped_not_fatal() {
         let (pool, apalis_pool) = setup_test_pools().await;
@@ -2845,7 +2917,7 @@ mod tests {
         )
         .with_equity(
             unconfigured.clone(),
-            FractionalShares::new(float!(3)),
+            FractionalShares::ZERO,
             FractionalShares::ZERO,
         );
         let (ctx, _position) = build_ctx(
@@ -2901,6 +2973,108 @@ mod tests {
         assert_eq!(
             total_rows, 4,
             "the capture must persist exactly the configured rows: AAPL and USDC at both venues"
+        );
+    }
+
+    /// Dropping an unconfigured symbol's rows must not leave the day looking
+    /// complete. `read.rs` states the rule its own way: "Per-row exclusion of
+    /// a row that does count would understate capital and mechanically
+    /// inflate the reported return -- the dangerous direction for a financial
+    /// metric to be wrong in -- so a single bad counted row excludes the whole
+    /// day instead." Positive equity counts at every location, so a retired
+    /// symbol still holding shares is exactly such a row.
+    ///
+    /// The read layer cannot enforce that here: the rows never reach the
+    /// table, so the day parses as complete and is Included with a total that
+    /// silently omits them. Average deployed capital then comes out low, and
+    /// since the return is realized PnL over that average, the reported return
+    /// is inflated.
+    ///
+    /// Before #1279 this day was excluded either way -- the capture crashed
+    /// (MissingSnapshot), and had it not, the unmarked balance would have
+    /// excluded it (MissingMark). #1279 turned both into a wrong number.
+    /// Once the residual reaches zero the drop is harmless, because
+    /// `evaluate_day` skips zero balances outright.
+    #[tokio::test]
+    async fn unconfigured_symbol_holding_value_must_not_be_dropped_from_capital() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let unconfigured = Symbol::new("QSEP").unwrap();
+        let view = freshly_polled_view(
+            aapl(),
+            FractionalShares::new(float!(10)),
+            FractionalShares::new(float!(5)),
+            Usdc::new(float!(1000)),
+            Usdc::new(float!(500)),
+        )
+        .with_equity(
+            unconfigured.clone(),
+            FractionalShares::new(float!(3)),
+            FractionalShares::new(float!(2)),
+        );
+        let (ctx, position) = build_ctx(
+            pool.clone(),
+            apalis_pool,
+            view,
+            HashSet::from([aapl()]),
+            true,
+            false,
+            Some(Arc::new(MockWrapper::new())),
+        )
+        .await;
+        mark_all_required_fresh(&ctx);
+
+        // Give the configured symbol a fresh mark so every OTHER counted row
+        // is complete. Without this the day is excluded on AAPL's missing
+        // mark and the assertion below would pass for the wrong reason.
+        let block_timestamp = Utc::now();
+        position
+            .send(
+                &aapl(),
+                PositionCommand::AcknowledgeOnChainFillAt {
+                    symbol: aapl(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::ZERO,
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp,
+                    block_number: None,
+                    seen_at: block_timestamp,
+                },
+            )
+            .await
+            .unwrap();
+
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+
+        let today = et_day(Utc::now());
+        let days = load_portfolio_days(
+            &pool,
+            EtDayRange {
+                from: Some(today),
+                to: Some(today),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The exact reason, not merely "excluded": AAPL and USDC are marked,
+        // so any other exclusion would mean something unrelated broke and
+        // this test would pass without pinning anything.
+        assert_eq!(days.len(), 1);
+        assert_eq!(
+            days[0].capital,
+            DayCapital::Excluded(DayExclusionReason::MissingMark(PortfolioAsset::Equity(
+                unconfigured.clone()
+            ))),
+            "a counted balance dropped at capture leaves the day looking complete, so it is \
+             included with a total that omits it -- understated capital inflates the return"
         );
     }
 

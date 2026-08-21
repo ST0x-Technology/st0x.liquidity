@@ -156,9 +156,10 @@ struct ConfiguredInventoryVaults {
     usdc_vaults: Option<BTreeSet<B256>>,
 }
 
-fn configured_inventory_vaults(ctx: &Ctx) -> ConfiguredInventoryVaults {
-    let equity_symbols: HashSet<_> = ctx
-        .assets
+/// Equity symbols the portfolio treats as configured. Shared with the CLI's
+/// snapshot-mark repair so the two cannot drift on what "configured" means.
+pub(crate) fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
+    ctx.assets
         .equities
         .symbols
         .keys()
@@ -166,7 +167,11 @@ fn configured_inventory_vaults(ctx: &Ctx) -> ConfiguredInventoryVaults {
             ctx.assets.is_trading_enabled(symbol) || ctx.assets.is_rebalancing_enabled(symbol)
         })
         .cloned()
-        .collect();
+        .collect()
+}
+
+fn configured_inventory_vaults(ctx: &Ctx) -> ConfiguredInventoryVaults {
+    let equity_symbols = configured_equity_symbols(ctx);
 
     let mut equity_vaults: BTreeMap<Address, BTreeSet<B256>> = BTreeMap::new();
     for equity_config in ctx.assets.equities.symbols.values() {
