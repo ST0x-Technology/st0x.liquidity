@@ -161,6 +161,38 @@ mod alloy_support {
                 .to_fixed_decimal(6)
                 .map_err(UsdcConversionError::Float)
         }
+
+        /// Floors to USDC's 6-decimal on-chain grid, truncating any finer
+        /// precision toward zero.
+        ///
+        /// For amounts observed at venues that report more decimals than
+        /// USDC can represent on-chain: Alpaca crypto fills carry up to 9.
+        /// The sub-6-decimal remainder cannot exist in an on-chain transfer
+        /// and stays at the venue.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`UsdcConversionError::NegativeValue`] if the USDC
+        /// amount is negative, or [`UsdcConversionError::Float`] if a
+        /// Float operation fails.
+        pub fn floor_to_6_decimals(self) -> Result<Self, UsdcConversionError> {
+            if self
+                .inner()
+                .lt(Float::zero()?)
+                .map_err(UsdcConversionError::Float)?
+            {
+                return Err(UsdcConversionError::NegativeValue(self.inner()));
+            }
+
+            let (fixed, _lossless) = self
+                .inner()
+                .to_fixed_decimal_lossy(6)
+                .map_err(UsdcConversionError::Float)?;
+
+            Float::from_fixed_decimal(fixed, 6)
+                .map(Self)
+                .map_err(UsdcConversionError::Float)
+        }
     }
 }
 
@@ -287,5 +319,34 @@ mod tests {
     #[test]
     fn to_u256_zero_converts_to_zero() {
         assert_eq!(Usdc::ZERO.to_u256_6_decimals().unwrap(), U256::ZERO);
+    }
+
+    #[test]
+    fn floor_truncates_nine_decimal_fill_to_six() {
+        let usdc = Usdc::new(float!(9794.019706861));
+        let floored = usdc.floor_to_6_decimals().unwrap();
+        assert_eq!(floored, Usdc::new(float!(9794.019706)));
+        assert_eq!(
+            floored.to_u256_6_decimals().unwrap(),
+            U256::from(9_794_019_706u64)
+        );
+    }
+
+    #[test]
+    fn floor_leaves_six_decimal_amount_unchanged() {
+        let usdc = Usdc::new(float!(1000.123456));
+        assert_eq!(usdc.floor_to_6_decimals().unwrap(), usdc);
+    }
+
+    #[test]
+    fn floor_leaves_zero_unchanged() {
+        assert_eq!(Usdc::ZERO.floor_to_6_decimals().unwrap(), Usdc::ZERO);
+    }
+
+    #[test]
+    fn floor_rejects_negative_amount() {
+        let usdc = Usdc::new(float!(-1.1234567));
+        let error = usdc.floor_to_6_decimals().unwrap_err();
+        assert!(matches!(error, UsdcConversionError::NegativeValue(_)));
     }
 }

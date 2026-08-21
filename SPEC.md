@@ -2977,6 +2977,12 @@ enum BridgeStage { Burn, Attestation, Mint }
     price it decides how much USDC a notional of N actually buys, always less
     than N. The bot therefore never needs the collar percentage: the received
     USDC is read from the fill, and no broker constant appears in the sizing
+  - Fill precision: Alpaca reports crypto fill quantities with up to 9 decimals;
+    on-chain USDC has 6. The received amount is floored to 6 decimals before it
+    sizes the withdrawal and burn, always downwards; the sub-6-decimal remainder
+    stays in the Alpaca crypto wallet. The `ConversionConfirmed` event records
+    the exact fill. Resume floors the same way, so a persisted amount with more
+    than 6 decimals cannot fail the burn-amount conversion
   - Crypto trading is available 24/7 on Alpaca (no market hours restrictions)
   - Market orders are near-instant but NOT guaranteed to fill immediately
   - Slippage: ~17bps observed in live tests (reduces effective USD received)
