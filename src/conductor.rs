@@ -110,8 +110,8 @@ use crate::rebalancing::equity::{
 };
 use crate::rebalancing::trigger::GuardState;
 use crate::rebalancing::usdc::{
-    TransferUsdcToHedging, TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking,
-    TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
+    RecheckUsdcDeposit, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
+    TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
 };
 use crate::rebalancing::{
     BaseWallet, ChainWallets, EthereumWallet, RebalancerServices, RebalancingSchedulers,
@@ -572,6 +572,44 @@ async fn finish_startup_recovery(deps: StartupRecoveryDeps<'_>) -> anyhow::Resul
     Ok(())
 }
 
+/// Builds the position/rebalancing wiring and immediately runs the startup
+/// recovery phase that depends on it: the requeue and hydration steps in
+/// [`finish_startup_recovery`] consume the transfer contexts, rebalancing
+/// service, and position projection this setup produces, so the two form
+/// one startup unit.
+async fn setup_positioning_with_recovery(
+    rebalancing: Option<RebalancingCtx>,
+    deps: RebalancingDeps,
+    backfill_queue: &BackfillJobQueue,
+    record_bot_gas_receipt_cost_ctx: Option<&Arc<RecordBotGasReceiptCostCtx>>,
+) -> anyhow::Result<PositionAndRebalancing> {
+    // The recovery phase needs these after `setup` consumes `deps`.
+    let pool = deps.pool.clone();
+    let inventory = deps.inventory.clone();
+    let schedulers = deps.schedulers.clone();
+    let record_bot_gas_receipt_cost_queue = deps.record_bot_gas_receipt_cost_queue.clone();
+
+    let positioning = PositionAndRebalancing::setup(rebalancing, deps).await?;
+
+    finish_startup_recovery(StartupRecoveryDeps {
+        schedulers: &schedulers,
+        backfill_queue,
+        usdc_to_hedging_ctx: positioning.transfer_usdc_to_hedging_ctx.as_ref(),
+        usdc_to_market_making_ctx: positioning.transfer_usdc_to_market_making_ctx.as_ref(),
+        equity_to_market_making_ctx: positioning.transfer_equity_to_market_making_ctx.as_ref(),
+        equity_to_hedging_ctx: positioning.transfer_equity_to_hedging_ctx.as_ref(),
+        record_bot_gas_receipt_cost_queue: &record_bot_gas_receipt_cost_queue,
+        record_bot_gas_receipt_cost_ctx,
+        pool: &pool,
+        inventory: &inventory,
+        rebalancing_service: positioning.service.as_ref(),
+        position_projection: &positioning.position_projection,
+    })
+    .await?;
+
+    Ok(positioning)
+}
+
 async fn requeue_transfer_orphans<Task>(
     queue: &job::JobQueue<Task>,
     direction_label: &str,
@@ -795,8 +833,11 @@ fn publish_recovery_handle(
     recovery_cell: &tokio::sync::OnceCell<crate::api::RecoveryHandle>,
     transfer: Option<Arc<CrossVenueEquityTransfer>>,
     rebalancing_service: Option<Arc<RebalancingService>>,
+    usdc_recheck: Option<Arc<dyn RecheckUsdcDeposit>>,
 ) {
-    let (Some(transfer), Some(rebalancing_service)) = (transfer, rebalancing_service) else {
+    let (Some(transfer), Some(rebalancing_service), Some(usdc_recheck)) =
+        (transfer, rebalancing_service, usdc_recheck)
+    else {
         debug!("Rebalancing disabled: /transfers/resume stays unavailable");
         return;
     };
@@ -804,6 +845,7 @@ fn publish_recovery_handle(
     let _ = recovery_cell.set(crate::api::RecoveryHandle {
         transfer,
         rebalancing_service,
+        usdc_recheck,
     });
 }
 
@@ -880,6 +922,7 @@ impl Conductor {
             wrapper,
             service: rebalancing_service,
             recovery_transfer,
+            usdc_recheck,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store,
@@ -891,7 +934,7 @@ impl Conductor {
             resume_tokenization_queue,
             deliver_mint_authorization_queue,
             deliver_mint_authorization_ctx,
-        } = PositionAndRebalancing::setup(
+        } = Box::pin(setup_positioning_with_recovery(
             rebalancing,
             RebalancingDeps {
                 pool: pool.clone(),
@@ -907,23 +950,9 @@ impl Conductor {
                 notifier: notifier.clone(),
                 record_bot_gas_receipt_cost_queue: record_bot_gas_receipt_cost_queue.clone(),
             },
-        )
-        .await?;
-
-        finish_startup_recovery(StartupRecoveryDeps {
-            schedulers: &schedulers,
-            backfill_queue: &backfill_queue,
-            usdc_to_hedging_ctx: transfer_usdc_to_hedging_ctx.as_ref(),
-            usdc_to_market_making_ctx: transfer_usdc_to_market_making_ctx.as_ref(),
-            equity_to_market_making_ctx: transfer_equity_to_market_making_ctx.as_ref(),
-            equity_to_hedging_ctx: transfer_equity_to_hedging_ctx.as_ref(),
-            record_bot_gas_receipt_cost_queue: &record_bot_gas_receipt_cost_queue,
-            record_bot_gas_receipt_cost_ctx: record_bot_gas_receipt_cost_ctx.as_ref(),
-            pool: &pool,
-            inventory: &inventory,
-            rebalancing_service: rebalancing_service.as_ref(),
-            position_projection: &position_projection,
-        })
+            &backfill_queue,
+            record_bot_gas_receipt_cost_ctx.as_ref(),
+        ))
         .await?;
 
         let (offchain_order, offchain_order_projection) = setup_offchain_order_store(
@@ -1058,7 +1087,12 @@ impl Conductor {
             .worker_failure_notifier(notifier)
             .call()?;
 
-        publish_recovery_handle(&recovery_cell, recovery_transfer, recovery_service);
+        publish_recovery_handle(
+            &recovery_cell,
+            recovery_transfer,
+            recovery_service,
+            usdc_recheck,
+        );
 
         conductor
             .run_until_completion(startup_tokens.initialized)
@@ -1657,6 +1691,9 @@ struct RebalancingInfrastructure {
     wrapper: Arc<dyn Wrapper>,
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
+    /// Operator `transfer recheck` entry point for a failed USDC deposit,
+    /// published on the recovery handle.
+    usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -1707,6 +1744,7 @@ struct PositionAndRebalancing {
     wrapper: Option<Arc<dyn Wrapper>>,
     service: Option<Arc<RebalancingService>>,
     recovery_transfer: Option<Arc<CrossVenueEquityTransfer>>,
+    usdc_recheck: Option<Arc<dyn RecheckUsdcDeposit>>,
     wrapped_equity_recovery_store: Option<Arc<Store<WrappedEquityRecovery>>>,
     unwrapped_equity_recovery_store: Option<Arc<Store<UnwrappedEquityRecovery>>>,
     mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
@@ -1791,6 +1829,7 @@ impl PositionAndRebalancing {
                 wrapper: Some(infra.wrapper),
                 service: Some(infra.service),
                 recovery_transfer: Some(infra.recovery_transfer),
+                usdc_recheck: Some(infra.usdc_recheck),
                 wrapped_equity_recovery_store: Some(infra.wrapped_equity_recovery_store),
                 unwrapped_equity_recovery_store: Some(infra.unwrapped_equity_recovery_store),
                 mint_store: Some(infra.mint_store),
@@ -1848,6 +1887,7 @@ impl PositionAndRebalancing {
                 wrapper,
                 service: None,
                 recovery_transfer: None,
+                usdc_recheck: None,
                 wrapped_equity_recovery_store: None,
                 unwrapped_equity_recovery_store: None,
                 mint_store: None,
@@ -2481,6 +2521,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             wrapper,
             service: rebalancing_service,
             recovery_transfer,
+            usdc_recheck: usdc_handles.recheck_deposit,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store: built.mint,

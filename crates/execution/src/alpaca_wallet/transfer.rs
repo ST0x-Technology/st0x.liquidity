@@ -8,6 +8,7 @@ use alloy::primitives::{Address, TxHash};
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize};
+use tracing::warn;
 use uuid::Uuid;
 
 use rain_math_float::Float;
@@ -234,22 +235,94 @@ pub(super) async fn list_all_transfers(
     Ok(serde_json::from_str(&body)?)
 }
 
-/// Finds a transfer by its transaction hash.
+/// Finds an incoming deposit by its transaction hash with a single query --
+/// no polling deadline. Both predicates (hash AND incoming direction) apply
+/// to the same search: an outgoing transfer sharing the hash must not
+/// shadow the deposit behind it, and can never itself be the deposit a
+/// recheck is verifying.
 ///
-/// Fetches all transfers and filters by tx_hash. Returns the first match
-/// or None if no transfer with that tx hash exists.
-pub(super) async fn find_transfer_by_tx_hash(
+/// Scans the account-wide transfer list client-side because the list
+/// endpoint has no tx-hash filter and a deposit detected by hash has no
+/// Alpaca transfer id to feed the by-id endpoint. The list is potentially
+/// capped (see [`get_transfer_status`]), so `Ok(None)` means "not in the
+/// list", NOT proof the deposit does not exist: callers must treat it as
+/// retryable, never as grounds for an irreversible decision.
+///
+/// Filters on a chain-neutral key before parsing EVM fields: the
+/// account-wide list can carry transfers on other chains whose hashes and
+/// addresses do not parse as EVM types, and one such row must not make an
+/// Ethereum deposit impossible to recheck. A hash that does not parse as
+/// an EVM tx hash can never match the EVM target, so foreign rows are
+/// skipped, not errors; only the matched row is parsed as a full
+/// [`Transfer`], where a parse failure IS an error.
+pub(super) async fn find_deposit_by_tx_hash(
     client: &AlpacaWalletClient,
     tx_hash: &TxHash,
+) -> Result<Option<Transfer>, AlpacaWalletError> {
+    scan_transfer_list_by_tx_hash(client, tx_hash, Some(TransferDirection::Incoming)).await
+}
+
+/// Chain-neutral scan of the account-wide transfer list for a tx-hash match,
+/// optionally constrained to one direction. Shared by both hash lookups so a
+/// foreign-chain row is skipped in one place instead of failing whichever
+/// caller deserializes the full list.
+async fn scan_transfer_list_by_tx_hash(
+    client: &AlpacaWalletClient,
+    tx_hash: &TxHash,
+    direction: Option<TransferDirection>,
 ) -> Result<Option<Transfer>, AlpacaWalletError> {
     let path = format!("/v1/accounts/{}/wallets/transfers", client.account_id());
 
     let body = client.get(&path).await?;
-    let transfers: Vec<Transfer> = serde_json::from_str(&body)?;
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&body)?;
 
-    Ok(transfers
-        .into_iter()
-        .find(|transfer| transfer.tx.as_ref() == Some(tx_hash)))
+    rows.into_iter()
+        .find(|row| {
+            // Log the parse error and the row's transfer id only, never the
+            // full row: it is an external payload of arbitrary shape carrying
+            // account addresses and amounts that do not belong in logs.
+            let key = match TransferListKey::deserialize(row) {
+                Ok(key) => key,
+                Err(error) => {
+                    warn!(
+                        %error,
+                        row_id = ?row.get("id"),
+                        "skipping transfer-list row without a parsable direction"
+                    );
+                    return false;
+                }
+            };
+
+            direction.is_none_or(|wanted| key.direction == wanted)
+                && key
+                    .tx
+                    .is_some_and(|raw| raw.parse::<TxHash>().ok().as_ref() == Some(tx_hash))
+        })
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(Into::into)
+}
+
+/// Chain-neutral subset of a transfer-list row: only the fields the
+/// tx-hash search filters on, with the hash left as a raw string so a
+/// non-EVM row deserializes instead of failing the whole scan.
+#[derive(Deserialize)]
+struct TransferListKey {
+    #[serde(rename = "tx_hash", default)]
+    tx: Option<String>,
+    direction: TransferDirection,
+}
+
+/// Finds a transfer by its transaction hash, in either direction.
+///
+/// Scans the account-wide list through the shared chain-neutral scan, so a
+/// foreign-chain row cannot fail the lookup. Returns the first match or
+/// None if no transfer with that tx hash exists.
+pub(super) async fn find_transfer_by_tx_hash(
+    client: &AlpacaWalletClient,
+    tx_hash: &TxHash,
+) -> Result<Option<Transfer>, AlpacaWalletError> {
+    scan_transfer_list_by_tx_hash(client, tx_hash, None).await
 }
 
 #[cfg(test)]
@@ -998,5 +1071,270 @@ mod tests {
             error.to_string().contains("Float"),
             "error should indicate Float parse failure: {error}"
         );
+    }
+
+    fn transfer_list_entry(tx_hash: TxHash, direction: &str, status: &str) -> serde_json::Value {
+        json!({
+            "id": Uuid::new_v4(),
+            "direction": direction,
+            "amount": "500",
+            "usd_value": "500",
+            "chain": "ethereum",
+            "asset": "USDC",
+            "from_address": "0x9999999999999999999999999999999999999999",
+            "to_address": "0x1234567890abcdef1234567890abcdef12345678",
+            "status": status,
+            "tx_hash": tx_hash,
+            "created_at": "2024-01-01T00:00:00Z",
+            "network_fee": "0",
+            "fees": "0"
+        })
+    }
+
+    fn test_wallet_client(server: &MockServer) -> AlpacaWalletClient {
+        AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        )
+    }
+
+    const DEPOSIT_TX: TxHash =
+        fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+
+    /// The single-shot lookup finds a settled incoming deposit without any
+    /// polling deadline -- the `transfer recheck` path for a deposit that
+    /// completed after the poller gave up.
+    #[tokio::test]
+    async fn find_deposit_returns_completed_incoming_transfer() {
+        let server = MockServer::start();
+        let transfers_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([transfer_list_entry(
+                    DEPOSIT_TX, "INCOMING", "COMPLETE"
+                )]));
+        });
+
+        let transfer = find_deposit_by_tx_hash(&test_wallet_client(&server), &DEPOSIT_TX)
+            .await
+            .unwrap()
+            .expect("a settled incoming deposit must be found");
+
+        transfers_mock.assert();
+        assert_eq!(transfer.status, TransferStatus::Complete);
+        assert_eq!(transfer.tx, Some(DEPOSIT_TX));
+        assert_eq!(transfer.direction, TransferDirection::Incoming);
+    }
+
+    /// A still-processing deposit is returned with its live status so the
+    /// caller can refuse rather than fabricate a success.
+    #[tokio::test]
+    async fn find_deposit_preserves_non_terminal_status() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([transfer_list_entry(
+                    DEPOSIT_TX,
+                    "INCOMING",
+                    "PROCESSING"
+                )]));
+        });
+
+        let transfer = find_deposit_by_tx_hash(&test_wallet_client(&server), &DEPOSIT_TX)
+            .await
+            .unwrap()
+            .expect("a detected deposit must be found regardless of status");
+
+        assert_eq!(transfer.status, TransferStatus::Processing);
+    }
+
+    /// An outgoing duplicate listed BEFORE the incoming deposit must not
+    /// shadow it: both predicates apply to the same search, so the deposit
+    /// behind the duplicate is still found.
+    #[tokio::test]
+    async fn find_deposit_finds_incoming_behind_outgoing_duplicate() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    transfer_list_entry(DEPOSIT_TX, "OUTGOING", "COMPLETE"),
+                    transfer_list_entry(DEPOSIT_TX, "INCOMING", "COMPLETE"),
+                ]));
+        });
+
+        let transfer = find_deposit_by_tx_hash(&test_wallet_client(&server), &DEPOSIT_TX)
+            .await
+            .unwrap()
+            .expect("the incoming deposit behind the outgoing duplicate must be found");
+
+        assert_eq!(transfer.direction, TransferDirection::Incoming);
+        assert_eq!(transfer.status, TransferStatus::Complete);
+    }
+
+    /// An outgoing transfer with the same hash can never be the deposit a
+    /// recheck verifies; it must be filtered out, not returned.
+    #[tokio::test]
+    async fn find_deposit_filters_outgoing_transfer_with_matching_hash() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([transfer_list_entry(
+                    DEPOSIT_TX, "OUTGOING", "COMPLETE"
+                )]));
+        });
+
+        let found = find_deposit_by_tx_hash(&test_wallet_client(&server), &DEPOSIT_TX)
+            .await
+            .unwrap();
+
+        assert_eq!(found.map(|transfer| transfer.id), None);
+    }
+
+    /// A transfer on another chain -- whose hash and addresses do not parse
+    /// as EVM types -- must not make the Ethereum deposit behind it
+    /// impossible to find: the search keys on chain-neutral fields first and
+    /// only parses the matched row as an EVM transfer.
+    #[tokio::test]
+    async fn find_deposit_skips_non_evm_rows_in_mixed_chain_list() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "id": Uuid::new_v4(),
+                        "direction": "INCOMING",
+                        "amount": "2.5",
+                        "usd_value": "500",
+                        "chain": "solana",
+                        "asset": "SOL",
+                        "from_address": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                        "to_address": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+                        "status": "COMPLETE",
+                        "tx_hash": "5wHu1qwD4kKKyN1EEPBLRZ8hUvmCwF9zPSNdPCVBLcNq\
+                                    QwR8DXCzB1FLZniqW6cBGXbmMDvBhSf5aG1qNW7Wj2Vt",
+                        "created_at": "2024-01-01T00:00:00Z",
+                        "network_fee": "0",
+                        "fees": "0"
+                    },
+                    transfer_list_entry(DEPOSIT_TX, "INCOMING", "COMPLETE"),
+                ]));
+        });
+
+        let transfer = find_deposit_by_tx_hash(&test_wallet_client(&server), &DEPOSIT_TX)
+            .await
+            .unwrap()
+            .expect("the EVM deposit behind the non-EVM row must be found");
+
+        assert_eq!(transfer.tx, Some(DEPOSIT_TX));
+        assert_eq!(transfer.direction, TransferDirection::Incoming);
+        assert_eq!(transfer.status, TransferStatus::Complete);
+    }
+
+    /// A row without a parsable direction (here: the field is absent) must be
+    /// skipped with a warning, not hide the matching deposit listed after it.
+    #[tokio::test]
+    async fn find_deposit_skips_row_without_parsable_direction() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "id": Uuid::new_v4(),
+                        "amount": "500",
+                        "usd_value": "500",
+                        "chain": "ethereum",
+                        "asset": "USDC",
+                        "status": "COMPLETE",
+                        "tx_hash": DEPOSIT_TX,
+                        "created_at": "2024-01-01T00:00:00Z"
+                    },
+                    transfer_list_entry(DEPOSIT_TX, "INCOMING", "COMPLETE"),
+                ]));
+        });
+
+        let transfer = find_deposit_by_tx_hash(&test_wallet_client(&server), &DEPOSIT_TX)
+            .await
+            .unwrap()
+            .expect("the deposit behind the directionless row must be found");
+
+        assert_eq!(transfer.tx, Some(DEPOSIT_TX));
+        assert_eq!(transfer.direction, TransferDirection::Incoming);
+    }
+
+    /// The direction-agnostic hash lookup shares the chain-neutral scan, so a
+    /// non-EVM row in the account-wide list must not fail the whole lookup.
+    #[tokio::test]
+    async fn find_transfer_skips_non_evm_rows_in_mixed_chain_list() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "id": Uuid::new_v4(),
+                        "direction": "OUTGOING",
+                        "amount": "2.5",
+                        "usd_value": "500",
+                        "chain": "solana",
+                        "asset": "SOL",
+                        "from_address": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                        "to_address": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+                        "status": "COMPLETE",
+                        "tx_hash": "5wHu1qwD4kKKyN1EEPBLRZ8hUvmCwF9zPSNdPCVBLcNq\
+                                    QwR8DXCzB1FLZniqW6cBGXbmMDvBhSf5aG1qNW7Wj2Vt",
+                        "created_at": "2024-01-01T00:00:00Z",
+                        "network_fee": "0",
+                        "fees": "0"
+                    },
+                    transfer_list_entry(DEPOSIT_TX, "OUTGOING", "COMPLETE"),
+                ]));
+        });
+
+        let transfer = find_transfer_by_tx_hash(&test_wallet_client(&server), &DEPOSIT_TX)
+            .await
+            .unwrap()
+            .expect("the EVM transfer behind the non-EVM row must be found");
+
+        assert_eq!(transfer.tx, Some(DEPOSIT_TX));
+        assert_eq!(transfer.direction, TransferDirection::Outgoing);
+    }
+
+    #[tokio::test]
+    async fn find_deposit_returns_none_when_undetected() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        let found = find_deposit_by_tx_hash(&test_wallet_client(&server), &DEPOSIT_TX)
+            .await
+            .unwrap();
+
+        assert_eq!(found.map(|transfer| transfer.id), None);
     }
 }
