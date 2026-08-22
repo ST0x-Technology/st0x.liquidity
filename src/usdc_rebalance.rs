@@ -940,13 +940,18 @@ impl UsdcRebalance {
         }
     }
 
-    /// Whether a failed rebalance failed POST-burn -- the only USDC failures
-    /// `transfer reconcile --kind usdc` accepts (a pre-burn failure strands
-    /// nothing and the CLI rejects it). MUST stay in sync with the reconcilable
-    /// set in `transition_reconcile_stuck_rebalance`. A new (non-failure or
-    /// future) state defaults to `false`, i.e. not reconcilable -- the safe
-    /// default for surfacing the command on the dashboard.
-    fn is_post_burn_failure(&self) -> bool {
+    /// Whether a failed rebalance is one `transfer reconcile --kind usdc`
+    /// accepts: a post-burn failure, or an AlpacaToBase `BridgingFailed`
+    /// (post-withdrawal, so the funds are off Alpaca even without burn
+    /// evidence -- the settlement-retry-deadline terminal).
+    ///
+    /// The SINGLE source of the reconcile-eligibility rule: the
+    /// `transition_reconcile_stuck_rebalance` guard, the `OperatorReconciled`
+    /// apply guard, the CLI preflight, and the dashboard DTO all call this
+    /// predicate rather than mirroring the condition. The match is
+    /// exhaustive, so a new state forces a conscious classification here at
+    /// compile time instead of silently landing in a wildcard arm.
+    pub(crate) fn is_reconcilable_failure(&self) -> bool {
         match self {
             Self::DepositFailed { .. }
             | Self::ConversionFailed {
@@ -954,19 +959,25 @@ impl UsdcRebalance {
                 ..
             } => true,
             Self::BridgingFailed {
+                direction,
                 burn_tx_hash,
                 cctp_nonce,
                 ..
-            } => burn_tx_hash.is_some() || cctp_nonce.is_some(),
-            // Everything else is not a post-burn failure: pre-burn failures
-            // strand nothing on-chain (WithdrawalFailed, and an AlpacaToBase
-            // ConversionFailed which is pre-withdrawal), and in-flight or
-            // clearable-terminal states (success / Reconciled) are not failures
-            // at all -- so the CLI rejects `transfer reconcile --kind usdc` for
-            // all of them. Enumerated exhaustively rather than via a wildcard so
-            // a new variant forces a conscious post-burn classification here
-            // instead of silently defaulting to false and diverging from the
-            // reconcilable set in `transition_reconcile_stuck_rebalance`.
+            } => {
+                burn_tx_hash.is_some()
+                    || cctp_nonce.is_some()
+                    || *direction == RebalanceDirection::AlpacaToBase
+            }
+            // Everything else is not reconcilable: failures whose funds never
+            // left the source venue (WithdrawalFailed, an AlpacaToBase
+            // ConversionFailed which is pre-withdrawal) reconcile to source on
+            // their own, and in-flight or clearable-terminal states
+            // (success / Reconciled) are not failures at all -- so the CLI
+            // rejects `transfer reconcile --kind usdc` for all of them.
+            // Enumerated exhaustively rather than via a wildcard so a new
+            // variant forces a conscious classification here instead of
+            // silently defaulting to false and diverging from the reconcilable
+            // set in `transition_reconcile_stuck_rebalance`.
             Self::WithdrawalFailed { .. }
             | Self::ConversionFailed {
                 direction: RebalanceDirection::AlpacaToBase,
@@ -1064,7 +1075,12 @@ impl UsdcRebalance {
                 *amount,
                 UsdcBridgeStatus::Failed {
                     failed_at: *failed_at,
-                    post_burn: self.is_post_burn_failure(),
+                    // `post_burn` is the wire name kept for DTO compatibility;
+                    // the value is reconcile-eligibility, which is also true
+                    // for an AlpacaToBase `BridgingFailed` with NO recorded
+                    // burn (post-withdrawal, funds off Alpaca -- the
+                    // settlement-retry-deadline terminal).
+                    post_burn: self.is_reconcilable_failure(),
                 },
                 *initiated_at,
                 *failed_at,
@@ -1260,21 +1276,32 @@ impl UsdcRebalance {
                 RebalanceDirection::BaseToAlpaca => false,
             },
             // Post-burn failure (burn already broadcast) keeps the guard so a
-            // re-burn cannot fire against funds CCTP already burned. `FailBridging`
-            // from post-burn `Bridging`/`Attested` states emits `burn_tx_hash: Some`
-            // and holds the guard. A plain pre-burn `FailBridging` from
-            // `WithdrawalComplete` carries `burn_tx_hash: None` and reconciles to
-            // source.
+            // re-burn cannot fire against funds CCTP already burned.
+            // `FailBridging` from post-burn `Bridging`/`Attested` states emits
+            // `burn_tx_hash: Some` and holds the guard.
             //
-            // For a BaseToAlpaca post-burn failure this is not a permanent latch:
-            // it is now recoverable and auto-re-armed on startup, and recovery
-            // drives `BridgingFailed -> Bridged -> deposit -> terminal`, at which
-            // point this returns `false` and the guard clears via the normal
-            // terminal path with no operator action. An AlpacaToBase post-burn
-            // failure also holds the guard here, but has no recovery path yet
-            // (neither startup re-arm nor the resume CLI drive it), so it stays
-            // held until manual reconciliation.
-            Self::BridgingFailed { burn_tx_hash, .. } => burn_tx_hash.is_some(),
+            // An AlpacaToBase `BridgingFailed` holds even WITHOUT burn
+            // evidence: `FailBridging` is only reachable after the withdrawal
+            // completed, so the withdrawn funds are off Alpaca and may still
+            // land on-chain late (the settlement-retry-deadline terminal).
+            // Releasing the guard would let a fresh transfer start and burn
+            // those late-landing funds as its own. The guard stays held until
+            // `transfer reconcile --kind usdc` settles the funds. A
+            // BaseToAlpaca pre-burn `FailBridging` carries no moved funds and
+            // reconciles to source.
+            //
+            // For a BaseToAlpaca post-burn failure this is not a permanent
+            // latch: it is recoverable and auto-re-armed on startup, and
+            // recovery drives `BridgingFailed -> Bridged -> deposit ->
+            // terminal`, at which point this returns `false` and the guard
+            // clears via the normal terminal path with no operator action.
+            Self::BridgingFailed {
+                direction,
+                burn_tx_hash,
+                ..
+            } => {
+                burn_tx_hash.is_some() || *direction == RebalanceDirection::AlpacaToBase
+            }
             // BaseToAlpaca-only post-burn legs: after DepositConfirmed the
             // post-deposit USDC->USD conversion is still pending, and a
             // post-deposit ConversionFailed is post-mint -- both hold. For
@@ -1407,12 +1434,14 @@ impl UsdcRebalance {
         &self,
     ) -> Option<(RebalanceDirection, Usdc, DateTime<Utc>)> {
         match self {
-            // The three manually-reconcilable guard-holding terminal states
-            // that cannot self-recover via the reactor/apalis:
+            // The manually-reconcilable guard-holding terminal states that
+            // cannot self-recover via the reactor/apalis:
             //  - DepositFailed (any direction): post-burn/post-mint.
             //  - ConversionFailed(BaseToAlpaca): post-deposit USDC->USD leg,
             //    post-mint, no apalis re-arm.
-            //  - BridgingFailed(AlpacaToBase, burn_tx=Some): post-burn; only
+            //  - BridgingFailed(AlpacaToBase), with or without burn evidence:
+            //    post-withdrawal, so the funds are off Alpaca (the pre-burn
+            //    case is the settlement-retry-deadline terminal); only
             //    BaseToAlpaca BridgingFailed is re-armed on startup by
             //    `resumable_post_burn_transfer`; AlpacaToBase has no recovery
             //    path and requires CLI reconciliation.
@@ -1431,7 +1460,6 @@ impl UsdcRebalance {
             | Self::BridgingFailed {
                 direction: direction @ RebalanceDirection::AlpacaToBase,
                 amount,
-                burn_tx_hash: Some(_),
                 failed_at,
                 ..
             } => Some((*direction, *amount, *failed_at)),
@@ -2360,14 +2388,13 @@ impl EventSourced for UsdcRebalance {
                         reconciled_at: *reconciled_at,
                     },
 
-                    // BridgingFailed with a burn tx or cctp nonce: post-burn, manually
-                    // reconcilable.
+                    // BridgingFailed: eligibility decided by
+                    // `is_reconcilable_failure` (burn evidence, or an
+                    // AlpacaToBase whose withdrawal completed).
                     Self::BridgingFailed {
                         reason: failure_reason,
-                        burn_tx_hash,
-                        cctp_nonce,
                         ..
-                    } if burn_tx_hash.is_some() || cctp_nonce.is_some() => Self::Reconciled {
+                    } if state.is_reconcilable_failure() => Self::Reconciled {
                         direction: *direction,
                         amount: *amount,
                         reason: *reason,
@@ -3491,8 +3518,12 @@ impl UsdcRebalance {
     /// - `BridgingFailed` with a recorded `burn_tx_hash` or `cctp_nonce` -- both
     ///   are only ever populated after the burn reaches CCTP, so either proves
     ///   the failure is post-burn (mirrors the reactor's post-burn classifier).
-    ///   A pre-burn `BridgingFailed` (both `None`) carries no burned funds and
-    ///   already reconciles to source on its own.
+    ///   An AlpacaToBase `BridgingFailed` is ALSO accepted without burn
+    ///   evidence: `FailBridging` is only reachable after the withdrawal
+    ///   completed, so its funds are provably off Alpaca (the
+    ///   settlement-retry-deadline terminal). A BaseToAlpaca pre-burn
+    ///   `BridgingFailed` (both `None`) carries no burned funds and already
+    ///   reconciles to source on its own.
     /// - A `BaseToAlpaca` `ConversionFailed` -- that conversion is the
     ///   post-deposit USDC->USD leg, so it is post-mint. The `AlpacaToBase`
     ///   `ConversionFailed` is the pre-withdrawal leg (pre-burn) and reconciles
@@ -3519,16 +3550,17 @@ impl UsdcRebalance {
                 initiated_at,
                 ..
             } => (*direction, *amount, *initiated_at),
+            // The BridgingFailed eligibility rule (burn evidence, or an
+            // AlpacaToBase whose withdrawal completed) lives in
+            // `is_reconcilable_failure`; a BaseToAlpaca pre-burn
+            // BridgingFailed stays rejected there because its funds never
+            // left the source venue.
             Self::BridgingFailed {
                 direction,
                 amount,
-                burn_tx_hash,
-                cctp_nonce,
                 initiated_at,
                 ..
-            } if burn_tx_hash.is_some() || cctp_nonce.is_some() => {
-                (*direction, *amount, *initiated_at)
-            }
+            } if self.is_reconcilable_failure() => (*direction, *amount, *initiated_at),
             _ => {
                 return Err(UsdcRebalanceError::InvalidCommand {
                     command: "ReconcileStuckRebalance".to_string(),
@@ -7404,6 +7436,59 @@ mod tests {
         );
     }
 
+    /// Event history landing an AlpacaToBase aggregate in a PRE-burn terminal
+    /// `BridgingFailed` (no burn evidence) after the withdrawal completed --
+    /// the settlement-retry-deadline terminal. The withdrawn funds are off
+    /// Alpaca, so the state is operator-reconcilable despite being pre-burn.
+    fn alpaca_to_base_pre_burn_bridging_failed_history() -> Vec<UsdcRebalanceEvent> {
+        let amount = Usdc::new(float!(100.00));
+
+        vec![
+            UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::ConversionConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                conversion: ConversionAmounts::new(amount, amount),
+                converted_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceEvent::BridgingFailed {
+                burn_tx_hash: None,
+                cctp_nonce: None,
+                reason: "settlement retry deadline elapsed".to_string(),
+                failed_at: Utc::now(),
+            },
+        ]
+    }
+
+    /// Hypothesis: an AlpacaToBase pre-burn `BridgingFailed` is
+    /// reconcile-eligible even without burn evidence. `FailBridging` is only
+    /// reachable after the withdrawal completed, so the withdrawn funds are
+    /// provably off Alpaca and only an operator can settle them -- rejecting
+    /// this state (as the burn-evidence-only rule does) leaves the
+    /// settlement-deadline terminal with no operator exit.
+    #[tokio::test]
+    async fn reconcile_stuck_rebalance_from_alpaca_to_base_pre_burn_bridging_failed() {
+        assert_reconcile_emits_operator_reconciled(
+            alpaca_to_base_pre_burn_bridging_failed_history(),
+            RebalanceDirection::AlpacaToBase,
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn reconcile_stuck_rebalance_from_post_burn_bridging_failed_emits_operator_reconciled() {
         assert_reconcile_emits_operator_reconciled(
@@ -9512,6 +9597,41 @@ mod tests {
     }
 
     #[test]
+    fn to_dto_bridging_failed_alpaca_to_base_without_burn_maps_to_reconcilable_status() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+        let failed_at = initiated_at + chrono::Duration::seconds(60);
+        let state = UsdcRebalance::BridgingFailed {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc::new(float!(750)),
+            burn_tx_hash: None,
+            cctp_nonce: None,
+            reason: "settlement retry deadline elapsed".to_string(),
+            initiated_at,
+            failed_at,
+        };
+
+        let dto = state.to_dto(&id);
+        let TransferOperation::UsdcBridge(bridge) = dto else {
+            panic!("expected UsdcBridge variant");
+        };
+
+        // No burn evidence, but the AlpacaToBase withdrawal completed, so the
+        // funds are off Alpaca and the CLI accepts
+        // `transfer reconcile --kind usdc` -- the discriminator must be true
+        // even without a burn.
+        assert!(matches!(
+            bridge.status,
+            UsdcBridgeStatus::Failed {
+                failed_at: fa,
+                post_burn: true
+            } if fa == failed_at
+        ));
+        assert_eq!(bridge.started_at, initiated_at);
+        assert_eq!(bridge.updated_at, failed_at);
+    }
+
+    #[test]
     fn to_dto_conversion_failed_base_to_alpaca_maps_to_post_burn_failed_status() {
         let id = UsdcRebalanceId(Uuid::new_v4());
         let initiated_at = Utc::now();
@@ -9887,7 +10007,11 @@ mod tests {
             }
             .holds_rebalance_guard()
         );
-        // Post-burn bridge failure keeps the guard; pre-burn failure clears it.
+        // Post-burn bridge failure keeps the guard. An AlpacaToBase
+        // BridgingFailed keeps it even pre-burn: FailBridging is only
+        // reachable after the withdrawal completed, so the withdrawn funds
+        // are off Alpaca and may land late (the settlement-retry-deadline
+        // terminal); a fresh transfer must not start until reconcile.
         assert!(
             BridgingFailed {
                 direction: AlpacaToBase,
@@ -9901,12 +10025,12 @@ mod tests {
             .holds_rebalance_guard()
         );
         assert!(
-            !BridgingFailed {
+            BridgingFailed {
                 direction: AlpacaToBase,
                 amount,
                 burn_tx_hash: None,
                 cctp_nonce: None,
-                reason: "pre-burn".to_string(),
+                reason: "pre-burn, post-withdrawal".to_string(),
                 initiated_at: now,
                 failed_at: now,
             }

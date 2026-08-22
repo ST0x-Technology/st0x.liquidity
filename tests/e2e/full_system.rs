@@ -552,6 +552,7 @@ eth_usd_feed_id = "0xabababababababababababababababababababababababababababababa
 transfer_timeout_secs = 1800
 transfer_attempt_timeout_secs = 3600
 attestation_retry_deadline_secs = 86400
+settlement_retry_deadline_secs = 86400
 max_burn_revert_redrives = 5
 equity = {{ target = 0.5, deviation = 0.1 }}
 usdc = {{ mode = "enabled", target = 0.5, deviation = 0.1 }}
