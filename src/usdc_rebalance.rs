@@ -83,7 +83,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
-use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Nil, Store};
 use st0x_execution::{AlpacaTransferId, ClientOrderId};
 use st0x_finance::{HasZero, Id, Usdc};
 
@@ -1669,6 +1669,62 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
     }
 
     Ok(InterruptedUsdcRebalances { ids, unparseable })
+}
+
+/// Whether any persisted USDC rebalance currently holds the single-rebalance
+/// guard. Mirrors startup guard recovery's defensive posture: unparseable
+/// candidate ids and aggregates that fail to load count as holders, because
+/// treating them as clear could release a latch that still protects a
+/// possibly post-burn rebalance.
+pub(crate) async fn any_rebalance_holds_guard(
+    pool: &SqlitePool,
+    store: &Store<UsdcRebalance>,
+) -> Result<bool, sqlx::Error> {
+    let InterruptedUsdcRebalances { ids, unparseable } =
+        interrupted_usdc_rebalance_ids(pool).await?;
+
+    if !unparseable.is_empty() {
+        warn!(
+            target: "rebalance",
+            ?unparseable,
+            "Treating unparseable USDC rebalance candidates as guard holders"
+        );
+        return Ok(true);
+    }
+
+    for id in ids {
+        match store.load(&id).await {
+            Ok(Some(entity)) => {
+                if entity.holds_rebalance_guard() {
+                    return Ok(true);
+                }
+            }
+            // The candidate query only returns ids with persisted events, so
+            // events that replay to no state are a store inconsistency --
+            // treating it as clear could release a latch that still protects
+            // a possibly post-burn rebalance.
+            Ok(None) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    "USDC rebalance candidate has events but no materialized \
+                     state; treating it as a guard holder"
+                );
+                return Ok(true);
+            }
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    ?error,
+                    "Treating unloadable USDC rebalance as a guard holder"
+                );
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 #[async_trait]
@@ -10311,6 +10367,113 @@ mod tests {
             store.send(&id, command).await.unwrap();
         }
         id
+    }
+
+    #[tokio::test]
+    async fn any_rebalance_holds_guard_is_false_for_empty_store() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+
+        assert!(!any_rebalance_holds_guard(&pool, &store).await.unwrap());
+    }
+
+    /// A post-burn `BridgingFailed` (burn tx recorded) holds the guard, so
+    /// the durable scan must report a holder.
+    #[tokio::test]
+    async fn any_rebalance_holds_guard_detects_post_burn_failure() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+
+        seed_through(
+            &store,
+            vec![
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(400.0)),
+                    withdrawal: TransferRef::OnchainTx(BURN_TX),
+                },
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+                UsdcRebalanceCommand::InitiateBridging { burn_tx: BURN_TX },
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "x".to_string(),
+                },
+            ],
+        )
+        .await;
+
+        assert!(any_rebalance_holds_guard(&pool, &store).await.unwrap());
+    }
+
+    /// A pre-burn `WithdrawalFailed` clears the guard on its own, so the
+    /// durable scan must not report it as a holder.
+    #[tokio::test]
+    async fn any_rebalance_holds_guard_is_false_for_pre_burn_withdrawal_failure() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+
+        seed_through(
+            &store,
+            vec![
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(400.0)),
+                    withdrawal: TransferRef::OnchainTx(BURN_TX),
+                },
+                UsdcRebalanceCommand::FailWithdrawal {
+                    reason: "x".to_string(),
+                },
+            ],
+        )
+        .await;
+
+        assert!(!any_rebalance_holds_guard(&pool, &store).await.unwrap());
+    }
+
+    /// A candidate whose events exist but replay to no aggregate state is a
+    /// store inconsistency, not a cleared guard: the durable scan must fail
+    /// closed and report a holder, mirroring startup guard recovery.
+    #[tokio::test]
+    async fn any_rebalance_holds_guard_fails_closed_when_candidate_loads_to_none() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // Direct INSERT into `events`, normally forbidden: the CQRS framework
+        // can never produce this corrupt shape (no command emits an
+        // unoriginated first event -- the first event must be
+        // ConversionInitiated/Initiated), so bypassing it is the only way to
+        // construct the store inconsistency this test guards against. The
+        // candidate query returns this id, but Store::load replays to None --
+        // exactly the inconsistency the scan must fail safe on.
+        let event = UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: BURN_TX,
+            burned_at: Utc::now(),
+        };
+        let payload = serde_json::to_string(&event).unwrap();
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('UsdcRebalance', ?, 0, 'UsdcRebalanceEvent::BridgingInitiated', '1.0', ?, '{}')",
+        )
+        .bind(id.to_string())
+        .bind(payload)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.load(&id).await.unwrap(),
+            None,
+            "an unoriginated first event must not load into an aggregate"
+        );
+
+        assert!(
+            any_rebalance_holds_guard(&pool, &store).await.unwrap(),
+            "a candidate with events but no materialized state must count as \
+             a guard holder"
+        );
     }
 
     #[tokio::test]

@@ -3343,6 +3343,25 @@ race the same allowance.
 
 Alpaca to Base:
 
+0. **Pre-flight wallet-empty check**: read the market-maker Ethereum wallet USDC
+   balance before any Alpaca call. A non-zero balance shows ambient or residual
+   USDC. The wallet-empty invariant then cannot hold at burn time, so the
+   transfer refuses before the conversion. The check refuses on any non-zero
+   balance, including dust that a third party sends to the wallet. The wallet
+   address is public on-chain, so anyone can create this condition. Only an
+   operator sweep clears the balance and lets rebalancing start again. This is
+   an accepted fail-closed trade-off. No aggregate event is emitted, and no cash
+   leaves Alpaca. The refusal surfaces `WalletUsdcAmbientPreflight`. The worker
+   alerts the operator to sweep the wallet and releases the in-progress guard,
+   because no terminal event exists to clear it. The release checks durable
+   state first: while a persisted rebalance still holds the guard, the latch
+   stays (fail closed). If the balance read itself fails, the transfer stops
+   with `PreflightBalanceUnavailable` — same guard release; a single failure
+   only warns, and a sustained outage pages the operator at a bounded rate
+   (every fifth consecutive failure, with the streak in the message) — and the
+   trigger retries on its next cycle. The transfer is a true no-op with nothing
+   to resume or reconcile. A check that runs only at settlement time strands the
+   already-withdrawn USDC on Ethereum (the 2026-07-10 incident).
 1. **Convert USD to USDC**: Place market sell order on USDC/USD pair (buy USDC)
 2. Poll Alpaca until conversion order is filled
 3. Initiate USDC withdrawal from Alpaca (get transfer_id)

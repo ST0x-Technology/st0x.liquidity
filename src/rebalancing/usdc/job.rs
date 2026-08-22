@@ -15,19 +15,29 @@
 //! indeterminate failure that leaves the aggregate mid-flight (e.g. stalled at
 //! `WithdrawalSubmitting`/`BridgingSubmitting`), keeps the guard latched so
 //! automation does not re-arm a fresh transfer on top of a partial one.
+//!
+//! The exceptions are the pre-flight refusals (`WalletUsdcAmbientPreflight`,
+//! `WalletUsdcAmbientPreflightUnrepresentable`, and
+//! `PreflightBalanceUnavailable`): they happen before the first aggregate
+//! event, so no terminal event can ever clear the guard for them. Those arms
+//! -- and only those arms -- release the guard from the worker.
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use alloy::primitives::U256;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use thiserror::Error;
 use tracing::{error, warn};
 
 use st0x_bridge::cctp::CctpError;
+use st0x_event_sorcery::Store;
 use st0x_evm::Wallet;
 use st0x_execution::{AlpacaWalletError, Backpressure};
 use st0x_finance::Usdc;
@@ -41,7 +51,7 @@ use crate::conductor::job::{
     BackpressureStep, BackpressureStreak, Job, JobQueue, Label, QueuePushError,
     advance_backpressure, apply_backpressure_step, find_backpressure,
 };
-use crate::usdc_rebalance::UsdcRebalanceId;
+use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceId, any_rebalance_holds_guard};
 
 const ATTESTATION_REDRIVE_DELAY: Duration = Duration::from_secs(60);
 
@@ -1142,6 +1152,201 @@ pub(crate) struct TransferUsdcToMarketMakingCtx {
     /// `TelegramNotifier` otherwise. Never `None` — absence is explicit via
     /// `NoopNotifier` rather than a silent skip.
     pub(crate) notifier: Arc<dyn Notifier>,
+    /// Release-only handle for the trigger's single-rebalance guard, for the
+    /// pre-flight refusals that emit no aggregate event (see
+    /// [`UsdcGuardRelease`]). Every other outcome keeps the guard
+    /// deliberately or clears it event-driven via the reactor.
+    pub(crate) usdc_guard: Arc<dyn UsdcGuardRelease>,
+    /// Cross-attempt pacing for the pre-flight alerts (see
+    /// [`PreflightAlertGate`]): shared by every attempt through this ctx so
+    /// refusals that repeat on every rebalancing check do not page once per
+    /// check.
+    pub(crate) preflight_alerts: Arc<PreflightAlertGate>,
+}
+
+/// A single balance-read blip is warn-only, but a sustained RPC outage halts
+/// Alpaca->Base rebalancing silently; page on every N-th consecutive
+/// pre-flight balance-read failure so the outage surfaces at a bounded rate.
+const PREFLIGHT_UNAVAILABLE_ALERT_STREAK: u32 = 5;
+
+/// Alert pacing for the pre-flight refusals. Both pre-flight outcomes repeat
+/// on every rebalancing check (one check per fill and per snapshot) until an
+/// operator acts, because the guard release lets each check re-arm and
+/// refuse again -- unlike the settlement-time ambient failure, whose
+/// aggregate holds the guard and therefore alerts exactly once. The ambient
+/// refusal re-pages only when the observed balance changes; the balance-read
+/// failure pages on every [`PREFLIGHT_UNAVAILABLE_ALERT_STREAK`]-th
+/// consecutive failure. Any non-pre-flight outcome resets both, so the next
+/// incident pages afresh.
+#[derive(Default)]
+pub(crate) struct PreflightAlertGate {
+    last_paged_ambient: tokio::sync::Mutex<Option<Usdc>>,
+    unavailable_streak: AtomicU32,
+}
+
+impl PreflightAlertGate {
+    /// Whether this ambient refusal should page: the first one, or one whose
+    /// balance differs from the last paged balance (the wallet was swept and
+    /// re-dusted, or received more funds).
+    async fn should_page_ambient(&self, balance: Usdc) -> bool {
+        let mut last = self.last_paged_ambient.lock().await;
+        if *last == Some(balance) {
+            return false;
+        }
+        *last = Some(balance);
+        true
+    }
+
+    /// Counts a consecutive balance-read failure; true on every
+    /// [`PREFLIGHT_UNAVAILABLE_ALERT_STREAK`]-th so a sustained outage pages
+    /// at a bounded rate.
+    fn count_unavailable(&self) -> bool {
+        let streak = self.unavailable_streak.fetch_add(1, Ordering::SeqCst) + 1;
+        streak.is_multiple_of(PREFLIGHT_UNAVAILABLE_ALERT_STREAK)
+    }
+
+    /// Clears both gates. Called on any non-pre-flight outcome: the
+    /// pre-flight passed, so the next refusal is a new incident.
+    async fn reset(&self) {
+        *self.last_paged_ambient.lock().await = None;
+        self.unavailable_streak.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Settles the ambient pre-flight refusal (`WalletUsdcAmbientPreflight`):
+/// warn on every attempt, page through the balance-keyed gate (the refusal
+/// repeats on every rebalancing check until the wallet is swept), and
+/// release the guard -- no aggregate exists to clear it event-driven.
+async fn settle_preflight_ambient(
+    ctx: &TransferUsdcToMarketMakingCtx,
+    id: &UsdcRebalanceId,
+    balance: Usdc,
+    nominal: Usdc,
+) {
+    warn!(
+        target: "rebalance",
+        %id,
+        %balance,
+        %nominal,
+        "Alpaca->Base USDC transfer refused pre-flight: ambient USDC in \
+         market-maker wallet; no Alpaca call was made and no aggregate exists"
+    );
+    if ctx.preflight_alerts.should_page_ambient(balance).await {
+        let message = format!(
+            "USDC transfer {id} refused before start: market-maker wallet already \
+             holds {balance} USDC (nominal {nominal}). No cash left Alpaca. \
+             Sweep the wallet to unblock USDC rebalancing."
+        );
+        if let Err(error) = ctx.notifier.notify(&message).await {
+            warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making pre-flight ambient alert");
+        }
+    }
+    ctx.usdc_guard.release_unless_durably_held().await;
+}
+
+/// Settles the ambient sibling for a balance too large to represent
+/// (`WalletUsdcAmbientPreflightUnrepresentable`): the wallet provably holds
+/// USDC, so this pages and releases like the ambient refusal. Not deduped --
+/// the case is near-impossible, and when it fires the loudest response is
+/// the right one.
+async fn settle_preflight_unrepresentable(
+    ctx: &TransferUsdcToMarketMakingCtx,
+    id: &UsdcRebalanceId,
+    raw: U256,
+    error: &UsdcTransferError,
+) {
+    error!(
+        target: "rebalance",
+        %id,
+        %raw,
+        "Alpaca->Base USDC transfer refused pre-flight: ambient USDC in \
+         market-maker wallet with an unrepresentable balance; no Alpaca \
+         call was made and no aggregate exists"
+    );
+    let message = format!("{error}");
+    if let Err(error) = ctx.notifier.notify(&message).await {
+        warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making pre-flight ambient alert");
+    }
+    ctx.usdc_guard.release_unless_durably_held().await;
+}
+
+/// Settles the pre-flight balance-read failure
+/// (`PreflightBalanceUnavailable`): warn-only for a transient blip, but a
+/// sustained outage halts Alpaca->Base rebalancing, so every
+/// [`PREFLIGHT_UNAVAILABLE_ALERT_STREAK`]-th consecutive failure pages.
+/// Releases the guard; the trigger's next cycle is the retry.
+async fn settle_preflight_unavailable(
+    ctx: &TransferUsdcToMarketMakingCtx,
+    id: &UsdcRebalanceId,
+    source: &UsdcTransferError,
+) {
+    warn!(
+        target: "rebalance",
+        %id,
+        ?source,
+        "Alpaca->Base USDC transfer refused pre-flight: wallet balance \
+         could not be determined; the trigger retries on its next cycle"
+    );
+    if ctx.preflight_alerts.count_unavailable() {
+        let message = format!(
+            "USDC transfer pre-flight balance read has failed \
+             {PREFLIGHT_UNAVAILABLE_ALERT_STREAK} consecutive times (latest \
+             transfer {id}: {source}). Alpaca->Base USDC rebalancing is \
+             halted until the RPC recovers."
+        );
+        if let Err(error) = ctx.notifier.notify(&message).await {
+            warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making pre-flight outage alert");
+        }
+    }
+    ctx.usdc_guard.release_unless_durably_held().await;
+}
+
+/// Release-only handle for the trigger's single-rebalance guard, given to the
+/// worker for the outcomes that cannot clear it event-driven: pre-flight
+/// refusals, which emit no aggregate event, so no terminal event will ever
+/// clear the guard for them. Deliberately NOT the raw atomic: the guard is
+/// process-global and startup recovery re-latches it for OTHER aggregates
+/// (e.g. a post-burn failure awaiting manual reconciliation), so a blind
+/// release could drop a latch that still protects funds. The durable check
+/// covers exactly the persisted holders; a claim armed for a transfer that
+/// has not persisted its first event yet is invisible to it. That window is
+/// closed one layer up: every enqueue passes the trigger's
+/// `in_flight_usdc_transfer` gate, which refuses to arm a new transfer while
+/// any USDC transfer job row is still live, so a stale job's release cannot
+/// admit a second concurrent transfer. The release-only trait also keeps any
+/// future arm from claiming or blindly flipping the guard.
+#[async_trait]
+pub(crate) trait UsdcGuardRelease: Send + Sync + 'static {
+    async fn release_unless_durably_held(&self);
+}
+
+/// Production [`UsdcGuardRelease`]: clears the guard only when no persisted
+/// rebalance still holds it, keeping the latch on any doubt (fail closed,
+/// mirroring startup guard recovery).
+pub(crate) struct DurableCheckedGuardRelease {
+    pub(crate) pool: SqlitePool,
+    pub(crate) store: Arc<Store<UsdcRebalance>>,
+    pub(crate) usdc_in_progress: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl UsdcGuardRelease for DurableCheckedGuardRelease {
+    async fn release_unless_durably_held(&self) {
+        match any_rebalance_holds_guard(&self.pool, &self.store).await {
+            Ok(false) => self.usdc_in_progress.store(false, Ordering::SeqCst),
+            Ok(true) => warn!(
+                target: "rebalance",
+                "Guard stays latched after a pre-flight refusal: another \
+                 persisted USDC rebalance still holds it"
+            ),
+            Err(error) => warn!(
+                target: "rebalance",
+                ?error,
+                "Could not verify durable guard holders after a pre-flight \
+                 refusal; keeping the guard latched (fail closed)"
+            ),
+        }
+    }
 }
 
 /// Errors emitted by [`TransferUsdcToMarketMaking::perform`].
@@ -1228,6 +1433,38 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
             ControlFlow::Break(outcome) => return outcome,
             ControlFlow::Continue(result) => result,
         };
+
+        self.settle_transfer_outcome(ctx, result).await
+    }
+}
+
+impl TransferUsdcToMarketMaking {
+    /// Routes the transfer outcome to its recovery or terminal handling: the
+    /// redrive waits (attestation, settlement), the pre-flight guard
+    /// releases, the fail-closed burn-safety latches, backpressure, and the
+    /// terminal failures. One arm per error contract. The match ends in a
+    /// catch-all that routes to the terminal/backpressure handler, which
+    /// latches the guard -- so any NEW pre-aggregate variant MUST get an
+    /// explicit guard-releasing arm here, or its guard is latched with no
+    /// terminal event to ever clear it. The compiler cannot flag that; the
+    /// error type's docs mark the pre-aggregate variants.
+    async fn settle_transfer_outcome(
+        &self,
+        ctx: &TransferUsdcToMarketMakingCtx,
+        result: Result<(), UsdcTransferError>,
+    ) -> Result<(), TransferUsdcToMarketMakingJobError> {
+        // Any non-pre-flight outcome proves the pre-flight passed, so the
+        // alert gates reset and the next refusal pages as a fresh incident.
+        // A wildcard is safe here: a future variant wrongly resetting the
+        // gate can only cause an extra page, never a missed one.
+        match &result {
+            Err(
+                UsdcTransferError::WalletUsdcAmbientPreflight { .. }
+                | UsdcTransferError::WalletUsdcAmbientPreflightUnrepresentable { .. }
+                | UsdcTransferError::PreflightBalanceUnavailable { .. },
+            ) => {}
+            _ => ctx.preflight_alerts.reset().await,
+        }
 
         match result {
             Ok(()) => {}
@@ -1349,6 +1586,29 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
                     warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making ambient-balance alert");
                 }
             }
+            // Pre-flight refusals (see the variants' docs): no aggregate
+            // exists, so each settles worker-side -- log, page through its
+            // alert gate, and release the guard -- and never redrives; the
+            // trigger re-attempts on its own schedule.
+            Err(UsdcTransferError::WalletUsdcAmbientPreflight {
+                id,
+                balance,
+                nominal,
+            }) => {
+                settle_preflight_ambient(ctx, &id, balance, nominal).await;
+            }
+            Err(
+                ref error @ UsdcTransferError::WalletUsdcAmbientPreflightUnrepresentable {
+                    ref id,
+                    raw,
+                    ..
+                },
+            ) => {
+                settle_preflight_unrepresentable(ctx, id, raw, error).await;
+            }
+            Err(UsdcTransferError::PreflightBalanceUnavailable { id, source }) => {
+                settle_preflight_unavailable(ctx, &id, &source).await;
+            }
             // Indeterminate withdrawal poll: the Alpaca poll timed out or returned
             // a transport/API error without observing a terminal status. The
             // aggregate is in Withdrawing (guard held, AlpacaTransferId recorded)
@@ -1402,59 +1662,27 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
             // apalis job with NO retry, so the aggregate stays latched at
             // `BridgingSubmitting` (guard held) and NO automatic reburn occurs.
             // The operator verifies on-chain and uses resume-/fail-usdc-transfer.
-            Err(UsdcTransferError::BurnTxDropped { id, burn_tx }) => {
-                error!(
-                    target: "rebalance",
-                    %id,
-                    %burn_tx,
-                    "Alpaca->Base USDC transfer: recorded burn classified dropped; latched at \
-                     BridgingSubmitting for operator reconciliation (no auto-reburn)"
-                );
-                let message = format!(
-                    "USDC transfer {id}: recorded burn {burn_tx} classified dropped (not mined, \
-                     absent from mempool past grace). Latched for operator reconciliation; \
-                     verify on-chain before any reburn."
-                );
-                if let Err(error) = ctx.notifier.notify(&message).await {
-                    warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making dropped-burn alert");
-                }
-            }
-            Err(UsdcTransferError::BurnRecordFailed { id, burn_tx }) => {
-                error!(
-                    target: "rebalance",
-                    %id,
-                    %burn_tx,
-                    "Alpaca->Base USDC transfer: burn broadcast but its hash could not be durably \
-                     recorded; latched at BridgingSubmitting for operator reconciliation \
-                     (no auto-reburn)"
-                );
-                let message = format!(
-                    "USDC transfer {id}: burn {burn_tx} broadcast but its hash could not be \
-                     durably recorded; a burn is in flight. Latched for operator reconciliation; \
-                     verify on-chain before any reburn."
-                );
-                if let Err(error) = ctx.notifier.notify(&message).await {
-                    warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making record-failed-burn alert");
-                }
-            }
+            // The variants' Display strings carry the id, burn tx, and
+            // situation, so one arm serves all four without restating them.
             Err(
-                UsdcTransferError::BurnSubmitInconclusive { id }
-                | UsdcTransferError::BurnRecordTaskFailed { id },
+                error @ (UsdcTransferError::BurnTxDropped { .. }
+                | UsdcTransferError::BurnRecordFailed { .. }
+                | UsdcTransferError::BurnSubmitInconclusive { .. }
+                | UsdcTransferError::BurnRecordTaskFailed { .. }),
             ) => {
                 error!(
                     target: "rebalance",
-                    %id,
-                    "Alpaca->Base USDC transfer: burn submission inconclusive or its hash was \
-                     not durably recorded; latched at BridgingSubmitting for operator \
-                     reconciliation (no auto-reburn)"
+                    id = %self.id,
+                    %error,
+                    "Alpaca->Base USDC transfer: latched at BridgingSubmitting \
+                     for operator reconciliation (no auto-reburn)"
                 );
                 let message = format!(
-                    "USDC transfer {id}: burn submission inconclusive or its hash was not \
-                     durably recorded; a burn may be in flight. Latched for operator \
-                     reconciliation; verify on-chain before any reburn."
+                    "{error}. Latched for operator reconciliation; verify \
+                     on-chain before any reburn."
                 );
                 if let Err(error) = ctx.notifier.notify(&message).await {
-                    warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making inconclusive-burn alert");
+                    warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making burn-safety alert");
                 }
             }
             // Both outcomes are deterministic across retries and neither has a
@@ -1473,9 +1701,7 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
 
         Ok(())
     }
-}
 
-impl TransferUsdcToMarketMaking {
     /// Ends the attempt without a retry for the two conversion outcomes that
     /// are deterministic across retries and have no safe automatic next step,
     /// alerting the operator instead.
@@ -1872,6 +2098,7 @@ impl TransferUsdcToMarketMaking {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, TxHash, U256};
+    use alloy::transports::TransportErrorKind;
     use chrono::{DateTime, Utc};
     use reqwest::StatusCode;
     use uuid::{Uuid, uuid};
@@ -2034,6 +2261,115 @@ mod tests {
             _amount: Usdc,
         ) -> Result<(), UsdcTransferError> {
             Err(UsdcTransferError::AttestationTimedOut { id: id.clone() })
+        }
+    }
+
+    struct NoopGuardRelease;
+
+    #[async_trait]
+    impl UsdcGuardRelease for NoopGuardRelease {
+        async fn release_unless_durably_held(&self) {}
+    }
+
+    /// Records whether the worker asked for a guard release, standing in for
+    /// the durable-state-checked production impl.
+    #[derive(Default)]
+    struct RecordingGuardRelease {
+        released: AtomicBool,
+    }
+
+    #[async_trait]
+    impl UsdcGuardRelease for RecordingGuardRelease {
+        async fn release_unless_durably_held(&self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct AmbientPreflightAlpacaToBase;
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for AmbientPreflightAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::WalletUsdcAmbientPreflight {
+                id: id.clone(),
+                balance: Usdc::new(float!(50)),
+                nominal: amount,
+            })
+        }
+    }
+
+    /// Ambient pre-flight refusal with a caller-chosen balance, for the
+    /// alert-dedup tests that need the observed balance to change.
+    struct AmbientPreflightWithBalance(Usdc);
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for AmbientPreflightWithBalance {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::WalletUsdcAmbientPreflight {
+                id: id.clone(),
+                balance: self.0,
+                nominal: amount,
+            })
+        }
+    }
+
+    struct UnrepresentableAmbientAlpacaToBase;
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for UnrepresentableAmbientAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(
+                UsdcTransferError::WalletUsdcAmbientPreflightUnrepresentable {
+                    id: id.clone(),
+                    raw: alloy::primitives::U256::MAX,
+                    source: Box::new(UsdcTransferError::Cctp(Box::new(CctpError::RpcTransport(
+                        TransportErrorKind::backend_gone(),
+                    )))),
+                },
+            )
+        }
+    }
+
+    struct OkAlpacaToBase;
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for OkAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            _id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Ok(())
+        }
+    }
+
+    struct BalanceUnavailableAlpacaToBase;
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for BalanceUnavailableAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::PreflightBalanceUnavailable {
+                id: id.clone(),
+                source: Box::new(UsdcTransferError::Cctp(Box::new(CctpError::RpcTransport(
+                    TransportErrorKind::backend_gone(),
+                )))),
+            })
         }
     }
 
@@ -2554,6 +2890,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(pool),
             max_burn_revert_redrives: 5,
             notifier: Arc::new(NoopNotifier),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         }
     }
 
@@ -2760,6 +3098,350 @@ mod tests {
         assert_eq!(job.backpressure_streak, BackpressureStreak::default());
     }
 
+    /// Hypothesis: a pre-flight ambient refusal requests the durable-checked
+    /// guard release from the worker. The refusal emits NO aggregate event,
+    /// so no terminal event will ever clear the guard event-driven; without
+    /// this release the trigger stays wedged ("already in progress") until
+    /// restart. The job must also alert the operator to sweep the wallet and
+    /// must NOT redrive (a retry cannot remove the ambient balance; the
+    /// trigger re-attempts on its own schedule).
+    #[tokio::test]
+    async fn market_making_job_releases_guard_and_alerts_on_preflight_ambient_refusal() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let guard_release = Arc::new(RecordingGuardRelease::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(AmbientPreflightAlpacaToBase),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: guard_release.clone(),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(1000)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        assert!(
+            guard_release.released.load(Ordering::SeqCst),
+            "the pre-flight refusal must request the guard release: no \
+             aggregate event exists to clear the guard event-driven"
+        );
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            0,
+            "a pre-flight refusal must NOT redrive: retrying cannot remove \
+             the ambient balance"
+        );
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "exactly one operator alert must fire; got: {messages:?}"
+        );
+        assert!(
+            messages[0].contains("Sweep the wallet"),
+            "the alert must tell the operator to sweep the wallet; got: {}",
+            messages[0]
+        );
+    }
+
+    /// The production release clears the latch when no persisted rebalance
+    /// holds the guard: the pre-flight refusal wrote nothing durable, so the
+    /// guard must reflect durable state alone.
+    #[tokio::test]
+    async fn durable_checked_release_clears_guard_when_no_holder() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = st0x_event_sorcery::test_store::<UsdcRebalance>(pool.clone(), ());
+        let latch = Arc::new(AtomicBool::new(true));
+
+        DurableCheckedGuardRelease {
+            pool,
+            store: Arc::new(store),
+            usdc_in_progress: latch.clone(),
+        }
+        .release_unless_durably_held()
+        .await;
+
+        assert!(
+            !latch.load(Ordering::SeqCst),
+            "with no durable holder the release must clear the latch"
+        );
+    }
+
+    /// The production release must NOT clear the latch while a persisted
+    /// rebalance still holds the guard: a stale pre-crash job row can reach
+    /// the pre-flight refusal while startup recovery has re-latched the
+    /// guard for a different, unreconciled aggregate.
+    #[tokio::test]
+    async fn durable_checked_release_keeps_guard_for_post_burn_holder() {
+        use crate::usdc_rebalance::UsdcRebalanceCommand::*;
+
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = st0x_event_sorcery::test_store::<UsdcRebalance>(pool.clone(), ());
+        let burn_tx = TxHash::repeat_byte(0x11);
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        for command in [
+            Initiate {
+                direction: crate::usdc_rebalance::RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(400.0)),
+                withdrawal: crate::usdc_rebalance::TransferRef::OnchainTx(burn_tx),
+            },
+            ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            InitiateBridging { burn_tx },
+            FailBridging {
+                reason: "x".to_string(),
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+
+        let latch = Arc::new(AtomicBool::new(true));
+        DurableCheckedGuardRelease {
+            pool,
+            store: Arc::new(store),
+            usdc_in_progress: latch.clone(),
+        }
+        .release_unless_durably_held()
+        .await;
+
+        assert!(
+            latch.load(Ordering::SeqCst),
+            "the release must keep the latch while a persisted rebalance \
+             still holds the guard (fail closed)"
+        );
+    }
+
+    /// Hypothesis: a pre-flight balance-read failure releases the guard and
+    /// does NOT redrive or page: nothing started, no aggregate exists, and
+    /// the trigger's next cycle is the retry (a transient RPC blip must not
+    /// alert-spam the operator).
+    #[tokio::test]
+    async fn market_making_job_releases_guard_without_alert_on_preflight_balance_failure() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let guard_release = Arc::new(RecordingGuardRelease::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(BalanceUnavailableAlpacaToBase),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: guard_release.clone(),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(1000)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        assert!(
+            guard_release.released.load(Ordering::SeqCst),
+            "a pre-flight balance failure must request the guard release: \
+             nothing started and no aggregate exists"
+        );
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            0,
+            "a pre-flight balance failure must NOT redrive; the trigger's \
+             next cycle is the retry"
+        );
+        assert!(
+            notifier.messages().is_empty(),
+            "a transient balance-read failure must not page the operator; \
+             got: {:?}",
+            notifier.messages()
+        );
+    }
+
+    /// The ambient refusal repeats on every rebalancing check until the
+    /// wallet is swept, so the page dedups on the observed balance: same
+    /// balance pages once, a changed balance pages again.
+    #[tokio::test]
+    async fn market_making_preflight_ambient_alert_pages_once_per_balance() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let gate = Arc::new(PreflightAlertGate::default());
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(1000)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let ctx_with_balance = |balance: Usdc| TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(AmbientPreflightWithBalance(balance)),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: gate.clone(),
+        };
+
+        let dusted = ctx_with_balance(Usdc::new(float!(50)));
+        job.perform(&dusted).await.unwrap();
+        job.perform(&dusted).await.unwrap();
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "a repeated refusal on the same balance must page exactly once"
+        );
+
+        let more_dust = ctx_with_balance(Usdc::new(float!(75)));
+        job.perform(&more_dust).await.unwrap();
+        assert_eq!(
+            notifier.messages().len(),
+            2,
+            "a changed ambient balance is a new incident and must page again"
+        );
+    }
+
+    /// A single balance-read blip stays warn-only, but a sustained outage
+    /// halts Alpaca->Base rebalancing: every
+    /// `PREFLIGHT_UNAVAILABLE_ALERT_STREAK`-th consecutive failure pages.
+    #[tokio::test]
+    async fn market_making_preflight_outage_pages_on_streak_threshold() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(BalanceUnavailableAlpacaToBase),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(1000)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        for _ in 0..4 {
+            job.perform(&ctx).await.unwrap();
+        }
+        assert!(
+            notifier.messages().is_empty(),
+            "below the streak threshold the outage must stay warn-only; \
+             got: {:?}",
+            notifier.messages()
+        );
+
+        job.perform(&ctx).await.unwrap();
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "the fifth consecutive failure must page the operator"
+        );
+        assert!(
+            messages[0].contains("halted until the RPC recovers"),
+            "the page must state that rebalancing is halted; got: {}",
+            messages[0]
+        );
+    }
+
+    /// A successful pre-flight between failures proves the outage ended, so
+    /// the streak resets and the next failures start counting from zero.
+    #[tokio::test]
+    async fn market_making_preflight_outage_streak_resets_on_success() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let gate = Arc::new(PreflightAlertGate::default());
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(1000)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let failing = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(BalanceUnavailableAlpacaToBase),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: gate.clone(),
+        };
+        let succeeding = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(OkAlpacaToBase),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: gate.clone(),
+        };
+
+        for _ in 0..3 {
+            job.perform(&failing).await.unwrap();
+        }
+        job.perform(&succeeding).await.unwrap();
+        for _ in 0..4 {
+            job.perform(&failing).await.unwrap();
+        }
+
+        assert!(
+            notifier.messages().is_empty(),
+            "a success between failures must reset the streak; got: {:?}",
+            notifier.messages()
+        );
+    }
+
+    /// The unrepresentable-balance refusal is the ambient sibling: page the
+    /// operator with the raw balance, release the guard, never redrive.
+    #[tokio::test]
+    async fn market_making_job_pages_and_releases_on_unrepresentable_ambient() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let guard_release = Arc::new(RecordingGuardRelease::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(UnrepresentableAmbientAlpacaToBase),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: guard_release.clone(),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(1000)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        assert!(
+            guard_release.released.load(Ordering::SeqCst),
+            "the unrepresentable ambient refusal is pre-aggregate and must \
+             release the guard"
+        );
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            0,
+            "the refusal must NOT redrive: retrying cannot shrink the balance"
+        );
+        let messages = notifier.messages();
+        assert_eq!(messages.len(), 1, "the refusal must page the operator");
+        assert!(
+            messages[0].contains("raw balance"),
+            "the page must carry the raw balance; got: {}",
+            messages[0]
+        );
+    }
+
     #[tokio::test]
     async fn market_making_job_429_reschedules_with_incremented_streak() {
         let pool = setup_queue_pool().await;
@@ -2769,6 +3451,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         // See the hedging-direction sibling test: a nonzero, distinct
         // `revert_redrive_attempts` closes the swap-risk gap between the two
@@ -2807,6 +3491,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -2846,6 +3532,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -2905,6 +3593,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         // `backpressure_streak` starts nonzero: this non-429 inconclusive
         // poll error routes through `handle_withdrawal_poll_inconclusive`
@@ -2982,6 +3672,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3040,6 +3732,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3083,6 +3777,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3117,6 +3813,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3161,6 +3859,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3212,6 +3912,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3286,6 +3988,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3344,6 +4048,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3402,6 +4108,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3797,6 +4505,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -5219,6 +5929,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: Arc::new(NoopNotifier),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -5255,6 +5967,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         // attempts=2 -> next=3 == 5/2+1: exactly at threshold
         let job = TransferUsdcToMarketMaking {
@@ -5300,6 +6014,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         // attempts=2 -> next=3 == max=3: last allowed redrive, alert fires
         let job = TransferUsdcToMarketMaking {
@@ -5345,6 +6061,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         // attempts=3 -> next=4 > max=3: over-limit, Err, no alert
         let job = TransferUsdcToMarketMaking {
@@ -5400,6 +6118,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -5470,6 +6190,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -5591,6 +6313,8 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -5623,16 +6347,22 @@ mod tests {
     }
 
     /// WalletUsdcAmbientBalance (market-making) must fire a notifier alert
-    /// because it leaves the aggregate in an operator-reconciliation-bound state.
+    /// because it leaves the aggregate in an operator-reconciliation-bound
+    /// state. The failure already emitted `FailBridging`, so the reactor
+    /// clears the guard event-driven -- the worker must NOT release it, or a
+    /// second rebalance could start on top of the unreconciled one.
     #[tokio::test]
     async fn market_making_job_fires_alert_on_ambient_balance() {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
+        let guard_release = Arc::new(RecordingGuardRelease::default());
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::AmbientBalance)),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: guard_release.clone(),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -5655,6 +6385,11 @@ mod tests {
             messages[0].contains(&job.id.to_string()),
             "alert must include the transfer id; got: {:?}",
             messages[0]
+        );
+        assert!(
+            !guard_release.released.load(Ordering::SeqCst),
+            "a post-flight ambient failure must leave the guard for the \
+             event-driven reactor, never release it from the worker"
         );
     }
 }
