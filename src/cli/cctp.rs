@@ -246,7 +246,7 @@ mod tests {
     use rain_math_float::Float;
     use st0x_config::ExecutionThreshold;
     use st0x_config::create_test_issuance_ctx;
-    use st0x_config::{AssetsConfig, BrokerCtx, CtxError, EquitiesConfig, LogLevel, TradingMode};
+    use st0x_config::{AssetsConfig, BrokerCtx, CtxError, EquitiesConfig, LogLevel};
     use st0x_config::{EvmCtx, IngestionCutoff, InventoryAdapters, InventoryMode};
     use st0x_evm::OpenChainErrorRegistry;
     use st0x_finance::Usdc;
@@ -287,7 +287,7 @@ mod tests {
             telemetry: None,
             alerts: None,
             pricing: None,
-            trading_mode: TradingMode::Standalone,
+            rebalancing: st0x_config::default_test_rebalancing_ctx(),
             order_owner: Address::ZERO,
             wallet: None,
             wallet_meta: None,

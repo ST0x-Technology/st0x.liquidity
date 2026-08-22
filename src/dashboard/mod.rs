@@ -311,25 +311,23 @@ pub(crate) fn routes() -> Router<AppState> {
 }
 
 pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
-    let (equity_target, equity_deviation, usdc_target, usdc_deviation) =
-        ctx.rebalancing_ctx().map_or_else(
-            |_| (0.5, 0.2, None, None),
-            |rebalancing| {
-                let (ut, ud) = rebalancing.usdc.as_ref().map_or((None, None), |threshold| {
-                    (
-                        Some(float_to_f64(threshold.target, 0.5)),
-                        Some(float_to_f64(threshold.deviation, 0.3)),
-                    )
-                });
-
+    let (equity_target, equity_deviation, usdc_target, usdc_deviation) = {
+        let rebalancing = &ctx.rebalancing;
+        let (usdc_target, usdc_deviation) =
+            rebalancing.usdc.as_ref().map_or((None, None), |threshold| {
                 (
-                    float_to_f64(rebalancing.equity.target, 0.5),
-                    float_to_f64(rebalancing.equity.deviation, 0.2),
-                    ut,
-                    ud,
+                    Some(float_to_f64(threshold.target, 0.5)),
+                    Some(float_to_f64(threshold.deviation, 0.3)),
                 )
-            },
-        );
+            });
+
+        (
+            float_to_f64(rebalancing.equity.target, 0.5),
+            float_to_f64(rebalancing.equity.deviation, 0.2),
+            usdc_target,
+            usdc_deviation,
+        )
+    };
 
     let execution_threshold = match &ctx.execution_threshold {
         ExecutionThreshold::Shares(shares) => {
@@ -383,10 +381,9 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         })
         .collect();
 
-    let trading_mode = match &ctx.trading_mode {
-        st0x_config::TradingMode::Standalone => "standalone",
-        st0x_config::TradingMode::Rebalancing(_) => "rebalancing",
-    };
+    // Transitional constant: the single supported topology is always
+    // rebalancing; the DTO field itself is scheduled for removal.
+    let trading_mode = "rebalancing";
 
     let broker = match &ctx.broker {
         st0x_config::BrokerCtx::AlpacaBrokerApi(_) => "alpaca",
@@ -621,7 +618,7 @@ mod tests {
             server_port: 8001,
             orderbook: "0x0".to_string(),
             deployment_block: 0,
-            trading_mode: "standalone".to_string(),
+            trading_mode: "rebalancing".to_string(),
             broker: "dry_run".to_string(),
             order_polling_interval: 5,
             inventory_poll_interval: 15,

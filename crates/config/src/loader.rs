@@ -596,18 +596,6 @@ enum BrokerSecrets {
     DryRun,
 }
 
-/// Encodes the two operating modes at the type level.
-///
-/// `Standalone`: hedging only, no automatic rebalancing.
-/// `Rebalancing`: hedging + automatic inventory rebalancing.
-///
-/// In both modes, `order_owner` is derived from `[wallet].address`.
-#[derive(Clone, Debug)]
-pub enum TradingMode {
-    Standalone,
-    Rebalancing(Box<RebalancingCtx>),
-}
-
 /// Combined runtime context for the server. Assembled from plaintext config,
 /// encrypted secrets, and derived runtime state.
 #[derive(Clone)]
@@ -656,7 +644,11 @@ pub struct Ctx {
     pub alerts: Option<AlertsCtx>,
     /// Live reference prices used exclusively by dashboard USD valuations.
     pub pricing: Option<PricingCtx>,
-    pub trading_mode: TradingMode,
+    /// Rebalancing operating parameters from the required `[rebalancing]`
+    /// section. The rebalancing infrastructure always starts; per-asset
+    /// `rebalancing` settings, issuance freeze, and USDC controls are the
+    /// supported ways to pause new rebalancing work.
+    pub rebalancing: Box<RebalancingCtx>,
     /// The onchain address that owns orders on the orderbook.
     /// Always derived from the configured `[wallet]` address.
     pub order_owner: Address,
@@ -672,12 +664,10 @@ pub struct Ctx {
     /// `Some` when the config includes a `[tokenization]` section.
     pub redemption_wallet: Option<Address>,
     /// ETH/USD valuation source for bot-gas cost recording (ADR 0017).
-    /// Bot-gas cost recording only runs on rebalancing paths (vault
-    /// deposit/withdraw, wrap/unwrap, CCTP burn/mint, USDC transfer), so this
-    /// is required (validated at startup) whenever `[rebalancing]` is
-    /// configured (`TradingMode::Rebalancing`) and otherwise optional --
-    /// including in Standalone mode, where an operator may still configure it
-    /// even though no rebalancing path will ever enqueue to it.
+    /// Bot-gas cost recording runs on rebalancing paths (vault
+    /// deposit/withdraw, wrap/unwrap, CCTP burn/mint, USDC transfer), which
+    /// always exist in the single supported topology, so file-parsed configs
+    /// require it at startup. `Option` only so test builders can omit it.
     pub bot_gas_valuation: Option<BotGasValuationConfig>,
     /// Per-network ST0xOrchestrator contract addresses from
     /// `[orchestrator.addresses]`, needed to sign `MintAuthV1` recipient
@@ -810,7 +800,7 @@ impl std::fmt::Debug for Ctx {
             .field("telemetry", &self.telemetry)
             .field("alerts", &self.alerts)
             .field("pricing", &self.pricing)
-            .field("trading_mode", &self.trading_mode)
+            .field("rebalancing", &self.rebalancing)
             .field("order_owner", &self.order_owner)
             .field("wallet_configured", &self.wallet.is_some())
             .field("wallet_meta", &self.wallet_meta)
@@ -887,7 +877,7 @@ struct ValidatedParts {
     alerts: Option<AlertsCtx>,
     pricing: Option<PricingCtx>,
     execution_threshold: ExecutionThreshold,
-    trading_mode: TradingMode,
+    rebalancing: Box<RebalancingCtx>,
     assets: AssetsConfig,
     travel_rule: Option<TravelRuleConfig>,
     rest_api: Option<RestApiCtx>,
@@ -1101,42 +1091,44 @@ fn parse_and_validate(
         config_path,
     )?;
 
-    let trading_mode = match config.rebalancing {
-        Some(rebalancing_config) => {
-            let BrokerCtx::AlpacaBrokerApi(_) = &broker else {
-                return Err(RebalancingCtxError::NotAlpacaBroker.into());
-            };
-
-            let minimum = *crate::ALPACA_TO_BASE_MINIMUM_TRANSFER;
-
-            if let Some(cash) = &config.assets.cash
-                && cash.rebalancing == OperationMode::Enabled
-                && let Some(cash_limit) = &cash.operational_limit
-            {
-                let below_minimum = cash_limit.inner().lt(&minimum)?;
-
-                if below_minimum {
-                    return Err(CtxError::CashOperationalLimitBelowMinimumTransfer {
-                        configured: cash_limit.inner(),
-                        minimum,
-                    });
-                }
-            }
-
-            TradingMode::Rebalancing(Box::new(RebalancingCtx::new(&rebalancing_config)?))
-        }
-        None => TradingMode::Standalone,
+    // Checked before the missing-section error so a retired dry-run config
+    // fails with the retirement message directly, not with a prompt to add
+    // a [rebalancing] section that dry-run can never satisfy.
+    let BrokerCtx::AlpacaBrokerApi(_) = &broker else {
+        return Err(RebalancingCtxError::NotAlpacaBroker.into());
     };
+
+    let Some(rebalancing_config) = config.rebalancing else {
+        return Err(CtxError::MissingRebalancing);
+    };
+
+    let minimum = *crate::ALPACA_TO_BASE_MINIMUM_TRANSFER;
+
+    if let Some(cash) = &config.assets.cash
+        && cash.rebalancing == OperationMode::Enabled
+        && let Some(cash_limit) = &cash.operational_limit
+    {
+        let below_minimum = cash_limit.inner().lt(&minimum)?;
+
+        if below_minimum {
+            return Err(CtxError::CashOperationalLimitBelowMinimumTransfer {
+                configured: cash_limit.inner(),
+                minimum,
+            });
+        }
+    }
+
+    let rebalancing = Box::new(RebalancingCtx::new(&rebalancing_config)?);
 
     let redemption_wallet = config.tokenization.map(|t| t.redemption_wallet);
 
-    if matches!(trading_mode, TradingMode::Rebalancing(_)) && redemption_wallet.is_none() {
+    if redemption_wallet.is_none() {
         return Err(CtxError::MissingTokenization);
     }
 
-    // See `Ctx::bot_gas_valuation` doc for why this is required only in
-    // Rebalancing mode.
-    if matches!(trading_mode, TradingMode::Rebalancing(_)) && config.bot_gas_valuation.is_none() {
+    // Bot-gas cost recording runs on rebalancing paths, which always exist
+    // in the single supported topology.
+    if config.bot_gas_valuation.is_none() {
         return Err(CtxError::MissingBotGasValuation);
     }
 
@@ -1194,7 +1186,7 @@ fn parse_and_validate(
         alerts,
         pricing,
         execution_threshold,
-        trading_mode,
+        rebalancing,
         assets: config.assets,
         travel_rule,
         rest_api: config
@@ -1347,7 +1339,7 @@ impl Ctx {
             telemetry: parts.telemetry,
             alerts: parts.alerts,
             pricing: parts.pricing,
-            trading_mode: parts.trading_mode,
+            rebalancing: parts.rebalancing,
             order_owner,
             wallet: Some(wallet),
             wallet_meta: Some(parts.wallet_meta),
@@ -1437,13 +1429,6 @@ impl Ctx {
 
     pub async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error> {
         configure_sqlite_pool(&self.database_url).await
-    }
-
-    pub fn rebalancing_ctx(&self) -> Result<&RebalancingCtx, CtxError> {
-        match &self.trading_mode {
-            TradingMode::Rebalancing(ctx) => Ok(ctx),
-            TradingMode::Standalone => Err(CtxError::NotRebalancing),
-        }
     }
 
     pub fn wallet(&self) -> Result<&crate::wallet::OnchainWalletCtx, CtxError> {
@@ -1594,7 +1579,11 @@ impl Ctx {
         deployment_block: u64,
         #[builder(default = 0)] required_confirmations: u64,
         broker: BrokerCtx,
-        trading_mode: TradingMode,
+        /// Rebalancing operating parameters. Defaults to an inert fixture
+        /// (USDC rebalancing disabled, freeze guard disabled) so tests that
+        /// exercise only hedging need no explicit value.
+        #[builder(default = default_test_rebalancing_ctx())]
+        rebalancing: Box<RebalancingCtx>,
         order_owner: Address,
         wallet: Option<crate::wallet::OnchainWalletCtx>,
         /// Rebalancing settlement mode. Defaults to `Legacy` (bot-EOA-owned
@@ -1627,18 +1616,6 @@ impl Ctx {
             Some(threshold) => threshold,
             None => broker.execution_threshold()?,
         };
-
-        if matches!(trading_mode, TradingMode::Rebalancing(_)) && wallet.is_none() {
-            return Err(CtxError::WalletNotConfigured);
-        }
-
-        if matches!(trading_mode, TradingMode::Rebalancing(_)) && redemption_wallet.is_none() {
-            return Err(CtxError::MissingTokenization);
-        }
-
-        if matches!(trading_mode, TradingMode::Rebalancing(_)) && bot_gas_valuation.is_none() {
-            return Err(CtxError::MissingBotGasValuation);
-        }
 
         // Legacy: tests simulate the pre-migration state where the bot owns
         // the vaults and settles on the orderbook, so the startup
@@ -1683,7 +1660,7 @@ impl Ctx {
             telemetry: None,
             alerts: None,
             pricing: None,
-            trading_mode,
+            rebalancing,
             order_owner,
             wallet,
             wallet_meta: None,
@@ -1800,17 +1777,19 @@ pub enum CtxError {
     Alerts(#[from] crate::alerts::AlertsAssemblyError),
     #[error(transparent)]
     Evm(#[from] crate::evm::EvmConfigError),
-    #[error("operation requires rebalancing mode")]
-    NotRebalancing,
+    #[error(
+        "the [rebalancing] config section is required; there is no global \
+         rebalancing off-switch. To pause rebalancing work use the narrow \
+         controls: per-asset `rebalancing = \"disabled\"`, issuance freeze, \
+         or the `usdc` mode under [rebalancing]"
+    )]
+    MissingRebalancing,
     #[error(
         "operation requires [tokenization] config section \
          with redemption_wallet"
     )]
     MissingTokenization,
-    #[error(
-        "[bot_gas_valuation] section is required when rebalancing is enabled \
-         (see ADR 0017)"
-    )]
+    #[error("[bot_gas_valuation] section is required (see ADR 0017)")]
     MissingBotGasValuation,
     #[error(
         "operation requires a configured [wallet] section \
@@ -1871,7 +1850,7 @@ impl CtxError {
         match self {
             Self::Rebalancing(_) => "rebalancing configuration error",
             Self::Pricing(_) => "pricing configuration error",
-            Self::NotRebalancing => "operation requires rebalancing mode",
+            Self::MissingRebalancing => "missing [rebalancing] config section",
             Self::MissingTokenization => "operation requires tokenization config",
             Self::MissingBotGasValuation => "missing bot gas valuation config",
             Self::ConfigIo { .. } => "failed to read config file",
@@ -2001,6 +1980,31 @@ pub fn test_issuance_status_ctx(base_url: Url) -> IssuanceStatusCtx {
     }
 }
 
+/// Inert rebalancing fixture for test contexts: valid thresholds, USDC
+/// rebalancing disabled, freeze guard disabled -- the topology boots but no
+/// rebalancing trigger ever fires.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn default_test_rebalancing_ctx() -> Box<RebalancingCtx> {
+    let equity = crate::ImbalanceThreshold::new(float!(0.5), float!(0.1))
+        .unwrap_or_else(|_| unreachable!("hardcoded threshold literals are valid"));
+
+    let config = RebalancingConfig {
+        equity,
+        usdc: crate::UsdcRebalancing::Disabled,
+        transfer_timeout_secs: 1800,
+        transfer_attempt_timeout_secs: 3600,
+        attestation_retry_deadline_secs: 86_400,
+        max_burn_revert_redrives: 5,
+        freeze_check: OperationMode::Disabled,
+    };
+
+    let ctx = RebalancingCtx::new(&config)
+        .unwrap_or_else(|_| unreachable!("hardcoded fixture values are valid"));
+
+    Box::new(ctx)
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
     Ctx {
@@ -2039,7 +2043,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         telemetry: None,
         alerts: None,
         pricing: None,
-        trading_mode: TradingMode::Standalone,
+        rebalancing: default_test_rebalancing_ctx(),
         order_owner,
         wallet: None,
         wallet_meta: None,
@@ -2075,6 +2079,21 @@ mod tests {
         file
     }
 
+    /// Runs the synchronous validation pipeline against fixture files and
+    /// returns the validated parts, skipping the async wallet construction
+    /// that `Ctx::load_files` performs afterwards. Wallet backends are
+    /// feature-gated (`wallet-private-key`/`wallet-turnkey`), so a
+    /// default-features test run cannot build a real wallet; success-path
+    /// tests assert on the parts, which carry every config-derived field.
+    fn parse_and_validate_files(
+        config: &NamedTempFile,
+        secrets: &NamedTempFile,
+    ) -> Result<ValidatedParts, CtxError> {
+        let config_str = std::fs::read_to_string(config.path()).unwrap();
+        let secrets_str = std::fs::read_to_string(secrets.path()).unwrap();
+        parse_and_validate(&config_str, config.path(), &secrets_str, secrets.path())
+    }
+
     /// `Ctx::for_test`'s `vault_owner` derivation mirrors the production
     /// `EvmCtx` wiring: `Legacy` (no distinct inventory contract) resolves to
     /// `order_owner`, `Managed` resolves to the inventory address. A swapped
@@ -2090,7 +2109,6 @@ mod tests {
             .orderbook(address!("0x2222222222222222222222222222222222222222"))
             .deployment_block(1)
             .broker(BrokerCtx::DryRun)
-            .trading_mode(TradingMode::Standalone)
             .order_owner(order_owner)
             .assets(AssetsConfig::default())
             .call()
@@ -2111,7 +2129,6 @@ mod tests {
             .orderbook(address!("0x2222222222222222222222222222222222222222"))
             .deployment_block(1)
             .broker(BrokerCtx::DryRun)
-            .trading_mode(TradingMode::Standalone)
             .order_owner(order_owner)
             .assets(AssetsConfig::default())
             .inventory_mode(InventoryMode::Managed { inventory })
@@ -2150,10 +2167,10 @@ mod tests {
         assert_eq!(busy_timeout_ms, 10_000);
     }
 
-    fn minimal_config_toml() -> NamedTempFile {
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(
-            br#"
+    /// Core config body shared by the minimal fixtures: everything a valid
+    /// config needs except the [tokenization], [bot_gas_valuation], and
+    /// [rebalancing] sections, which compose on top so tests can omit one.
+    const MINIMAL_CONFIG_CORE: &str = r#"
             database_url = ":memory:"
             server_port = 8080
             board_port = 8081
@@ -2172,10 +2189,61 @@ mod tests {
             required_confirmations = 3
             ingestion_cutoff = "safe"
 
+            [broker]
+            counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
+            extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
+            extended_hours_close_flatten_window_secs = 900
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Entity"
+
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
-        "#,
+        "#;
+
+    const TOKENIZATION_SECTION: &str = r#"
+            [tokenization]
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "#;
+
+    const BOT_GAS_VALUATION_SECTION: &str = r#"
+            [bot_gas_valuation]
+            pyth_contract = "0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a"
+            eth_usd_feed_id = "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"
+        "#;
+
+    /// Inert [rebalancing] section: valid parameters, USDC rebalancing and
+    /// the freeze guard disabled.
+    const REBALANCING_SECTION: &str = r#"
+            [rebalancing]
+            transfer_timeout_secs = 1800
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+            freeze_check = "disabled"
+
+            [rebalancing.equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [rebalancing.usdc]
+            mode = "disabled"
+        "#;
+
+    /// Complete minimal valid config: every required section present,
+    /// rebalancing triggers inert. Pair with `alpaca_secrets_toml()` for
+    /// success-path tests.
+    fn minimal_config_toml() -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            format!(
+                "{MINIMAL_CONFIG_CORE}{TOKENIZATION_SECTION}\
+                 {BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}"
+            )
+            .as_bytes(),
         )
         .unwrap();
         file
@@ -2260,6 +2328,7 @@ mod tests {
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
+            {TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
         "#
         ))
     }
@@ -2294,7 +2363,7 @@ mod tests {
     }
 
     fn alpaca_trading_config_toml() -> NamedTempFile {
-        toml_file(
+        toml_file(&format!(
             r#"
             database_url = ":memory:"
             server_port = 8080
@@ -2325,8 +2394,9 @@ mod tests {
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
-        "#,
-        )
+            {TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
+        "#
+        ))
     }
 
     fn dry_run_secrets_toml() -> NamedTempFile {
@@ -2367,6 +2437,22 @@ mod tests {
         file
     }
 
+    /// Alpaca secrets plus the pricing key, for configs that carry both an
+    /// alpaca `[broker]` and a `[pricing]` section (pricing secrets are
+    /// required whenever `[pricing]` is configured).
+    fn alpaca_pricing_secrets_toml() -> NamedTempFile {
+        let mut file = alpaca_secrets_toml();
+        file.write_all(
+            br#"
+
+            [pricing]
+            api_key = "pricing-oracle-test-key"
+        "#,
+        )
+        .unwrap();
+        file
+    }
+
     fn equity_pricing_config_toml(include_pricing: bool) -> NamedTempFile {
         let pricing = if include_pricing {
             r#"
@@ -2379,11 +2465,7 @@ mod tests {
 
         toml_file(&format!(
             r#"
-            database_url = ":memory:"
-            server_port = 8080
-            board_port = 8081
-            apalis_finished_job_cleanup_interval_secs = 3600
-            inventory_divergence_threshold = 10
+            {MINIMAL_CONFIG_CORE}{TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
 
             [assets.equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
@@ -2394,20 +2476,6 @@ mod tests {
             extended_hours_counter_trading = "disabled"
 
             {pricing}
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            inventory_mode = "managed"
-            inventory_adapters = []
-            inventory = "0x2222222222222222222222222222222222222222"
-            vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
-            required_confirmations = 3
-            ingestion_cutoff = "safe"
-
-            [wallet]
-            kind = "private-key"
-            address = "0x0000000000000000000000000000000000000001"
             "#,
         ))
     }
@@ -2486,22 +2554,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dry_run_broker_does_not_require_any_credentials() {
-        let config = minimal_config_toml();
-        let secrets = dry_run_secrets_toml();
-        let ctx = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap();
-        assert!(matches!(ctx.broker, BrokerCtx::DryRun));
-        assert_eq!(ctx.extended_hours_reprice_timeout_secs, None);
-        assert_eq!(
-            ctx.close_flatten_cross_max_bps,
-            ctx.broker.counter_trade_slippage_bps(),
-            "an inactive DryRun ramp must still have a valid base-equal ceiling"
-        );
-    }
-
-    #[tokio::test]
     async fn load_files_rejects_invalid_orderbook_address() {
         let config = toml_file(
             r#"
@@ -2543,9 +2595,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn travel_rule_parsed_from_broker_section() {
-        let config = toml_file(
+    #[test]
+    fn travel_rule_parsed_from_broker_section() {
+        let config = toml_file(&format!(
             r#"
             database_url = ":memory:"
             server_port = 8080
@@ -2570,33 +2622,71 @@ mod tests {
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
 
+            [broker]
+            counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
+            extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
+            extended_hours_close_flatten_window_secs = 900
+
             [broker.travel_rule]
             beneficiary_entity_name = "T0 TRADE (BVI) LTD"
-        "#,
-        );
-        let secrets = dry_run_secrets_toml();
-        let ctx = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap();
+            {TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
+        "#
+        ));
+        let secrets = alpaca_secrets_toml();
+        let parts = parse_and_validate_files(&config, &secrets).unwrap();
 
-        let travel_rule = ctx.travel_rule.unwrap();
+        let travel_rule = parts.travel_rule.unwrap();
         assert_eq!(travel_rule.beneficiary_entity_name, "T0 TRADE (BVI) LTD");
     }
 
-    #[tokio::test]
-    async fn travel_rule_optional_when_broker_section_absent() {
-        let config = minimal_config_toml();
-        let secrets = dry_run_secrets_toml();
-        let ctx = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap();
+    /// A wholly absent `[broker]` config section is reported as the first
+    /// missing broker key (see `BrokerCtx::from_parts`): a per-field error
+    /// would depend on field declaration order.
+    #[test]
+    fn missing_broker_section_fails_with_missing_counter_trade_slippage() {
+        let config = toml_file(&format!(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
 
-        assert!(ctx.travel_rule.is_none());
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory_adapters = []
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
+
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+            {TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
+        "#
+        ));
+        let secrets = alpaca_secrets_toml();
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::MissingCounterTradeSlippageBps),
+            "expected MissingCounterTradeSlippageBps for an absent [broker] \
+             section, got: {error:?}"
+        );
     }
 
     #[tokio::test]
     async fn travel_rule_rejects_placeholder_entity_name() {
-        let config = toml_file(
+        let config = toml_file(&format!(
             r#"
             database_url = ":memory:"
             server_port = 8080
@@ -2621,11 +2711,19 @@ mod tests {
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
 
+            [broker]
+            counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
+            extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
+            extended_hours_close_flatten_window_secs = 900
+
             [broker.travel_rule]
             beneficiary_entity_name = "PLACEHOLDER"
-        "#,
-        );
-        let secrets = dry_run_secrets_toml();
+            {TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
+        "#
+        ));
+        let secrets = alpaca_secrets_toml();
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
@@ -2644,7 +2742,7 @@ mod tests {
 
     #[tokio::test]
     async fn travel_rule_rejects_blank_entity_name() {
-        let config = toml_file(
+        let config = toml_file(&format!(
             r#"
             database_url = ":memory:"
             server_port = 8080
@@ -2669,11 +2767,19 @@ mod tests {
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
 
+            [broker]
+            counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
+            extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
+            extended_hours_close_flatten_window_secs = 900
+
             [broker.travel_rule]
             beneficiary_entity_name = "   "
-        "#,
-        );
-        let secrets = dry_run_secrets_toml();
+            {TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
+        "#
+        ));
+        let secrets = alpaca_secrets_toml();
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
@@ -2690,31 +2796,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn alerts_ctx_built_when_section_and_secret_present() {
-        let config = toml_file(
+    #[test]
+    fn alerts_ctx_built_when_section_and_secret_present() {
+        let config = toml_file(&format!(
             r#"
-            database_url = ":memory:"
-            server_port = 8080
-            board_port = 8081
-            apalis_finished_job_cleanup_interval_secs = 3600
-            inventory_divergence_threshold = 10
-
-            [assets.equities]
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
-            required_confirmations = 3
-            ingestion_cutoff = "safe"
-
-            [wallet]
-            kind = "private-key"
-            address = "0x0000000000000000000000000000000000000001"
+            {MINIMAL_CONFIG_CORE}{TOKENIZATION_SECTION}
+            {BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
 
             [alerts]
             chat_id = -1_001_234_567_890
@@ -2722,8 +2809,8 @@ mod tests {
             ethereum_low_balance_threshold = "0.01"
             poll_interval = 300
             realert_interval = 3600
-        "#,
-        );
+        "#
+        ));
         let secrets = toml_file(
             r#"
             [evm]
@@ -2733,7 +2820,10 @@ mod tests {
             hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
-            type = "dry-run"
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
 
             [alerts]
             bot_token = "123:abc"
@@ -2747,11 +2837,9 @@ mod tests {
         "#,
         );
 
-        let ctx = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap();
+        let parts = parse_and_validate_files(&config, &secrets).unwrap();
 
-        let alerts = ctx.alerts.unwrap();
+        let alerts = parts.alerts.unwrap();
         assert_eq!(alerts.chat_id, -1_001_234_567_890);
         assert_eq!(
             alerts.base_low_balance_threshold_wei,
@@ -2769,15 +2857,13 @@ mod tests {
         assert_eq!(alerts.message_thread_id, None);
     }
 
-    #[tokio::test]
-    async fn alerts_ctx_absent_when_section_omitted() {
+    #[test]
+    fn alerts_ctx_absent_when_section_omitted() {
         let config = minimal_config_toml();
-        let secrets = dry_run_secrets_toml();
-        let ctx = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap();
+        let secrets = alpaca_secrets_toml();
+        let parts = parse_and_validate_files(&config, &secrets).unwrap();
 
-        assert!(ctx.alerts.is_none());
+        assert!(parts.alerts.is_none());
     }
 
     #[tokio::test]
@@ -2823,32 +2909,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standalone_mode_when_no_rebalancing() {
-        let config = minimal_config_toml();
-        let secrets = dry_run_secrets_toml();
-        let ctx = Ctx::load_files(config.path(), secrets.path())
+    async fn missing_rebalancing_section_fails_with_typed_error() {
+        let config = toml_file(&format!(
+            "{MINIMAL_CONFIG_CORE}{TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}"
+        ));
+        let secrets = alpaca_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
             .await
-            .unwrap();
-        assert!(matches!(ctx.trading_mode, TradingMode::Standalone));
-        assert_eq!(
-            ctx.order_owner(),
-            address!("0xfcad0b19bb29d4674531d6f115237e16afce377c")
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::MissingRebalancing),
+            "expected MissingRebalancing, got: {error:?}"
+        );
+
+        let message = error.to_string();
+        assert!(
+            message.contains("per-asset") && message.contains("issuance freeze"),
+            "the error must name the supported pause controls, got: {message}"
         );
     }
 
     #[tokio::test]
-    async fn defaults_applied_when_optional_fields_omitted() {
+    async fn missing_tokenization_section_fails_with_typed_error() {
+        let config = toml_file(&format!(
+            "{MINIMAL_CONFIG_CORE}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}"
+        ));
+        let secrets = alpaca_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::MissingTokenization),
+            "expected MissingTokenization, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_bot_gas_valuation_section_fails_with_typed_error() {
+        let config = toml_file(&format!(
+            "{MINIMAL_CONFIG_CORE}{TOKENIZATION_SECTION}{REBALANCING_SECTION}"
+        ));
+        let secrets = alpaca_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::MissingBotGasValuation),
+            "expected MissingBotGasValuation, got: {error:?}"
+        );
+    }
+
+    /// Pins the dry-run broker retirement: dry-run secrets cannot produce a
+    /// parseable configuration, and the error points at the replacement
+    /// workflow for local testing.
+    #[tokio::test]
+    async fn dry_run_broker_is_retired() {
         let config = minimal_config_toml();
         let secrets = dry_run_secrets_toml();
-        let ctx = Ctx::load_files(config.path(), secrets.path())
+
+        let error = Ctx::load_files(config.path(), secrets.path())
             .await
-            .unwrap();
-        assert!(matches!(ctx.log_level, LogLevel::Debug));
-        assert_eq!(ctx.order_polling_interval, 15);
-        assert_eq!(ctx.order_polling_max_jitter, 5);
-        assert_eq!(ctx.position_check_interval, 60);
-        assert_eq!(ctx.inventory_poll_interval, 60);
-        assert_eq!(ctx.order_fill_poll_interval, 5);
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::Rebalancing(ref boxed)
+                    if matches!(**boxed, RebalancingCtxError::NotAlpacaBroker)
+            ),
+            "expected NotAlpacaBroker, got: {error:?}"
+        );
+
+        let message = error.to_string();
+        assert!(
+            message.contains("retired") && message.contains("nix run .#simulate"),
+            "the error must mention the retirement and the simulate app, got: {message}"
+        );
+    }
+
+    #[test]
+    fn defaults_applied_when_optional_fields_omitted() {
+        let config = minimal_config_toml();
+        let secrets = alpaca_secrets_toml();
+        let parts = parse_and_validate_files(&config, &secrets).unwrap();
+        assert!(matches!(parts.log_level, LogLevel::Debug));
+        assert_eq!(parts.order_polling_interval, 15);
+        assert_eq!(parts.order_polling_max_jitter, 5);
+        assert_eq!(parts.position_check_interval, 60);
+        assert_eq!(parts.inventory_poll_interval, 60);
+        assert_eq!(parts.order_fill_poll_interval, 5);
     }
 
     #[tokio::test]
@@ -3329,9 +3484,9 @@ mod tests {
         assert_eq!(minimum, Usdc::new(float!(53)));
     }
 
-    #[tokio::test]
-    async fn optional_fields_override_defaults() {
-        let config = toml_file(
+    #[test]
+    fn optional_fields_override_defaults() {
+        let config = toml_file(&format!(
             r#"
             database_url = ":memory:"
             board_port = 8081
@@ -3357,22 +3512,31 @@ mod tests {
             required_confirmations = 3
             ingestion_cutoff = "safe"
 
+            [broker]
+            counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
+            extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
+            extended_hours_close_flatten_window_secs = 900
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Entity"
+
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
-        "#,
-        );
-        let secrets = dry_run_secrets_toml();
+            {TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
+        "#
+        ));
+        let secrets = alpaca_secrets_toml();
 
-        let ctx = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap();
-        assert!(matches!(ctx.log_level, LogLevel::Warn));
-        assert_eq!(ctx.server_port, 9090);
-        assert_eq!(ctx.order_polling_interval, 30);
-        assert_eq!(ctx.order_polling_max_jitter, 10);
-        assert_eq!(ctx.position_check_interval, 120);
-        assert_eq!(ctx.inventory_poll_interval, 90);
+        let parts = parse_and_validate_files(&config, &secrets).unwrap();
+        assert!(matches!(parts.log_level, LogLevel::Warn));
+        assert_eq!(parts.server_port, 9090);
+        assert_eq!(parts.order_polling_interval, 30);
+        assert_eq!(parts.order_polling_max_jitter, 10);
+        assert_eq!(parts.position_check_interval, 120);
+        assert_eq!(parts.inventory_poll_interval, 90);
     }
 
     #[tokio::test]
@@ -3475,16 +3639,23 @@ mod tests {
         );
     }
 
+    /// Requires the `wallet-private-key` feature: the assertion exercises
+    /// address derivation from the example's private key, and without a
+    /// wallet backend feature `WalletKind` is uninhabited so `load_files`
+    /// can never construct a wallet. `validate_files_accepts_example_config_and_secrets`
+    /// covers feature-independent acceptance of the example files.
+    #[cfg(feature = "wallet-private-key")]
     #[tokio::test]
     async fn example_config_and_secrets_parse_successfully() {
         let ctx = Ctx::load_files(example_config_toml(), example_secrets_toml())
             .await
             .unwrap();
 
-        // Example configs enable rebalancing with a private-key wallet.
-        assert!(matches!(ctx.trading_mode, TradingMode::Rebalancing(_)));
+        // Example configs configure rebalancing with a private-key wallet;
+        // a successful parse proves the required [rebalancing] section and
+        // its dependent sections are present and valid.
 
-        // In rebalancing mode, order_owner is derived from the wallet key.
+        // order_owner is derived from the wallet key.
         // The example key 0x0123...cdef derives to this address.
         assert_eq!(
             ctx.order_owner(),
@@ -3492,45 +3663,23 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn telemetry_ctx_assembled_from_config() {
-        let config = toml_file(
+    #[test]
+    fn telemetry_ctx_assembled_from_config() {
+        let config = toml_file(&format!(
             r#"
-            database_url = ":memory:"
-            server_port = 8080
-            board_port = 8081
-            apalis_finished_job_cleanup_interval_secs = 3600
-            inventory_divergence_threshold = 10
-
-            [assets.equities]
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
-            required_confirmations = 3
-            ingestion_cutoff = "safe"
-
-            [wallet]
-            kind = "private-key"
-            address = "0x0000000000000000000000000000000000000001"
+            {MINIMAL_CONFIG_CORE}{TOKENIZATION_SECTION}
+            {BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
 
             [telemetry]
             service_name = "test-service"
             environment = "test"
             traces_endpoint = "http://100.0.0.1:10428"
             logs_endpoint = "http://100.0.0.1:9428"
-        "#,
-        );
+        "#
+        ));
 
-        let ctx = Ctx::load_files(config.path(), dry_run_secrets_toml().path())
-            .await
-            .unwrap();
-        let telemetry = ctx.telemetry.as_ref().expect("telemetry should be Some");
+        let parts = parse_and_validate_files(&config, &alpaca_secrets_toml()).unwrap();
+        let telemetry = parts.telemetry.as_ref().expect("telemetry should be Some");
         assert_eq!(telemetry.service_name, "test-service");
         assert_eq!(telemetry.environment, "test");
         // `url::Url` normalizes an authority-only URL to carry a trailing-slash
@@ -3542,16 +3691,14 @@ mod tests {
         assert_eq!(telemetry.logs_endpoint.as_str(), "http://100.0.0.1:9428/");
     }
 
-    #[tokio::test]
-    async fn telemetry_absent_when_config_section_missing() {
+    #[test]
+    fn telemetry_absent_when_config_section_missing() {
         let config = minimal_config_toml();
-        let ctx = Ctx::load_files(config.path(), dry_run_secrets_toml().path())
-            .await
-            .unwrap();
+        let parts = parse_and_validate_files(&config, &alpaca_secrets_toml()).unwrap();
         assert!(
-            ctx.telemetry.is_none(),
+            parts.telemetry.is_none(),
             "expected telemetry None when [telemetry] absent, got: {:?}",
-            ctx.telemetry
+            parts.telemetry
         );
     }
 
@@ -4013,63 +4160,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn standalone_mode_does_not_require_bot_gas_valuation() {
-        let config_str = r#"
-            database_url = ":memory:"
-            server_port = 8080
-            board_port = 8081
-            apalis_finished_job_cleanup_interval_secs = 3600
-            inventory_divergence_threshold = 10
-
-            [assets.equities]
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            inventory_mode = "managed"
-            inventory_adapters = []
-            inventory = "0x2222222222222222222222222222222222222222"
-            vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
-            required_confirmations = 3
-            ingestion_cutoff = "safe"
-
-            [wallet]
-            kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "#;
-        let secrets_str = r#"
-            [evm]
-            rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.example.com"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
-
-            [broker]
-            type = "dry-run"
-
-            [wallet]
-            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-
-            [issuance]
-            base_url = "http://issuance.test:8000"
-            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
-        "#;
-
-        let parts = parse_and_validate(
-            config_str,
-            Path::new("config.toml"),
-            secrets_str,
-            Path::new("secrets.toml"),
-        )
-        .unwrap();
-
-        assert!(
-            parts.bot_gas_valuation.is_none(),
-            "Standalone mode should not require [bot_gas_valuation]"
-        );
-    }
-
     #[tokio::test]
     async fn wallet_config_without_wallet_secrets_fails() {
         let config = toml_file(
@@ -4387,34 +4477,55 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn default_execution_threshold_is_one_share_for_dry_run() {
-        let config = minimal_config_toml();
-        let secrets = dry_run_secrets_toml();
-        let ctx = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap();
+    /// The DryRun broker arm of `execution_threshold` is still live code
+    /// (dry-run is retired at config validation, not physically removed),
+    /// so the threshold is asserted on the broker ctx directly.
+    #[test]
+    fn default_execution_threshold_is_one_share_for_dry_run() {
         assert_eq!(
-            ctx.execution_threshold,
+            BrokerCtx::DryRun.execution_threshold().unwrap(),
             ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(1))).unwrap())
         );
     }
 
     #[tokio::test]
     async fn alpaca_broker_api_requires_counter_trade_slippage_config() {
-        let config = minimal_config_toml();
-        let secrets = toml_file(
+        let config = toml_file(&format!(
             r#"
-            [evm]
-            rpc_url = "http://localhost:8545"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [broker]
-            type = "alpaca-broker-api"
-            api_key = "test-key"
-            api_secret = "test-secret"
-            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
-        "#,
-        );
+            close_flatten_cross_max_bps = 400
+            extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
+            extended_hours_close_flatten_window_secs = 900
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Entity"
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+            {TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
+        "#
+        ));
+        let secrets = alpaca_secrets_toml();
 
         let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
 
@@ -4439,7 +4550,7 @@ mod tests {
 
     #[tokio::test]
     async fn alpaca_broker_api_requires_extended_hours_reprice_timeout_config() {
-        let config = toml_file(
+        let config = toml_file(&format!(
             r#"
             database_url = ":memory:"
             server_port = 8080
@@ -4466,8 +4577,9 @@ mod tests {
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
-        "#,
-        );
+            {TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
+        "#
+        ));
         let secrets = toml_file(
             r#"
             [evm]
@@ -4632,7 +4744,7 @@ mod tests {
 
     #[tokio::test]
     async fn alpaca_broker_api_requires_extended_hours_close_flatten_window_config() {
-        let config = toml_file(
+        let config = toml_file(&format!(
             r#"
             database_url = ":memory:"
             server_port = 8080
@@ -4661,8 +4773,9 @@ mod tests {
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
-        "#,
-        );
+            {TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
+        "#
+        ));
         let secrets = toml_file(
             r#"
             [evm]
@@ -4692,7 +4805,7 @@ mod tests {
 
     #[tokio::test]
     async fn alpaca_broker_api_rejects_zero_extended_hours_close_flatten_window() {
-        let config = toml_file(
+        let config = toml_file(&format!(
             r#"
             database_url = ":memory:"
             server_port = 8080
@@ -4722,8 +4835,9 @@ mod tests {
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
-        "#,
-        );
+            {TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
+        "#
+        ));
         let secrets = toml_file(
             r#"
             [evm]
@@ -4874,10 +4988,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn alpaca_broker_api_counter_trade_slippage_accepts_9_999_bps() {
+    #[test]
+    fn alpaca_broker_api_counter_trade_slippage_accepts_9_999_bps() {
         // 9_999 bps is the maximum accepted value (MAX_COUNTER_TRADE_SLIPPAGE_BPS).
-        let config = toml_file(
+        let config = toml_file(&format!(
             r#"
             database_url = ":memory:"
             server_port = 8080
@@ -4911,55 +5025,31 @@ mod tests {
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
-        "#,
-        );
-        let secrets = toml_file(
-            r#"
-            [evm]
-            rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+            {TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
+        "#
+        ));
+        let secrets = alpaca_secrets_toml();
 
-            [broker]
-            type = "alpaca-broker-api"
-            api_key = "test-key"
-            api_secret = "test-secret"
-            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+        let parts = parse_and_validate_files(&config, &secrets).unwrap();
 
-            [wallet]
-            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        assert_eq!(parts.broker.counter_trade_slippage_bps(), 9999);
 
-            [issuance]
-            base_url = "http://issuance.test:8000"
-            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
-        "#,
-        );
-
-        let ctx = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap();
-
-        assert_eq!(ctx.broker.counter_trade_slippage_bps(), 9999);
-
-        let BrokerCtx::AlpacaBrokerApi(broker) = &ctx.broker else {
+        let BrokerCtx::AlpacaBrokerApi(broker) = &parts.broker else {
             panic!("expected AlpacaBrokerApi broker");
         };
 
         assert_eq!(broker.counter_trade_slippage_bps, 9999);
     }
 
-    #[tokio::test]
-    async fn close_flatten_cross_max_bps_accepts_the_slippage_base_as_its_floor() {
+    #[test]
+    fn close_flatten_cross_max_bps_accepts_the_slippage_base_as_its_floor() {
         let config = alpaca_config_toml(Some(100));
         let secrets = alpaca_secrets_toml();
 
-        let ctx = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap();
+        let parts = parse_and_validate_files(&config, &secrets).unwrap();
 
-        assert_eq!(ctx.broker.counter_trade_slippage_bps(), 100);
-        assert_eq!(ctx.close_flatten_cross_max_bps, 100);
+        assert_eq!(parts.broker.counter_trade_slippage_bps(), 100);
+        assert_eq!(parts.close_flatten_cross_max_bps, 100);
     }
 
     /// The ramp runs from `counter_trade_slippage_bps` up to this ceiling, so a
@@ -5003,21 +5093,19 @@ mod tests {
         assert_eq!((configured, min, max), (10_000, 100, 9_999));
     }
 
-    #[tokio::test]
-    async fn alpaca_broker_api_executor_uses_dollar_threshold() {
+    #[test]
+    fn alpaca_broker_api_executor_uses_dollar_threshold() {
         let config = alpaca_config_toml(Some(400));
         let secrets = alpaca_secrets_toml();
 
-        let ctx = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap();
+        let parts = parse_and_validate_files(&config, &secrets).unwrap();
         let expected = ExecutionThreshold::dollar_value(Usdc::new(float!(2))).unwrap();
-        assert_eq!(ctx.execution_threshold, expected);
+        assert_eq!(parts.execution_threshold, expected);
         assert_eq!(
-            ctx.extended_hours_reprice_timeout_secs,
+            parts.extended_hours_reprice_timeout_secs,
             NonZeroU64::new(300)
         );
-        assert_eq!(ctx.close_flatten_cross_max_bps, 400);
+        assert_eq!(parts.close_flatten_cross_max_bps, 400);
     }
 
     #[tokio::test]
@@ -5032,7 +5120,10 @@ mod tests {
             hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
-            type = "dry-run"
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
 
             [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -5123,7 +5214,10 @@ mod tests {
             hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
-            type = "dry-run"
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
 
             [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -5158,7 +5252,10 @@ mod tests {
             hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
             [broker]
-            type = "dry-run"
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
 
             [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -5368,17 +5465,6 @@ mod tests {
             "expected unsupported Schwab broker secrets to fail during parsing, got: {error:?}"
         );
         assert_eq!(error.kind(), "failed to parse secrets");
-    }
-
-    #[tokio::test]
-    async fn rebalancing_ctx_returns_err_when_standalone() {
-        let config = minimal_config_toml();
-        let secrets = dry_run_secrets_toml();
-        let ctx = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap();
-        let error = ctx.rebalancing_ctx().unwrap_err();
-        assert!(matches!(error, CtxError::NotRebalancing));
     }
 
     #[test]
@@ -7013,14 +7099,19 @@ mod tests {
     #[test]
     fn validate_files_accepts_valid_config_and_secrets() {
         let config = minimal_config_toml();
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
         Ctx::validate_files(config.path(), secrets.path()).unwrap();
     }
 
+    /// Requires the `wallet-private-key` feature: `load_files` constructs a
+    /// wallet, and without a wallet backend feature `WalletKind` is
+    /// uninhabited. The two error-path tests below stay feature-independent
+    /// because pricing assembly fails before wallet construction.
+    #[cfg(feature = "wallet-private-key")]
     #[tokio::test]
     async fn load_files_assembles_pricing_for_configured_equities() {
         let config = equity_pricing_config_toml(true);
-        let secrets = dry_run_pricing_secrets_toml();
+        let secrets = alpaca_pricing_secrets_toml();
 
         let ctx = Ctx::load_files(config.path(), secrets.path())
             .await
@@ -7034,7 +7125,7 @@ mod tests {
     #[tokio::test]
     async fn load_files_requires_pricing_config_for_configured_equities() {
         let config = equity_pricing_config_toml(false);
-        let secrets = dry_run_pricing_secrets_toml();
+        let secrets = alpaca_pricing_secrets_toml();
 
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
@@ -7049,7 +7140,7 @@ mod tests {
     #[tokio::test]
     async fn load_files_requires_pricing_secrets_for_configured_equities() {
         let config = equity_pricing_config_toml(true);
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
 
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
@@ -7064,7 +7155,7 @@ mod tests {
     #[cfg(feature = "wallet-turnkey")]
     #[test]
     fn load_turnkey_approval_policy_inputs_extracts_validated_deploy_inputs() {
-        let config = toml_file(
+        let config = toml_file(&format!(
             r#"
             database_url = ":memory:"
             server_port = 8080
@@ -7093,12 +7184,23 @@ mod tests {
             required_confirmations = 3
             ingestion_cutoff = "safe"
 
+            [broker]
+            counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
+            extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
+            extended_hours_close_flatten_window_secs = 900
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Entity"
+
             [wallet]
             kind = "turnkey"
             address = "0x6666666666666666666666666666666666666666"
             organization_id = "org-test"
-            "#,
-        );
+            {TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
+            "#
+        ));
         let secrets = toml_file(
             r#"
             [evm]
@@ -7108,7 +7210,10 @@ mod tests {
             hyperevm_rpc_url = "https://hyperevm.example.com"
 
             [broker]
-            type = "dry-run"
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
 
             [wallet]
             api_private_key = "secret-p256-key"
@@ -7149,7 +7254,7 @@ mod tests {
     #[test]
     fn load_turnkey_approval_policy_inputs_skips_non_turnkey_wallet() {
         let config = minimal_config_toml();
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
 
         let inputs =
             Ctx::load_turnkey_approval_policy_inputs(config.path(), secrets.path()).unwrap();
@@ -7212,7 +7317,7 @@ mod tests {
 
     #[test]
     fn validate_files_accepts_extended_hours_with_counter_trading() {
-        let config = toml_file(
+        let config = toml_file(&format!(
             r#"
             database_url = ":memory:"
             server_port = 8080
@@ -7241,59 +7346,55 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [broker]
+            counter_trade_slippage_bps = 100
             extended_hours_reprice_timeout_secs = 300
             close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
             close_flatten_cross_max_bps = 400
 
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Entity"
+
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
-        "#,
-        );
-        let secrets = dry_run_pricing_secrets_toml();
+            {TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
+        "#
+        ));
+        let secrets = alpaca_pricing_secrets_toml();
 
         Ctx::validate_files(config.path(), secrets.path()).unwrap();
     }
 
-    #[test]
-    fn dry_run_broker_requires_extended_hours_reprice_timeout_when_extended_hours_enabled() {
-        let config = toml_file(
+    /// Assets fixture with extended hours enabled for one symbol, so the
+    /// DryRun arm of `extended_hours_broker_windows` requires configured
+    /// windows. The dry-run broker is retired at config validation, but its
+    /// window resolution is still live code, so these tests exercise the
+    /// private functions directly instead of going through `Ctx::load_files`.
+    fn extended_hours_assets_config() -> AssetsConfig {
+        toml::from_str(
             r#"
-            database_url = ":memory:"
-            server_port = 8080
-            board_port = 8081
-            apalis_finished_job_cleanup_interval_secs = 3600
-            inventory_divergence_threshold = 10
-
-            [assets.equities.AAPL]
+            [equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
             tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "enabled"
-
-            [pricing]
-            ws_url = "wss://pricing.test/ws"
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            inventory_mode = "legacy"
-            inventory_adapters = []
-            vault_owner = "0x0000000000000000000000000000000000000001"
-            deployment_block = 1
-            required_confirmations = 3
-            ingestion_cutoff = "safe"
-
-            [wallet]
-            kind = "private-key"
-            address = "0x0000000000000000000000000000000000000001"
         "#,
-        );
-        let secrets = dry_run_pricing_secrets_toml();
+        )
+        .unwrap()
+    }
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+    #[test]
+    fn dry_run_broker_requires_extended_hours_reprice_timeout_when_extended_hours_enabled() {
+        let Err(error) = extended_hours_broker_windows(
+            &BrokerCtx::DryRun,
+            None,
+            &extended_hours_assets_config(),
+        ) else {
+            panic!("expected MissingExtendedHoursRepriceTimeout, got Ok windows");
+        };
 
         assert!(
             matches!(error, CtxError::MissingExtendedHoursRepriceTimeout),
@@ -7302,113 +7403,27 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn dry_run_broker_honors_configured_extended_hours_reprice_timeout() {
-        let config = toml_file(
-            r#"
-            database_url = ":memory:"
-            server_port = 8080
-            board_port = 8081
-            apalis_finished_job_cleanup_interval_secs = 3600
-            inventory_divergence_threshold = 10
+    #[test]
+    fn dry_run_broker_honors_configured_extended_hours_reprice_timeout() {
+        let broker_config = BrokerConfig {
+            counter_trade_slippage_bps: None,
+            extended_hours_reprice_timeout_secs: Some(300),
+            close_flatten_reprice_timeout_secs: Some(60),
+            extended_hours_close_flatten_window_secs: Some(900),
+            travel_rule: None,
+            close_flatten_cross_max_bps: Some(400),
+        };
 
-            [assets.equities.AAPL]
-            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
-            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
-            trading = "enabled"
-            rebalancing = "disabled"
-            wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "enabled"
+        let windows = extended_hours_broker_windows(
+            &BrokerCtx::DryRun,
+            Some(&broker_config),
+            &extended_hours_assets_config(),
+        )
+        .unwrap();
 
-            [pricing]
-            ws_url = "wss://pricing.test/ws"
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            inventory_mode = "legacy"
-            inventory_adapters = []
-            vault_owner = "0x0000000000000000000000000000000000000001"
-            deployment_block = 1
-            required_confirmations = 3
-            ingestion_cutoff = "safe"
-
-            [broker]
-            extended_hours_reprice_timeout_secs = 300
-            close_flatten_reprice_timeout_secs = 60
-            extended_hours_close_flatten_window_secs = 900
-            close_flatten_cross_max_bps = 400
-
-            [wallet]
-            kind = "private-key"
-            address = "0x0000000000000000000000000000000000000001"
-        "#,
-        );
-        let secrets = dry_run_pricing_secrets_toml();
-
-        let ctx = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap();
-
-        assert_eq!(
-            ctx.extended_hours_reprice_timeout_secs,
-            NonZeroU64::new(300)
-        );
-        assert_eq!(ctx.close_flatten_reprice_timeout_secs, 60);
-        assert_eq!(ctx.extended_hours_close_flatten_window_secs, 900);
-    }
-
-    /// DryRun config with extended hours enabled, so the close-flatten keys are
-    /// required. `counter_trade_slippage_bps` is a parameter because DryRun
-    /// never reads it: the ramp base is the executor default, and validation
-    /// must be checked against the base the runtime actually uses.
-    fn dry_run_extended_hours_config_toml(
-        counter_trade_slippage_bps: Option<u16>,
-        close_flatten_cross_max_bps: u16,
-    ) -> NamedTempFile {
-        let slippage_line = counter_trade_slippage_bps
-            .map(|bps| format!("counter_trade_slippage_bps = {bps}"))
-            .unwrap_or_default();
-
-        toml_file(&format!(
-            r#"
-            database_url = ":memory:"
-            server_port = 8080
-            board_port = 8081
-            apalis_finished_job_cleanup_interval_secs = 3600
-            inventory_divergence_threshold = 10
-
-            [assets.equities.AAPL]
-            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
-            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
-            trading = "enabled"
-            rebalancing = "disabled"
-            wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "enabled"
-
-            [pricing]
-            ws_url = "wss://pricing.test/ws"
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            inventory_mode = "legacy"
-            inventory_adapters = []
-            vault_owner = "0x0000000000000000000000000000000000000001"
-            deployment_block = 1
-            required_confirmations = 3
-            ingestion_cutoff = "safe"
-
-            [broker]
-            {slippage_line}
-            extended_hours_reprice_timeout_secs = 300
-            close_flatten_reprice_timeout_secs = 60
-            extended_hours_close_flatten_window_secs = 900
-            close_flatten_cross_max_bps = {close_flatten_cross_max_bps}
-
-            [wallet]
-            kind = "private-key"
-            address = "0x0000000000000000000000000000000000000001"
-        "#
-        ))
+        assert_eq!(windows.reprice_timeout_secs, NonZeroU64::new(300));
+        assert_eq!(windows.close_flatten_reprice_timeout_secs, 60);
+        assert_eq!(windows.close_flatten_window_secs, 900);
     }
 
     /// A DryRun ceiling equal to a configured base still runs the ramp
@@ -7416,10 +7431,22 @@ mod tests {
     /// instead of the configured value.
     #[test]
     fn dry_run_close_flatten_cross_max_bps_below_the_executor_default_is_rejected() {
-        let config = dry_run_extended_hours_config_toml(Some(50), 50);
-        let secrets = dry_run_pricing_secrets_toml();
+        let broker_config = BrokerConfig {
+            counter_trade_slippage_bps: Some(50),
+            extended_hours_reprice_timeout_secs: Some(300),
+            close_flatten_reprice_timeout_secs: Some(60),
+            extended_hours_close_flatten_window_secs: Some(900),
+            travel_rule: None,
+            close_flatten_cross_max_bps: Some(50),
+        };
 
-        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let Err(err) = extended_hours_broker_windows(
+            &BrokerCtx::DryRun,
+            Some(&broker_config),
+            &extended_hours_assets_config(),
+        ) else {
+            panic!("expected CloseFlattenCrossMaxBpsOutOfRange, got Ok windows");
+        };
         let message = err.to_string();
 
         let CtxError::CloseFlattenCrossMaxBpsOutOfRange {
@@ -7440,68 +7467,52 @@ mod tests {
     /// The mirror case: a ceiling at the executor default is accepted even
     /// though the configured base sits below it, since the configured base is
     /// dead weight under DryRun.
-    #[tokio::test]
-    async fn dry_run_close_flatten_cross_max_bps_accepts_the_executor_default_as_its_floor() {
-        let config =
-            dry_run_extended_hours_config_toml(Some(50), DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS);
-        let secrets = dry_run_pricing_secrets_toml();
+    #[test]
+    fn dry_run_close_flatten_cross_max_bps_accepts_the_executor_default_as_its_floor() {
+        let broker_config = BrokerConfig {
+            counter_trade_slippage_bps: Some(50),
+            extended_hours_reprice_timeout_secs: Some(300),
+            close_flatten_reprice_timeout_secs: Some(60),
+            extended_hours_close_flatten_window_secs: Some(900),
+            travel_rule: None,
+            close_flatten_cross_max_bps: Some(DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS),
+        };
 
-        let ctx = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap();
+        let windows = extended_hours_broker_windows(
+            &BrokerCtx::DryRun,
+            Some(&broker_config),
+            &extended_hours_assets_config(),
+        )
+        .unwrap();
 
         assert_eq!(
-            ctx.close_flatten_cross_max_bps,
+            windows.close_flatten_cross_max_bps,
             DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS
         );
         assert_eq!(
-            ctx.broker.counter_trade_slippage_bps(),
+            BrokerCtx::DryRun.counter_trade_slippage_bps(),
             DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS
         );
     }
 
     #[test]
     fn dry_run_broker_requires_extended_hours_close_flatten_window_when_extended_hours_enabled() {
-        let config = toml_file(
-            r#"
-            database_url = ":memory:"
-            server_port = 8080
-            board_port = 8081
-            apalis_finished_job_cleanup_interval_secs = 3600
-            inventory_divergence_threshold = 10
+        let broker_config = BrokerConfig {
+            counter_trade_slippage_bps: None,
+            extended_hours_reprice_timeout_secs: Some(300),
+            close_flatten_reprice_timeout_secs: Some(60),
+            extended_hours_close_flatten_window_secs: None,
+            travel_rule: None,
+            close_flatten_cross_max_bps: None,
+        };
 
-            [assets.equities.AAPL]
-            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
-            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
-            trading = "enabled"
-            rebalancing = "disabled"
-            wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "enabled"
-
-            [pricing]
-            ws_url = "wss://pricing.test/ws"
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            inventory_mode = "legacy"
-            inventory_adapters = []
-            vault_owner = "0x0000000000000000000000000000000000000001"
-            deployment_block = 1
-            required_confirmations = 3
-            ingestion_cutoff = "safe"
-
-            [broker]
-            extended_hours_reprice_timeout_secs = 300
-            close_flatten_reprice_timeout_secs = 60
-
-            [wallet]
-            kind = "private-key"
-            address = "0x0000000000000000000000000000000000000001"
-        "#,
-        );
-        let secrets = dry_run_pricing_secrets_toml();
-
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let Err(error) = extended_hours_broker_windows(
+            &BrokerCtx::DryRun,
+            Some(&broker_config),
+            &extended_hours_assets_config(),
+        ) else {
+            panic!("expected MissingExtendedHoursCloseFlattenWindow, got Ok windows");
+        };
 
         assert!(
             matches!(error, CtxError::MissingExtendedHoursCloseFlattenWindow),
@@ -7758,7 +7769,7 @@ mod tests {
 
     #[test]
     fn validate_files_rejects_placeholder_travel_rule() {
-        let config = toml_file(
+        let config = toml_file(&format!(
             r#"
             database_url = ":memory:"
             server_port = 8080
@@ -7783,11 +7794,19 @@ mod tests {
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
 
+            [broker]
+            counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
+            extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
+            extended_hours_close_flatten_window_secs = 900
+
             [broker.travel_rule]
             beneficiary_entity_name = "PLACEHOLDER"
-        "#,
-        );
-        let secrets = dry_run_secrets_toml();
+            {TOKENIZATION_SECTION}{BOT_GAS_VALUATION_SECTION}{REBALANCING_SECTION}
+        "#
+        ));
+        let secrets = alpaca_secrets_toml();
 
         let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
         assert!(

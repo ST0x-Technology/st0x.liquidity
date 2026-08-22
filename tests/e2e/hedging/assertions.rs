@@ -18,7 +18,7 @@ pub(crate) use st0x_execution::{FractionalShares, Positive, Symbol};
 pub(crate) use st0x_hedge::ExecutionThreshold;
 use st0x_hedge::bindings::IRaindexV6;
 use st0x_hedge::mock_api::REDEMPTION_WALLET;
-use st0x_hedge::{ImbalanceThreshold, OperationMode, RebalancingCtx, TradingMode, UsdcRebalancing};
+use st0x_hedge::{ImbalanceThreshold, OperationMode, RebalancingCtx, UsdcRebalancing};
 pub(crate) use st0x_hedge::{OffchainOrder, Position};
 
 pub(crate) use crate::assert::ExpectedPosition;
@@ -108,7 +108,7 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         .orderbook(chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)
-        .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
+        .rebalancing(Box::new(rebalancing_ctx))
         .order_owner(chain.owner)
         .wallet(wallet_ctx)
         .redemption_wallet(REDEMPTION_WALLET)
