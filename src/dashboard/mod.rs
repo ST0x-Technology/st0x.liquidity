@@ -381,10 +381,6 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         })
         .collect();
 
-    // Transitional constant: the single supported topology is always
-    // rebalancing; the DTO field itself is scheduled for removal.
-    let trading_mode = "rebalancing";
-
     let broker = match &ctx.broker {
         st0x_config::BrokerCtx::AlpacaBrokerApi(_) => "alpaca",
         st0x_config::BrokerCtx::DryRun => "dry_run",
@@ -419,7 +415,6 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         server_port: ctx.server_port,
         orderbook: format!("{:#x}", ctx.evm.orderbook),
         deployment_block: ctx.evm.deployment_block,
-        trading_mode: trading_mode.to_string(),
         broker: broker.to_string(),
         order_polling_interval: ctx.order_polling_interval,
         inventory_poll_interval: ctx.inventory_poll_interval,
@@ -618,7 +613,6 @@ mod tests {
             server_port: 8001,
             orderbook: "0x0".to_string(),
             deployment_block: 0,
-            trading_mode: "rebalancing".to_string(),
             broker: "dry_run".to_string(),
             order_polling_interval: 5,
             inventory_poll_interval: 15,

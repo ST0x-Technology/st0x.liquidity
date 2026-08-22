@@ -1234,11 +1234,12 @@ struct ExtendedHoursBrokerWindows {
 
 /// Resolves both extended-hours windows, requiring validated config values
 /// whenever they can actually be consulted at runtime: always for Alpaca,
-/// and for DryRun whenever any asset has extended hours enabled. DryRun is a
-/// real runtime mode (staging, CLI dry-run), not test-only -- the reprice
-/// sweep and the close-flatten policy both consult these windows on every
-/// `CheckPositions` tick, so neither may silently default to 0 while
-/// extended hours is live.
+/// and for DryRun whenever any asset has extended hours enabled. The dry-run
+/// broker is retired at config validation, so the DryRun arm is reachable
+/// only from hand-built test contexts -- it keeps the same strictness so
+/// those tests exercise the real rules (the reprice sweep and close-flatten
+/// policy consult these windows on every `CheckPositions` tick, and neither
+/// may silently default to 0 while extended hours is live).
 fn extended_hours_broker_windows(
     broker: &BrokerCtx,
     broker_config: Option<&BrokerConfig>,
@@ -5853,26 +5854,36 @@ mod tests {
         }
     }
 
-    /// `parse_and_validate` rejects a config with `[rebalancing]` but no
-    /// `[bot_gas_valuation]` (`CtxError::MissingBotGasValuation`). But
+    /// `parse_and_validate` requires the `[rebalancing]`, `[wallet]`,
+    /// `[tokenization]`, and `[bot_gas_valuation]` sections at startup. But
     /// `all_repo_config_tomls_are_valid` only exercises `toml::from_str`,
-    /// a structural parse that succeeds either way since the field is
-    /// `Option` -- so a future edit that drops or renames
-    /// `[bot_gas_valuation]` from a checked-in `[rebalancing]` config would
-    /// stay green there and only fail at the `validate-config` deploy gate
-    /// or at bot startup. Guard the cross-field invariant here instead, the
-    /// same way `repo_config_vault_owner_matches_settlement_mode` guards its
-    /// own cross-field invariant.
+    /// a structural parse that succeeds without them since the fields are
+    /// `Option` -- so a checked-in config missing a section would stay
+    /// green there and only fail at the `validate-config` deploy gate or
+    /// at startup, after the merge. Guard the deploy precondition here,
+    /// the same way `repo_config_vault_owner_matches_settlement_mode`
+    /// guards its own cross-field invariant.
     #[test]
-    fn repo_config_rebalancing_requires_bot_gas_valuation() {
+    fn repo_configs_contain_all_required_sections() {
         for path in repo_config_paths() {
             let contents = std::fs::read_to_string(&path).unwrap();
             let config: Config = toml::from_str(&contents).unwrap();
 
             assert!(
-                config.rebalancing.is_none() || config.bot_gas_valuation.is_some(),
-                "{path:?}: [rebalancing] is configured but [bot_gas_valuation] is \
-                 missing -- parse_and_validate rejects this combination at startup"
+                config.rebalancing.is_some(),
+                "{path:?}: missing required [rebalancing] section"
+            );
+            assert!(
+                config.wallet.is_some(),
+                "{path:?}: missing required [wallet] section"
+            );
+            assert!(
+                config.tokenization.is_some(),
+                "{path:?}: missing required [tokenization] section"
+            );
+            assert!(
+                config.bot_gas_valuation.is_some(),
+                "{path:?}: missing required [bot_gas_valuation] section"
             );
         }
     }
@@ -5933,10 +5944,10 @@ mod tests {
             let contents = std::fs::read_to_string(&path).unwrap();
             let config: Config = toml::from_str(&contents).unwrap();
 
-            // e2e/config.toml supplies its wallet out of band, so there is no
-            // [wallet].address to pin a legacy vault_owner against -- but the
-            // mode/inventory consistency checks below don't need the wallet,
-            // so they run for every checked-in config.
+            // Every checked-in config currently carries a [wallet] section;
+            // the Option handling stays so a future wallet-less template
+            // still gets the mode/inventory consistency checks below, which
+            // don't need the wallet.
             let wallet: Option<WalletMeta> = config.wallet.map(|value| value.try_into().unwrap());
 
             match (config.raindex.inventory_mode, config.raindex.inventory) {
