@@ -5,8 +5,9 @@ design decisions at a level sufficient to understand the system without
 prescribing exact commands or code. For terminology and naming conventions, see
 [docs/domain.md](docs/domain.md).
 
-Current supported offchain execution backends are `alpaca-broker-api` and
-`dry-run`.
+The supported offchain execution backend is `alpaca-broker-api`. Tests and local
+simulation run it in `mock` mode against a mock Alpaca server (see the
+simulation apps, e.g. `nix run .#simulate`).
 
 ## Background
 
@@ -74,9 +75,6 @@ and the system proves market fit.
 - **Alpaca Broker API**: Supports fractional share trading. Production can use
   dollar-value execution thresholds to reduce unhedged exposure while still
   respecting buying-power constraints.
-- **Dry run**: Supports fractional arithmetic for simulation and testing.
-  Operators may still configure whole-share thresholds when that is useful for
-  conservative modeling.
 
 #### Rebalancing Process
 
@@ -100,6 +98,32 @@ and the system proves market fit.
   cross-chain USDC transfers
 
 Automated rebalancing is Alpaca Broker API based.
+
+The `[rebalancing]` configuration section is required. If the section is absent,
+the bot does not start: configuration parsing fails with an explicit error.
+There is no global switch that turns rebalancing off, and there is no separate
+hedging-only topology. The rebalancing infrastructure — inventory polling,
+transfer stores and workers, and interrupted-transfer recovery — always starts.
+
+##### Pausing Rebalancing
+
+Operators pause rebalancing with narrow, explicit controls:
+
+- **Per-asset `rebalancing = "disabled"`**: removes the asset from the trigger
+  whitelist. New equity rebalancing flows do not start for that asset.
+- **Issuance freeze (`Frozen`)**: stops new mints for the asset during
+  maintenance or corporate actions. When `freeze_check = "enabled"`, the freeze
+  also stops new liquidity-initiated rebalancing flows for the asset. When
+  `freeze_check = "disabled"`, the bot does not consult issuance and equity
+  rebalancing proceeds. This bypass is an operator escape hatch for an issuance
+  outage.
+- **USDC-specific controls** (`usdc` mode under `[rebalancing]`): stop new USDC
+  rebalancing flows.
+- **Circuit breakers**: stop a transfer after repeated failures and alert the
+  operator.
+
+None of these controls disable hedging, inventory visibility, or the recovery of
+in-flight transfers. A pause stops new rebalancing work only.
 
 ##### Shared-Inventory Settlement
 
@@ -1553,7 +1577,7 @@ Feature flags control which implementations are compiled:
 [dependencies]
 st0x-server = { features = ["all-wallets"] }
 
-# Dry-run testing
+# Local simulation and e2e testing (mock Alpaca server)
 st0x-server = { features = ["mock"] }
 
 # Future: crypto + perps fork with different integrations

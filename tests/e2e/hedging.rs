@@ -1729,6 +1729,14 @@ async fn e2e_inventory_trade_settlement_hedges() -> anyhow::Result<()> {
         .grant_inventory_operator(inventory, operator)
         .await?;
 
+    // The bot signs with its own dedicated wallet account; the managed-mode
+    // startup preflight requires that wallet to hold OPERATOR_ROLE on the
+    // inventory.
+    infra
+        .base_chain
+        .grant_inventory_operator(inventory, infra.base_chain.bot_wallet)
+        .await?;
+
     // Seed the inventory's USDC vault (admin-funded) so the operator's
     // withdraw4(USDC) below has a real balance to draw from.
     let usdc_vault_id = B256::random();

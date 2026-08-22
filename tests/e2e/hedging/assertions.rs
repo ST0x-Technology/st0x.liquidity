@@ -1,19 +1,24 @@
 use alloy::primitives::{Address, B256};
 pub(crate) use alloy::providers::Provider;
+use alloy::providers::RootProvider;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
+use st0x_float_macro::float;
+use std::sync::Arc;
 pub(crate) use std::time::Duration;
 use tokio::task::JoinHandle;
 
 pub(crate) use st0x_config::InventoryMode;
-use st0x_config::{AssetsConfig, BrokerCtx, Ctx};
+use st0x_config::{AssetsConfig, BrokerCtx, Ctx, OnchainWalletCtx};
 pub(crate) use st0x_event_sorcery::Projection;
+use st0x_evm::Wallet;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_API_KEY, TEST_API_SECRET};
 use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
 pub(crate) use st0x_execution::{FractionalShares, Positive, Symbol};
 pub(crate) use st0x_hedge::ExecutionThreshold;
-use st0x_hedge::TradingMode;
 use st0x_hedge::bindings::IRaindexV6;
+use st0x_hedge::mock_api::REDEMPTION_WALLET;
+use st0x_hedge::{ImbalanceThreshold, OperationMode, RebalancingCtx, TradingMode, UsdcRebalancing};
 pub(crate) use st0x_hedge::{OffchainOrder, Position};
 
 pub(crate) use crate::assert::ExpectedPosition;
@@ -24,6 +29,7 @@ pub(crate) use crate::poll::{
     DEFAULT_POLL_TIMEOUT_SECS, connect_db, count_events, poll_for_aggregate_events_containing,
     poll_for_events, sleep_or_crash, spawn_bot, wait_for_processing,
 };
+use crate::rebalancing::assertions::{TestWallet, mock_bot_gas_valuation};
 pub(crate) use crate::test_infra::TestInfra;
 
 /// Builds a `Ctx` pointing at the given chain, broker, and database path.
@@ -67,14 +73,46 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         None => chain.endpoint().parse()?,
     };
 
+    // Hedging and chaos tests boot the full rebalancing topology with every
+    // rebalancing trigger disabled (per-asset `rebalancing` and cash settings
+    // come from `assets`): the infrastructure starts, but no rebalancing flow
+    // ever fires.
+    //
+    // The wallet uses its own dedicated account (`bot_wallet_key`) because
+    // these tests drive the owner account from the harness concurrently with
+    // the bot's startup approvals -- sharing the key produces nonce
+    // collisions. It connects directly to the chain endpoint, not through
+    // `rpc_url_override`: chaos proxies target the monitor/hedging path, and
+    // routing wallet polling through a fault proxy would add unasserted
+    // noise. There is no separate Ethereum chain in these tests and, with
+    // triggers disabled, nothing exercises the Ethereum side, so one shared
+    // instance serves both chain slots and all bot transactions flow through
+    // a single nonce manager.
+    let wallet: Arc<dyn Wallet<Provider = RootProvider>> = Arc::new(TestWallet::new(
+        &chain.bot_wallet_key,
+        chain.endpoint().parse()?,
+        1,
+    )?);
+
+    let wallet_ctx = OnchainWalletCtx::from_wallets(wallet.clone(), wallet.clone(), wallet);
+
+    let rebalancing_ctx = RebalancingCtx::with_wallets()
+        .equity(ImbalanceThreshold::new(float!(0.5), float!(0.1))?)
+        .usdc(UsdcRebalancing::Disabled)
+        .freeze_check(OperationMode::Disabled)
+        .call();
+
     Ctx::for_test()
         .database_url(db_path.display().to_string())
         .rpc_url(rpc_url)
         .orderbook(chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)
-        .trading_mode(TradingMode::Standalone)
+        .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
         .order_owner(chain.owner)
+        .wallet(wallet_ctx)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .bot_gas_valuation(mock_bot_gas_valuation(chain.mock_pyth))
         .assets(assets)
         .maybe_execution_threshold_override(execution_threshold_override)
         .maybe_inventory_mode(inventory_mode_override)
