@@ -24266,7 +24266,7 @@ mod tests {
         crate::conductor::restore_inventory_at_boot(
             &pool,
             &trigger.inventory,
-            Some(&trigger),
+            &trigger,
             &projection,
         )
         .await
@@ -24314,7 +24314,7 @@ mod tests {
         crate::conductor::restore_inventory_at_boot(
             &pool,
             &trigger.inventory,
-            Some(&trigger),
+            &trigger,
             &projection,
         )
         .await
@@ -24397,7 +24397,7 @@ mod tests {
         crate::conductor::restore_inventory_at_boot(
             &pool,
             &trigger.inventory,
-            Some(&trigger),
+            &trigger,
             &projection,
         )
         .await
@@ -25671,7 +25671,7 @@ mod tests {
         crate::conductor::restore_inventory_at_boot(
             &pool,
             &trigger.inventory,
-            Some(&trigger),
+            &trigger,
             &projection,
         )
         .await

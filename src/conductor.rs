@@ -35,7 +35,7 @@ use tracing::{debug, error, info, warn};
 
 use st0x_config::{
     AssetsConfig, BrokerCtx, Ctx, CtxError, EvmCtx, ExecutionThreshold, InventoryMode,
-    IssuanceStatusCtx, OperationMode, RebalancingCtx,
+    IssuanceStatusCtx, OperationMode, RebalancingCtx, RebalancingCtxError,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
@@ -68,9 +68,7 @@ use crate::dashboard::{Broadcaster, DashboardTradeDelivery};
 use crate::equity_redemption::{
     EquityRedemption, interrupted_redemption_ids, symbols_with_stuck_redemptions,
 };
-use crate::inventory::{
-    BroadcastingInventory, Inventory, InventoryProjection, InventorySnapshot, Venue,
-};
+use crate::inventory::{BroadcastingInventory, Inventory, InventorySnapshot, Venue};
 use crate::mint_authorization::{ConfiguredMintAuthorizer, MintAuthorizationService};
 use crate::offchain::order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacer,
@@ -127,19 +125,13 @@ use crate::trading::offchain::close_flatten::{CloseFlattenCrossRamp, CloseFlatte
 use crate::trading::offchain::hedge::{apply_slippage, resolve_extended_hours_reference_price};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, TradeAccountingError};
-use crate::unwrapped_equity_recovery::{
-    UnwrappedEquityRecovery, UnwrappedEquityRecoveryCtx, UnwrappedEquityRecoveryJobQueue,
-    UnwrappedEquityRecoveryServices,
-};
+use crate::unwrapped_equity_recovery::{UnwrappedEquityRecovery, UnwrappedEquityRecoveryServices};
 use crate::vault_lookup::{VaultLookup, VaultRegistryLookup};
 use crate::vault_registry::{
     SeedVaultRegistry, SeedVaultRegistryCtx, SeedVaultRegistryJobQueue, VaultRegistry,
     VaultRegistryCommand, VaultRegistryId,
 };
-use crate::wrapped_equity_recovery::{
-    WrappedEquityRecovery, WrappedEquityRecoveryCtx, WrappedEquityRecoveryJobQueue,
-    WrappedEquityRecoveryServices,
-};
+use crate::wrapped_equity_recovery::{WrappedEquityRecovery, WrappedEquityRecoveryServices};
 
 pub(crate) use builder::CqrsFrameworks;
 use manifest::{BuiltFrameworks, QueryManifest};
@@ -445,43 +437,28 @@ const TERMINAL_FAILURE_ALERT_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// A previous process may have died mid-transfer, leaving an apalis `Running`
 /// row that no live worker owns. Resets orphaned rows for every transfer
-/// queue whose worker is wired (its ctx is present, i.e. rebalancing is
-/// enabled) before the monitor spawns, so any `Running` row is orphaned by
-/// definition. The USDC queues are wedge-prone symmetrically: Base->Alpaca
-/// via the enqueue dedup, Alpaca->Base because `rearm_stranded_transfers`
-/// treats a `Running` row as in-flight and skips it. The equity mint queue
-/// is wedge-prone via its per-symbol enqueue dedup.
-async fn requeue_wired_transfer_orphans(
-    schedulers: &RebalancingSchedulers,
-    usdc_to_hedging_ctx: Option<&Arc<TransferUsdcToHedgingCtx>>,
-    usdc_to_market_making_ctx: Option<&Arc<TransferUsdcToMarketMakingCtx>>,
-    equity_to_market_making_ctx: Option<&Arc<TransferEquityToMarketMakingCtx>>,
-    equity_to_hedging_ctx: Option<&Arc<TransferEquityToHedgingCtx>>,
-) -> anyhow::Result<()> {
-    if usdc_to_hedging_ctx.is_some() {
-        requeue_transfer_orphans(&schedulers.transfer_usdc_to_hedging, "Base->Alpaca").await?;
-    }
+/// queue before the monitor spawns (every transfer worker is always wired),
+/// so any `Running` row is orphaned by definition. The USDC queues are
+/// wedge-prone symmetrically: Base->Alpaca via the enqueue dedup,
+/// Alpaca->Base because `rearm_stranded_transfers` treats a `Running` row as
+/// in-flight and skips it. The equity mint queue is wedge-prone via its
+/// per-symbol enqueue dedup.
+async fn requeue_wired_transfer_orphans(schedulers: &RebalancingSchedulers) -> anyhow::Result<()> {
+    requeue_transfer_orphans(&schedulers.transfer_usdc_to_hedging, "Base->Alpaca").await?;
 
-    if usdc_to_market_making_ctx.is_some() {
-        requeue_transfer_orphans(&schedulers.transfer_usdc_to_market_making, "Alpaca->Base")
-            .await?;
-    }
+    requeue_transfer_orphans(&schedulers.transfer_usdc_to_market_making, "Alpaca->Base").await?;
 
-    if equity_to_market_making_ctx.is_some() {
-        requeue_transfer_orphans(
-            &schedulers.transfer_equity_to_market_making,
-            "equity hedging->market-making",
-        )
-        .await?;
-    }
+    requeue_transfer_orphans(
+        &schedulers.transfer_equity_to_market_making,
+        "equity hedging->market-making",
+    )
+    .await?;
 
-    if equity_to_hedging_ctx.is_some() {
-        requeue_transfer_orphans(
-            &schedulers.transfer_equity_to_hedging,
-            "equity market-making->hedging",
-        )
-        .await?;
-    }
+    requeue_transfer_orphans(
+        &schedulers.transfer_equity_to_hedging,
+        "equity market-making->hedging",
+    )
+    .await?;
 
     Ok(())
 }
@@ -489,69 +466,38 @@ async fn requeue_wired_transfer_orphans(
 async fn requeue_startup_orphans(
     schedulers: &RebalancingSchedulers,
     backfill_queue: &BackfillJobQueue,
-    usdc_to_hedging_ctx: Option<&Arc<TransferUsdcToHedgingCtx>>,
-    usdc_to_market_making_ctx: Option<&Arc<TransferUsdcToMarketMakingCtx>>,
-    equity_to_market_making_ctx: Option<&Arc<TransferEquityToMarketMakingCtx>>,
-    equity_to_hedging_ctx: Option<&Arc<TransferEquityToHedgingCtx>>,
 ) -> anyhow::Result<()> {
-    requeue_wired_transfer_orphans(
-        schedulers,
-        usdc_to_hedging_ctx,
-        usdc_to_market_making_ctx,
-        equity_to_market_making_ctx,
-        equity_to_hedging_ctx,
-    )
-    .await?;
+    requeue_wired_transfer_orphans(schedulers).await?;
     requeue_backfill_orphans(backfill_queue).await
 }
 
 /// Borrowed dependencies for [`finish_startup_recovery`]. Bundled into a
-/// struct (rather than passed as individual arguments) to stay under the
-/// crate's argument-count lint -- the phase genuinely needs every one of
-/// these to requeue orphans, re-arm the bot-gas recovery queue, and hydrate
-/// inventory.
+/// struct (rather than passed as individual arguments) to keep the phase's
+/// call site self-describing -- it needs every one of these to requeue
+/// orphans, re-arm the bot-gas recovery queue, and hydrate inventory.
 struct StartupRecoveryDeps<'startup> {
     schedulers: &'startup RebalancingSchedulers,
     backfill_queue: &'startup BackfillJobQueue,
-    usdc_to_hedging_ctx: Option<&'startup Arc<TransferUsdcToHedgingCtx>>,
-    usdc_to_market_making_ctx: Option<&'startup Arc<TransferUsdcToMarketMakingCtx>>,
-    equity_to_market_making_ctx: Option<&'startup Arc<TransferEquityToMarketMakingCtx>>,
-    equity_to_hedging_ctx: Option<&'startup Arc<TransferEquityToHedgingCtx>>,
     record_bot_gas_receipt_cost_queue: &'startup RecordBotGasReceiptCostJobQueue,
-    record_bot_gas_receipt_cost_ctx: Option<&'startup Arc<RecordBotGasReceiptCostCtx>>,
     pool: &'startup SqlitePool,
     inventory: &'startup Arc<BroadcastingInventory>,
-    rebalancing_service: Option<&'startup Arc<RebalancingService>>,
+    rebalancing_service: &'startup Arc<RebalancingService>,
     position_projection: &'startup Projection<Position>,
 }
 
 /// Runs the startup recovery phase, in order: re-queues orphaned transfer
 /// jobs left in-flight by a previous process, re-queues orphaned bot-gas
-/// receipt-cost recovery jobs (when a worker is registered for them),
-/// restores the in-memory inventory view from its persisted snapshot and
-/// seeds the open-hedge gate, then enqueues wallet-balance recovery for the
-/// current on-chain balances.
+/// receipt-cost recovery jobs, restores the in-memory inventory view from
+/// its persisted snapshot and seeds the open-hedge gate, then enqueues
+/// wallet-balance recovery for the current on-chain balances.
 async fn finish_startup_recovery(deps: StartupRecoveryDeps<'_>) -> anyhow::Result<()> {
-    requeue_startup_orphans(
-        deps.schedulers,
-        deps.backfill_queue,
-        deps.usdc_to_hedging_ctx,
-        deps.usdc_to_market_making_ctx,
-        deps.equity_to_market_making_ctx,
-        deps.equity_to_hedging_ctx,
+    requeue_startup_orphans(deps.schedulers, deps.backfill_queue).await?;
+
+    requeue_recovery_orphans(
+        deps.record_bot_gas_receipt_cost_queue,
+        "bot gas receipt cost",
     )
     .await?;
-
-    // Gated on the ctx (not just "queue exists"), matching every other
-    // recovery/transfer queue: without a registered worker, promoting an
-    // orphaned row to `Pending` just leaves it stuck Pending instead.
-    if deps.record_bot_gas_receipt_cost_ctx.is_some() {
-        requeue_recovery_orphans(
-            deps.record_bot_gas_receipt_cost_queue,
-            "bot gas receipt cost",
-        )
-        .await?;
-    }
 
     // Restore the in-memory InventoryView from persisted snapshot state
     // and seed the open-hedge gate. Without hydration, the first
@@ -565,23 +511,21 @@ async fn finish_startup_recovery(deps: StartupRecoveryDeps<'_>) -> anyhow::Resul
         deps.position_projection,
     )
     .await?;
-    if let Some(service) = deps.rebalancing_service {
-        service.enqueue_recovery_for_current_wallet_balances().await;
-    }
+    deps.rebalancing_service
+        .enqueue_recovery_for_current_wallet_balances()
+        .await;
 
     Ok(())
 }
 
 /// Builds the position/rebalancing wiring and immediately runs the startup
 /// recovery phase that depends on it: the requeue and hydration steps in
-/// [`finish_startup_recovery`] consume the transfer contexts, rebalancing
-/// service, and position projection this setup produces, so the two form
-/// one startup unit.
+/// [`finish_startup_recovery`] consume the rebalancing service and position
+/// projection this setup produces, so the two form one startup unit.
 async fn setup_positioning_with_recovery(
-    rebalancing: Option<RebalancingCtx>,
+    rebalancing_ctx: RebalancingCtx,
     deps: RebalancingDeps,
     backfill_queue: &BackfillJobQueue,
-    record_bot_gas_receipt_cost_ctx: Option<&Arc<RecordBotGasReceiptCostCtx>>,
 ) -> anyhow::Result<PositionAndRebalancing> {
     // The recovery phase needs these after `setup` consumes `deps`.
     let pool = deps.pool.clone();
@@ -589,20 +533,15 @@ async fn setup_positioning_with_recovery(
     let schedulers = deps.schedulers.clone();
     let record_bot_gas_receipt_cost_queue = deps.record_bot_gas_receipt_cost_queue.clone();
 
-    let positioning = PositionAndRebalancing::setup(rebalancing, deps).await?;
+    let positioning = PositionAndRebalancing::setup(rebalancing_ctx, deps).await?;
 
     finish_startup_recovery(StartupRecoveryDeps {
         schedulers: &schedulers,
         backfill_queue,
-        usdc_to_hedging_ctx: positioning.transfer_usdc_to_hedging_ctx.as_ref(),
-        usdc_to_market_making_ctx: positioning.transfer_usdc_to_market_making_ctx.as_ref(),
-        equity_to_market_making_ctx: positioning.transfer_equity_to_market_making_ctx.as_ref(),
-        equity_to_hedging_ctx: positioning.transfer_equity_to_hedging_ctx.as_ref(),
         record_bot_gas_receipt_cost_queue: &record_bot_gas_receipt_cost_queue,
-        record_bot_gas_receipt_cost_ctx,
         pool: &pool,
         inventory: &inventory,
-        rebalancing_service: positioning.service.as_ref(),
+        rebalancing_service: &positioning.service,
         position_projection: &positioning.position_projection,
     })
     .await?;
@@ -673,21 +612,6 @@ async fn requeue_backfill_orphans(backfill_queue: &BackfillJobQueue) -> anyhow::
         );
     }
 
-    Ok(())
-}
-
-async fn requeue_equity_recovery_orphans(
-    wrapped_ctx: Option<&Arc<WrappedEquityRecoveryCtx>>,
-    unwrapped_ctx: Option<&Arc<UnwrappedEquityRecoveryCtx>>,
-    wrapped_queue: &WrappedEquityRecoveryJobQueue,
-    unwrapped_queue: &UnwrappedEquityRecoveryJobQueue,
-) -> anyhow::Result<()> {
-    if wrapped_ctx.is_some() {
-        requeue_recovery_orphans(wrapped_queue, "wrapped equity").await?;
-    }
-    if unwrapped_ctx.is_some() {
-        requeue_recovery_orphans(unwrapped_queue, "unwrapped equity").await?;
-    }
     Ok(())
 }
 
@@ -811,24 +735,16 @@ where
 ///
 /// Called only after all startup work (inventory hydration, orphan recovery,
 /// store builds) completes, so the endpoint returns 503 until the conductor is
-/// ready. Both halves exist only when rebalancing is enabled; the tuple match
-/// makes that dual-Some requirement explicit, so the compiler flags any arm
-/// accidentally set without the other. A losing `set` race is ignored: the
-/// cell is written once per boot, so an already-populated cell holds an
-/// equivalent handle.
+/// ready. Every half of the handle always exists (rebalancing is the only
+/// topology), so publication is unconditional. A losing `set` race is
+/// ignored: the cell is written once per boot, so an already-populated cell
+/// holds an equivalent handle.
 fn publish_recovery_handle(
     recovery_cell: &tokio::sync::OnceCell<crate::api::RecoveryHandle>,
-    transfer: Option<Arc<CrossVenueEquityTransfer>>,
-    rebalancing_service: Option<Arc<RebalancingService>>,
-    usdc_recheck: Option<Arc<dyn RecheckUsdcDeposit>>,
+    transfer: Arc<CrossVenueEquityTransfer>,
+    rebalancing_service: Arc<RebalancingService>,
+    usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
 ) {
-    let (Some(transfer), Some(rebalancing_service), Some(usdc_recheck)) =
-        (transfer, rebalancing_service, usdc_recheck)
-    else {
-        debug!("Rebalancing disabled: /transfers/resume stays unavailable");
-        return;
-    };
-
     let _ = recovery_cell.set(crate::api::RecoveryHandle {
         transfer,
         rebalancing_service,
@@ -896,10 +812,6 @@ impl Conductor {
 
         run_startup_maintenance(&ctx, &pool).await?;
 
-        // `PositionAndRebalancing::setup` keeps its `Option` parameter until
-        // the conductor collapses to the single topology; the `[rebalancing]`
-        // section is required, so this is always `Some`.
-        let rebalancing = Some((*ctx.rebalancing).clone());
         let notifier = build_alert_notifier(ctx.alerts.as_ref(), "Operational alerting")?;
 
         let PositionAndRebalancing {
@@ -925,7 +837,7 @@ impl Conductor {
             deliver_mint_authorization_queue,
             deliver_mint_authorization_ctx,
         } = Box::pin(setup_positioning_with_recovery(
-            rebalancing,
+            (*ctx.rebalancing).clone(),
             RebalancingDeps {
                 pool: pool.clone(),
                 apalis_pool: apalis_pool.clone(),
@@ -941,7 +853,6 @@ impl Conductor {
                 record_bot_gas_receipt_cost_queue: record_bot_gas_receipt_cost_queue.clone(),
             },
             &backfill_queue,
-            record_bot_gas_receipt_cost_ctx.as_ref(),
         ))
         .await?;
 
@@ -1027,11 +938,10 @@ impl Conductor {
         // rebalancing service to rebuild tracking during recheck recovery.
         let recovery_service = rebalancing_service.clone();
 
-        let (resume_tokenization_queue, resume_tokenization_ctx) = resolve_resume_tokenization(
-            resume_tokenization_queue,
-            recovery_transfer.as_ref(),
-            &apalis_pool,
-        );
+        let resume_tokenization_ctx = Arc::new(ResumeTokenizationCtx {
+            transfer: recovery_transfer.clone(),
+            job_queue: resume_tokenization_queue.clone(),
+        });
 
         let conductor = builder::spawn()
             .context(conductor_ctx)
@@ -1048,28 +958,28 @@ impl Conductor {
             .portfolio_snapshot_queue(portfolio_snapshot_queue)
             .notifier(notifier.clone())
             .wrapped_equity_recovery_queue(wrapped_equity_recovery_queue)
-            .maybe_wrapped_equity_recovery_ctx(wrapped_equity_recovery_ctx)
+            .wrapped_equity_recovery_ctx(wrapped_equity_recovery_ctx)
             .unwrapped_equity_recovery_queue(unwrapped_equity_recovery_queue)
-            .maybe_unwrapped_equity_recovery_ctx(unwrapped_equity_recovery_ctx)
+            .unwrapped_equity_recovery_ctx(unwrapped_equity_recovery_ctx)
             .equity_check_scheduler(schedulers.equity)
             .usdc_check_scheduler(schedulers.usdc)
             .transfer_usdc_to_hedging_queue(schedulers.transfer_usdc_to_hedging)
-            .maybe_transfer_usdc_to_hedging_ctx(transfer_usdc_to_hedging_ctx)
+            .transfer_usdc_to_hedging_ctx(transfer_usdc_to_hedging_ctx)
             .transfer_usdc_to_market_making_queue(schedulers.transfer_usdc_to_market_making)
-            .maybe_transfer_usdc_to_market_making_ctx(transfer_usdc_to_market_making_ctx)
+            .transfer_usdc_to_market_making_ctx(transfer_usdc_to_market_making_ctx)
             .transfer_equity_to_market_making_queue(schedulers.transfer_equity_to_market_making)
-            .maybe_transfer_equity_to_market_making_ctx(transfer_equity_to_market_making_ctx)
+            .transfer_equity_to_market_making_ctx(transfer_equity_to_market_making_ctx)
             .transfer_equity_to_hedging_queue(schedulers.transfer_equity_to_hedging)
-            .maybe_transfer_equity_to_hedging_ctx(transfer_equity_to_hedging_ctx)
-            .maybe_rebalancing_service(rebalancing_service)
+            .transfer_equity_to_hedging_ctx(transfer_equity_to_hedging_ctx)
+            .rebalancing_service(rebalancing_service)
             .seed_vault_registry_queue(seed_vault_registry_queue)
             .seed_vault_registry_ctx(seed_vault_registry_ctx)
             .resume_tokenization_queue(resume_tokenization_queue)
-            .maybe_resume_tokenization_ctx(resume_tokenization_ctx)
+            .resume_tokenization_ctx(resume_tokenization_ctx)
             .deliver_mint_authorization_queue(deliver_mint_authorization_queue)
-            .maybe_deliver_mint_authorization_ctx(deliver_mint_authorization_ctx)
+            .deliver_mint_authorization_ctx(deliver_mint_authorization_ctx)
             .record_bot_gas_receipt_cost_queue(record_bot_gas_receipt_cost_queue)
-            .maybe_record_bot_gas_receipt_cost_ctx(record_bot_gas_receipt_cost_ctx)
+            .record_bot_gas_receipt_cost_ctx(record_bot_gas_receipt_cost_ctx)
             .job_cleanup(job_cleanup)
             .telemetry_writer(telemetry_writer)
             // Worker-failure pages share the operational `[alerts]` channel
@@ -1266,62 +1176,6 @@ impl Drop for Conductor {
     }
 }
 
-/// Builds the [`WrappedEquityRecoveryCtx`] when every dependency the recovery
-/// job needs is present; returns `None` (recovery wiring absent) if any is not.
-fn build_wrapped_equity_recovery_ctx(
-    store: Option<Arc<Store<WrappedEquityRecovery>>>,
-    service: Option<Arc<RebalancingService>>,
-    mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
-    redemption_store: Option<Arc<Store<EquityRedemption>>>,
-    inventory: Arc<BroadcastingInventory>,
-    queue: WrappedEquityRecoveryJobQueue,
-    reschedule_interval: Duration,
-) -> Option<Arc<WrappedEquityRecoveryCtx>> {
-    let (Some(store), Some(service), Some(mint_store), Some(redemption_store)) =
-        (store, service, mint_store, redemption_store)
-    else {
-        return None;
-    };
-
-    Some(Arc::new(WrappedEquityRecoveryCtx {
-        inventory,
-        store,
-        mint_store,
-        redemption_store,
-        equity_in_progress: service.equity_in_progress.clone(),
-        queue,
-        reschedule_interval,
-    }))
-}
-
-/// Builds the [`UnwrappedEquityRecoveryCtx`] when every dependency the recovery
-/// job needs is present; returns `None` (recovery wiring absent) if any is not.
-fn build_unwrapped_equity_recovery_ctx(
-    store: Option<Arc<Store<UnwrappedEquityRecovery>>>,
-    service: Option<Arc<RebalancingService>>,
-    mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
-    redemption_store: Option<Arc<Store<EquityRedemption>>>,
-    inventory: Arc<BroadcastingInventory>,
-    queue: UnwrappedEquityRecoveryJobQueue,
-    reschedule_interval: Duration,
-) -> Option<Arc<UnwrappedEquityRecoveryCtx>> {
-    let (Some(store), Some(service), Some(mint_store), Some(redemption_store)) =
-        (store, service, mint_store, redemption_store)
-    else {
-        return None;
-    };
-
-    Some(Arc::new(UnwrappedEquityRecoveryCtx {
-        inventory,
-        store,
-        mint_store,
-        redemption_store,
-        equity_in_progress: service.equity_in_progress.clone(),
-        queue,
-        reschedule_interval,
-    }))
-}
-
 /// Brings the PnL ledger read model up to the event-log head (ADR 0018).
 /// Runs before any store is built so the returned doorbell reactor can be
 /// registered on every source aggregate's framework. The ledger instance is
@@ -1346,10 +1200,7 @@ async fn setup_pnl_ledger(ledger: Arc<PnlLedger>) -> anyhow::Result<Arc<PnlLedge
 }
 
 /// Builds the bot-gas cost-recording wiring (ADR 0017): the event store, the
-/// job queue, and the ctx. The store and queue are constructed
-/// unconditionally because doing so is cheap and has no side effects,
-/// regardless of trading mode; only the ctx is conditional (see
-/// [`build_record_bot_gas_receipt_cost_ctx`]).
+/// job queue, and the ctx (see [`build_record_bot_gas_receipt_cost_ctx`]).
 async fn setup_bot_gas_receipt_cost(
     pool: &SqlitePool,
     apalis_pool: &apalis_sqlite::SqlitePool,
@@ -1357,7 +1208,7 @@ async fn setup_bot_gas_receipt_cost(
     pnl_ledger_reactor: Arc<PnlLedgerReactor>,
 ) -> anyhow::Result<(
     RecordBotGasReceiptCostJobQueue,
-    Option<Arc<RecordBotGasReceiptCostCtx>>,
+    Arc<RecordBotGasReceiptCostCtx>,
 )> {
     let store = StoreBuilder::<BotGasReceiptCost>::new(pool.clone())
         .with(pnl_ledger_reactor)
@@ -1369,42 +1220,30 @@ async fn setup_bot_gas_receipt_cost(
     Ok((queue, record_ctx))
 }
 
-/// Builds the [`RecordBotGasReceiptCostCtx`] whenever `[bot_gas_valuation]` is
-/// configured (ADR 0017), independent of trading mode -- `[bot_gas_valuation]`
-/// is mandatory when `[rebalancing]` is configured and optional otherwise, so
-/// this also returns `Some` in Standalone mode if the operator opted in. The
-/// worker is registered either way; in Standalone mode nothing enqueues to it
-/// because every `bot_gas_enqueuer` outside `spawn_rebalancing_infrastructure`
-/// is `Disabled`.
+/// Builds the [`RecordBotGasReceiptCostCtx`] (ADR 0017). `[bot_gas_valuation]`
+/// and `[wallet]` are both mandatory alongside the required `[rebalancing]`
+/// section; file-parsed configs guarantee them, so an absence here is a
+/// wiring bug (e.g. a hand-built test ctx) and must fail startup rather than
+/// silently skip cost recording.
 fn build_record_bot_gas_receipt_cost_ctx(
     ctx: &Ctx,
     bot_gas_receipt_cost_store: Arc<Store<BotGasReceiptCost>>,
     job_queue: RecordBotGasReceiptCostJobQueue,
-) -> anyhow::Result<Option<Arc<RecordBotGasReceiptCostCtx>>> {
+) -> anyhow::Result<Arc<RecordBotGasReceiptCostCtx>> {
     let Some(bot_gas_valuation) = &ctx.bot_gas_valuation else {
-        return Ok(None);
+        return Err(CtxError::MissingBotGasValuation.into());
     };
 
-    let wallet_ctx = match ctx.wallet() {
-        Ok(wallet_ctx) => wallet_ctx,
-        Err(CtxError::WalletNotConfigured) => {
-            warn!(
-                target: "orderbook",
-                "[bot_gas_valuation] is configured but no wallet is configured -- \
-                 bot gas receipt cost recording is disabled"
-            );
-            return Ok(None);
-        }
-        Err(error) => return Err(error.into()),
-    };
-    Ok(Some(Arc::new(RecordBotGasReceiptCostCtx {
+    let wallet_ctx = ctx.wallet()?;
+
+    Ok(Arc::new(RecordBotGasReceiptCostCtx {
         base_wallet: wallet_ctx.base_wallet().clone(),
         ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
         pyth_contract: bot_gas_valuation.pyth_contract,
         eth_usd_feed_id: bot_gas_valuation.eth_usd_feed_id,
         ledger: BotGasCostLedger::new(bot_gas_receipt_cost_store),
         job_queue,
-    })))
+    }))
 }
 
 fn base_wallet_equity_recovery_enabled(ctx: &Ctx, symbol: &Symbol) -> bool {
@@ -1439,8 +1278,8 @@ fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Addr
 /// configured equity addresses, and submits through the base wallet so
 /// confirmations and nonce handling match every other on-chain write.
 ///
-/// Skips entirely when no wallet is configured -- a standalone bot without a
-/// wallet never wraps or deposits, so it has no allowances to grant.
+/// Skips entirely when no wallet is configured -- without one the bot never
+/// wraps or deposits, so it has no allowances to grant.
 async fn grant_startup_token_approvals(ctx: &Ctx) -> anyhow::Result<()> {
     let base_wallet = match ctx.wallet() {
         Ok(wallet_ctx) => wallet_ctx.base_wallet().clone(),
@@ -1620,7 +1459,7 @@ async fn compact_inventory_snapshot_events(pool: &SqlitePool) -> Result<u64, sql
 pub(crate) async fn restore_inventory_at_boot(
     pool: &SqlitePool,
     inventory: &Arc<BroadcastingInventory>,
-    rebalancing_service: Option<&Arc<RebalancingService>>,
+    rebalancing_service: &Arc<RebalancingService>,
     position_projection: &Projection<Position>,
 ) -> Result<(), ProjectionError<Position>> {
     inventory
@@ -1630,11 +1469,9 @@ pub(crate) async fn restore_inventory_at_boot(
 
     hydrate_inventory_from_snapshot(pool, inventory).await;
 
-    if let Some(service) = rebalancing_service {
-        service
-            .recover_pending_offchain_order_symbols(position_projection)
-            .await?;
-    }
+    rebalancing_service
+        .recover_pending_offchain_order_symbols(position_projection)
+        .await?;
 
     Ok(())
 }
@@ -1713,41 +1550,31 @@ struct RebalancingDeps {
     record_bot_gas_receipt_cost_queue: RecordBotGasReceiptCostJobQueue,
 }
 
-/// Position + rebalancing-adjacent infrastructure produced during conductor
-/// startup. When rebalancing is disabled, the optional fields are `None` and
-/// the position aggregate is built standalone; otherwise the rebalancing
-/// setup owns position construction and surfaces its handles here.
+/// Position + rebalancing infrastructure produced during conductor startup.
+/// The rebalancing setup owns position construction and surfaces its handles
+/// here.
 struct PositionAndRebalancing {
     position: Arc<Store<Position>>,
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
     portfolio_snapshot: Arc<Store<PortfolioSnapshot>>,
-    wallet_polling: Option<crate::inventory::WalletPollingCtx>,
-    tokenizer: Option<Arc<dyn Tokenizer>>,
-    /// `None` only when no wallet is configured at all: without one, the bot
-    /// can never hold onchain (wrapped) equity in the first place, so the
-    /// portfolio-snapshot capture gate never actually needs to resolve a
-    /// vault ratio in that case (`crate::portfolio_snapshot::write`). `Some`
-    /// regardless of whether rebalancing itself is enabled -- a wallet can be
-    /// configured for trading alone (the removed Standalone topology), and market
-    /// making still holds wrapped vault shares in that mode.
-    wrapper: Option<Arc<dyn Wrapper>>,
-    service: Option<Arc<RebalancingService>>,
-    recovery_transfer: Option<Arc<CrossVenueEquityTransfer>>,
-    usdc_recheck: Option<Arc<dyn RecheckUsdcDeposit>>,
-    wrapped_equity_recovery_store: Option<Arc<Store<WrappedEquityRecovery>>>,
-    unwrapped_equity_recovery_store: Option<Arc<Store<UnwrappedEquityRecovery>>>,
-    mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
-    redemption_store: Option<Arc<Store<EquityRedemption>>>,
-    transfer_usdc_to_hedging_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
-    transfer_usdc_to_market_making_ctx: Option<Arc<TransferUsdcToMarketMakingCtx>>,
-    transfer_equity_to_market_making_ctx: Option<Arc<TransferEquityToMarketMakingCtx>>,
-    transfer_equity_to_hedging_ctx: Option<Arc<TransferEquityToHedgingCtx>>,
-    resume_tokenization_queue: Option<ResumeTokenizationJobQueue>,
-    /// Always present (unlike the ctx): the builder needs a queue handle
-    /// either way, and workers skip registration via the absent ctx.
+    wallet_polling: crate::inventory::WalletPollingCtx,
+    tokenizer: Arc<dyn Tokenizer>,
+    wrapper: Arc<dyn Wrapper>,
+    service: Arc<RebalancingService>,
+    recovery_transfer: Arc<CrossVenueEquityTransfer>,
+    usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
+    unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
+    mint_store: Arc<Store<TokenizedEquityMint>>,
+    redemption_store: Arc<Store<EquityRedemption>>,
+    transfer_usdc_to_hedging_ctx: Arc<TransferUsdcToHedgingCtx>,
+    transfer_usdc_to_market_making_ctx: Arc<TransferUsdcToMarketMakingCtx>,
+    transfer_equity_to_market_making_ctx: Arc<TransferEquityToMarketMakingCtx>,
+    transfer_equity_to_hedging_ctx: Arc<TransferEquityToHedgingCtx>,
+    resume_tokenization_queue: ResumeTokenizationJobQueue,
     deliver_mint_authorization_queue: DeliverMintAuthorizationJobQueue,
-    deliver_mint_authorization_ctx: Option<Arc<DeliverMintAuthorizationCtx>>,
+    deliver_mint_authorization_ctx: Arc<DeliverMintAuthorizationCtx>,
 }
 
 /// Builds the wrapper service from the single wallet/config source shared by
@@ -1763,15 +1590,10 @@ fn build_wrapper<Chain: Wallet + Clone>(
 }
 
 impl PositionAndRebalancing {
-    async fn setup(
-        rebalancing: Option<RebalancingCtx>,
-        deps: RebalancingDeps,
-    ) -> anyhow::Result<Self> {
-        // Built exactly once, regardless of whether rebalancing is enabled:
-        // daily portfolio capture must happen independent of rebalancing
-        // mode, and the Single-Framework-Instance rule (docs/cqrs.md)
-        // forbids building a second Store<PortfolioSnapshot> in either
-        // branch below.
+    async fn setup(rebalancing_ctx: RebalancingCtx, deps: RebalancingDeps) -> anyhow::Result<Self> {
+        // Built exactly once: the Single-Framework-Instance rule
+        // (docs/cqrs.md) forbids building a second Store<PortfolioSnapshot>
+        // anywhere else in the server path.
         let portfolio_snapshot_projection = PortfolioSnapshotProjection::new(deps.pool.clone());
         portfolio_snapshot_projection.rebuild_all().await?;
         let portfolio_snapshot = StoreBuilder::<PortfolioSnapshot>::new(deps.pool.clone())
@@ -1781,118 +1603,61 @@ impl PositionAndRebalancing {
             .build(())
             .await?;
 
-        if let Some(rebalancing_ctx) = rebalancing {
-            let wallet_ctx = deps.ctx.wallet()?;
-            let wallets = ChainWallets::from_wallet_ctx(wallet_ctx);
-            let redemption_wallet = deps.ctx.redemption_wallet()?;
+        let wallet_ctx = deps.ctx.wallet()?;
+        let wallets = ChainWallets::from_wallet_ctx(wallet_ctx);
+        let redemption_wallet = deps.ctx.redemption_wallet()?;
 
-            // Computed before `deps` is moved into the spawn call, since
-            // `WalletPollingCtx` below also needs the config behind `deps.ctx`.
-            let unwrapped_equity_token_addresses =
-                base_wallet_unwrapped_equity_token_addresses(&deps.ctx);
-            let wrapped_equity_token_addresses =
-                base_wallet_wrapped_equity_token_addresses(&deps.ctx);
+        // Computed before `deps` is moved into the spawn call, since
+        // `WalletPollingCtx` below also needs the config behind `deps.ctx`.
+        let unwrapped_equity_token_addresses =
+            base_wallet_unwrapped_equity_token_addresses(&deps.ctx);
+        let wrapped_equity_token_addresses = base_wallet_wrapped_equity_token_addresses(&deps.ctx);
 
-            let infra = spawn_rebalancing_infrastructure(
-                rebalancing_ctx,
-                redemption_wallet,
-                wallets.clone(),
-                deps,
-            )
-            .await?;
+        let infra = spawn_rebalancing_infrastructure(
+            rebalancing_ctx,
+            redemption_wallet,
+            wallets.clone(),
+            deps,
+        )
+        .await?;
 
-            let (EthereumWallet(ethereum_wallet), BaseWallet(base_wallet)) = wallets.into_parts();
-            let wallet_polling = crate::inventory::WalletPollingCtx {
-                ethereum: Arc::new(ethereum_wallet),
-                base: Arc::new(base_wallet),
-                unwrapped_equity_token_addresses,
-                wrapped_equity_token_addresses,
-            };
+        // Seed the position_shares gauge for already-open positions: a
+        // normal restart does not replay current positions through evolve(),
+        // so the gauge would otherwise stay absent until each symbol's next
+        // position event.
+        crate::position::hydrate_position_gauges(&infra.position_projection).await?;
 
-            Ok(Self {
-                position: infra.position,
-                position_projection: infra.position_projection,
-                snapshot: infra.snapshot,
-                portfolio_snapshot,
-                wallet_polling: Some(wallet_polling),
-                tokenizer: Some(infra.tokenizer),
-                wrapper: Some(infra.wrapper),
-                service: Some(infra.service),
-                recovery_transfer: Some(infra.recovery_transfer),
-                usdc_recheck: Some(infra.usdc_recheck),
-                wrapped_equity_recovery_store: Some(infra.wrapped_equity_recovery_store),
-                unwrapped_equity_recovery_store: Some(infra.unwrapped_equity_recovery_store),
-                mint_store: Some(infra.mint_store),
-                redemption_store: Some(infra.redemption_store),
-                transfer_usdc_to_hedging_ctx: Some(infra.transfer_usdc_to_hedging_ctx),
-                transfer_usdc_to_market_making_ctx: Some(infra.transfer_usdc_to_market_making_ctx),
-                transfer_equity_to_market_making_ctx: Some(
-                    infra.transfer_equity_to_market_making_ctx,
-                ),
-                transfer_equity_to_hedging_ctx: Some(infra.transfer_equity_to_hedging_ctx),
-                resume_tokenization_queue: Some(infra.resume_tokenization_queue),
-                deliver_mint_authorization_queue: infra.deliver_mint_authorization_queue,
-                deliver_mint_authorization_ctx: Some(infra.deliver_mint_authorization_ctx),
-            })
-        } else {
-            let RebalancingDeps {
-                pool,
-                apalis_pool,
-                ctx,
-                inventory,
-                broadcaster,
-                pnl_ledger_reactor,
-                ..
-            } = deps;
+        let (EthereumWallet(ethereum_wallet), BaseWallet(base_wallet)) = wallets.into_parts();
+        let wallet_polling = crate::inventory::WalletPollingCtx {
+            ethereum: Arc::new(ethereum_wallet),
+            base: Arc::new(base_wallet),
+            unwrapped_equity_token_addresses,
+            wrapped_equity_token_addresses,
+        };
 
-            let (position, position_projection) =
-                build_position_cqrs(&pool, broadcaster, pnl_ledger_reactor).await?;
-
-            // Without the service, the projection is the only subscriber
-            // keeping the dashboard view in sync.
-            let inventory_projection = Arc::new(InventoryProjection::new(inventory));
-            let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
-                .with(inventory_projection)
-                .build(())
-                .await?;
-
-            // Rebalancing itself may be disabled (the removed Standalone topology)
-            // while a wallet is still configured for trading alone -- market
-            // making then still holds wrapped vault shares onchain, so the
-            // portfolio-snapshot job still needs a ratio source. Mirrors
-            // `grant_startup_token_approvals`'s wallet-presence check.
-            let wrapper: Option<Arc<dyn Wrapper>> = match ctx.wallet() {
-                Ok(wallet_ctx) => Some(build_wrapper(wallet_ctx.base_wallet().clone(), &ctx)),
-                Err(CtxError::WalletNotConfigured) => None,
-                Err(error) => return Err(error.into()),
-            };
-
-            Ok(Self {
-                position,
-                position_projection,
-                snapshot,
-                portfolio_snapshot,
-                wallet_polling: None,
-                tokenizer: None,
-                wrapper,
-                service: None,
-                recovery_transfer: None,
-                usdc_recheck: None,
-                wrapped_equity_recovery_store: None,
-                unwrapped_equity_recovery_store: None,
-                mint_store: None,
-                redemption_store: None,
-                transfer_usdc_to_hedging_ctx: None,
-                transfer_usdc_to_market_making_ctx: None,
-                transfer_equity_to_market_making_ctx: None,
-                transfer_equity_to_hedging_ctx: None,
-                resume_tokenization_queue: None,
-                deliver_mint_authorization_queue: DeliverMintAuthorizationJobQueue::new(
-                    &apalis_pool,
-                ),
-                deliver_mint_authorization_ctx: None,
-            })
-        }
+        Ok(Self {
+            position: infra.position,
+            position_projection: infra.position_projection,
+            snapshot: infra.snapshot,
+            portfolio_snapshot,
+            wallet_polling,
+            tokenizer: infra.tokenizer,
+            wrapper: infra.wrapper,
+            service: infra.service,
+            recovery_transfer: infra.recovery_transfer,
+            usdc_recheck: infra.usdc_recheck,
+            wrapped_equity_recovery_store: infra.wrapped_equity_recovery_store,
+            unwrapped_equity_recovery_store: infra.unwrapped_equity_recovery_store,
+            mint_store: infra.mint_store,
+            redemption_store: infra.redemption_store,
+            transfer_usdc_to_hedging_ctx: infra.transfer_usdc_to_hedging_ctx,
+            transfer_usdc_to_market_making_ctx: infra.transfer_usdc_to_market_making_ctx,
+            transfer_equity_to_market_making_ctx: infra.transfer_equity_to_market_making_ctx,
+            transfer_equity_to_hedging_ctx: infra.transfer_equity_to_hedging_ctx,
+            resume_tokenization_queue: infra.resume_tokenization_queue,
+            deliver_mint_authorization_queue: infra.deliver_mint_authorization_queue,
+            deliver_mint_authorization_ctx: infra.deliver_mint_authorization_ctx,
+        })
     }
 }
 
@@ -2166,38 +1931,6 @@ async fn revoke_stale_orderbook_allowances<Chain: Wallet + Clone>(
     }
 }
 
-/// Resolves the resume-tokenization wiring.
-///
-/// The ctx is built only when BOTH the queue and the recovery transfer are
-/// present (rebalancing enabled). `zip()` makes the dual-Some requirement
-/// explicit: if either is None the ctx is None, and the compiler flags any
-/// mismatch if one arm is accidentally set without the other. The queue falls
-/// back to an empty one when rebalancing is disabled, so the builder always
-/// receives a concrete queue (it is never consumed).
-fn resolve_resume_tokenization(
-    queue: Option<ResumeTokenizationJobQueue>,
-    recovery_transfer: Option<&Arc<CrossVenueEquityTransfer>>,
-    apalis_pool: &apalis_sqlite::SqlitePool,
-) -> (
-    ResumeTokenizationJobQueue,
-    Option<Arc<ResumeTokenizationCtx>>,
-) {
-    let ctx = queue
-        .as_ref()
-        .zip(recovery_transfer)
-        .map(|(job_queue, transfer)| {
-            Arc::new(ResumeTokenizationCtx {
-                transfer: transfer.clone(),
-                job_queue: job_queue.clone(),
-            })
-        });
-
-    (
-        queue.unwrap_or_else(|| ResumeTokenizationJobQueue::new(apalis_pool)),
-        ctx,
-    )
-}
-
 /// Builds the CQRS frameworks behind the query manifest: the four query
 /// projections, with the stage-timing read models caught up to the event log
 /// before their reactors go live. The broadcaster is passed in rather than
@@ -2285,28 +2018,26 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     Box::pin(async move {
         info!("Initializing rebalancing infrastructure");
 
-        let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &deps.ctx.broker else {
-            anyhow::bail!("rebalancing requires Alpaca Broker API configuration");
+        // The parse layer already rejects a `[rebalancing]` section without
+        // an Alpaca broker (`RebalancingCtxError::NotAlpacaBroker`), so the
+        // DryRun arm is reachable only from a hand-built ctx (e.g. in a
+        // unit test) and surfaces the same typed error instead of a panic.
+        let alpaca_auth = match &deps.ctx.broker {
+            BrokerCtx::AlpacaBrokerApi(alpaca_auth) => alpaca_auth,
+            BrokerCtx::DryRun => {
+                return Err(CtxError::from(RebalancingCtxError::NotAlpacaBroker).into());
+            }
         };
 
         let BaseWallet(base_wallet) = wallets.base();
         let market_maker_wallet = base_wallet.address();
 
-        // This function runs for every boot (the [rebalancing] section is
-        // required and demands a configured [wallet]; see CtxError),
-        // so `[wallet]` presence is guaranteed here -- unlike
-        // `build_record_bot_gas_receipt_cost_ctx`, which also runs in
-        // Standalone mode and must check both. With that precondition met,
-        // gating on `bot_gas_valuation.is_some()` alone matches
-        // `build_record_bot_gas_receipt_cost_ctx`'s outcome exactly, so the
-        // enqueuer and the registered worker can never disagree: an enqueuer
-        // with no worker would pile up `Pending` rows that nothing ever
-        // drains.
-        let bot_gas_enqueuer = if deps.ctx.bot_gas_valuation.is_some() {
-            BotGasReceiptCostEnqueuer::Enabled(deps.record_bot_gas_receipt_cost_queue.clone())
-        } else {
-            BotGasReceiptCostEnqueuer::Disabled
-        };
+        // The worker consuming this queue is always registered
+        // (`build_record_bot_gas_receipt_cost_ctx` fails startup when its
+        // config is missing), so the enqueuer and the worker can never
+        // disagree: every enqueued row has a consumer.
+        let bot_gas_enqueuer =
+            BotGasReceiptCostEnqueuer::Enabled(deps.record_bot_gas_receipt_cost_queue.clone());
 
         // The (orderbook, vault-owner) pair keys both the vault-registry lookup
         // and the rebalancing service's registry reads.
@@ -2528,11 +2259,10 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 }
 
 /// Catches the lifecycle-failure read model up to the event log before its
-/// reactor goes live. Runs in BOTH trading modes: the projection subscribes to
-/// OffchainOrder, which is active even in standalone/hedging-only mode, so a
-/// hedging-only deploy must replay its failure history too -- not just the
-/// rebalancing path. Idempotent via the dedup insert, so re-running cannot
-/// duplicate rows.
+/// reactor goes live. The projection subscribes to OffchainOrder as well as
+/// the rebalancing aggregates, so the replay covers hedge-side failure
+/// history too -- not just the rebalancing path. Idempotent via the dedup
+/// insert, so re-running cannot duplicate rows.
 async fn catch_up_lifecycle_failures(pool: &SqlitePool) -> anyhow::Result<()> {
     let replayed = LifecycleFailureProjection::new(pool.clone())
         .catch_up()
@@ -3074,30 +2804,6 @@ fn orphaned_order_position_command(
             command
         }
     }
-}
-
-/// Constructs the position CQRS framework with its view query
-/// (without rebalancing trigger). Used when rebalancing is disabled.
-async fn build_position_cqrs(
-    pool: &SqlitePool,
-    broadcaster: Arc<Broadcaster>,
-    pnl_ledger_reactor: Arc<PnlLedgerReactor>,
-) -> anyhow::Result<(Arc<Store<Position>>, Arc<Projection<Position>>)> {
-    let (store, projection) = StoreBuilder::<Position>::new(pool.clone())
-        .with(broadcaster)
-        .with(Arc::new(RetryOnBusy {
-            inner: HedgeLatencyProjection::new(pool.clone()),
-        }))
-        .with(pnl_ledger_reactor)
-        .build(())
-        .await?;
-
-    // Seed the position_shares gauge for already-open positions: a normal
-    // restart does not replay current positions through evolve(), so the gauge
-    // would otherwise stay absent until each symbol's next position event.
-    crate::position::hydrate_position_gauges(&projection).await?;
-
-    Ok((store, projection))
 }
 
 /// Discovers vaults from a trade and emits VaultRegistryCommands.
@@ -4655,9 +4361,11 @@ mod tests {
     use crate::onchain::mock::MockRaindex;
     use crate::onchain::trade::{InventoryTrade, OnchainTrade};
     use crate::rebalancing::equity::{
-        EquityTransferServices, ResumeTokenizationAggregate, ResumeTokenizationJobQueue,
-        ResumeTokenizationTarget, TransferEquityToHedging, TransferEquityToMarketMaking,
+        EquityTransferServices, RecheckOutcome, ResumeTokenizationAggregate,
+        ResumeTokenizationJobQueue, ResumeTokenizationTarget, TransferEquityToHedging,
+        TransferEquityToMarketMaking,
     };
+    use crate::rebalancing::usdc::UsdcRecheckError;
     use crate::rebalancing::{RebalancingSchedulers, RebalancingService};
     use crate::test_utils::{
         OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_log, get_test_order,
@@ -4666,9 +4374,14 @@ mod tests {
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::trading::onchain::inclusion::EmittedOnChain;
     use crate::trading::onchain::trade_accountant::AccountForDexTrade;
-    use crate::unwrapped_equity_recovery::UnwrappedEquityRecoveryJob;
     use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryId;
+    use crate::unwrapped_equity_recovery::{
+        UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
+    };
+    use crate::usdc_rebalance::UsdcRebalanceId;
     use crate::vault_lookup::MockVaultLookup;
+    use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
+    use crate::wrapped_equity_recovery::{WrappedEquityRecoveryJob, WrappedEquityRecoveryJobQueue};
 
     struct TaskDropFlag(Arc<AtomicBool>);
 
@@ -4830,6 +4543,24 @@ mod tests {
         Arc::new(PnlLedgerReactor::new(Arc::new(PnlLedger::new(
             pool.clone(),
         ))))
+    }
+
+    /// Test-only mirror of the manifest's Position wiring (broadcaster,
+    /// hedge-latency projection, PnL reactor) without the rebalancing
+    /// trigger, for tests that exercise the store/projection alone.
+    async fn build_position_cqrs(
+        pool: &SqlitePool,
+        broadcaster: Arc<Broadcaster>,
+        pnl_ledger_reactor: Arc<PnlLedgerReactor>,
+    ) -> anyhow::Result<(Arc<Store<Position>>, Arc<Projection<Position>>)> {
+        Ok(StoreBuilder::<Position>::new(pool.clone())
+            .with(broadcaster)
+            .with(Arc::new(RetryOnBusy {
+                inner: HedgeLatencyProjection::new(pool.clone()),
+            }))
+            .with(pnl_ledger_reactor)
+            .build(())
+            .await?)
     }
 
     fn test_broadcaster(
@@ -5366,6 +5097,42 @@ mod tests {
             .unwrap();
 
         requeue_recovery_orphans(&queue, "unwrapped equity")
+            .await
+            .unwrap();
+
+        let (status, lock_by): (String, Option<String>) =
+            sqlx_apalis::query_as("SELECT status, lock_by FROM Jobs WHERE job_type = ?")
+                .bind(job_type)
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        assert_eq!(status, Status::Pending.to_string());
+        assert_eq!(lock_by, None);
+    }
+
+    #[tokio::test]
+    async fn requeue_recovery_orphans_resets_wrapped_recovery_rows() {
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let mut queue = WrappedEquityRecoveryJobQueue::new(&apalis_pool);
+        let job_type = std::any::type_name::<WrappedEquityRecoveryJob>();
+
+        queue
+            .push(WrappedEquityRecoveryJob {
+                symbol: Symbol::new("AAPL").unwrap(),
+                recovery_id: WrappedEquityRecoveryId(uuid::Uuid::new_v4()),
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        sqlx_apalis::query("UPDATE Jobs SET status = ?, lock_at = 1 WHERE job_type = ?")
+            .bind(Status::Running.to_string())
+            .bind(job_type)
+            .execute(&apalis_pool)
+            .await
+            .unwrap();
+
+        requeue_recovery_orphans(&queue, "wrapped equity")
             .await
             .unwrap();
 
@@ -10321,7 +10088,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standalone_position_cqrs_broadcasts_live_position_updates() {
+    async fn position_cqrs_broadcasts_live_position_updates() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let (broadcaster, mut receiver, _queue, _delivery_ctx) =
@@ -10355,81 +10122,6 @@ mod tests {
             .await
             .expect("position command should broadcast dashboard update")
             .expect("position command should broadcast dashboard update");
-
-        match message {
-            Statement::PositionUpdate(position) => {
-                assert_eq!(position.symbol, symbol);
-                assert!(position.net.eq(float!(3)).unwrap());
-            }
-            other => panic!("expected PositionUpdate message, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn disabled_rebalancing_setup_broadcasts_live_position_updates() {
-        let (pool, apalis_pool) = setup_test_pools().await;
-        let symbol = Symbol::new("AAPL").unwrap();
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let (event_sender, mut event_receiver) = broadcast::channel(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default(),
-            event_sender.clone(),
-        ));
-        let (vault_registry, vault_registry_projection) =
-            StoreBuilder::<VaultRegistry>::new(pool.clone())
-                .build(())
-                .await
-                .unwrap();
-        let dashboard_delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, event_sender);
-
-        let position_and_rebalancing = PositionAndRebalancing::setup(
-            None,
-            RebalancingDeps {
-                pool: pool.clone(),
-                apalis_pool: apalis_pool.clone(),
-                ctx: ctx.clone(),
-                inventory,
-                broadcaster: dashboard_delivery.broadcaster,
-                pnl_ledger_reactor: test_pnl_ledger_reactor(&pool),
-                vault_registry,
-                vault_registry_projection,
-                schedulers: RebalancingSchedulers::new(&apalis_pool),
-                telemetry: TelemetrySender::disabled(),
-                notifier: Arc::new(NoopNotifier),
-                record_bot_gas_receipt_cost_queue: RecordBotGasReceiptCostJobQueue::new(
-                    &apalis_pool,
-                ),
-            },
-        )
-        .await
-        .unwrap();
-
-        position_and_rebalancing
-            .position
-            .send(
-                &symbol,
-                PositionCommand::AcknowledgeOnChainFill {
-                    symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::whole_share(),
-                    trade_id: TradeId {
-                        tx_hash: TxHash::random(),
-                        log_index: 0,
-                    },
-                    amount: FractionalShares::new(float!(3)),
-                    direction: Direction::Buy,
-                    price_usdc: float!(150),
-                    block_timestamp: chrono::Utc::now(),
-                    block_number: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        let message =
-            tokio::time::timeout(std::time::Duration::from_secs(1), event_receiver.recv())
-                .await
-                .expect("position command should broadcast through setup event sender")
-                .expect("position command should broadcast through setup event sender");
 
         match message {
             Statement::PositionUpdate(position) => {
@@ -13587,12 +13279,11 @@ mod tests {
             .expect("a well-formed [alerts] config must yield a notifier, not a startup error");
     }
 
-    /// A walletless standalone deployment (no `[wallet]`) that still opts into
-    /// `[bot_gas_valuation]` must boot cleanly with bot-gas recording disabled,
-    /// not hard-fail with `WalletNotConfigured` -- mirrors
-    /// `grant_startup_token_approvals`'s handling of the same combination.
+    /// A ctx that opts into `[bot_gas_valuation]` but carries no `[wallet]`
+    /// must hard-fail with the typed `WalletNotConfigured` error -- never
+    /// silently skip cost recording.
     #[tokio::test]
-    async fn record_bot_gas_receipt_cost_ctx_disabled_without_wallet() {
+    async fn record_bot_gas_receipt_cost_ctx_errors_without_wallet() {
         let (pool, apalis_pool) = setup_test_pools().await;
 
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
@@ -13609,19 +13300,48 @@ mod tests {
             .unwrap();
         let job_queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
 
-        let result = build_record_bot_gas_receipt_cost_ctx(&ctx, store, job_queue).unwrap();
+        let Err(error) = build_record_bot_gas_receipt_cost_ctx(&ctx, store, job_queue) else {
+            panic!("a walletless ctx must fail to build the bot-gas recording ctx");
+        };
+        let error = error.downcast::<CtxError>().unwrap();
 
         assert!(
-            result.is_none(),
-            "walletless deployment must disable bot-gas recording, not fail startup"
+            matches!(error, CtxError::WalletNotConfigured),
+            "expected WalletNotConfigured, got: {error:?}"
+        );
+    }
+
+    /// A ctx missing `[bot_gas_valuation]` must hard-fail with the typed
+    /// `MissingBotGasValuation` error -- never silently skip cost recording.
+    #[tokio::test]
+    async fn record_bot_gas_receipt_cost_ctx_errors_without_bot_gas_valuation() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        ctx.bot_gas_valuation = None;
+
+        let store = StoreBuilder::<BotGasReceiptCost>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let job_queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+
+        let Err(error) = build_record_bot_gas_receipt_cost_ctx(&ctx, store, job_queue) else {
+            panic!("a ctx without [bot_gas_valuation] must fail to build the recording ctx");
+        };
+        let error = error.downcast::<CtxError>().unwrap();
+
+        assert!(
+            matches!(error, CtxError::MissingBotGasValuation),
+            "expected MissingBotGasValuation, got: {error:?}"
         );
     }
 
     /// When both `[bot_gas_valuation]` and `[wallet]` are configured, the ctx
     /// must be built and must thread `pyth_contract`/`eth_usd_feed_id` through
-    /// unchanged -- a regression that unconditionally returned `None` would
-    /// pass every other test in this module, since they only exercise the
-    /// disabled paths.
+    /// unchanged -- a regression that unconditionally errored would pass the
+    /// two tests above, since they only exercise the failure paths.
     #[tokio::test]
     async fn record_bot_gas_receipt_cost_ctx_enabled_with_wallet_and_valuation() {
         let (pool, apalis_pool) = setup_test_pools().await;
@@ -13644,11 +13364,77 @@ mod tests {
         let job_queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
 
         let result = build_record_bot_gas_receipt_cost_ctx(&ctx, store, job_queue)
-            .unwrap()
             .expect("wallet + bot_gas_valuation configured must build a ctx");
 
         assert_eq!(result.pyth_contract, pyth_contract);
         assert_eq!(result.eth_usd_feed_id, eth_usd_feed_id);
+    }
+
+    /// `/transfers/resume` recovery stub: publication happens after startup,
+    /// so nothing ever calls it inside `publish_recovery_handle` tests.
+    struct NeverCalledUsdcRecheck;
+
+    #[async_trait::async_trait]
+    impl RecheckUsdcDeposit for NeverCalledUsdcRecheck {
+        async fn recheck_deposit(
+            &self,
+            _id: &UsdcRebalanceId,
+        ) -> Result<RecheckOutcome, UsdcRecheckError> {
+            Ok(RecheckOutcome::LeftUnchanged)
+        }
+    }
+
+    /// The collapse to the single always-rebalancing topology makes every
+    /// half of the recovery handle concrete, so publishing after startup
+    /// must always populate the OnceCell backing `/transfers/resume` (the
+    /// endpoint's 503-until-ready window ends at exactly this call) -- and
+    /// with exactly the values that were published.
+    #[tokio::test]
+    async fn publish_recovery_handle_always_sets_the_cell() {
+        let pool = setup_test_db().await;
+
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        };
+        let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
+        let redemption_store = Arc::new(test_store(pool, services));
+        let transfer = Arc::new(CrossVenueEquityTransfer::new(
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockVaultLookup::new()),
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockWrapper::new()),
+            Address::ZERO,
+            mint_store,
+            redemption_store,
+        ));
+        let rebalancing_service = freeze_guard_test_service().await;
+        let usdc_recheck: Arc<dyn RecheckUsdcDeposit> = Arc::new(NeverCalledUsdcRecheck);
+
+        let recovery_cell = tokio::sync::OnceCell::new();
+
+        publish_recovery_handle(
+            &recovery_cell,
+            transfer.clone(),
+            rebalancing_service.clone(),
+            usdc_recheck,
+        );
+
+        let handle = recovery_cell
+            .get()
+            .expect("publishing the recovery handle must always populate the cell");
+        assert!(
+            Arc::ptr_eq(&handle.transfer, &transfer),
+            "the cell must hold the published transfer"
+        );
+        assert!(
+            Arc::ptr_eq(&handle.rebalancing_service, &rebalancing_service),
+            "the cell must hold the published rebalancing service"
+        );
     }
 
     /// A wallet whose provider never answers -- mint-authorization

@@ -1,29 +1,36 @@
-//! Folds [`InventorySnapshotEvent`]s into the in-memory
+//! Snapshot-event fold errors, plus a test-only harness that folds
+//! [`InventorySnapshotEvent`]s into the in-memory
 //! [`BroadcastingInventory`] that feeds the dashboard WS.
 //!
-//! When rebalancing is enabled the projection is owned by
-//! `RebalancingService`, which calls [`Self::apply`] before its
-//! threshold checks so rebalancing decisions only run against a
-//! successfully-folded view. When rebalancing is disabled the
-//! projection is registered directly as the sole subscriber on the
-//! `InventorySnapshot` store so the dashboard still updates.
+//! In production the fold is owned by `RebalancingService`, which applies
+//! snapshot events before its threshold checks so rebalancing decisions
+//! only run against a successfully-folded view (and surfaces
+//! [`InventoryProjectionError`] from that fold). The standalone
+//! [`InventoryProjection`] reactor survives only as a test harness for the
+//! fold-and-recover semantics.
 
-use std::sync::Arc;
-
+#[cfg(test)]
 use async_trait::async_trait;
+#[cfg(test)]
 use chrono::Utc;
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
 use tracing::{debug, trace, warn};
 
+#[cfg(test)]
 use st0x_event_sorcery::{EntityList, Reactor, deps};
 
-use super::{
-    BroadcastingInventory, InventorySnapshot, InventoryViewError, snapshot::InventorySnapshotEvent,
-};
+use super::InventoryViewError;
+#[cfg(test)]
+use super::{BroadcastingInventory, InventorySnapshot, snapshot::InventorySnapshotEvent};
 
+#[cfg(test)]
 pub(crate) struct InventoryProjection {
     inventory: Arc<BroadcastingInventory>,
 }
 
+#[cfg(test)]
 impl InventoryProjection {
     pub(crate) fn new(inventory: Arc<BroadcastingInventory>) -> Self {
         Self { inventory }
@@ -69,8 +76,10 @@ pub(crate) enum InventoryProjectionError {
     View(#[from] InventoryViewError),
 }
 
+#[cfg(test)]
 deps!(InventoryProjection, [InventorySnapshot]);
 
+#[cfg(test)]
 #[async_trait]
 impl Reactor for InventoryProjection {
     type Error = InventoryProjectionError;
@@ -422,17 +431,15 @@ mod tests {
         );
     }
 
-    /// When rebalancing is disabled the projection is the sole
-    /// subscriber on the snapshot store and must still propagate events
-    /// to `BroadcastingInventory` so the dashboard reflects live balances.
+    /// A projection registered as the sole subscriber on the snapshot store
+    /// must still propagate events to `BroadcastingInventory` so the
+    /// dashboard reflects live balances.
     #[tokio::test]
     async fn snapshot_command_through_store_updates_view_without_rebalancing() {
         let pool = setup_test_db().await;
         let (sender, _receiver) = broadcast::channel(10);
         let inventory = Arc::new(BroadcastingInventory::new(InventoryView::default(), sender));
 
-        // Mirror the non-rebalancing branch of `Conductor::start`: the
-        // projection is the only subscriber on the snapshot store.
         let projection = Arc::new(InventoryProjection::new(inventory.clone()));
         let snapshot = StoreBuilder::<InventorySnapshot>::new(pool)
             .with(projection)

@@ -1708,10 +1708,9 @@ mod tests {
 
     use super::*;
     use crate::equity_redemption::RedemptionAggregateId;
+    use crate::inventory::projection::InventoryProjection;
     use crate::inventory::snapshot::InventorySnapshotEvent;
-    use crate::inventory::{
-        BroadcastingInventory, InventoryDivergenceGate, InventoryProjection, InventoryView,
-    };
+    use crate::inventory::{BroadcastingInventory, InventoryDivergenceGate, InventoryView};
     use crate::test_utils::setup_test_db;
     use crate::usdc_rebalance::UsdcRebalanceId;
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
