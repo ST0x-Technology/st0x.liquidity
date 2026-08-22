@@ -16,8 +16,8 @@ use st0x_evm::ReadOnlyEvm;
 use st0x_execution::alpaca_broker_api::{AlpacaLimitOrder, AlpacaLimitPrice};
 use st0x_execution::{
     AlpacaBrokerApiError, CancellationOutcome, ClientOrderId, Direction, Executor, ExecutorOrderId,
-    FractionalShares, MarketOrder, MockExecutor, MockExecutorCtx, OrderFailureTerminality,
-    OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
+    FractionalShares, MarketOrder, MockExecutor, OrderFailureTerminality, OrderPlacement,
+    OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
 };
 use st0x_float_serde::format_float_with_fallback;
 
@@ -273,21 +273,15 @@ async fn get_broker_order_status<W: Write>(
     order_id: &str,
     _stdout: &mut W,
 ) -> anyhow::Result<OrderState> {
-    match &ctx.broker {
-        BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
-            let broker = alpaca_auth.clone().try_into_executor().await?;
-            let order_id = order_id.to_string();
-            Ok(retry_on_backpressure(
-                || broker.get_order_status(&order_id),
-                BACKPRESSURE_RETRY_MAX_ATTEMPTS,
-            )
-            .await?)
-        }
-        BrokerCtx::DryRun => anyhow::bail!(
-            "order status is unavailable in dry-run mode because dry-run does not persist broker \
-             order state"
-        ),
-    }
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
+    let broker = alpaca_auth.clone().try_into_executor().await?;
+    let order_id = order_id.to_string();
+
+    Ok(retry_on_backpressure(
+        || broker.get_order_status(&order_id),
+        BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+    )
+    .await?)
 }
 
 /// Cancels an open broker order by the id the broker assigned at placement
@@ -300,34 +294,27 @@ pub(super) async fn cancel_broker_order<W: Write>(
     order_id: Uuid,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    let outcome = match &ctx.broker {
-        BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
-            let broker = alpaca_auth.clone().try_into_executor().await?;
-            let broker_order_id = order_id.to_string();
-            let cancellation = retry_on_backpressure(
-                || broker.cancel_order(&broker_order_id),
-                BACKPRESSURE_RETRY_MAX_ATTEMPTS,
-            )
-            .await;
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
+    let broker = alpaca_auth.clone().try_into_executor().await?;
+    let broker_order_id = order_id.to_string();
+    let cancellation = retry_on_backpressure(
+        || broker.cancel_order(&broker_order_id),
+        BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+    )
+    .await;
 
-            match cancellation {
-                Ok(outcome) => outcome,
-                Err(AlpacaBrokerApiError::ApiError { status, .. })
-                    if status == StatusCode::UNPROCESSABLE_ENTITY =>
-                {
-                    writeln!(
-                        stdout,
-                        "Order {order_id} is no longer cancelable (already filled or cancelled)"
-                    )?;
-                    return Ok(());
-                }
-                Err(error) => return Err(error.into()),
-            }
+    let outcome = match cancellation {
+        Ok(outcome) => outcome,
+        Err(AlpacaBrokerApiError::ApiError { status, .. })
+            if status == StatusCode::UNPROCESSABLE_ENTITY =>
+        {
+            writeln!(
+                stdout,
+                "Order {order_id} is no longer cancelable (already filled or cancelled)"
+            )?;
+            return Ok(());
         }
-        BrokerCtx::DryRun => {
-            let broker = MockExecutorCtx.try_into_executor().await?;
-            broker.cancel_order(&order_id.to_string()).await?
-        }
+        Err(error) => return Err(error.into()),
     };
 
     match outcome {
@@ -431,9 +418,7 @@ async fn execute_alpaca_limit_order<W: Write>(
         }
     };
 
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!("--limit-price is only supported with alpaca-broker-api");
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     writeln!(stdout, "🔄 Executing Alpaca Broker API limit order...")?;
 
@@ -568,45 +553,25 @@ pub(super) async fn execute_broker_order<W: Write>(
     time_in_force: Option<TimeInForce>,
     stdout: &mut W,
 ) -> anyhow::Result<OrderPlacement<String>> {
-    match &ctx.broker {
-        BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
-            writeln!(stdout, "🔄 Executing Alpaca Broker API order...")?;
-            let mut auth = alpaca_auth.clone();
-            if let Some(tif) = time_in_force {
-                auth.time_in_force = tif;
-            }
-            let broker = auth.try_into_executor().await?;
-            let placement = retry_on_backpressure(
-                || broker.place_market_order(market_order.clone()),
-                BACKPRESSURE_RETRY_MAX_ATTEMPTS,
-            )
-            .await?;
-            writeln!(
-                stdout,
-                "✅ Alpaca Broker API order placed with ID: {}",
-                placement.order_id
-            )?;
-            Ok(placement)
-        }
-        BrokerCtx::DryRun => {
-            writeln!(stdout, "🔄 Executing dry-run order...")?;
-            if time_in_force.is_some() {
-                writeln!(
-                    stdout,
-                    "⚠️  --time-in-force is ignored for dry-run \
-                     (only supported by Alpaca Broker API)"
-                )?;
-            }
-            let broker = MockExecutorCtx.try_into_executor().await?;
-            let placement = broker.place_market_order(market_order).await?;
-            writeln!(
-                stdout,
-                "✅ Dry-run order placed with ID: {}",
-                placement.order_id
-            )?;
-            Ok(placement)
-        }
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
+
+    writeln!(stdout, "🔄 Executing Alpaca Broker API order...")?;
+    let mut auth = alpaca_auth.clone();
+    if let Some(tif) = time_in_force {
+        auth.time_in_force = tif;
     }
+    let broker = auth.try_into_executor().await?;
+    let placement = retry_on_backpressure(
+        || broker.place_market_order(market_order.clone()),
+        BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+    )
+    .await?;
+    writeln!(
+        stdout,
+        "✅ Alpaca Broker API order placed with ID: {}",
+        placement.order_id
+    )?;
+    Ok(placement)
 }
 
 /// Poll cadence for the dividend-bump buy-fill wait. Mirrors the tokenization
@@ -631,16 +596,10 @@ pub(super) async fn execute_market_buy_until_filled<W: Write>(
         client_order_id: ClientOrderId::cli(Uuid::new_v4()),
     };
 
-    match &ctx.broker {
-        BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
-            let broker = alpaca_auth.clone().try_into_executor().await?;
-            place_market_order_until_filled(&broker, market_order, stdout).await
-        }
-        BrokerCtx::DryRun => {
-            let broker = MockExecutorCtx.try_into_executor().await?;
-            place_market_order_until_filled(&broker, market_order, stdout).await
-        }
-    }
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
+    let broker = alpaca_auth.clone().try_into_executor().await?;
+
+    place_market_order_until_filled(&broker, market_order, stdout).await
 }
 
 async fn place_market_order_until_filled<Exec: Executor, W: Write>(
@@ -1206,6 +1165,7 @@ mod tests {
         AssetsConfig, BrokerCtx, EquitiesConfig, EquityAssetConfig, EvmCtx, ExecutionThreshold,
         IngestionCutoff, InventoryAdapters, InventoryMode, LogLevel, OperationMode,
     };
+    use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, CancellationOutcome,
         CounterTradePreflight, ExecutionError, InventoryResult, LimitOrder, Positive,
@@ -1224,8 +1184,8 @@ mod tests {
         InventoryVenue, OnChainTrade as OnChainTradeCqrs, OnChainTradeCommand, OnChainTradeSource,
     };
     use crate::test_utils::{
-        OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_order, positive_shares, setup_test_db,
-        setup_test_pools,
+        OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_order, mock_alpaca_broker_ctx,
+        positive_shares, setup_test_db, setup_test_pools,
     };
     use crate::trading::onchain::inclusion::EmittedOnChain;
     use crate::trading::onchain::trade_accountant::TradeAccountingError;
@@ -1441,7 +1401,7 @@ mod tests {
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,
             apalis_finished_job_cleanup_interval_secs: 3600,
-            broker: BrokerCtx::DryRun,
+            broker: st0x_config::test_alpaca_broker_ctx(),
             telemetry: None,
             alerts: None,
             pricing: None,
@@ -1478,19 +1438,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_status_is_unavailable_in_dry_run_mode() {
-        let ctx = create_base_test_ctx();
+    async fn order_status_command_reports_the_broker_status() {
+        let broker_mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![(
+                Symbol::new("AAPL").unwrap(),
+                Float::parse("150.00".to_string()).unwrap(),
+            )])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        let mut ctx = create_base_test_ctx();
+        ctx.broker = mock_alpaca_broker_ctx(broker_mock.base_url());
         let pool = setup_test_db().await;
-        let mut stdout = Vec::new();
 
-        let error = order_status_command(&mut stdout, "TEST_1", &ctx, &pool)
+        let market_order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: positive_shares("1"),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+        };
+        let placement = execute_broker_order(&ctx, &pool, market_order, None, &mut Vec::new())
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(
-            error.to_string(),
-            "order status is unavailable in dry-run mode because dry-run does not persist broker \
-             order state"
+        let mut stdout = Vec::new();
+        order_status_command(&mut stdout, &placement.order_id, &ctx, &pool)
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("Order Status:"),
+            "expected a broker status report, got: {output}"
         );
     }
 
@@ -1881,23 +1860,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_broker_order_dry_run_reports_requested() {
-        let mut ctx = create_base_test_ctx();
-        ctx.broker = BrokerCtx::DryRun;
-
-        let order_id = uuid!("61e7b016-9c91-4a97-b912-615c9d365c9d");
-        let mut stdout = Vec::new();
-        cancel_broker_order(&ctx, order_id, &mut stdout)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            String::from_utf8(stdout).unwrap(),
-            format!("Cancellation requested for order {order_id}\n")
-        );
-    }
-
-    #[tokio::test]
     async fn test_execute_order_failure_stdout_contains_error() {
         let server = MockServer::start();
         let ctx = create_alpaca_broker_api_test_ctx(&server);
@@ -1945,33 +1907,6 @@ mod tests {
         assert!(
             output.contains("❌ Failed to place order"),
             "Expected failure message, got: {output}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_time_in_force_warning_for_dry_run() {
-        let ctx = create_base_test_ctx();
-        let pool = setup_test_db().await;
-
-        let mut stdout_buffer = Vec::new();
-        execute_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("100"),
-            Direction::Buy,
-            Some(TimeInForce::Day),
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut stdout_buffer,
-        )
-        .await
-        .unwrap();
-
-        let output = String::from_utf8(stdout_buffer).unwrap();
-        assert!(
-            output.contains("--time-in-force is ignored"),
-            "Expected warning about ignored --time-in-force, got: {output}"
         );
     }
 
@@ -2037,32 +1972,6 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.to_string(), "--extended-hours requires --limit-price");
-    }
-
-    #[tokio::test]
-    async fn test_limit_order_rejected_for_dry_run() {
-        let ctx = create_base_test_ctx();
-        let pool = setup_test_db().await;
-
-        let mut stdout_buffer = Vec::new();
-        let error = execute_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("10"),
-            Direction::Buy,
-            None,
-            Some(positive_limit_price("195.25")),
-            false,
-            &ctx,
-            &pool,
-            &mut stdout_buffer,
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "--limit-price is only supported with alpaca-broker-api"
-        );
     }
 
     #[tokio::test]

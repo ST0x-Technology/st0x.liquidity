@@ -2049,6 +2049,7 @@ mod tests {
     use st0x_config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel};
     use st0x_config::{EvmCtx, IngestionCutoff, InventoryAdapters, InventoryMode};
     use st0x_event_sorcery::StoreBuilder;
+    use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
     use st0x_float_macro::float;
     use st0x_tokenization::IssuerRequestId;
     use st0x_tokenization::mock::MockTokenizer;
@@ -2093,7 +2094,7 @@ mod tests {
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,
             apalis_finished_job_cleanup_interval_secs: 3600,
-            broker: BrokerCtx::DryRun,
+            broker: st0x_config::test_alpaca_broker_ctx(),
             telemetry: None,
             alerts: None,
             pricing: None,
@@ -3813,8 +3814,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_command_with_writers_executes_dry_run_buy() {
-        let ctx = create_test_ctx();
+    async fn run_command_with_writers_executes_buy() {
+        let broker_mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        let mut ctx = create_test_ctx();
+        ctx.broker = crate::test_utils::mock_alpaca_broker_ctx(broker_mock.base_url());
         let pool = setup_test_db().await;
         let command = Commands::Buy {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -3830,6 +3837,10 @@ mod tests {
             .unwrap();
 
         let output = String::from_utf8(stdout_buffer).unwrap();
+        assert!(
+            output.contains("Alpaca Broker API order placed"),
+            "unexpected output: {output}"
+        );
         assert!(
             output.contains("Order placed successfully"),
             "unexpected output: {output}"
