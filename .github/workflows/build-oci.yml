@@ -99,12 +99,12 @@ jobs:
           gc-max-store-size-linux: 10G
 
       - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
         with:
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
           service_account: ${{ env.DEPLOYER_SA }}
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f  # v2
         with:
           # `container binauthz` lives in the beta component.
           install_components: beta
@@ -200,12 +200,12 @@ jobs:
       CONFIG_BUCKET: t0-liquidity-staging-config
     steps:
       - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
         with:
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
           service_account: ${{ env.DEPLOYER_SA }}
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f  # v2
 
       - name: Rewrite images.env with the digests just built
         id: roll
@@ -220,6 +220,12 @@ jobs:
               --format='value(image_summary.digest)'
           }
 
+          # Generation captured BEFORE the read so the precondition on the
+          # write spans the whole read-modify-write: a concurrent writer
+          # (a t0.devops apply) between our read and our cp fails the cp
+          # itself instead of being detected only by the read-back below.
+          GENERATION=$(gcloud storage objects describe \
+            "gs://${CONFIG_BUCKET}/images.env" --format='value(generation)')
           gcloud storage cat "gs://${CONFIG_BUCKET}/images.env" > current.env
           cp current.env next.env
 
@@ -248,13 +254,27 @@ jobs:
           echo "--- images.env ---"
           cat next.env
 
+          # Outputs are emitted on EVERY path, early-exit included: the
+          # adoption wait below runs regardless of who wrote the digests,
+          # so a re-run after a failed roll re-verifies instead of going
+          # green over a box still running the old images (review catch,
+          # #1284).
+          grep -q '^GATED_SERVICE_REPLICAS=0$' next.env \
+            && echo "gated=true" >> "$GITHUB_OUTPUT" \
+            || echo "gated=false" >> "$GITHUB_OUTPUT"
+          echo "bot=$(grep '^BOT_IMAGE=' next.env)" >> "$GITHUB_OUTPUT"
+
           if cmp -s current.env next.env; then
-            echo "::notice::staging already runs these digests — nothing to roll"
+            echo "::notice::images.env already carries these digests — verifying adoption only"
             echo "rolled=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          gcloud storage cp next.env "gs://${CONFIG_BUCKET}/images.env"
+          gcloud storage cp --if-generation-match="$GENERATION" \
+            next.env "gs://${CONFIG_BUCKET}/images.env" || {
+            echo "::error::images.env changed under us (a concurrent t0.devops apply?) — re-run this job"
+            exit 1
+          }
 
           # Read back: Terraform writes this object too (on a t0.devops merge),
           # and a plan taken before this push would apply older digests. Losing
@@ -267,25 +287,38 @@ jobs:
           }
 
           echo "rolled=true" >> "$GITHUB_OUTPUT"
-          grep -q '^GATED_SERVICE_REPLICAS=0$' next.env \
-            && echo "gated=true" >> "$GITHUB_OUTPUT" \
-            || echo "gated=false" >> "$GITHUB_OUTPUT"
-          echo "bot=$(grep '^BOT_IMAGE=' next.env)" >> "$GITHUB_OUTPUT"
 
       # The roll is only real once the box has taken it. The timer publishes
       # deployed.env after a SUCCESSFUL stack restart, so this turns a refused
       # attestation or a crash-looping image into a failed deploy here instead
       # of a green build over a box still running the old digests. Skipped when
       # the workload is gated off (nothing runs, so nothing is published).
+      # Gated on `gated` ALONE, not on `rolled`: after a failed roll the
+      # digests are already in images.env, so a re-run's write is a no-op —
+      # the verification must still happen or the re-run goes green over a
+      # box running the old images. A genuine no-op merge passes on the
+      # first poll, so this costs nothing (review catch, #1284).
       - name: Wait for the VM to adopt it
-        if: steps.roll.outputs.rolled == 'true' && steps.roll.outputs.gated == 'false'
+        if: steps.roll.outputs.gated == 'false'
         run: |
           set -euo pipefail
           want="${{ steps.roll.outputs.bot }}"
           for _ in $(seq 1 40); do
-            if gcloud storage cat "gs://${CONFIG_BUCKET}/deployed.env" 2>/dev/null | grep -qxF "$want"; then
-              echo "::notice::t0-liquidity-staging rolled to ${GITHUB_SHA}"
-              exit 0
+            # A permission failure must not look like "not adopted yet"
+            # (review catch: the deployer SA's grant is conditioned per
+            # object, and a missing deployed.env read grant would burn the
+            # full timeout pointing at the roll timer). Branch on the exit
+            # status: only a successful read may be inspected; a denied
+            # read fails loudly at the FIRST poll.
+            if out=$(gcloud storage cat "gs://${CONFIG_BUCKET}/deployed.env" 2>&1); then
+              if grep -qxF "$want" <<<"$out"; then
+                echo "::notice::t0-liquidity-staging rolled to ${GITHUB_SHA}"
+                exit 0
+              fi
+            elif grep -qiE "403|permission|denied" <<<"$out"; then
+              echo "::error::cannot READ deployed.env — the deployer SA lacks the read grant (t0.devops staging-liquidity):"
+              echo "$out"
+              exit 1
             fi
             sleep 15
           done
