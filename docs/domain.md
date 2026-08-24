@@ -150,13 +150,52 @@ spread between onchain and offchain prices.
 Direction logic: positive net position -> sell offchain; negative net position
 -> buy offchain.
 
+### Market Session
+
+The classification that drives execution decisions, derived from the broker
+calendar. `MarketSession` has four values:
+
+- **Regular** - 09:30-16:00 ET; counter-trades place market orders.
+- **Extended** - pre-market (04:00-09:30 ET) and after-hours (16:00-20:00 ET) on
+  the regular equity tape; counter-trades place limit orders with
+  `extended_hours = true`.
+- **Overnight** - 20:00-04:00 ET on the Blue Ocean ATS; counter-trades place
+  limit day orders priced from the indicative overnight feed, opt-in per asset.
+- **Closed** - no venue is open: weekends, full holidays until 20:00 ET that
+  evening (including the overnight window immediately before the holiday), and
+  the gap after an early close until 20:00 ET.
+
+The trading day starts at 20:00 ET: the overnight session is the first session
+of a trade date, so a Monday 21:00 ET fill has a Tuesday trade date.
+
+### Overnight Session
+
+The 20:00-04:00 ET trading window on the Blue Ocean alternative trading system
+(ATS), reached through the same Alpaca order endpoint as every other session.
+Runs Sunday evening through Friday morning. The evening leg (20:00-24:00 on day
+D) exists iff D+1 is a trading day; the morning leg (00:00-04:00 on day D)
+exists iff D is a trading day. Only limit orders flagged `extended_hours = true`
+are accepted, with `day` or `gtc` time-in-force; the bot uses `day` only.
+
+### Indicative Quote
+
+An overnight price estimate from Alpaca's derived Blue Ocean feed
+(`feed=overnight`), as opposed to firm tape quotes. Buys price from the ask,
+sells from the bid. Indicative means fills can deviate from the quote, so
+reference-to-fill slippage is measured per session. Overnight orders are priced
+only from this feed; a missing, stale, crossed, or non-positive indicative quote
+defers the hedge rather than falling back to regular-session data (the normative
+rule is SPEC.md's overnight pricing failure policy).
+
 ### Post-Close Gap
 
 The calendar-derived interval between the current extended-session close and the
 next trading session. `PostCloseGap` distinguishes an ordinary overnight (next
 session is the following calendar day), a multi-day closure (weekend or exchange
 holiday), and unknown next-session metadata. The distinction drives close
-flattening without hardcoding weekdays or holiday dates.
+flattening without hardcoding weekdays or holiday dates. An ordinary overnight
+gap leads into a valid overnight session; a multi-day closure means the
+overnight session does not run that evening.
 
 ### Position
 

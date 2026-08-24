@@ -450,6 +450,8 @@ The bot supports multiple brokers through a unified trait interface:
 - Manual CLI limit orders for operator intervention
 - Manual Alpaca limit orders use day time-in-force only and can optionally be
   marked as extended-hours eligible when the asset supports it
+- Overnight (24/5) session support: limit day orders priced from Alpaca's
+  indicative overnight feed, opt-in per asset
 - Order status polling and updates
 - Support for both paper trading and live trading environments
 - Position querying for inventory management
@@ -473,6 +475,12 @@ from the config are treated as disabled (fail-closed). The cancel-and-replace
 pass at the regular open honors the same per-asset setting: only orders for
 enabled assets are converged.
 
+The overnight session (20:00–04:00 ET) is separate from extended hours. It has
+its own per-asset opt-in, its own pricing feed, and its own eligibility rules,
+described in [Overnight hedging (24/5)](#overnight-hedging-245). Enabling or
+disabling overnight for an asset does not change that asset's pre-market or
+after-hours behavior.
+
 ##### Market session model
 
 Execution decisions are driven by a `MarketSession` classification derived from
@@ -490,9 +498,21 @@ the broker calendar:
   whenever the market moved past the buffer. Rounding favors fill probability
   (buys round up, sells round down) and honors the broker's minimum price
   variance (penny increments at or above $1.00, sub-penny below).
-- **Closed** — outside all sessions (overnight, weekends, holidays); no order is
-  placed. The exposure is left for the next scan to hedge once the venue
-  reopens, rather than failing a durable job against a multi-hour closure.
+- **Overnight** — 20:00–04:00 ET, traded on the Blue Ocean ATS through the same
+  Alpaca order endpoint. The broker accepts only limit orders flagged
+  `extended_hours = true`, with `day` or `gtc` time-in-force; the bot uses `day`
+  only. Counter-trades for overnight-enabled, overnight-eligible assets place
+  limit orders priced from Alpaca's indicative overnight quote feed — buys from
+  the ask, sells from the bid — crossed by the configured overnight protection
+  bound and rounded to the broker tick exactly like extended-hours orders.
+  Assets that are not opted in, not eligible, or not priceable defer to a later
+  scan; see [Overnight hedging (24/5)](#overnight-hedging-245).
+- **Closed** — outside all sessions: after Friday 20:00 ET until Sunday 20:00
+  ET, full market holidays until 20:00 ET that evening (including the overnight
+  window that immediately precedes the holiday), and the gap between an early
+  close's `session_close` and 20:00 ET. No order is placed. The exposure is left
+  for the next scan to hedge once the venue reopens, rather than failing a
+  durable job against a multi-hour closure.
 
 **External contract (Alpaca).** The session windows (pre-market 04:00–09:30 ET,
 after-hours 16:00–20:00 ET), the extended-hours order constraints (only `limit`
@@ -508,10 +528,180 @@ specified by Alpaca's order documentation:
 cross-checked against the documented 04:00/20:00 window (a mismatch is logged),
 since Alpaca's reference does not formally define those two fields.
 
+**External contract (Alpaca 24/5 overnight).** The overnight session runs
+20:00–04:00 ET on the Blue Ocean ATS, Sunday evening through Friday morning, per
+Alpaca's 24/5 documentation: <https://docs.alpaca.markets/us/docs/245-trading>.
+
+- **Trade date.** The trading day starts at 20:00 ET: the overnight session is
+  the first session of a trade date. A fill in the 20:00–24:00 leg gets the next
+  calendar day as its trade date; a fill in the 00:00–04:00 leg gets the current
+  calendar day.
+- **Calendar derivation.** Alpaca's `/v1/calendar` does not model the overnight
+  session, so the bot derives it: the evening leg (20:00–24:00 ET on day D)
+  exists iff D+1 is a trading day, and the morning leg (00:00–04:00 on day D)
+  exists iff D is a trading day. D itself does not need to be a trading day for
+  the evening leg — Sunday 20:00 and a holiday's own 20:00 start the next
+  trading day's overnight session whenever D+1 actually trades. The same
+  predicate closes the opposite cases: a Sunday before a Monday holiday has no
+  overnight session (Alpaca's info deck lists exactly those skipped Sundays),
+  and the overnight session immediately preceding any full market holiday does
+  not run. An early close never moves the overnight open: the early
+  `session_close` leaves a Closed gap until 20:00 ET, and the same D+1 predicate
+  then decides whether an overnight session opens at all. Most real half-days
+  (July 3, Christmas Eve, the Friday after Thanksgiving) precede a holiday or
+  weekend, so their evenings stay Closed; a half-day whose next calendar day
+  trades opens overnight at 20:00 as usual. Calendar-failure boundary: an empty
+  response, or one whose entries all fall past the queried window, is positive
+  evidence the queried days do not trade and classifies as Closed. A broken
+  response (an entry dated earlier than the query) or a failed calendar request
+  is an error — the caller logs it and defers the hedge to a later scan, so no
+  order is ever placed against unknown session bounds. The post-close-gap
+  lookahead is softer: its failure yields Unknown, which close flattening treats
+  conservatively (see Long-gap close flattening).
+- **Order contract.** Only limit orders are accepted; `time_in_force` must be
+  `day` or `gtc`, and every request must set `extended_hours = true`. The bot
+  restricts itself to `day`. An unfilled `day` order placed overnight stays live
+  through pre-market, regular hours, and after-hours, and Alpaca cancels it at
+  the next 20:00 ET. Quantities allow at most 9 decimal places and notional
+  amounts at most 2 decimal places. The bot submits quantity-sized orders only
+  (never notional-sized), and validates the 9-decimal quantity bound before the
+  HTTP call.
+- **Market data.** Overnight pricing uses Alpaca's indicative quote feed
+  (`feed=overnight`, real-time, derived from Blue Ocean data). The delayed
+  historical variant (`feed=boats`) is not used for pricing. The feed is a paid
+  subscription provisioned per correspondent; credentials without it receive 403
+  on the feed. Sandbox credentials authenticate against the sandbox market-data
+  host, production credentials against the production host. The feed is
+  indicative, not firm: fills can deviate from the quote, which is why
+  reference-to-fill slippage is measured per session.
+- **Asset eligibility.** The assets endpoint exposes `overnight_tradable` and
+  `overnight_halted`; the halt flag qualifies an otherwise overnight-tradable
+  asset. Wire shape (verified against a live sandbox): `fractionable` is a
+  top-level boolean, while `fractional_eh_enabled`, `overnight_tradable`, and
+  `overnight_halted` arrive as presence-strings in an `attributes` array —
+  absence from a present array means false, and an absent array means the
+  attribute state is unknown. Broker behavior: Alpaca accepts an order for a
+  halted or overnight-inactive asset and holds it pending (per its technical
+  sign-off sheet; the sandbox demonstration verifies this behavior). Bot
+  behavior is separate and fail-closed: an asset that is not overnight-tradable,
+  is halted, or has missing or stale eligibility data defers with no broker call
+  (see [Overnight hedging (24/5)](#overnight-hedging-245)). Alpaca's technical
+  sign-off sheet requires the partner to sync assets at least once per day
+  inside the 19:45–20:00 ET window (target 19:55). Fractional orders follow the
+  documented matrix: `fractionable = false` allows whole-share orders only;
+  `fractionable = true` with `fractional_eh_enabled = false` allows whole-share
+  orders only; both true allows fractional orders. A missing `fractionable`
+  field is treated exactly like the absent attributes array: the state is
+  unknown and fails closed — no fractional order is authorized (whole-share
+  handling is unaffected, since it never depends on `fractionable`). A
+  wrong-typed value invalidates the whole asset record: the response fails to
+  parse and the asset defers with no broker call.
+- **Sell-side guard.** Outside regular hours Alpaca rejects certain consecutive
+  sell sequences for the same security (net-short prevention; its documentation
+  describes the restriction for mixed notional/quantity fractional sequences,
+  while its order docs phrase it more broadly). The bot does not depend on the
+  exact broker rule: it submits quantity-sized sells only, and its own
+  cancel-settle-release lifecycle never holds two live sells for one position —
+  a replacement waits for the prior sell's terminal state. The waiting rule is a
+  bot-owned invariant, not reliance on broker enforcement; the sandbox and
+  staging runs observe which sequences the venue actually rejects.
+- **Queued orders.** An order submitted while every session is closed (a
+  weekend, a holiday closure, or the early-close gap) is queued by Alpaca for
+  the next session it is eligible for, not rejected; an order submitted during a
+  session it is eligible for executes rather than queues. The bot still never
+  submits during Closed by design; the session re-check below enforces it.
+
 The session is re-checked at execution time, immediately before placement, so a
-hedge job that was enqueued in one session but runs after a 9:30/16:00 boundary
-places the order type appropriate to the _current_ session, not the stale
-enqueue-time one.
+hedge job that was enqueued in one session but runs after a 9:30, 16:00, 20:00,
+or 04:00 boundary places the order type appropriate to the _current_ session,
+not the stale enqueue-time one.
+
+##### Overnight hedging (24/5)
+
+Overnight counter-trading is **opt-in per asset** via a required
+`overnight_counter_trading` field on each `[assets.equities.SYMBOL]` config
+block, independent from `extended_hours_counter_trading` (committed as
+`"disabled"`; absent assets are disabled, fail-closed). Overnight has a separate
+broker entitlement, a separate feed, and a separate risk profile, so it never
+piggybacks on the extended-hours flag. Disabling one asset — or all of them — is
+a config change only and does not disturb regular or extended-hours hedging. The
+protection bound for overnight limits is a separate `overnight_slippage_bps`,
+because the indicative feed's spreads are not comparable to tape-based
+extended-hours pricing. It follows the same configuration contract as
+`counter_trade_slippage_bps`: required whenever any asset enables overnight
+counter-trading, and startup validation rejects zero and out-of-range values
+(the accepted range matches `counter_trade_slippage_bps` — a 1–9,999 bps sanity
+bound, not a calibration to tape-session spreads, so it does not constrain
+legitimate overnight values; the type admits no negatives). The crossed
+reference is rounded to the broker tick by the same path as every other limit
+price — buys round up, sells round down — so the bound stays protective without
+going sub-tick aggressive.
+
+**Eligibility.** Before an overnight placement, the bot checks its synced asset
+attributes: the asset must be `overnight_tradable`, not `overnight_halted`, and
+fractional quantities require the fractional matrix to allow them. Configured
+assets are re-synced at startup and in the 19:45–20:00 ET window on every
+calendar day whose evening opens an overnight session — not only on trading days
+(a Sunday is not a trading day, yet its evening opens a session; the broker
+calendar decides, not a weekday list). Staleness is defined against the
+completion time of the last successful sync: attributes authorize placement only
+for the overnight session they were synced for, so a placement attempt defers
+unless the last successful sync completed at or after the start of the 19:45 ET
+window that precedes the session's 20:00 open (the startup sync satisfies this
+when the bot starts mid-session). A missing, stale, or failed sync fails closed:
+the asset defers with a concrete reason and no broker call, and a failed
+scheduled sync alerts rather than silently serving stale eligibility.
+
+**Pricing failure policy.** Overnight orders are priced only from the indicative
+overnight feed. A missing, stale, crossed, or non-positive overnight quote
+defers the hedge — the bot must never silently price an overnight order from a
+regular-session print, IEX, delayed SIP, or a position mark. Freshness is
+defined against the feed's own quote timestamp: the overnight path requires the
+timestamp on every quote (a quote without one is invalid), and age is that
+timestamp compared to the wall clock at evaluation time. The maximum acceptable
+age is an operational parameter with no implicit default —
+`overnight_max_quote_age_secs` is required whenever any asset enables overnight
+counter-trading — and every overnight placement path resolves quotes through the
+same resolver, so a single configured bound drives every defer decision. An
+entitlement failure (401/403) on the feed is classified distinctly from
+transient data failures and pages the operator. Deferred exposure stays visible
+through the standing scan-skip metrics and is retried on the next scan.
+
+**Session boundaries.** Open-order behavior at each boundary (the policies below
+are level-triggered by the position scan, like every other session transition):
+
+- **20:00 ET entering a valid overnight session** (any evening whose next
+  calendar day trades, per the broker calendar). Alpaca cancels unfilled `day`
+  orders from the previous cycle at 20:00, but the bot never assumes that
+  cancellation: a position stays claimed by its prior order until the status
+  poller observes a terminal broker state — a cancellation the venue is still
+  processing keeps the claim — and only the terminal-state release makes the
+  exposure eligible for a new placement. The scan then re-hedges released,
+  eligible exposure with overnight limit orders priced from the overnight feed.
+  This is the same cancel-settle-release invariant as every other boundary, so a
+  lagging broker cancellation delays the overnight hedge; it can never double
+  it.
+- **04:00 ET.** A still-live overnight-priced limit is stale by regime: the scan
+  cancels it through the existing two-phase cancel and reprices from the
+  extended-hours reference chain on a later scan. Cancel-before-replace
+  guarantees there are never two live orders for one position.
+- **09:30 ET.** Any surviving limit order — extended-hours or overnight —
+  converges to the regular-hours market-order behavior via the existing
+  cancel-and-replace pass at the regular open.
+- **Friday 20:00 ET and pre-holiday 20:00 ET.** The session classifies as Closed
+  (no overnight session before a long gap), so no overnight order is created;
+  the long-gap close flatten during the preceding extended session is unchanged.
+
+Unfilled overnight limits inside the session reuse the bounded cancel,
+reconcile, release, and reprice lifecycle with an overnight reprice cadence
+(`overnight_reprice_timeout_secs`). The cadence follows the same configuration
+contract as `extended_hours_reprice_timeout_secs`: required whenever any asset
+enables overnight counter-trading, with no implicit default, and startup rejects
+a missing, zero, or out-of-range value — an unconfigured cadence must fail the
+deploy, never leave stale overnight limits live. All cash, inventory,
+idempotency, and accounting guarantees of the offchain order lifecycle apply
+unchanged; a session re-check immediately before placement prevents a stale
+queued job from using the wrong order type or feed.
 
 ##### Long-gap close flattening
 
@@ -521,8 +711,10 @@ trading session is more than one calendar day away. The broker calendar, not a
 hardcoded weekday or holiday list, classifies the post-close gap as one of:
 
 - **Ordinary overnight** — the next trading session is on the following calendar
-  day. Close-flatten mode does not activate; ordinary weekday exposure handling
-  is unchanged in preparation for planned 24/5 trading.
+  day. Close-flatten mode does not activate: the gap leads into a valid
+  overnight session, where overnight-enabled assets hedge instead of waiting for
+  pre-market. Assets without overnight enabled keep the unchanged ordinary
+  weekday exposure handling (deferred to the next open session).
 - **Multi-day closure** — the next trading session is more than one calendar day
   away, including weekends and exchange holidays. Close-flatten mode activates.
 - **Unknown** — the current trading day is valid but the broker did not provide
@@ -533,10 +725,10 @@ hardcoded weekday or holiday list, classifies the post-close gap as one of:
 Close-flatten mode is one shared policy used by both position scanning and hedge
 placement:
 
-- On the first scan inside the window, any live extended-hours hedge placed
-  before the window is cancelled so an aggressive replacement can start
-  promptly. Partial fills are reconciled before cancellation; after the broker
-  confirms the cancellation, every remaining broker-executable amount is
+- On the first scan inside the window, any live extended-hours or overnight
+  hedge placed before the window is cancelled so an aggressive replacement can
+  start promptly. Partial fills are reconciled before cancellation; after the
+  broker confirms the cancellation, every remaining broker-executable amount is
   released back to the position for retry.
 - Every extended-hours hedge resolves its reference through one ordered chain:
   an optional current bid/ask market-data source, then the **position mark**,
@@ -680,19 +872,22 @@ and stable reason, and blocked attempts are logged at error level.
 
 ##### Cancel-and-replace at the regular open
 
-Extended-hours limit orders may not fill before regular hours begin. Every
-position scan during Regular hours requests cancellation of any still-live
-extended-hours limit order so it is replaced with a market order on a subsequent
-scan. The pass is level-triggered rather than keyed to the observed session
-transition -- orders already cancelling or terminal are skipped, making the
-sweep idempotent -- so an order that straddles the 9:30 boundary, survives a
-restart, or whose cancellation request transiently failed is still converged.
-Cancellation is two-phase: the order is reconciled against broker state _before_
-the cancel is issued (so a fill that landed between the last poll and the cancel
-is recorded, never dropped), then moves to a `Cancelling` state and becomes
-terminal only once the broker confirms. The owning position is finalized —
-applying any partial fill and releasing the pending reference so the symbol can
-resume hedging — once the cancellation confirms.
+Extended-hours and overnight limit orders may not fill before regular hours
+begin. Every position scan during Regular hours requests cancellation of any
+bot-owned still-live extended-hours or overnight limit order — only orders the
+bot placed and tracks through its order aggregate for the configured executor; a
+manual CLI order on the shared account is never touched — so it is replaced with
+a market order on a subsequent scan. The pass is level-triggered rather than
+keyed to the observed session transition -- orders already cancelling or
+terminal are skipped, making the sweep idempotent -- so an order that straddles
+the 9:30 boundary, survives a restart, or whose cancellation request transiently
+failed is still converged. Cancellation is two-phase: the order is reconciled
+against broker state _before_ the cancel is issued (so a fill that landed
+between the last poll and the cancel is recorded, never dropped), then moves to
+a `Cancelling` state and becomes terminal only once the broker confirms. The
+owning position is finalized — applying any partial fill and releasing the
+pending reference so the symbol can resume hedging — once the cancellation
+confirms.
 
 ##### Order lifecycle and integrity guarantees
 
