@@ -1,5 +1,6 @@
 //! Shared Alpaca market-data lookups used for hedge preflight checks.
 
+use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use reqwest::{RequestBuilder, StatusCode};
 use serde::Deserialize;
@@ -11,21 +12,38 @@ use crate::alpaca_broker_api::kms_jwt::KmsJwtError;
 
 use crate::rate_limit::retry_after_from_response_headers;
 use crate::{
-    Backpressure, LatestQuote, LatestQuoteError, Permanence, Positive, Symbol, Usd,
-    deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
+    Backpressure, IndicativeQuote, LatestQuote, LatestQuoteError, Permanence, Positive, Symbol,
+    Usd, deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
     status_permanence,
 };
 
-/// The only market-data feed this account can price a quote against.
-///
-/// `sip` is rejected outright without a real-time SIP entitlement, which Broker
-/// API partners must arrange separately. `iex` answers, but it is a single
-/// venue that stops quoting around 16:00 ET and publishes stub books afterwards
-/// -- exactly when extended-hours hedging needs it. `delayed_sip` returns a real
-/// consolidated NBBO fifteen minutes old, which is the best quote available
-/// here. Not configurable: there is one correct value, and offering the others
-/// only creates a way to misconfigure the bot into losing money (ADR 0019).
-const QUOTE_FEED: &str = "delayed_sip";
+/// The latest-quote feed to price against. Not configurable: each session has
+/// exactly one correct feed, and offering the others only creates a way to
+/// misconfigure the bot into losing money (ADR 0019).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteFeed {
+    /// The only feed this account can price a regular/extended-hours quote
+    /// against. `sip` is rejected outright without a real-time SIP
+    /// entitlement, which Broker API partners must arrange separately. `iex`
+    /// answers, but it is a single venue that stops quoting around 16:00 ET
+    /// and publishes stub books afterwards -- exactly when extended-hours
+    /// hedging needs it. `delayed_sip` returns a real consolidated NBBO
+    /// fifteen minutes old, which is the best quote available here.
+    DelayedSip,
+    /// The real-time indicative overnight feed (derived from Blue Ocean
+    /// data), the only feed that quotes the 20:00-04:00 ET session. The
+    /// delayed variant (`boats`) is never priced from.
+    Overnight,
+}
+
+impl QuoteFeed {
+    const fn as_query_value(self) -> &'static str {
+        match self {
+            Self::DelayedSip => "delayed_sip",
+            Self::Overnight => "overnight",
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AlpacaMarketDataError {
@@ -39,6 +57,13 @@ pub enum AlpacaMarketDataError {
         body: String,
         retry_after: Option<Duration>,
     },
+    #[error(
+        "market-data entitlement failure (status {status}): {body}; the credentials lack the \
+         feed entitlement, which no immediate retry can fix"
+    )]
+    Entitlement { status: StatusCode, body: String },
+    #[error("latest quote response for {symbol} did not include a timestamp")]
+    MissingQuoteTimestamp { symbol: Symbol },
     #[error("failed to parse latest trade response: {0}")]
     JsonParse(#[from] serde_json::Error),
     #[error("failed to parse latest quote response: {0}")]
@@ -101,11 +126,13 @@ impl AlpacaMarketDataError {
             | Self::JsonParse(_)
             | Self::LatestQuoteJsonParse(_)
             | Self::LatestQuoteSymbolMismatch { .. }
+            | Self::Entitlement { .. }
             | Self::MissingPrice { .. }
             | Self::NonPositivePrice { .. }
             | Self::MissingQuote { .. }
             | Self::MissingBid { .. }
             | Self::MissingAsk { .. }
+            | Self::MissingQuoteTimestamp { .. }
             | Self::NonPositiveBid { .. }
             | Self::NonPositiveAsk { .. }
             | Self::InvalidQuote { .. } => None,
@@ -125,9 +152,11 @@ impl AlpacaMarketDataError {
 
             // A malformed response is deterministic for the response that
             // arrived and does not become usable by immediately parsing it
-            // again.
+            // again. A missing entitlement is a provisioning fact about the
+            // credentials, not a transient data condition.
             Self::JsonParse(_)
             | Self::LatestQuoteJsonParse(_)
+            | Self::Entitlement { .. }
             | Self::MissingPrice { .. }
             | Self::NonPositivePrice { .. } => Permanence::Permanent,
 
@@ -140,6 +169,7 @@ impl AlpacaMarketDataError {
             | Self::MissingQuote { .. }
             | Self::MissingBid { .. }
             | Self::MissingAsk { .. }
+            | Self::MissingQuoteTimestamp { .. }
             | Self::NonPositiveBid { .. }
             | Self::NonPositiveAsk { .. }
             | Self::InvalidQuote { .. } => Permanence::Transient,
@@ -171,10 +201,14 @@ struct LatestQuoteEnvelope {
 /// (https://docs.alpaca.markets/reference/stocklatestquotesingle):
 /// `GET /v2/stocks/{symbol}/quotes/latest` returns
 /// `{"symbol": ..., "quote": {"t", "ax", "ap", "as", "bx", "bp", "bs", "c", "z"}}`.
-/// `bp`/`ap` are the best bid/ask price in dollars -- the only fields this
-/// type consumes. The sibling fields (exchange codes, sizes, timestamp,
-/// condition flags, tape) are covered by `fetch_latest_quote_deserializes_full_alpaca_response`
-/// below and ignored here via serde's default unknown-field behavior.
+/// `bp`/`ap` are the best bid/ask price in dollars and `t` is the quote
+/// timestamp -- the only fields this type consumes. The timestamp is required
+/// on the overnight path (an indicative quote is priced only when its age is
+/// known) and ignored on the delayed-SIP path, whose staleness is a fixed
+/// property of the feed. The sibling fields (exchange codes, sizes, condition
+/// flags, tape) are covered by
+/// `fetch_latest_quote_deserializes_full_alpaca_response` below and ignored
+/// here via serde's default unknown-field behavior.
 #[derive(Debug, Deserialize)]
 struct LatestQuotePayload {
     #[serde(
@@ -189,6 +223,8 @@ struct LatestQuotePayload {
         deserialize_with = "deserialize_option_float_from_number_or_string"
     )]
     ask: Option<Float>,
+    #[serde(rename = "t", default)]
+    at: Option<DateTime<Utc>>,
 }
 
 /// Sends a market-data request and returns the raw response body, handling
@@ -212,6 +248,13 @@ async fn get_market_data_bytes(request: RequestBuilder) -> Result<Vec<u8>, Alpac
         body = %String::from_utf8_lossy(&bytes),
         "Alpaca market data response body received"
     );
+
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return Err(AlpacaMarketDataError::Entitlement {
+            status,
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+        });
+    }
 
     if !status.is_success() {
         return Err(AlpacaMarketDataError::ApiError {
@@ -251,14 +294,45 @@ pub(crate) async fn fetch_latest_trade_price(
         })
 }
 
+/// Fetches the latest delayed-SIP quote for a symbol (see
+/// [`QuoteFeed::DelayedSip`] for why that is the only regular/extended-hours
+/// feed). The quote timestamp is dropped: this feed's staleness is a fixed
+/// fifteen minutes by construction, not a per-quote property worth checking.
 pub(crate) async fn fetch_latest_quote(
     client: &AlpacaBrokerApiClient,
     symbol: &Symbol,
 ) -> Result<LatestQuote, AlpacaMarketDataError> {
+    let (quote, _) = fetch_quote_and_timestamp(client, symbol, QuoteFeed::DelayedSip).await?;
+    Ok(quote)
+}
+
+/// Fetches the latest indicative overnight quote for a symbol.
+///
+/// Unlike the delayed-SIP path, the quote timestamp is mandatory: the
+/// indicative feed is the only pricing source overnight, and a quote of
+/// unknown age must never be priced from (SPEC "Overnight hedging (24/5)").
+pub(crate) async fn fetch_latest_overnight_quote(
+    client: &AlpacaBrokerApiClient,
+    symbol: &Symbol,
+) -> Result<IndicativeQuote, AlpacaMarketDataError> {
+    let (quote, at) = fetch_quote_and_timestamp(client, symbol, QuoteFeed::Overnight).await?;
+
+    let at = at.ok_or_else(|| AlpacaMarketDataError::MissingQuoteTimestamp {
+        symbol: symbol.clone(),
+    })?;
+
+    Ok(IndicativeQuote { quote, at })
+}
+
+async fn fetch_quote_and_timestamp(
+    client: &AlpacaBrokerApiClient,
+    symbol: &Symbol,
+    feed: QuoteFeed,
+) -> Result<(LatestQuote, Option<DateTime<Utc>>), AlpacaMarketDataError> {
     let request = client
         .market_data_get(&format!("/v2/stocks/{symbol}/quotes/latest"))
         .await?;
-    let bytes = get_market_data_bytes(request.query(&[("feed", QUOTE_FEED)])).await?;
+    let bytes = get_market_data_bytes(request.query(&[("feed", feed.as_query_value())])).await?;
 
     let response: LatestQuoteEnvelope =
         serde_json::from_slice(&bytes).map_err(AlpacaMarketDataError::LatestQuoteJsonParse)?;
@@ -290,10 +364,13 @@ pub(crate) async fn fetch_latest_quote(
             ask: error.value,
         })?;
 
-    LatestQuote::new(bid, ask).map_err(|source| AlpacaMarketDataError::InvalidQuote {
-        symbol: symbol.clone(),
-        source,
-    })
+    let validated =
+        LatestQuote::new(bid, ask).map_err(|source| AlpacaMarketDataError::InvalidQuote {
+            symbol: symbol.clone(),
+            source,
+        })?;
+
+    Ok((validated, quote.at))
 }
 
 #[cfg(test)]
@@ -626,13 +703,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_latest_quote_returns_api_error_on_non_success_status() {
-        // Mirrors `fetch_latest_trade_price_logs_error_response_body`'s status
-        // check, but for `fetch_latest_quote`'s own (separately implemented)
-        // non-success branch -- e.g. Alpaca returning 403 for a missing SIP
-        // subscription, which SPEC.md calls out as a case the close-flatten
-        // window must treat as retryable rather than falling back to a worse
-        // price.
+    async fn fetch_latest_quote_classifies_403_as_entitlement() {
+        // A 403 on a market-data endpoint means the credentials lack the feed
+        // entitlement -- a provisioning fact, distinct from transient data
+        // failures, so it gets its own permanent variant instead of the
+        // generic ApiError.
         let server = MockServer::start();
         let client = mock_client(&server);
         let symbol = Symbol::new("AAPL").unwrap();
@@ -649,9 +724,129 @@ mod tests {
         let error = fetch_latest_quote(&client, &symbol).await.unwrap_err();
 
         assert!(matches!(
-            error,
-            AlpacaMarketDataError::ApiError { status, .. }
-                if status == StatusCode::FORBIDDEN
+            &error,
+            AlpacaMarketDataError::Entitlement { status, .. }
+                if *status == StatusCode::FORBIDDEN
+        ));
+        assert_eq!(error.permanence(), Permanence::Permanent);
+        assert_eq!(error.backpressure(), None);
+    }
+
+    async fn overnight_quote_result(
+        quote: serde_json::Value,
+    ) -> Result<IndicativeQuote, AlpacaMarketDataError> {
+        let server = MockServer::start();
+        let client = mock_client(&server);
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/stocks/AAPL/quotes/latest")
+                .query_param("feed", "overnight");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({ "symbol": "AAPL", "quote": quote }));
+        });
+
+        fetch_latest_overnight_quote(&client, &symbol).await
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_overnight_quote_returns_quote_and_timestamp() {
+        let indicative = overnight_quote_result(json!({
+            "t": "2026-08-24T01:30:00.123456Z",
+            "bp": "24.10",
+            "ap": "24.30"
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            indicative.quote.bid().inner(),
+            Usd::new(Float::parse("24.10".to_string()).unwrap())
+        );
+        assert_eq!(
+            indicative.quote.ask().inner(),
+            Usd::new(Float::parse("24.30".to_string()).unwrap())
+        );
+        assert_eq!(
+            indicative.at,
+            "2026-08-24T01:30:00.123456Z"
+                .parse::<DateTime<Utc>>()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_overnight_quote_rejects_missing_timestamp() {
+        // The indicative feed is the only overnight pricing source; a quote
+        // of unknown age must never be priced from, so a payload without `t`
+        // is an error on this path (the delayed-SIP path ignores `t`).
+        let error = overnight_quote_result(json!({ "bp": "24.10", "ap": "24.30" }))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            AlpacaMarketDataError::MissingQuoteTimestamp { symbol }
+                if *symbol == Symbol::new("AAPL").unwrap()
+        ));
+        assert_eq!(error.permanence(), Permanence::Transient);
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_overnight_quote_classifies_401_as_entitlement() {
+        let server = MockServer::start();
+        let client = mock_client(&server);
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/stocks/AAPL/quotes/latest")
+                .query_param("feed", "overnight");
+            then.status(401)
+                .header("content-type", "application/json")
+                .json_body(json!({ "message": "unauthorized" }));
+        });
+
+        let error = fetch_latest_overnight_quote(&client, &symbol)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            AlpacaMarketDataError::Entitlement { status, .. }
+                if *status == StatusCode::UNAUTHORIZED
+        ));
+        assert_eq!(error.permanence(), Permanence::Permanent);
+        assert_eq!(error.backpressure(), None);
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_overnight_quote_validates_like_the_delayed_path() {
+        // The overnight path shares the delayed-SIP validation chain: missing
+        // sides, non-positive sides, and crossed books classify identically.
+        let missing_bid = overnight_quote_result(json!({
+            "t": "2026-08-24T01:30:00Z", "ap": "24.30"
+        }))
+        .await
+        .unwrap_err();
+        let crossed = overnight_quote_result(json!({
+            "t": "2026-08-24T01:30:00Z", "bp": "24.40", "ap": "24.30"
+        }))
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            missing_bid,
+            AlpacaMarketDataError::MissingBid { .. }
+        ));
+        assert!(matches!(
+            crossed,
+            AlpacaMarketDataError::InvalidQuote {
+                source: LatestQuoteError::Crossed { .. },
+                ..
+            }
         ));
     }
 

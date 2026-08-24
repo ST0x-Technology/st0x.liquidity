@@ -14,17 +14,43 @@ use super::order::{AlpacaLimitOrder, ConversionOrder, CryptoOrderResponse};
 use super::{AlpacaBrokerApiError, AssetStatus, MissingOrderField, TimeInForce};
 use crate::{
     CancellationOutcome, ClientOrderId, CounterTradePreflight, Direction, Executor,
-    ExecutorOrderId, FractionalShares, InventoryResult, LatestQuote, LimitOrder, MarketOrder,
-    MarketSession, MarketSessionStatus, OrderPlacement, OrderState, OrderStatus, Positive,
-    SupportedExecutor, Symbol, TryIntoExecutor, Usd, buying_power_counter_trade_preflight,
-    estimate_buffered_cost_cents,
+    ExecutorOrderId, FractionalShares, IndicativeQuote, InventoryResult, LatestQuote, LimitOrder,
+    MarketOrder, MarketSession, MarketSessionStatus, OrderPlacement, OrderState, OrderStatus,
+    Positive, SupportedExecutor, Symbol, TryIntoExecutor, Usd,
+    buying_power_counter_trade_preflight, estimate_buffered_cost_cents,
 };
 
-/// Response from the asset endpoint
+/// Response from the asset endpoint.
+///
+/// Real payload shape (verified against a live sandbox on 2026-08-25):
+/// `fractionable` is a top-level bool, while the fractional-extended-hours
+/// and overnight eligibility markers arrive as presence-strings inside an
+/// `attributes` array, e.g.
+/// `"attributes": ["fractional_eh_enabled", "has_options",
+/// "overnight_tradable"]`. Both `fractionable` and `attributes` are `Option`
+/// because their presence is entitlement- and API-version-dependent; an
+/// inspecting consumer reports an absent field as absent, and any
+/// eligibility decision must treat `None` as ineligible (fail closed).
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct AssetResponse {
     pub status: AssetStatus,
     pub tradable: bool,
+    #[serde(default)]
+    pub fractionable: Option<bool>,
+    #[serde(default)]
+    pub attributes: Option<Vec<String>>,
+}
+
+impl AssetResponse {
+    /// Whether the named attribute is present in the `attributes` array:
+    /// `Some(contains)` when the array was sent, `None` when the payload
+    /// omitted the array entirely (indistinguishable from "unsupported", so
+    /// consumers fail closed on it).
+    fn attribute(&self, name: &str) -> Option<bool> {
+        self.attributes
+            .as_ref()
+            .map(|attributes| attributes.iter().any(|attribute| attribute == name))
+    }
 }
 
 /// Cached asset information with expiration tracking
@@ -32,6 +58,10 @@ pub(super) struct AssetResponse {
 struct CachedAsset {
     status: AssetStatus,
     tradable: bool,
+    fractionable: Option<bool>,
+    fractional_eh_enabled: Option<bool>,
+    overnight_tradable: Option<bool>,
+    overnight_halted: Option<bool>,
     cached_at: Instant,
 }
 
@@ -40,6 +70,10 @@ impl CachedAsset {
         Self {
             status: response.status,
             tradable: response.tradable,
+            fractionable: response.fractionable,
+            fractional_eh_enabled: response.attribute("fractional_eh_enabled"),
+            overnight_tradable: response.attribute("overnight_tradable"),
+            overnight_halted: response.attribute("overnight_halted"),
             cached_at: Instant::now(),
         }
     }
@@ -47,6 +81,21 @@ impl CachedAsset {
     fn is_expired(&self, ttl: Duration) -> bool {
         self.cached_at.elapsed() > ttl
     }
+}
+
+/// A symbol's full Alpaca asset attribute set, for inspection consumers such
+/// as the CLI `asset` command.
+///
+/// An `Option` field is `None` when the broker's asset payload omitted it;
+/// eligibility decisions treat that as ineligible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssetDetails {
+    pub status: AssetStatus,
+    pub tradable: bool,
+    pub fractionable: Option<bool>,
+    pub fractional_eh_enabled: Option<bool>,
+    pub overnight_tradable: Option<bool>,
+    pub overnight_halted: Option<bool>,
 }
 
 /// Alpaca Broker API executor implementation
@@ -469,6 +518,43 @@ impl AlpacaBrokerApi {
         super::order::place_limit_order(&self.client, order).await
     }
 
+    /// Returns the symbol's full asset attribute set for inspection.
+    ///
+    /// Served through the same TTL cache as placement-side asset validation,
+    /// so an inspecting consumer sees exactly the attributes a placement
+    /// decision would use.
+    pub async fn get_asset_details(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<AssetDetails, AlpacaBrokerApiError> {
+        let asset = self.get_asset_cached(symbol).await?;
+
+        Ok(AssetDetails {
+            status: asset.status,
+            tradable: asset.tradable,
+            fractionable: asset.fractionable,
+            fractional_eh_enabled: asset.fractional_eh_enabled,
+            overnight_tradable: asset.overnight_tradable,
+            overnight_halted: asset.overnight_halted,
+        })
+    }
+
+    /// Fetches the latest indicative overnight quote (`feed=overnight`) with
+    /// its broker timestamp.
+    ///
+    /// Inherent rather than on the `Executor` trait: the automated overnight
+    /// pricing path is not built yet, and today's only consumer is the CLI's
+    /// overnight inspection surface, which addresses the Alpaca
+    /// implementation directly.
+    pub async fn fetch_latest_overnight_quote(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<IndicativeQuote, AlpacaBrokerApiError> {
+        crate::alpaca_market_data::fetch_latest_overnight_quote(&self.client, symbol)
+            .await
+            .map_err(|source| AlpacaBrokerApiError::LatestQuote(Box::new(source)))
+    }
+
     async fn get_asset_cached(&self, symbol: &Symbol) -> Result<CachedAsset, AlpacaBrokerApiError> {
         let symbol_str = symbol.to_string();
 
@@ -596,7 +682,10 @@ mod tests {
 
     #[test]
     fn test_asset_response_deserialize() {
-        // API returns more fields than we need - serde ignores the extras
+        // API returns more fields than we need - serde ignores the extras.
+        // The overnight/fractional attributes are absent here, as on a
+        // payload without the entitlement: they deserialize as None rather
+        // than failing.
         let json = json!({
             "id": "904837e3-3b76-47ec-b432-046db621571b",
             "symbol": "AAPL",
@@ -607,6 +696,89 @@ mod tests {
         let response: AssetResponse = serde_json::from_value(json).unwrap();
         assert_eq!(response.status, AssetStatus::Active);
         assert!(response.tradable);
+        assert_eq!(response.fractionable, None);
+        assert_eq!(response.attribute("fractional_eh_enabled"), None);
+        assert_eq!(response.attribute("overnight_tradable"), None);
+        assert_eq!(response.attribute("overnight_halted"), None);
+    }
+
+    #[test]
+    fn wrong_typed_asset_attributes_invalidate_the_whole_record() {
+        // The third attribute-handling clause of the spec: a wrong-typed
+        // value fails the whole asset parse (fail closed), never a
+        // silent downgrade to a default. Pinned so a future
+        // `deserialize_with` softening turns a red test instead of a
+        // fail-open eligibility gate.
+        let wrong_typed_fractionable = json!({
+            "id": "904837e3-3b76-47ec-b432-046db621571b",
+            "symbol": "AAPL",
+            "status": "active",
+            "tradable": true,
+            "fractionable": "yes"
+        });
+        let error = serde_json::from_value::<AssetResponse>(wrong_typed_fractionable).unwrap_err();
+        assert_eq!(error.classify(), serde_json::error::Category::Data);
+
+        let non_array_attributes = json!({
+            "id": "904837e3-3b76-47ec-b432-046db621571b",
+            "symbol": "AAPL",
+            "status": "active",
+            "tradable": true,
+            "fractionable": true,
+            "attributes": "overnight_tradable"
+        });
+        let error = serde_json::from_value::<AssetResponse>(non_array_attributes).unwrap_err();
+        assert_eq!(error.classify(), serde_json::error::Category::Data);
+    }
+
+    #[test]
+    fn test_asset_response_deserializes_real_sandbox_payload() {
+        // Pins the parser against the REAL asset payload shape captured from
+        // a live sandbox on 2026-08-25: `fractionable` is a top-level bool,
+        // while the fractional-EH and overnight markers are presence-strings
+        // in the `attributes` array.
+        let json = json!({
+            "id": "91cee411-1675-48eb-a902-45c8c152f2a1",
+            "class": "us_equity",
+            "exchange": "NASDAQ",
+            "symbol": "RKLB",
+            "name": "Rocket Lab Corporation Common Stock",
+            "status": "active",
+            "tradable": true,
+            "marginable": true,
+            "maintenance_margin_requirement": 30,
+            "margin_requirement_long": "30",
+            "margin_requirement_short": "30",
+            "shortable": true,
+            "easy_to_borrow": true,
+            "borrow_status": "easy_to_borrow",
+            "fractionable": true,
+            "attributes": ["fractional_eh_enabled", "has_options", "overnight_tradable"]
+        });
+
+        let response: AssetResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(response.fractionable, Some(true));
+        assert_eq!(response.attribute("fractional_eh_enabled"), Some(true));
+        assert_eq!(response.attribute("overnight_tradable"), Some(true));
+        assert_eq!(
+            response.attribute("overnight_halted"),
+            Some(false),
+            "an attribute missing from a present array is a definite false, not absent"
+        );
+    }
+
+    /// An active, tradable cache entry with the given age anchor and no
+    /// overnight/fractional attributes.
+    fn active_cached_asset(cached_at: Instant) -> CachedAsset {
+        CachedAsset {
+            status: AssetStatus::Active,
+            tradable: true,
+            fractionable: None,
+            fractional_eh_enabled: None,
+            overnight_tradable: None,
+            overnight_halted: None,
+            cached_at,
+        }
     }
 
     #[test]
@@ -614,23 +786,25 @@ mod tests {
         let response = AssetResponse {
             status: AssetStatus::Active,
             tradable: true,
+            fractionable: Some(true),
+            attributes: Some(vec!["overnight_tradable".to_string()]),
         };
 
         let cached = CachedAsset::from_response(&response);
 
         assert_eq!(cached.status, AssetStatus::Active);
         assert!(cached.tradable);
+        assert_eq!(cached.fractionable, Some(true));
+        assert_eq!(cached.fractional_eh_enabled, Some(false));
+        assert_eq!(cached.overnight_tradable, Some(true));
+        assert_eq!(cached.overnight_halted, Some(false));
         // cached_at should be very recent (within last second)
         assert!(cached.cached_at.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
     fn test_cached_asset_is_expired_returns_false_when_fresh() {
-        let cached = CachedAsset {
-            status: AssetStatus::Active,
-            tradable: true,
-            cached_at: Instant::now(),
-        };
+        let cached = active_cached_asset(Instant::now());
 
         assert!(
             !cached.is_expired(Duration::from_secs(3600)),
@@ -640,13 +814,11 @@ mod tests {
 
     #[test]
     fn test_cached_asset_is_expired_returns_true_when_expired() {
-        let cached = CachedAsset {
-            status: AssetStatus::Active,
-            tradable: true,
-            cached_at: Instant::now()
+        let cached = active_cached_asset(
+            Instant::now()
                 .checked_sub(Duration::from_secs(100))
                 .unwrap(),
-        };
+        );
 
         assert!(
             cached.is_expired(Duration::from_secs(60)),
@@ -658,11 +830,7 @@ mod tests {
     fn test_cached_asset_is_expired_boundary_not_expired() {
         // Entry at exactly TTL should not be expired (uses > not >=)
         let ttl = Duration::from_millis(50);
-        let cached = CachedAsset {
-            status: AssetStatus::Active,
-            tradable: true,
-            cached_at: Instant::now(),
-        };
+        let cached = active_cached_asset(Instant::now());
 
         // Should not be expired immediately
         assert!(!cached.is_expired(ttl));
@@ -671,11 +839,7 @@ mod tests {
     #[test]
     fn test_cached_asset_is_expired_boundary_expired() {
         let ttl = Duration::from_millis(10);
-        let cached = CachedAsset {
-            status: AssetStatus::Active,
-            tradable: true,
-            cached_at: Instant::now(),
-        };
+        let cached = active_cached_asset(Instant::now());
 
         // Wait past TTL
         thread::sleep(Duration::from_millis(20));
@@ -688,11 +852,7 @@ mod tests {
 
     #[test]
     fn test_cached_asset_is_expired_zero_ttl() {
-        let cached = CachedAsset {
-            status: AssetStatus::Active,
-            tradable: true,
-            cached_at: Instant::now(),
-        };
+        let cached = active_cached_asset(Instant::now());
 
         // Zero TTL means always expired after any time passes
         thread::sleep(Duration::from_millis(1));
@@ -926,8 +1086,8 @@ mod tests {
         let AlpacaBrokerApiError::LatestQuote(source) = &error else {
             panic!("expected LatestQuote, got {error:?}");
         };
-        let AlpacaMarketDataError::ApiError { status, .. } = source.as_ref() else {
-            panic!("expected LatestQuote(ApiError), got {source:?}");
+        let AlpacaMarketDataError::Entitlement { status, .. } = source.as_ref() else {
+            panic!("expected LatestQuote(Entitlement), got {source:?}");
         };
         assert_eq!(*status, reqwest::StatusCode::FORBIDDEN);
     }
@@ -1342,6 +1502,135 @@ mod tests {
                 AlpacaBrokerApiError::AssetNotTradable { symbol } if *symbol == Symbol::new("AAPL").unwrap()
             ),
             "Expected AssetNotTradable error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_asset_details_exposes_overnight_attributes() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/assets/AAPL");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "AAPL",
+                    "status": "active",
+                    "tradable": true,
+                    "fractionable": true,
+                    "attributes": ["fractional_eh_enabled", "overnight_tradable"]
+                }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let details = executor
+            .get_asset_details(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            details,
+            AssetDetails {
+                status: AssetStatus::Active,
+                tradable: true,
+                fractionable: Some(true),
+                fractional_eh_enabled: Some(true),
+                overnight_tradable: Some(true),
+                overnight_halted: Some(false),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn get_asset_details_reports_absent_attributes_as_none() {
+        // A payload without the overnight/fractional attributes (entitlement
+        // or API-version dependent) must inspect as absent, not fail.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/assets/AAPL");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "AAPL",
+                    "status": "active",
+                    "tradable": true
+                }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let details = executor
+            .get_asset_details(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            details,
+            AssetDetails {
+                status: AssetStatus::Active,
+                tradable: true,
+                fractionable: None,
+                fractional_eh_enabled: None,
+                overnight_tradable: None,
+                overnight_halted: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_overnight_quote_wires_through_market_data_url() {
+        // Pins the executor-level wiring: the inherent method reaches the
+        // market-data base URL (the mock server in Mock mode) with
+        // feed=overnight and returns the validated quote plus timestamp.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let quote_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/stocks/AAPL/quotes/latest")
+                .query_param("feed", "overnight");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "symbol": "AAPL",
+                    "quote": {
+                        "t": "2026-08-24T01:30:00.123456Z",
+                        "bp": "24.10",
+                        "ap": "24.30"
+                    }
+                }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let indicative = executor
+            .fetch_latest_overnight_quote(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap();
+
+        quote_mock.assert();
+        assert_eq!(
+            indicative.quote.bid().inner(),
+            Usd::new(Float::parse("24.10".to_string()).unwrap())
+        );
+        assert_eq!(
+            indicative.quote.ask().inner(),
+            Usd::new(Float::parse("24.30".to_string()).unwrap())
+        );
+        assert_eq!(
+            indicative.at,
+            "2026-08-24T01:30:00.123456Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap()
         );
     }
 

@@ -63,11 +63,13 @@ pub use auth::{
 // Exposed as the single source of truth for the broker HTTP request timeout so
 // timing-sensitive integration tests derive their boundaries from it.
 pub use client::HTTP_REQUEST_TIMEOUT;
+
 // Crate-visible so the market-data module can build authenticated
 // requests through the client instead of reaching for raw reqwest.
 pub(crate) use client::AlpacaBrokerApiClient;
-// The only kms_jwt items that cross the module (and crate) boundary.
-pub use executor::AlpacaBrokerApi;
+
+// `AssetDetails` is the CLI's overnight/fractional asset-inspection surface.
+pub use executor::{AlpacaBrokerApi, AssetDetails};
 pub use journal::{JournalResponse, JournalStatus};
 pub use kms_jwt::{AuthRuntime, KmsJwtError};
 pub use order::{
