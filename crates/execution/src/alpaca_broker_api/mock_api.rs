@@ -257,6 +257,17 @@ struct MockState {
     /// (ids are monotonic and double as pagination cursors). Fills append
     /// FEE rows; [`AlpacaBrokerMock::push_activity`] seeds arbitrary rows.
     activities: Vec<MockActivity>,
+    /// Per-symbol `feed=overnight` latest-quote fixtures, served verbatim as
+    /// the `quote` object. Symbols without an entry answer with a quote-less
+    /// envelope (the real feed's shape for a symbol it has no data for).
+    overnight_quotes: HashMap<Symbol, Value>,
+    /// When true, every `feed=overnight` quote request is answered 403 --
+    /// models credentials without the overnight feed entitlement.
+    overnight_feed_forbidden: bool,
+    /// Per-symbol raw `/v1/assets/{symbol}` payload overrides, served
+    /// verbatim so tests control exactly which attributes are present or
+    /// absent. Symbols without an override get the default payload.
+    asset_payload_overrides: HashMap<Symbol, Value>,
 }
 
 /// Status of a whitelisted address.
@@ -417,6 +428,9 @@ impl AlpacaBrokerMock {
             calendar_failures_remaining: 0,
             unauthorized_placement_failures_remaining: 0,
             activities: Vec::new(),
+            overnight_quotes: HashMap::new(),
+            overnight_feed_forbidden: false,
+            asset_payload_overrides: HashMap::new(),
         }));
 
         let server = MockServer::start_async().await;
@@ -443,6 +457,28 @@ impl AlpacaBrokerMock {
     /// Sets a fill price for a specific symbol.
     pub fn set_symbol_fill_price(&self, symbol: Symbol, price: Float) {
         lock(&self.state).symbol_fill_prices.insert(symbol, price);
+    }
+
+    /// Sets the `feed=overnight` latest-quote payload for a symbol. The
+    /// value is served verbatim as the envelope's `quote` object, so tests
+    /// control exactly which fields (`bp`, `ap`, `t`, ...) are present.
+    pub fn set_overnight_quote(&self, symbol: Symbol, quote: Value) {
+        lock(&self.state).overnight_quotes.insert(symbol, quote);
+    }
+
+    /// Answers every subsequent `feed=overnight` quote request with a 403,
+    /// modeling credentials without the overnight feed entitlement.
+    pub fn set_overnight_feed_forbidden(&self, forbidden: bool) {
+        lock(&self.state).overnight_feed_forbidden = forbidden;
+    }
+
+    /// Overrides the raw `/v1/assets/{symbol}` payload for a symbol, served
+    /// verbatim. Tests use this to control which asset attributes
+    /// (`overnight_tradable`, `fractionable`, ...) are present or absent.
+    pub fn set_asset_payload(&self, symbol: Symbol, payload: Value) {
+        lock(&self.state)
+            .asset_payload_overrides
+            .insert(symbol, payload);
     }
 
     /// Changes the mock mode for subsequent requests.
@@ -877,7 +913,7 @@ fn register_endpoints(server: &MockServer, state: &Arc<Mutex<MockState>>) {
     register_positions_endpoint(server, state);
     register_wallet_get_endpoint(server, state);
     register_market_data_endpoint(server, state);
-    register_asset_endpoint(server);
+    register_asset_endpoint(server, state);
     register_order_placement_endpoint(server, state);
     register_order_by_client_order_id_endpoint(server, state);
     register_order_status_endpoint(server, state);
@@ -1122,13 +1158,40 @@ fn register_market_data_endpoint(server: &MockServer, state: &Arc<Mutex<MockStat
             let (symbol, kind) = if let Some(symbol) = path.strip_suffix("/trades/latest") {
                 (symbol, MockMarketDataKind::Trade)
             } else if let Some(symbol) = path.strip_suffix("/quotes/latest") {
-                if request.uri().query() != Some("feed=delayed_sip") {
-                    return json_response(
-                        400,
-                        &json!({"message": "mock quotes require feed=delayed_sip"}),
-                    );
+                match request.uri().query() {
+                    Some("feed=delayed_sip") => (symbol, MockMarketDataKind::Quote),
+                    Some("feed=overnight") => {
+                        let Ok(symbol) = Symbol::new(symbol) else {
+                            return json_response(404, &json!({"message": "unknown symbol"}));
+                        };
+                        let (forbidden, fixture) = {
+                            let state = lock(&state);
+                            (
+                                state.overnight_feed_forbidden,
+                                state.overnight_quotes.get(&symbol).cloned(),
+                            )
+                        };
+                        if forbidden {
+                            return json_response(
+                                403,
+                                &json!({"message": "subscription does not permit the overnight feed"}),
+                            );
+                        }
+                        // A symbol the feed has no data for answers with a
+                        // quote-less envelope, not an error.
+                        let body = fixture.map_or_else(
+                            || json!({ "symbol": symbol }),
+                            |quote| json!({ "symbol": symbol, "quote": quote }),
+                        );
+                        return json_response(200, &body);
+                    }
+                    _ => {
+                        return json_response(
+                            400,
+                            &json!({"message": "mock quotes require feed=delayed_sip or feed=overnight"}),
+                        );
+                    }
                 }
-                (symbol, MockMarketDataKind::Quote)
             } else {
                 return json_response(404, &json!({"message": "not found"}));
             };
@@ -1160,12 +1223,27 @@ fn register_market_data_endpoint(server: &MockServer, state: &Arc<Mutex<MockStat
     });
 }
 
-fn register_asset_endpoint(server: &MockServer) {
+fn register_asset_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+    let state = Arc::clone(state);
     server.mock(|when, then| {
         when.method(GET).path_prefix("/v1/assets/");
-        then.respond_with(|request: &HttpMockRequest| {
+        then.respond_with(move |request: &HttpMockRequest| {
             let path = request.uri().path().to_string();
             let symbol = path.strip_prefix("/v1/assets/").unwrap_or("UNKNOWN");
+
+            // Overrides are keyed by the domain `Symbol`, so an unparseable
+            // path segment can never silently shadow a configured override.
+            if let Ok(parsed) = Symbol::new(symbol)
+                && let Some(payload) = lock(&state).asset_payload_overrides.get(&parsed)
+            {
+                return json_response(200, payload);
+            }
+
+            // Default: an active, fully overnight-eligible asset, so tests
+            // that don't care about eligibility keep working unchanged. The
+            // shape mirrors the real payload: `fractionable` is a top-level
+            // bool, the other eligibility markers are presence-strings in
+            // the `attributes` array.
             json_response(
                 200,
                 &json!({
@@ -1174,6 +1252,7 @@ fn register_asset_endpoint(server: &MockServer) {
                     "status": "active",
                     "tradable": true,
                     "fractionable": true,
+                    "attributes": ["fractional_eh_enabled", "overnight_tradable"],
                 }),
             )
         });
@@ -2287,6 +2366,7 @@ mod tests {
     use alloy::primitives::{Address, U256};
     use chrono::{NaiveTime, TimeZone, Utc};
     use chrono_tz::America::New_York;
+    use rain_math_float::Float;
     use uuid::Uuid;
 
     use st0x_float_macro::float;
@@ -2300,9 +2380,144 @@ mod tests {
     };
     use crate::alpaca_broker_api::client::AlpacaBrokerApiClient;
     use crate::alpaca_broker_api::{
-        AccountActivitiesQuery, AlpacaBrokerApi, TimeInForce, market_hours,
+        AccountActivitiesQuery, AlpacaBrokerApi, AlpacaBrokerApiError, TimeInForce, market_hours,
     };
     use crate::{Executor, MarketSession, Symbol, Usd, Usdc};
+
+    /// Contract test between the mock's overnight-quote and asset knobs and
+    /// the real client parsers: the knobs must produce payload shapes the
+    /// production `fetch_latest_overnight_quote` / `get_asset_details` code
+    /// actually accepts (and the entitlement knob must classify as such).
+    #[tokio::test]
+    async fn overnight_knobs_round_trip_through_the_real_parsers() {
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        let symbol = Symbol::new("RKLB").unwrap();
+
+        let executor = AlpacaBrokerApi::try_from_ctx(mock_broker_ctx(&mock))
+            .await
+            .unwrap();
+
+        // Default asset payload: fully overnight-eligible.
+        let details = executor.get_asset_details(&symbol).await.unwrap();
+        assert_eq!(details.overnight_tradable, Some(true));
+        assert_eq!(details.overnight_halted, Some(false));
+        assert_eq!(details.fractionable, Some(true));
+        assert_eq!(details.fractional_eh_enabled, Some(true));
+
+        // Overnight quote knob round-trips bid/ask/timestamp.
+        mock.set_overnight_quote(
+            symbol.clone(),
+            serde_json::json!({
+                "t": "2026-08-24T01:30:00Z",
+                "bp": "24.10",
+                "ap": "24.30"
+            }),
+        );
+        let indicative = executor
+            .fetch_latest_overnight_quote(&symbol)
+            .await
+            .unwrap();
+        assert_eq!(indicative.quote.bid().inner(), Usd::new(float!(24.10)));
+        assert_eq!(indicative.quote.ask().inner(), Usd::new(float!(24.30)));
+        assert_eq!(
+            indicative.at,
+            "2026-08-24T01:30:00Z"
+                .parse::<chrono::DateTime<Utc>>()
+                .unwrap()
+        );
+
+        // A symbol without a fixture answers quote-less -> MissingQuote for
+        // exactly the queried symbol.
+        let missing = executor
+            .fetch_latest_overnight_quote(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap_err();
+        let AlpacaBrokerApiError::LatestQuote(source) = missing else {
+            panic!("expected LatestQuote(MissingQuote), got: {missing:?}");
+        };
+        assert!(
+            matches!(
+                source.as_ref(),
+                crate::AlpacaMarketDataError::MissingQuote { symbol }
+                    if *symbol == Symbol::new("AAPL").unwrap()
+            ),
+            "expected MissingQuote for AAPL, got: {source:?}"
+        );
+
+        // The entitlement knob produces the permanent entitlement error with
+        // the 403 the real feed sends.
+        mock.set_overnight_feed_forbidden(true);
+        let forbidden = executor
+            .fetch_latest_overnight_quote(&symbol)
+            .await
+            .unwrap_err();
+        assert_eq!(forbidden.permanence(), crate::Permanence::Permanent);
+        let AlpacaBrokerApiError::LatestQuote(source) = forbidden else {
+            panic!("expected LatestQuote(Entitlement), got: {forbidden:?}");
+        };
+        assert!(
+            matches!(
+                source.as_ref(),
+                crate::AlpacaMarketDataError::Entitlement { status, .. }
+                    if *status == reqwest::StatusCode::FORBIDDEN
+            ),
+            "expected a 403 Entitlement, got: {source:?}"
+        );
+    }
+
+    /// Round-trip for the asset override knob: a payload configured for a
+    /// symbol must be served for exactly that symbol and parse through the
+    /// real client into the `AssetDetails` it describes -- pinning both the
+    /// Symbol-keyed lookup and the override-before-default precedence.
+    #[tokio::test]
+    async fn asset_payload_override_round_trips_through_the_real_parser() {
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        let symbol = Symbol::new("RKLB").unwrap();
+        mock.set_asset_payload(
+            symbol.clone(),
+            serde_json::json!({
+                "id": "00000000-0000-0000-0000-000000000000",
+                "symbol": "RKLB",
+                "status": "active",
+                "tradable": true,
+                "fractionable": false,
+                "attributes": ["overnight_tradable", "overnight_halted"]
+            }),
+        );
+
+        let executor = AlpacaBrokerApi::try_from_ctx(mock_broker_ctx(&mock))
+            .await
+            .unwrap();
+
+        let details = executor.get_asset_details(&symbol).await.unwrap();
+        assert_eq!(
+            details,
+            crate::AssetDetails {
+                status: crate::alpaca_broker_api::AssetStatus::Active,
+                tradable: true,
+                fractionable: Some(false),
+                fractional_eh_enabled: Some(false),
+                overnight_tradable: Some(true),
+                overnight_halted: Some(true),
+            }
+        );
+
+        // A symbol without an override still gets the default payload.
+        let default_details = executor
+            .get_asset_details(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(default_details.fractionable, Some(true));
+        assert_eq!(default_details.overnight_halted, Some(false));
+    }
 
     /// Regression test for the calendar contract between `AlpacaBrokerMock`
     /// and the market-hours parser: `CalendarDay` requires `session_open` /
@@ -2394,9 +2609,38 @@ mod tests {
         assert_eq!(activities.len(), 0);
     }
 
-    /// Broker-API context pointed at the given mock, for driving the
-    /// account-activities client against it.
-    fn activities_ctx(mock: &AlpacaBrokerMock) -> AlpacaBrokerApiCtx {
+    /// Baseline state for the crypto-order handler tests: $100 cash and
+    /// buying power, happy-path mode, and the given USDC wallet balances.
+    fn crypto_order_test_state(wallet_balances: HashMap<String, Float>) -> MockState {
+        MockState {
+            account: MockAccount {
+                cash: float!(100),
+                buying_power: float!(100),
+                positions: HashMap::new(),
+            },
+            orders: HashMap::new(),
+            symbol_fill_prices: HashMap::new(),
+            mode: MockMode::HappyPath,
+            rotating_outcome_index: 0,
+            symbol_fill_delays: HashMap::new(),
+            calendar_entries: vec![],
+            wallet_transfers: vec![],
+            alpaca_deposit_address: format!("{:#x}", Address::ZERO),
+            wallet_balances,
+            whitelisted_addresses: vec![],
+            transient_placement_failures_remaining: 0,
+            calendar_failures_remaining: 0,
+            unauthorized_placement_failures_remaining: 0,
+            activities: vec![],
+            overnight_quotes: HashMap::new(),
+            overnight_feed_forbidden: false,
+            asset_payload_overrides: HashMap::new(),
+        }
+    }
+
+    /// Broker-API context pointed at the given mock, for driving a client
+    /// or executor against it.
+    fn mock_broker_ctx(mock: &AlpacaBrokerMock) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
             auth: crate::AlpacaBrokerAuth::Basic {
                 api_key: TEST_API_KEY.to_string(),
@@ -2418,18 +2662,9 @@ mod tests {
             .symbol_positions(vec![])
             .call()
             .await;
-        let ctx = AlpacaBrokerApiCtx {
-            auth: crate::AlpacaBrokerAuth::Basic {
-                api_key: TEST_API_KEY.to_string(),
-                api_secret: TEST_API_SECRET.to_string(),
-            },
-            account_id: AlpacaAccountId::new(Uuid::parse_str(TEST_ACCOUNT_ID).unwrap()),
-            mode: Some(AlpacaBrokerApiMode::Mock(mock.base_url())),
-            asset_cache_ttl: Duration::from_secs(3600),
-            time_in_force: TimeInForce::Day,
-            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-        };
-        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        let executor = AlpacaBrokerApi::try_from_ctx(mock_broker_ctx(&mock))
+            .await
+            .unwrap();
 
         let quote = executor
             .fetch_latest_quote(&symbol)
@@ -2449,7 +2684,7 @@ mod tests {
             .symbol_positions(vec![])
             .call()
             .await;
-        let client = AlpacaBrokerApiClient::new(&activities_ctx(&mock)).unwrap();
+        let client = AlpacaBrokerApiClient::new(&mock_broker_ctx(&mock)).unwrap();
 
         let asset = client.get_asset(&symbol).await.unwrap();
 
@@ -2468,18 +2703,9 @@ mod tests {
             }])
             .call()
             .await;
-        let ctx = AlpacaBrokerApiCtx {
-            auth: crate::AlpacaBrokerAuth::Basic {
-                api_key: TEST_API_KEY.to_string(),
-                api_secret: TEST_API_SECRET.to_string(),
-            },
-            account_id: AlpacaAccountId::new(Uuid::parse_str(TEST_ACCOUNT_ID).unwrap()),
-            mode: Some(AlpacaBrokerApiMode::Mock(mock.base_url())),
-            asset_cache_ttl: Duration::from_secs(3600),
-            time_in_force: TimeInForce::Day,
-            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-        };
-        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        let executor = AlpacaBrokerApi::try_from_ctx(mock_broker_ctx(&mock))
+            .await
+            .unwrap();
 
         let mark = executor
             .fetch_position_mark(&symbol)
@@ -2529,7 +2755,7 @@ mod tests {
             .await
             .unwrap();
 
-        let activities = activities_ctx(&mock)
+        let activities = mock_broker_ctx(&mock)
             .fetch_account_activities(&AccountActivitiesQuery::pnl(None, None))
             .await
             .unwrap();
@@ -2555,7 +2781,7 @@ mod tests {
         mock.push_activity("INT", "-2", None, at(2));
         mock.push_activity("FEE", "-0.7", Some(symbol), at(3));
 
-        let fees = activities_ctx(&mock)
+        let fees = mock_broker_ctx(&mock)
             .fetch_account_activities(&AccountActivitiesQuery {
                 activity_types: vec!["FEE".to_string()],
                 after: Some(at(1)),
@@ -2582,7 +2808,7 @@ mod tests {
             mock.push_activity("FEE", "-0.1", Some(symbol.clone()), Utc::now());
         }
 
-        let activities = activities_ctx(&mock)
+        let activities = mock_broker_ctx(&mock)
             .fetch_account_activities(&AccountActivitiesQuery::pnl(None, None))
             .await
             .unwrap();
@@ -2750,27 +2976,7 @@ mod tests {
 
     #[test]
     fn crypto_cash_delta_is_quantized_to_cents() {
-        let mut state = MockState {
-            account: MockAccount {
-                cash: float!(100),
-                buying_power: float!(100),
-                positions: HashMap::new(),
-            },
-            orders: HashMap::new(),
-            symbol_fill_prices: HashMap::new(),
-            mode: MockMode::HappyPath,
-            rotating_outcome_index: 0,
-            symbol_fill_delays: HashMap::new(),
-            calendar_entries: vec![],
-            wallet_transfers: vec![],
-            alpaca_deposit_address: format!("{:#x}", Address::ZERO),
-            wallet_balances: HashMap::new(),
-            whitelisted_addresses: vec![],
-            transient_placement_failures_remaining: 0,
-            calendar_failures_remaining: 0,
-            unauthorized_placement_failures_remaining: 0,
-            activities: vec![],
-        };
+        let mut state = crypto_order_test_state(HashMap::new());
 
         let response = handle_crypto_order(
             &mut state,
@@ -2799,27 +3005,7 @@ mod tests {
 
     #[test]
     fn crypto_sell_debits_wallet_usdc_before_crediting_cash() {
-        let mut state = MockState {
-            account: MockAccount {
-                cash: float!(100),
-                buying_power: float!(100),
-                positions: HashMap::new(),
-            },
-            orders: HashMap::new(),
-            symbol_fill_prices: HashMap::new(),
-            mode: MockMode::HappyPath,
-            rotating_outcome_index: 0,
-            symbol_fill_delays: HashMap::new(),
-            calendar_entries: vec![],
-            wallet_transfers: vec![],
-            alpaca_deposit_address: format!("{:#x}", Address::ZERO),
-            wallet_balances: HashMap::from([("USDC".to_string(), float!(20))]),
-            whitelisted_addresses: vec![],
-            transient_placement_failures_remaining: 0,
-            calendar_failures_remaining: 0,
-            unauthorized_placement_failures_remaining: 0,
-            activities: vec![],
-        };
+        let mut state = crypto_order_test_state(HashMap::from([("USDC".to_string(), float!(20))]));
 
         let response = handle_crypto_order(
             &mut state,
@@ -2855,27 +3041,7 @@ mod tests {
 
     #[test]
     fn crypto_quantity_with_excess_precision_is_rejected() {
-        let mut state = MockState {
-            account: MockAccount {
-                cash: float!(100),
-                buying_power: float!(100),
-                positions: HashMap::new(),
-            },
-            orders: HashMap::new(),
-            symbol_fill_prices: HashMap::new(),
-            mode: MockMode::HappyPath,
-            rotating_outcome_index: 0,
-            symbol_fill_delays: HashMap::new(),
-            calendar_entries: vec![],
-            wallet_transfers: vec![],
-            alpaca_deposit_address: format!("{:#x}", Address::ZERO),
-            wallet_balances: HashMap::new(),
-            whitelisted_addresses: vec![],
-            transient_placement_failures_remaining: 0,
-            calendar_failures_remaining: 0,
-            unauthorized_placement_failures_remaining: 0,
-            activities: vec![],
-        };
+        let mut state = crypto_order_test_state(HashMap::new());
 
         let response = handle_crypto_order(
             &mut state,
@@ -2901,7 +3067,7 @@ mod tests {
             .symbol_positions(vec![])
             .call()
             .await;
-        let client = AlpacaBrokerApiClient::new(&activities_ctx(&mock)).unwrap();
+        let client = AlpacaBrokerApiClient::new(&mock_broker_ctx(&mock)).unwrap();
 
         let placed = crate::alpaca_broker_api::order::convert_usdc_usd(
             &client,
@@ -2946,27 +3112,7 @@ mod tests {
 
     #[test]
     fn crypto_notional_buy_debits_the_dollars_named() {
-        let mut state = MockState {
-            account: MockAccount {
-                cash: float!(100),
-                buying_power: float!(100),
-                positions: HashMap::new(),
-            },
-            orders: HashMap::new(),
-            symbol_fill_prices: HashMap::new(),
-            mode: MockMode::HappyPath,
-            rotating_outcome_index: 0,
-            symbol_fill_delays: HashMap::new(),
-            calendar_entries: vec![],
-            wallet_transfers: vec![],
-            alpaca_deposit_address: format!("{:#x}", Address::ZERO),
-            wallet_balances: HashMap::new(),
-            whitelisted_addresses: vec![],
-            transient_placement_failures_remaining: 0,
-            calendar_failures_remaining: 0,
-            unauthorized_placement_failures_remaining: 0,
-            activities: vec![],
-        };
+        let mut state = crypto_order_test_state(HashMap::new());
 
         let response = handle_crypto_order(
             &mut state,
@@ -2993,27 +3139,7 @@ mod tests {
     /// whole cents fails against the mock the same way it would in prod.
     #[test]
     fn crypto_notional_with_sub_cent_precision_is_rejected() {
-        let mut state = MockState {
-            account: MockAccount {
-                cash: float!(100),
-                buying_power: float!(100),
-                positions: HashMap::new(),
-            },
-            orders: HashMap::new(),
-            symbol_fill_prices: HashMap::new(),
-            mode: MockMode::HappyPath,
-            rotating_outcome_index: 0,
-            symbol_fill_delays: HashMap::new(),
-            calendar_entries: vec![],
-            wallet_transfers: vec![],
-            alpaca_deposit_address: format!("{:#x}", Address::ZERO),
-            wallet_balances: HashMap::new(),
-            whitelisted_addresses: vec![],
-            transient_placement_failures_remaining: 0,
-            calendar_failures_remaining: 0,
-            unauthorized_placement_failures_remaining: 0,
-            activities: vec![],
-        };
+        let mut state = crypto_order_test_state(HashMap::new());
 
         let response = handle_crypto_order(
             &mut state,
