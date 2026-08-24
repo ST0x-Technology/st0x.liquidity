@@ -15,9 +15,10 @@ use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::alpaca_broker_api::{AlpacaLimitOrder, AlpacaLimitPrice};
 use st0x_execution::{
-    AlpacaBrokerApiError, CancellationOutcome, ClientOrderId, Direction, Executor, ExecutorOrderId,
-    FractionalShares, MarketOrder, MockExecutor, MockExecutorCtx, OrderFailureTerminality,
-    OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
+    ALPACA_MAX_DECIMAL_PLACES, AlpacaBrokerApiError, CancellationOutcome, ClientOrderId, Direction,
+    Executor, ExecutorOrderId, FractionalShares, MarketOrder, MarketSession, MockExecutor,
+    MockExecutorCtx, OrderFailureTerminality, OrderPlacement, OrderState, Positive, Symbol,
+    TimeInForce, TryIntoExecutor,
 };
 use st0x_float_serde::format_float_with_fallback;
 
@@ -51,8 +52,15 @@ impl OrderPlacer for CliOrderPlacer {
         &self,
         order: MarketOrder,
     ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
-        let placement =
-            execute_broker_order(&self.ctx, &self.pool, order, None, &mut std::io::sink()).await?;
+        let placement = execute_broker_order(
+            &self.ctx,
+            &self.pool,
+            order,
+            None,
+            SessionValidation::Bypass,
+            &mut std::io::sink(),
+        )
+        .await?;
         Ok(OrderPlacementResult {
             executor_order_id: ExecutorOrderId::new(&placement.order_id),
             placed_shares: placement.shares,
@@ -90,6 +98,7 @@ pub(super) fn create_order_placer(ctx: &Ctx, pool: &SqlitePool) -> Arc<dyn Order
     })
 }
 
+#[derive(Debug)]
 pub(super) enum CliOrderKind {
     Market {
         time_in_force: Option<TimeInForce>,
@@ -100,11 +109,18 @@ pub(super) enum CliOrderKind {
     },
 }
 
+#[derive(Debug)]
 pub(super) struct CliOrderRequest {
     pub(super) symbol: Symbol,
     pub(super) shares: Positive<FractionalShares>,
     pub(super) direction: Direction,
     pub(super) kind: CliOrderKind,
+    /// An operator-supplied idempotency key from `--client-order-id`.
+    /// `None` generates a fresh key; passing the key a previous attempt
+    /// printed lets a rerun adopt the already-accepted order (via the
+    /// broker's duplicate reconciliation) instead of creating a second
+    /// one after a lost response.
+    pub(super) client_order_id: Option<Uuid>,
 }
 
 impl CliOrderRequest {
@@ -115,7 +131,23 @@ impl CliOrderRequest {
         time_in_force: Option<TimeInForce>,
         limit_price: Option<AlpacaLimitPrice>,
         extended_hours: bool,
+        client_order_id: Option<Uuid>,
     ) -> anyhow::Result<Self> {
+        // Reject over-precise quantities instead of the automated path's
+        // silent floor: a manual operator typing more than Alpaca's 9
+        // decimal places made either a typo or a wrong assumption, and
+        // placing a DIFFERENT quantity than the one typed would mask it.
+        let (_, lossless) = shares
+            .inner()
+            .inner()
+            .to_fixed_decimal_lossy(ALPACA_MAX_DECIMAL_PLACES)?;
+        if !lossless {
+            anyhow::bail!(
+                "quantity {shares} exceeds Alpaca's maximum of {ALPACA_MAX_DECIMAL_PLACES} \
+                 decimal places"
+            );
+        }
+
         let kind = if let Some(limit_price) = limit_price {
             if time_in_force.is_some() {
                 anyhow::bail!("--time-in-force is not supported with --limit-price");
@@ -138,6 +170,7 @@ impl CliOrderRequest {
             shares,
             direction,
             kind,
+            client_order_id,
         })
     }
 
@@ -153,6 +186,79 @@ impl CliOrderRequest {
             CliOrderKind::Market { .. } => false,
             CliOrderKind::AlpacaLimit { extended_hours, .. } => *extended_hours,
         }
+    }
+
+    /// The effective time-in-force label for the evidence block. Limit
+    /// orders are hard-coded `day` by the placement path; market orders
+    /// without an explicit `--time-in-force` submit with the broker ctx's
+    /// configured `time_in_force` (see `execute_broker_order`), so the
+    /// label resolves from the same source. Dry-run ignores time-in-force
+    /// entirely (a warning says so at placement) and submits a plain
+    /// market order, so its label is always `day` -- even when an
+    /// explicit value was passed and ignored.
+    fn time_in_force_label(&self, ctx: &Ctx) -> &'static str {
+        let cli_time_in_force = match &self.kind {
+            CliOrderKind::AlpacaLimit { .. } => return "day",
+            CliOrderKind::Market { time_in_force } => *time_in_force,
+        };
+
+        let effective = match (cli_time_in_force, &ctx.broker) {
+            (_, BrokerCtx::DryRun) => TimeInForce::Day,
+            (Some(explicit), _) => explicit,
+            (None, BrokerCtx::AlpacaBrokerApi(alpaca)) => alpaca.time_in_force,
+        };
+
+        match effective {
+            TimeInForce::Day => "day",
+            TimeInForce::MarketOnClose => "market-on-close (cls)",
+        }
+    }
+}
+
+/// Pre-submission session validation for manual orders: the overnight
+/// session accepts only limit `day` orders flagged `extended_hours = true`,
+/// so a non-conforming request is rejected BEFORE the HTTP call with the
+/// contract spelled out, instead of surfacing as a broker rejection.
+///
+/// The one market-order exception is market-on-close: Alpaca queues a cls
+/// order submitted after 19:00 ET for the next regular close (see
+/// `TimeInForce::MarketOnClose`), so it passes through. Callers must
+/// resolve the market time-in-force to the EFFECTIVE value (the broker
+/// ctx's configured one when the CLI option is absent) before validating.
+fn validate_order_kind_for_session(
+    kind: &CliOrderKind,
+    session: MarketSession,
+) -> anyhow::Result<()> {
+    // Exhaustive on purpose: a new session variant must decide its order
+    // contract here instead of silently passing validation.
+    match session {
+        MarketSession::Regular | MarketSession::Extended | MarketSession::Closed => {
+            return Ok(());
+        }
+        MarketSession::Overnight => {}
+    }
+
+    match kind {
+        CliOrderKind::Market {
+            time_in_force: Some(TimeInForce::Day) | None,
+        } => anyhow::bail!(
+            "the overnight session (20:00-04:00 ET) accepts only limit orders; retry with \
+             --limit-price and --extended-hours, or queue for the next regular close with \
+             --time-in-force market-on-close"
+        ),
+        CliOrderKind::AlpacaLimit {
+            extended_hours: false,
+            ..
+        } => anyhow::bail!(
+            "overnight orders require extended_hours = true; retry with --extended-hours"
+        ),
+        CliOrderKind::AlpacaLimit {
+            extended_hours: true,
+            ..
+        }
+        | CliOrderKind::Market {
+            time_in_force: Some(TimeInForce::MarketOnClose),
+        } => Ok(()),
     }
 }
 
@@ -366,12 +472,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
 
     match execution {
         Ok(placement) => {
-            write_order_success(
-                stdout,
-                &placement,
-                request.limit_price(),
-                request.extended_hours(),
-            )?;
+            write_order_success(stdout, &placement, request.time_in_force_label(ctx), ctx)?;
         }
         Err(error) => {
             error!(
@@ -402,17 +503,29 @@ async fn execute_market_order<W: Write>(
         }
     };
 
+    // A fresh key per invocation, unless the operator re-supplied the key
+    // a previous attempt printed: then the broker's duplicate
+    // reconciliation adopts the already-accepted order instead of
+    // creating a second one after a lost response.
+    let client_order_id = ClientOrderId::cli(request.client_order_id.unwrap_or_else(Uuid::new_v4));
+    writeln!(stdout, "   Client Order ID: {client_order_id}")?;
+
     let market_order = MarketOrder {
         symbol: request.symbol.clone(),
         shares: request.shares,
         direction: request.direction,
-        // Manual CLI placement; generate a fresh idempotency key so an
-        // operator-issued retry cannot accidentally dedupe against an
-        // unrelated earlier placement.
-        client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+        client_order_id,
     };
 
-    execute_broker_order(ctx, pool, market_order, time_in_force, stdout).await
+    execute_broker_order(
+        ctx,
+        pool,
+        market_order,
+        time_in_force,
+        SessionValidation::Enforce,
+        stdout,
+    )
+    .await
 }
 
 async fn execute_alpaca_limit_order<W: Write>(
@@ -437,13 +550,29 @@ async fn execute_alpaca_limit_order<W: Write>(
     writeln!(stdout, "🔄 Executing Alpaca Broker API limit order...")?;
 
     let broker = alpaca_auth.clone().try_into_executor().await?;
+
+    let session =
+        retry_on_backpressure(|| broker.market_session(), BACKPRESSURE_RETRY_MAX_ATTEMPTS).await?;
+    validate_order_kind_for_session(&request.kind, session)?;
+    if session == MarketSession::Overnight {
+        writeln!(
+            stdout,
+            "🌙 Overnight session: placing a limit day order with extended_hours=true"
+        )?;
+    }
+
+    // Same reuse semantics as the market path: an operator-supplied key
+    // makes a rerun adopt the accepted order instead of duplicating it.
+    let client_order_id = ClientOrderId::cli(request.client_order_id.unwrap_or_else(Uuid::new_v4));
+    writeln!(stdout, "   Client Order ID: {client_order_id}")?;
+
     let order = AlpacaLimitOrder {
         symbol: request.symbol.clone(),
         shares: request.shares,
         direction: request.direction,
         limit_price,
         extended_hours,
-        client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+        client_order_id,
     };
     let placement = retry_on_backpressure(
         || broker.place_alpaca_limit_order(order.clone()),
@@ -460,11 +589,20 @@ async fn execute_alpaca_limit_order<W: Write>(
     Ok(placement)
 }
 
+/// Prints the placement evidence block: everything an Alpaca sign-off
+/// reviewer (or a runbook operator) needs to identify the order -- broker
+/// timestamps in UTC and ET, the account, the broker-held order terms, and
+/// both order ids.
+///
+/// Limit terms come from the PLACEMENT, not the request: a reused
+/// `client_order_id` can adopt an existing broker order whose limit price
+/// and extended-hours state differ from this request, and the evidence
+/// must report what the broker actually holds.
 fn write_order_success<W: Write>(
     stdout: &mut W,
     placement: &OrderPlacement<String>,
-    limit_price: Option<&AlpacaLimitPrice>,
-    extended_hours: bool,
+    time_in_force_label: &str,
+    ctx: &Ctx,
 ) -> anyhow::Result<()> {
     info!(
         symbol = %placement.symbol,
@@ -474,22 +612,43 @@ fn write_order_success<W: Write>(
         "Order placed successfully"
     );
     writeln!(stdout, "✅ Order placed successfully")?;
+    writeln!(
+        stdout,
+        "   Placed at (UTC): {}",
+        placement.placed_at.format("%Y-%m-%d %H:%M:%S%.3f")
+    )?;
+    writeln!(
+        stdout,
+        "   Placed at (ET):  {}",
+        placement
+            .placed_at
+            .with_timezone(&chrono_tz::America::New_York)
+            .format("%Y-%m-%d %H:%M:%S %Z")
+    )?;
+    if let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker {
+        writeln!(stdout, "   Account ID: {}", alpaca_auth.account_id)?;
+    }
     writeln!(stdout, "   Symbol: {}", placement.symbol)?;
     writeln!(stdout, "   Action: {:?}", placement.direction)?;
     writeln!(stdout, "   Quantity: {}", placement.shares)?;
+    writeln!(stdout, "   Time in Force: {time_in_force_label}")?;
     writeln!(stdout, "   Order ID: {}", placement.order_id)?;
 
-    if let Some(limit_price) = limit_price {
+    if let Some(limit_price) = placement.limit_price {
         writeln!(stdout, "   Order Type: limit")?;
         writeln!(
             stdout,
             "   Limit Price: ${}",
-            format_float_with_fallback(&limit_price.as_price().inner().inner())
+            format_float_with_fallback(&limit_price.inner().inner())
         )?;
         writeln!(
             stdout,
             "   Extended Hours: {}",
-            if extended_hours { "yes" } else { "no" }
+            if placement.extended_hours {
+                "yes"
+            } else {
+                "no"
+            }
         )?;
     }
 
@@ -558,11 +717,26 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     Ok(())
 }
 
+/// Whether `execute_broker_order` enforces the pre-submission session
+/// contract.
+#[derive(Clone, Copy)]
+pub(super) enum SessionValidation {
+    /// Interactive placements: reject a non-conforming order BEFORE the
+    /// HTTP call, with the retry flags spelled out for the operator.
+    Enforce,
+    /// The `OrderPlacer` hedge path (`process-tx`): it cannot pass the
+    /// retry flags the rejection message names, and a day market hedge
+    /// placed overnight queues at Alpaca for the next regular open, so
+    /// the pre-gate behavior is kept and no session lookup runs.
+    Bypass,
+}
+
 pub(super) async fn execute_broker_order<W: Write>(
     ctx: &Ctx,
     _pool: &SqlitePool,
     market_order: MarketOrder,
     time_in_force: Option<TimeInForce>,
+    session_validation: SessionValidation,
     stdout: &mut W,
 ) -> anyhow::Result<OrderPlacement<String>> {
     match &ctx.broker {
@@ -572,7 +746,36 @@ pub(super) async fn execute_broker_order<W: Write>(
             if let Some(tif) = time_in_force {
                 auth.time_in_force = tif;
             }
+            // The submitted order carries auth.time_in_force, so session
+            // validation must see that effective value: a configured
+            // market-on-close with no CLI override queues overnight
+            // instead of being rejected.
+            let effective_time_in_force = auth.time_in_force;
             let broker = auth.try_into_executor().await?;
+
+            match session_validation {
+                SessionValidation::Enforce => {
+                    let session = retry_on_backpressure(
+                        || broker.market_session(),
+                        BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+                    )
+                    .await?;
+                    validate_order_kind_for_session(
+                        &CliOrderKind::Market {
+                            time_in_force: Some(effective_time_in_force),
+                        },
+                        session,
+                    )?;
+                }
+                SessionValidation::Bypass => {}
+            }
+
+            writeln!(
+                stdout,
+                "   Client Order ID: {}",
+                market_order.client_order_id
+            )?;
+
             let placement = retry_on_backpressure(
                 || broker.place_market_order(market_order.clone()),
                 BACKPRESSURE_RETRY_MAX_ATTEMPTS,
@@ -1189,6 +1392,7 @@ mod tests {
     use alloy::primitives::{Address, B256, U256, address};
     use chrono::Utc;
     use httpmock::MockServer;
+    use proptest::prelude::*;
     use rain_math_float::Float;
     use regex::Regex;
     use serde_json::json;
@@ -1227,6 +1431,305 @@ mod tests {
     };
     use crate::trading::onchain::inclusion::EmittedOnChain;
     use crate::trading::onchain::trade_accountant::TradeAccountingError;
+
+    fn positive_fractional(value: &str) -> Positive<FractionalShares> {
+        Positive::new(FractionalShares::new(
+            Float::parse(value.to_string()).unwrap(),
+        ))
+        .unwrap()
+    }
+
+    /// Pins the placement evidence block literally: the sign-off sheet's
+    /// reviewer reads these lines as evidence, so a silently dropped or
+    /// reformatted field (timestamps, account id, time-in-force) must fail a
+    /// test, not surface on a demo call.
+    #[tokio::test]
+    async fn write_order_success_prints_the_full_evidence_block() {
+        let server = MockServer::start();
+        let ctx = create_alpaca_broker_api_test_ctx(&server);
+
+        let placed_at = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 24, 1, 30, 0).unwrap();
+        let placement = OrderPlacement {
+            order_id: "broker-order-1".to_string(),
+            symbol: Symbol::new("RKLB").unwrap(),
+            shares: positive_shares("10"),
+            direction: Direction::Buy,
+            placed_at,
+            extended_hours: true,
+            limit_price: Some(*positive_limit_price("24.10").as_price()),
+        };
+        let mut stdout = Vec::new();
+        write_order_success(&mut stdout, &placement, "day", &ctx).unwrap();
+
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "✅ Order placed successfully\n\
+             \x20  Placed at (UTC): 2026-08-24 01:30:00.000\n\
+             \x20  Placed at (ET):  2026-08-23 21:30:00 EDT\n\
+             \x20  Account ID: 904837e3-3b76-47ec-b432-046db621571b\n\
+             \x20  Symbol: RKLB\n\
+             \x20  Action: Buy\n\
+             \x20  Quantity: 10\n\
+             \x20  Time in Force: day\n\
+             \x20  Order ID: broker-order-1\n\
+             \x20  Order Type: limit\n\
+             \x20  Limit Price: $24.1\n\
+             \x20  Extended Hours: yes\n"
+        );
+    }
+
+    #[test]
+    fn time_in_force_label_reports_the_configured_market_on_close() {
+        // No --time-in-force: execute_broker_order submits with the broker
+        // ctx's configured value, so the evidence label must match it.
+        let server = MockServer::start();
+        let mut ctx = create_alpaca_broker_api_test_ctx(&server);
+        let BrokerCtx::AlpacaBrokerApi(ref mut alpaca) = ctx.broker else {
+            panic!("expected an Alpaca broker ctx");
+        };
+        alpaca.time_in_force = TimeInForce::MarketOnClose;
+
+        let request = cli_order_request(
+            Symbol::new("RKLB").unwrap(),
+            positive_shares("10"),
+            Direction::Buy,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(request.time_in_force_label(&ctx), "market-on-close (cls)");
+    }
+
+    #[test]
+    fn time_in_force_label_prefers_the_explicit_cli_value() {
+        // An explicit --time-in-force overrides the configured value in
+        // execute_broker_order; the label follows the same precedence.
+        let server = MockServer::start();
+        let mut ctx = create_alpaca_broker_api_test_ctx(&server);
+        let BrokerCtx::AlpacaBrokerApi(ref mut alpaca) = ctx.broker else {
+            panic!("expected an Alpaca broker ctx");
+        };
+        alpaca.time_in_force = TimeInForce::MarketOnClose;
+
+        let request = cli_order_request(
+            Symbol::new("RKLB").unwrap(),
+            positive_shares("10"),
+            Direction::Buy,
+            Some(TimeInForce::Day),
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(request.time_in_force_label(&ctx), "day");
+    }
+
+    #[test]
+    fn time_in_force_label_reports_day_for_dry_run_even_with_explicit_cls() {
+        // Dry-run placement ignores time-in-force (a warning says so at
+        // placement) and submits a plain market order; the evidence label
+        // must report what was placed, never the ignored explicit flag.
+        let ctx = create_base_test_ctx();
+
+        let request = cli_order_request(
+            Symbol::new("RKLB").unwrap(),
+            positive_shares("10"),
+            Direction::Buy,
+            Some(TimeInForce::MarketOnClose),
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(request.time_in_force_label(&ctx), "day");
+    }
+
+    #[test]
+    fn from_cli_args_rejects_quantity_over_nine_decimal_places() {
+        let error = CliOrderRequest::from_cli_args(
+            Symbol::new("RKLB").unwrap(),
+            positive_fractional("0.1234567891"),
+            Direction::Buy,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "quantity 0.1234567891 exceeds Alpaca's maximum of 9 decimal places"
+        );
+    }
+
+    #[test]
+    fn from_cli_args_accepts_quantity_at_nine_decimal_places() {
+        let request = CliOrderRequest::from_cli_args(
+            Symbol::new("RKLB").unwrap(),
+            positive_fractional("0.123456789"),
+            Direction::Buy,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(request.shares, positive_fractional("0.123456789"));
+    }
+
+    proptest! {
+        // Both sides of the 9-decimal boundary: a quantity whose LAST
+        // fractional digit is nonzero has exactly `leading.len() + 1`
+        // decimal places, so acceptance flips precisely at nine.
+        #[test]
+        fn quantity_precision_boundary_flips_at_nine_decimals(
+            integer in 0u32..1_000,
+            leading in proptest::collection::vec(0u8..=9, 0..=11),
+            last in 1u8..=9,
+        ) {
+            let decimal_places = leading.len() + 1;
+            let mut fraction: String = leading
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            fraction.push_str(&last.to_string());
+            let quantity = format!("{integer}.{fraction}");
+
+            let result = CliOrderRequest::from_cli_args(
+                Symbol::new("RKLB").unwrap(),
+                positive_fractional(&quantity),
+                Direction::Buy,
+                None,
+                None,
+                false,
+                None,
+            );
+
+            if decimal_places <= 9 {
+                let request = result.unwrap();
+                prop_assert_eq!(request.shares, positive_fractional(&quantity));
+            } else {
+                let error = result.unwrap_err();
+                prop_assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "quantity {quantity} exceeds Alpaca's maximum of 9 decimal places"
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn from_cli_args_accepts_trailing_zeros_beyond_nine_decimal_places() {
+        // Trailing zeros carry no precision: the VALUE is representable
+        // at nine decimals, so the lossless check accepts it.
+        let request = CliOrderRequest::from_cli_args(
+            Symbol::new("RKLB").unwrap(),
+            positive_fractional("0.1000000000"),
+            Direction::Buy,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(request.shares, positive_fractional("0.1"));
+    }
+
+    #[test]
+    fn overnight_session_rejects_day_market_orders() {
+        for time_in_force in [None, Some(TimeInForce::Day)] {
+            let error = validate_order_kind_for_session(
+                &CliOrderKind::Market { time_in_force },
+                MarketSession::Overnight,
+            )
+            .unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                "the overnight session (20:00-04:00 ET) accepts only limit orders; retry with \
+                 --limit-price and --extended-hours, or queue for the next regular close with \
+                 --time-in-force market-on-close"
+            );
+        }
+    }
+
+    #[test]
+    fn overnight_session_accepts_market_on_close_orders() {
+        // Alpaca queues a cls order submitted after 19:00 ET for the next
+        // regular close, so the overnight session must let it through.
+        validate_order_kind_for_session(
+            &CliOrderKind::Market {
+                time_in_force: Some(TimeInForce::MarketOnClose),
+            },
+            MarketSession::Overnight,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn overnight_session_rejects_limit_without_extended_hours() {
+        let limit_price = "24.10".parse::<AlpacaLimitPrice>().unwrap();
+        let error = validate_order_kind_for_session(
+            &CliOrderKind::AlpacaLimit {
+                limit_price,
+                extended_hours: false,
+            },
+            MarketSession::Overnight,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "overnight orders require extended_hours = true; retry with --extended-hours"
+        );
+    }
+
+    #[test]
+    fn overnight_session_accepts_extended_hours_limit() {
+        let limit_price = "24.10".parse::<AlpacaLimitPrice>().unwrap();
+        validate_order_kind_for_session(
+            &CliOrderKind::AlpacaLimit {
+                limit_price,
+                extended_hours: true,
+            },
+            MarketSession::Overnight,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn other_sessions_accept_every_order_kind() {
+        for session in [
+            MarketSession::Regular,
+            MarketSession::Extended,
+            MarketSession::Closed,
+        ] {
+            validate_order_kind_for_session(
+                &CliOrderKind::Market {
+                    time_in_force: Some(TimeInForce::MarketOnClose),
+                },
+                session,
+            )
+            .unwrap();
+
+            let limit_price = "24.10".parse::<AlpacaLimitPrice>().unwrap();
+            validate_order_kind_for_session(
+                &CliOrderKind::AlpacaLimit {
+                    limit_price,
+                    extended_hours: false,
+                },
+                session,
+            )
+            .unwrap();
+        }
+    }
 
     /// `OrderPlacer` that always returns a broker error, used to drive the
     /// `OffchainOrder::Failed` path in `process_found_trade` tests.
@@ -1511,6 +2014,7 @@ mod tests {
             time_in_force,
             limit_price,
             extended_hours,
+            None,
         )
     }
 
@@ -1563,13 +2067,41 @@ mod tests {
         })
     }
 
+    /// Serves an all-day-open calendar entry for today so the pre-submission
+    /// session check classifies Regular regardless of when the test runs.
+    /// Returns the mock so tests can assert the session check actually
+    /// queried the calendar before placement.
+    fn mock_regular_session_calendar(server: &MockServer) -> httpmock::Mock<'_> {
+        let today = Utc::now()
+            .with_timezone(&chrono_tz::America::New_York)
+            .date_naive();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/v1/calendar");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "date": today.format("%Y-%m-%d").to_string(),
+                    "open": "00:00",
+                    "close": "23:59",
+                    "session_open": "0000",
+                    "session_close": "2359"
+                }]));
+        })
+    }
+
     fn setup_alpaca_broker_market_order_mocks<'a>(
         server: &'a MockServer,
         symbol: &'a str,
         quantity: &'a str,
         side: &'a str,
-    ) -> (httpmock::Mock<'a>, httpmock::Mock<'a>, httpmock::Mock<'a>) {
+    ) -> (
+        httpmock::Mock<'a>,
+        httpmock::Mock<'a>,
+        httpmock::Mock<'a>,
+        httpmock::Mock<'a>,
+    ) {
         let account_mock = mock_active_account(server);
+        let calendar_mock = mock_regular_session_calendar(server);
 
         let asset_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1581,7 +2113,7 @@ mod tests {
                     "symbol": symbol,
                     "status": "active",
                     "tradable": true,
-                    "overnight_tradable": true
+                    "attributes": ["overnight_tradable"]
                 }));
         });
 
@@ -1623,13 +2155,19 @@ mod tests {
                 }));
         });
 
-        (account_mock, asset_mock, order_mock)
+        (account_mock, calendar_mock, asset_mock, order_mock)
     }
 
     fn setup_alpaca_broker_limit_order_mocks(
         server: &MockServer,
-    ) -> (httpmock::Mock<'_>, httpmock::Mock<'_>, httpmock::Mock<'_>) {
+    ) -> (
+        httpmock::Mock<'_>,
+        httpmock::Mock<'_>,
+        httpmock::Mock<'_>,
+        httpmock::Mock<'_>,
+    ) {
         let account_mock = mock_active_account(server);
+        let calendar_mock = mock_regular_session_calendar(server);
 
         let asset_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET).path("/v1/assets/AAPL");
@@ -1640,7 +2178,7 @@ mod tests {
                     "symbol": "AAPL",
                     "status": "active",
                     "tradable": true,
-                    "overnight_tradable": true
+                    "attributes": ["overnight_tradable"]
                 }));
         });
 
@@ -1676,7 +2214,7 @@ mod tests {
                 }));
         });
 
-        (account_mock, asset_mock, order_mock)
+        (account_mock, calendar_mock, asset_mock, order_mock)
     }
 
     /// Regex asserting a request body carries a well-formed `cli-{uuid}`
@@ -1688,12 +2226,161 @@ mod tests {
         .unwrap()
     }
 
+    fn mock_tradable_asset<'a>(server: &'a MockServer, symbol: &'a str) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/v1/assets/{symbol}"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": symbol,
+                    "status": "active",
+                    "tradable": true,
+                    "attributes": ["overnight_tradable"]
+                }));
+        })
+    }
+
+    #[tokio::test]
+    async fn explicit_client_order_id_is_sent_verbatim() {
+        // --client-order-id makes the idempotency key deterministic, so a
+        // rerun after a lost response re-sends the SAME key instead of a
+        // fresh UUID that would create a second order.
+        let server = MockServer::start();
+        let ctx = create_alpaca_broker_api_test_ctx(&server);
+        let pool = setup_test_db().await;
+        let _account_mock = mock_active_account(&server);
+        let _calendar_mock = mock_regular_session_calendar(&server);
+        let _asset_mock = mock_tradable_asset(&server, "AAPL");
+
+        let reused = uuid!("4d6d9f40-5434-4f77-89f6-7156e375b739");
+        let order_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body_includes(
+                    json!({"client_order_id": format!("cli-{reused}")}).to_string(),
+                );
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let request = CliOrderRequest::from_cli_args(
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("100"),
+            Direction::Buy,
+            None,
+            None,
+            false,
+            Some(reused),
+        )
+        .unwrap();
+        super::execute_order_with_writers(request, &ctx, &pool, &mut std::io::sink())
+            .await
+            .unwrap();
+
+        order_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn rerun_with_the_same_client_order_id_adopts_the_accepted_order() {
+        // The lost-response regression: the first attempt was accepted
+        // but its response never arrived. A rerun with the printed key
+        // hits the duplicate 422 and adopts the broker's recorded order
+        // instead of creating a second one.
+        let server = MockServer::start();
+        let ctx = create_alpaca_broker_api_test_ctx(&server);
+        let pool = setup_test_db().await;
+        let _account_mock = mock_active_account(&server);
+        let _calendar_mock = mock_regular_session_calendar(&server);
+        let _asset_mock = mock_tradable_asset(&server, "AAPL");
+
+        let reused = uuid!("4d6d9f40-5434-4f77-89f6-7156e375b739");
+        let place_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(422)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "code": 40_010_001,
+                    "message": "client_order_id must be unique"
+                }));
+        });
+        // The adopted order deliberately differs from the request on every
+        // reportable term: a distinct broker order id (NOT the account id,
+        // so the Order ID assertion cannot be satisfied by the Account ID
+        // line), a smaller accepted quantity, and adopted extended-hours
+        // limit terms the plain market request never asked for.
+        let lookup_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(
+                    "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders:by_client_order_id",
+                )
+                .query_param("client_order_id", format!("cli-{reused}"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "AAPL",
+                    "qty": "50",
+                    "side": "buy",
+                    "status": "new",
+                    "extended_hours": true,
+                    "limit_price": "24.20",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let request = CliOrderRequest::from_cli_args(
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("100"),
+            Direction::Buy,
+            None,
+            None,
+            false,
+            Some(reused),
+        )
+        .unwrap();
+        let mut stdout = Vec::new();
+        super::execute_order_with_writers(request, &ctx, &pool, &mut stdout)
+            .await
+            .unwrap();
+
+        place_mock.assert();
+        lookup_mock.assert();
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("   Order ID: 61e7b016-9c91-4a97-b912-615c9d365c9d\n"),
+            "the ADOPTED broker order id must be reported on its exact line, got:\n{output}"
+        );
+        assert!(
+            output.contains("   Quantity: 50\n"),
+            "the broker-accepted quantity must be reported, not the request's 100:\n{output}"
+        );
+        assert!(
+            output.contains("   Limit Price: $24.2\n"),
+            "the adopted limit price must be reported for a market request:\n{output}"
+        );
+        assert!(
+            output.contains("   Extended Hours: yes\n"),
+            "the adopted extended-hours state must be reported honestly:\n{output}"
+        );
+    }
+
     #[tokio::test]
     async fn test_execute_order_buy_success() {
         let server = MockServer::start();
         let ctx = create_alpaca_broker_api_test_ctx(&server);
         let pool = setup_test_db().await;
-        let (account_mock, asset_mock, order_mock) =
+        let (account_mock, calendar_mock, asset_mock, order_mock) =
             setup_alpaca_broker_market_order_mocks(&server, "AAPL", "100", "buy");
 
         execute_order_with_writers!(
@@ -1711,6 +2398,7 @@ mod tests {
         .unwrap();
 
         account_mock.assert();
+        calendar_mock.assert();
         asset_mock.assert();
         order_mock.assert();
     }
@@ -1720,7 +2408,7 @@ mod tests {
         let server = MockServer::start();
         let ctx = create_alpaca_broker_api_test_ctx(&server);
         let pool = setup_test_db().await;
-        let (account_mock, asset_mock, order_mock) =
+        let (account_mock, calendar_mock, asset_mock, order_mock) =
             setup_alpaca_broker_market_order_mocks(&server, "TSLA", "50", "sell");
 
         execute_order_with_writers!(
@@ -1738,6 +2426,42 @@ mod tests {
         .unwrap();
 
         account_mock.assert();
+        calendar_mock.assert();
+        asset_mock.assert();
+        order_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn order_placer_hedge_path_bypasses_the_session_gate() {
+        let server = MockServer::start();
+        let ctx = create_alpaca_broker_api_test_ctx(&server);
+        let pool = setup_test_db().await;
+        let (account_mock, calendar_mock, asset_mock, order_mock) =
+            setup_alpaca_broker_market_order_mocks(&server, "AAPL", "100", "buy");
+
+        let market_order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: positive_shares("100"),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::cli(Uuid::new_v4()),
+        };
+        execute_broker_order(
+            &ctx,
+            &pool,
+            market_order,
+            None,
+            SessionValidation::Bypass,
+            &mut std::io::sink(),
+        )
+        .await
+        .unwrap();
+
+        account_mock.assert();
+        // The hedge path places without consulting the calendar: the
+        // session gate (whose rejection message names CLI retry flags
+        // the OrderPlacer cannot pass) applies only to interactive
+        // placements.
+        calendar_mock.assert_calls(0);
         asset_mock.assert();
         order_mock.assert();
     }
@@ -1906,6 +2630,10 @@ mod tests {
         let pool = setup_test_db().await;
 
         mock_active_account(&server);
+        // Without the calendar mock the session check fails first and the
+        // test would assert the failure banner without ever reaching the
+        // order POST it claims to exercise.
+        let calendar_mock = mock_regular_session_calendar(&server);
 
         server.mock(|when, then| {
             when.method(httpmock::Method::GET).path("/v1/assets/AAPL");
@@ -1916,11 +2644,11 @@ mod tests {
                     "symbol": "AAPL",
                     "status": "active",
                     "tradable": true,
-                    "overnight_tradable": true
+                    "attributes": ["overnight_tradable"]
                 }));
         });
 
-        server.mock(|when, then| {
+        let order_mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
             then.status(400)
@@ -1943,6 +2671,8 @@ mod tests {
         .await
         .unwrap_err();
 
+        calendar_mock.assert();
+        order_mock.assert();
         let output = String::from_utf8(stdout_buffer).unwrap();
         assert!(
             output.contains("❌ Failed to place order"),
@@ -1982,7 +2712,8 @@ mod tests {
         let server = MockServer::start();
         let ctx = create_alpaca_broker_api_test_ctx(&server);
         let pool = setup_test_db().await;
-        let (account_mock, asset_mock, order_mock) = setup_alpaca_broker_limit_order_mocks(&server);
+        let (account_mock, calendar_mock, asset_mock, order_mock) =
+            setup_alpaca_broker_limit_order_mocks(&server);
 
         let mut stdout_buffer = Vec::new();
         execute_order_with_writers!(
@@ -2000,6 +2731,7 @@ mod tests {
         .unwrap();
 
         account_mock.assert();
+        calendar_mock.assert();
         asset_mock.assert();
         order_mock.assert();
 

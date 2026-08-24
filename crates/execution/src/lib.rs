@@ -60,7 +60,11 @@ pub use st0x_finance::{
 };
 
 /// Alpaca supports a maximum of 9 decimal places for order quantities.
-pub(crate) const ALPACA_MAX_DECIMAL_PLACES: u8 = 9;
+///
+/// Public because it is part of the broker contract consumers validate
+/// against (the CLI rejects over-precise manual quantities before
+/// submission rather than silently truncating them).
+pub const ALPACA_MAX_DECIMAL_PLACES: u8 = 9;
 
 /// Truncates a Float to at most `max_decimals` decimal places.
 ///

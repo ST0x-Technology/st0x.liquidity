@@ -6,6 +6,7 @@ mod audit_source;
 mod backpressure_retry;
 mod cctp;
 mod dividend;
+mod overnight;
 mod rebalancing;
 mod repair;
 mod token_list;
@@ -309,6 +310,11 @@ pub enum Commands {
         /// Submit the limit order as extended-hours eligible
         #[arg(long = "extended-hours", requires = "limit_price")]
         extended_hours: bool,
+        /// Reuse the client order id printed by a previous attempt, so a
+        /// rerun after a lost response adopts the already-accepted order
+        /// instead of creating a second one
+        #[arg(long = "client-order-id")]
+        client_order_id: Option<Uuid>,
     },
     /// Sell shares of a stock
     Sell {
@@ -327,6 +333,11 @@ pub enum Commands {
         /// Submit the limit order as extended-hours eligible
         #[arg(long = "extended-hours", requires = "limit_price")]
         extended_hours: bool,
+        /// Reuse the client order id printed by a previous attempt, so a
+        /// rerun after a lost response adopts the already-accepted order
+        /// instead of creating a second one
+        #[arg(long = "client-order-id")]
+        client_order_id: Option<Uuid>,
     },
     /// Cancel an open Alpaca order by its broker order id
     ///
@@ -335,6 +346,34 @@ pub enum Commands {
     Cancel {
         /// Broker order id (UUID) printed at placement
         order_id: Uuid,
+    },
+    /// Show the current market session (regular, extended, overnight, closed)
+    ///
+    /// Classified from the Alpaca calendar, including the 20:00-04:00 ET
+    /// overnight session. Requires the alpaca-broker-api broker.
+    MarketSession,
+    /// Fetch the latest quote for a symbol
+    ///
+    /// Defaults to the indicative overnight feed (feed=overnight) and prints
+    /// the quote timestamp and age. Requires the alpaca-broker-api broker.
+    Quote {
+        /// Stock symbol (e.g., AAPL, RKLB)
+        #[arg(short = 's', long = "symbol")]
+        symbol: Symbol,
+        /// Feed to query
+        #[arg(long = "feed", value_enum, default_value = "overnight")]
+        feed: overnight::QuoteFeedArg,
+    },
+    /// Show a symbol's Alpaca asset attributes and overnight eligibility
+    ///
+    /// Prints status, tradable, fractionable, fractional_eh_enabled,
+    /// overnight_tradable, overnight_halted, and the derived fractional-order
+    /// and overnight-eligibility verdicts. Requires the alpaca-broker-api
+    /// broker.
+    Asset {
+        /// Stock symbol (e.g., AAPL, RKLB)
+        #[arg(short = 's', long = "symbol")]
+        symbol: Symbol,
     },
     /// Account a missed onchain fill by its transaction hash, then place the
     /// opposite-side hedge.
@@ -980,6 +1019,7 @@ enum SimpleCommand {
         time_in_force: Option<TimeInForce>,
         limit_price: Option<AlpacaLimitPrice>,
         extended_hours: bool,
+        client_order_id: Option<Uuid>,
     },
     Sell {
         symbol: Symbol,
@@ -987,9 +1027,18 @@ enum SimpleCommand {
         time_in_force: Option<TimeInForce>,
         limit_price: Option<AlpacaLimitPrice>,
         extended_hours: bool,
+        client_order_id: Option<Uuid>,
     },
     Cancel {
         order_id: Uuid,
+    },
+    MarketSession,
+    Quote {
+        symbol: Symbol,
+        feed: overnight::QuoteFeedArg,
+    },
+    Asset {
+        symbol: Symbol,
     },
     TransferEquity {
         direction: TransferDirection,
@@ -1340,12 +1389,14 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             time_in_force,
             limit_price,
             extended_hours,
+            client_order_id,
         } => Ok(SimpleCommand::Buy {
             symbol,
             quantity,
             time_in_force,
             limit_price,
             extended_hours,
+            client_order_id,
         }),
         Commands::Sell {
             symbol,
@@ -1353,14 +1404,19 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             time_in_force,
             limit_price,
             extended_hours,
+            client_order_id,
         } => Ok(SimpleCommand::Sell {
             symbol,
             quantity,
             time_in_force,
             limit_price,
             extended_hours,
+            client_order_id,
         }),
         Commands::Cancel { order_id } => Ok(SimpleCommand::Cancel { order_id }),
+        Commands::MarketSession => Ok(SimpleCommand::MarketSession),
+        Commands::Quote { symbol, feed } => Ok(SimpleCommand::Quote { symbol, feed }),
+        Commands::Asset { symbol } => Ok(SimpleCommand::Asset { symbol }),
         Commands::TransferEquity {
             direction,
             symbol,
@@ -1580,6 +1636,7 @@ async fn run_simple_command<W: Write>(
             time_in_force,
             limit_price,
             extended_hours,
+            client_order_id,
         } => {
             let request = trading::CliOrderRequest::from_cli_args(
                 symbol,
@@ -1588,6 +1645,7 @@ async fn run_simple_command<W: Write>(
                 time_in_force,
                 limit_price,
                 extended_hours,
+                client_order_id,
             )
             .map_err(|error| {
                 let _ = writeln!(stdout, "❌ Failed to place order: {error}");
@@ -1601,6 +1659,7 @@ async fn run_simple_command<W: Write>(
             time_in_force,
             limit_price,
             extended_hours,
+            client_order_id,
         } => {
             let request = trading::CliOrderRequest::from_cli_args(
                 symbol,
@@ -1609,6 +1668,7 @@ async fn run_simple_command<W: Write>(
                 time_in_force,
                 limit_price,
                 extended_hours,
+                client_order_id,
             )
             .map_err(|error| {
                 let _ = writeln!(stdout, "❌ Failed to place order: {error}");
@@ -1618,6 +1678,15 @@ async fn run_simple_command<W: Write>(
         }
         SimpleCommand::Cancel { order_id } => {
             trading::cancel_broker_order(ctx, order_id, stdout).await
+        }
+        SimpleCommand::MarketSession => {
+            overnight::market_session_command(stdout, &ctx.broker).await
+        }
+        SimpleCommand::Quote { symbol, feed } => {
+            overnight::quote_command(stdout, &symbol, feed, &ctx.broker).await
+        }
+        SimpleCommand::Asset { symbol } => {
+            overnight::asset_command(stdout, &symbol, &ctx.broker).await
         }
         SimpleCommand::TransferEquity {
             direction,
@@ -2257,6 +2326,88 @@ mod tests {
     }
 
     #[test]
+    fn market_session_command_parses() {
+        let cli = Cli::try_parse_from(["st0x-cli", "market-session"]).unwrap();
+
+        match cli.command {
+            Commands::MarketSession => {}
+            other => panic!("expected market-session command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quote_command_defaults_to_the_overnight_feed() {
+        let cli = Cli::try_parse_from(["st0x-cli", "quote", "-s", "RKLB"]).unwrap();
+
+        match cli.command {
+            Commands::Quote { symbol, feed } => {
+                assert_eq!(symbol, Symbol::new("RKLB").unwrap());
+                assert_eq!(feed, overnight::QuoteFeedArg::Overnight);
+            }
+            other => panic!("expected quote command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quote_command_parses_the_delayed_sip_feed() {
+        let cli = Cli::try_parse_from(["st0x-cli", "quote", "-s", "RKLB", "--feed", "delayed-sip"])
+            .unwrap();
+
+        match cli.command {
+            Commands::Quote { symbol, feed } => {
+                assert_eq!(symbol, Symbol::new("RKLB").unwrap());
+                assert_eq!(feed, overnight::QuoteFeedArg::DelayedSip);
+            }
+            other => panic!("expected quote command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn asset_command_parses_symbol() {
+        let cli = Cli::try_parse_from(["st0x-cli", "asset", "-s", "RKLB"]).unwrap();
+
+        match cli.command {
+            Commands::Asset { symbol } => {
+                assert_eq!(symbol, Symbol::new("RKLB").unwrap());
+            }
+            other => panic!("expected asset command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_command_routes_market_session_as_simple() {
+        let Ok(SimpleCommand::MarketSession) = classify_command(Commands::MarketSession) else {
+            panic!("expected market-session to classify as a simple command");
+        };
+    }
+
+    #[test]
+    fn classify_command_routes_quote_as_simple() {
+        let classified = classify_command(Commands::Quote {
+            symbol: Symbol::new("RKLB").unwrap(),
+            feed: overnight::QuoteFeedArg::DelayedSip,
+        });
+
+        let Ok(SimpleCommand::Quote { symbol, feed }) = classified else {
+            panic!("expected quote to classify as a simple command");
+        };
+        assert_eq!(symbol, Symbol::new("RKLB").unwrap());
+        assert_eq!(feed, overnight::QuoteFeedArg::DelayedSip);
+    }
+
+    #[test]
+    fn classify_command_routes_asset_as_simple() {
+        let classified = classify_command(Commands::Asset {
+            symbol: Symbol::new("RKLB").unwrap(),
+        });
+
+        let Ok(SimpleCommand::Asset { symbol }) = classified else {
+            panic!("expected asset to classify as a simple command");
+        };
+        assert_eq!(symbol, Symbol::new("RKLB").unwrap());
+    }
+
+    #[test]
     fn alpaca_tokenize_parses_hyperevm_network() {
         let cli = Cli::try_parse_from([
             "st0x-cli",
@@ -2428,6 +2579,7 @@ mod tests {
             time_in_force: None,
             limit_price: None,
             extended_hours: false,
+            client_order_id: None,
         };
 
         match classify_command(command) {
@@ -2446,6 +2598,48 @@ mod tests {
                 | ProviderCommand::AlpacaTokenizationRequests,
             ) => panic!("expected simple command classification"),
         }
+    }
+
+    #[test]
+    fn classification_preserves_the_client_order_id_for_buy_and_sell() {
+        // The retry-identity contract: the operator-supplied idempotency
+        // key must survive classification exactly, or a rerun silently
+        // loses its duplicate-adoption recovery.
+        let reused = Uuid::from_u128(0x4d6d_9f40_5434_4f77_89f6_7156_e375_b739);
+
+        let buy = Commands::Buy {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: positive_shares("1"),
+            time_in_force: None,
+            limit_price: None,
+            extended_hours: false,
+            client_order_id: Some(reused),
+        };
+        let Ok(SimpleCommand::Buy {
+            client_order_id: buy_id,
+            ..
+        }) = classify_command(buy)
+        else {
+            panic!("expected buy simple command");
+        };
+        assert_eq!(buy_id, Some(reused));
+
+        let sell = Commands::Sell {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: positive_shares("1"),
+            time_in_force: None,
+            limit_price: None,
+            extended_hours: false,
+            client_order_id: Some(reused),
+        };
+        let Ok(SimpleCommand::Sell {
+            client_order_id: sell_id,
+            ..
+        }) = classify_command(sell)
+        else {
+            panic!("expected sell simple command");
+        };
+        assert_eq!(sell_id, Some(reused));
     }
 
     #[test]
@@ -3928,6 +4122,7 @@ mod tests {
             time_in_force: None,
             limit_price: None,
             extended_hours: false,
+            client_order_id: None,
         };
 
         let mut stdout_buffer = Vec::new();
@@ -3951,6 +4146,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         );
 
         match result {
