@@ -95,11 +95,18 @@ pub(crate) fn truncate_to_decimal_places(
 /// - `Regular` -- standard market hours; market orders are used.
 /// - `Extended` -- pre-market or after-hours; only limit orders with
 ///   `extended_hours: true` are allowed by the broker.
-/// - `Closed` -- outside all trading sessions (weekends, holidays, overnight).
+/// - `Overnight` -- 20:00-04:00 ET on the Blue Ocean ATS; only limit orders
+///   with `day` time-in-force and `extended_hours: true` are allowed, priced
+///   from the indicative overnight feed.
+/// - `Closed` -- outside all trading sessions: weekends, holidays until 20:00
+///   ET that evening (including the overnight window immediately preceding
+///   the holiday), and the gap between an early close's session end and
+///   20:00 ET.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MarketSession {
     Regular,
     Extended,
+    Overnight,
     Closed,
 }
 

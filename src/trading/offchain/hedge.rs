@@ -330,6 +330,18 @@ async fn select_order_kind_for_current_session(
             );
             Ok(None)
         }
+        // Overnight defers like Closed until automated overnight
+        // counter-trading ships; it will then select an overnight limit
+        // order priced from the indicative overnight feed.
+        MarketSession::Overnight => {
+            info!(
+                target: "hedge",
+                %symbol,
+                "Overnight session at perform time; overnight counter-trading is not \
+                 implemented yet, skipping hedge, CheckPositions will re-enqueue"
+            );
+            Ok(None)
+        }
         MarketSession::Extended => {
             if !ctx.assets.is_extended_hours_enabled(symbol) {
                 info!(
@@ -5435,6 +5447,70 @@ mod tests {
         assert_eq!(
             order, None,
             "No market order may be submitted into a closed venue, got: {order:?}"
+        );
+    }
+
+    /// Overnight defers exactly like Closed until automated overnight
+    /// counter-trading ships: a job performing during the overnight session
+    /// must skip without claiming the position or placing any order, even
+    /// with extended hours enabled for the symbol.
+    #[tokio::test]
+    async fn job_skips_without_claiming_during_overnight_session() {
+        let TestInfra {
+            ctx,
+            position_projection,
+            offchain_order_projection,
+            ..
+        } = create_hedge_ctx_with(
+            market_session_overriding_placer(MarketSession::Overnight),
+            extended_hours_assets("AAPL", true),
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let job = PlaceHedge {
+            symbol: symbol.clone(),
+            direction: Direction::Sell,
+            shares: Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+            executor: SupportedExecutor::DryRun,
+            threshold: ExecutionThreshold::whole_share(),
+            offchain_order_id: OffchainOrderId::new(),
+            // Stale serialized session: enqueued during extended hours.
+            market_session: MarketSession::Extended,
+            backpressure_streak: BackpressureStreak::default(),
+            transient_streak: TransientFailureStreak::default(),
+        };
+
+        job.perform(&ctx)
+            .await
+            .expect("a job performing during the overnight session must skip");
+
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "An overnight recheck must not claim the position"
+        );
+
+        let order = offchain_order_projection
+            .load(&job.offchain_order_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            order, None,
+            "No order may be submitted during the overnight session until overnight \
+             counter-trading ships, got: {order:?}"
         );
     }
 
