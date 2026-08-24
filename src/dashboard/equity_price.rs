@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, HeaderValue};
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 use tracing::{debug, info, warn};
 
-use st0x_config::{AssetsConfig, PricingCtx};
+use st0x_config::{AssetsConfig, PricingAuth, PricingCtx};
 use st0x_dto::{EquityPrice, EquityPriceStatus, Statement};
 use st0x_evm::USDC_BASE;
 use st0x_finance::Symbol;
@@ -357,9 +357,18 @@ impl EquityPriceMonitor {
             .as_str()
             .into_client_request()
             .map_err(PricingSessionError::Request)?;
-        let mut authorization =
-            HeaderValue::from_str(&format!("Bearer {}", self.ctx.api_key.bearer_value()))
-                .map_err(PricingSessionError::AuthorizationHeader)?;
+        let bearer = match &self.ctx.auth {
+            PricingAuth::ApiKey(api_key) => api_key.bearer_value().to_string(),
+            // Cloud Run IAM: a fresh ID token per (re)connect from the
+            // instance metadata server -- tokens live ~1h, and the
+            // reconnect loop already re-enters here on every drop, so
+            // expiry never needs its own timer.
+            PricingAuth::GcpIdToken { audience } => {
+                fetch_gcp_identity_token(audience).await?
+            }
+        };
+        let mut authorization = HeaderValue::from_str(&format!("Bearer {bearer}"))
+            .map_err(PricingSessionError::AuthorizationHeader)?;
         authorization.set_sensitive(true);
         request.headers_mut().insert(AUTHORIZATION, authorization);
 
@@ -578,6 +587,37 @@ enum PricingSessionError {
     Encode(#[from] ciborium::ser::Error<io::Error>),
     #[error("pricing WebSocket closed")]
     Closed,
+    #[error("failed to mint a Google ID token for the pricing service")]
+    IdentityToken(#[source] reqwest::Error),
+    #[error("metadata server answered HTTP {0} for the identity token")]
+    IdentityTokenStatus(u16),
+}
+
+/// Mints a Google ID token for `audience` from the GCE instance metadata
+/// server — the VM's ambient service-account identity, the same
+/// no-stored-credential model as the Turnkey KMS stamper. Only reachable
+/// on GCP by construction; the config layer refuses `gcp_id_token`
+/// without wss, and off-GCP this endpoint simply does not resolve.
+async fn fetch_gcp_identity_token(audience: &str) -> Result<String, PricingSessionError> {
+    let url = format!(
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience={audience}"
+    );
+    let response = reqwest::Client::new()
+        .get(&url)
+        .header("Metadata-Flavor", "Google")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(PricingSessionError::IdentityToken)?;
+    if !response.status().is_success() {
+        return Err(PricingSessionError::IdentityTokenStatus(
+            response.status().as_u16(),
+        ));
+    }
+    response
+        .text()
+        .await
+        .map_err(PricingSessionError::IdentityToken)
 }
 
 #[derive(Debug, thiserror::Error)]

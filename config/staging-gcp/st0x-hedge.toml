@@ -26,7 +26,13 @@ apalis_finished_job_cleanup_interval_secs = 3600
 inventory_divergence_threshold = 10
 
 [pricing]
-ws_url = "ws://st0x-pricing:8080/ws"
+# The pricing plane on Cloud Run for THIS environment. Auth is the VM's
+# ambient Google identity (run.invoker on the service, granted in
+# t0.devops' pricing stack) — an ID token minted per connect, no
+# [pricing] secret exists. The droplet's ws://st0x-pricing:8080 was a
+# droplet-local container; it never existed on this VM.
+ws_url = "wss://st0x-pricing-3z4ofantqq-ey.a.run.app/ws"
+gcp_id_token = true
 # Slippage tolerance (basis points) for counter-trades that hedge
 # incoming orderbook fills.
 [broker]
