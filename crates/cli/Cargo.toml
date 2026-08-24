@@ -69,6 +69,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 httpmock.workspace = true
+proptest.workspace = true
 regex = "1.12.3"
 st0x-evm = { workspace = true, features = ["mock", "test-support"] }
 st0x-execution = { workspace = true, features = ["mock", "test-support"] }

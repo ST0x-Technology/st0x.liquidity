@@ -7207,6 +7207,7 @@ dependencies = [
  "clap",
  "event-sorcery",
  "httpmock",
+ "proptest",
  "rain-math-float",
  "regex",
  "reqwest 0.12.28",
