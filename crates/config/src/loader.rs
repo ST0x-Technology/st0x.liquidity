@@ -238,6 +238,7 @@ struct Config {
     database_url: String,
     log_level: Option<LogLevel>,
     log_dir: Option<String>,
+    log_format: Option<LogFormat>,
     server_port: u16,
     board_port: u16,
     raindex: EvmConfig,
@@ -615,6 +616,7 @@ pub struct Ctx {
     pub database_url: String,
     pub log_level: LogLevel,
     pub log_dir: Option<String>,
+    pub log_format: LogFormat,
     pub server_port: u16,
     pub board_port: u16,
     pub evm: EvmCtx,
@@ -773,6 +775,7 @@ impl std::fmt::Debug for Ctx {
             .field("database_url", &self.database_url)
             .field("log_level", &self.log_level)
             .field("log_dir", &self.log_dir)
+            .field("log_format", &self.log_format)
             .field("server_port", &self.server_port)
             .field("board_port", &self.board_port)
             .field("evm", &self.evm)
@@ -837,6 +840,16 @@ pub enum LogLevel {
     Error,
 }
 
+/// Console log output format. `text` is the human readable format; `json`
+/// emits one JSON object per line, the same shape as the rolling file
+/// layer, so a log shipper can parse journald output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
 impl From<LogLevel> for Level {
     fn from(log_level: LogLevel) -> Self {
         match log_level {
@@ -867,6 +880,7 @@ struct ValidatedParts {
     database_url: String,
     log_level: LogLevel,
     log_dir: Option<String>,
+    log_format: LogFormat,
     server_port: u16,
     board_port: u16,
     evm: EvmCtx,
@@ -1141,6 +1155,7 @@ fn parse_and_validate(
     }
 
     let log_level = config.log_level.unwrap_or(LogLevel::Debug);
+    let log_format = config.log_format.unwrap_or(LogFormat::Text);
 
     let ExtendedHoursBrokerWindows {
         reprice_timeout_secs: extended_hours_reprice_timeout_secs,
@@ -1173,6 +1188,7 @@ fn parse_and_validate(
         database_url: config.database_url,
         log_level,
         log_dir: config.log_dir,
+        log_format,
         server_port: config.server_port,
         board_port: config.board_port,
         evm,
@@ -1326,6 +1342,7 @@ impl Ctx {
             database_url: parts.database_url,
             log_level: parts.log_level,
             log_dir: parts.log_dir,
+            log_format: parts.log_format,
             server_port: parts.server_port,
             board_port: parts.board_port,
             evm: parts.evm,
@@ -1656,6 +1673,7 @@ impl Ctx {
             database_url,
             log_level: LogLevel::Debug,
             log_dir: None,
+            log_format: LogFormat::Text,
             server_port,
             board_port,
             evm: EvmCtx {
@@ -2007,6 +2025,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         database_url: ":memory:".to_owned(),
         log_level: LogLevel::Debug,
         log_dir: None,
+        log_format: LogFormat::Text,
         server_port: 8080,
         board_port: 8081,
         evm: EvmCtx {
@@ -2844,6 +2863,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(ctx.log_level, LogLevel::Debug));
+        assert!(matches!(ctx.log_format, LogFormat::Text));
         assert_eq!(ctx.order_polling_interval, 15);
         assert_eq!(ctx.order_polling_max_jitter, 5);
         assert_eq!(ctx.position_check_interval, 60);
@@ -3338,6 +3358,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
             log_level = "warn"
+            log_format = "json"
             server_port = 9090
             order_polling_interval = 30
             order_polling_max_jitter = 10
@@ -3368,6 +3389,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(ctx.log_level, LogLevel::Warn));
+        assert!(matches!(ctx.log_format, LogFormat::Json));
         assert_eq!(ctx.server_port, 9090);
         assert_eq!(ctx.order_polling_interval, 30);
         assert_eq!(ctx.order_polling_max_jitter, 10);

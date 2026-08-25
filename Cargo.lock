@@ -7209,6 +7209,7 @@ dependencies = [
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "parking_lot",
  "proptest",
  "rain-math-float",
  "reqwest 0.12.28",

@@ -144,7 +144,7 @@ mod tests {
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
         AssetsConfig, BrokerCtx, EquitiesConfig, EvmCtx, ExecutionThreshold, IngestionCutoff,
-        InventoryAdapters, InventoryMode, LogLevel, TradingMode,
+        InventoryAdapters, InventoryMode, LogFormat, LogLevel, TradingMode,
     };
 
     use super::*;
@@ -196,6 +196,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             log_dir: None,
+            log_format: LogFormat::Text,
             server_port: 8080,
             board_port: 8081,
             evm: EvmCtx {
