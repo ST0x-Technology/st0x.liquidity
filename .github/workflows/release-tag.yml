@@ -14,8 +14,14 @@ name: release-tag
 #   - no BinAuthz attestation on it   -> fail: a version tag must never
 #     bless an unattested digest.
 #
-# Auth: same deployer identity as build-oci (WIF, master-scoped SA — tags
-# are pushable by the same set who can merge, so this adds no new trust).
+# Auth: NOT the deployer — its WIF binding is exact-match
+# repository_ref@refs/heads/master and can never satisfy a refs/tags/*
+# subject (review catch: the first version of this workflow would have
+# died at auth). Tags authenticate as liquidity-labeler, a dedicated SA
+# bound via attribute.repository (any ref of this repo) whose CUSTOM role
+# can create/update AR tags and read images but structurally cannot push;
+# the verify phase below means it can only ever name digests master CI
+# built and attested. t0.devops production-artifacts/liquidity.tf.
 
 on:
   push:
@@ -30,7 +36,7 @@ env:
   REGION: europe-west3
   AR_REPO: europe-west3-docker.pkg.dev/t0-artifacts/t0-liquidity
   WIF_PROVIDER: projects/684788085322/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
-  DEPLOYER_SA: liquidity-deployer@t0-artifacts.iam.gserviceaccount.com
+  LABELER_SA: liquidity-labeler@t0-artifacts.iam.gserviceaccount.com
   ATTESTOR: projects/t0-artifacts/attestors/liquidity-image
 
 jobs:
@@ -46,7 +52,7 @@ jobs:
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
         with:
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
-          service_account: ${{ env.DEPLOYER_SA }}
+          service_account: ${{ env.LABELER_SA }}
 
       - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
         with:
