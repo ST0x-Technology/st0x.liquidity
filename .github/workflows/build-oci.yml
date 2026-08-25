@@ -262,7 +262,14 @@ jobs:
           grep -q '^GATED_SERVICE_REPLICAS=0$' next.env \
             && echo "gated=true" >> "$GITHUB_OUTPUT" \
             || echo "gated=false" >> "$GITHUB_OUTPUT"
+          # ALL THREE first-party lines, not just the bot: Nix builds are
+          # reproducible, so a dashboard-only merge leaves BOT_IMAGE
+          # identical to the previous roll — matching one line would go
+          # green while the box still runs the old dashboard (review
+          # catch, ueco-jb).
           echo "bot=$(grep '^BOT_IMAGE=' next.env)" >> "$GITHUB_OUTPUT"
+          echo "dashboard=$(grep '^DASHBOARD_IMAGE=' next.env)" >> "$GITHUB_OUTPUT"
+          echo "datasette=$(grep '^DATASETTE_IMAGE=' next.env)" >> "$GITHUB_OUTPUT"
 
           if cmp -s current.env next.env; then
             echo "::notice::images.env already carries these digests — verifying adoption only"
@@ -302,7 +309,9 @@ jobs:
         if: steps.roll.outputs.gated == 'false'
         run: |
           set -euo pipefail
-          want="${{ steps.roll.outputs.bot }}"
+          wants=("${{ steps.roll.outputs.bot }}" \
+                 "${{ steps.roll.outputs.dashboard }}" \
+                 "${{ steps.roll.outputs.datasette }}")
           for _ in $(seq 1 40); do
             # A permission failure must not look like "not adopted yet"
             # (review catch: the deployer SA's grant is conditioned per
@@ -311,7 +320,11 @@ jobs:
             # status: only a successful read may be inspected; a denied
             # read fails loudly at the FIRST poll.
             if out=$(gcloud storage cat "gs://${CONFIG_BUCKET}/deployed.env" 2>&1); then
-              if grep -qxF "$want" <<<"$out"; then
+              adopted=true
+              for want in "${wants[@]}"; do
+                grep -qxF "$want" <<<"$out" || { adopted=false; break; }
+              done
+              if $adopted; then
                 echo "::notice::t0-liquidity-staging rolled to ${GITHUB_SHA}"
                 exit 0
               fi
