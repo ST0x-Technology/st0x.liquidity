@@ -8,10 +8,20 @@
 //! field -- there are no silent threshold defaults, per the financial-integrity
 //! rule.
 
+use std::collections::BTreeMap;
+
 use alloy::primitives::U256;
 use alloy::primitives::utils::{UnitsError, parse_ether};
 use serde::Deserialize;
 use thiserror::Error;
+
+use st0x_evm::Chain;
+
+/// The chains this binary runs a gas monitor on.
+///
+/// A threshold is required for each and rejected for any other chain, so a
+/// misspelled key fails startup instead of silently monitoring nothing.
+pub const GAS_MONITORED_CHAINS: [Chain; 2] = [Chain::Base, Chain::Ethereum];
 
 /// Non-secret alerting settings deserialized from the plaintext config TOML.
 #[derive(Debug, Clone, Deserialize)]
@@ -19,14 +29,13 @@ use thiserror::Error;
 pub struct AlertsConfig {
     /// Telegram chat id alerts are delivered to.
     pub chat_id: i64,
-    /// Base native-ETH balance threshold, expressed as a decimal-ETH string
-    /// (e.g. `"0.05"`). Parsed to wei at load time so a malformed value fails
-    /// fast.
-    pub base_low_balance_threshold: String,
-    /// Ethereum native-ETH balance threshold, expressed as a decimal-ETH
-    /// string. Required independently from the Base threshold so neither chain
-    /// can silently inherit the other's operational limit.
-    pub ethereum_low_balance_threshold: String,
+    /// Native-gas balance threshold per chain, as decimal-ETH strings (e.g.
+    /// `"0.05"`), parsed to wei at load time so a malformed value fails fast.
+    ///
+    /// Keyed by chain rather than one field per chain: a single global figure
+    /// would be simultaneously too low on an expensive chain and too high on a
+    /// cheap one, and every monitored chain must state its own.
+    pub low_balance_thresholds: BTreeMap<Chain, String>,
     /// Seconds between native-balance polls.
     pub poll_interval: u64,
     /// Minimum seconds between repeated low-balance alerts while the balance
@@ -64,10 +73,9 @@ impl std::fmt::Debug for AlertsSecrets {
 pub struct AlertsCtx {
     pub chat_id: i64,
     pub bot_token: String,
-    /// Base low-balance threshold in wei.
-    pub base_low_balance_threshold_wei: U256,
-    /// Ethereum low-balance threshold in wei.
-    pub ethereum_low_balance_threshold_wei: U256,
+    /// Low-balance threshold in wei, per monitored chain. Validated at
+    /// construction to hold exactly [`GAS_MONITORED_CHAINS`].
+    low_balance_thresholds_wei: BTreeMap<Chain, U256>,
     pub poll_interval: std::time::Duration,
     pub realert_interval: std::time::Duration,
     /// Forum topic to deliver alerts into, or `None` for the default topic.
@@ -80,12 +88,8 @@ impl std::fmt::Debug for AlertsCtx {
             .field("chat_id", &self.chat_id)
             .field("bot_token", &"[REDACTED]")
             .field(
-                "base_low_balance_threshold_wei",
-                &self.base_low_balance_threshold_wei,
-            )
-            .field(
-                "ethereum_low_balance_threshold_wei",
-                &self.ethereum_low_balance_threshold_wei,
+                "low_balance_thresholds_wei",
+                &self.low_balance_thresholds_wei,
             )
             .field("poll_interval", &self.poll_interval)
             .field("realert_interval", &self.realert_interval)
@@ -95,6 +99,33 @@ impl std::fmt::Debug for AlertsCtx {
 }
 
 impl AlertsCtx {
+    /// The low-balance threshold for `chain`, or `None` when no gas monitor
+    /// runs on it. Total for every chain in [`GAS_MONITORED_CHAINS`], because
+    /// [`Self::new`] refuses a config that omits one.
+    pub fn low_balance_threshold_wei(&self, chain: Chain) -> Option<U256> {
+        self.low_balance_thresholds_wei.get(&chain).copied()
+    }
+
+    /// An alerts context with the given per-chain thresholds, for tests and
+    /// fixtures. Production contexts come from [`Self::new`], which is what
+    /// validates the threshold map against [`GAS_MONITORED_CHAINS`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(
+        chat_id: i64,
+        low_balance_thresholds_wei: BTreeMap<Chain, U256>,
+        poll_interval: std::time::Duration,
+        realert_interval: std::time::Duration,
+    ) -> Self {
+        Self {
+            chat_id,
+            bot_token: "test-token".to_owned(),
+            low_balance_thresholds_wei,
+            poll_interval,
+            realert_interval,
+            message_thread_id: None,
+        }
+    }
+
     pub fn new(
         config: Option<AlertsConfig>,
         secrets: Option<AlertsSecrets>,
@@ -113,20 +144,28 @@ impl AlertsCtx {
                     });
                 }
 
-                let base_low_balance_threshold_wei = parse_threshold(
-                    "base_low_balance_threshold",
-                    &config.base_low_balance_threshold,
-                )?;
-                let ethereum_low_balance_threshold_wei = parse_threshold(
-                    "ethereum_low_balance_threshold",
-                    &config.ethereum_low_balance_threshold,
-                )?;
+                for chain in config.low_balance_thresholds.keys() {
+                    if !GAS_MONITORED_CHAINS.contains(chain) {
+                        return Err(AlertsAssemblyError::UnmonitoredChain { chain: *chain });
+                    }
+                }
+
+                let low_balance_thresholds_wei = GAS_MONITORED_CHAINS
+                    .into_iter()
+                    .map(|chain| {
+                        let raw = config
+                            .low_balance_thresholds
+                            .get(&chain)
+                            .ok_or(AlertsAssemblyError::MissingThreshold { chain })?;
+
+                        Ok((chain, parse_threshold(chain, raw)?))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, AlertsAssemblyError>>()?;
 
                 Ok(Some(Self {
                     chat_id: config.chat_id,
                     bot_token: secrets.bot_token,
-                    base_low_balance_threshold_wei,
-                    ethereum_low_balance_threshold_wei,
+                    low_balance_thresholds_wei,
                     poll_interval: std::time::Duration::from_secs(config.poll_interval),
                     realert_interval: std::time::Duration::from_secs(config.realert_interval),
                     message_thread_id: config.message_thread_id,
@@ -139,15 +178,15 @@ impl AlertsCtx {
     }
 }
 
-fn parse_threshold(field: &'static str, value: &str) -> Result<U256, AlertsAssemblyError> {
+fn parse_threshold(chain: Chain, value: &str) -> Result<U256, AlertsAssemblyError> {
     let threshold = parse_ether(value).map_err(|source| AlertsAssemblyError::InvalidThreshold {
-        field,
+        chain,
         value: value.to_owned(),
         source,
     })?;
 
     if threshold.is_zero() {
-        return Err(AlertsAssemblyError::ZeroThreshold { field });
+        return Err(AlertsAssemblyError::ZeroThreshold { chain });
     }
 
     Ok(threshold)
@@ -161,15 +200,29 @@ pub enum AlertsAssemblyError {
     ConfigMissing,
     #[error("[alerts] {field} must be non-zero")]
     ZeroInterval { field: &'static str },
-    #[error("[alerts] {field} must be greater than zero")]
-    ZeroThreshold { field: &'static str },
-    #[error("[alerts] {field} {value} is not a valid decimal-ETH amount")]
+    #[error("[alerts.low_balance_thresholds] {chain} must be greater than zero")]
+    ZeroThreshold { chain: Chain },
+    #[error(
+        "[alerts.low_balance_thresholds] {chain} value {value} is not a valid \
+         decimal-ETH amount"
+    )]
     InvalidThreshold {
-        field: &'static str,
+        chain: Chain,
         value: String,
         #[source]
         source: UnitsError,
     },
+    #[error(
+        "[alerts.low_balance_thresholds] is missing {chain}; every chain the gas \
+         monitor runs on needs its own threshold, because one figure cannot be \
+         right for both an expensive chain and a cheap one"
+    )]
+    MissingThreshold { chain: Chain },
+    #[error(
+        "[alerts.low_balance_thresholds] configures {chain}, which this binary runs \
+         no gas monitor on, so the threshold would never be read"
+    )]
+    UnmonitoredChain { chain: Chain },
 }
 
 #[cfg(test)]
@@ -179,8 +232,10 @@ mod tests {
     fn valid_config() -> AlertsConfig {
         AlertsConfig {
             chat_id: -1_001_234_567_890,
-            base_low_balance_threshold: "0.05".to_owned(),
-            ethereum_low_balance_threshold: "0.01".to_owned(),
+            low_balance_thresholds: BTreeMap::from([
+                (Chain::Base, "0.05".to_owned()),
+                (Chain::Ethereum, "0.01".to_owned()),
+            ]),
             poll_interval: 300,
             realert_interval: 3600,
             message_thread_id: None,
@@ -193,39 +248,49 @@ mod tests {
         }
     }
 
+    /// The table is required, not defaulted: an `[alerts]` section without it
+    /// would parse into an empty map, and a gas monitor with no threshold is
+    /// a monitor that never alerts.
     #[test]
-    fn config_requires_base_threshold() {
+    fn config_requires_a_threshold_table() {
+        let error = toml::from_str::<AlertsConfig>(
+            "
+            chat_id = 1
+            poll_interval = 300
+            realert_interval = 3600
+            ",
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("low_balance_thresholds"),
+            "a missing threshold table must fail explicitly, got: {error}"
+        );
+    }
+
+    /// A config still carrying the retired per-chain field names supplies no
+    /// thresholds at all. Rejecting them by name is what turns a stale config
+    /// into a startup failure instead of a monitor that silently never fires.
+    #[test]
+    fn config_rejects_the_retired_flat_threshold_fields() {
         let error = toml::from_str::<AlertsConfig>(
             r#"
             chat_id = 1
+            base_low_balance_threshold = "0.05"
             ethereum_low_balance_threshold = "0.01"
             poll_interval = 300
             realert_interval = 3600
+
+            [low_balance_thresholds]
+            base = "0.05"
+            ethereum = "0.01"
             "#,
         )
         .unwrap_err();
 
         assert!(
             error.to_string().contains("base_low_balance_threshold"),
-            "missing Base threshold must fail explicitly, got: {error}"
-        );
-    }
-
-    #[test]
-    fn config_requires_ethereum_threshold() {
-        let error = toml::from_str::<AlertsConfig>(
-            r#"
-            chat_id = 1
-            base_low_balance_threshold = "0.05"
-            poll_interval = 300
-            realert_interval = 3600
-            "#,
-        )
-        .unwrap_err();
-
-        assert!(
-            error.to_string().contains("ethereum_low_balance_threshold"),
-            "missing Ethereum threshold must fail explicitly, got: {error}"
+            "the retired field must be rejected by name, got: {error}"
         );
     }
 
@@ -239,12 +304,12 @@ mod tests {
         assert_eq!(ctx.bot_token, "123:abc");
         // 0.05 ETH = 5 * 10^16 wei.
         assert_eq!(
-            ctx.base_low_balance_threshold_wei,
-            U256::from(50_000_000_000_000_000_u64)
+            ctx.low_balance_threshold_wei(Chain::Base),
+            Some(U256::from(50_000_000_000_000_000_u64))
         );
         assert_eq!(
-            ctx.ethereum_low_balance_threshold_wei,
-            U256::from(10_000_000_000_000_000_u64)
+            ctx.low_balance_threshold_wei(Chain::Ethereum),
+            Some(U256::from(10_000_000_000_000_000_u64))
         );
         assert_eq!(ctx.poll_interval, std::time::Duration::from_secs(300));
         assert_eq!(ctx.realert_interval, std::time::Duration::from_secs(3600));
@@ -275,26 +340,118 @@ mod tests {
     #[test]
     fn new_fails_fast_on_bad_base_threshold() {
         let mut config = valid_config();
-        config.base_low_balance_threshold = "not-a-number".to_owned();
+        config
+            .low_balance_thresholds
+            .insert(Chain::Base, "not-a-number".to_owned());
 
         let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
 
         assert!(
-            matches!(error, AlertsAssemblyError::InvalidThreshold { field: "base_low_balance_threshold", ref value, .. } if value == "not-a-number"),
-            "expected InvalidThreshold carrying the Base field and offending value, got: {error}"
+            matches!(
+                error,
+                AlertsAssemblyError::InvalidThreshold {
+                    chain: Chain::Base,
+                    ref value,
+                    ..
+                } if value == "not-a-number"
+            ),
+            "expected InvalidThreshold naming Base and the offending value, got: {error}"
         );
     }
 
     #[test]
     fn new_fails_fast_on_bad_ethereum_threshold() {
         let mut config = valid_config();
-        config.ethereum_low_balance_threshold = "not-a-number".to_owned();
+        config
+            .low_balance_thresholds
+            .insert(Chain::Ethereum, "not-a-number".to_owned());
 
         let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
 
         assert!(
-            matches!(error, AlertsAssemblyError::InvalidThreshold { field: "ethereum_low_balance_threshold", ref value, .. } if value == "not-a-number"),
-            "expected InvalidThreshold carrying the Ethereum field and offending value, got: {error}"
+            matches!(
+                error,
+                AlertsAssemblyError::InvalidThreshold {
+                    chain: Chain::Ethereum,
+                    ref value,
+                    ..
+                } if value == "not-a-number"
+            ),
+            "expected InvalidThreshold naming Ethereum and the offending value, got: {error}"
+        );
+    }
+
+    /// A monitored chain with no threshold has no balance to compare against.
+    /// Substituting one would either never alert (zero) or alert at the wrong
+    /// balance, so the config is refused instead.
+    #[test]
+    fn new_rejects_a_monitored_chain_without_a_threshold() {
+        let mut config = valid_config();
+        config.low_balance_thresholds.remove(&Chain::Ethereum);
+
+        let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AlertsAssemblyError::MissingThreshold {
+                    chain: Chain::Ethereum
+                }
+            ),
+            "expected MissingThreshold for Ethereum, got: {error}"
+        );
+    }
+
+    /// A threshold for a chain no monitor runs on would never be read. Taking
+    /// it silently would make a misspelled or premature key look configured.
+    #[test]
+    fn new_rejects_a_threshold_for_an_unmonitored_chain() {
+        let mut config = valid_config();
+        config
+            .low_balance_thresholds
+            .insert(Chain::HyperEvm, "0.05".to_owned());
+
+        let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AlertsAssemblyError::UnmonitoredChain {
+                    chain: Chain::HyperEvm
+                }
+            ),
+            "expected UnmonitoredChain for HyperEVM, got: {error}"
+        );
+    }
+
+    #[test]
+    fn thresholds_parse_from_a_chain_keyed_table() {
+        let config: AlertsConfig = toml::from_str(
+            r#"
+            chat_id = 1
+            poll_interval = 300
+            realert_interval = 3600
+
+            [low_balance_thresholds]
+            base = "0.05"
+            ethereum = "0.01"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config
+                .low_balance_thresholds
+                .get(&Chain::Base)
+                .map(String::as_str),
+            Some("0.05")
+        );
+        assert_eq!(
+            config
+                .low_balance_thresholds
+                .get(&Chain::Ethereum)
+                .map(String::as_str),
+            Some("0.01")
         );
     }
 
@@ -319,15 +476,15 @@ mod tests {
     #[test]
     fn new_rejects_zero_base_threshold() {
         let mut config = valid_config();
-        config.base_low_balance_threshold = "0".to_owned();
+        config
+            .low_balance_thresholds
+            .insert(Chain::Base, "0".to_owned());
 
         let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
         assert!(
             matches!(
                 error,
-                AlertsAssemblyError::ZeroThreshold {
-                    field: "base_low_balance_threshold"
-                }
+                AlertsAssemblyError::ZeroThreshold { chain: Chain::Base }
             ),
             "expected ZeroThreshold for Base, got: {error}"
         );
@@ -336,14 +493,16 @@ mod tests {
     #[test]
     fn new_rejects_zero_ethereum_threshold() {
         let mut config = valid_config();
-        config.ethereum_low_balance_threshold = "0".to_owned();
+        config
+            .low_balance_thresholds
+            .insert(Chain::Ethereum, "0".to_owned());
 
         let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
         assert!(
             matches!(
                 error,
                 AlertsAssemblyError::ZeroThreshold {
-                    field: "ethereum_low_balance_threshold"
+                    chain: Chain::Ethereum
                 }
             ),
             "expected ZeroThreshold for Ethereum, got: {error}"

@@ -42,7 +42,7 @@ use st0x_event_sorcery::{
     AggregateError, EventSourced, LifecycleError, Projection, ProjectionError, RetryOnBusy,
     SendError, Store, StoreBuilder, compact_events, incremental_vacuum, load_all_ids, load_entity,
 };
-use st0x_evm::{OpenChainErrorRegistry, USDC_BASE, Wallet};
+use st0x_evm::{Chain, OpenChainErrorRegistry, USDC_BASE, Wallet};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, ClientOrderId, CounterTradePreflight,
     CounterTradeReservation, CounterTradeSkipReason, ExecutionError, Executor, FractionalShares,
@@ -2014,7 +2014,7 @@ where
     let authorizer = match ctx
         .orchestrator
         .as_ref()
-        .map(|config| config.addresses.base)
+        .map(|config| config.addresses.get(Chain::Base))
     {
         Some(Some(base_orchestrator)) => ConfiguredMintAuthorizer::Enabled(Arc::new(
             MintAuthorizationService::new(base_wallet.clone(), base_orchestrator),
@@ -4549,6 +4549,7 @@ mod tests {
     use apalis::prelude::Status;
     use rain_math_float::Float;
     use sqlx::{ConnectOptions, SqlitePool};
+    use std::collections::BTreeMap;
     use std::future::pending;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex, RwLock};
@@ -13461,15 +13462,15 @@ mod tests {
     /// which shares this exact code path with a different `channel` string.
     #[tokio::test]
     async fn build_usdc_notifier_returns_ok_telegram_when_alerts_present() {
-        let alerts = st0x_config::AlertsCtx {
-            chat_id: 123,
-            bot_token: "test-bot-token".to_string(),
-            base_low_balance_threshold_wei: U256::from(0u64),
-            ethereum_low_balance_threshold_wei: U256::from(0u64),
-            poll_interval: std::time::Duration::from_secs(60),
-            realert_interval: std::time::Duration::from_secs(3600),
-            message_thread_id: Some(42),
-        };
+        let alerts = st0x_config::AlertsCtx::for_test(
+            123,
+            BTreeMap::from([
+                (Chain::Base, U256::from(1u64)),
+                (Chain::Ethereum, U256::from(1u64)),
+            ]),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(3600),
+        );
 
         build_alert_notifier(Some(&alerts), "USDC alerting")
             .expect("a well-formed [alerts] config must yield a notifier, not a startup error");
@@ -13555,10 +13556,10 @@ mod tests {
     #[tokio::test]
     async fn orchestrator_base_entry_enables_mint_authorization() {
         let (_pool, apalis_pool) = setup_test_pools().await;
-        let ctx = ctx_with_orchestrator(Some(OrchestratorAddresses {
-            base: Some(address!("0x4444444444444444444444444444444444444444")),
-            ethereum: None,
-        }));
+        let ctx = ctx_with_orchestrator(Some(OrchestratorAddresses::from_iter([(
+            Chain::Base,
+            address!("0x4444444444444444444444444444444444444444"),
+        )])));
 
         let infra =
             build_mint_authorization_infra(&ctx, &apalis_pool, &mint_authorization_test_wallet())
@@ -13581,10 +13582,10 @@ mod tests {
     #[tracing_test::traced_test]
     async fn ethereum_only_orchestrator_config_disables_mint_authorization() {
         let (_pool, apalis_pool) = setup_test_pools().await;
-        let ctx = ctx_with_orchestrator(Some(OrchestratorAddresses {
-            base: None,
-            ethereum: Some(address!("0x5555555555555555555555555555555555555555")),
-        }));
+        let ctx = ctx_with_orchestrator(Some(OrchestratorAddresses::from_iter([(
+            Chain::Ethereum,
+            address!("0x5555555555555555555555555555555555555555"),
+        )])));
 
         let infra =
             build_mint_authorization_infra(&ctx, &apalis_pool, &mint_authorization_test_wallet())

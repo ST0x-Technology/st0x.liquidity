@@ -154,10 +154,10 @@ chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 # recipient authorizations for orchestrator-mode mints. Which assets are
 # orchestrator-mode is owned by the issuance bot (the vault_mode field on its
 # per-asset status endpoint); this section only supplies contract addresses,
-# one per network (each chain carries its own deployment; known keys: base,
-# ethereum). Mint authorization signs against the base entry — every
-# tokenized equity the bot mints lives on Base. Omit while every asset is
-# vault-direct. When present, an empty map, an unknown network key, or a
+# one per chain (each chain carries its own deployment; the keys are chain
+# names: base, ethereum, hyperevm). Mint authorization signs against the base
+# entry — every tokenized equity the bot mints lives on Base. Omit while every
+# asset is vault-direct. When present, an empty map, an unknown chain key, or a
 # malformed or zero address fails config validation even before any asset
 # cuts over.
 # [orchestrator.addresses]
@@ -231,10 +231,12 @@ rebalancing = "enabled"
 # [alerts]
 # Telegram chat the alerts are delivered to (a negative id for group/channel).
 # chat_id = -1001234567890
-# Per-chain native-ETH balances below which alerts fire, as decimal-ETH
-# strings. Both are required; neither chain falls back to the other.
-# base_low_balance_threshold = "0.05"
-# ethereum_low_balance_threshold = "0.05"
+# Native-gas balance below which alerts fire, per chain, as decimal-ETH
+# strings. Required for every chain the gas monitor runs on (base, ethereum);
+# a chain the monitor does not cover is rejected rather than ignored.
+# [alerts.low_balance_thresholds]
+# base = "0.05"
+# ethereum = "0.05"
 # Seconds between native-balance polls.
 # poll_interval = 300
 # Minimum seconds between repeated low-balance alerts while still low; 12h

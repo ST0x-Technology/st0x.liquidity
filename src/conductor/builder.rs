@@ -113,6 +113,11 @@ pub(crate) enum ConductorSpawnError {
     CloseFlattenWindow(#[from] chrono::OutOfRangeError),
     #[error(transparent)]
     CloseFlattenCrossRamp(#[from] CloseFlattenCrossRampError),
+    #[error(
+        "[alerts.low_balance_thresholds] has no entry for {chain}, but a gas monitor \
+         runs on it"
+    )]
+    MissingGasThreshold { chain: Chain },
     #[error("[alerts] requires a configured [wallet] section")]
     AlertsRequireWallet,
 }
@@ -346,7 +351,7 @@ where
             ethereum_wallet.provider().clone(),
             ethereum_wallet.address(),
             notifier.clone(),
-        ))
+        )?)
     } else {
         None
     };
@@ -1086,7 +1091,12 @@ fn alerts_with_wallet(
     })
 }
 
-/// Builds the Base and Ethereum low-gas monitors from `[alerts]`.
+/// Builds one low-gas monitor per chain in [`GAS_MONITORED_CHAINS`].
+///
+/// Fails when a monitored chain has no threshold rather than substituting one:
+/// a zero threshold never alerts, and any other guess alerts at the wrong
+/// balance. `AlertsCtx::new` already rejects such a config, so reaching this
+/// error means the two lists have drifted apart.
 fn build_gas_monitors<BaseProv, EthereumProv>(
     alerts: &AlertsCtx,
     base_provider: BaseProv,
@@ -1094,18 +1104,24 @@ fn build_gas_monitors<BaseProv, EthereumProv>(
     ethereum_provider: EthereumProv,
     ethereum_wallet: Address,
     notifier: Arc<dyn Notifier>,
-) -> [GasMonitor; 2]
+) -> Result<[GasMonitor; 2], ConductorSpawnError>
 where
     BaseProv: Provider + Send + Sync + 'static,
     EthereumProv: Provider + Send + Sync + 'static,
 {
-    [
+    let threshold = |chain: Chain| {
+        alerts
+            .low_balance_threshold_wei(chain)
+            .ok_or(ConductorSpawnError::MissingGasThreshold { chain })
+    };
+
+    Ok([
         GasMonitor {
             balance_reader: Arc::new(ProviderBalanceReader::new(base_provider)),
             notifier: notifier.clone(),
             wallet: base_wallet,
             chain: Chain::Base,
-            threshold_wei: alerts.base_low_balance_threshold_wei,
+            threshold_wei: threshold(Chain::Base)?,
             poll_interval: alerts.poll_interval,
             realert_interval: alerts.realert_interval,
         },
@@ -1114,11 +1130,11 @@ where
             notifier,
             wallet: ethereum_wallet,
             chain: Chain::Ethereum,
-            threshold_wei: alerts.ethereum_low_balance_threshold_wei,
+            threshold_wei: threshold(Chain::Ethereum)?,
             poll_interval: alerts.poll_interval,
             realert_interval: alerts.realert_interval,
         },
-    ]
+    ])
 }
 
 fn log_optional_task_status(task_name: &str, is_configured: bool) {
@@ -1493,20 +1509,58 @@ mod tests {
     #[test]
     fn alerts_require_a_configured_wallet() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.alerts = Some(AlertsCtx {
-            chat_id: 1,
-            bot_token: "token".to_owned(),
-            base_low_balance_threshold_wei: U256::from(100_u64),
-            ethereum_low_balance_threshold_wei: U256::from(200_u64),
-            poll_interval: Duration::from_secs(300),
-            realert_interval: Duration::from_secs(3600),
-            message_thread_id: None,
-        });
+        ctx.alerts = Some(AlertsCtx::for_test(
+            1,
+            BTreeMap::from([
+                (Chain::Base, U256::from(100_u64)),
+                (Chain::Ethereum, U256::from(200_u64)),
+            ]),
+            Duration::from_secs(300),
+            Duration::from_secs(3600),
+        ));
 
         assert!(matches!(
             alerts_with_wallet(&ctx),
             Err(ConductorSpawnError::AlertsRequireWallet)
         ));
+    }
+
+    /// `AlertsCtx::new` refuses a config missing a monitored chain's
+    /// threshold, so reaching this error means the monitored-chain list and
+    /// the configured map have drifted apart. It must fail rather than
+    /// substitute a value: zero never alerts, and anything else alerts at the
+    /// wrong balance.
+    #[tokio::test]
+    async fn a_monitored_chain_without_a_threshold_fails_to_build_its_monitor() {
+        let alerts = AlertsCtx::for_test(
+            1,
+            BTreeMap::from([(Chain::Base, U256::from(100_u64))]),
+            Duration::from_secs(300),
+            Duration::from_secs(3600),
+        );
+
+        let error = build_gas_monitors(
+            &alerts,
+            ProviderBuilder::new().connect_mocked_client(Asserter::new()),
+            address!("0x0000000000000000000000000000000000000ba5"),
+            ProviderBuilder::new().connect_mocked_client(Asserter::new()),
+            address!("0x0000000000000000000000000000000000000e78"),
+            Arc::new(crate::alerts::NoopNotifier),
+        );
+
+        let Err(error) = error else {
+            panic!("a monitored chain with no threshold must not build a monitor")
+        };
+
+        assert!(
+            matches!(
+                error,
+                ConductorSpawnError::MissingGasThreshold {
+                    chain: Chain::Ethereum
+                }
+            ),
+            "expected MissingGasThreshold for Ethereum, got: {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -1516,15 +1570,15 @@ mod tests {
         let ethereum_asserter = Asserter::new();
         ethereum_asserter.push_success(&U256::from(22_u64));
 
-        let alerts = AlertsCtx {
-            chat_id: 1,
-            bot_token: "token".to_owned(),
-            base_low_balance_threshold_wei: U256::from(100_u64),
-            ethereum_low_balance_threshold_wei: U256::from(200_u64),
-            poll_interval: Duration::from_secs(300),
-            realert_interval: Duration::from_secs(3600),
-            message_thread_id: None,
-        };
+        let alerts = AlertsCtx::for_test(
+            1,
+            BTreeMap::from([
+                (Chain::Base, U256::from(100_u64)),
+                (Chain::Ethereum, U256::from(200_u64)),
+            ]),
+            Duration::from_secs(300),
+            Duration::from_secs(3600),
+        );
         let base_wallet = address!("0x0000000000000000000000000000000000000ba5");
         let ethereum_wallet = address!("0x0000000000000000000000000000000000000e78");
         let [base, ethereum] = build_gas_monitors(
@@ -1534,7 +1588,8 @@ mod tests {
             ProviderBuilder::new().connect_mocked_client(ethereum_asserter),
             ethereum_wallet,
             Arc::new(crate::alerts::NoopNotifier),
-        );
+        )
+        .unwrap();
 
         assert_eq!(base.wallet, base_wallet);
         assert_eq!(base.chain, Chain::Base);

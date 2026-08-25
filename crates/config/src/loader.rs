@@ -2268,10 +2268,12 @@ mod tests {
 
             [alerts]
             chat_id = 1
-            base_low_balance_threshold = "{base_threshold}"
-            ethereum_low_balance_threshold = "{ethereum_threshold}"
             poll_interval = 300
             realert_interval = 3600
+
+            [alerts.low_balance_thresholds]
+            base = "{base_threshold}"
+            ethereum = "{ethereum_threshold}"
             "#,
         ))
     }
@@ -2854,10 +2856,12 @@ mod tests {
 
             [alerts]
             chat_id = -1_001_234_567_890
-            base_low_balance_threshold = "0.05"
-            ethereum_low_balance_threshold = "0.01"
             poll_interval = 300
             realert_interval = 3600
+
+            [alerts.low_balance_thresholds]
+            base = "0.05"
+            ethereum = "0.01"
         "#,
         );
         let secrets = toml_file(
@@ -2894,12 +2898,12 @@ mod tests {
         let alerts = ctx.alerts.unwrap();
         assert_eq!(alerts.chat_id, -1_001_234_567_890);
         assert_eq!(
-            alerts.base_low_balance_threshold_wei,
-            alloy::primitives::U256::from(50_000_000_000_000_000_u64)
+            alerts.low_balance_threshold_wei(Chain::Base),
+            Some(alloy::primitives::U256::from(50_000_000_000_000_000_u64))
         );
         assert_eq!(
-            alerts.ethereum_low_balance_threshold_wei,
-            alloy::primitives::U256::from(10_000_000_000_000_000_u64)
+            alerts.low_balance_threshold_wei(Chain::Ethereum),
+            Some(alloy::primitives::U256::from(10_000_000_000_000_000_u64))
         );
         assert_eq!(alerts.poll_interval, std::time::Duration::from_secs(300));
         assert_eq!(
@@ -2945,9 +2949,9 @@ mod tests {
         "#,
         );
 
-        for (base_threshold, ethereum_threshold, expected_field) in [
-            ("not-a-number", "0.01", "base_low_balance_threshold"),
-            ("0.05", "not-a-number", "ethereum_low_balance_threshold"),
+        for (base_threshold, ethereum_threshold, expected_chain) in [
+            ("not-a-number", "0.01", Chain::Base),
+            ("0.05", "not-a-number", Chain::Ethereum),
         ] {
             let config = alerts_config_toml(base_threshold, ethereum_threshold);
             let error = Ctx::load_files(config.path(), secrets.path())
@@ -2958,10 +2962,10 @@ mod tests {
                 matches!(
                     &error,
                     CtxError::Alerts(
-                        crate::alerts::AlertsAssemblyError::InvalidThreshold { field, .. }
-                    ) if *field == expected_field
+                        crate::alerts::AlertsAssemblyError::InvalidThreshold { chain, .. }
+                    ) if *chain == expected_chain
                 ),
-                "expected Alerts(InvalidThreshold) for {expected_field}, got: {error}"
+                "expected Alerts(InvalidThreshold) for {expected_chain}, got: {error}"
             );
         }
     }
@@ -4348,7 +4352,7 @@ mod tests {
             .orchestrator
             .expect("orchestrator should be Some when configured");
         assert_eq!(
-            orchestrator.addresses.base,
+            orchestrator.addresses.get(Chain::Base),
             Some(address!("0x4444444444444444444444444444444444444444"))
         );
     }
