@@ -1710,9 +1710,17 @@ async fn run_simple_command<W: Write>(
             transfer_type,
             id,
             reason,
-        } => rebalancing::fail_transfer_command(stdout, pool, transfer_type, &id, &reason).await,
+        } => {
+            let result =
+                rebalancing::fail_transfer_command(stdout, pool, transfer_type, &id, &reason).await;
+            write_log_query_url(stdout, ctx, &id)?;
+            result
+        }
         SimpleCommand::RecheckTransfer { transfer_type, id } => {
-            rebalancing::recheck_transfer_command(stdout, transfer_type, &id, ctx).await
+            let result =
+                rebalancing::recheck_transfer_command(stdout, transfer_type, &id, ctx).await;
+            write_log_query_url(stdout, ctx, &id)?;
+            result
         }
         SimpleCommand::ResumeInterruptedTransfers => {
             rebalancing::resume_interrupted_transfers_command(stdout, ctx).await
@@ -1724,23 +1732,48 @@ async fn run_simple_command<W: Write>(
             // `AuditReason` rejects blanks at the CLI boundary. This secondary
             // parse also constrains USDC reconciliation to its fixed vocabulary.
             let reason = parse_usdc_reconcile_reason(reason.as_ref())?;
-            rebalancing::reconcile_usdc_transfer_command(stdout, id, reason.into(), pool).await
+            let result =
+                rebalancing::reconcile_usdc_transfer_command(stdout, id, reason.into(), pool).await;
+            write_log_query_url(stdout, ctx, &id.to_string())?;
+            result
         }
         SimpleCommand::FailUsdcTransfer { id, reason } => {
-            rebalancing::fail_usdc_transfer_command(stdout, id, &reason, pool).await
+            let result = rebalancing::fail_usdc_transfer_command(stdout, id, &reason, pool).await;
+            write_log_query_url(stdout, ctx, &id.to_string())?;
+            result
         }
         SimpleCommand::ReconcileEquityTransfer {
             transfer_type,
             id,
             reason,
         } => {
-            rebalancing::reconcile_equity_transfer_command(stdout, transfer_type, &id, reason, pool)
-                .await
+            let result = rebalancing::reconcile_equity_transfer_command(
+                stdout,
+                transfer_type,
+                &id,
+                reason,
+                pool,
+            )
+            .await;
+            write_log_query_url(stdout, ctx, &id)?;
+            result
         }
         SimpleCommand::ClearPendingBurn { id, reason } => {
-            rebalancing::clear_pending_burn_command(stdout, id, &reason, pool).await
+            let result = rebalancing::clear_pending_burn_command(stdout, id, &reason, pool).await;
+            write_log_query_url(stdout, ctx, &id.to_string())?;
+            result
         }
     }
+}
+
+/// Prints `log_query_url_template` with `{id}` substituted, after the command
+/// regardless of its outcome. `None` prints nothing.
+fn write_log_query_url<W: Write>(stdout: &mut W, ctx: &Ctx, id: &str) -> anyhow::Result<()> {
+    let Some(template) = &ctx.log_query_url_template else {
+        return Ok(());
+    };
+    writeln!(stdout, "Logs: {}", template.replace("{id}", id))?;
+    Ok(())
 }
 
 async fn rebuild_view<W: Write>(
@@ -2052,6 +2085,7 @@ mod tests {
             log_level: LogLevel::Debug,
             log_dir: None,
             log_format: LogFormat::Text,
+            log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
             evm: EvmCtx {
@@ -2097,6 +2131,23 @@ mod tests {
             bot_gas_valuation: None,
             orchestrator: None,
         }
+    }
+
+    /// The link is deployment config: no template prints nothing, a template
+    /// prints one line with `{id}` substituted verbatim.
+    #[test]
+    fn write_log_query_url_substitutes_id_and_skips_when_unset() {
+        let mut ctx = create_test_ctx();
+        let mut out = Vec::new();
+        write_log_query_url(&mut out, &ctx, "abc-123").unwrap();
+        assert!(out.is_empty(), "no template must print nothing");
+
+        ctx.log_query_url_template = Some("https://logs.example/q?id={id}".to_string());
+        write_log_query_url(&mut out, &ctx, "abc-123").unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "Logs: https://logs.example/q?id=abc-123\n"
+        );
     }
 
     #[test]
