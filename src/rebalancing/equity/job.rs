@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
-use st0x_config::EquitiesConfig;
+use st0x_config::ChainEquities;
 use st0x_event_sorcery::Store;
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_tokenization::IssuerRequestId;
@@ -106,7 +106,7 @@ pub(crate) struct TransferEquityToMarketMakingCtx {
     /// same predicate the inventory reactor uses when dispatching recovery jobs.
     /// Keeping the check here ensures the two paths cannot disagree: if recovery
     /// is disabled, `Err(PostReceipt)` is returned instead and apalis retries.
-    pub(crate) equities_config: EquitiesConfig,
+    pub(crate) equities_config: ChainEquities,
     /// Used to delayed-redrive on a bot-gas receipt cost enqueue failure
     /// (ADR 0017 SS4: "failure in cost recording never blocks trading")
     /// instead of consuming the apalis retry budget or handing the symbol
@@ -551,7 +551,7 @@ mod tests {
 
     use alloy::primitives::{Address, TxHash, U256};
     use serde_json::json;
-    use st0x_config::{EquityAssetConfig, OperationMode};
+    use st0x_config::{ChainEquityAsset, OperationMode};
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_float_macro::float;
     use st0x_raindex::Raindex;
@@ -592,17 +592,16 @@ mod tests {
         };
         let mint_store = Arc::new(test_store(pool, transfer_services));
 
-        let aapl_config = EquityAssetConfig {
+        let aapl_config = ChainEquityAsset {
             tokenized_equity: Address::ZERO,
             tokenized_equity_derivative: Address::ZERO,
             vault_ids: vec![],
             trading: OperationMode::Disabled,
             rebalancing: OperationMode::Enabled,
             wrapped_equity_recovery: recovery_mode,
-            extended_hours_counter_trading: OperationMode::Disabled,
             operational_limit: None,
         };
-        let mut equities_config = EquitiesConfig::default();
+        let mut equities_config = ChainEquities::default();
         equities_config
             .symbols
             .insert(Symbol::new("AAPL").unwrap(), aapl_config);

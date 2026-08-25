@@ -157,12 +157,19 @@ struct ConfiguredInventoryVaults {
 /// Equity symbols the portfolio treats as configured. Shared with the CLI's
 /// snapshot-mark repair so the two cannot drift on what "configured" means.
 pub(crate) fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
-    ctx.assets
+    ctx.chains
+        .sole_trading()
+        .assets
         .equities
         .symbols
         .keys()
         .filter(|symbol| {
-            ctx.assets.is_trading_enabled(symbol) || ctx.assets.is_rebalancing_enabled(symbol)
+            ctx.chains.sole_trading().assets.is_trading_enabled(symbol)
+                || ctx
+                    .chains
+                    .sole_trading()
+                    .assets
+                    .is_rebalancing_enabled(symbol)
         })
         .cloned()
         .collect()
@@ -172,7 +179,7 @@ fn configured_inventory_vaults(ctx: &Ctx) -> ConfiguredInventoryVaults {
     let equity_symbols = configured_equity_symbols(ctx);
 
     let mut equity_vaults: BTreeMap<Address, BTreeSet<B256>> = BTreeMap::new();
-    for equity_config in ctx.assets.equities.symbols.values() {
+    for equity_config in ctx.chains.sole_trading().assets.equities.symbols.values() {
         equity_vaults
             .entry(equity_config.tokenized_equity_derivative)
             .or_default()
@@ -180,6 +187,8 @@ fn configured_inventory_vaults(ctx: &Ctx) -> ConfiguredInventoryVaults {
     }
 
     let usdc_vaults = ctx
+        .chains
+        .sole_trading()
         .assets
         .cash
         .as_ref()
@@ -259,7 +268,7 @@ where
         .assets
         .cash
         .as_ref()
-        .and_then(|cash| cash.reserved)
+        .map(|cash| cash.reserved)
         .map_or(Usd::ZERO, Positive::inner);
 
     let snapshot_id = InventorySnapshotId {
@@ -435,7 +444,7 @@ where
         portfolio_snapshot: context.frameworks.portfolio_snapshot.clone(),
         wrapper: context.wrapper.clone(),
         configured_equity_symbols,
-        usdc_tracking_enabled: context.ctx.assets.cash.is_some(),
+        usdc_tracking_enabled: context.ctx.chains.sole_trading().assets.cash.is_some(),
         wallet_polling_enabled,
         poll_freshness,
         notifier,
@@ -450,7 +459,8 @@ where
         offchain_order: context.frameworks.offchain_order,
         order_placer,
         execution_threshold: context.execution_threshold,
-        assets: context.ctx.assets.clone(),
+        assets: context.ctx.chains.sole_trading().assets.clone(),
+        hedging: context.ctx.assets.clone(),
         counter_trade_submission_lock,
         close_flatten_policy,
         close_flatten_ramp,
@@ -1408,7 +1418,10 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use async_trait::async_trait;
-    use st0x_config::{EquitiesConfig, create_test_ctx_with_order_owner};
+    use st0x_config::{
+        ChainAssets, ChainEquities, ChainEquityAsset, OperationMode,
+        create_test_ctx_with_order_owner,
+    };
     use st0x_event_sorcery::test_store;
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_float_macro::float;
@@ -1428,6 +1441,54 @@ mod tests {
     };
     use crate::test_utils::{setup_test_apalis_pool, setup_test_pools};
     use crate::vault_lookup::MockVaultLookup;
+
+    fn equity_asset(trading: OperationMode, rebalancing: OperationMode) -> ChainEquityAsset {
+        ChainEquityAsset {
+            tokenized_equity: Address::ZERO,
+            tokenized_equity_derivative: Address::ZERO,
+            vault_ids: vec![],
+            trading,
+            rebalancing,
+            wrapped_equity_recovery: OperationMode::Disabled,
+            operational_limit: None,
+        }
+    }
+
+    #[test]
+    fn configured_equity_symbols_include_trading_or_rebalancing_enabled_only() {
+        // The portfolio's notion of "configured" gates snapshot marks and
+        // inventory vault discovery: a symbol with both switches off must not
+        // count, and either switch alone must.
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains.sole_trading_mut().assets = ChainAssets {
+            equities: ChainEquities {
+                operational_limit: None,
+                symbols: HashMap::from([
+                    (
+                        Symbol::new("TRADE").unwrap(),
+                        equity_asset(OperationMode::Enabled, OperationMode::Disabled),
+                    ),
+                    (
+                        Symbol::new("REBAL").unwrap(),
+                        equity_asset(OperationMode::Disabled, OperationMode::Enabled),
+                    ),
+                    (
+                        Symbol::new("OFF").unwrap(),
+                        equity_asset(OperationMode::Disabled, OperationMode::Disabled),
+                    ),
+                ]),
+            },
+            cash: None,
+        };
+
+        let symbols = configured_equity_symbols(&ctx);
+
+        assert_eq!(
+            symbols,
+            HashSet::from([Symbol::new("TRADE").unwrap(), Symbol::new("REBAL").unwrap()]),
+            "trading-enabled and rebalancing-enabled symbols count; fully disabled ones do not"
+        );
+    }
 
     #[test]
     fn alerts_require_a_configured_wallet() {
@@ -1592,7 +1653,7 @@ mod tests {
             transfer,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
             mint_store: Arc::new(test_store(cqrs_pool, services)),
-            equities_config: EquitiesConfig::default(),
+            equities_config: ChainEquities::default(),
             job_queue,
         })
     }

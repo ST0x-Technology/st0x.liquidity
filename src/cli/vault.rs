@@ -175,15 +175,23 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
 ) -> anyhow::Result<()> {
     ctx.wallet()?;
 
-    let cash =
-        ctx.assets.cash.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("assets.cash.vault_ids is required but not configured")
+    let cash = ctx
+        .chains
+        .sole_trading()
+        .assets
+        .cash
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+            )
         })?;
 
-    let vault_id =
-        cash.vault_ids.first().copied().ok_or_else(|| {
-            anyhow::anyhow!("assets.cash.vault_ids is required but not configured")
-        })?;
+    let vault_id = cash.vault_ids.first().copied().ok_or_else(|| {
+        anyhow::anyhow!(
+            "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+        )
+    })?;
 
     if cash.vault_ids.len() > 1 {
         writeln!(
@@ -211,11 +219,12 @@ mod tests {
 
     use st0x_config::ChainRegistry;
     use st0x_config::ExecutionThreshold;
+    use st0x_config::HedgingAssets;
     use st0x_config::RebalancingCtx;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
-        AssetsConfig, BrokerCtx, CashAssetConfig, EquitiesConfig, LogFormat, LogLevel,
-        OperationMode, TradingMode,
+        BrokerCtx, ChainAssets, ChainCashAsset, ChainEquities, LogFormat, LogLevel, OperationMode,
+        TradingMode,
     };
     use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
     use st0x_evm::Chain;
@@ -237,6 +246,8 @@ mod tests {
             server_port: 8080,
             board_port: 8081,
             chains: ChainRegistry::single_trading_chain(TradingChain {
+                redemption_wallet: None,
+                assets: ChainAssets::default(),
                 chain: Chain::Base,
                 inventory_adapters: InventoryAdapters::default(),
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -269,10 +280,7 @@ mod tests {
             wallet: None,
             wallet_meta: None,
             execution_threshold: ExecutionThreshold::whole_share(),
-            assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            assets: HedgingAssets::default(),
             travel_rule: None,
             rest_api: None,
             issuance: create_test_issuance_ctx(),
@@ -282,7 +290,7 @@ mod tests {
         }
     }
 
-    fn create_ctx_with_rebalancing(cash: Option<CashAssetConfig>) -> Ctx {
+    fn create_ctx_with_rebalancing(cash: Option<ChainCashAsset>) -> Ctx {
         Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
@@ -292,6 +300,11 @@ mod tests {
             server_port: 8080,
             board_port: 8081,
             chains: ChainRegistry::single_trading_chain(TradingChain {
+                redemption_wallet: None,
+                assets: ChainAssets {
+                    equities: ChainEquities::default(),
+                    cash,
+                },
                 chain: Chain::Base,
                 inventory_adapters: InventoryAdapters::default(),
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -335,10 +348,7 @@ mod tests {
             wallet: Some(st0x_config::OnchainWalletCtx::stub()),
             wallet_meta: None,
             execution_threshold: ExecutionThreshold::whole_share(),
-            assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash,
-            },
+            assets: HedgingAssets::default(),
             travel_rule: None,
             rest_api: None,
             issuance: create_test_issuance_ctx(),
@@ -546,11 +556,10 @@ mod tests {
 
     #[tokio::test]
     async fn withdraw_usdc_fails_when_cash_vault_id_missing() {
-        let ctx = create_ctx_with_rebalancing(Some(CashAssetConfig {
+        let ctx = create_ctx_with_rebalancing(Some(ChainCashAsset {
             vault_ids: Vec::new(),
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
-            reserved: None,
         }));
         let amount = Usdc::new(float!(100));
 
@@ -561,7 +570,9 @@ mod tests {
             .to_string();
 
         assert!(
-            err_msg.contains("assets.cash.vault_ids is required but not configured"),
+            err_msg.contains(
+                "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+            ),
             "Expected vault_id missing error, got: {err_msg}"
         );
     }
@@ -595,18 +606,19 @@ mod tests {
             .to_string();
 
         assert!(
-            err_msg.contains("assets.cash.vault_ids is required but not configured"),
+            err_msg.contains(
+                "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+            ),
             "Expected vault_id missing error, got: {err_msg}"
         );
     }
 
     #[tokio::test]
     async fn withdraw_usdc_passes_cash_vault_lookup_when_vault_id_configured() {
-        let ctx = create_ctx_with_rebalancing(Some(CashAssetConfig {
+        let ctx = create_ctx_with_rebalancing(Some(ChainCashAsset {
             vault_ids: vec![TEST_VAULT_ID],
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
-            reserved: None,
         }));
         let amount = Usdc::new(float!(100));
 

@@ -348,7 +348,12 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         }
     };
 
+    // One row per symbol the trading chain lists, joined with that symbol's
+    // hedging policy. The two halves live in different tables now: what a
+    // symbol is on-chain is a chain fact, how it hedges is not.
     let assets = ctx
+        .chains
+        .sole_trading()
         .assets
         .equities
         .symbols
@@ -363,13 +368,13 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
             });
 
             // Extended hours lives under `Enabled` only. Config validation
-            // rejects `extended_hours_counter_trading = enabled` with
-            // `trading = disabled`, so a disabled asset never carries a live
-            // extended-hours flag -- this maps valid config, it does not
+            // rejects `extended_hours_counter_trading = enabled` for a symbol
+            // that trades on no chain, so a disabled asset never carries a
+            // live extended-hours flag -- this maps valid config, it does not
             // coerce a contradictory pair.
             let counter_trading = match config.trading {
                 OperationMode::Enabled => st0x_dto::CounterTrading::Enabled {
-                    extended_hours: config.extended_hours_counter_trading == OperationMode::Enabled,
+                    extended_hours: ctx.assets.is_extended_hours_enabled(symbol),
                 },
                 OperationMode::Disabled => st0x_dto::CounterTrading::Disabled,
             };
@@ -397,7 +402,7 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         .assets
         .cash
         .as_ref()
-        .and_then(|cash| cash.reserved)
+        .map(|cash| cash.reserved)
         .map(Positive::inner);
 
     let wallet = ctx
@@ -481,7 +486,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::{WebSocketStream, connect_async};
 
-    use st0x_config::{AssetsConfig, EquityAssetConfig, create_test_ctx_with_order_owner};
+    use st0x_config::{ChainAssets, ChainEquityAsset, create_test_ctx_with_order_owner};
     use st0x_dto::{Direction, Trade, TradingVenue};
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::{
@@ -647,17 +652,31 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
         let symbol = st0x_finance::Symbol::new("RKLB").unwrap();
+        ctx.chains
+            .sole_trading_mut()
+            .assets
+            .equities
+            .symbols
+            .insert(
+                symbol.clone(),
+                ChainEquityAsset {
+                    tokenized_equity: address!("0x1111111111111111111111111111111111111111"),
+                    tokenized_equity_derivative: address!(
+                        "0x2222222222222222222222222222222222222222"
+                    ),
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            );
+        // The dashboard row joins the chain listing above with the symbol's
+        // hedging policy, which lives in the global table.
         ctx.assets.equities.symbols.insert(
             symbol.clone(),
-            EquityAssetConfig {
-                tokenized_equity: address!("0x1111111111111111111111111111111111111111"),
-                tokenized_equity_derivative: address!("0x2222222222222222222222222222222222222222"),
-                vault_ids: Vec::new(),
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
+            st0x_config::EquityHedgePolicy {
                 extended_hours_counter_trading: OperationMode::Enabled,
-                operational_limit: None,
             },
         );
 
@@ -683,19 +702,25 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
         let symbol = st0x_finance::Symbol::new("RKLB").unwrap();
-        ctx.assets.equities.symbols.insert(
-            symbol.clone(),
-            EquityAssetConfig {
-                tokenized_equity: address!("0x1111111111111111111111111111111111111111"),
-                tokenized_equity_derivative: address!("0x2222222222222222222222222222222222222222"),
-                vault_ids: Vec::new(),
-                trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
-                operational_limit: None,
-            },
-        );
+        ctx.chains
+            .sole_trading_mut()
+            .assets
+            .equities
+            .symbols
+            .insert(
+                symbol.clone(),
+                ChainEquityAsset {
+                    tokenized_equity: address!("0x1111111111111111111111111111111111111111"),
+                    tokenized_equity_derivative: address!(
+                        "0x2222222222222222222222222222222222222222"
+                    ),
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Disabled,
+                    rebalancing: OperationMode::Enabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            );
 
         let settings = settings_from_ctx(&ctx);
         let asset = settings
@@ -727,7 +752,7 @@ mod tests {
                 inventory::InventoryView::default(),
                 sender,
             )),
-            equity_prices: equity_price::EquityPriceStore::new(&AssetsConfig::default()),
+            equity_prices: equity_price::EquityPriceStore::new(&ChainAssets::default()),
             settings: empty_settings(),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(crate::api::ResumeLock(tokio::sync::Mutex::new(()))),

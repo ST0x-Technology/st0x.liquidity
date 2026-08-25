@@ -14,6 +14,8 @@ use url::Url;
 
 use st0x_evm::Chain;
 
+use crate::assets::ChainAssets;
+
 /// Which block tag to use as the fill-ingestion cutoff.
 ///
 /// The cutoff caps what the fill monitor treats as safe to ingest. Tags differ
@@ -213,6 +215,18 @@ pub struct TradingConfig {
     pub vault_owner: Address,
     pub deployment_block: u64,
     pub ingestion_cutoff: IngestionCutoff,
+    /// Alpaca's issuer wallet on this chain -- ERC-20 transfers for redemption
+    /// go here. Per chain because a redemption delivers tokens that exist on
+    /// one chain, so sending to another chain's issuer address burns them.
+    pub redemption_wallet: Option<Address>,
+    /// The equities and cash the bot holds on this chain.
+    ///
+    /// Defaulted rather than required: an absent table and an empty one mean
+    /// the same thing -- the bot holds nothing here yet -- which is the normal
+    /// state while a chain is being brought up. Requiring the header would add
+    /// ceremony without closing a gap, since an empty table stays valid.
+    #[serde(default)]
+    pub assets: ChainAssets,
 }
 
 impl TradingConfig {
@@ -293,6 +307,8 @@ pub struct TradingChain {
     pub vault_owner: Address,
     pub deployment_block: u64,
     pub ingestion_cutoff: IngestionCutoff,
+    pub redemption_wallet: Option<Address>,
+    pub assets: ChainAssets,
 }
 
 impl std::fmt::Debug for TradingChain {
@@ -307,6 +323,8 @@ impl std::fmt::Debug for TradingChain {
             .field("vault_owner", &self.vault_owner)
             .field("deployment_block", &self.deployment_block)
             .field("ingestion_cutoff", &self.ingestion_cutoff)
+            .field("redemption_wallet", &self.redemption_wallet)
+            .field("assets", &self.assets)
             .finish()
     }
 }
@@ -330,6 +348,8 @@ impl TradingChain {
             vault_owner: trading.vault_owner,
             deployment_block: trading.deployment_block,
             ingestion_cutoff: trading.ingestion_cutoff,
+            redemption_wallet: trading.redemption_wallet,
+            assets: trading.assets.clone(),
         })
     }
 
@@ -520,6 +540,8 @@ impl ChainRegistry {
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;
+
+    use st0x_execution::Symbol;
 
     use super::*;
 
@@ -904,7 +926,14 @@ mod tests {
              inventory = \"0x2222222222222222222222222222222222222222\"\n\
              vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
-             ingestion_cutoff = \"safe\"",
+             ingestion_cutoff = \"safe\"\n\
+             redemption_wallet = \"0x4444444444444444444444444444444444444444\"\n\
+             [assets.equities.COIN]\n\
+             tokenized_equity = \"0x6666666666666666666666666666666666666666\"\n\
+             tokenized_equity_derivative = \"0x5555555555555555555555555555555555555555\"\n\
+             trading = \"enabled\"\n\
+             rebalancing = \"disabled\"\n\
+             wrapped_equity_recovery = \"disabled\"",
         )
         .unwrap();
 
@@ -930,6 +959,20 @@ mod tests {
         assert_eq!(
             ctx.vault_owner,
             alloy::primitives::address!("0x3333333333333333333333333333333333333333"),
+        );
+        assert_eq!(
+            ctx.redemption_wallet,
+            Some(alloy::primitives::address!(
+                "0x4444444444444444444444444444444444444444"
+            )),
+        );
+        let coin = ctx
+            .assets
+            .tokenized_equity(&Symbol::new("COIN").unwrap())
+            .expect("the configured assets table must ride along into TradingChain");
+        assert_eq!(
+            coin,
+            alloy::primitives::address!("0x6666666666666666666666666666666666666666"),
         );
     }
 

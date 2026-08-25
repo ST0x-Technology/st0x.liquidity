@@ -467,11 +467,13 @@ at the regular open.
 
 This behavior is **opt-in per asset** via the required
 `extended_hours_counter_trading` field on each `[assets.equities.SYMBOL]` config
-block (committed as `"disabled"`). With it disabled for an asset, behavior for
-that asset is unchanged: market orders during regular hours only. Assets absent
-from the config are treated as disabled (fail-closed). The cancel-and-replace
-pass at the regular open honors the same per-asset setting: only orders for
-enabled assets are converged.
+block (committed as `"disabled"`). That block is global rather than per chain:
+one broker account hedges one position per symbol, so the same exposure cannot
+carry two session policies. With it disabled for an asset, behavior for that
+asset is unchanged: market orders during regular hours only. Assets absent from
+the config are treated as disabled (fail-closed). The cancel-and-replace pass at
+the regular open honors the same per-asset setting: only orders for enabled
+assets are converged.
 
 ##### Market session model
 

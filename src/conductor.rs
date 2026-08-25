@@ -34,8 +34,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use st0x_config::{
-    AssetsConfig, BrokerCtx, Ctx, CtxError, ExecutionThreshold, InventoryMode, IssuanceStatusCtx,
-    OperationMode, RebalancingCtx, TradingChain,
+    BrokerCtx, ChainAssets, Ctx, CtxError, ExecutionThreshold, HedgingAssets, InventoryMode,
+    IssuanceStatusCtx, OperationMode, RebalancingCtx, TradingChain,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
@@ -377,7 +377,11 @@ pub(crate) struct TradeProcessingCqrs {
     /// in the placement path, not the command handler.
     pub(crate) order_placer: Arc<dyn OrderPlacer>,
     pub(crate) execution_threshold: ExecutionThreshold,
-    pub(crate) assets: AssetsConfig,
+    /// What the trading chain lists: token addresses, vault ids, per-asset
+    /// switches and operational limits.
+    pub(crate) assets: ChainAssets,
+    /// How each symbol is hedged, independent of where it is listed.
+    pub(crate) hedging: HedgingAssets,
     pub(crate) counter_trade_submission_lock: Arc<Mutex<()>>,
     pub(crate) close_flatten_policy: CloseFlattenPolicy,
     pub(crate) close_flatten_ramp: CloseFlattenCrossRamp,
@@ -1383,13 +1387,23 @@ fn build_record_bot_gas_receipt_cost_ctx(
 }
 
 fn base_wallet_equity_recovery_enabled(ctx: &Ctx, symbol: &Symbol) -> bool {
-    ctx.assets.is_trading_enabled(symbol)
-        || ctx.assets.is_rebalancing_enabled(symbol)
-        || ctx.assets.is_wrapped_equity_recovery_enabled(symbol)
+    ctx.chains.sole_trading().assets.is_trading_enabled(symbol)
+        || ctx
+            .chains
+            .sole_trading()
+            .assets
+            .is_rebalancing_enabled(symbol)
+        || ctx
+            .chains
+            .sole_trading()
+            .assets
+            .is_wrapped_equity_recovery_enabled(symbol)
 }
 
 fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
-    ctx.assets
+    ctx.chains
+        .sole_trading()
+        .assets
         .equities
         .symbols
         .iter()
@@ -1399,7 +1413,9 @@ fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Ad
 }
 
 fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
-    ctx.assets
+    ctx.chains
+        .sole_trading()
+        .assets
         .equities
         .symbols
         .iter()
@@ -1429,8 +1445,11 @@ async fn grant_startup_token_approvals(ctx: &Ctx) -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     };
 
-    let targets =
-        build_approval_targets(&ctx.assets, ctx.chains.sole_trading().orderbook, USDC_BASE);
+    let targets = build_approval_targets(
+        &ctx.chains.sole_trading().assets,
+        ctx.chains.sole_trading().orderbook,
+        USDC_BASE,
+    );
 
     grant_startup_approvals(&base_wallet, &targets).await?;
 
@@ -1458,7 +1477,7 @@ pub(crate) struct AccumulatedPositionExecutionCtx<'a> {
     pub(crate) order_placer: &'a dyn OrderPlacer,
     pub(crate) counter_trade_submission_lock: &'a Mutex<()>,
     pub(crate) threshold: &'a ExecutionThreshold,
-    pub(crate) assets: &'a AssetsConfig,
+    pub(crate) assets: &'a ChainAssets,
 }
 
 fn check_monitor_drain_result(
@@ -1730,7 +1749,7 @@ fn build_wrapper<Signer: Wallet + Clone>(
 ) -> Arc<WrapperService<Signer>> {
     Arc::new(WrapperService::new(
         base_wallet,
-        to_wrapped_equities(&ctx.assets.equities.symbols),
+        to_wrapped_equities(&ctx.chains.sole_trading().assets.equities.symbols),
     ))
 }
 
@@ -1974,6 +1993,8 @@ where
     }
 
     let token_addresses = ctx
+        .chains
+        .sole_trading()
         .assets
         .equities
         .symbols
@@ -2114,7 +2135,9 @@ async fn revoke_stale_orderbook_allowances<Signer: Wallet + Clone>(
     ctx: &Ctx,
 ) {
     let revoke_tokens = std::iter::once(st0x_evm::USDC_BASE).chain(
-        ctx.assets
+        ctx.chains
+            .sole_trading()
+            .assets
             .equities
             .symbols
             .values()
@@ -2333,7 +2356,8 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
                 equity: rebalancing_ctx.equity,
                 usdc: rebalancing_ctx.usdc,
                 transfer_timeout: rebalancing_ctx.transfer_timeout,
-                assets: deps.ctx.assets.clone(),
+                assets: deps.ctx.chains.sole_trading().assets.clone(),
+                cash_reserved: deps.ctx.assets.cash.as_ref().map(|cash| cash.reserved),
             },
             deps.vault_registry,
             vault_registry_id,
@@ -2423,6 +2447,8 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         let usdc_vault_id = deps
             .ctx
+            .chains
+            .sole_trading()
             .assets
             .cash
             .as_ref()
@@ -2462,7 +2488,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             transfer: recovery_transfer.clone(),
             equity_in_progress: rebalancing_service.equity_in_progress.clone(),
             mint_store: built.mint.clone(),
-            equities_config: deps.ctx.assets.equities.clone(),
+            equities_config: deps.ctx.chains.sole_trading().assets.equities.clone(),
             job_queue: transfer_equity_to_market_making_queue,
         });
 
@@ -3534,6 +3560,7 @@ where
         base_symbol,
         executor_type,
         &cqrs.assets,
+        &cqrs.hedging,
         asset_enabled,
     )
     .await?
@@ -4530,7 +4557,7 @@ mod tests {
     use url::Url;
 
     use st0x_config::{
-        AssetsConfig, BotGasValuationConfig, EquitiesConfig, EquityAssetConfig, ExecutionThreshold,
+        BotGasValuationConfig, ChainAssets, ChainEquities, ChainEquityAsset, ExecutionThreshold,
         OperationMode, OrchestratorAddresses, OrchestratorConfig, create_test_ctx_with_order_owner,
         test_issuance_status_ctx,
     };
@@ -4666,13 +4693,14 @@ mod tests {
 
         Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                cash_reserved: None,
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 },
                 usdc: None,
                 transfer_timeout: Duration::from_secs(60),
-                assets: AssetsConfig {
+                assets: ChainAssets {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
                     cash: None,
                 },
@@ -5371,13 +5399,14 @@ mod tests {
         let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool.clone(), ()));
         let rebalancing_service = RebalancingService::new(
             RebalancingServiceConfig {
+                cash_reserved: None,
                 equity: crate::inventory::ImbalanceThreshold {
                     target: st0x_float_macro::float!(0.5),
                     deviation: st0x_float_macro::float!(0.2),
                 },
                 usdc: None,
                 transfer_timeout: Duration::from_secs(60),
-                assets: AssetsConfig {
+                assets: ChainAssets {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
                     cash: None,
                 },
@@ -5831,20 +5860,19 @@ mod tests {
     {
         let symbol = Symbol::new("AAPL").unwrap();
 
-        // Helper that builds a single-symbol EquitiesConfig with a configurable
+        // Helper that builds a single-symbol ChainEquities with a configurable
         // wrapped_equity_recovery mode.
-        let make_equities_config = |wrapped_equity_recovery_mode: OperationMode| EquitiesConfig {
+        let make_equities_config = |wrapped_equity_recovery_mode: OperationMode| ChainEquities {
             operational_limit: None,
             symbols: std::iter::once((
                 symbol.clone(),
-                EquityAssetConfig {
+                ChainEquityAsset {
                     tokenized_equity: alloy::primitives::Address::ZERO,
                     tokenized_equity_derivative: alloy::primitives::Address::ZERO,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Disabled,
                     rebalancing: OperationMode::Enabled,
                     wrapped_equity_recovery: wrapped_equity_recovery_mode,
-                    extended_hours_counter_trading: OperationMode::Disabled,
                     operational_limit: None,
                 },
             ))
@@ -5903,13 +5931,14 @@ mod tests {
         let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool.clone(), ()));
         let rebalancing_service = RebalancingService::new(
             RebalancingServiceConfig {
+                cash_reserved: None,
                 equity: crate::inventory::ImbalanceThreshold {
                     target: st0x_float_macro::float!(0.5),
                     deviation: st0x_float_macro::float!(0.2),
                 },
                 usdc: None,
                 transfer_timeout: Duration::from_secs(60),
-                assets: AssetsConfig {
+                assets: ChainAssets {
                     // wrapped_equity_recovery ENABLED: recover_mint_state will set
                     // HeldForRecovery on TokensReceived, blocking the resume push.
                     equities: make_equities_config(OperationMode::Enabled),
@@ -5999,13 +6028,14 @@ mod tests {
         let vault_registry2: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool2.clone(), ()));
         let rebalancing_service2 = RebalancingService::new(
             RebalancingServiceConfig {
+                cash_reserved: None,
                 equity: crate::inventory::ImbalanceThreshold {
                     target: st0x_float_macro::float!(0.5),
                     deviation: st0x_float_macro::float!(0.2),
                 },
                 usdc: None,
                 transfer_timeout: Duration::from_secs(60),
-                assets: AssetsConfig {
+                assets: ChainAssets {
                     // wrapped_equity_recovery DISABLED: recover_mint_state keeps
                     // ActiveTransfer, so the pre-wrap exclusion does NOT fire.
                     equities: make_equities_config(OperationMode::Disabled),
@@ -6351,68 +6381,62 @@ mod tests {
         let mut symbols = HashMap::new();
         symbols.insert(
             aapl.clone(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: aapl_token,
                 tokenized_equity_derivative: Address::random(),
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
         symbols.insert(
             tsla.clone(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: tsla_token,
                 tokenized_equity_derivative: Address::random(),
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
         symbols.insert(
             spym.clone(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: spym_token,
                 tokenized_equity_derivative: Address::random(),
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
         symbols.insert(
             coin.clone(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: coin_token,
                 tokenized_equity_derivative: Address::random(),
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Enabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
 
-        let ctx = Ctx {
-            assets: AssetsConfig {
-                equities: EquitiesConfig {
-                    symbols,
-                    operational_limit: None,
-                },
-                cash: None,
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        ctx.chains.sole_trading_mut().assets = ChainAssets {
+            equities: ChainEquities {
+                symbols,
+                operational_limit: None,
             },
-            ..create_test_ctx_with_order_owner(address!(
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ))
+            cash: None,
         };
 
         let actual = base_wallet_unwrapped_equity_token_addresses(&ctx);
@@ -6445,68 +6469,62 @@ mod tests {
         let mut symbols = HashMap::new();
         symbols.insert(
             aapl.clone(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: aapl_wrapped_token,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
         symbols.insert(
             tsla.clone(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: tsla_wrapped_token,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
         symbols.insert(
             spym.clone(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: spym_wrapped_token,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
         symbols.insert(
             coin.clone(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: coin_wrapped_token,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Enabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
 
-        let ctx = Ctx {
-            assets: AssetsConfig {
-                equities: EquitiesConfig {
-                    symbols,
-                    operational_limit: None,
-                },
-                cash: None,
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        ctx.chains.sole_trading_mut().assets = ChainAssets {
+            equities: ChainEquities {
+                symbols,
+                operational_limit: None,
             },
-            ..create_test_ctx_with_order_owner(address!(
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ))
+            cash: None,
         };
 
         let actual = base_wallet_wrapped_equity_token_addresses(&ctx);
@@ -7007,8 +7025,8 @@ mod tests {
             pool,
             threshold,
             apalis_pool,
-            AssetsConfig {
-                equities: EquitiesConfig::default(),
+            ChainAssets {
+                equities: ChainEquities::default(),
                 cash: None,
             },
         )
@@ -7019,9 +7037,12 @@ mod tests {
         pool: &SqlitePool,
         threshold: ExecutionThreshold,
         apalis_pool: &apalis_sqlite::SqlitePool,
-        assets: AssetsConfig,
+        assets: ChainAssets,
     ) -> TradeProcessingCqrs {
+        let hedging = hedging_for(&assets, OperationMode::Disabled);
+
         TradeProcessingCqrs {
+            hedging,
             pool: pool.clone(),
             onchain_trade: frameworks.onchain_trade.clone(),
             position: frameworks.position.clone(),
@@ -7039,20 +7060,42 @@ mod tests {
         }
     }
 
-    fn extended_hours_assets(symbol: &Symbol) -> AssetsConfig {
-        AssetsConfig {
-            equities: EquitiesConfig {
+    /// A hedging policy for every symbol the listing carries, which is what
+    /// the config validator requires of a real file.
+    fn hedging_for(assets: &ChainAssets, extended_hours: OperationMode) -> HedgingAssets {
+        HedgingAssets {
+            equities: st0x_config::HedgedEquities {
+                symbols: assets
+                    .equities
+                    .symbols
+                    .keys()
+                    .map(|symbol| {
+                        (
+                            symbol.clone(),
+                            st0x_config::EquityHedgePolicy {
+                                extended_hours_counter_trading: extended_hours,
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+            cash: None,
+        }
+    }
+
+    fn extended_hours_assets(symbol: &Symbol) -> ChainAssets {
+        ChainAssets {
+            equities: ChainEquities {
                 operational_limit: None,
                 symbols: HashMap::from([(
                     symbol.clone(),
-                    EquityAssetConfig {
+                    ChainEquityAsset {
                         tokenized_equity: Address::ZERO,
                         tokenized_equity_derivative: Address::ZERO,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Enabled,
                         rebalancing: OperationMode::Disabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
-                        extended_hours_counter_trading: OperationMode::Enabled,
                         operational_limit: None,
                     },
                 )]),
@@ -8619,6 +8662,17 @@ mod tests {
         let (frameworks, offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = TradeProcessingCqrs {
+            hedging: HedgingAssets {
+                equities: st0x_config::HedgedEquities {
+                    symbols: HashMap::from([(
+                        Symbol::new("AAPL").unwrap(),
+                        st0x_config::EquityHedgePolicy {
+                            extended_hours_counter_trading: OperationMode::Enabled,
+                        },
+                    )]),
+                },
+                cash: None,
+            },
             pool: pool.clone(),
             onchain_trade: frameworks.onchain_trade.clone(),
             position: frameworks.position.clone(),
@@ -8626,19 +8680,18 @@ mod tests {
             offchain_order: frameworks.offchain_order.clone(),
             order_placer: succeeding_order_placer(),
             execution_threshold: ExecutionThreshold::whole_share(),
-            assets: AssetsConfig {
-                equities: EquitiesConfig {
+            assets: ChainAssets {
+                equities: ChainEquities {
                     operational_limit: None,
                     symbols: HashMap::from([(
                         Symbol::new("AAPL").unwrap(),
-                        EquityAssetConfig {
+                        ChainEquityAsset {
                             tokenized_equity: Address::ZERO,
                             tokenized_equity_derivative: Address::ZERO,
                             vault_ids: Vec::new(),
                             trading: OperationMode::Enabled,
                             rebalancing: OperationMode::Disabled,
                             wrapped_equity_recovery: OperationMode::Disabled,
-                            extended_hours_counter_trading: OperationMode::Enabled,
                             operational_limit: None,
                         },
                     )]),
@@ -8737,13 +8790,15 @@ mod tests {
         let (frameworks, offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let cqrs = trade_processing_cqrs_with_assets(
+        let assets = extended_hours_assets(&symbol);
+        let mut cqrs = trade_processing_cqrs_with_assets(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
-            extended_hours_assets(&symbol),
+            assets.clone(),
         );
+        cqrs.hedging = hedging_for(&assets, OperationMode::Enabled);
 
         let trade_event = make_trade_event(76);
         let trade = test_trade_with_amount_and_direction(float!(5.0), 76, Direction::Buy);
@@ -9609,6 +9664,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                cash_reserved: None,
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
@@ -9618,7 +9674,7 @@ mod tests {
                     deviation: float!(0.2),
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
-                assets: AssetsConfig {
+                assets: ChainAssets {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
                     cash: None,
                 },
@@ -9727,10 +9783,11 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                cash_reserved: None,
                 equity: threshold,
                 usdc: Some(threshold),
                 transfer_timeout: Duration::from_secs(30 * 60),
-                assets: AssetsConfig {
+                assets: ChainAssets {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
                     cash: None,
                 },
@@ -9843,6 +9900,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                cash_reserved: None,
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
@@ -9852,7 +9910,7 @@ mod tests {
                     deviation: float!(0.2),
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
-                assets: AssetsConfig {
+                assets: ChainAssets {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
                     cash: None,
                 },
@@ -9983,6 +10041,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                cash_reserved: None,
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
@@ -9992,7 +10051,7 @@ mod tests {
                     deviation: float!(0.2),
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
-                assets: AssetsConfig {
+                assets: ChainAssets {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
                     cash: None,
                 },

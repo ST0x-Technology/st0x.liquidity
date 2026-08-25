@@ -2042,13 +2042,12 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::broadcast;
 
+    use st0x_config::ChainAssets;
     use st0x_dto::Statement;
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, test_store};
     use st0x_evm::Chain;
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_float_macro::float;
-
-    use st0x_config::{AssetsConfig, EquitiesConfig};
     use st0x_tokenization::issuer_request_id;
     use st0x_tokenization::mock::{
         MockCompletionOutcome, MockDetectionOutcome, MockTokenizer, MockVerificationOutcome,
@@ -2217,16 +2216,14 @@ mod tests {
 
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                cash_reserved: None,
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 },
                 usdc: None,
                 transfer_timeout: Duration::from_secs(1800),
-                assets: AssetsConfig {
-                    equities: EquitiesConfig::default(),
-                    cash: None,
-                },
+                assets: ChainAssets::default(),
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             VaultRegistryId {
@@ -2365,16 +2362,14 @@ mod tests {
 
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                cash_reserved: None,
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 },
                 usdc: None,
                 transfer_timeout: Duration::from_secs(1800),
-                assets: AssetsConfig {
-                    equities: EquitiesConfig::default(),
-                    cash: None,
-                },
+                assets: ChainAssets::default(),
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             VaultRegistryId {
@@ -2691,16 +2686,14 @@ mod tests {
 
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                cash_reserved: None,
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 },
                 usdc: None,
                 transfer_timeout: Duration::from_secs(1800),
-                assets: AssetsConfig {
-                    equities: EquitiesConfig::default(),
-                    cash: None,
-                },
+                assets: ChainAssets::default(),
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             VaultRegistryId {

@@ -799,9 +799,12 @@ mod tests {
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
     use rain_math_float::Float;
-    use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
-    use st0x_evm::Chain;
     use url::Url;
+
+    use st0x_config::{
+        ChainAssets, IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain,
+    };
+    use st0x_evm::Chain;
 
     use super::*;
     use crate::bindings::IRaindexV6;
@@ -840,6 +843,8 @@ mod tests {
     async fn test_backfill_start_block_uses_deployment_block_without_checkpoint() {
         let pool = setup_test_db().await;
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -862,6 +867,8 @@ mod tests {
     async fn test_backfill_start_block_resumes_after_checkpoint() {
         let pool = setup_test_db().await;
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -886,6 +893,8 @@ mod tests {
     async fn test_backfill_start_block_respects_deployment_block_floor() {
         let pool = setup_test_db().await;
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -935,6 +944,8 @@ mod tests {
         push_tip_response(&asserter);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -972,6 +983,8 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1016,6 +1029,8 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1058,6 +1073,8 @@ mod tests {
     async fn test_save_backfill_checkpoint_is_monotonic() {
         let pool = setup_test_db().await;
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1184,6 +1201,8 @@ mod tests {
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1259,6 +1278,8 @@ mod tests {
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1335,6 +1356,8 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1444,6 +1467,8 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1492,6 +1517,8 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1588,6 +1615,8 @@ mod tests {
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1693,6 +1722,8 @@ mod tests {
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1755,6 +1786,8 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1808,6 +1841,8 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1862,6 +1897,8 @@ mod tests {
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1915,6 +1952,8 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1962,6 +2001,8 @@ mod tests {
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2063,6 +2104,8 @@ mod tests {
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2119,6 +2162,8 @@ mod tests {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2164,6 +2209,8 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2212,6 +2259,8 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2270,6 +2319,8 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2337,6 +2388,8 @@ mod tests {
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2394,6 +2447,8 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2437,6 +2492,8 @@ mod tests {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2498,6 +2555,8 @@ mod tests {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2552,6 +2611,8 @@ mod tests {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2593,6 +2654,8 @@ mod tests {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2661,6 +2724,8 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2725,6 +2790,8 @@ mod tests {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2776,6 +2843,8 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2817,6 +2886,8 @@ mod tests {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2914,6 +2985,8 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -3016,6 +3089,8 @@ mod tests {
 
     fn inventory_test_evm_ctx() -> TradingChain {
         TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),

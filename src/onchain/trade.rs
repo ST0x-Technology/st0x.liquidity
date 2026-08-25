@@ -14,7 +14,7 @@ use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use st0x_config::{AssetsConfig, InventoryAdapterVenue, InventoryAdapters, TradingChain};
+use st0x_config::{ChainAssets, InventoryAdapterVenue, InventoryAdapters, TradingChain};
 use st0x_evm::{Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE};
 use st0x_execution::{Direction, FractionalShares, HasZero};
 use st0x_float_serde::format_float_with_fallback;
@@ -395,7 +395,7 @@ impl OnchainTrade {
     pub(crate) async fn try_from_inventory_trade<EvmImpl: Evm>(
         cache: &SymbolCache,
         evm: &EvmImpl,
-        assets: &AssetsConfig,
+        assets: &ChainAssets,
         inventory_adapters: &InventoryAdapters,
         trade: &InventoryTrade,
         log: Log,
@@ -499,7 +499,6 @@ impl OnchainTrade {
         evm: &EvmImpl,
         cache: &SymbolCache,
         ctx: &TradingChain,
-        assets: &AssetsConfig,
         actors: RecoveryActors,
     ) -> Result<Option<Self>, OnChainError> {
         let receipt = evm
@@ -554,7 +553,6 @@ impl OnchainTrade {
         let recovery_config = InventoryRecoveryConfig {
             cache,
             trading_chain: ctx,
-            assets,
         };
 
         Self::try_inventory_trade_from_receipt_logs(
@@ -619,7 +617,7 @@ impl OnchainTrade {
         Self::try_from_inventory_trade(
             config.cache,
             evm,
-            config.assets,
+            &config.trading_chain.assets,
             &config.trading_chain.inventory_adapters,
             &inv,
             withdraw_log,
@@ -634,7 +632,6 @@ impl OnchainTrade {
 struct InventoryRecoveryConfig<'config> {
     cache: &'config SymbolCache,
     trading_chain: &'config TradingChain,
-    assets: &'config AssetsConfig,
 }
 
 fn inventory_trade_source(
@@ -688,7 +685,7 @@ fn reclassify_inventory_float_error(error: OnChainError) -> OnChainError {
 /// `InventoryTrade` path; the trusted ClearV3/TakeOrderV3 path never needs
 /// this since its token addresses already come from the bot's own orders.
 fn validate_inventory_token_addresses(
-    assets: &AssetsConfig,
+    assets: &ChainAssets,
     trade_details: &TradeDetails,
 ) -> Result<(), TradeValidationError> {
     let usdc_token = trade_details.usdc_token();
@@ -976,8 +973,8 @@ mod tests {
     use rain_math_float::Float;
 
     use st0x_config::{
-        EquitiesConfig, EquityAssetConfig, IngestionCutoff, InventoryAdapter,
-        InventoryAdapterVenue, InventoryAdapters, InventoryMode, OperationMode, TradingChain,
+        ChainEquities, ChainEquityAsset, IngestionCutoff, InventoryAdapter, InventoryAdapterVenue,
+        InventoryAdapters, InventoryMode, OperationMode, TradingChain,
     };
     use st0x_evm::Chain;
     use st0x_evm::IERC20::decimalsCall;
@@ -1205,6 +1202,8 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
         let ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: "http://localhost:8545".parse().unwrap(),
@@ -1227,7 +1226,6 @@ mod tests {
             &ReadOnlyEvm::new(provider),
             &cache,
             &ctx,
-            &AssetsConfig::default(),
             RecoveryActors {
                 order_owner: Address::ZERO,
                 bot_operator: BotOperator(Address::ZERO),
@@ -1315,6 +1313,8 @@ mod tests {
             deployment_block: 0,
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
         };
 
         let trade = OnchainTrade::try_from_tx_hash(
@@ -1322,7 +1322,6 @@ mod tests {
             &ReadOnlyEvm::new(provider),
             &cache,
             &ctx,
-            &AssetsConfig::default(),
             RecoveryActors {
                 order_owner,
                 bot_operator: BotOperator(Address::ZERO),
@@ -1421,6 +1420,8 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: inventory_adapters(InventoryAdapterVenue::Bebop, venue_operator),
             rpc_url: "http://localhost:8545".parse().unwrap(),
@@ -1431,14 +1432,16 @@ mod tests {
             required_confirmations: 0,
             ingestion_cutoff: IngestionCutoff::Safe,
         };
-        let assets = assets_config_with_equity("COIN", REAL_WTCOIN_BASE);
+        let ctx = TradingChain {
+            assets: assets_config_with_equity("COIN", REAL_WTCOIN_BASE),
+            ..ctx
+        };
 
         let trade = OnchainTrade::try_from_tx_hash(
             tx_hash,
             &ReadOnlyEvm::new(provider),
             &cache,
             &ctx,
-            &assets,
             RecoveryActors {
                 order_owner: inventory,
                 bot_operator: BotOperator(bot_operator),
@@ -1560,6 +1563,8 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: "http://localhost:8545".parse().unwrap(),
@@ -1576,7 +1581,6 @@ mod tests {
             &ReadOnlyEvm::new(provider),
             &cache,
             &ctx,
-            &AssetsConfig::default(),
             RecoveryActors {
                 order_owner: inventory,
                 bot_operator: BotOperator(bot_operator),
@@ -1671,6 +1675,8 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: "http://localhost:8545".parse().unwrap(),
@@ -1687,7 +1693,6 @@ mod tests {
             &ReadOnlyEvm::new(provider),
             &cache,
             &ctx,
-            &AssetsConfig::default(),
             RecoveryActors {
                 order_owner: inventory,
                 bot_operator: BotOperator(bot_operator),
@@ -1883,29 +1888,28 @@ mod tests {
     const INVENTORY_USDC: Address = USDC_BASE;
     const INVENTORY_EQUITY: Address = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
-    /// Builds an `AssetsConfig` with a single configured equity symbol,
+    /// Builds an `ChainAssets` with a single configured equity symbol,
     /// whose `tokenized_equity_derivative` is the canonical address
     /// `try_from_inventory_trade` validates the equity leg against.
     fn assets_config_with_equity(
         symbol: &str,
         tokenized_equity_derivative: Address,
-    ) -> AssetsConfig {
+    ) -> ChainAssets {
         let mut symbols = HashMap::new();
         symbols.insert(
             Symbol::new(symbol).unwrap(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
-        AssetsConfig {
-            equities: EquitiesConfig {
+        ChainAssets {
+            equities: ChainEquities {
                 operational_limit: None,
                 symbols,
             },

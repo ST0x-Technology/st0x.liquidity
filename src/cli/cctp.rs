@@ -262,10 +262,9 @@ mod tests {
 
     use st0x_config::ChainRegistry;
     use st0x_config::ExecutionThreshold;
+    use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
-    use st0x_config::{
-        AssetsConfig, BrokerCtx, CtxError, EquitiesConfig, LogFormat, LogLevel, TradingMode,
-    };
+    use st0x_config::{BrokerCtx, ChainAssets, CtxError, LogFormat, LogLevel, TradingMode};
     use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
     use st0x_evm::Chain;
     use st0x_evm::OpenChainErrorRegistry;
@@ -283,6 +282,8 @@ mod tests {
             server_port: 8080,
             board_port: 8081,
             chains: ChainRegistry::single_trading_chain(TradingChain {
+                redemption_wallet: None,
+                assets: ChainAssets::default(),
                 chain: Chain::Base,
                 inventory_adapters: InventoryAdapters::default(),
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -315,10 +316,7 @@ mod tests {
             wallet: None,
             wallet_meta: None,
             execution_threshold: ExecutionThreshold::whole_share(),
-            assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            assets: HedgingAssets::default(),
             travel_rule: None,
             rest_api: None,
             issuance: create_test_issuance_ctx(),

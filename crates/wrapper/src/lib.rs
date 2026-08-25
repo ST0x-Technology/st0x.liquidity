@@ -62,7 +62,7 @@ pub struct UnwrapConfirmation {
 /// The underlying and derivative (ERC-4626 vault) token addresses for a wrappable
 /// equity symbol.
 ///
-/// Narrow replacement for the integration crate's view of `EquityAssetConfig`:
+/// Narrow replacement for the integration crate's view of `ChainEquityAsset`:
 /// `st0x-wrapper` only needs the two token addresses, not the full asset config,
 /// so it stays independent of `st0x-config`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

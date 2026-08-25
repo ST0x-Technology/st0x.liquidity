@@ -386,7 +386,7 @@ pub enum Commands {
         network: TokenizationNetwork,
         /// Path to the st0x.registry token list for the selected network
         /// (`token-lists/<network>.json`). Required for non Base networks;
-        /// Base resolves from [assets.equities]
+        /// Base resolves from `[chains.<name>.trading.assets.equities]`
         #[arg(long = "registry")]
         registry: Option<std::path::PathBuf>,
     },
@@ -405,7 +405,7 @@ pub enum Commands {
         network: TokenizationNetwork,
         /// Path to the st0x.registry token list for the selected network
         /// (`token-lists/<network>.json`). Required for non Base networks;
-        /// Base resolves from [assets.equities]
+        /// Base resolves from `[chains.<name>.trading.assets.equities]`
         #[arg(long = "registry")]
         registry: Option<std::path::PathBuf>,
     },
@@ -624,7 +624,7 @@ pub enum Commands {
     /// Withdraw USDC from the configured Raindex cash vault
     ///
     /// This preserves the existing USDC-specific operator flow by resolving
-    /// `assets.cash.vault_ids` from config and forwarding into the generic
+    /// `vault_ids` from `[chains.<name>.trading.assets.cash]` in config and forwarding into the generic
     /// vault withdrawal implementation.
     VaultWithdrawUsdc {
         /// Amount of USDC to withdraw
@@ -663,7 +663,7 @@ pub enum Commands {
     /// without any Raindex/vault operations.
     AlpacaTokenize {
         /// Stock symbol (e.g., AAPL, TSLA) -- resolves the tokenized-equity
-        /// address from `[assets.equities]`
+        /// address from `[chains.<name>.trading.assets.equities]`
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
         /// Number of shares to tokenize (supports fractional shares)
@@ -677,7 +677,7 @@ pub enum Commands {
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
         /// Tokenized equity (tStock) address override. Required for
-        /// non-base networks -- `[assets.equities]` holds Base addresses
+        /// non-base networks -- `[chains.<name>.trading.assets.equities]` holds Base addresses
         #[arg(long = "token")]
         token: Option<Address>,
     },
@@ -689,7 +689,7 @@ pub enum Commands {
     /// without any Raindex/vault operations.
     AlpacaRedeem {
         /// Stock symbol (e.g., AAPL, TSLA) -- resolves the tokenized-equity
-        /// address from `[assets.equities]`
+        /// address from `[chains.<name>.trading.assets.equities]`
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
         /// Number of shares to redeem (supports fractional shares)
@@ -703,7 +703,7 @@ pub enum Commands {
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
         /// Tokenized equity (tStock) address override. Required for
-        /// non-base networks -- `[assets.equities]` holds Base addresses
+        /// non-base networks -- `[chains.<name>.trading.assets.equities]` holds Base addresses
         #[arg(long = "token")]
         token: Option<Address>,
     },
@@ -2107,8 +2107,9 @@ mod tests {
 
     use st0x_config::ChainRegistry;
     use st0x_config::ExecutionThreshold;
+    use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
-    use st0x_config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogFormat, LogLevel, TradingMode};
+    use st0x_config::{BrokerCtx, ChainAssets, LogFormat, LogLevel, TradingMode};
     use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
     use st0x_event_sorcery::StoreBuilder;
     use st0x_evm::Chain;
@@ -2136,6 +2137,8 @@ mod tests {
             server_port: 8080,
             board_port: 8081,
             chains: ChainRegistry::single_trading_chain(TradingChain {
+                redemption_wallet: None,
+                assets: ChainAssets::default(),
                 chain: Chain::Base,
                 inventory_adapters: InventoryAdapters::default(),
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2168,10 +2171,7 @@ mod tests {
             wallet: None,
             wallet_meta: None,
             execution_threshold: ExecutionThreshold::whole_share(),
-            assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            assets: HedgingAssets::default(),
             travel_rule: None,
             rest_api: None,
             issuance: create_test_issuance_ctx(),
@@ -3979,7 +3979,7 @@ mod tests {
                 apalis_finished_job_cleanup_interval_secs = 3600
                 inventory_divergence_threshold = 3
 
-                [assets.equities]
+                [chains.base.trading.assets.equities]
 
                 [chains.base]
                 required_confirmations = 3

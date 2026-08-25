@@ -117,11 +117,11 @@ pub use st0x_config::ExecutionThreshold;
 pub use st0x_config::TradingMode;
 #[cfg(any(test, feature = "test-support"))]
 pub use st0x_config::{
-    AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, OperationMode,
+    BotGasValuationConfig, ImbalanceThreshold, RebalancingCtx, RebalancingCtxError, UsdcRebalancing,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use st0x_config::{
-    BotGasValuationConfig, ImbalanceThreshold, RebalancingCtx, RebalancingCtxError, UsdcRebalancing,
+    ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode,
 };
 #[cfg(feature = "test-support")]
 pub use trading::onchain::trade_accountant::AccountForDexTrade;
@@ -247,11 +247,12 @@ async fn run_bot_session_inner(
         inventory::InventoryView::default(),
         event_sender.clone(),
     ));
-    let equity_prices = dashboard::equity_price::EquityPriceStore::new(&ctx.assets);
+    let equity_prices =
+        dashboard::equity_price::EquityPriceStore::new(&ctx.chains.sole_trading().assets);
     let equity_price_monitor = ctx.pricing.clone().map(|pricing| {
         dashboard::equity_price::EquityPriceMonitor::new(
             pricing,
-            &ctx.assets,
+            &ctx.chains.sole_trading().assets,
             equity_prices.clone(),
             event_sender.clone(),
         )

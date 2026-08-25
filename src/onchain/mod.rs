@@ -112,7 +112,9 @@ mod tests {
 
     use alloy::primitives::address;
 
-    use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
+    use st0x_config::{
+        ChainAssets, IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain,
+    };
     use st0x_evm::Chain;
 
     use super::raindex_contracts;
@@ -136,6 +138,8 @@ mod tests {
             vault_owner: address!("0x3333333333333333333333333333333333333333"),
             deployment_block: 1,
             ingestion_cutoff: IngestionCutoff::Safe,
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
         });
 
         assert_eq!(contracts.inventory, inventory);
@@ -162,6 +166,8 @@ mod tests {
             vault_owner: address!("0x3333333333333333333333333333333333333333"),
             deployment_block: 1,
             ingestion_cutoff: IngestionCutoff::Safe,
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
         });
 
         assert_eq!(contracts.inventory, contracts.orderbook);

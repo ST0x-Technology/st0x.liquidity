@@ -6,7 +6,7 @@ pub(crate) use std::time::Duration;
 use tokio::task::JoinHandle;
 
 pub(crate) use st0x_config::InventoryMode;
-use st0x_config::{AssetsConfig, BrokerCtx, Ctx};
+use st0x_config::{BrokerCtx, ChainAssets, Ctx};
 pub(crate) use st0x_event_sorcery::Projection;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_API_KEY, TEST_API_SECRET};
 use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
@@ -33,7 +33,7 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
     broker: &AlpacaBrokerMock,
     db_path: &std::path::Path,
     deployment_block: u64,
-    assets: AssetsConfig,
+    assets: ChainAssets,
     execution_threshold_override: Option<st0x_hedge::ExecutionThreshold>,
     /// Override the HTTP RPC URL the bot connects to. Default is
     /// `chain.endpoint()`. Used by chaos tests to route the bot

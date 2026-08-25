@@ -1764,7 +1764,9 @@ mod tests {
                 inventory::InventoryView::default(),
                 sender,
             )),
-            equity_prices: crate::dashboard::equity_price::EquityPriceStore::new(&ctx.assets),
+            equity_prices: crate::dashboard::equity_price::EquityPriceStore::new(
+                &ctx.chains.sole_trading().assets,
+            ),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
             pnl_report_admission: crate::dashboard::pnl::pnl_report_admission(),

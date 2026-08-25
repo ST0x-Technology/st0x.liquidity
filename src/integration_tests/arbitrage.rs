@@ -21,8 +21,9 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use st0x_config::HedgingAssets;
 use st0x_config::{
-    AssetsConfig, EquitiesConfig, EquityAssetConfig, ExecutionThreshold, OperationMode,
+    ChainAssets, ChainEquities, ChainEquityAsset, ExecutionThreshold, OperationMode,
 };
 use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
 use st0x_evm::{ReadOnlyEvm, USDC_BASE};
@@ -920,10 +921,10 @@ async fn create_test_cqrs(
     create_test_cqrs_with_assets(
         pool,
         apalis_pool,
-        AssetsConfig {
-            equities: EquitiesConfig {
+        ChainAssets {
+            equities: ChainEquities {
                 operational_limit: None,
-                ..EquitiesConfig::default()
+                ..ChainEquities::default()
             },
             cash: None,
         },
@@ -934,7 +935,7 @@ async fn create_test_cqrs(
 async fn create_test_cqrs_with_assets(
     pool: &SqlitePool,
     apalis_pool: &apalis_sqlite::SqlitePool,
-    assets: AssetsConfig,
+    assets: ChainAssets,
 ) -> (
     TradeProcessingCqrs,
     Arc<Store<Position>>,
@@ -959,6 +960,7 @@ async fn create_test_cqrs_with_assets(
             .unwrap();
 
     let cqrs = TradeProcessingCqrs {
+        hedging: HedgingAssets::default(),
         pool: pool.clone(),
         onchain_trade,
         position: position.clone(),
@@ -1345,8 +1347,8 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
             order_placer: cqrs.order_placer.as_ref(),
             counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
             threshold: &ExecutionThreshold::whole_share(),
-            assets: &AssetsConfig {
-                equities: EquitiesConfig::default(),
+            assets: &ChainAssets {
+                equities: ChainEquities::default(),
                 cash: None,
             },
         },
@@ -2049,8 +2051,8 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
             order_placer: cqrs.order_placer.as_ref(),
             counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
             threshold: &ExecutionThreshold::whole_share(),
-            assets: &AssetsConfig {
-                equities: EquitiesConfig::default(),
+            assets: &ChainAssets {
+                equities: ChainEquities::default(),
                 cash: None,
             },
         },
@@ -2762,19 +2764,18 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
 
     // Per-asset limit = 1 share. A 3-share onchain sell requires
     // 3 cycles of 1-share hedges to fully close.
-    let assets = AssetsConfig {
-        equities: EquitiesConfig {
+    let assets = ChainAssets {
+        equities: ChainEquities {
             operational_limit: None,
             symbols: HashMap::from([(
                 Symbol::new(TEST_AAPL).unwrap(),
-                EquityAssetConfig {
+                ChainEquityAsset {
                     tokenized_equity: Address::ZERO,
                     tokenized_equity_derivative: Address::ZERO,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
-                    extended_hours_counter_trading: OperationMode::Disabled,
                     operational_limit: Some(
                         Positive::new(FractionalShares::new(float!(1))).unwrap(),
                     ),
@@ -2973,19 +2974,18 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
     // Per-asset shares limit = 2. A 5-share onchain sell hedges 2 shares,
     // fails, retries (also capped to 2), and the pending order blocks
     // concurrent checker cycles.
-    let assets = AssetsConfig {
-        equities: EquitiesConfig {
+    let assets = ChainAssets {
+        equities: ChainEquities {
             operational_limit: None,
             symbols: HashMap::from([(
                 Symbol::new(TEST_AAPL).unwrap(),
-                EquityAssetConfig {
+                ChainEquityAsset {
                     tokenized_equity: Address::ZERO,
                     tokenized_equity_derivative: Address::ZERO,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
-                    extended_hours_counter_trading: OperationMode::Disabled,
                     operational_limit: Some(
                         Positive::new(FractionalShares::new(float!(2))).unwrap(),
                     ),

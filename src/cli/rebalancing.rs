@@ -119,7 +119,7 @@ async fn build_equity_transfer_services(
 
     let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
         base_caller.clone(),
-        to_wrapped_equities(&ctx.assets.equities.symbols),
+        to_wrapped_equities(&ctx.chains.sole_trading().assets.equities.symbols),
     ));
 
     let vault_lookup: Arc<dyn VaultLookup> = Arc::new(VaultRegistryLookup::new(
@@ -517,15 +517,23 @@ async fn run_usdc_transfer<Writer: Write>(
 
     let wallet_ctx = ctx.wallet()?;
 
-    let cash =
-        ctx.assets.cash.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("assets.cash.vault_ids is required but not configured")
+    let cash = ctx
+        .chains
+        .sole_trading()
+        .assets
+        .cash
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+            )
         })?;
 
-    let usdc_vault_id =
-        cash.vault_ids.first().copied().ok_or_else(|| {
-            anyhow::anyhow!("assets.cash.vault_ids is required but not configured")
-        })?;
+    let usdc_vault_id = cash.vault_ids.first().copied().ok_or_else(|| {
+        anyhow::anyhow!(
+            "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+        )
+    })?;
 
     writeln!(stdout, "   Vault ID: {usdc_vault_id}")?;
 
@@ -1099,7 +1107,7 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
 
 /// Resolves the tokenized-equity (tStock) address for a tokenization
 /// command: an explicit `--token` override wins; otherwise the Base address
-/// comes from `[assets.equities]`. Non-base networks have no config source,
+/// comes from `[chains.<name>.trading.assets.equities]`. Non-base networks have no config source,
 /// so they require the override.
 fn resolve_tokenization_token(
     token_override: Option<Address>,
@@ -1112,16 +1120,23 @@ fn resolve_tokenization_token(
     }
 
     match network {
-        TokenizationNetwork::Base => ctx.assets.tokenized_equity(symbol).ok_or_else(|| {
-            anyhow::anyhow!("equity {symbol} is not configured in [assets.equities]")
-        }),
+        TokenizationNetwork::Base => ctx
+            .chains
+            .sole_trading()
+            .assets
+            .tokenized_equity(symbol)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "equity {symbol} is not configured in [chains.<name>.trading.assets.equities]"
+                )
+            }),
         TokenizationNetwork::Ethereum => Err(anyhow::anyhow!(
             "pass --token with the Ethereum tStock address for {symbol}: \
-             [assets.equities] holds Base addresses only"
+             [chains.base.trading.assets.equities] holds Base addresses only"
         )),
         TokenizationNetwork::HyperEvm => Err(anyhow::anyhow!(
             "pass --token with the HyperEVM tStock address for {symbol}: \
-             [assets.equities] holds Base addresses only"
+             [chains.base.trading.assets.equities] holds Base addresses only"
         )),
     }
 }
@@ -1812,10 +1827,11 @@ mod tests {
     use st0x_bridge::cctp::CctpError;
     use st0x_config::ChainRegistry;
     use st0x_config::ExecutionThreshold;
+    use st0x_config::HedgingAssets;
     use st0x_config::RebalancingCtx;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
-        AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, LogFormat, LogLevel,
+        ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, LogFormat, LogLevel,
         OperationMode, TradingMode,
     };
     use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
@@ -2230,6 +2246,8 @@ mod tests {
             server_port: 8080,
             board_port: 8081,
             chains: ChainRegistry::single_trading_chain(TradingChain {
+                redemption_wallet: None,
+                assets: ChainAssets::default(),
                 chain: Chain::Base,
                 inventory_adapters: InventoryAdapters::default(),
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2262,10 +2280,7 @@ mod tests {
             wallet: None,
             wallet_meta: None,
             execution_threshold: ExecutionThreshold::whole_share(),
-            assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            assets: HedgingAssets::default(),
             travel_rule: None,
             rest_api: None,
             issuance: create_test_issuance_ctx(),
@@ -2291,7 +2306,7 @@ mod tests {
         ctx
     }
 
-    fn create_alpaca_ctx_with_rebalancing(cash: Option<CashAssetConfig>) -> Ctx {
+    fn create_alpaca_ctx_with_rebalancing(cash: Option<ChainCashAsset>) -> Ctx {
         let alpaca_broker_auth = AlpacaBrokerApiCtx {
             auth: st0x_execution::AlpacaBrokerAuth::Basic {
                 api_key: "test-key".to_string(),
@@ -2313,6 +2328,11 @@ mod tests {
             server_port: 8080,
             board_port: 8081,
             chains: ChainRegistry::single_trading_chain(TradingChain {
+                redemption_wallet: None,
+                assets: ChainAssets {
+                    equities: ChainEquities::default(),
+                    cash,
+                },
                 chain: Chain::Base,
                 inventory_adapters: InventoryAdapters::default(),
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -2356,10 +2376,7 @@ mod tests {
             wallet: Some(st0x_config::OnchainWalletCtx::stub()),
             wallet_meta: None,
             execution_threshold: ExecutionThreshold::whole_share(),
-            assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash,
-            },
+            assets: HedgingAssets::default(),
             travel_rule: None,
             rest_api: None,
             issuance: create_test_issuance_ctx(),
@@ -2418,7 +2435,7 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires [tokenization]"),
+            err_msg.contains("redemption_wallet"),
             "Expected tokenization config error, got: {err_msg}"
         );
     }
@@ -2638,13 +2655,12 @@ mod tests {
     #[tokio::test]
     async fn test_transfer_usdc_requires_wallet_config() {
         let mut ctx = create_alpaca_ctx_without_rebalancing();
-        ctx.assets.cash = Some(CashAssetConfig {
+        ctx.chains.sole_trading_mut().assets.cash = Some(ChainCashAsset {
             vault_ids: vec![b256!(
                 "0x00000000000000000000000000000000000000000000000000000000000000ab"
             )],
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
-            reserved: None,
         });
         let pool = setup_test_db().await;
         let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
@@ -2762,18 +2778,17 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("assets.cash.vault_ids is required"),
+            err_msg.contains("vault_ids in [chains.<name>.trading.assets.cash] is required"),
             "Expected vault_id error, got: {err_msg}"
         );
     }
 
     #[tokio::test]
     async fn test_transfer_usdc_requires_vault_id_when_vault_id_is_none() {
-        let ctx = create_alpaca_ctx_with_rebalancing(Some(CashAssetConfig {
+        let ctx = create_alpaca_ctx_with_rebalancing(Some(ChainCashAsset {
             vault_ids: Vec::new(),
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
-            reserved: None,
         }));
         let pool = setup_test_db().await;
         let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
@@ -2790,7 +2805,7 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("assets.cash.vault_ids is required"),
+            err_msg.contains("vault_ids in [chains.<name>.trading.assets.cash] is required"),
             "Expected vault_id error, got: {err_msg}"
         );
     }
@@ -2798,11 +2813,10 @@ mod tests {
     #[tokio::test]
     async fn test_transfer_usdc_writes_vault_id_to_stdout() {
         let vault_id = b256!("0x00000000000000000000000000000000000000000000000000000000000000ab");
-        let ctx = create_alpaca_ctx_with_rebalancing(Some(CashAssetConfig {
+        let ctx = create_alpaca_ctx_with_rebalancing(Some(ChainCashAsset {
             vault_ids: vec![vault_id],
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
-            reserved: None,
         }));
         let pool = setup_test_db().await;
         let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
@@ -2856,7 +2870,7 @@ mod tests {
         let result = resolve_redemption_wallet(None, &ctx);
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires [tokenization]"),
+            err_msg.contains("redemption_wallet"),
             "Expected tokenization config error, got: {err_msg}"
         );
     }
@@ -3954,27 +3968,37 @@ mod tests {
     fn tokenized_equity_resolves_from_config() {
         let mut ctx = create_ctx_without_rebalancing();
         let token = address!("0x626757e6f50675d17fcad312e82f989ae7a23d38");
-        ctx.assets.equities.symbols.insert(
-            Symbol::new("COIN").unwrap(),
-            EquityAssetConfig {
-                tokenized_equity: token,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: Vec::new(),
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
-                operational_limit: None,
-            },
-        );
+        ctx.chains
+            .sole_trading_mut()
+            .assets
+            .equities
+            .symbols
+            .insert(
+                Symbol::new("COIN").unwrap(),
+                ChainEquityAsset {
+                    tokenized_equity: token,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            );
 
         assert_eq!(
-            ctx.assets.tokenized_equity(&Symbol::new("COIN").unwrap()),
+            ctx.chains
+                .sole_trading()
+                .assets
+                .tokenized_equity(&Symbol::new("COIN").unwrap()),
             Some(token),
             "a configured symbol must resolve to its tokenized_equity address",
         );
         assert_eq!(
-            ctx.assets.tokenized_equity(&Symbol::new("AAPL").unwrap()),
+            ctx.chains
+                .sole_trading()
+                .assets
+                .tokenized_equity(&Symbol::new("AAPL").unwrap()),
             None,
             "an unconfigured symbol must resolve to None, never a default address",
         );
@@ -3998,9 +4022,9 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("equity COIN is not configured in [assets.equities]"),
+            error.to_string().contains(
+                "equity COIN is not configured in [chains.<name>.trading.assets.equities]"
+            ),
             "an unconfigured symbol must fail before any network call, got: {error}"
         );
     }
@@ -4023,9 +4047,9 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("equity COIN is not configured in [assets.equities]"),
+            error.to_string().contains(
+                "equity COIN is not configured in [chains.<name>.trading.assets.equities]"
+            ),
             "an unconfigured symbol must fail before any network call, got: {error}"
         );
     }

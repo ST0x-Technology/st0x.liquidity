@@ -149,7 +149,7 @@ where
                 OnchainTrade::try_from_inventory_trade(
                     &ctx.cache,
                     &ctx.evm,
-                    &ctx.ctx.assets,
+                    &ctx.ctx.chains.sole_trading().assets,
                     &ctx.ctx.chains.sole_trading().inventory_adapters,
                     inv.as_ref(),
                     reconstructed_log,
@@ -324,7 +324,12 @@ where
         let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
         let _guard = symbol_lock.lock().await;
 
-        let trading_enabled = ctx.ctx.assets.is_trading_enabled(trade.symbol.base());
+        let trading_enabled = ctx
+            .ctx
+            .chains
+            .sole_trading()
+            .assets
+            .is_trading_enabled(trade.symbol.base());
 
         match process_queued_trade(
             &ctx.executor,
@@ -759,8 +764,9 @@ mod tests {
     use rain_math_float::Float;
 
     use st0x_config::ExecutionThreshold;
+    use st0x_config::HedgingAssets;
     use st0x_config::create_test_ctx_with_order_owner;
-    use st0x_config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
+    use st0x_config::{ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder};
     use st0x_evm::IERC20::{decimalsCall, symbolCall};
     use st0x_execution::{
@@ -825,6 +831,7 @@ mod tests {
                 .unwrap();
 
         let cqrs = TradeProcessingCqrs {
+            hedging: HedgingAssets::default(),
             pool: pool.clone(),
             onchain_trade,
             position,
@@ -832,7 +839,7 @@ mod tests {
             offchain_order,
             order_placer: noop_order_placer(),
             execution_threshold,
-            assets: ctx.assets.clone(),
+            assets: ctx.chains.sole_trading().assets.clone(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
             close_flatten_policy:
                 crate::trading::offchain::close_flatten::CloseFlattenPolicy::from_secs(900).unwrap(),
@@ -1472,7 +1479,7 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
 
         // Trading must be explicitly enabled for COIN: `perform` computes
-        // `trading_enabled` from `ctx.assets.is_trading_enabled`, which
+        // `trading_enabled` from `ctx.chains.sole_trading().assets.is_trading_enabled`, which
         // defaults to disabled for any symbol absent from the config.
         // `tokenized_equity_derivative` must equal the real wtCOIN address
         // used above -- `try_from_inventory_trade` now validates the
@@ -1481,19 +1488,18 @@ mod tests {
         let mut symbols = HashMap::new();
         symbols.insert(
             Symbol::new("COIN").unwrap(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: equity_token,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
-        ctx.assets = AssetsConfig {
-            equities: EquitiesConfig {
+        ctx.chains.sole_trading_mut().assets = ChainAssets {
+            equities: ChainEquities {
                 operational_limit: None,
                 symbols,
             },
@@ -1715,19 +1721,18 @@ mod tests {
         let mut symbols = HashMap::new();
         symbols.insert(
             Symbol::new("COIN").unwrap(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: equity_token,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
-        ctx.assets = AssetsConfig {
-            equities: EquitiesConfig {
+        ctx.chains.sole_trading_mut().assets = ChainAssets {
+            equities: ChainEquities {
                 operational_limit: None,
                 symbols,
             },
@@ -1844,7 +1849,7 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
 
         // Trading must be explicitly enabled for COIN: `perform` computes
-        // `trading_enabled` from `ctx.assets.is_trading_enabled`, which
+        // `trading_enabled` from `ctx.chains.sole_trading().assets.is_trading_enabled`, which
         // defaults to disabled for any symbol absent from the config.
         // `tokenized_equity_derivative` must equal the real wtCOIN address
         // used above -- `try_from_inventory_trade` now validates the
@@ -1853,19 +1858,18 @@ mod tests {
         let mut symbols = HashMap::new();
         symbols.insert(
             Symbol::new("COIN").unwrap(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: equity_token,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
-        ctx.assets = AssetsConfig {
-            equities: EquitiesConfig {
+        ctx.chains.sole_trading_mut().assets = ChainAssets {
+            equities: ChainEquities {
                 operational_limit: None,
                 symbols,
             },

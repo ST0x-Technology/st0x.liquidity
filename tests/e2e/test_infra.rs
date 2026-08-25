@@ -18,7 +18,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use st0x_bridge::cctp::CctpAttestationMock;
 use st0x_config::mk_env_filter;
-use st0x_config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
+use st0x_config::{ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
 use st0x_execution::Symbol;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, MockPosition};
 use st0x_hedge::mock_api::{AlpacaTokenizationMock, REDEMPTION_WALLET};
@@ -110,22 +110,21 @@ pub struct TestInfra<P> {
 }
 
 impl<P> TestInfra<P> {
-    /// Builds an `AssetsConfig` with trading enabled for all deployed
+    /// Builds an `ChainAssets` with trading enabled for all deployed
     /// equities. Use this when constructing `Ctx::for_test()` in hedging
     /// tests so the conductor treats the symbols as active.
-    pub fn assets_config(&self) -> AssetsConfig {
+    pub fn assets_config(&self) -> ChainAssets {
         let symbols = self
             .equity_addresses
             .iter()
             .map(|(symbol, vault_addr, underlying_addr)| {
-                let config = EquityAssetConfig {
+                let config = ChainEquityAsset {
                     tokenized_equity: *underlying_addr,
                     tokenized_equity_derivative: *vault_addr,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
-                    extended_hours_counter_trading: OperationMode::Disabled,
                     operational_limit: None,
                 };
                 let Ok(symbol_key) = Symbol::new(symbol.clone()) else {
@@ -135,8 +134,8 @@ impl<P> TestInfra<P> {
             })
             .collect();
 
-        AssetsConfig {
-            equities: EquitiesConfig {
+        ChainAssets {
+            equities: ChainEquities {
                 symbols,
                 operational_limit: None,
             },

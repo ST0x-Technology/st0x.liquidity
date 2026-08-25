@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 
 use st0x_bridge::cctp::CctpAttestationMock;
 use st0x_config::{BrokerCtx, Ctx};
+use st0x_config::{CashHedgePolicy, EquityHedgePolicy, HedgedEquities, HedgingAssets};
 use st0x_evm::{Evm, EvmError, Wallet};
 use st0x_execution::alpaca_broker_api::{
     AlpacaBrokerMock, OrderSide, OrderStatus, TEST_API_KEY, TEST_API_SECRET, TransferDirection,
@@ -42,7 +43,7 @@ pub(crate) use st0x_hedge::mock_api::REDEMPTION_WALLET;
 use st0x_hedge::mock_api::{AlpacaTokenizationMock, TokenizationStatus};
 pub(crate) use st0x_hedge::mock_api::{RedemptionOutcome, TokenizationRequestType};
 use st0x_hedge::{
-    AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, ImbalanceThreshold,
+    ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, ImbalanceThreshold,
     OperationMode, TradingMode,
 };
 
@@ -57,6 +58,30 @@ pub(crate) use crate::poll::{
 };
 pub(crate) use crate::test_infra::TestInfra;
 use st0x_float_macro::float;
+
+/// The hedging table the e2e Ctx builder needs alongside a chain listing:
+/// every listed symbol gets a policy, plus the broker-side cash reserve.
+fn hedging_with_reserve(
+    equities: &HashMap<Symbol, ChainEquityAsset>,
+    reserved: Option<Positive<Usd>>,
+) -> HedgingAssets {
+    HedgingAssets {
+        equities: HedgedEquities {
+            symbols: equities
+                .keys()
+                .map(|symbol| {
+                    (
+                        symbol.clone(),
+                        EquityHedgePolicy {
+                            extended_hours_counter_trading: OperationMode::Disabled,
+                        },
+                    )
+                })
+                .collect(),
+        },
+        cash: reserved.map(|reserved| CashHedgePolicy { reserved }),
+    }
+}
 
 /// Local signing wallet for rebalancing e2e tests that exposes
 /// `Provider = RootProvider`.
@@ -249,19 +274,18 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     };
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth);
 
-    let equities: HashMap<Symbol, EquityAssetConfig> = equity_tokens
+    let equities: HashMap<Symbol, ChainEquityAsset> = equity_tokens
         .iter()
         .map(|&(ref symbol, wrapped, unwrapped)| {
             Ok((
                 Symbol::new(symbol)?,
-                EquityAssetConfig {
+                ChainEquityAsset {
                     tokenized_equity: unwrapped,
                     tokenized_equity_derivative: wrapped,
                     vault_ids: equity_vault_ids.get(symbol).copied().into_iter().collect(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Enabled,
                     wrapped_equity_recovery,
-                    extended_hours_counter_trading: OperationMode::Disabled,
                     operational_limit: None,
                 },
             ))
@@ -288,16 +312,15 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         base_wallet,
     );
 
-    let assets = AssetsConfig {
-        equities: EquitiesConfig {
+    let assets = ChainAssets {
+        equities: ChainEquities {
             symbols: equities,
             operational_limit: None,
         },
-        cash: Some(CashAssetConfig {
+        cash: Some(ChainCashAsset {
             vault_ids: vec![cash_vault_id],
             rebalancing: cash_rebalancing,
             operational_limit: None,
-            reserved: None,
         }),
     };
 
@@ -351,19 +374,18 @@ where
     };
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth);
 
-    let equities: HashMap<Symbol, EquityAssetConfig> = equity_tokens
+    let equities: HashMap<Symbol, ChainEquityAsset> = equity_tokens
         .iter()
         .map(|(symbol, wrapped, unwrapped)| {
             Ok((
                 Symbol::new(symbol)?,
-                EquityAssetConfig {
+                ChainEquityAsset {
                     tokenized_equity: *unwrapped,
                     tokenized_equity_derivative: *wrapped,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery,
-                    extended_hours_counter_trading: OperationMode::Disabled,
                     operational_limit: None,
                 },
             ))
@@ -403,18 +425,18 @@ where
         .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
         .order_owner(base_chain.owner)
         .wallet(wallet_ctx)
-        .assets(AssetsConfig {
-            equities: EquitiesConfig {
-                symbols: equities,
+        .assets(ChainAssets {
+            equities: ChainEquities {
+                symbols: equities.clone(),
                 operational_limit: None,
             },
-            cash: Some(CashAssetConfig {
+            cash: Some(ChainCashAsset {
                 vault_ids: vec![usdc_vault_id],
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
-                reserved,
             }),
         })
+        .hedging(hedging_with_reserve(&equities, reserved))
         .inventory_poll_interval(15)
         .redemption_wallet(Address::random())
         .bot_gas_valuation(st0x_hedge::BotGasValuationConfig {

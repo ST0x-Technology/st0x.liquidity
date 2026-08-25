@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, HeaderValue};
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 use tracing::{debug, info, warn};
 
-use st0x_config::{AssetsConfig, PricingAuth, PricingCtx};
+use st0x_config::{ChainAssets, PricingAuth, PricingCtx};
 use st0x_dto::{EquityPrice, EquityPriceStatus, Statement};
 use st0x_evm::USDC_BASE;
 use st0x_finance::Symbol;
@@ -86,7 +86,7 @@ pub(crate) struct EquityPriceStore {
 }
 
 impl EquityPriceStore {
-    pub(crate) fn new(assets: &AssetsConfig) -> Self {
+    pub(crate) fn new(assets: &ChainAssets) -> Self {
         let prices = assets
             .equities
             .symbols
@@ -196,7 +196,7 @@ pub(crate) struct EquityPriceMonitor {
 impl EquityPriceMonitor {
     pub(crate) fn new(
         ctx: PricingCtx,
-        assets: &AssetsConfig,
+        assets: &ChainAssets,
         store: EquityPriceStore,
         sender: broadcast::Sender<Statement>,
     ) -> Self {
@@ -671,7 +671,7 @@ mod tests {
     };
     use url::Url;
 
-    use st0x_config::{EquitiesConfig, EquityAssetConfig, OperationMode};
+    use st0x_config::{ChainEquities, ChainEquityAsset, OperationMode};
 
     use super::*;
 
@@ -718,20 +718,19 @@ mod tests {
         }
     }
 
-    fn assets() -> AssetsConfig {
-        AssetsConfig {
-            equities: EquitiesConfig {
+    fn assets() -> ChainAssets {
+        ChainAssets {
+            equities: ChainEquities {
                 operational_limit: None,
                 symbols: HashMap::from([(
                     Symbol::new("AAPL").unwrap(),
-                    EquityAssetConfig {
+                    ChainEquityAsset {
                         tokenized_equity: address!("0x2222222222222222222222222222222222222222"),
                         tokenized_equity_derivative: expected().base,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Enabled,
                         rebalancing: OperationMode::Disabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
-                        extended_hours_counter_trading: OperationMode::Disabled,
                         operational_limit: None,
                     },
                 )]),

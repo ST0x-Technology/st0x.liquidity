@@ -142,10 +142,11 @@ mod tests {
     use url::Url;
 
     use st0x_config::ChainRegistry;
+    use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
-        AssetsConfig, BrokerCtx, EquitiesConfig, ExecutionThreshold, IngestionCutoff,
-        InventoryAdapters, InventoryMode, LogFormat, LogLevel, TradingChain, TradingMode,
+        BrokerCtx, ChainAssets, ExecutionThreshold, IngestionCutoff, InventoryAdapters,
+        InventoryMode, LogFormat, LogLevel, TradingChain, TradingMode,
     };
     use st0x_evm::Chain;
 
@@ -203,6 +204,8 @@ mod tests {
             server_port: 8080,
             board_port: 8081,
             chains: ChainRegistry::single_trading_chain(TradingChain {
+                redemption_wallet: None,
+                assets: ChainAssets::default(),
                 chain: Chain::Base,
                 inventory_adapters: InventoryAdapters::default(),
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -235,10 +238,7 @@ mod tests {
             wallet: None,
             wallet_meta: None,
             execution_threshold: ExecutionThreshold::whole_share(),
-            assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            assets: HedgingAssets::default(),
             travel_rule: None,
             rest_api: None,
             issuance: create_test_issuance_ctx(),
@@ -267,9 +267,9 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("equity COIN is not configured in [assets.equities]"),
+            error.to_string().contains(
+                "equity COIN is not configured in [chains.<name>.trading.assets.equities]"
+            ),
             "tokenize must fail on the unconfigured symbol, got: {error}"
         );
 
