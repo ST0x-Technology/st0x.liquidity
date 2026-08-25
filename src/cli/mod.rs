@@ -1734,14 +1734,12 @@ async fn run_transfer_command<W: Write>(
         } => {
             let result =
                 rebalancing::fail_transfer_command(stdout, pool, transfer_type, &id, &reason).await;
-            write_log_query_url(stdout, ctx, &id)?;
-            result
+            finish_with_log_query_url(stdout, ctx, &id, result)
         }
         SimpleCommand::RecheckTransfer { transfer_type, id } => {
             let result =
                 rebalancing::recheck_transfer_command(stdout, transfer_type, &id, ctx).await;
-            write_log_query_url(stdout, ctx, &id)?;
-            result
+            finish_with_log_query_url(stdout, ctx, &id, result)
         }
         SimpleCommand::ResumeInterruptedTransfers => {
             rebalancing::resume_interrupted_transfers_command(stdout, ctx).await
@@ -1755,13 +1753,11 @@ async fn run_transfer_command<W: Write>(
             let reason = parse_usdc_reconcile_reason(reason.as_ref())?;
             let result =
                 rebalancing::reconcile_usdc_transfer_command(stdout, id, reason.into(), pool).await;
-            write_log_query_url(stdout, ctx, &id.to_string())?;
-            result
+            finish_with_log_query_url(stdout, ctx, &id.to_string(), result)
         }
         SimpleCommand::FailUsdcTransfer { id, reason } => {
             let result = rebalancing::fail_usdc_transfer_command(stdout, id, &reason, pool).await;
-            write_log_query_url(stdout, ctx, &id.to_string())?;
-            result
+            finish_with_log_query_url(stdout, ctx, &id.to_string(), result)
         }
         SimpleCommand::ReconcileEquityTransfer {
             transfer_type,
@@ -1776,16 +1772,27 @@ async fn run_transfer_command<W: Write>(
                 pool,
             )
             .await;
-            write_log_query_url(stdout, ctx, &id)?;
-            result
+            finish_with_log_query_url(stdout, ctx, &id, result)
         }
         SimpleCommand::ClearPendingBurn { id, reason } => {
             let result = rebalancing::clear_pending_burn_command(stdout, id, &reason, pool).await;
-            write_log_query_url(stdout, ctx, &id.to_string())?;
-            result
+            finish_with_log_query_url(stdout, ctx, &id.to_string(), result)
         }
         _ => unreachable!("non-transfer command routed to run_transfer_command"),
     }
+}
+
+/// Prints the log query link after a transfer command. The command's error
+/// wins when both it and the link write fail; a link write failure surfaces
+/// only for a command that succeeded.
+fn finish_with_log_query_url<W: Write>(
+    stdout: &mut W,
+    ctx: &Ctx,
+    id: &str,
+    result: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let link = write_log_query_url(stdout, ctx, id);
+    result.and(link)
 }
 
 /// Prints `log_query_url_template` with `{id}` substituted, after the command
@@ -2170,6 +2177,43 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "Logs: https://logs.example/q?id=abc-123\n"
+        );
+    }
+
+    /// A writer that refuses every write, standing in for a closed stdout.
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("stdout closed"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The command's error must survive a failed link write; the link write
+    /// error surfaces only when the command succeeded.
+    #[test]
+    fn finish_with_log_query_url_keeps_the_command_error() {
+        let mut ctx = create_test_ctx();
+        ctx.log_query_url_template = Some("https://logs.example/q?id={id}".to_string());
+
+        let command_error = finish_with_log_query_url(
+            &mut FailingWriter,
+            &ctx,
+            "abc",
+            Err(anyhow::anyhow!("command failed")),
+        )
+        .unwrap_err();
+        assert_eq!(command_error.to_string(), "command failed");
+
+        let link_error =
+            finish_with_log_query_url(&mut FailingWriter, &ctx, "abc", Ok(())).unwrap_err();
+        assert!(
+            link_error.to_string().contains("stdout closed"),
+            "expected the link write error, got: {link_error}"
         );
     }
 
