@@ -34,8 +34,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use st0x_config::{
-    AssetsConfig, BrokerCtx, Ctx, CtxError, EvmCtx, ExecutionThreshold, InventoryMode,
-    IssuanceStatusCtx, OperationMode, RebalancingCtx,
+    AssetsConfig, BrokerCtx, Ctx, CtxError, ExecutionThreshold, InventoryMode, IssuanceStatusCtx,
+    OperationMode, RebalancingCtx, TradingChain,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
@@ -712,7 +712,7 @@ type HttpProvider = FillProvider<
 
 async fn setup_instrumentation<E>(
     executor_ctx: impl TryIntoExecutor<Executor = E>,
-    evm: &EvmCtx,
+    trading_chain: &TradingChain,
     pool: SqlitePool,
 ) -> anyhow::Result<(
     InstrumentedExecutor<E>,
@@ -738,7 +738,7 @@ where
     // from any provider handle is timed.
     let rpc_client = ClientBuilder::default()
         .layer(RpcTelemetryLayer::new(telemetry.clone()))
-        .http(evm.rpc_url.clone());
+        .http(trading_chain.rpc_url.clone());
     let provider = ProviderBuilder::new().connect_client(rpc_client);
 
     // The HTTP transport connects lazily, so probe it once at startup to
@@ -754,7 +754,7 @@ where
     // misconfigured or unsupported endpoint before the fill monitor starts
     // polling. A null response is allowed through (cold start); an error or
     // a detected `finalized`-aliasing-to-`latest` returns Err and fails startup.
-    match probe_cutoff_block_support(&provider, chain_tip, evm.ingestion_cutoff)
+    match probe_cutoff_block_support(&provider, chain_tip, trading_chain.ingestion_cutoff)
         .await
         .context("RPC endpoint cannot serve the configured cutoff block tag at startup")?
     {
@@ -843,7 +843,7 @@ impl Conductor {
         crate::offchain::order::JobError: From<E::Error>,
     {
         let (executor, provider, telemetry_writer, telemetry) =
-            setup_instrumentation(executor_ctx, &ctx.evm, pool.clone()).await?;
+            setup_instrumentation(executor_ctx, ctx.chains.sole_trading(), pool.clone()).await?;
         let cache = SymbolCache::default();
 
         let (job_queue, backfill_queue, dashboard_delivery, schedulers) =
@@ -1429,7 +1429,8 @@ async fn grant_startup_token_approvals(ctx: &Ctx) -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     };
 
-    let targets = build_approval_targets(&ctx.assets, ctx.evm.orderbook, USDC_BASE);
+    let targets =
+        build_approval_targets(&ctx.assets, ctx.chains.sole_trading().orderbook, USDC_BASE);
 
     grant_startup_approvals(&base_wallet, &targets).await?;
 
@@ -2061,7 +2062,7 @@ fn build_rebalancing_raindex_service<Signer: Wallet + Clone>(
 ) -> Arc<RaindexService<Signer>> {
     Arc::new(RaindexService::new(
         base_wallet.clone(),
-        crate::onchain::raindex_contracts(&ctx.evm),
+        crate::onchain::raindex_contracts(ctx.chains.sole_trading()),
         market_maker_wallet,
     ))
 }
@@ -2080,7 +2081,7 @@ async fn preflight_inventory_access<Signer: Wallet + Clone>(
     raindex_service: &RaindexService<Signer>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let InventoryMode::Managed { inventory } = ctx.evm.inventory else {
+    let InventoryMode::Managed { inventory } = ctx.chains.sole_trading().inventory else {
         debug!(
             target: "inventory",
             "legacy inventory mode; skipping OPERATOR_ROLE preflight (no distinct inventory in play)",
@@ -2279,7 +2280,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         // The (orderbook, vault-owner) pair keys both the vault-registry lookup
         // and the rebalancing service's registry reads.
         let vault_registry_id = VaultRegistryId {
-            orderbook: deps.ctx.evm.orderbook,
+            orderbook: deps.ctx.chains.sole_trading().orderbook,
             owner: deps.ctx.vault_owner(),
         };
 
@@ -2415,7 +2416,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             wallets,
             raindex_service,
             &rebalancing_ctx,
-            deps.ctx.evm.required_confirmations,
+            deps.ctx.chains.sole_trading().required_confirmations,
             deps.telemetry.clone(),
         )
         .await?;
@@ -4624,7 +4625,7 @@ mod tests {
         // preflight tried to read OPERATOR_ROLE / hasRole, the mock would error.
         let service = mock_wallet_raindex_service(Asserter::new());
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.evm.inventory = InventoryMode::Legacy;
+        ctx.chains.sole_trading_mut().inventory = InventoryMode::Legacy;
 
         preflight_inventory_access(&service, &ctx)
             .await
@@ -4640,7 +4641,7 @@ mod tests {
         // covered by the RaindexService::verify_operator_role unit tests.
         let service = mock_wallet_raindex_service(Asserter::new());
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.evm.inventory = InventoryMode::Managed {
+        ctx.chains.sole_trading_mut().inventory = InventoryMode::Managed {
             inventory: Address::repeat_byte(0xAA),
         };
 

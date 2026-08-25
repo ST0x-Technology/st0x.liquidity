@@ -505,7 +505,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     cache: &SymbolCache,
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
-    let evm_ctx = &ctx.evm;
+    let trading_chain = ctx.chains.sole_trading();
     // Matches ClearV3/TakeOrderV3 fills to our Raindex orders -- owned by the
     // inventory contract post-migration, the bot EOA before it.
     let actors = RecoveryActors {
@@ -522,9 +522,8 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
         tx_hash,
         &read_evm,
         cache,
-        evm_ctx,
+        trading_chain,
         &ctx.assets,
-        &ctx.inventory_adapters,
         actors,
     )
     .await
@@ -1198,12 +1197,14 @@ mod tests {
     use url::Url;
     use uuid::uuid;
 
+    use st0x_config::ChainRegistry;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
-        AssetsConfig, BrokerCtx, EquitiesConfig, EquityAssetConfig, EvmCtx, ExecutionThreshold,
+        AssetsConfig, BrokerCtx, EquitiesConfig, EquityAssetConfig, ExecutionThreshold,
         IngestionCutoff, InventoryAdapters, InventoryMode, LogFormat, LogLevel, OperationMode,
-        TradingMode,
+        TradingChain, TradingMode,
     };
+    use st0x_evm::Chain;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, CancellationOutcome,
         CounterTradePreflight, ExecutionError, InventoryResult, LimitOrder, Positive,
@@ -1418,7 +1419,9 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            evm: EvmCtx {
+            chains: ChainRegistry::single_trading_chain(TradingChain {
+                chain: Chain::Base,
+                inventory_adapters: InventoryAdapters::default(),
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 inventory: InventoryMode::Managed {
@@ -1428,8 +1431,7 @@ mod tests {
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
-            },
-            inventory_adapters: InventoryAdapters::default(),
+            }),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,

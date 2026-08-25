@@ -14,7 +14,7 @@ use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use st0x_config::{AssetsConfig, EvmCtx, InventoryAdapterVenue, InventoryAdapters};
+use st0x_config::{AssetsConfig, InventoryAdapterVenue, InventoryAdapters, TradingChain};
 use st0x_evm::{Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE};
 use st0x_execution::{Direction, FractionalShares, HasZero};
 use st0x_float_serde::format_float_with_fallback;
@@ -498,9 +498,8 @@ impl OnchainTrade {
         tx_hash: TxHash,
         evm: &EvmImpl,
         cache: &SymbolCache,
-        ctx: &EvmCtx,
+        ctx: &TradingChain,
         assets: &AssetsConfig,
-        inventory_adapters: &InventoryAdapters,
         actors: RecoveryActors,
     ) -> Result<Option<Self>, OnChainError> {
         let receipt = evm
@@ -554,9 +553,8 @@ impl OnchainTrade {
         // re-fetch the same receipt via a second `eth_getTransactionReceipt`.
         let recovery_config = InventoryRecoveryConfig {
             cache,
-            evm_ctx: ctx,
+            trading_chain: ctx,
             assets,
-            inventory_adapters,
         };
 
         Self::try_inventory_trade_from_receipt_logs(
@@ -588,7 +586,7 @@ impl OnchainTrade {
         let inventory_logs: Vec<Log> = logs
             .iter()
             .filter(|log| {
-                log.address() == config.evm_ctx.inventory_address()
+                log.address() == config.trading_chain.inventory_address()
                     && (log.topic0() == Some(&OperatorDeposit::SIGNATURE_HASH)
                         || log.topic0() == Some(&OperatorWithdraw::SIGNATURE_HASH))
             })
@@ -622,7 +620,7 @@ impl OnchainTrade {
             config.cache,
             evm,
             config.assets,
-            config.inventory_adapters,
+            &config.trading_chain.inventory_adapters,
             &inv,
             withdraw_log,
             Some(receipt_metadata),
@@ -635,9 +633,8 @@ impl OnchainTrade {
 /// keeping its argument count under the clippy threshold.
 struct InventoryRecoveryConfig<'config> {
     cache: &'config SymbolCache,
-    evm_ctx: &'config EvmCtx,
+    trading_chain: &'config TradingChain,
     assets: &'config AssetsConfig,
-    inventory_adapters: &'config InventoryAdapters,
 }
 
 fn inventory_trade_source(
@@ -803,7 +800,7 @@ async fn try_convert_log_to_onchain_trade<EvmImpl: Evm>(
     log: &Log,
     evm: &EvmImpl,
     cache: &SymbolCache,
-    ctx: &EvmCtx,
+    ctx: &TradingChain,
     receipt_metadata: ReceiptMetadata,
     order_owner: Address,
 ) -> Result<Option<OnchainTrade>, OnChainError> {
@@ -979,9 +976,10 @@ mod tests {
     use rain_math_float::Float;
 
     use st0x_config::{
-        EquitiesConfig, EquityAssetConfig, EvmCtx, IngestionCutoff, InventoryAdapter,
-        InventoryAdapterVenue, InventoryAdapters, InventoryMode, OperationMode,
+        EquitiesConfig, EquityAssetConfig, IngestionCutoff, InventoryAdapter,
+        InventoryAdapterVenue, InventoryAdapters, InventoryMode, OperationMode, TradingChain,
     };
+    use st0x_evm::Chain;
     use st0x_evm::IERC20::decimalsCall;
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::Symbol;
@@ -1206,7 +1204,9 @@ mod tests {
         asserter.push_success(&serde_json::Value::Null);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
-        let ctx = EvmCtx {
+        let ctx = TradingChain {
+            chain: Chain::Base,
+            inventory_adapters: InventoryAdapters::default(),
             rpc_url: "http://localhost:8545".parse().unwrap(),
             orderbook: Address::ZERO,
             inventory: InventoryMode::Managed {
@@ -1228,7 +1228,6 @@ mod tests {
             &cache,
             &ctx,
             &AssetsConfig::default(),
-            &InventoryAdapters::default(),
             RecoveryActors {
                 order_owner: Address::ZERO,
                 bot_operator: BotOperator(Address::ZERO),
@@ -1304,7 +1303,9 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
         seed_get_test_order_token_symbols(&cache);
-        let ctx = EvmCtx {
+        let ctx = TradingChain {
+            chain: Chain::Base,
+            inventory_adapters: InventoryAdapters::default(),
             rpc_url: "http://localhost:8545".parse().unwrap(),
             orderbook,
             inventory: InventoryMode::Managed {
@@ -1322,7 +1323,6 @@ mod tests {
             &cache,
             &ctx,
             &AssetsConfig::default(),
-            &InventoryAdapters::default(),
             RecoveryActors {
                 order_owner,
                 bot_operator: BotOperator(Address::ZERO),
@@ -1420,7 +1420,9 @@ mod tests {
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtCOIN
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let ctx = EvmCtx {
+        let ctx = TradingChain {
+            chain: Chain::Base,
+            inventory_adapters: inventory_adapters(InventoryAdapterVenue::Bebop, venue_operator),
             rpc_url: "http://localhost:8545".parse().unwrap(),
             orderbook,
             inventory: InventoryMode::Managed { inventory },
@@ -1437,7 +1439,6 @@ mod tests {
             &cache,
             &ctx,
             &assets,
-            &InventoryAdapters::default(),
             RecoveryActors {
                 order_owner: inventory,
                 bot_operator: BotOperator(bot_operator),
@@ -1453,6 +1454,14 @@ mod tests {
         let expected_amount =
             Float::from_fixed_decimal(uint!(34_172_366_621_067_031_U256), 18).unwrap();
         assert!(trade.amount.inner().eq(expected_amount).unwrap());
+        assert_eq!(
+            trade.source,
+            OnChainTradeSource::Inventory {
+                operator: venue_operator,
+                venue: InventoryVenue::Bebop,
+            },
+            "the recovered source must come from the trading chain's own adapter registry"
+        );
     }
 
     /// The manual `process-tx` recovery path must quarantine a tx with one
@@ -1550,7 +1559,9 @@ mod tests {
         asserter.push_success(&receipt); // get_transaction_receipt
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let ctx = EvmCtx {
+        let ctx = TradingChain {
+            chain: Chain::Base,
+            inventory_adapters: InventoryAdapters::default(),
             rpc_url: "http://localhost:8545".parse().unwrap(),
             orderbook,
             inventory: InventoryMode::Managed { inventory },
@@ -1566,7 +1577,6 @@ mod tests {
             &cache,
             &ctx,
             &AssetsConfig::default(),
-            &InventoryAdapters::default(),
             RecoveryActors {
                 order_owner: inventory,
                 bot_operator: BotOperator(bot_operator),
@@ -1660,7 +1670,9 @@ mod tests {
         asserter.push_success(&receipt); // get_transaction_receipt
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let ctx = EvmCtx {
+        let ctx = TradingChain {
+            chain: Chain::Base,
+            inventory_adapters: InventoryAdapters::default(),
             rpc_url: "http://localhost:8545".parse().unwrap(),
             orderbook,
             inventory: InventoryMode::Managed { inventory },
@@ -1676,7 +1688,6 @@ mod tests {
             &cache,
             &ctx,
             &AssetsConfig::default(),
-            &InventoryAdapters::default(),
             RecoveryActors {
                 order_owner: inventory,
                 bot_operator: BotOperator(bot_operator),

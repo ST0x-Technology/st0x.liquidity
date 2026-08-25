@@ -21,14 +21,27 @@ extended_hours_counter_trading = "disabled"
 tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
-[raindex]
+[chains.base]
+required_confirmations = 0
+
+[chains.base.trading]
 orderbook = "0x1111111111111111111111111111111111111111"
 inventory_mode = "legacy"
 inventory_adapters = []
 vault_owner = "0x3333333333333333333333333333333333333333"
 deployment_block = 1
-required_confirmations = 0
 ingestion_cutoff = "safe"
+
+# Ethereum is a cash-corridor endpoint only: the bot holds USDC and signs
+# there, but runs no orderbook and ingests no fills, so it has no [trading]
+# table. Confirmations are deeper than Base's because an L1 reorg is a
+# different risk from an OP-Stack sequencer batch.
+[chains.ethereum]
+required_confirmations = 12
+
+# HyperEVM, same shape as Ethereum.
+[chains.hyperevm]
+required_confirmations = 1
 
 [rest_api]
 url = "http://localhost:8099"

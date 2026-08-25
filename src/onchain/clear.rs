@@ -7,7 +7,7 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use tracing::debug;
 
-use st0x_config::EvmCtx;
+use st0x_config::TradingChain;
 use st0x_evm::Evm;
 use st0x_registry::SymbolCache;
 
@@ -20,7 +20,7 @@ impl OnchainTrade {
     /// Creates OnchainTrade directly from ClearV3 blockchain events
     #[tracing::instrument(target = "hedge", skip_all, fields(tx_hash = ?log.transaction_hash, log_index = ?log.log_index), level = tracing::Level::DEBUG)]
     pub async fn try_from_clear_v3<E: Evm>(
-        evm_ctx: &EvmCtx,
+        trading_chain: &TradingChain,
         cache: &SymbolCache,
         evm: &E,
         event: ClearV3,
@@ -64,7 +64,7 @@ impl OnchainTrade {
             return Ok(None);
         }
 
-        let after_clear = fetch_after_clear_event(evm, evm_ctx, &log).await?;
+        let after_clear = fetch_after_clear_event(evm, trading_chain, &log).await?;
 
         let ClearStateChangeV2 {
             aliceOutput,
@@ -123,7 +123,7 @@ impl OnchainTrade {
 /// returned 0 AfterClearV2 logs, but `get_transaction_receipt` showed both logs present.
 async fn fetch_after_clear_event(
     evm: &impl Evm,
-    evm_ctx: &EvmCtx,
+    trading_chain: &TradingChain,
     log: &Log,
 ) -> Result<AfterClearV2, OnChainError> {
     let block_number = log
@@ -134,7 +134,7 @@ async fn fetch_after_clear_event(
 
     let filter = Filter::new()
         .select(block_number)
-        .address(evm_ctx.orderbook)
+        .address(trading_chain.orderbook)
         .event_signature(AfterClearV2::SIGNATURE_HASH);
 
     let after_clear_logs = evm.provider().get_logs(&filter).await?;
@@ -186,7 +186,7 @@ async fn fetch_after_clear_event(
         .logs()
         .iter()
         .filter(|receipt_log| {
-            receipt_log.address() == evm_ctx.orderbook
+            receipt_log.address() == trading_chain.orderbook
                 && receipt_log.topics().first() == Some(&AfterClearV2::SIGNATURE_HASH)
                 && receipt_log
                     .log_index
@@ -209,10 +209,11 @@ async fn fetch_after_clear_event(
 
     // Check what's actually in the receipt for error reporting
     let clear_in_receipt = tx_receipt.inner.logs().iter().any(|log| {
-        log.address() == evm_ctx.orderbook && log.topics().first() == Some(&ClearV3::SIGNATURE_HASH)
+        log.address() == trading_chain.orderbook
+            && log.topics().first() == Some(&ClearV3::SIGNATURE_HASH)
     });
     let after_clear_in_receipt = tx_receipt.inner.logs().iter().any(|log| {
-        log.address() == evm_ctx.orderbook
+        log.address() == trading_chain.orderbook
             && log.topics().first() == Some(&AfterClearV2::SIGNATURE_HASH)
     });
 
@@ -246,7 +247,8 @@ mod tests {
     use serde_json::json;
     use url::Url;
 
-    use st0x_config::{IngestionCutoff, InventoryMode};
+    use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode};
+    use st0x_evm::Chain;
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{Direction, FractionalShares};
     use st0x_float_macro::float;
@@ -261,8 +263,10 @@ mod tests {
 
     const TEST_BLOCK_TIMESTAMP: u64 = 1_700_000_000;
 
-    fn create_test_ctx() -> EvmCtx {
-        EvmCtx {
+    fn create_test_ctx() -> TradingChain {
+        TradingChain {
+            chain: Chain::Base,
+            inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             inventory: InventoryMode::Managed {

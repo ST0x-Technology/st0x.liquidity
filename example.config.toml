@@ -51,7 +51,15 @@ close_flatten_cross_max_bps = 400
 [broker.travel_rule]
 beneficiary_entity_name = "Acme Corp"
 
-[raindex]
+[chains.base]
+# Block-confirmation depth required before a transaction this bot submits is
+# treated as settled (the primary gate for USDC rebalancing withdrawals). This
+# does NOT govern order-fill ingestion: the fill monitor caps the backfill range
+# at the configured ingestion_cutoff block, not this depth. Set explicitly per
+# chain based on observed confirmation behavior.
+required_confirmations = 3
+
+[chains.base.trading]
 orderbook = "0x1111111111111111111111111111111111111111"
 # Rebalancing settlement mode. "legacy" settles directly against the orderbook
 # with bot-EOA-owned vaults and omits the `inventory` field below; "managed"
@@ -85,12 +93,6 @@ inventory = "0x6b7B523fADd1677413AD92c9404C8F0796bACF6F"
 # it does here.
 vault_owner = "0x6b7B523fADd1677413AD92c9404C8F0796bACF6F"
 deployment_block = 1
-# Block-confirmation depth required before a transaction this bot submits is
-# treated as settled (the primary gate for USDC rebalancing withdrawals). This
-# does NOT govern order-fill ingestion: the fill monitor caps the backfill range
-# at the configured ingestion_cutoff block, not this depth. Set explicitly per
-# chain based on observed confirmation behavior.
-required_confirmations = 3
 # Block tag used as the fill-ingestion cutoff. REQUIRED -- must be set
 # explicitly to "safe" or "finalized"; omitting this field fails startup.
 # "safe"      -- OP-Stack safe block: sequencer batch posted to L1, not yet
@@ -105,10 +107,17 @@ required_confirmations = 3
 #                ~20 min hedging lag on Base.
 ingestion_cutoff = "safe"
 
-# Wallet provider — select via `kind`:
-#   "turnkey"     — Turnkey secure enclave signing   (requires --features wallet-turnkey)
-#   "private-key" — local raw private key signing     (requires --features wallet-private-key)
-# The wallet address is used as the order_owner for orderbook event filtering.
+# Ethereum is a cash-corridor endpoint only: the bot holds USDC and signs
+# there, but runs no orderbook and ingests no fills, so it has no [trading]
+# table. Confirmations are deeper than Base's because an L1 reorg is a
+# different risk from an OP-Stack sequencer batch.
+[chains.ethereum]
+required_confirmations = 12
+
+# HyperEVM, same shape as Ethereum.
+[chains.hyperevm]
+required_confirmations = 1
+
 [wallet]
 kind = "private-key"
 address = "0xfcad0b19bb29d4674531d6f115237e16afce377c"

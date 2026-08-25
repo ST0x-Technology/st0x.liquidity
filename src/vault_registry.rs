@@ -578,7 +578,7 @@ impl SeedVaultRegistryCtx {
         }
 
         let id = VaultRegistryId {
-            orderbook: ctx.evm.orderbook,
+            orderbook: ctx.chains.sole_trading().orderbook,
             owner: ctx.vault_owner(),
         };
 

@@ -125,14 +125,14 @@ async fn build_equity_transfer_services(
     let vault_lookup: Arc<dyn VaultLookup> = Arc::new(VaultRegistryLookup::new(
         vault_registry_projection,
         VaultRegistryId {
-            orderbook: ctx.evm.orderbook,
+            orderbook: ctx.chains.sole_trading().orderbook,
             owner: ctx.vault_owner(),
         },
     ));
 
     let raindex = Arc::new(RaindexService::new(
         base_caller,
-        crate::onchain::raindex_contracts(&ctx.evm),
+        crate::onchain::raindex_contracts(ctx.chains.sole_trading()),
         wallet,
     ));
 
@@ -582,7 +582,7 @@ async fn run_usdc_transfer<Writer: Write>(
 
     let vault_service = Arc::new(RaindexService::new(
         wallet_ctx.base_wallet().clone(),
-        crate::onchain::raindex_contracts(&ctx.evm),
+        crate::onchain::raindex_contracts(ctx.chains.sole_trading()),
         owner,
     ));
 
@@ -598,7 +598,7 @@ async fn run_usdc_transfer<Writer: Write>(
         RaindexVaultId(usdc_vault_id),
         &UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
-            required_confirmations: ctx.evm.required_confirmations,
+            required_confirmations: ctx.chains.sole_trading().required_confirmations,
             #[cfg(feature = "test-support")]
             circle_api_base: rebalancing_ctx.circle_api_base.clone(),
             #[cfg(feature = "test-support")]
@@ -1810,6 +1810,7 @@ mod tests {
     use uuid::uuid;
 
     use st0x_bridge::cctp::CctpError;
+    use st0x_config::ChainRegistry;
     use st0x_config::ExecutionThreshold;
     use st0x_config::RebalancingCtx;
     use st0x_config::create_test_issuance_ctx;
@@ -1817,8 +1818,9 @@ mod tests {
         AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, LogFormat, LogLevel,
         OperationMode, TradingMode,
     };
-    use st0x_config::{EvmCtx, IngestionCutoff, InventoryAdapters, InventoryMode};
+    use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
     use st0x_event_sorcery::LifecycleError;
+    use st0x_evm::Chain;
     #[cfg(feature = "test-support")]
     use st0x_evm::StubWallet;
     use st0x_execution::{
@@ -2227,7 +2229,9 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            evm: EvmCtx {
+            chains: ChainRegistry::single_trading_chain(TradingChain {
+                chain: Chain::Base,
+                inventory_adapters: InventoryAdapters::default(),
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 inventory: InventoryMode::Managed {
@@ -2237,8 +2241,7 @@ mod tests {
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
-            },
-            inventory_adapters: InventoryAdapters::default(),
+            }),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
@@ -2309,7 +2312,9 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            evm: EvmCtx {
+            chains: ChainRegistry::single_trading_chain(TradingChain {
+                chain: Chain::Base,
+                inventory_adapters: InventoryAdapters::default(),
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 inventory: InventoryMode::Managed {
@@ -2319,8 +2324,7 @@ mod tests {
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
-            },
-            inventory_adapters: InventoryAdapters::default(),
+            }),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,

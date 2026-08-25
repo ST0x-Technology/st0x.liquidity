@@ -9,13 +9,14 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tracing::{Level, warn};
 use url::Url;
 
+use st0x_evm::Chain;
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaBrokerAuth,
     DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, FractionalShares, Positive, SupportedExecutor,
@@ -24,12 +25,17 @@ use st0x_execution::{
 use st0x_finance::{Usd, Usdc};
 use st0x_float_macro::float;
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::InventoryAdapters;
+#[cfg(any(test, feature = "test-support"))]
+use crate::chain::TradingChain;
 use crate::pricing::PricingSecrets;
+use crate::wallet::{SigningChain, SigningChains};
 use crate::{
-    AlertsConfig, AlertsCtx, AlertsSecrets, BotGasValuationConfig, EvmConfig, EvmCtx, EvmSecrets,
-    ExecutionThreshold, InvalidThresholdError, InventoryAdapters, OrchestratorConfig,
-    PricingConfig, PricingCtx, PricingCtxError, RebalancingConfig, RebalancingCtx,
-    RebalancingCtxError, TelemetryConfig, TelemetryCtx,
+    AlertsConfig, AlertsCtx, AlertsSecrets, BotGasValuationConfig, ChainConfig, ChainRegistry,
+    ChainSecrets, ExecutionThreshold, InvalidThresholdError, OrchestratorConfig, PricingConfig,
+    PricingCtx, PricingCtxError, RebalancingConfig, RebalancingCtx, RebalancingCtxError,
+    TelemetryConfig, TelemetryCtx,
 };
 
 /// Alpaca minimum execution threshold: $2.
@@ -209,7 +215,9 @@ struct Config {
     log_query_url_template: Option<String>,
     server_port: u16,
     board_port: u16,
-    raindex: EvmConfig,
+    /// One table per chain the bot acts on. Replaces the single unnamed
+    /// `[raindex]` section, which could only ever describe one chain.
+    chains: BTreeMap<Chain, ChainConfig>,
     order_polling_interval: Option<u64>,
     order_polling_max_jitter: Option<u64>,
     position_check_interval: Option<u64>,
@@ -541,7 +549,7 @@ impl std::fmt::Debug for TravelRuleConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Secrets {
-    evm: EvmSecrets,
+    chains: BTreeMap<Chain, ChainSecrets>,
     broker: BrokerSecrets,
     alerts: Option<AlertsSecrets>,
     pricing: Option<PricingSecrets>,
@@ -600,9 +608,9 @@ pub struct Ctx {
     pub log_query_url_template: Option<LogQueryUrlTemplate>,
     pub server_port: u16,
     pub board_port: u16,
-    pub evm: EvmCtx,
-    /// Deployment-specific shared-inventory operator-to-venue attribution.
-    pub inventory_adapters: InventoryAdapters,
+    /// Every chain the bot acts on. Read the trading chain out of it with
+    /// [`ChainRegistry::sole_trading`].
+    pub chains: ChainRegistry,
     pub order_polling_interval: u64,
     pub order_polling_max_jitter: u64,
     pub position_check_interval: u64,
@@ -801,8 +809,7 @@ impl std::fmt::Debug for Ctx {
             .field("log_query_url_template", &self.log_query_url_template)
             .field("server_port", &self.server_port)
             .field("board_port", &self.board_port)
-            .field("evm", &self.evm)
-            .field("inventory_adapters", &self.inventory_adapters)
+            .field("chains", &self.chains)
             .field("order_polling_interval", &self.order_polling_interval)
             .field("order_polling_max_jitter", &self.order_polling_max_jitter)
             .field("position_check_interval", &self.position_check_interval)
@@ -943,8 +950,7 @@ struct ValidatedParts {
     log_query_url_template: Option<LogQueryUrlTemplate>,
     server_port: u16,
     board_port: u16,
-    evm: EvmCtx,
-    inventory_adapters: InventoryAdapters,
+    chains: ChainRegistry,
     order_polling_interval: u64,
     order_polling_max_jitter: u64,
     position_check_interval: u64,
@@ -981,9 +987,8 @@ struct ValidatedParts {
 struct WalletInputs {
     config: toml::Value,
     secrets: toml::Value,
-    base_rpc_url: Url,
-    ethereum_rpc_url: Url,
-    hyperevm_rpc_url: Url,
+    /// Endpoint and confirmation depth per chain the wallet signs on.
+    signing_chains: SigningChains,
 }
 
 /// Non-secret wallet metadata extracted from the config TOML during
@@ -996,13 +1001,15 @@ pub struct WalletMeta {
 }
 
 /// Validates the config/secrets pairing and RPC prerequisites for wallet
-/// construction without connecting to either chain.
+/// construction without connecting to any chain.
+///
+/// The wallet signs on every chain the bot holds funds on, including the ones
+/// it does not trade on, so each of those needs a `[chains.<name>]` entry
+/// carrying its `rpc_url`.
 fn validate_wallet_inputs(
     wallet_config: Option<toml::Value>,
     wallet_secrets: Option<toml::Value>,
-    base_rpc_url: Option<Url>,
-    ethereum_rpc_url: Option<Url>,
-    hyperevm_rpc_url: Option<Url>,
+    chains: &ChainRegistry,
     config_path: &Path,
 ) -> Result<(WalletInputs, WalletMeta), CtxError> {
     match (wallet_config, wallet_secrets) {
@@ -1018,18 +1025,26 @@ fn validate_wallet_inputs(
                 None => return Err(CtxError::WalletSecretsMissing),
             };
 
-            let base_rpc_url = base_rpc_url.ok_or(CtxError::WalletMissingRpcUrl {
-                field: "base_rpc_url",
-            })?;
-            let ethereum_rpc_url = ethereum_rpc_url.ok_or(CtxError::WalletMissingRpcUrl {
-                field: "ethereum_rpc_url",
-            })?;
-            let hyperevm_rpc_url = hyperevm_rpc_url.ok_or(CtxError::WalletMissingRpcUrl {
-                field: "hyperevm_rpc_url",
-            })?;
-            crate::wallet::require_secure_wallet_rpc_url(&base_rpc_url, "base_rpc_url")?;
-            crate::wallet::require_secure_wallet_rpc_url(&ethereum_rpc_url, "ethereum_rpc_url")?;
-            crate::wallet::require_secure_wallet_rpc_url(&hyperevm_rpc_url, "hyperevm_rpc_url")?;
+            let signing_chain = |chain: Chain| -> Result<SigningChain, CtxError> {
+                let rpc_url = chains
+                    .rpc_url(chain)
+                    .ok_or(CtxError::WalletMissingChain { chain })?;
+                crate::wallet::require_secure_wallet_rpc_url(rpc_url, chain)?;
+                let required_confirmations = chains
+                    .required_confirmations(chain)
+                    .ok_or(CtxError::WalletMissingChain { chain })?;
+
+                Ok(SigningChain {
+                    rpc_url: rpc_url.clone(),
+                    required_confirmations,
+                })
+            };
+            let signing_chains = SigningChains {
+                base: signing_chain(Chain::Base)?,
+                ethereum: signing_chain(Chain::Ethereum)?,
+                hyperevm: signing_chain(Chain::HyperEvm)?,
+            };
+
             let wallet_meta = WalletMeta::deserialize(wallet_config.clone()).map_err(|source| {
                 CtxError::ConfigToml {
                     path: config_path.to_path_buf(),
@@ -1041,9 +1056,7 @@ fn validate_wallet_inputs(
                 WalletInputs {
                     config: wallet_config,
                     secrets: wallet_secrets,
-                    base_rpc_url,
-                    ethereum_rpc_url,
-                    hyperevm_rpc_url,
+                    signing_chains,
                 },
                 wallet_meta,
             ))
@@ -1131,11 +1144,10 @@ fn parse_and_validate(
         path: config_path.to_path_buf(),
         source,
     })?;
-    let mut secrets: Secrets =
-        toml::from_str(secrets_str).map_err(|source| CtxError::SecretsToml {
-            path: secrets_path.to_path_buf(),
-            source,
-        })?;
+    let secrets: Secrets = toml::from_str(secrets_str).map_err(|source| CtxError::SecretsToml {
+        path: secrets_path.to_path_buf(),
+        source,
+    })?;
 
     if config.server_port == config.board_port {
         return Err(CtxError::ServerAndBoardPortsMatch {
@@ -1161,19 +1173,9 @@ fn parse_and_validate(
     // - DryRun uses shares threshold for testing
     let execution_threshold = broker.execution_threshold()?;
 
-    // Extract RPC URLs before EvmCtx consumes secrets.evm.
-    let base_rpc_url = secrets.evm.base.take();
-    let ethereum_rpc_url = secrets.evm.ethereum.take();
-    let hyperevm_rpc_url = secrets.evm.hyperevm.take();
-    let evm = EvmCtx::new(&config.raindex, secrets.evm)?;
-    let (wallet_inputs, wallet_meta) = validate_wallet_inputs(
-        config.wallet,
-        secrets.wallet,
-        base_rpc_url,
-        ethereum_rpc_url,
-        hyperevm_rpc_url,
-        config_path,
-    )?;
+    let chains = ChainRegistry::new(&config.chains, secrets.chains)?;
+    let (wallet_inputs, wallet_meta) =
+        validate_wallet_inputs(config.wallet, secrets.wallet, &chains, config_path)?;
 
     let trading_mode = match config.rebalancing {
         Some(rebalancing_config) => {
@@ -1256,8 +1258,7 @@ fn parse_and_validate(
         log_query_url_template,
         server_port: config.server_port,
         board_port: config.board_port,
-        evm,
-        inventory_adapters: config.raindex.inventory_adapters,
+        chains,
         order_polling_interval: polling_intervals.order_polling_interval,
         order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
         position_check_interval: polling_intervals.position_check_interval,
@@ -1395,9 +1396,7 @@ impl Ctx {
         let wallet = crate::wallet::OnchainWalletCtx::new(
             parts.wallet_inputs.config,
             parts.wallet_inputs.secrets,
-            parts.wallet_inputs.base_rpc_url,
-            parts.wallet_inputs.ethereum_rpc_url,
-            parts.wallet_inputs.hyperevm_rpc_url,
+            parts.wallet_inputs.signing_chains,
         )
         .await?;
 
@@ -1411,8 +1410,7 @@ impl Ctx {
             log_query_url_template: parts.log_query_url_template,
             server_port: parts.server_port,
             board_port: parts.board_port,
-            evm: parts.evm,
-            inventory_adapters: parts.inventory_adapters,
+            chains: parts.chains,
             order_polling_interval: parts.order_polling_interval,
             order_polling_max_jitter: parts.order_polling_max_jitter,
             position_check_interval: parts.position_check_interval,
@@ -1513,7 +1511,7 @@ impl Ctx {
             kms_api_key,
             api_private_key,
             wallet_address,
-            orderbook: parts.evm.orderbook,
+            orderbook: parts.chains.sole_trading().orderbook,
             assets: parts.assets,
         }))
     }
@@ -1561,12 +1559,12 @@ impl Ctx {
     ///
     /// Every `vaultBalance2` read, vault-registry entry, and ClearV3/TakeOrderV3
     /// order-owner fill match is scoped by this address. Sourced from the
-    /// required `[raindex].vault_owner` config field -- the signing wallet while
+    /// required `[chains.<name>.trading].vault_owner` config field -- the signing wallet while
     /// the vaults are bot-EOA-owned, flipped to the inventory address when the
     /// shared-inventory migration makes the inventory contract `msg.sender` to
     /// Raindex (and therefore the vault owner).
     pub fn vault_owner(&self) -> Address {
-        self.evm.vault_owner
+        self.chains.sole_trading().vault_owner
     }
 }
 
@@ -1728,16 +1726,17 @@ impl Ctx {
             log_query_url_template: None,
             server_port,
             board_port,
-            evm: EvmCtx {
+            chains: ChainRegistry::single_trading_chain(TradingChain {
+                chain: Chain::Base,
                 rpc_url,
+                required_confirmations,
                 orderbook,
                 inventory: inventory_mode,
+                inventory_adapters,
                 vault_owner,
                 deployment_block,
-                required_confirmations,
                 ingestion_cutoff: IngestionCutoff::Safe,
-            },
-            inventory_adapters,
+            }),
             order_polling_interval: 1,
             order_polling_max_jitter: 0,
             position_check_interval: 2,
@@ -1882,7 +1881,9 @@ pub enum CtxError {
     #[error(transparent)]
     Alerts(#[from] crate::alerts::AlertsAssemblyError),
     #[error(transparent)]
-    Evm(#[from] crate::evm::EvmConfigError),
+    Chain(#[from] crate::chain::ChainConfigError),
+    #[error(transparent)]
+    ChainRegistry(#[from] crate::chain::ChainRegistryError),
     #[error("operation requires rebalancing mode")]
     NotRebalancing,
     #[error(
@@ -1896,15 +1897,17 @@ pub enum CtxError {
     )]
     MissingBotGasValuation,
     #[error(
-        "operation requires a configured [wallet] section \
-         (base_rpc_url, ethereum_rpc_url, and hyperevm_rpc_url in [evm] \
-         secrets)"
+        "operation requires a configured [wallet] section, and a [chains.<name>] \
+         entry supplying an rpc_url for every chain it signs on"
     )]
     WalletNotConfigured,
     #[error(transparent)]
     Wallet(#[from] crate::wallet::WalletCtxError),
-    #[error("[evm] {field} is required when [wallet] is configured")]
-    WalletMissingRpcUrl { field: &'static str },
+    #[error(
+        "[chains.{chain}] is required when [wallet] is configured: the wallet signs \
+         on that chain and needs its rpc_url"
+    )]
+    WalletMissingChain { chain: Chain },
     #[error("[wallet] config present but [wallet] secrets missing")]
     WalletSecretsMissing,
     #[error(
@@ -1986,7 +1989,8 @@ impl CtxError {
                 "counter trade slippage bps out of range"
             }
             Self::Alerts(_) => "alerts assembly error",
-            Self::Evm(_) => "evm configuration error",
+            Self::Chain(_) => "chain configuration error",
+            Self::ChainRegistry(_) => "chain registry error",
             Self::CashOperationalLimitBelowMinimumTransfer { .. } => {
                 "cash operational limit below minimum transfer"
             }
@@ -2002,7 +2006,7 @@ impl CtxError {
             Self::MissingTravelRule => "missing travel rule config",
             Self::WalletNotConfigured => "wallet not configured",
             Self::Wallet(_) => "wallet construction error",
-            Self::WalletMissingRpcUrl { .. } => "wallet missing RPC URL",
+            Self::WalletMissingChain { .. } => "wallet missing a chain entry",
             Self::WalletSecretsMissing => "wallet secrets missing",
             Self::RestApiClient(_) => "failed to build REST API HTTP client",
             Self::MissingIssuanceConfig => "missing issuance config",
@@ -2099,21 +2103,22 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         log_query_url_template: None,
         server_port: 8080,
         board_port: 8081,
-        evm: EvmCtx {
+        chains: ChainRegistry::single_trading_chain(TradingChain {
+            chain: Chain::Base,
             // Hard-coded literal URL — parse cannot fail in a test helper.
             #[allow(clippy::unwrap_used)]
             rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
+            required_confirmations: 1,
             orderbook: alloy::primitives::address!("0x1111111111111111111111111111111111111111"),
             // Legacy by default: no distinct inventory, so the OPERATOR_ROLE
             // preflight is skipped. Tests exercising the managed path override
-            // `evm.inventory` explicitly.
+            // the trading chain's `inventory` explicitly.
             inventory: InventoryMode::Legacy,
+            inventory_adapters: InventoryAdapters::default(),
             vault_owner: order_owner,
             deployment_block: 1,
-            required_confirmations: 1,
             ingestion_cutoff: IngestionCutoff::Safe,
-        },
-        inventory_adapters: InventoryAdapters::default(),
+        }),
         order_polling_interval: 15,
         order_polling_max_jitter: 5,
         position_check_interval: 60,
@@ -2186,8 +2191,8 @@ mod tests {
             .call()
             .unwrap();
 
-        assert_eq!(ctx.evm.inventory, InventoryMode::Legacy);
-        assert_eq!(ctx.evm.vault_owner, order_owner);
+        assert_eq!(ctx.chains.sole_trading().inventory, InventoryMode::Legacy);
+        assert_eq!(ctx.chains.sole_trading().vault_owner, order_owner);
     }
 
     #[test]
@@ -2208,8 +2213,11 @@ mod tests {
             .call()
             .unwrap();
 
-        assert_eq!(ctx.evm.inventory, InventoryMode::Managed { inventory });
-        assert_eq!(ctx.evm.vault_owner, inventory);
+        assert_eq!(
+            ctx.chains.sole_trading().inventory,
+            InventoryMode::Managed { inventory }
+        );
+        assert_eq!(ctx.chains.sole_trading().vault_owner, inventory);
     }
 
     /// Pins the first line of defense against database contention: every
@@ -2252,15 +2260,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
             inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -2282,15 +2298,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
             inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -2326,16 +2350,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -2361,11 +2392,15 @@ mod tests {
     fn alpaca_secrets_toml() -> NamedTempFile {
         toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.infura.io"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -2394,16 +2429,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -2423,11 +2465,15 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(
             br#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.infura.io"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "dry-run"
@@ -2485,15 +2531,23 @@ mod tests {
 
             {pricing}
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
             inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -2505,8 +2559,15 @@ mod tests {
     fn unsupported_schwab_secrets_toml() -> NamedTempFile {
         toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [chains.hyperevm]
+            rpc_url = "http://localhost:8545"
+
 
             [broker]
             type = "schwab"
@@ -2603,12 +2664,20 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "not-an-address"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "not-an-address"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
+
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -2645,16 +2714,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -2696,16 +2772,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -2744,16 +2827,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -2792,15 +2882,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -2816,11 +2914,15 @@ mod tests {
         );
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.infura.io"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "dry-run"
@@ -2874,11 +2976,15 @@ mod tests {
     async fn alerts_config_fails_fast_on_bad_thresholds() {
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.infura.io"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "dry-run"
@@ -2953,16 +3059,24 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
+
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -2994,15 +3108,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
             inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -3035,15 +3157,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
             inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -3075,16 +3205,24 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
+
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -3116,16 +3254,24 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
+
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -3163,16 +3309,24 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
             inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
-
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
+
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -3205,16 +3359,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -3250,16 +3411,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -3294,16 +3462,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -3329,11 +3504,15 @@ mod tests {
     async fn rebalancing_with_low_cash_operational_limit_fails() {
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.infura.io"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -3361,15 +3540,23 @@ mod tests {
             rebalancing = "enabled"
             operational_limit = 52
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -3439,16 +3626,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -3490,17 +3684,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
 
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
@@ -3532,17 +3732,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
 
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
@@ -3563,11 +3769,15 @@ mod tests {
     async fn rebalancing_with_schwab_fails() {
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.infura.io"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "schwab"
@@ -3590,15 +3800,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -3688,16 +3906,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -3751,15 +3976,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -3791,8 +4024,15 @@ mod tests {
 
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [chains.hyperevm]
+            rpc_url = "http://localhost:8545"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -3821,15 +4061,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -3864,8 +4112,15 @@ mod tests {
 
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [chains.hyperevm]
+            rpc_url = "http://localhost:8545"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -3895,15 +4150,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -3939,11 +4202,15 @@ mod tests {
 
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.example.com"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.example.com"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -3979,15 +4246,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
             inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -4030,11 +4305,15 @@ mod tests {
     fn rebalancing_secrets_toml() -> NamedTempFile {
         toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.example.com"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.example.com"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -4202,26 +4481,38 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
             inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         "#;
         let secrets_str = r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.example.com"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.example.com"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "dry-run"
@@ -4260,16 +4551,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
 
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -4289,8 +4587,15 @@ mod tests {
 
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [chains.hyperevm]
+            rpc_url = "http://localhost:8545"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -4328,16 +4633,23 @@ mod tests {
             target_ratio = 0.5
             ratio_deviation = 0.2
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
 
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -4357,11 +4669,15 @@ mod tests {
 
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:1"
-            base_rpc_url = "http://localhost:1"
-            ethereum_rpc_url = "http://localhost:1"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:1"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -4391,16 +4707,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
 
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -4420,9 +4743,6 @@ mod tests {
 
         let secrets = toml_file(
             r#"
-            [evm]
-            rpc_url = "http://localhost:8545"
-
             [broker]
             type = "alpaca-broker-api"
             api_key = "test-key"
@@ -4436,14 +4756,14 @@ mod tests {
         );
 
         let result = Ctx::load_files(config.path(), secrets.path()).await;
+        let error = result.unwrap_err();
+        let detail = std::error::Error::source(&error)
+            .map(std::string::ToString::to_string)
+            .unwrap_or_default();
         assert!(
-            matches!(
-                result,
-                Err(CtxError::WalletMissingRpcUrl {
-                    field: "base_rpc_url"
-                })
-            ),
-            "Expected WalletMissingRpcUrl for base_rpc_url, got {result:?}"
+            detail.contains("chains"),
+            "a secrets file supplying no chain endpoints must fail naming the \
+             missing table, got: {detail}"
         );
     }
 
@@ -4459,15 +4779,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
             inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -4487,10 +4815,12 @@ mod tests {
 
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.example.com"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.example.com"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -4508,11 +4838,14 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(CtxError::WalletMissingRpcUrl {
-                    field: "hyperevm_rpc_url"
-                })
+                Err(CtxError::ChainRegistry(
+                    crate::chain::ChainRegistryError::MissingSecrets {
+                        chain: Chain::HyperEvm
+                    }
+                ))
             ),
-            "Expected WalletMissingRpcUrl for hyperevm_rpc_url, got {result:?}"
+            "a chain described in the config but absent from secrets must be \
+             refused by the registry pairing check, got {result:?}"
         );
     }
 
@@ -4520,13 +4853,13 @@ mod tests {
     fn wallet_rpc_url_rejects_routable_http() {
         let url = Url::parse("http://mainnet.example.com").unwrap();
 
-        let result = crate::wallet::require_secure_wallet_rpc_url(&url, "hyperevm_rpc_url");
+        let result = crate::wallet::require_secure_wallet_rpc_url(&url, Chain::HyperEvm);
 
         assert!(
             matches!(
                 result,
                 Err(crate::wallet::WalletCtxError::InsecureRpcUrl {
-                    field: "hyperevm_rpc_url"
+                    chain: Chain::HyperEvm
                 })
             ),
             "routable http must be rejected, got {result:?}"
@@ -4538,14 +4871,12 @@ mod tests {
         for url in ["ftp://localhost:8545", "ws://127.0.0.1:8545"] {
             let parsed = Url::parse(url).unwrap();
 
-            let result = crate::wallet::require_secure_wallet_rpc_url(&parsed, "base_rpc_url");
+            let result = crate::wallet::require_secure_wallet_rpc_url(&parsed, Chain::Base);
 
             assert!(
                 matches!(
                     result,
-                    Err(crate::wallet::WalletCtxError::InsecureRpcUrl {
-                        field: "base_rpc_url"
-                    })
+                    Err(crate::wallet::WalletCtxError::InsecureRpcUrl { chain: Chain::Base })
                 ),
                 "{url} must be rejected, got {result:?}"
             );
@@ -4561,7 +4892,7 @@ mod tests {
             "http://[::1]:8545",
         ] {
             let parsed = Url::parse(url).unwrap();
-            crate::wallet::require_secure_wallet_rpc_url(&parsed, "base_rpc_url").unwrap();
+            crate::wallet::require_secure_wallet_rpc_url(&parsed, Chain::Base).unwrap();
         }
     }
 
@@ -4583,8 +4914,15 @@ mod tests {
         let config = minimal_config_toml();
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [chains.hyperevm]
+            rpc_url = "http://localhost:8545"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -4627,15 +4965,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
             inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -4648,11 +4994,15 @@ mod tests {
         );
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.example.com"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.example.com"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -4820,15 +5170,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
             inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -4843,11 +5201,15 @@ mod tests {
         );
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.example.com"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.example.com"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -4880,15 +5242,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
             inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -4904,11 +5274,15 @@ mod tests {
         );
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.example.com"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.example.com"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -4944,16 +5318,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 0
@@ -4961,8 +5342,15 @@ mod tests {
         );
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [chains.hyperevm]
+            rpc_url = "http://localhost:8545"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -5003,16 +5391,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
             inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
-
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 10000
@@ -5024,8 +5419,15 @@ mod tests {
         );
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [chains.hyperevm]
+            rpc_url = "http://localhost:8545"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -5065,16 +5467,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
             inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
-
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 9999
@@ -5093,11 +5502,15 @@ mod tests {
         );
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.infura.io"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -5203,11 +5616,15 @@ mod tests {
         let config = minimal_config_toml();
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.infura.io"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "dry-run"
@@ -5231,11 +5648,15 @@ mod tests {
         let config = minimal_config_toml();
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.infura.io"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "dry-run"
@@ -5262,11 +5683,15 @@ mod tests {
         let config = minimal_config_toml();
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.infura.io"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "dry-run"
@@ -5294,11 +5719,15 @@ mod tests {
         let config = minimal_config_toml();
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.infura.io"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "dry-run"
@@ -5329,11 +5758,15 @@ mod tests {
         let config = minimal_config_toml();
         let secrets = toml_file(&format!(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.infura.io"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "dry-run"
@@ -5432,11 +5865,15 @@ mod tests {
         let config = alpaca_trading_config_toml();
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.infura.io"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -5475,11 +5912,15 @@ mod tests {
     async fn rebalancing_with_schwab_logs_error_kind() {
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.infura.io"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "schwab"
@@ -5502,15 +5943,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -5748,15 +6197,23 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [assets.equities.AAPL]
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -5916,32 +6373,41 @@ mod tests {
             // so they run for every checked-in config.
             let wallet: Option<WalletMeta> = config.wallet.map(|value| value.try_into().unwrap());
 
-            match (config.raindex.inventory_mode, config.raindex.inventory) {
-                (InventoryModeTag::Legacy, None) => {
-                    if let Some(wallet) = wallet {
-                        assert_eq!(
-                            config.raindex.vault_owner, wallet.address,
-                            "{path:?}: inventory_mode = \"legacy\" means the bot's EOA owns \
-                             the vaults, so vault_owner must equal [wallet].address"
-                        );
+            for (chain, chain_config) in &config.chains {
+                let Some(trading) = &chain_config.trading else {
+                    continue;
+                };
+
+                match (trading.inventory_mode, trading.inventory) {
+                    (InventoryModeTag::Legacy, None) => {
+                        if let Some(wallet) = &wallet {
+                            assert_eq!(
+                                trading.vault_owner, wallet.address,
+                                "{path:?} [chains.{chain}]: inventory_mode = \"legacy\" means \
+                                 the bot's EOA owns the vaults, so vault_owner must equal \
+                                 [wallet].address"
+                            );
+                        }
                     }
-                }
-                (InventoryModeTag::Legacy, Some(inventory)) => {
-                    // EvmCtx::new rejects this combination at startup
-                    // (LegacyWithInventory); asserting it here fails the
-                    // contradiction in CI instead of at the deploy gate.
-                    panic!(
-                        "{path:?}: inventory_mode = \"legacy\" forbids an inventory address, \
-                         found {inventory}"
-                    )
-                }
-                (InventoryModeTag::Managed, Some(inventory)) => assert_eq!(
-                    config.raindex.vault_owner, inventory,
-                    "{path:?}: inventory_mode = \"managed\" means the inventory contract \
-                     owns the vaults, so vault_owner must equal inventory"
-                ),
-                (InventoryModeTag::Managed, None) => {
-                    panic!("{path:?}: inventory_mode = \"managed\" requires an inventory address")
+                    (InventoryModeTag::Legacy, Some(inventory)) => {
+                        // TradingChain::new rejects this combination at
+                        // startup (LegacyWithInventory); asserting it here
+                        // fails the contradiction in CI instead of at the
+                        // deploy gate.
+                        panic!(
+                            "{path:?} [chains.{chain}]: inventory_mode = \"legacy\" forbids an \
+                             inventory address, found {inventory}"
+                        )
+                    }
+                    (InventoryModeTag::Managed, Some(inventory)) => assert_eq!(
+                        trading.vault_owner, inventory,
+                        "{path:?} [chains.{chain}]: inventory_mode = \"managed\" means the \
+                         inventory contract owns the vaults, so vault_owner must equal inventory"
+                    ),
+                    (InventoryModeTag::Managed, None) => panic!(
+                        "{path:?} [chains.{chain}]: inventory_mode = \"managed\" requires an \
+                         inventory address"
+                    ),
                 }
             }
         }
@@ -5980,16 +6446,24 @@ mod tests {
             inventory_divergence_threshold = 10
             bogus_field = "should fail"
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
+
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -6018,16 +6492,24 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
+
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -6060,16 +6542,24 @@ mod tests {
             extended_hours_counter_trading = "disabled"
             bogus_field = "should fail"
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
+
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -6097,16 +6587,24 @@ mod tests {
             rebalancing = "disabled"
             bogus_field = "should fail"
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
+
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -6125,9 +6623,16 @@ mod tests {
         let config = minimal_config_toml();
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            extra_secret = "should fail"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [chains.hyperevm]
+            rpc_url = "http://localhost:8545"
+
+            extra_secret = "surprise"
 
             [broker]
             type = "dry-run"
@@ -6148,9 +6653,16 @@ mod tests {
         let config = minimal_config_toml();
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            extra_secret = "should fail"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [chains.hyperevm]
+            rpc_url = "http://localhost:8545"
+
+            extra_secret = "surprise"
 
             [broker]
             type = "dry-run"
@@ -6187,16 +6699,24 @@ mod tests {
             inventory_divergence_threshold = 10
             bogus_field = "should fail"
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
+
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -6218,8 +6738,15 @@ mod tests {
         let config = minimal_config_toml();
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [chains.hyperevm]
+            rpc_url = "http://localhost:8545"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -6970,7 +7497,13 @@ mod tests {
         // RFC 7523 client assertions.
         let secrets: Secrets = toml::from_str(
             r#"
-            [evm]
+            [chains.base]
+            rpc_url = "http://localhost:8545"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [chains.hyperevm]
             rpc_url = "http://localhost:8545"
 
             [broker]
@@ -7058,8 +7591,15 @@ mod tests {
         for (kebab_value, variant_name) in variants {
             let toml_str = format!(
                 r#"
-                [evm]
+                [chains.base]
                 rpc_url = "http://localhost:8545"
+
+                [chains.ethereum]
+                rpc_url = "http://localhost:8545"
+
+                [chains.hyperevm]
+                rpc_url = "http://localhost:8545"
+
 
                 [broker]
                 type = "{kebab_value}"
@@ -7085,13 +7625,34 @@ mod tests {
         }
     }
 
+    /// Both files now key RPC endpoints by chain. The retired flat `[evm]`
+    /// section must be rejected rather than silently ignored: a secrets file
+    /// still carrying it supplies no endpoint for any chain, and the registry
+    /// would fail later with a missing-secrets error that does not say why.
     #[test]
-    fn secrets_evm_section_uses_evm_not_raindex() {
-        // The secrets TOML section for EVM RPC URLs must be [evm], not
-        // [raindex]. These are generic EVM secrets (RPC endpoints), not
-        // Raindex-specific. The config TOML correctly uses [raindex] because
-        // those fields (orderbook, deployment_block) are Raindex-specific.
-        let with_evm = r#"
+    fn secrets_reject_the_retired_flat_evm_section() {
+        let per_chain = r#"
+            [chains.base]
+            rpc_url = "http://localhost:8545"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [chains.hyperevm]
+            rpc_url = "http://localhost:8545"
+
+            [broker]
+            type = "dry-run"
+        "#;
+
+        let secrets = toml::from_str::<Secrets>(per_chain).unwrap();
+        assert_eq!(secrets.chains.len(), 3);
+        assert_eq!(
+            secrets.chains[&Chain::Base].rpc_url.as_str(),
+            "http://localhost:8545/"
+        );
+
+        let flat = r#"
             [evm]
             rpc_url = "http://localhost:8545"
 
@@ -7099,27 +7660,12 @@ mod tests {
             type = "dry-run"
         "#;
 
-        let result = toml::from_str::<Secrets>(with_evm);
+        let Err(error) = toml::from_str::<Secrets>(flat) else {
+            panic!("the retired [evm] section must be rejected")
+        };
         assert!(
-            result.is_ok(),
-            "Secrets TOML with [evm] section should parse successfully, \
-             but got error: {}",
-            result.err().unwrap()
-        );
-
-        let with_raindex = r#"
-            [raindex]
-            rpc_url = "http://localhost:8545"
-
-            [broker]
-            type = "dry-run"
-        "#;
-
-        let result = toml::from_str::<Secrets>(with_raindex);
-        assert!(
-            result.is_err(),
-            "Secrets TOML with [raindex] section should be rejected \
-             (deny_unknown_fields); the correct section name is [evm]"
+            error.to_string().contains("evm"),
+            "expected an unknown-field error naming [evm], got: {error}"
         );
     }
 
@@ -7130,8 +7676,15 @@ mod tests {
         for snake_value in snake_values {
             let toml_str = format!(
                 r#"
-                [evm]
+                [chains.base]
                 rpc_url = "http://localhost:8545"
+
+                [chains.ethereum]
+                rpc_url = "http://localhost:8545"
+
+                [chains.hyperevm]
+                rpc_url = "http://localhost:8545"
+
 
                 [broker]
                 type = "{snake_value}"
@@ -7225,15 +7778,23 @@ mod tests {
             [pricing]
             ws_url = "wss://pricing.test/ws"
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "managed"
             inventory_adapters = []
             inventory = "0x2222222222222222222222222222222222222222"
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "turnkey"
@@ -7243,11 +7804,15 @@ mod tests {
         );
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://ethereum.example.com"
-            hyperevm_rpc_url = "https://hyperevm.example.com"
+
+            [chains.ethereum]
+            rpc_url = "https://ethereum.example.com"
+
+            [chains.hyperevm]
+            rpc_url = "https://hyperevm.example.com"
+
 
             [broker]
             type = "dry-run"
@@ -7325,14 +7890,22 @@ mod tests {
             [pricing]
             ws_url = "wss://pricing.test/ws"
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
             inventory_adapters = []
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -7373,14 +7946,22 @@ mod tests {
             [pricing]
             ws_url = "wss://pricing.test/ws"
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
             inventory_adapters = []
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             extended_hours_reprice_timeout_secs = 300
@@ -7419,14 +8000,22 @@ mod tests {
             [pricing]
             ws_url = "wss://pricing.test/ws"
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
             inventory_adapters = []
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -7465,14 +8054,22 @@ mod tests {
             [pricing]
             ws_url = "wss://pricing.test/ws"
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
             inventory_adapters = []
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             extended_hours_reprice_timeout_secs = 300
@@ -7530,14 +8127,22 @@ mod tests {
             [pricing]
             ws_url = "wss://pricing.test/ws"
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
             inventory_adapters = []
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             {slippage_line}
@@ -7623,14 +8228,22 @@ mod tests {
             [pricing]
             ws_url = "wss://pricing.test/ws"
 
-            [raindex]
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
             orderbook = "0x1111111111111111111111111111111111111111"
             inventory_mode = "legacy"
             inventory_adapters = []
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
-            required_confirmations = 3
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             extended_hours_reprice_timeout_secs = 300
@@ -7661,16 +8274,24 @@ mod tests {
             board_port = 8081
             bogus_field = "should fail"
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
+
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -7687,9 +8308,16 @@ mod tests {
         let config = minimal_config_toml();
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            extra_secret = "should fail"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [chains.hyperevm]
+            rpc_url = "http://localhost:8545"
+
+            extra_secret = "surprise"
 
             [broker]
             type = "dry-run"
@@ -7715,21 +8343,36 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
         "#,
         );
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [chains.hyperevm]
+            rpc_url = "http://localhost:8545"
+
 
             [broker]
             type = "dry-run"
@@ -7755,16 +8398,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
 
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -7783,8 +8433,15 @@ mod tests {
         );
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [chains.hyperevm]
+            rpc_url = "http://localhost:8545"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -7814,16 +8471,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
 
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -7842,9 +8506,6 @@ mod tests {
         );
         let secrets = toml_file(
             r#"
-            [evm]
-            rpc_url = "http://localhost:8545"
-
             [broker]
             type = "alpaca-broker-api"
             api_key = "test-key"
@@ -7859,13 +8520,9 @@ mod tests {
 
         let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
         assert!(
-            matches!(
-                error,
-                CtxError::WalletMissingRpcUrl {
-                    field: "base_rpc_url"
-                }
-            ),
-            "Expected WalletMissingRpcUrl for base_rpc_url, got {error:?}"
+            matches!(error, CtxError::SecretsToml { .. }),
+            "a secrets file supplying no chain endpoints must fail to parse, \
+             got {error:?}"
         );
     }
 
@@ -7874,11 +8531,15 @@ mod tests {
         let config = alpaca_trading_config_toml();
         let secrets = toml_file(
             r#"
-            [evm]
+            [chains.base]
             rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.infura.io"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -7910,16 +8571,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"
@@ -7957,16 +8625,23 @@ mod tests {
 
             [assets.equities]
 
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-           inventory_mode = "managed"
-           inventory_adapters = []
-           inventory = "0x2222222222222222222222222222222222222222"
-           vault_owner = "0x3333333333333333333333333333333333333333"
-
-            deployment_block = 1
+            [chains.base]
             required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
             ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
 
             [wallet]
             kind = "private-key"

@@ -1186,7 +1186,7 @@ mod tests {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         // Port 1 refuses connections immediately, so the startup RPC probe
         // fails fast rather than hanging on a retry loop.
-        ctx.evm.rpc_url = "http://127.0.0.1:1".parse().unwrap();
+        ctx.chains.sole_trading_mut().rpc_url = "http://127.0.0.1:1".parse().unwrap();
         let error = Box::pin(run_conductor_session(
             ctx,
             DatabasePools {
@@ -1219,7 +1219,7 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
-        ctx.evm.rpc_url = "http://127.0.0.1:1".parse().unwrap();
+        ctx.chains.sole_trading_mut().rpc_url = "http://127.0.0.1:1".parse().unwrap();
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let error = Box::pin(run_conductor_session(
             ctx,

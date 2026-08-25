@@ -532,13 +532,22 @@ counter_trade_slippage_bps = 100
 [broker.travel_rule]
 beneficiary_entity_name = "Simulate Failures"
 
-[raindex]
+[chains.base]
+required_confirmations = 0
+
+[chains.base.trading]
 orderbook = "{orderbook}"
 inventory_mode = "legacy"
+inventory_adapters = []
 vault_owner = "{owner}"
 deployment_block = {current_block}
-required_confirmations = 0
 ingestion_cutoff = "safe"
+
+[chains.ethereum]
+required_confirmations = 1
+
+[chains.hyperevm]
+required_confirmations = 1
 
 [wallet]
 kind = "private-key"
@@ -591,11 +600,14 @@ rebalancing = "enabled"
 
     let secrets = format!(
         r#"
-[evm]
+[chains.base]
 rpc_url = "{rpc_url}"
-base_rpc_url = "{base_rpc_url}"
-ethereum_rpc_url = "{ethereum_rpc_url}"
-hyperevm_rpc_url = "{ethereum_rpc_url}"
+
+[chains.ethereum]
+rpc_url = "{ethereum_rpc_url}"
+
+[chains.hyperevm]
+rpc_url = "{ethereum_rpc_url}"
 
 [broker]
 type = "alpaca-broker-api"
@@ -608,7 +620,6 @@ account_id = "{account_id}"
 private_key = "{private_key:#x}"
 "#,
         rpc_url = infra.base_chain.endpoint(),
-        base_rpc_url = infra.base_chain.endpoint(),
         ethereum_rpc_url = cctp.ethereum_endpoint,
         broker_base_url = infra.broker_service.base_url(),
         api_key = TEST_API_KEY,

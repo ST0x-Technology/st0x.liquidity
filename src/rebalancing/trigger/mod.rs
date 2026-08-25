@@ -20445,6 +20445,7 @@ mod tests {
             wallet_config.into(),
             wallet_secrets.into(),
             "https://example.com".parse().unwrap(),
+            1,
         )
         .await
         .unwrap();

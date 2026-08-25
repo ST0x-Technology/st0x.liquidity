@@ -100,17 +100,35 @@ subscribes to the pricing service's Raindex `wt<symbol>` stream for
 dashboard-only USD values; an outage leaves those values unavailable without
 stopping hedging or falling back to a trade fill.
 
-The `[raindex]` section requires an explicit `inventory_mode` (`"legacy"` or
-`"managed"`) and a `vault_owner` address (the on-chain owner the vaults are
-keyed by; no fallback). `"managed"` additionally requires an `inventory` address
-(the shared `RaindexInventory` the bot operates via `OPERATOR_ROLE`) and is
-forbidden from being set under `"legacy"`. Its required `inventory_adapters`
-table maps public operator addresses to venues such as Bebop and Uniswap v4;
-unknown operators remain visibly unattributed. This deployment metadata belongs
-in plaintext config, not secrets or environment variables. Trade protocol v3
+The `[chains.<name>.trading]` table requires an explicit `inventory_mode`
+(`"legacy"` or `"managed"`) and a `vault_owner` address (the on-chain owner the
+vaults are keyed by; no fallback). `"managed"` additionally requires an
+`inventory` address (the shared `RaindexInventory` the bot operates via
+`OPERATOR_ROLE`) and is forbidden from being set under `"legacy"`. Its required
+`inventory_adapters` is an array of `{ venue, operator }` records attributing
+public operator addresses to venues such as Bebop and Uniswap v4; unknown
+operators remain visibly unattributed. This deployment metadata belongs in
+plaintext config, not secrets or environment variables. Trade protocol v3
 preserves configured and unknown onchain venues; older protocol versions
 collapse adapter and Unknown Onchain venues to Raindex for compatibility. See
-the `[raindex]` block in `example.config.toml` for the full field documentation.
+the `[chains.base]` block in `example.config.toml` for the full field
+documentation.
+
+The chain registry enforces four rules at startup, each failing closed rather
+than skipping the chain:
+
+- Every `[chains.<name>]` table needs a matching `[chains.<name>]` secrets entry
+  supplying its `rpc_url`, and vice versa. Acting on a chain with no endpoint,
+  and holding an endpoint for a chain with no addresses, both leave fund routing
+  undefined.
+- Exactly one chain may carry a `[trading]` table. The shape admits more, but
+  the runtime drives a single fill watcher, so a second trading chain would be
+  fully described and never read -- unhedged exposure presenting as a working
+  config.
+- At least one chain must be configured, and at least one of those must trade.
+- Every `[chains.<name>]` entry must declare `required_confirmations` directly
+  on the chain table (not inside `[trading]`). There is no default: the depth
+  encodes that chain's reorg behaviour, so omitting it fails config parsing.
 
 Current broker support is limited to `alpaca-broker-api` and `dry-run`.
 

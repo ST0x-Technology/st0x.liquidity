@@ -31,10 +31,12 @@ pub(crate) use trade::TradeValidationError;
 /// Builds the [`st0x_raindex::RaindexContracts`] pair from the EVM config.
 /// The single conversion point keeps every construction site in sync should
 /// the struct grow a field.
-pub(crate) fn raindex_contracts(evm: &st0x_config::EvmCtx) -> st0x_raindex::RaindexContracts {
+pub(crate) fn raindex_contracts(
+    trading_chain: &st0x_config::TradingChain,
+) -> st0x_raindex::RaindexContracts {
     st0x_raindex::RaindexContracts {
-        inventory: evm.inventory_address(),
-        orderbook: evm.orderbook,
+        inventory: trading_chain.inventory_address(),
+        orderbook: trading_chain.orderbook,
     }
 }
 
@@ -101,4 +103,71 @@ pub(crate) enum OnChainError {
         observed_tip: u64,
         required_tip: u64,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    //! Mapping tests for [`raindex_contracts`]: each address must land in
+    //! its own slot for both inventory modes.
+
+    use alloy::primitives::address;
+
+    use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
+    use st0x_evm::Chain;
+
+    use super::raindex_contracts;
+
+    /// `inventory` and `orderbook` are both `Address`, so a swap between them
+    /// compiles. Under `Managed` it would send rebalancing `deposit4`/
+    /// `withdraw4` to the orderbook and orderbook calls to the inventory
+    /// contract, so each must be asserted in its own slot.
+    #[test]
+    fn managed_mode_maps_each_address_to_its_own_slot() {
+        let inventory = address!("0x2222222222222222222222222222222222222222");
+        let contracts = raindex_contracts(&TradingChain {
+            chain: Chain::Base,
+            // Hard-coded literal URL -- parse cannot fail in a test helper.
+            #[allow(clippy::unwrap_used)]
+            rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
+            required_confirmations: 1,
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: InventoryMode::Managed { inventory },
+            inventory_adapters: InventoryAdapters::default(),
+            vault_owner: address!("0x3333333333333333333333333333333333333333"),
+            deployment_block: 1,
+            ingestion_cutoff: IngestionCutoff::Safe,
+        });
+
+        assert_eq!(contracts.inventory, inventory);
+        assert_eq!(
+            contracts.orderbook,
+            address!("0x1111111111111111111111111111111111111111")
+        );
+    }
+
+    /// Legacy has no distinct inventory contract, so both slots are the
+    /// orderbook and a swap is invisible -- which is why the managed case
+    /// above is the one that pins the mapping.
+    #[test]
+    fn legacy_mode_points_both_slots_at_the_orderbook() {
+        let contracts = raindex_contracts(&TradingChain {
+            chain: Chain::Base,
+            // Hard-coded literal URL -- parse cannot fail in a test helper.
+            #[allow(clippy::unwrap_used)]
+            rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
+            required_confirmations: 1,
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            inventory: InventoryMode::Legacy,
+            inventory_adapters: InventoryAdapters::default(),
+            vault_owner: address!("0x3333333333333333333333333333333333333333"),
+            deployment_block: 1,
+            ingestion_cutoff: IngestionCutoff::Safe,
+        });
+
+        assert_eq!(contracts.inventory, contracts.orderbook);
+        assert_eq!(
+            contracts.orderbook,
+            address!("0x1111111111111111111111111111111111111111")
+        );
+    }
 }

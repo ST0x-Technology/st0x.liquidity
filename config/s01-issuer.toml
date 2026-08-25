@@ -10,7 +10,7 @@
 #
 # The encrypted secret (secret/s01-issuer.toml.age) must carry the FULL secret
 # surface the shared validate-config gate checks, or the deploy fails closed:
-#   [evm]       rpc_url, base_rpc_url, ethereum_rpc_url, hyperevm_rpc_url
+#   [chains.<name>]  rpc_url, one table per chain named in the config file
 #   [broker]    type = "alpaca-broker-api" + api_key/api_secret/account_id
 #   [wallet]    api_private_key (turnkey)
 #   [issuance]  base_url + api_key (required unconditionally by the validator)
@@ -28,7 +28,10 @@ inventory_divergence_threshold = 10
 ws_url = "ws://st0x-pricing:8080/ws"
 
 # On-chain orderbook settings (same Rain Orderbook on Base as the bot).
-[raindex]
+[chains.base]
+required_confirmations = 3
+
+[chains.base.trading]
 orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 # The issuer/dividend-ops bot does not rebalance, so it settles nothing through a
 # shared inventory: "legacy" keeps the OPERATOR_ROLE preflight off.
@@ -38,13 +41,19 @@ inventory_adapters = []
 # wallet (= [wallet].address below).
 vault_owner = "0x975789F46b5De4624d6a4c3B3679901edF1a5bdA"
 deployment_block = 43259507
-required_confirmations = 3
 ingestion_cutoff = "safe"
 
-# Dividend-ops turnkey wallet. `address` and `organization_id` are non-secret and
-# live here; the turnkey API key + base RPC URLs are secret and live in
-# secret/s01-issuer.toml.age. Same turnkey organization as the market-making
-# wallet (st0x-hedge.toml), a distinct wallet address.
+# Ethereum is a cash-corridor endpoint only: the bot holds USDC and signs
+# there, but runs no orderbook and ingests no fills, so it has no [trading]
+# table. Confirmations are deeper than Base's because an L1 reorg is a
+# different risk from an OP-Stack sequencer batch.
+[chains.ethereum]
+required_confirmations = 12
+
+# HyperEVM, same shape as Ethereum.
+[chains.hyperevm]
+required_confirmations = 1
+
 [wallet]
 kind = "turnkey"
 address = "0x975789F46b5De4624d6a4c3B3679901edF1a5bdA"

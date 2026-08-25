@@ -250,7 +250,7 @@ where
     let evm = ReadOnlyEvm::new(context.provider.clone());
     let raindex_service = Arc::new(RaindexService::new(
         evm,
-        crate::onchain::raindex_contracts(&context.ctx.evm),
+        crate::onchain::raindex_contracts(context.ctx.chains.sole_trading()),
         order_owner,
     ));
 
@@ -263,7 +263,7 @@ where
         .map_or(Usd::ZERO, Positive::inner);
 
     let snapshot_id = InventorySnapshotId {
-        orderbook: context.ctx.evm.orderbook,
+        orderbook: context.ctx.chains.sole_trading().orderbook,
         owner: order_owner,
     };
 
@@ -462,7 +462,7 @@ where
     let maintenance_interval = context.executor.maintenance_interval();
 
     let accountant_ctx = Arc::new(AccountantCtx {
-        contracts: crate::onchain::raindex_contracts(&context.ctx.evm),
+        contracts: crate::onchain::raindex_contracts(context.ctx.chains.sole_trading()),
         ctx: context.ctx.clone(),
         cache: context.cache,
         evm: ReadOnlyEvm::new(context.provider.clone()),
@@ -486,7 +486,7 @@ where
     } = context.supervisor_startup;
 
     let order_fill_monitor = OrderFillMonitor::new(
-        context.ctx.evm.clone(),
+        context.ctx.chains.sole_trading().clone(),
         backfill_queue.clone(),
         context.pool,
         context.provider,
