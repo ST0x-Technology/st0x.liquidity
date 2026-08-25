@@ -1,0 +1,77 @@
+name: release-tag
+
+# Promote-on-tag: "steady master -> push a vX.Y.Z tag -> the tagged artifact
+# exists" (design settled in #1289 review). Pushing a release tag LABELS the
+# images master CI already built and attested for that commit — it does not
+# build, does not deploy, and cannot touch images.env or staging. Tagging an
+# old commit is a normal git operation and here it only labels old images.
+#
+# The version tag is consumed by exactly one thing: t0.devops'
+# images-version.yml guard, which refuses a production manifest whose
+# `version:` does not resolve to the pinned digests. Two refusals keep the
+# label honest end to end:
+#   - no image for the tagged commit  -> fail: tag a commit master CI built;
+#   - no BinAuthz attestation on it   -> fail: a version tag must never
+#     bless an unattested digest.
+#
+# Auth: same deployer identity as build-oci (WIF, master-scoped SA — tags
+# are pushable by the same set who can merge, so this adds no new trust).
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  REGION: europe-west3
+  AR_REPO: europe-west3-docker.pkg.dev/t0-artifacts/t0-liquidity
+  WIF_PROVIDER: projects/684788085322/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+  DEPLOYER_SA: liquidity-deployer@t0-artifacts.iam.gserviceaccount.com
+  ATTESTOR: projects/t0-artifacts/attestors/liquidity-image
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - id: auth
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+        with:
+          install_components: beta
+
+      - name: Label the tagged commit's attested images
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          # On a tag push GITHUB_SHA is the tagged commit for lightweight
+          # tags and the tag object's target for annotated ones.
+          COMMIT="${GITHUB_SHA}"
+          for image in t0-liquidity t0-liquidity-dashboard t0-liquidity-datasette; do
+            digest=$(gcloud artifacts docker images describe \
+              "${AR_REPO}/${image}:${COMMIT}" \
+              --format='value(image_summary.digest)' 2>/dev/null) || true
+            if [ -z "${digest:-}" ]; then
+              echo "::error::no ${image} image exists for ${COMMIT} — tag a commit that master CI has built (and wait for its build to finish)."
+              exit 1
+            fi
+            attested=$(gcloud beta container binauthz attestations list \
+              --project=t0-artifacts --attestor="${ATTESTOR}" \
+              --artifact-url="${AR_REPO}/${image}@${digest}" \
+              --format='value(name)' | head -1)
+            if [ -z "${attested}" ]; then
+              echo "::error::${image}@${digest} carries NO liquidity-image attestation — refusing to put a version label on an unattested digest."
+              exit 1
+            fi
+            gcloud artifacts docker tags add \
+              "${AR_REPO}/${image}@${digest}" \
+              "${AR_REPO}/${image}:${VERSION}"
+            echo "labeled ${image}@${digest} as ${VERSION}"
+          done
