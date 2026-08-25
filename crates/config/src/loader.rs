@@ -855,6 +855,10 @@ pub enum LogFormat {
     Json,
 }
 
+/// Placeholder in `log_query_url_template` replaced with the transfer or
+/// aggregate id.
+pub const LOG_QUERY_ID_PLACEHOLDER: &str = "{id}";
+
 impl From<LogLevel> for Level {
     fn from(log_level: LogLevel) -> Self {
         match log_level {
@@ -1163,7 +1167,7 @@ fn parse_and_validate(
     let log_level = config.log_level.unwrap_or(LogLevel::Debug);
     let log_format = config.log_format.unwrap_or(LogFormat::Text);
     if let Some(template) = &config.log_query_url_template
-        && !template.contains("{id}")
+        && !template.contains(LOG_QUERY_ID_PLACEHOLDER)
     {
         return Err(CtxError::LogQueryUrlTemplateMissingIdPlaceholder);
     }

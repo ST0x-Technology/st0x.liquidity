@@ -1706,6 +1706,27 @@ async fn run_simple_command<W: Write>(
         SimpleCommand::PortfolioSnapshot { command } => {
             repair::set_portfolio_snapshot_mark_command(stdout, pool, command, ctx).await
         }
+        command @ (SimpleCommand::FailTransfer { .. }
+        | SimpleCommand::RecheckTransfer { .. }
+        | SimpleCommand::ResumeInterruptedTransfers
+        | SimpleCommand::ReconcileUsdcTransfer { .. }
+        | SimpleCommand::FailUsdcTransfer { .. }
+        | SimpleCommand::ReconcileEquityTransfer { .. }
+        | SimpleCommand::ClearPendingBurn { .. }) => {
+            run_transfer_command(command, ctx, pool, stdout).await
+        }
+    }
+}
+
+/// Runs the transfer-family commands routed here by [`run_simple_command`],
+/// printing the configured log query link for the id each one names.
+async fn run_transfer_command<W: Write>(
+    command: SimpleCommand,
+    ctx: &Ctx,
+    pool: &SqlitePool,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    match command {
         SimpleCommand::FailTransfer {
             transfer_type,
             id,
@@ -1763,6 +1784,7 @@ async fn run_simple_command<W: Write>(
             write_log_query_url(stdout, ctx, &id.to_string())?;
             result
         }
+        _ => unreachable!("non-transfer command routed to run_transfer_command"),
     }
 }
 
@@ -1772,7 +1794,8 @@ fn write_log_query_url<W: Write>(stdout: &mut W, ctx: &Ctx, id: &str) -> anyhow:
     let Some(template) = &ctx.log_query_url_template else {
         return Ok(());
     };
-    writeln!(stdout, "Logs: {}", template.replace("{id}", id))?;
+    let url = template.replace(st0x_config::LOG_QUERY_ID_PLACEHOLDER, id);
+    writeln!(stdout, "Logs: {url}")?;
     Ok(())
 }
 
