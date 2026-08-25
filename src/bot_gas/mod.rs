@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil, SendError, Store};
+use st0x_evm::{Chain, ParseChainError};
 use st0x_finance::{HasZero, Symbol, Usd};
 use st0x_float_macro::float;
 
@@ -36,7 +37,7 @@ pub(crate) async fn enqueue_base_equity_cost(
 ) -> Result<(), BotGasEnqueueFailure> {
     bot_gas_enqueuer
         .enqueue(RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash,
             category,
             symbol: Some(symbol.clone()),
@@ -142,44 +143,6 @@ pub(crate) enum BotGasCostError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum BotGasChain {
-    Base,
-    Ethereum,
-}
-
-impl BotGasChain {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Base => "base",
-            Self::Ethereum => "ethereum",
-        }
-    }
-}
-
-impl fmt::Display for BotGasChain {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error("expected bot gas chain 'base' or 'ethereum'")]
-pub(crate) struct ParseBotGasChainError;
-
-impl FromStr for BotGasChain {
-    type Err = ParseBotGasChainError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "base" => Ok(Self::Base),
-            "ethereum" => Ok(Self::Ethereum),
-            _ => Err(ParseBotGasChainError),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub(crate) enum BotGasOperationCategory {
     VaultDeposit,
     VaultWithdraw,
@@ -224,7 +187,7 @@ pub(crate) struct EthUsdPrice {
 /// `eth_usd_price` and `usd_cost` -- derives both directly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BotGasReceiptCost {
-    pub(crate) chain: BotGasChain,
+    pub(crate) chain: Chain,
     pub(crate) tx_hash: TxHash,
     pub(crate) receipt_from: Address,
     pub(crate) gas_used: u64,
@@ -242,7 +205,7 @@ pub(crate) struct BotGasReceiptCost {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BotGasReceiptCostId {
-    pub(crate) chain: BotGasChain,
+    pub(crate) chain: Chain,
     pub(crate) tx_hash: TxHash,
 }
 
@@ -257,7 +220,7 @@ pub(crate) enum ParseBotGasReceiptCostIdError {
     #[error("bot gas receipt cost id is missing the chain/hash delimiter")]
     MissingDelimiter,
     #[error(transparent)]
-    Chain(#[from] ParseBotGasChainError),
+    Chain(#[from] ParseChainError),
     #[error(transparent)]
     TransactionHash(#[from] alloy::hex::FromHexError),
 }
@@ -313,7 +276,7 @@ impl BotGasReceiptCost {
     pub(crate) fn from_receipt(
         receipt: &TransactionReceipt,
         bot_wallet: Address,
-        chain: BotGasChain,
+        chain: Chain,
         operation_category: BotGasOperationCategory,
         symbol: Option<Symbol>,
         eth_usd_price: EthUsdPrice,
@@ -596,6 +559,42 @@ mod tests {
 
     use super::*;
 
+    /// `BotGasReceiptCostId` is an aggregate id in the event store, so its
+    /// two persisted spellings must render and parse byte-identically now
+    /// that the chain enum they use is shared and has gained a third variant.
+    #[test]
+    fn persisted_receipt_cost_ids_round_trip_unchanged() {
+        let tx_hash = TxHash::repeat_byte(0x11);
+
+        for (chain, expected) in [
+            (
+                Chain::Base,
+                "base:0x1111111111111111111111111111111111111111111111111111111111111111",
+            ),
+            (
+                Chain::Ethereum,
+                "ethereum:0x1111111111111111111111111111111111111111111111111111111111111111",
+            ),
+        ] {
+            let id = BotGasReceiptCostId { chain, tx_hash };
+
+            assert_eq!(id.to_string(), expected);
+            assert_eq!(expected.parse::<BotGasReceiptCostId>().unwrap(), id);
+        }
+    }
+
+    #[test]
+    fn receipt_cost_id_rejects_an_unknown_chain_name() {
+        let error = "solana:0x1111111111111111111111111111111111111111111111111111111111111111"
+            .parse::<BotGasReceiptCostId>()
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ParseBotGasReceiptCostIdError::Chain(_)),
+            "expected a chain parse failure, got: {error:?}"
+        );
+    }
+
     fn receipt(from: Address) -> TransactionReceipt {
         TransactionReceipt {
             inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom {
@@ -635,7 +634,7 @@ mod tests {
         let cost = BotGasReceiptCost::from_receipt(
             &receipt(bot),
             bot,
-            BotGasChain::Base,
+            Chain::Base,
             BotGasOperationCategory::VaultDeposit,
             None,
             price(),
@@ -652,7 +651,7 @@ mod tests {
         let error = BotGasReceiptCost::from_receipt(
             &receipt(Address::repeat_byte(0x02)),
             Address::repeat_byte(0x01),
-            BotGasChain::Base,
+            Chain::Base,
             BotGasOperationCategory::VaultDeposit,
             None,
             price(),
@@ -672,7 +671,7 @@ mod tests {
         let error = BotGasReceiptCost::from_receipt(
             &receipt,
             bot,
-            BotGasChain::Base,
+            Chain::Base,
             BotGasOperationCategory::VaultDeposit,
             None,
             price(),
@@ -695,7 +694,7 @@ mod tests {
         let error = BotGasReceiptCost::from_receipt(
             &receipt,
             bot,
-            BotGasChain::Base,
+            Chain::Base,
             BotGasOperationCategory::VaultDeposit,
             None,
             price(),
@@ -719,7 +718,7 @@ mod tests {
             let error = BotGasReceiptCost::from_receipt(
                 &receipt(bot),
                 bot,
-                BotGasChain::Base,
+                Chain::Base,
                 BotGasOperationCategory::VaultDeposit,
                 None,
                 price,
@@ -784,7 +783,7 @@ mod tests {
         let cost = BotGasReceiptCost::from_receipt(
             &dust_receipt,
             bot,
-            BotGasChain::Base,
+            Chain::Base,
             BotGasOperationCategory::VaultDeposit,
             None,
             dust_price,
@@ -821,7 +820,7 @@ mod tests {
             let mut cost = BotGasReceiptCost::from_receipt(
                 &receipt(bot),
                 bot,
-                BotGasChain::Base,
+                Chain::Base,
                 BotGasOperationCategory::VaultDeposit,
                 None,
                 price(),
@@ -918,7 +917,7 @@ mod tests {
         let cost = BotGasReceiptCost::from_receipt(
             &receipt(bot),
             bot,
-            BotGasChain::Base,
+            Chain::Base,
             BotGasOperationCategory::VaultDeposit,
             None,
             price(),
@@ -941,7 +940,7 @@ mod tests {
         let cost = BotGasReceiptCost::from_receipt(
             &receipt(bot),
             bot,
-            BotGasChain::Base,
+            Chain::Base,
             BotGasOperationCategory::VaultDeposit,
             None,
             price(),
@@ -990,7 +989,7 @@ mod tests {
         let freshly_computed = BotGasReceiptCost::from_receipt(
             &realistic_receipt,
             bot,
-            BotGasChain::Base,
+            Chain::Base,
             BotGasOperationCategory::VaultDeposit,
             None,
             realistic_price,
@@ -1030,7 +1029,7 @@ mod tests {
         let mut cost = BotGasReceiptCost::from_receipt(
             &receipt(bot),
             bot,
-            BotGasChain::Base,
+            Chain::Base,
             BotGasOperationCategory::VaultDeposit,
             None,
             price(),
@@ -1068,7 +1067,7 @@ mod tests {
         let cost = BotGasReceiptCost::from_receipt(
             &receipt(bot),
             bot,
-            BotGasChain::Base,
+            Chain::Base,
             BotGasOperationCategory::VaultDeposit,
             None,
             price(),
@@ -1093,7 +1092,7 @@ mod tests {
         let cost = BotGasReceiptCost::from_receipt(
             &receipt(bot),
             bot,
-            BotGasChain::Base,
+            Chain::Base,
             BotGasOperationCategory::VaultDeposit,
             None,
             price(),

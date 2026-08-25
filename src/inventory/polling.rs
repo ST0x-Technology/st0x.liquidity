@@ -171,11 +171,11 @@ struct CashDivergenceEscalation {
 }
 
 /// Service that polls actual inventory from onchain vaults and offchain brokers.
-pub(crate) struct InventoryPollingService<Chain, Exe>
+pub(crate) struct InventoryPollingService<Rpc, Exe>
 where
-    Chain: Evm,
+    Rpc: Evm,
 {
-    raindex_service: Arc<RaindexService<Chain>>,
+    raindex_service: Arc<RaindexService<Rpc>>,
     executor: Exe,
     vault_registry: Arc<Store<VaultRegistry>>,
     snapshot_id: InventorySnapshotId,
@@ -215,15 +215,15 @@ where
     poll_freshness: PollFreshness,
 }
 
-impl<Chain, Exe> InventoryPollingService<Chain, Exe>
+impl<Rpc, Exe> InventoryPollingService<Rpc, Exe>
 where
-    Chain: Evm,
+    Rpc: Evm,
     Exe: Executor,
 {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         poll_freshness: PollFreshness,
-        raindex_service: Arc<RaindexService<Chain>>,
+        raindex_service: Arc<RaindexService<Rpc>>,
         executor: Exe,
         vault_registry: Arc<Store<VaultRegistry>>,
         snapshot_id: InventorySnapshotId,
@@ -1654,7 +1654,7 @@ fn compute_available_cash(
     Ok((gross_usd_cents, available_usd_cents))
 }
 
-/// Erases the `Chain` and `Exe` parameters of [`InventoryPollingService`]
+/// Erases the `Rpc` and `Exe` parameters of [`InventoryPollingService`]
 /// so the apalis [`Job`] context isn't generic over them.
 #[async_trait]
 pub(crate) trait Poller: Send + Sync {
@@ -1669,9 +1669,9 @@ pub(crate) trait Poller: Send + Sync {
 pub(crate) struct PollerError(pub(crate) Box<dyn std::error::Error + Send + Sync>);
 
 #[async_trait]
-impl<Chain, Exe> Poller for InventoryPollingService<Chain, Exe>
+impl<Rpc, Exe> Poller for InventoryPollingService<Rpc, Exe>
 where
-    Chain: Evm + Send + Sync + 'static,
+    Rpc: Evm + Send + Sync + 'static,
     Exe: Executor + Send + Sync + 'static,
     Exe::Error: std::error::Error + Send + Sync + 'static,
 {

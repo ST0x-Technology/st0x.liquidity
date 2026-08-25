@@ -651,11 +651,12 @@ mod tests {
 
     use st0x_config::ExecutionThreshold;
     use st0x_event_sorcery::StoreBuilder;
+    use st0x_evm::Chain;
     use st0x_execution::{ExecutorOrderId, SupportedExecutor};
     use st0x_finance::{FractionalShares, Positive, Symbol, Usd, Usdc};
     use st0x_float_macro::float;
 
-    use crate::bot_gas::{BotGasChain, BotGasOperationCategory};
+    use crate::bot_gas::BotGasOperationCategory;
     use crate::offchain::order::OffchainOrderId;
     use crate::position::{PositionCommand, TradeId, TriggerReason};
     use crate::test_utils::{persist_event, setup_test_db};
@@ -684,7 +685,7 @@ mod tests {
 
     fn gas_cost() -> crate::bot_gas::BotGasReceiptCost {
         crate::bot_gas::BotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0xcd),
             receipt_from: Address::repeat_byte(0x11),
             gas_used: 21_000,

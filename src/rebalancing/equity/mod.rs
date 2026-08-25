@@ -2044,6 +2044,7 @@ mod tests {
 
     use st0x_dto::Statement;
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, test_store};
+    use st0x_evm::Chain;
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_float_macro::float;
 
@@ -2056,7 +2057,7 @@ mod tests {
     use st0x_wrapper::MockWrapper;
 
     use super::*;
-    use crate::bot_gas::{BotGasChain, RecordBotGasReceiptCostJobQueue, pending_bot_gas_jobs};
+    use crate::bot_gas::{RecordBotGasReceiptCostJobQueue, pending_bot_gas_jobs};
     use crate::equity_redemption::{EquityRedemptionError, redemption_aggregate_id};
     use crate::inventory::{
         BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Venue,
@@ -2849,7 +2850,7 @@ mod tests {
         assert_eq!(wrap_jobs.len(), 1);
         assert_eq!(deposit_jobs.len(), 1);
         for job in [wrap_jobs[0], deposit_jobs[0]] {
-            assert_eq!(job.chain, BotGasChain::Base);
+            assert_eq!(job.chain, Chain::Base);
             assert_eq!(job.symbol, Some(symbol.clone()));
         }
     }
@@ -3540,7 +3541,7 @@ mod tests {
         assert_eq!(unwrap_jobs.len(), 1);
         assert_eq!(wallet_transfer_jobs.len(), 1);
         for job in [withdraw_jobs[0], unwrap_jobs[0], wallet_transfer_jobs[0]] {
-            assert_eq!(job.chain, BotGasChain::Base);
+            assert_eq!(job.chain, Chain::Base);
             assert_eq!(job.symbol, Some(symbol.clone()));
         }
     }

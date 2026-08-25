@@ -33,8 +33,9 @@ use task_supervisor::{SupervisedTask, TaskResult};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{error, info, warn};
 
+use st0x_evm::Chain;
+
 use crate::alerts::Notifier;
-use crate::bot_gas::BotGasChain;
 
 /// Reads the native balance of an address, abstracted so the monitor's
 /// threshold logic can be driven with canned values in tests instead of a
@@ -142,7 +143,7 @@ pub(crate) struct GasMonitor {
     pub(crate) balance_reader: Arc<dyn BalanceReader>,
     pub(crate) notifier: Arc<dyn Notifier>,
     pub(crate) wallet: Address,
-    pub(crate) chain: BotGasChain,
+    pub(crate) chain: Chain,
     pub(crate) threshold_wei: U256,
     pub(crate) poll_interval: Duration,
     pub(crate) realert_interval: Duration,
@@ -319,7 +320,7 @@ mod tests {
             balance_reader: Arc::new(StaticBalanceReader { balance, fail }),
             notifier,
             wallet: Address::ZERO,
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             threshold_wei: U256::from(100u64),
             poll_interval: Duration::from_secs(60),
             realert_interval: Duration::from_secs(3600),
@@ -330,7 +331,7 @@ mod tests {
     async fn ethereum_below_threshold_alert_identifies_chain() {
         let notifier = Arc::new(CapturingNotifier::new());
         let mut monitor = monitor_with(U256::from(50u64), false, notifier.clone());
-        monitor.chain = BotGasChain::Ethereum;
+        monitor.chain = Chain::Ethereum;
 
         let now = Instant::now();
         let next = monitor.poll_once(AlertState::Normal, now).await;
@@ -408,7 +409,7 @@ mod tests {
     async fn recovery_from_low_notifies_once() {
         let low_notifier = Arc::new(CapturingNotifier::new());
         let mut low_monitor = monitor_with(U256::from(50u64), false, low_notifier.clone());
-        low_monitor.chain = BotGasChain::Ethereum;
+        low_monitor.chain = Chain::Ethereum;
         let low_state = low_monitor
             .poll_once(AlertState::Normal, Instant::now())
             .await;
@@ -416,7 +417,7 @@ mod tests {
         // Same dedup state, but now the balance is healthy again.
         let recover_notifier = Arc::new(CapturingNotifier::new());
         let mut recover_monitor = monitor_with(U256::from(150u64), false, recover_notifier.clone());
-        recover_monitor.chain = BotGasChain::Ethereum;
+        recover_monitor.chain = Chain::Ethereum;
         let next = recover_monitor.poll_once(low_state, Instant::now()).await;
 
         assert_eq!(next, AlertState::Normal, "recovery returns to Normal");

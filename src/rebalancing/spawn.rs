@@ -50,7 +50,7 @@ pub(crate) fn to_wrapped_equities(
 }
 
 /// Trait-erased resume entry points for the cash transfer, so the conductor
-/// can build apalis job ctxs without leaking the wallet `Chain` generic
+/// can build apalis job ctxs without leaking the wallet `Signer` generic
 /// upstream.
 pub(crate) struct UsdcTransferResumeHandles {
     pub(crate) resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca>,
@@ -58,23 +58,23 @@ pub(crate) struct UsdcTransferResumeHandles {
 }
 
 #[derive(Clone)]
-pub(crate) struct EthereumWallet<Chain>(pub(crate) Chain);
+pub(crate) struct EthereumWallet<Signer>(pub(crate) Signer);
 
 #[derive(Clone)]
-pub(crate) struct BaseWallet<Chain>(pub(crate) Chain);
+pub(crate) struct BaseWallet<Signer>(pub(crate) Signer);
 
 #[derive(Clone)]
-pub(crate) struct ChainWallets<Chain> {
-    ethereum: EthereumWallet<Chain>,
-    base: BaseWallet<Chain>,
+pub(crate) struct ChainWallets<Signer> {
+    ethereum: EthereumWallet<Signer>,
+    base: BaseWallet<Signer>,
 }
 
-impl<Chain> ChainWallets<Chain> {
-    pub(crate) fn base(&self) -> &BaseWallet<Chain> {
+impl<Signer> ChainWallets<Signer> {
+    pub(crate) fn base(&self) -> &BaseWallet<Signer> {
         &self.base
     }
 
-    pub(crate) fn into_parts(self) -> (EthereumWallet<Chain>, BaseWallet<Chain>) {
+    pub(crate) fn into_parts(self) -> (EthereumWallet<Signer>, BaseWallet<Signer>) {
         (self.ethereum, self.base)
     }
 }
@@ -92,15 +92,15 @@ impl ChainWallets<Arc<dyn Wallet<Provider = RootProvider>>> {
 ///
 /// Holds connections to Alpaca APIs, CCTP bridge, and vault services.
 /// Providers for both chains are obtained from the wallets on `RebalancingCtx`.
-pub(crate) struct RebalancerServices<Chain: Wallet> {
+pub(crate) struct RebalancerServices<Signer: Wallet> {
     broker: InstrumentedAlpacaBroker,
     wallet: Arc<AlpacaWalletService>,
-    cctp: Arc<CctpBridge<Chain, Chain>>,
-    raindex: Arc<RaindexService<Chain>>,
+    cctp: Arc<CctpBridge<Signer, Signer>>,
+    raindex: Arc<RaindexService<Signer>>,
     settlement: UsdcSettlementParams,
 }
 
-impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
+impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
     /// Creates the services needed for rebalancing.
     ///
     /// RaindexService is passed in rather than created here because it is
@@ -109,8 +109,8 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     pub(crate) fn new(
         broker: InstrumentedAlpacaBroker,
         wallet: Arc<AlpacaWalletService>,
-        wallets: ChainWallets<Chain>,
-        raindex: Arc<RaindexService<Chain>>,
+        wallets: ChainWallets<Signer>,
+        raindex: Arc<RaindexService<Signer>>,
         settlement: UsdcSettlementParams,
     ) -> Result<Self, SpawnRebalancerError> {
         let ChainWallets {

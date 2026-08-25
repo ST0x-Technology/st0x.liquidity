@@ -14,6 +14,7 @@ use rain_math_float::Float;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+use st0x_evm::Chain;
 use st0x_execution::ExecutorOrderId;
 use st0x_execution::alpaca_broker_api::AccountActivity;
 use st0x_finance::{FractionalShares, Positive, Symbol, Usd, Usdc};
@@ -42,8 +43,7 @@ use super::{
     COST_WARNING, SYMBOL_FILTERED_CAPITAL_WARNING, validate_pnl_snapshot_rowid,
 };
 use crate::bot_gas::{
-    BotGasChain, BotGasOperationCategory, BotGasReceiptCost, BotGasReceiptCostError,
-    BotGasReceiptCostEvent,
+    BotGasOperationCategory, BotGasReceiptCost, BotGasReceiptCostError, BotGasReceiptCostEvent,
 };
 use crate::offchain::order::OffchainOrderId;
 use crate::portfolio_snapshot::EtDayRange;
@@ -615,7 +615,7 @@ fn bridged_event(fee: &str, timestamp: &str) -> UsdcRebalanceEvent {
 
 fn bot_gas_cost(usd_cost: Float) -> BotGasReceiptCost {
     BotGasReceiptCost {
-        chain: BotGasChain::Base,
+        chain: Chain::Base,
         tx_hash: TxHash::repeat_byte(0xab),
         receipt_from: Address::repeat_byte(0x11),
         gas_used: 21_000,
