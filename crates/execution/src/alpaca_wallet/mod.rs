@@ -57,15 +57,14 @@ impl AlpacaWalletService {
     pub fn new(
         base_url: String,
         account_id: AlpacaAccountId,
-        api_key: String,
-        api_secret: String,
-    ) -> Self {
-        let client = AlpacaWalletClient::new(base_url, account_id, api_key, api_secret);
+        auth: crate::AlpacaBrokerAuth,
+    ) -> Result<Self, AlpacaWalletError> {
+        let client = AlpacaWalletClient::new(base_url, account_id, auth)?;
 
-        Self {
+        Ok(Self {
             client: Arc::new(client),
             polling_config: PollingConfig::default(),
-        }
+        })
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -242,6 +241,8 @@ mod tests {
     use crate::AlpacaAccountId;
 
     use super::*;
+
+    use crate::alpaca_broker_api::AlpacaBrokerAuth;
     use st0x_float_macro::float;
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
@@ -251,9 +252,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key".to_string(),
-            "test_secret".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key".to_string(),
+                api_secret: "test_secret".to_string(),
+            },
+        )
+        .unwrap();
 
         AlpacaWalletService::new_with_client(client, None)
     }
@@ -392,9 +396,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key".to_string(),
-            "test_secret".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key".to_string(),
+                api_secret: "test_secret".to_string(),
+            },
+        )
+        .unwrap();
 
         let service = AlpacaWalletService::new_with_client(client, Some(polling_config));
 

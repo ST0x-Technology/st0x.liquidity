@@ -35,6 +35,7 @@ mod auth;
 mod client;
 mod executor;
 mod journal;
+pub mod kms_jwt;
 mod market_hours;
 #[cfg(feature = "mock")]
 mod mock_api;
@@ -56,9 +57,12 @@ pub enum AssetStatus {
 }
 
 pub use activity::{AccountActivitiesQuery, AccountActivity};
-pub use auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+pub use auth::{
+    AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaBrokerAuth,
+};
 // Exposed as the single source of truth for the broker HTTP request timeout so
 // timing-sensitive integration tests derive their boundaries from it.
+pub(crate) use client::AlpacaBrokerApiClient;
 pub use client::HTTP_REQUEST_TIMEOUT;
 pub use executor::AlpacaBrokerApi;
 pub use journal::{JournalResponse, JournalStatus};
@@ -242,6 +246,9 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Invalid header value: {0}")]
     InvalidHeader(#[from] reqwest::header::InvalidHeaderValue),
+
+    #[error("keyless Alpaca auth failed: {0}")]
+    KmsJwt(#[from] kms_jwt::KmsJwtError),
 
     #[error("{}", format_api_error(*status, alpaca_code.as_ref(), message))]
     ApiError {
@@ -470,6 +477,7 @@ impl AlpacaBrokerApiError {
 
             Self::ApiError { .. }
             | Self::HttpClient(_)
+            | Self::KmsJwt(_)
             | Self::JsonParse(_)
             | Self::PositionSymbolMismatch { .. }
             | Self::InvalidHeader(_)
@@ -530,7 +538,11 @@ impl AlpacaBrokerApiError {
             // routing/cache failure: a fresh request can clear it, but the
             // mismatched financial value must never be consumed.
             Self::HttpClient(source) if source.is_builder() => Permanence::Permanent,
-            Self::HttpClient(_) | Self::PositionSymbolMismatch { .. } => Permanence::Transient,
+            // A keyless-auth mint failure is network-shaped (metadata, KMS,
+            // or token-endpoint round-trip); a fresh attempt can clear it.
+            Self::HttpClient(_) | Self::KmsJwt(_) | Self::PositionSymbolMismatch { .. } => {
+                Permanence::Transient
+            }
 
             // Everything else is decided locally -- from a response that
             // already arrived, from configuration, or from arithmetic on

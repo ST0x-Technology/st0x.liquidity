@@ -106,12 +106,11 @@ async fn build_equity_transfer_services(
     let tokenization_service: Arc<dyn Tokenizer> = Arc::new(AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
         alpaca_auth.account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
+        alpaca_auth.auth.clone(),
         base_caller.clone(),
         Network::new("base"),
         Some(redemption_wallet),
-    ));
+    )?);
 
     let (_vault_store, vault_registry_projection) =
         StoreBuilder::<VaultRegistry>::new(pool.clone())
@@ -546,8 +545,7 @@ async fn run_usdc_transfer<Writer: Write>(
     };
 
     let broker_auth = AlpacaBrokerApiCtx {
-        api_key: alpaca_auth.api_key.clone(),
-        api_secret: alpaca_auth.api_secret.clone(),
+        auth: alpaca_auth.auth.clone(),
         account_id: alpaca_auth.account_id,
         mode: Some(broker_mode),
         asset_cache_ttl: std::time::Duration::from_secs(3600),
@@ -566,9 +564,8 @@ async fn run_usdc_transfer<Writer: Write>(
     let alpaca_wallet = Arc::new(AlpacaWalletService::new(
         broker_auth.base_url().to_string(),
         alpaca_auth.account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
-    ));
+        alpaca_auth.auth.clone(),
+    )?);
 
     let bridge = Arc::new(CctpBridge::try_from_ctx(CctpCtx {
         usdc_ethereum: USDC_ETHEREUM,
@@ -1179,12 +1176,11 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write>(
     let tokenization_service = AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
         alpaca_auth.account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
+        alpaca_auth.auth.clone(),
         wallet,
         wire_network,
         None,
-    );
+    )?;
 
     writeln!(stdout, "   Sending mint request to Alpaca...")?;
 
@@ -1307,12 +1303,11 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
     let tokenization_service = AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
         alpaca_auth.account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
+        alpaca_auth.auth.clone(),
         wallet,
         wire_network,
         Some(redemption_wallet),
-    );
+    )?;
 
     let amount = quantity.to_u256_18_decimals()?;
     writeln!(stdout, "   Amount (wei): {amount}")?;
@@ -1383,12 +1378,11 @@ pub(super) async fn alpaca_tokenization_requests_command<Writer: Write>(
     let tokenization_service = AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
         alpaca_auth.account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
+        alpaca_auth.auth.clone(),
         wallet_ctx.base_wallet().clone(),
         Network::new("base"),
         None,
-    );
+    )?;
 
     let requests = tokenization_service.list_requests().await?;
 
@@ -2279,8 +2273,10 @@ mod tests {
     fn create_alpaca_ctx_without_rebalancing() -> Ctx {
         let mut ctx = create_ctx_without_rebalancing();
         ctx.broker = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            auth: st0x_execution::AlpacaBrokerAuth::Basic {
+                api_key: "test-key".to_string(),
+                api_secret: "test-secret".to_string(),
+            },
             account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
@@ -2292,8 +2288,10 @@ mod tests {
 
     fn create_alpaca_ctx_with_rebalancing(cash: Option<CashAssetConfig>) -> Ctx {
         let alpaca_broker_auth = AlpacaBrokerApiCtx {
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            auth: st0x_execution::AlpacaBrokerAuth::Basic {
+                api_key: "test-key".to_string(),
+                api_secret: "test-secret".to_string(),
+            },
             account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
@@ -2687,8 +2685,10 @@ mod tests {
     #[test]
     fn cli_broker_mode_sandbox_when_sandbox_auth() {
         let alpaca_auth = AlpacaBrokerApiCtx {
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            auth: st0x_execution::AlpacaBrokerAuth::Basic {
+                api_key: "test-key".to_string(),
+                api_secret: "test-secret".to_string(),
+            },
             account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
@@ -2712,8 +2712,10 @@ mod tests {
     #[test]
     fn cli_broker_mode_production_when_production_auth() {
         let alpaca_auth = AlpacaBrokerApiCtx {
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            auth: st0x_execution::AlpacaBrokerAuth::Basic {
+                api_key: "test-key".to_string(),
+                api_secret: "test-secret".to_string(),
+            },
             account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Production),
             asset_cache_ttl: std::time::Duration::from_secs(3600),

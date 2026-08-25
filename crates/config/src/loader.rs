@@ -17,7 +17,7 @@ use tracing::{Level, warn};
 use url::Url;
 
 use st0x_execution::{
-    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
+    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaBrokerAuth,
     DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, FractionalShares, Positive, SupportedExecutor,
     Symbol, TimeInForce,
 };
@@ -593,6 +593,16 @@ enum BrokerSecrets {
         account_id: AlpacaAccountId,
         mode: Option<AlpacaBrokerApiMode>,
     },
+    /// Keyless variant: no stored credential. The client id names the
+    /// BrokerDash credential whose public half is the named Cloud KMS
+    /// key; the bot signs an RFC 7523 client assertion per token
+    /// request (see st0x-execution's `kms_jwt`).
+    AlpacaBrokerApiKms {
+        client_id: String,
+        kms_key_version: String,
+        account_id: AlpacaAccountId,
+        mode: Option<AlpacaBrokerApiMode>,
+    },
     DryRun,
 }
 
@@ -723,6 +733,28 @@ impl BrokerCtx {
 }
 
 impl BrokerCtx {
+    fn alpaca_ctx(
+        auth: AlpacaBrokerAuth,
+        account_id: AlpacaAccountId,
+        mode: Option<AlpacaBrokerApiMode>,
+        broker_config: Option<&BrokerConfig>,
+    ) -> Result<Self, CtxError> {
+        // Unwrap the section once: a per-field `ok_or` would make the
+        // error reported for a wholly missing `[broker]` depend on
+        // field declaration order, and every arm after the first
+        // would be unreachable.
+        let broker_config = broker_config.ok_or(CtxError::MissingCounterTradeSlippageBps)?;
+
+        Ok(Self::AlpacaBrokerApi(AlpacaBrokerApiCtx {
+            auth,
+            account_id,
+            mode,
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
+            counter_trade_slippage_bps: broker_config.counter_trade_slippage_bps()?,
+        }))
+    }
+
     fn from_parts(
         secrets: BrokerSecrets,
         broker_config: Option<&BrokerConfig>,
@@ -733,24 +765,30 @@ impl BrokerCtx {
                 api_secret,
                 account_id,
                 mode,
-            } => {
-                // Unwrap the section once: a per-field `ok_or` would make the
-                // error reported for a wholly missing `[broker]` depend on
-                // field declaration order, and every arm after the first
-                // would be unreachable.
-                let broker_config =
-                    broker_config.ok_or(CtxError::MissingCounterTradeSlippageBps)?;
-
-                Ok(Self::AlpacaBrokerApi(AlpacaBrokerApiCtx {
+            } => Self::alpaca_ctx(
+                AlpacaBrokerAuth::Basic {
                     api_key,
                     api_secret,
-                    account_id,
-                    mode,
-                    asset_cache_ttl: std::time::Duration::from_secs(3600),
-                    time_in_force: TimeInForce::default(),
-                    counter_trade_slippage_bps: broker_config.counter_trade_slippage_bps()?,
-                }))
-            }
+                },
+                account_id,
+                mode,
+                broker_config,
+            ),
+
+            BrokerSecrets::AlpacaBrokerApiKms {
+                client_id,
+                kms_key_version,
+                account_id,
+                mode,
+            } => Self::alpaca_ctx(
+                AlpacaBrokerAuth::KmsJwt {
+                    client_id,
+                    kms_key_version,
+                },
+                account_id,
+                mode,
+                broker_config,
+            ),
 
             BrokerSecrets::DryRun => Ok(Self::DryRun),
         }
@@ -6907,10 +6945,44 @@ mod tests {
     }
 
     #[test]
+    fn kms_broker_secrets_parse_without_stored_credentials() {
+        // The keyless [broker] variant carries no api_key/api_secret:
+        // a client id plus the Cloud KMS key-version that signs the
+        // RFC 7523 client assertions.
+        let secrets: Secrets = toml::from_str(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api-kms"
+            client_id = "CKTEST"
+            kms_key_version = "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "production"
+            "#,
+        )
+        .unwrap();
+
+        match secrets.broker {
+            BrokerSecrets::AlpacaBrokerApiKms {
+                ref client_id,
+                ref kms_key_version,
+                ..
+            } => {
+                assert_eq!(client_id, "CKTEST");
+                assert!(kms_key_version.ends_with("cryptoKeyVersions/1"));
+            }
+            ref other => panic!("expected keyless broker secrets, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn broker_type_tag_uses_kebab_case() {
         let variants = [
             ("dry-run", "DryRun"),
             ("alpaca-broker-api", "AlpacaBrokerApi"),
+            ("alpaca-broker-api-kms", "AlpacaBrokerApiKms"),
         ];
 
         for (kebab_value, variant_name) in variants {

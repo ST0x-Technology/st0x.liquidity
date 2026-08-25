@@ -365,8 +365,10 @@ mod tests {
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
-            api_key: "test_key".to_string(),
-            api_secret: "test_secret".to_string(),
+            auth: crate::AlpacaBrokerAuth::Basic {
+                api_key: "test_key".to_string(),
+                api_secret: "test_secret".to_string(),
+            },
             account_id: TEST_ACCOUNT_ID,
             mode: Some(mode),
             asset_cache_ttl: std::time::Duration::from_secs(3600),

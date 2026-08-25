@@ -139,10 +139,54 @@ impl AlpacaBrokerApiMode {
     }
 }
 
+/// How the broker (and market-data) clients authenticate to Alpaca.
+///
+/// `Basic` is the legacy stored key/secret pair. `KmsJwt` is keyless:
+/// bearer tokens bought with client assertions signed by a
+/// non-extractable Cloud KMS key (see [`super::kms_jwt`]). Untagged so
+/// the flattened `[broker]` TOML stays field-shaped: the field names
+/// alone pick the variant.
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+pub enum AlpacaBrokerAuth {
+    Basic {
+        api_key: String,
+        api_secret: String,
+    },
+    KmsJwt {
+        /// BrokerDash credential client id (not a secret; the private
+        /// half is the KMS key below).
+        client_id: String,
+        /// Full Cloud KMS key-version resource name
+        /// (`projects/.../cryptoKeyVersions/N`).
+        kms_key_version: String,
+    },
+}
+
+impl std::fmt::Debug for AlpacaBrokerAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Basic { .. } => f
+                .debug_struct("Basic")
+                .field("api_key", &"[REDACTED]")
+                .field("api_secret", &"[REDACTED]")
+                .finish(),
+            Self::KmsJwt {
+                client_id,
+                kms_key_version,
+            } => f
+                .debug_struct("KmsJwt")
+                .field("client_id", client_id)
+                .field("kms_key_version", kms_key_version)
+                .finish(),
+        }
+    }
+}
+
 #[derive(Clone, Deserialize)]
 pub struct AlpacaBrokerApiCtx {
-    pub api_key: String,
-    pub api_secret: String,
+    #[serde(flatten)]
+    pub auth: AlpacaBrokerAuth,
     pub account_id: AlpacaAccountId,
     pub mode: Option<AlpacaBrokerApiMode>,
     #[serde(
@@ -189,8 +233,7 @@ impl AlpacaBrokerApiCtx {
 impl std::fmt::Debug for AlpacaBrokerApiCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AlpacaBrokerApiCtx")
-            .field("api_key", &"[REDACTED]")
-            .field("api_secret", &"[REDACTED]")
+            .field("auth", &self.auth)
             .field("account_id", &self.account_id)
             .field("mode", &self.mode())
             .field("asset_cache_ttl", &self.asset_cache_ttl)
@@ -221,7 +264,7 @@ pub enum AccountStatus {
 
 /// Response from the account verification endpoint
 #[derive(Debug, Deserialize)]
-pub(super) struct AccountResponse {
+pub(crate) struct AccountResponse {
     pub id: Uuid,
     pub status: AccountStatus,
 }
@@ -237,8 +280,10 @@ mod tests {
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
-            api_key: "test_key_id".to_string(),
-            api_secret: "test_secret_key".to_string(),
+            auth: crate::AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
             account_id: TEST_ACCOUNT_ID,
             mode: Some(mode),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
@@ -350,8 +395,10 @@ mod tests {
     #[test]
     fn test_alpaca_broker_api_auth_env_debug_redacts_secrets() {
         let ctx = AlpacaBrokerApiCtx {
-            api_key: "super_secret_key_123".to_string(),
-            api_secret: "ultra_secret_secret_456".to_string(),
+            auth: crate::AlpacaBrokerAuth::Basic {
+                api_key: "super_secret_key_123".to_string(),
+                api_secret: "ultra_secret_secret_456".to_string(),
+            },
             account_id: TEST_ACCOUNT_ID,
             mode: None,
             asset_cache_ttl: std::time::Duration::from_secs(3600),

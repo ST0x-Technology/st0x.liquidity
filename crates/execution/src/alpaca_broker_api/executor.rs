@@ -277,8 +277,7 @@ impl Executor for AlpacaBrokerApi {
             }
             Direction::Buy => {
                 let latest_trade_price = crate::alpaca_market_data::fetch_latest_trade_price(
-                    self.client.market_data_http_client(),
-                    self.client.market_data_base_url(),
+                    &self.client,
                     &order.symbol,
                 )
                 .await
@@ -313,13 +312,9 @@ impl Executor for AlpacaBrokerApi {
         &self,
         symbol: &Symbol,
     ) -> Result<Option<LatestQuote>, Self::Error> {
-        let quote = crate::alpaca_market_data::fetch_latest_quote(
-            self.client.market_data_http_client(),
-            self.client.market_data_base_url(),
-            symbol,
-        )
-        .await
-        .map_err(|source| AlpacaBrokerApiError::LatestQuote(Box::new(source)))?;
+        let quote = crate::alpaca_market_data::fetch_latest_quote(&self.client, symbol)
+            .await
+            .map_err(|source| AlpacaBrokerApiError::LatestQuote(Box::new(source)))?;
         Ok(Some(quote))
     }
 
@@ -709,8 +704,10 @@ mod tests {
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
-            api_key: "test_key".to_string(),
-            api_secret: "test_secret".to_string(),
+            auth: crate::AlpacaBrokerAuth::Basic {
+                api_key: "test_key".to_string(),
+                api_secret: "test_secret".to_string(),
+            },
             account_id: TEST_ACCOUNT_ID,
             mode: Some(mode),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
@@ -1454,8 +1451,10 @@ mod tests {
 
         // Use a very short TTL for testing (0 seconds)
         let ctx = AlpacaBrokerApiCtx {
-            api_key: "test_key".to_string(),
-            api_secret: "test_secret".to_string(),
+            auth: crate::AlpacaBrokerAuth::Basic {
+                api_key: "test_key".to_string(),
+                api_secret: "test_secret".to_string(),
+            },
             account_id: TEST_ACCOUNT_ID,
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::ZERO,

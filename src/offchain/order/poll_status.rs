@@ -1725,8 +1725,10 @@ mod tests {
         let _account_mock = mock_alpaca_account(server);
 
         let auth = AlpacaBrokerApiCtx {
-            api_key: "test_key".to_string(),
-            api_secret: "test_secret".to_string(),
+            auth: st0x_execution::AlpacaBrokerAuth::Basic {
+                api_key: "test_key".to_string(),
+                api_secret: "test_secret".to_string(),
+            },
             account_id: TEST_ALPACA_ACCOUNT_ID,
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: Duration::from_secs(3600),

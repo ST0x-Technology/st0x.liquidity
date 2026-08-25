@@ -1,7 +1,9 @@
 //! Shared Alpaca market-data lookups used for hedge preflight checks.
 
 use rain_math_float::Float;
-use reqwest::{Client, RequestBuilder, StatusCode};
+use reqwest::{RequestBuilder, StatusCode};
+
+use crate::alpaca_broker_api::AlpacaBrokerApiClient;
 use serde::Deserialize;
 use std::time::Duration;
 use tracing::trace;
@@ -28,6 +30,8 @@ const QUOTE_FEED: &str = "delayed_sip";
 pub enum AlpacaMarketDataError {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("market data auth failed: {0}")]
+    Auth(String),
     #[error("API error (status {status}): {body}")]
     ApiError {
         status: StatusCode,
@@ -86,6 +90,7 @@ impl AlpacaMarketDataError {
 
             Self::ApiError { .. }
             | Self::Http(_)
+            | Self::Auth(_)
             | Self::JsonParse(_)
             | Self::LatestQuoteJsonParse(_)
             | Self::LatestQuoteSymbolMismatch { .. }
@@ -105,6 +110,9 @@ impl AlpacaMarketDataError {
     pub(crate) fn permanence(&self) -> Permanence {
         match self {
             Self::ApiError { status, .. } => status_permanence(*status),
+
+            // A keyless-auth mint failure is network-shaped; retryable.
+            Self::Auth(_) => Permanence::Transient,
 
             // A malformed response is deterministic for the response that
             // arrived and does not become usable by immediately parsing it
@@ -207,14 +215,17 @@ async fn get_market_data_bytes(request: RequestBuilder) -> Result<Vec<u8>, Alpac
 }
 
 pub(crate) async fn fetch_latest_trade_price(
-    client: &Client,
-    market_data_base_url: &str,
+    client: &AlpacaBrokerApiClient,
     symbol: &Symbol,
 ) -> Result<Positive<Usd>, AlpacaMarketDataError> {
-    let bytes = get_market_data_bytes(client.get(format!(
-        "{market_data_base_url}/v2/stocks/{symbol}/trades/latest"
-    )))
-    .await?;
+    let market_data_base_url = client.market_data_base_url();
+    let request = client
+        .market_data_get(format!(
+            "{market_data_base_url}/v2/stocks/{symbol}/trades/latest"
+        ))
+        .await
+        .map_err(|error| AlpacaMarketDataError::Auth(error.to_string()))?;
+    let bytes = get_market_data_bytes(request).await?;
 
     let response: LatestTradeEnvelope = serde_json::from_slice(&bytes)?;
 
@@ -235,18 +246,17 @@ pub(crate) async fn fetch_latest_trade_price(
 }
 
 pub(crate) async fn fetch_latest_quote(
-    client: &Client,
-    market_data_base_url: &str,
+    client: &AlpacaBrokerApiClient,
     symbol: &Symbol,
 ) -> Result<LatestQuote, AlpacaMarketDataError> {
-    let bytes = get_market_data_bytes(
-        client
-            .get(format!(
-                "{market_data_base_url}/v2/stocks/{symbol}/quotes/latest"
-            ))
-            .query(&[("feed", QUOTE_FEED)]),
-    )
-    .await?;
+    let market_data_base_url = client.market_data_base_url();
+    let request = client
+        .market_data_get(format!(
+            "{market_data_base_url}/v2/stocks/{symbol}/quotes/latest"
+        ))
+        .await
+        .map_err(|error| AlpacaMarketDataError::Auth(error.to_string()))?;
+    let bytes = get_market_data_bytes(request.query(&[("feed", QUOTE_FEED)])).await?;
 
     let response: LatestQuoteEnvelope =
         serde_json::from_slice(&bytes).map_err(AlpacaMarketDataError::LatestQuoteJsonParse)?;
@@ -290,12 +300,32 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::alpaca_broker_api::{
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaBrokerAuth,
+    };
+
+    fn mock_client(server: &MockServer) -> AlpacaBrokerApiClient {
+        AlpacaBrokerApiClient::new(&AlpacaBrokerApiCtx {
+            auth: AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+            account_id: "904837e3-3b76-47ec-b432-046db621571b"
+                .parse::<AlpacaAccountId>()
+                .unwrap(),
+            mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
+            asset_cache_ttl: Duration::from_secs(3600),
+            time_in_force: Default::default(),
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        })
+        .unwrap()
+    }
 
     async fn latest_quote_result(
         quote: serde_json::Value,
     ) -> Result<LatestQuote, AlpacaMarketDataError> {
         let server = MockServer::start();
-        let client = Client::new();
+        let client = mock_client(&server);
         let symbol = Symbol::new("AAPL").unwrap();
 
         server.mock(|when, then| {
@@ -307,7 +337,7 @@ mod tests {
                 .json_body(json!({ "symbol": "AAPL", "quote": quote }));
         });
 
-        fetch_latest_quote(&client, &server.base_url(), &symbol).await
+        fetch_latest_quote(&client, &symbol).await
     }
 
     #[tokio::test]
@@ -335,7 +365,7 @@ mod tests {
         // regression against -- e.g. an envelope or field-name change that
         // happens to still leave a minimal fixture parseable.
         let server = MockServer::start();
-        let client = Client::new();
+        let client = mock_client(&server);
         let symbol = Symbol::new("AAPL").unwrap();
 
         server.mock(|when, then| {
@@ -360,9 +390,7 @@ mod tests {
                 }));
         });
 
-        let quote = fetch_latest_quote(&client, &server.base_url(), &symbol)
-            .await
-            .unwrap();
+        let quote = fetch_latest_quote(&client, &symbol).await.unwrap();
 
         assert_eq!(
             quote.bid().inner(),
@@ -377,7 +405,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_latest_quote_rejects_a_response_for_another_symbol() {
         let server = MockServer::start();
-        let client = Client::new();
+        let client = mock_client(&server);
         let symbol = Symbol::new("AAPL").unwrap();
 
         server.mock(|when, then| {
@@ -392,9 +420,7 @@ mod tests {
                 }));
         });
 
-        let error = fetch_latest_quote(&client, &server.base_url(), &symbol)
-            .await
-            .unwrap_err();
+        let error = fetch_latest_quote(&client, &symbol).await.unwrap_err();
 
         assert!(matches!(
             error,
@@ -427,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_latest_quote_rejects_missing_quote() {
         let server = MockServer::start();
-        let client = Client::new();
+        let client = mock_client(&server);
         let symbol = Symbol::new("AAPL").unwrap();
 
         server.mock(|when, then| {
@@ -439,9 +465,7 @@ mod tests {
                 .json_body(json!({ "symbol": "AAPL" }));
         });
 
-        let error = fetch_latest_quote(&client, &server.base_url(), &symbol)
-            .await
-            .unwrap_err();
+        let error = fetch_latest_quote(&client, &symbol).await.unwrap_err();
 
         assert!(matches!(error, AlpacaMarketDataError::MissingQuote { .. }));
     }
@@ -483,7 +507,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_latest_trade_price_rejects_zero_price() {
         let server = MockServer::start();
-        let client = Client::new();
+        let client = mock_client(&server);
         let symbol = Symbol::new("AAPL").unwrap();
 
         server.mock(|when, then| {
@@ -497,7 +521,7 @@ mod tests {
                 }));
         });
 
-        let error = fetch_latest_trade_price(&client, &server.base_url(), &symbol)
+        let error = fetch_latest_trade_price(&client, &symbol)
             .await
             .unwrap_err();
 
@@ -514,7 +538,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_latest_trade_price_returns_positive_price() {
         let server = MockServer::start();
-        let client = Client::new();
+        let client = mock_client(&server);
         let symbol = Symbol::new("AAPL").unwrap();
 
         server.mock(|when, then| {
@@ -528,9 +552,7 @@ mod tests {
                 }));
         });
 
-        let price = fetch_latest_trade_price(&client, &server.base_url(), &symbol)
-            .await
-            .unwrap();
+        let price = fetch_latest_trade_price(&client, &symbol).await.unwrap();
 
         assert_eq!(
             price.inner(),
@@ -542,7 +564,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_latest_trade_price_logs_success_response_body() {
         let server = MockServer::start();
-        let client = Client::new();
+        let client = mock_client(&server);
         let symbol = Symbol::new("AAPL").unwrap();
 
         server.mock(|when, then| {
@@ -557,9 +579,7 @@ mod tests {
                 }));
         });
 
-        fetch_latest_trade_price(&client, &server.base_url(), &symbol)
-            .await
-            .unwrap();
+        fetch_latest_trade_price(&client, &symbol).await.unwrap();
 
         assert!(logs_contain("Alpaca market data response body received"));
         assert!(logs_contain("market_data_marker"));
@@ -570,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_latest_trade_price_logs_error_response_body() {
         let server = MockServer::start();
-        let client = Client::new();
+        let client = mock_client(&server);
         let symbol = Symbol::new("AAPL").unwrap();
 
         server.mock(|when, then| {
@@ -584,7 +604,7 @@ mod tests {
                 }));
         });
 
-        let error = fetch_latest_trade_price(&client, &server.base_url(), &symbol)
+        let error = fetch_latest_trade_price(&client, &symbol)
             .await
             .unwrap_err();
 
@@ -612,7 +632,7 @@ mod tests {
         // window must treat as retryable rather than falling back to a worse
         // price.
         let server = MockServer::start();
-        let client = Client::new();
+        let client = mock_client(&server);
         let symbol = Symbol::new("AAPL").unwrap();
 
         server.mock(|when, then| {
@@ -624,9 +644,7 @@ mod tests {
                 .json_body(json!({ "message": "subscription does not permit SIP feed" }));
         });
 
-        let error = fetch_latest_quote(&client, &server.base_url(), &symbol)
-            .await
-            .unwrap_err();
+        let error = fetch_latest_quote(&client, &symbol).await.unwrap_err();
 
         assert!(matches!(
             error,
@@ -638,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_latest_trade_price_backpressure_some_for_429_with_header() {
         let server = MockServer::start();
-        let client = Client::new();
+        let client = mock_client(&server);
         let symbol = Symbol::new("AAPL").unwrap();
 
         server.mock(|when, then| {
@@ -649,7 +667,7 @@ mod tests {
                 .json_body(json!({ "message": "rate limited" }));
         });
 
-        let error = fetch_latest_trade_price(&client, &server.base_url(), &symbol)
+        let error = fetch_latest_trade_price(&client, &symbol)
             .await
             .unwrap_err();
 
@@ -664,7 +682,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_latest_trade_price_backpressure_some_with_none_without_header() {
         let server = MockServer::start();
-        let client = Client::new();
+        let client = mock_client(&server);
         let symbol = Symbol::new("AAPL").unwrap();
 
         server.mock(|when, then| {
@@ -674,7 +692,7 @@ mod tests {
                 .json_body(json!({ "message": "rate limited" }));
         });
 
-        let error = fetch_latest_trade_price(&client, &server.base_url(), &symbol)
+        let error = fetch_latest_trade_price(&client, &symbol)
             .await
             .unwrap_err();
 
@@ -687,7 +705,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_latest_trade_price_backpressure_none_for_non_429() {
         let server = MockServer::start();
-        let client = Client::new();
+        let client = mock_client(&server);
         let symbol = Symbol::new("AAPL").unwrap();
 
         server.mock(|when, then| {
@@ -697,7 +715,7 @@ mod tests {
                 .json_body(json!({ "message": "boom" }));
         });
 
-        let error = fetch_latest_trade_price(&client, &server.base_url(), &symbol)
+        let error = fetch_latest_trade_price(&client, &symbol)
             .await
             .unwrap_err();
 
@@ -748,7 +766,10 @@ mod tests {
         let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
         let requested = Symbol::new("AAPL").unwrap();
         let returned = Symbol::new("TSLA").unwrap();
-        let http_error = Client::new().get("://invalid").build().unwrap_err();
+        let http_error = reqwest::Client::new()
+            .get("://invalid")
+            .build()
+            .unwrap_err();
 
         assert_eq!(
             AlpacaMarketDataError::LatestQuoteJsonParse(json_error).permanence(),

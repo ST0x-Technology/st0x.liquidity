@@ -278,7 +278,9 @@ mod tests {
     use uuid::{Uuid, uuid};
 
     use super::*;
+
     use crate::AlpacaAccountId;
+    use crate::alpaca_broker_api::AlpacaBrokerAuth;
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -315,9 +317,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let config = PollingConfig {
             interval: Duration::from_millis(100),
@@ -367,9 +372,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let config = PollingConfig {
             interval: Duration::from_millis(100),
@@ -419,9 +427,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let config = PollingConfig {
             interval: Duration::from_millis(100),
@@ -455,9 +466,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let config = PollingConfig {
             interval: Duration::from_millis(100),
@@ -485,12 +499,17 @@ mod tests {
         let server = MockServer::start();
         let transfer_id = Uuid::new_v4();
 
-        let client = Arc::new(AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        ));
+        let client = Arc::new(
+            AlpacaWalletClient::new(
+                server.base_url(),
+                TEST_ACCOUNT_ID,
+                AlpacaBrokerAuth::Basic {
+                    api_key: "test_key_id".to_string(),
+                    api_secret: "test_secret_key".to_string(),
+                },
+            )
+            .unwrap(),
+        );
 
         let mut processing_mock = server.mock(|when, then| {
             when.method(GET).path(format!(
@@ -680,9 +699,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let config = PollingConfig {
             interval: Duration::from_millis(10),
@@ -709,12 +731,17 @@ mod tests {
             fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
         let transfer_id = Uuid::new_v4();
 
-        let client = Arc::new(AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        ));
+        let client = Arc::new(
+            AlpacaWalletClient::new(
+                server.base_url(),
+                TEST_ACCOUNT_ID,
+                AlpacaBrokerAuth::Basic {
+                    api_key: "test_key_id".to_string(),
+                    api_secret: "test_secret_key".to_string(),
+                },
+            )
+            .unwrap(),
+        );
 
         let mut empty_mock = server.mock(|when, then| {
             when.method(GET)
@@ -788,9 +815,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let config = PollingConfig {
             interval: Duration::from_millis(10),
@@ -847,9 +877,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let config = PollingConfig {
             interval: Duration::from_millis(10),

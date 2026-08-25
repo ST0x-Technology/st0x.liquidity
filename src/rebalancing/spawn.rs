@@ -296,8 +296,10 @@ mod tests {
         account_id: AlpacaAccountId,
     ) -> (InstrumentedAlpacaBroker, Arc<AlpacaWalletService>) {
         let broker_auth = AlpacaBrokerApiCtx {
-            api_key: "test_key".to_string(),
-            api_secret: "test_secret".to_string(),
+            auth: st0x_execution::AlpacaBrokerAuth::Basic {
+                api_key: "test_key".to_string(),
+                api_secret: "test_secret".to_string(),
+            },
             account_id,
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
@@ -310,12 +312,17 @@ mod tests {
                 .expect("Failed to create test broker API"),
             TelemetrySender::disabled(),
         );
-        let wallet = Arc::new(AlpacaWalletService::new(
-            server.base_url(),
-            account_id,
-            "test_key".into(),
-            "test_secret".into(),
-        ));
+        let wallet = Arc::new(
+            AlpacaWalletService::new(
+                server.base_url(),
+                account_id,
+                st0x_execution::AlpacaBrokerAuth::Basic {
+                    api_key: "test_key".to_string(),
+                    api_secret: "test_secret".to_string(),
+                },
+            )
+            .unwrap(),
+        );
 
         (broker, wallet)
     }

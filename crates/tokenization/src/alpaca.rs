@@ -42,8 +42,8 @@ use st0x_evm::{
     OpenChainErrorRegistry, Wallet, wait_for_node_sync,
 };
 use st0x_execution::{
-    AlpacaAccountId, Backpressure, FractionalShares, Network, PollingConfig, Symbol,
-    retry_after_from_response_headers,
+    AlpacaAccountId, AlpacaBrokerAuth, AuthRuntime, Backpressure, FractionalShares, Network,
+    PollingConfig, Symbol, retry_after_from_response_headers,
 };
 
 use super::{
@@ -63,26 +63,24 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
     pub fn new(
         base_url: String,
         account_id: AlpacaAccountId,
-        api_key: String,
-        api_secret: String,
+        auth: AlpacaBrokerAuth,
         wallet: W,
         network: Network,
         redemption_wallet: Option<Address>,
-    ) -> Self {
+    ) -> Result<Self, AlpacaTokenizationError> {
         let client = AlpacaTokenizationClient::new(
             base_url,
             account_id,
-            api_key,
-            api_secret,
+            auth,
             wallet,
             network,
             redemption_wallet,
-        );
+        )?;
 
-        Self {
+        Ok(Self {
             client,
             polling_config: PollingConfig::default(),
-        }
+        })
     }
 
     /// Overrides the polling configuration (intervals, timeout, retry budget).
@@ -422,6 +420,9 @@ pub enum AlpacaTokenizationError {
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
 
+    #[error("tokenization auth failed: {0}")]
+    Auth(String),
+
     #[error("Failed to parse API response: {0}")]
     JsonParse(#[from] serde_json::Error),
 
@@ -584,8 +585,7 @@ struct AlpacaTokenizationClient<W: Wallet> {
     http_client: Client,
     base_url: String,
     account_id: AlpacaAccountId,
-    api_key: String,
-    api_secret: String,
+    auth: AuthRuntime,
     wallet: W,
     network: Network,
     redemption_wallet: Option<Address>,
@@ -595,22 +595,21 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
     fn new(
         base_url: String,
         account_id: AlpacaAccountId,
-        api_key: String,
-        api_secret: String,
+        auth: AlpacaBrokerAuth,
         wallet: W,
         network: Network,
         redemption_wallet: Option<Address>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, AlpacaTokenizationError> {
+        Ok(Self {
             http_client: Client::new(),
             base_url,
             account_id,
-            api_key,
-            api_secret,
+            auth: AuthRuntime::build(&auth)
+                .map_err(|error| AlpacaTokenizationError::Auth(error.to_string()))?,
             wallet,
             network,
             redemption_wallet,
-        }
+        })
     }
 
     /// Request a mint operation to convert offchain shares to onchain tokens.
@@ -641,10 +640,10 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         );
 
         let response = self
-            .http_client
-            .post(&url)
-            .header("APCA-API-KEY-ID", &self.api_key)
-            .header("APCA-API-SECRET-KEY", &self.api_secret)
+            .auth
+            .apply_apca(self.http_client.post(&url))
+            .await
+            .map_err(|error| AlpacaTokenizationError::Auth(error.to_string()))?
             .json(&request)
             .send()
             .await?;
@@ -949,10 +948,10 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         );
 
         let mut request = self
-            .http_client
-            .get(&url)
-            .header("APCA-API-KEY-ID", &self.api_key)
-            .header("APCA-API-SECRET-KEY", &self.api_secret);
+            .auth
+            .apply_apca(self.http_client.get(&url))
+            .await
+            .map_err(|error| AlpacaTokenizationError::Auth(error.to_string()))?;
 
         if let Some(ref request_type) = params.request_type {
             request = request.query(&[("type", request_type.to_string())]);
@@ -1197,12 +1196,15 @@ pub(crate) mod tests {
         AlpacaTokenizationClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_api_key".to_string(),
-            "test_api_secret".to_string(),
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_api_key".to_string(),
+                api_secret: "test_api_secret".to_string(),
+            },
             wallet,
             Network::new("base"),
             Some(redemption_wallet),
         )
+        .expect("basic-auth tokenization client")
     }
 
     fn create_test_service(
@@ -1312,12 +1314,15 @@ pub(crate) mod tests {
         let client = AlpacaTokenizationClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_api_key".to_string(),
-            "test_api_secret".to_string(),
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_api_key".to_string(),
+                api_secret: "test_api_secret".to_string(),
+            },
             wallet,
             Network::new("ethereum"),
             Some(TEST_REDEMPTION_WALLET),
-        );
+        )
+        .expect("basic-auth tokenization client");
         let service = create_test_service(client);
 
         let recipient = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -1781,12 +1786,15 @@ pub(crate) mod tests {
         let client = AlpacaTokenizationClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_api_key".to_string(),
-            "test_api_secret".to_string(),
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_api_key".to_string(),
+                api_secret: "test_api_secret".to_string(),
+            },
             wallet,
             Network::new("base"),
             Some(TEST_REDEMPTION_WALLET),
-        );
+        )
+        .expect("basic-auth tokenization client");
 
         let transfer_amount = U256::from(100_000u64);
 
@@ -1823,12 +1831,15 @@ pub(crate) mod tests {
         let client = AlpacaTokenizationClient::new(
             "http://unused.invalid".to_string(),
             TEST_ACCOUNT_ID,
-            "test_api_key".to_string(),
-            "test_api_secret".to_string(),
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_api_key".to_string(),
+                api_secret: "test_api_secret".to_string(),
+            },
             wallet,
             Network::new("base"),
             Some(TEST_REDEMPTION_WALLET),
-        );
+        )
+        .expect("basic-auth tokenization client");
 
         client
             .wait_for_block(current_block)
@@ -1853,12 +1864,15 @@ pub(crate) mod tests {
         let client = AlpacaTokenizationClient::new(
             "http://unused".to_string(),
             TEST_ACCOUNT_ID,
-            "test_api_key".to_string(),
-            "test_api_secret".to_string(),
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_api_key".to_string(),
+                api_secret: "test_api_secret".to_string(),
+            },
             wallet,
             Network::new("base"),
             Some(TEST_REDEMPTION_WALLET),
-        );
+        )
+        .expect("basic-auth tokenization client");
 
         let transfer_amount = U256::from(100_000u64);
         let err = client
