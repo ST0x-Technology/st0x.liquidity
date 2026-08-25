@@ -27,7 +27,7 @@ pub use imbalance_threshold::{ImbalanceThreshold, InvalidImbalanceThreshold};
 pub use loader::*;
 pub use orchestrator::{OrchestratorAddresses, OrchestratorConfig, OrchestratorError};
 pub use order_poller::OrderPollerCtx;
-pub use pricing::{PricingApiKey, PricingConfig, PricingCtx, PricingCtxError};
+pub use pricing::{PricingApiKey, PricingAuth, PricingConfig, PricingCtx, PricingCtxError};
 pub use rebalancing::{
     ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, RebalancingConfig, RebalancingCtx,
     RebalancingCtxError, UsdcRebalancing,

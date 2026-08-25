@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, HeaderValue};
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 use tracing::{debug, info, warn};
 
-use st0x_config::{AssetsConfig, PricingCtx};
+use st0x_config::{AssetsConfig, PricingAuth, PricingCtx};
 use st0x_dto::{EquityPrice, EquityPriceStatus, Statement};
 use st0x_evm::USDC_BASE;
 use st0x_finance::Symbol;
@@ -357,9 +357,16 @@ impl EquityPriceMonitor {
             .as_str()
             .into_client_request()
             .map_err(PricingSessionError::Request)?;
-        let mut authorization =
-            HeaderValue::from_str(&format!("Bearer {}", self.ctx.api_key.bearer_value()))
-                .map_err(PricingSessionError::AuthorizationHeader)?;
+        let bearer = match &self.ctx.auth {
+            PricingAuth::ApiKey(api_key) => api_key.bearer_value().to_string(),
+            // Cloud Run IAM: a fresh ID token per (re)connect from the
+            // instance metadata server -- tokens live ~1h, and the
+            // reconnect loop already re-enters here on every drop, so
+            // expiry never needs its own timer.
+            PricingAuth::GcpIdToken { audience } => fetch_gcp_identity_token(audience).await?,
+        };
+        let mut authorization = HeaderValue::from_str(&format!("Bearer {bearer}"))
+            .map_err(PricingSessionError::AuthorizationHeader)?;
         authorization.set_sensitive(true);
         request.headers_mut().insert(AUTHORIZATION, authorization);
 
@@ -578,6 +585,56 @@ enum PricingSessionError {
     Encode(#[from] ciborium::ser::Error<io::Error>),
     #[error("pricing WebSocket closed")]
     Closed,
+    #[error("failed to mint a Google ID token for the pricing service")]
+    IdentityToken(#[source] reqwest::Error),
+    #[error("metadata server answered HTTP {0} for the identity token")]
+    IdentityTokenStatus(u16),
+}
+
+/// GCE metadata identity endpoint (same seam shape as
+/// `crates/evm/src/gcp_kms_stamper.rs`: the const is the production
+/// base, tests inject a mock server's URL).
+const METADATA_IDENTITY_URL: &str =
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity";
+
+/// Mints a Google ID token for `audience` from the GCE instance metadata
+/// server — the VM's ambient service-account identity, the same
+/// no-stored-credential model as the Turnkey KMS stamper. Only reachable
+/// on GCP by construction; the config layer refuses `gcp_id_token`
+/// without wss, and off-GCP this endpoint simply does not resolve.
+async fn fetch_gcp_identity_token(audience: &str) -> Result<String, PricingSessionError> {
+    fetch_gcp_identity_token_from(METADATA_IDENTITY_URL, audience).await
+}
+
+async fn fetch_gcp_identity_token_from(
+    base_url: &str,
+    audience: &str,
+) -> Result<String, PricingSessionError> {
+    let url = format!("{base_url}?audience={audience}");
+    // no_proxy: the token must travel ONLY the direct link to the
+    // metadata server — a proxy honored from HTTP_PROXY/ALL_PROXY env
+    // would otherwise see a live credential (review catch). The fixed
+    // transport timeout mirrors the KMS stamper's: an implementation
+    // detail of a link-local endpoint, not an operational knob.
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(PricingSessionError::IdentityToken)?
+        .get(&url)
+        .header("Metadata-Flavor", "Google")
+        .send()
+        .await
+        .map_err(PricingSessionError::IdentityToken)?;
+    if !response.status().is_success() {
+        return Err(PricingSessionError::IdentityTokenStatus(
+            response.status().as_u16(),
+        ));
+    }
+    response
+        .text()
+        .await
+        .map_err(PricingSessionError::IdentityToken)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1115,5 +1172,53 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn identity_token_fetch_sends_metadata_flavor_and_returns_body() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path("/identity")
+                    .query_param("audience", "https://pricing.example")
+                    .header("Metadata-Flavor", "Google");
+                then.status(200).body("header.payload.signature");
+            })
+            .await;
+
+        let token =
+            fetch_gcp_identity_token_from(&server.url("/identity"), "https://pricing.example")
+                .await
+                .expect("token");
+
+        mock.assert_async().await;
+        assert_eq!(token, "header.payload.signature");
+    }
+
+    #[tokio::test]
+    async fn identity_token_fetch_surfaces_non_success_status() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/identity");
+                then.status(403).body("denied");
+            })
+            .await;
+
+        let err = fetch_gcp_identity_token_from(&server.url("/identity"), "aud")
+            .await
+            .expect_err("must fail");
+        assert!(matches!(err, PricingSessionError::IdentityTokenStatus(403)));
+    }
+
+    #[tokio::test]
+    async fn identity_token_fetch_surfaces_transport_failure() {
+        // A port nothing listens on: connection refused, mapped to
+        // IdentityToken rather than a status error.
+        let err = fetch_gcp_identity_token_from("http://127.0.0.1:1/identity", "aud")
+            .await
+            .expect_err("must fail");
+        assert!(matches!(err, PricingSessionError::IdentityToken(_)));
     }
 }
