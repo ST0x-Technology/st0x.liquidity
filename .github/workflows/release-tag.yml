@@ -37,6 +37,11 @@ jobs:
   label:
     runs-on: ubuntu-latest
     steps:
+      # Needed to peel the tag: on an ANNOTATED tag push GITHUB_SHA is the
+      # tag OBJECT's sha, not the commit (actions/runner#712) — resolving
+      # images by it would fail for exactly the tags `git tag -a` creates.
+      - uses: actions/checkout@v4
+
       - id: auth
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
         with:
@@ -51,10 +56,18 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME}"
-          # On a tag push GITHUB_SHA is the tagged commit for lightweight
-          # tags and the tag object's target for annotated ones.
-          COMMIT="${GITHUB_SHA}"
-          for image in t0-liquidity t0-liquidity-dashboard t0-liquidity-datasette; do
+          # Peel to the COMMIT: for annotated tags GITHUB_SHA is the tag
+          # object, not the commit (actions/runner#712); ^{commit} handles
+          # lightweight and annotated identically.
+          COMMIT=$(git rev-parse "HEAD^{commit}")
+          echo "tag ${VERSION} -> commit ${COMMIT} (GITHUB_SHA was ${GITHUB_SHA})"
+
+          # Phase 1: resolve and verify EVERY image before tagging ANY —
+          # a failure mid-loop must not leave earlier images carrying a
+          # version label the set as a whole never earned (review catch).
+          images="t0-liquidity t0-liquidity-dashboard t0-liquidity-datasette"
+          declare -A digest_for
+          for image in $images; do
             digest=$(gcloud artifacts docker images describe \
               "${AR_REPO}/${image}:${COMMIT}" \
               --format='value(image_summary.digest)' 2>/dev/null) || true
@@ -70,8 +83,13 @@ jobs:
               echo "::error::${image}@${digest} carries NO liquidity-image attestation — refusing to put a version label on an unattested digest."
               exit 1
             fi
+            digest_for[$image]="$digest"
+          done
+
+          # Phase 2: all verified — label them all.
+          for image in $images; do
             gcloud artifacts docker tags add \
-              "${AR_REPO}/${image}@${digest}" \
+              "${AR_REPO}/${image}@${digest_for[$image]}" \
               "${AR_REPO}/${image}:${VERSION}"
-            echo "labeled ${image}@${digest} as ${VERSION}"
+            echo "labeled ${image}@${digest_for[$image]} as ${VERSION}"
           done
