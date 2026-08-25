@@ -2211,10 +2211,7 @@ mod tests {
 
         let link_error =
             finish_with_log_query_url(&mut FailingWriter, &ctx, "abc", Ok(())).unwrap_err();
-        assert!(
-            link_error.to_string().contains("stdout closed"),
-            "expected the link write error, got: {link_error}"
-        );
+        assert_eq!(link_error.to_string(), "stdout closed");
     }
 
     #[test]
