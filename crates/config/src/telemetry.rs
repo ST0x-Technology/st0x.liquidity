@@ -50,6 +50,44 @@ fn build_log_file_appender(dir: &str) -> Result<RollingFileAppender, InitError> 
         .build(dir)
 }
 
+/// Console text rendering for [`console_fmt_layer`]. The telemetry-enabled
+/// subscriber renders full text; the file and console-only subscribers render
+/// compact text. Carried as a type so the deliberate difference is visible at
+/// the call sites instead of inferred from duplicated `match` blocks.
+#[derive(Clone, Copy)]
+enum ConsoleTextStyle {
+    Compact,
+    Full,
+}
+
+/// Build the console fmt layer for `log_format`. The JSON arm is the single
+/// place the console JSON wire shape is defined, byte-identical to the rolling
+/// file layer, so every subscriber emits one JSON shape.
+fn console_fmt_layer<S>(
+    log_format: LogFormat,
+    env_filter: EnvFilter,
+    style: ConsoleTextStyle,
+) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    match log_format {
+        LogFormat::Json => tracing_subscriber::fmt::layer()
+            .json()
+            .with_filter(env_filter)
+            .boxed(),
+        LogFormat::Text => match style {
+            ConsoleTextStyle::Compact => tracing_subscriber::fmt::layer()
+                .compact()
+                .with_filter(env_filter)
+                .boxed(),
+            ConsoleTextStyle::Full => tracing_subscriber::fmt::layer()
+                .with_filter(env_filter)
+                .boxed(),
+        },
+    }
+}
+
 /// Build the OTel [`Resource`] shared by the trace and log providers. Carries
 /// `service.name` and the `deployment.environment` attribute so signals from
 /// different environments are distinguishable in VictoriaTraces/VictoriaLogs.
@@ -184,15 +222,8 @@ impl TelemetryCtx {
         let otel_log_layer = OpenTelemetryTracingBridge::new(&logger_provider)
             .with_filter(mk_crate_filter(log_level));
 
-        let fmt_layer = match log_format {
-            LogFormat::Text => tracing_subscriber::fmt::layer()
-                .with_filter(mk_env_filter(log_level))
-                .boxed(),
-            LogFormat::Json => tracing_subscriber::fmt::layer()
-                .json()
-                .with_filter(mk_env_filter(log_level))
-                .boxed(),
-        };
+        let fmt_layer =
+            console_fmt_layer(log_format, mk_env_filter(log_level), ConsoleTextStyle::Full);
 
         let file_appender = log_dir.and_then(|dir| match build_log_file_appender(dir) {
             Ok(appender) => Some(appender),
@@ -346,16 +377,7 @@ pub fn setup_tracing(
         .with_writer(non_blocking)
         .with_filter(mk_crate_filter(level));
 
-    let fmt_layer = match log_format {
-        LogFormat::Text => tracing_subscriber::fmt::layer()
-            .compact()
-            .with_filter(env_filter)
-            .boxed(),
-        LogFormat::Json => tracing_subscriber::fmt::layer()
-            .json()
-            .with_filter(env_filter)
-            .boxed(),
-    };
+    let fmt_layer = console_fmt_layer(log_format, env_filter, ConsoleTextStyle::Compact);
 
     let subscriber = Registry::default()
         .with(extra_layer)
@@ -380,16 +402,7 @@ fn install_console_only_subscriber(
     extra_layer: Option<ExtraLayer>,
     env_filter: EnvFilter,
 ) {
-    let fmt_layer = match log_format {
-        LogFormat::Text => tracing_subscriber::fmt::layer()
-            .compact()
-            .with_filter(env_filter)
-            .boxed(),
-        LogFormat::Json => tracing_subscriber::fmt::layer()
-            .json()
-            .with_filter(env_filter)
-            .boxed(),
-    };
+    let fmt_layer = console_fmt_layer(log_format, env_filter, ConsoleTextStyle::Compact);
 
     let subscriber = Registry::default().with(extra_layer).with(fmt_layer);
 
