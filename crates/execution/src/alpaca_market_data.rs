@@ -122,7 +122,6 @@ impl AlpacaMarketDataError {
             // credential) fail identically on every retry; the rest of a
             // mint is network-shaped.
             Self::Auth(error) if error.is_deterministic() => Permanence::Permanent,
-            Self::Auth(_) => Permanence::Transient,
 
             // A malformed response is deterministic for the response that
             // arrived and does not become usable by immediately parsing it
@@ -135,7 +134,8 @@ impl AlpacaMarketDataError {
             // Transport failures can clear, and syntactically valid latest
             // quotes are dynamic snapshots: a later request can carry a
             // complete, positive, uncrossed book even when this one did not.
-            Self::Http(_)
+            Self::Auth(_)
+            | Self::Http(_)
             | Self::LatestQuoteSymbolMismatch { .. }
             | Self::MissingQuote { .. }
             | Self::MissingBid { .. }
@@ -303,7 +303,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca_broker_api::{
-        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaBrokerAuth,
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaBrokerAuth, TimeInForce,
     };
 
     fn mock_client(server: &MockServer) -> AlpacaBrokerApiClient {
@@ -317,7 +317,7 @@ mod tests {
                 .unwrap(),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: Duration::from_secs(3600),
-            time_in_force: Default::default(),
+            time_in_force: TimeInForce::default(),
             counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         })
         .unwrap()

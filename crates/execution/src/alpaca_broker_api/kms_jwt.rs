@@ -133,11 +133,13 @@ impl KmsJwtError {
     }
 }
 
-/// Signs client assertions with Cloud KMS and exchanges them for cached
-/// bearer tokens. Shared behind an `Arc` so every clone of one client
-/// reuses that client's token cache. (Each client builds its own
-/// runtime today, so a process runs one cache per client; Alpaca
-/// accepts concurrent tokens per client_id, observed live 2026-08-25.)
+/// Signs client assertions with Cloud KMS and exchanges them for
+/// cached bearer tokens.
+///
+/// Shared behind an `Arc` so every clone of one client reuses that
+/// client's token cache. (Each client builds its own runtime today, so
+/// a process runs one cache per client; Alpaca accepts concurrent
+/// tokens per client_id, observed live 2026-08-25.)
 pub struct KmsJwtAuth {
     client_id: String,
     /// Full KMS key-version resource name
@@ -257,16 +259,15 @@ impl KmsJwtAuth {
             return Ok(token);
         }
 
-        let _minting = match self.mint_lock.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                // A mint is in flight. Only wait for it if the cached
-                // token is unusable.
-                if let Some(token) = self.cached_before(|tok| tok.hard_expiry) {
-                    return Ok(token);
-                }
-                self.mint_lock.lock().await
+        let _minting = if let Ok(guard) = self.mint_lock.try_lock() {
+            guard
+        } else {
+            // A mint is in flight. Only wait for it if the cached token
+            // is unusable.
+            if let Some(token) = self.cached_before(|tok| tok.hard_expiry) {
+                return Ok(token);
             }
+            self.mint_lock.lock().await
         };
         // Whoever held the lock before us may have refreshed already.
         if let Some(token) = self.cached_before(|tok| tok.refresh_after) {
@@ -445,10 +446,11 @@ mod tests {
 
     // SEQUENCE of two INTEGERs, DER-style.
     fn der(r_int: &[u8], s_int: &[u8]) -> Vec<u8> {
-        let mut out = vec![0x30, (4 + r_int.len() + s_int.len()) as u8];
+        let total = u8::try_from(4 + r_int.len() + s_int.len()).unwrap();
+        let mut out = vec![0x30, total];
         for int in [r_int, s_int] {
             out.push(0x02);
-            out.push(int.len() as u8);
+            out.push(u8::try_from(int.len()).unwrap());
             out.extend_from_slice(int);
         }
         out
@@ -557,14 +559,14 @@ mod tests {
         // hard expiry: a failing refresh must fall back to it.
         *auth.cached.lock().unwrap() = Some(CachedToken {
             access_token: "seeded".into(),
-            refresh_after: Instant::now() - Duration::from_secs(1),
+            refresh_after: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
             hard_expiry: Instant::now() + Duration::from_secs(60),
         });
         assert_eq!(auth.access_token().await.unwrap(), "seeded");
 
         // Past the hard expiry the failure must surface instead.
         auth.cached.lock().unwrap().as_mut().unwrap().hard_expiry =
-            Instant::now() - Duration::from_secs(1);
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
         assert!(matches!(
             auth.access_token().await,
             Err(KmsJwtError::TokenStatus { status: 500, .. })
@@ -587,8 +589,8 @@ pub enum AuthRuntime {
 }
 
 impl AuthRuntime {
-    pub fn build(auth: &AlpacaBrokerAuth) -> Result<Self, KmsJwtError> {
-        match auth {
+    pub fn build(auth: AlpacaBrokerAuth) -> Result<Self, KmsJwtError> {
+        match &auth {
             AlpacaBrokerAuth::Basic {
                 api_key,
                 api_secret,

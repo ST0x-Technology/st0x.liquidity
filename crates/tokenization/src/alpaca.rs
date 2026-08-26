@@ -611,7 +611,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             http_client: Client::new(),
             base_url,
             account_id,
-            auth: AuthRuntime::build(&auth)?,
+            auth: AuthRuntime::build(auth)?,
             wallet,
             network,
             redemption_wallet,

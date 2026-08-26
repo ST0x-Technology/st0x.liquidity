@@ -132,7 +132,7 @@ impl AlpacaWalletClient {
             client: Client::new(),
             account_id,
             base_url,
-            auth: AuthRuntime::build(&auth)?,
+            auth: AuthRuntime::build(auth)?,
         })
     }
 
