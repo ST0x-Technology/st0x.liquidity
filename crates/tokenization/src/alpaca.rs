@@ -542,6 +542,7 @@ impl AlpacaTokenizationError {
 
             Self::ApiError { .. }
             | Self::Reqwest(_)
+            | Self::Auth(_)
             | Self::JsonParse(_)
             | Self::Utf8(_)
             | Self::InsufficientPosition { .. }
