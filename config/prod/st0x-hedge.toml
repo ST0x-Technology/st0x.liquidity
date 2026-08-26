@@ -53,6 +53,11 @@ orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 inventory_mode = "managed"
 # Operator addresses that attribute inventory settlements to venues.
 inventory_adapters = [
+  # NAV-asserting hook (live at cutover, st0x.bebop#85). Both hooks stay
+  # mapped until the old one is drained and its OPERATOR_ROLE revoked —
+  # a fill through either must attribute to Bebop or it will not hedge.
+  { venue = "bebop", operator = "0x7BDEa3bA0101E06Cbb7f12500ed12eF046148A03" },
+  # Pre-NAV hook, being retired.
   { venue = "bebop", operator = "0x3EE87Dcabfb324B2231044928080Dd4E6AC19baE" },
 ]
 inventory = "0x10e4db39275C3b128C01bA1194D45D19aE1520d9"
