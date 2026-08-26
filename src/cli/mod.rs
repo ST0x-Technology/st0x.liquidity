@@ -2029,7 +2029,7 @@ mod tests {
 
     use st0x_config::ExecutionThreshold;
     use st0x_config::create_test_issuance_ctx;
-    use st0x_config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
+    use st0x_config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogFormat, LogLevel, TradingMode};
     use st0x_config::{EvmCtx, IngestionCutoff, InventoryAdapters, InventoryMode};
     use st0x_event_sorcery::StoreBuilder;
     use st0x_float_macro::float;
@@ -2051,6 +2051,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             log_dir: None,
+            log_format: LogFormat::Text,
             server_port: 8080,
             board_port: 8081,
             evm: EvmCtx {

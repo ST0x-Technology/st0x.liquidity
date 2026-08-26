@@ -1,6 +1,9 @@
 server_port = 8080
 board_port = 8081
 log_level = "debug"
+# Console log output format: "text" (human readable, the default) or "json"
+# (one JSON object per line, for log shippers reading journald).
+log_format = "text"
 database_url = ":memory:"
 apalis_finished_job_cleanup_interval_secs = 3600
 # Consecutive offchain polls that must diverge from the inventory view's

@@ -52,6 +52,7 @@ url.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]
+parking_lot.workspace = true
 proptest.workspace = true
 serde_json.workspace = true
 st0x-evm = { workspace = true, features = ["test-support"] }
