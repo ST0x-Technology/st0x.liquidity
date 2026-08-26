@@ -142,6 +142,17 @@ impl AlpacaBrokerApiMode {
             Self::Mock(url) => url,
         }
     }
+
+    /// The authx token endpoint JWT-variant credentials mint at,
+    /// split by mode like every other Alpaca host.
+    pub(super) fn token_url(&self) -> String {
+        match self {
+            Self::Sandbox => super::kms_jwt::ALPACA_SANDBOX_TOKEN_URL.to_string(),
+            Self::Production => super::kms_jwt::ALPACA_TOKEN_URL.to_string(),
+            #[cfg(any(test, feature = "mock"))]
+            Self::Mock(url) => format!("{url}/v1/oauth2/token"),
+        }
+    }
 }
 
 /// How the broker (and market-data) clients authenticate to Alpaca.
@@ -166,6 +177,19 @@ pub enum AlpacaBrokerAuth {
         /// (`projects/.../cryptoKeyVersions/N`).
         kms_key_version: String,
     },
+    /// The same RFC 7523 client-assertion flow as `KmsJwt`, but signed
+    /// with a locally held EC P-256 private key — the BrokerDash
+    /// `private_key_jwt` export. For operator/CLI use (e.g. the sandbox
+    /// demo) where no KMS key or IAM grant exists; the deployed bot
+    /// stays keyless on `KmsJwt`.
+    PrivateKeyJwt {
+        /// BrokerDash credential client id (not a secret).
+        client_id: String,
+        /// The credential's EC P-256 private key, PEM-encoded. SEC1
+        /// (`BEGIN EC PRIVATE KEY`) and PKCS#8 (`BEGIN PRIVATE KEY`)
+        /// are both accepted.
+        private_key_pem: String,
+    },
 }
 
 impl std::fmt::Debug for AlpacaBrokerAuth {
@@ -183,6 +207,11 @@ impl std::fmt::Debug for AlpacaBrokerAuth {
                 .debug_struct("KmsJwt")
                 .field("client_id", client_id)
                 .field("kms_key_version", kms_key_version)
+                .finish(),
+            Self::PrivateKeyJwt { client_id, .. } => f
+                .debug_struct("PrivateKeyJwt")
+                .field("client_id", client_id)
+                .field("private_key_pem", &"[REDACTED]")
                 .finish(),
         }
     }
@@ -431,6 +460,64 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(parsed, AlpacaBrokerAuth::KmsJwt { .. }));
+    }
+
+    #[test]
+    fn private_key_jwt_auth_deserializes_from_flattened_fields() {
+        // The untagged auth enum picks the variant from field names alone:
+        // client_id + private_key_pem selects PrivateKeyJwt.
+        let ctx: AlpacaBrokerApiCtx = serde_json::from_str(
+            r#"{
+                "client_id": "CKLOCAL",
+                "private_key_pem": "-----BEGIN EC PRIVATE KEY-----\nfixture\n-----END EC PRIVATE KEY-----",
+                "account_id": "904837e3-3b76-47ec-b432-046db621571b",
+                "mode": "sandbox",
+                "counter_trade_slippage_bps": 100
+            }"#,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                ctx.auth,
+                crate::AlpacaBrokerAuth::PrivateKeyJwt { ref client_id, .. }
+                    if client_id == "CKLOCAL"
+            ),
+            "expected PrivateKeyJwt, got {:?}",
+            ctx.auth
+        );
+    }
+
+    #[test]
+    fn private_key_jwt_debug_redacts_the_key() {
+        let auth = crate::AlpacaBrokerAuth::PrivateKeyJwt {
+            client_id: "CKLOCAL".to_string(),
+            private_key_pem:
+                "-----BEGIN EC PRIVATE KEY-----\nsupersecret\n-----END EC PRIVATE KEY-----"
+                    .to_string(),
+        };
+
+        let debug_output = format!("{auth:?}");
+
+        assert!(debug_output.contains("CKLOCAL"));
+        assert!(debug_output.contains("[REDACTED]"));
+        assert!(!debug_output.contains("supersecret"));
+    }
+
+    #[test]
+    fn token_url_splits_by_mode() {
+        assert_eq!(
+            AlpacaBrokerApiMode::Production.token_url(),
+            "https://authx.alpaca.markets/v1/oauth2/token"
+        );
+        assert_eq!(
+            AlpacaBrokerApiMode::Sandbox.token_url(),
+            "https://authx.sandbox.alpaca.markets/v1/oauth2/token"
+        );
+        assert_eq!(
+            AlpacaBrokerApiMode::Mock("http://127.0.0.1:9".to_string()).token_url(),
+            "http://127.0.0.1:9/v1/oauth2/token"
+        );
     }
 
     #[test]

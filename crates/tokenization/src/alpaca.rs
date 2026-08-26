@@ -43,8 +43,9 @@ use st0x_evm::{
     OpenChainErrorRegistry, Wallet, wait_for_node_sync,
 };
 use st0x_execution::{
-    AlpacaAccountId, AlpacaBrokerAuth, AuthRuntime, Backpressure, FractionalShares, KmsJwtError,
-    Network, PollingConfig, Symbol, retry_after_from_response_headers,
+    ALPACA_TOKEN_URL, AlpacaAccountId, AlpacaBrokerAuth, AuthRuntime, Backpressure,
+    FractionalShares, KmsJwtError, Network, PollingConfig, Symbol,
+    retry_after_from_response_headers,
 };
 use st0x_wrapper::UnwrappedToken;
 
@@ -447,6 +448,13 @@ pub enum AlpacaTokenizationError {
     #[error("tokenization auth failed: {0}")]
     Auth(#[from] KmsJwtError),
 
+    #[error(
+        "private_key_jwt credentials are not supported for tokenization yet: the tokenization \
+         client mints at the production token endpoint only, so a sandbox credential would fail \
+         with a misleading production 401 -- use basic or kms-jwt credentials"
+    )]
+    PrivateKeyJwtUnsupported,
+
     #[error("Failed to parse API response: {0}")]
     JsonParse(#[from] serde_json::Error),
 
@@ -580,6 +588,7 @@ impl AlpacaTokenizationError {
             | Self::InsecureBaseUrl
             | Self::WrongNetwork { .. }
             | Self::NetworkMissing { .. }
+            | Self::PrivateKeyJwtUnsupported
             | Self::Evm(_)
             | Self::PollTimeout { .. }
             | Self::MissingRedemptionWallet => false,
@@ -622,6 +631,7 @@ impl AlpacaTokenizationError {
             Self::ApiError { .. }
             | Self::Reqwest(_)
             | Self::Auth(_)
+            | Self::PrivateKeyJwtUnsupported
             | Self::JsonParse(_)
             | Self::Utf8(_)
             | Self::InsufficientPosition { .. }
@@ -727,6 +737,19 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
     ) -> Result<Self, AlpacaTokenizationError> {
         validate_credentialed_base_url(&base_url)?;
 
+        // Tokenization carries a raw base_url with no mode, so JWT
+        // credentials mint at the live authx endpoint. Basic and KmsJwt
+        // are production-only by construction; a private_key_jwt
+        // credential can belong to the sandbox, and minting it at the
+        // production authx answers a misleading 401 -- reject it here
+        // until the token URL is threaded from a mode-aware caller.
+        match &auth {
+            AlpacaBrokerAuth::PrivateKeyJwt { .. } => {
+                return Err(AlpacaTokenizationError::PrivateKeyJwtUnsupported);
+            }
+            AlpacaBrokerAuth::Basic { .. } | AlpacaBrokerAuth::KmsJwt { .. } => {}
+        }
+
         Ok(Self {
             http_client: Client::builder()
                 .redirect(Policy::none())
@@ -735,7 +758,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
                 .build()?,
             base_url,
             account_id,
-            auth: AuthRuntime::build(auth)?,
+            auth: AuthRuntime::build(auth, ALPACA_TOKEN_URL)?,
             wallet,
             chain,
             redemption_wallet,
@@ -1491,6 +1514,36 @@ pub(crate) mod tests {
             result,
             Err(AlpacaTokenizationError::InsecureBaseUrl)
         ));
+    }
+
+    #[tokio::test]
+    async fn private_key_jwt_is_rejected_at_construction() {
+        // The tokenization client mints at the production token endpoint
+        // only. A private_key_jwt credential can belong to the sandbox,
+        // so accepting it here would mint at the wrong authx and fail
+        // with a misleading production 401. Fail at construction instead.
+        let (_anvil, endpoint, key) = setup_anvil();
+        let provider = ProviderBuilder::new().connect(&endpoint).await.unwrap();
+        let wallet = RawPrivateKeyWallet::new(&key, provider, 1).unwrap();
+
+        let Err(error) = AlpacaTokenizationClient::new(
+            "https://broker-api.sandbox.alpaca.markets".to_string(),
+            TEST_ACCOUNT_ID,
+            AlpacaBrokerAuth::PrivateKeyJwt {
+                client_id: "test-client".to_string(),
+                private_key_pem: "irrelevant".to_string(),
+            },
+            wallet,
+            Chain::Base,
+            None,
+        ) else {
+            panic!("private_key_jwt construction must fail");
+        };
+
+        assert!(
+            matches!(error, AlpacaTokenizationError::PrivateKeyJwtUnsupported),
+            "expected PrivateKeyJwtUnsupported, got {error:?}"
+        );
     }
 
     fn create_test_service(
