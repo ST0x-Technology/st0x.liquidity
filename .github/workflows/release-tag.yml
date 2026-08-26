@@ -1,51 +1,27 @@
 name: release-tag
 
 # Promote-on-tag, the org-standard release flow (settled in
-# st0x.liquidity#1289): "steady master -> push a vX.Y.Z tag -> the tagged
-# artifact exists". Pushing a release tag LABELS the images master CI
-# already built and attested for that commit — it does not build, does not
-# deploy, and cannot touch any manifest or environment. The verify-then-
-# label logic is inherited from ST0x-Technology/.github (release-label
-# composite action); the identity below is minted by t0.devops
-# production-artifacts (modules/ar-labeler): a dedicated labeler SA whose
-# custom role can create/update AR tags and read images but structurally
-# cannot push. The version tag is consumed by t0.devops' images-version.yml
-# guard, which refuses a production manifest whose `version:` does not
-# resolve to the pinned digest(s), and by the GitHub release the action cuts.
+# st0x.liquidity#1289): pushing git tag vX.Y.Z labels the images master
+# CI already built and attested for that commit, then cuts the GitHub
+# release. It does not build and does not deploy. The full contract
+# (refusals, idempotence, prerequisites) lives in the reusable workflow
+# below; the identity is minted by t0.devops production-artifacts
+# (modules/ar-labeler). Only the values in `with:` are this repo's own.
 
 on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
 
-permissions:
-  id-token: write
-  # write: the action cuts the GitHub release for the tag.
-  contents: write
-
 jobs:
   label:
-    runs-on: ubuntu-latest
-    steps:
-      # The action peels annotated tags itself (actions/runner#712), but
-      # needs the checkout to do it.
-      - uses: actions/checkout@v4
-
-      - id: auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
-        with:
-          workload_identity_provider: projects/684788085322/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
-          service_account: liquidity-labeler@t0-artifacts.iam.gserviceaccount.com
-
-      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f  # v2
-        with:
-          # attestation listing lives in the beta component.
-          install_components: beta
-
-      - uses: ST0x-Technology/.github/release-label@main
-        env:
-          GH_TOKEN: ${{ github.token }}
-        with:
-          ar_repo: europe-west3-docker.pkg.dev/t0-artifacts/t0-liquidity
-          images: t0-liquidity t0-liquidity-dashboard t0-liquidity-datasette
-          attestor: projects/t0-artifacts/attestors/liquidity-image
+    permissions:
+      id-token: write
+      # write: release-label cuts the GitHub release for the tag.
+      contents: write
+    uses: ST0x-Technology/.github/.github/workflows/release-label.yml@abdcdba03715f9165c8562d8060a8e4c17ab7cc8 # release-label, bump via PR
+    with:
+      service_account: liquidity-labeler@t0-artifacts.iam.gserviceaccount.com
+      ar_repo: europe-west3-docker.pkg.dev/t0-artifacts/t0-liquidity
+      images: t0-liquidity t0-liquidity-dashboard t0-liquidity-datasette
+      attestor: projects/t0-artifacts/attestors/liquidity-image
