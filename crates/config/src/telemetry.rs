@@ -30,7 +30,7 @@ use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::{EnvFilter, Registry};
 use url::Url;
 
-use crate::LogLevel;
+use crate::{LogFormat, LogLevel};
 
 /// Retain one week of daily log files. Older files are pruned automatically as
 /// new ones roll, bounding on-disk log growth so a long-running deployment
@@ -48,6 +48,44 @@ fn build_log_file_appender(dir: &str) -> Result<RollingFileAppender, InitError> 
         .filename_prefix("st0x-hedge.log")
         .max_log_files(LOG_RETENTION_DAYS)
         .build(dir)
+}
+
+/// Console text rendering for [`console_fmt_layer`]. The telemetry-enabled
+/// subscriber renders full text; the file and console-only subscribers render
+/// compact text. Carried as a type so the deliberate difference is visible at
+/// the call sites instead of inferred from duplicated `match` blocks.
+#[derive(Clone, Copy)]
+enum ConsoleTextStyle {
+    Compact,
+    Full,
+}
+
+/// Build the console fmt layer for `log_format`. The JSON arm is the single
+/// place the console JSON wire shape is defined, byte-identical to the rolling
+/// file layer, so every subscriber emits one JSON shape.
+fn console_fmt_layer<S>(
+    log_format: LogFormat,
+    env_filter: EnvFilter,
+    style: ConsoleTextStyle,
+) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    match log_format {
+        LogFormat::Json => tracing_subscriber::fmt::layer()
+            .json()
+            .with_filter(env_filter)
+            .boxed(),
+        LogFormat::Text => match style {
+            ConsoleTextStyle::Compact => tracing_subscriber::fmt::layer()
+                .compact()
+                .with_filter(env_filter)
+                .boxed(),
+            ConsoleTextStyle::Full => tracing_subscriber::fmt::layer()
+                .with_filter(env_filter)
+                .boxed(),
+        },
+    }
 }
 
 /// Build the OTel [`Resource`] shared by the trace and log providers. Carries
@@ -109,6 +147,7 @@ impl TelemetryCtx {
     pub fn setup(
         &self,
         log_level: tracing::Level,
+        log_format: LogFormat,
         log_dir: Option<&str>,
         extra_layer: Option<ExtraLayer>,
     ) -> Result<(Option<FileLogGuard>, TelemetryGuard), TelemetryError> {
@@ -183,7 +222,8 @@ impl TelemetryCtx {
         let otel_log_layer = OpenTelemetryTracingBridge::new(&logger_provider)
             .with_filter(mk_crate_filter(log_level));
 
-        let fmt_layer = tracing_subscriber::fmt::layer().with_filter(mk_env_filter(log_level));
+        let fmt_layer =
+            console_fmt_layer(log_format, mk_env_filter(log_level), ConsoleTextStyle::Full);
 
         let file_appender = log_dir.and_then(|dir| match build_log_file_appender(dir) {
             Ok(appender) => Some(appender),
@@ -306,6 +346,7 @@ pub type ExtraLayer =
 
 pub fn setup_tracing(
     log_level: &LogLevel,
+    log_format: LogFormat,
     log_dir: Option<&str>,
     extra_layer: Option<ExtraLayer>,
 ) -> Option<FileLogGuard> {
@@ -313,7 +354,7 @@ pub fn setup_tracing(
     let env_filter = mk_env_filter(level);
 
     let Some(dir) = log_dir else {
-        install_console_only_subscriber(extra_layer, env_filter);
+        install_console_only_subscriber(log_format, extra_layer, env_filter);
         return None;
     };
 
@@ -324,7 +365,7 @@ pub fn setup_tracing(
             // logging: degrade to console-only so the operator still sees
             // output (and this error) instead of a silent process.
             eprintln!("Failed to build rolling file appender, using console only: {error}");
-            install_console_only_subscriber(extra_layer, env_filter);
+            install_console_only_subscriber(log_format, extra_layer, env_filter);
             return None;
         }
     };
@@ -336,9 +377,7 @@ pub fn setup_tracing(
         .with_writer(non_blocking)
         .with_filter(mk_crate_filter(level));
 
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .compact()
-        .with_filter(env_filter);
+    let fmt_layer = console_fmt_layer(log_format, env_filter, ConsoleTextStyle::Compact);
 
     let subscriber = Registry::default()
         .with(extra_layer)
@@ -358,10 +397,12 @@ pub fn setup_tracing(
 /// Used both when no log directory is configured and as a fallback when the
 /// rolling file appender fails to build, so a missing/unwritable log directory
 /// degrades to console logging rather than disabling logging entirely.
-fn install_console_only_subscriber(extra_layer: Option<ExtraLayer>, env_filter: EnvFilter) {
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .compact()
-        .with_filter(env_filter);
+fn install_console_only_subscriber(
+    log_format: LogFormat,
+    extra_layer: Option<ExtraLayer>,
+    env_filter: EnvFilter,
+) {
+    let fmt_layer = console_fmt_layer(log_format, env_filter, ConsoleTextStyle::Compact);
 
     let subscriber = Registry::default().with(extra_layer).with(fmt_layer);
 
@@ -429,6 +470,61 @@ mod tests {
 
     use super::*;
 
+    /// Captures everything written through a subscriber layer so tests can
+    /// assert on the emitted bytes.
+    #[derive(Clone, Default)]
+    struct SharedWriter(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Pins the JSON console wire shape a log shipper parses: one JSON object
+    /// per line carrying `timestamp`, `level`, `target`, the event fields
+    /// under `fields`, and span fields under `span` -- the same shape as the
+    /// rolling file layer. A tracing-subscriber upgrade that changes this
+    /// shape must fail here, not in the shipper.
+    #[test]
+    fn json_console_layer_emits_one_parseable_object_per_line() {
+        let writer = SharedWriter::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(writer.clone());
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("recheck", aggregate_id = "abc-123");
+            let _entered = span.enter();
+            tracing::info!(target: "rebalance", "json shape pin");
+        });
+
+        let bytes = writer.0.lock().clone();
+        let output = std::str::from_utf8(&bytes).unwrap();
+        let line = output.lines().next().expect("one log line was emitted");
+
+        let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(entry["timestamp"].is_string(), "missing timestamp: {entry}");
+        assert_eq!(entry["level"], "INFO");
+        assert_eq!(entry["target"], "rebalance");
+        assert_eq!(entry["fields"]["message"], "json shape pin");
+        assert_eq!(entry["span"]["aggregate_id"], "abc-123");
+    }
+
     #[test]
     fn build_log_file_appender_writes_to_prefixed_file() {
         let dir = tempdir().unwrap();
@@ -475,7 +571,12 @@ mod tests {
         let file = NamedTempFile::new().unwrap();
         let uncreatable_dir = file.path().join("nested");
 
-        let file_guard = setup_tracing(&LogLevel::Info, uncreatable_dir.to_str(), None);
+        let file_guard = setup_tracing(
+            &LogLevel::Info,
+            LogFormat::Text,
+            uncreatable_dir.to_str(),
+            None,
+        );
 
         assert!(
             file_guard.is_none(),
@@ -560,7 +661,12 @@ mod tests {
         };
 
         let (file_guard, _telemetry_guard) = ctx
-            .setup(tracing::Level::INFO, uncreatable_dir.to_str(), None)
+            .setup(
+                tracing::Level::INFO,
+                LogFormat::Text,
+                uncreatable_dir.to_str(),
+                None,
+            )
             .unwrap();
 
         assert!(

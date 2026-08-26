@@ -1814,8 +1814,8 @@ mod tests {
     use st0x_config::RebalancingCtx;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
-        AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, LogLevel, OperationMode,
-        TradingMode,
+        AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, LogFormat, LogLevel,
+        OperationMode, TradingMode,
     };
     use st0x_config::{EvmCtx, IngestionCutoff, InventoryAdapters, InventoryMode};
     use st0x_event_sorcery::LifecycleError;
@@ -2223,6 +2223,8 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             log_dir: None,
+            log_format: LogFormat::Text,
+            log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
             evm: EvmCtx {
@@ -2303,6 +2305,8 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             log_dir: None,
+            log_format: LogFormat::Text,
+            log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
             evm: EvmCtx {

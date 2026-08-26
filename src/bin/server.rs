@@ -13,6 +13,7 @@ async fn main() -> anyhow::Result<()> {
     let (_file_log_guard, telemetry_guard) = if let Some(ref telemetry) = ctx.telemetry {
         match telemetry.setup(
             log_level,
+            ctx.log_format,
             ctx.log_dir.as_deref(),
             Some(apalis_board_tracing_layer(log_level)),
         ) {
@@ -21,6 +22,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("Failed to setup telemetry: {error}");
                 let file_guard = setup_tracing(
                     &ctx.log_level,
+                    ctx.log_format,
                     ctx.log_dir.as_deref(),
                     Some(apalis_board_tracing_layer(log_level)),
                 );
@@ -30,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         let file_guard = setup_tracing(
             &ctx.log_level,
+            ctx.log_format,
             ctx.log_dir.as_deref(),
             Some(apalis_board_tracing_layer(log_level)),
         );

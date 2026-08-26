@@ -1068,6 +1068,15 @@ enum SimpleCommand {
     PortfolioSnapshot {
         command: PortfolioSnapshotRecoveryCommand,
     },
+    Transfer {
+        command: TransferRecoveryCommand,
+    },
+}
+
+/// Transfer-family recovery commands, routed as one group to
+/// [`run_transfer_command`] so its dispatch stays exhaustive: adding a
+/// variant here forces an arm there.
+enum TransferRecoveryCommand {
     FailTransfer {
         transfer_type: TransferType,
         id: String,
@@ -1473,9 +1482,9 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::OrderStatus { order_id } => Ok(SimpleCommand::OrderStatus { order_id }),
         Commands::Position { command } => Ok(SimpleCommand::Position { command }),
         Commands::PortfolioSnapshot { command } => Ok(SimpleCommand::PortfolioSnapshot { command }),
-        Commands::FailUsdcTransfer { id, reason } => {
-            Ok(SimpleCommand::FailUsdcTransfer { id, reason })
-        }
+        Commands::FailUsdcTransfer { id, reason } => Ok(SimpleCommand::Transfer {
+            command: TransferRecoveryCommand::FailUsdcTransfer { id, reason },
+        }),
         Commands::Transfer { command } => match command {
             // `--kind equity` resumes all interrupted equity transfers via the bot
             // REST API. `--kind usdc` re-drives a single USDC transfer; `id` and
@@ -1483,7 +1492,9 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             TransferCommand::Resume {
                 kind: TransferResumeKind::Equity,
                 ..
-            } => Ok(SimpleCommand::ResumeInterruptedTransfers),
+            } => Ok(SimpleCommand::Transfer {
+                command: TransferRecoveryCommand::ResumeInterruptedTransfers,
+            }),
             TransferCommand::Resume {
                 kind: TransferResumeKind::Usdc,
                 id: Some(id),
@@ -1504,26 +1515,36 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             // parsed and validated in the handler so a bad value surfaces a clear
             // operator error rather than a panic here.
             TransferCommand::Reconcile { kind, id, reason } => match kind {
-                ReconcileKind::Usdc => Ok(SimpleCommand::ReconcileUsdcTransfer { id, reason }),
-                ReconcileKind::Mint => Ok(SimpleCommand::ReconcileEquityTransfer {
-                    transfer_type: TransferType::Mint,
-                    id,
-                    reason,
+                ReconcileKind::Usdc => Ok(SimpleCommand::Transfer {
+                    command: TransferRecoveryCommand::ReconcileUsdcTransfer { id, reason },
                 }),
-                ReconcileKind::Redemption => Ok(SimpleCommand::ReconcileEquityTransfer {
-                    transfer_type: TransferType::Redemption,
-                    id,
-                    reason,
+                ReconcileKind::Mint => Ok(SimpleCommand::Transfer {
+                    command: TransferRecoveryCommand::ReconcileEquityTransfer {
+                        transfer_type: TransferType::Mint,
+                        id,
+                        reason,
+                    },
+                }),
+                ReconcileKind::Redemption => Ok(SimpleCommand::Transfer {
+                    command: TransferRecoveryCommand::ReconcileEquityTransfer {
+                        transfer_type: TransferType::Redemption,
+                        id,
+                        reason,
+                    },
                 }),
             },
-            TransferCommand::Fail { kind, id, reason } => Ok(SimpleCommand::FailTransfer {
-                transfer_type: kind,
-                id,
-                reason,
+            TransferCommand::Fail { kind, id, reason } => Ok(SimpleCommand::Transfer {
+                command: TransferRecoveryCommand::FailTransfer {
+                    transfer_type: kind,
+                    id,
+                    reason,
+                },
             }),
-            TransferCommand::Recheck { kind, id } => Ok(SimpleCommand::RecheckTransfer {
-                transfer_type: kind,
-                id,
+            TransferCommand::Recheck { kind, id } => Ok(SimpleCommand::Transfer {
+                command: TransferRecoveryCommand::RecheckTransfer {
+                    transfer_type: kind,
+                    id,
+                },
             }),
         },
         Commands::View { command } => match command {
@@ -1540,9 +1561,9 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
                 source_chain,
             }),
         },
-        Commands::ClearPendingBurn { id, reason } => {
-            Ok(SimpleCommand::ClearPendingBurn { id, reason })
-        }
+        Commands::ClearPendingBurn { id, reason } => Ok(SimpleCommand::Transfer {
+            command: TransferRecoveryCommand::ClearPendingBurn { id, reason },
+        }),
     }
 }
 
@@ -1706,41 +1727,98 @@ async fn run_simple_command<W: Write>(
         SimpleCommand::PortfolioSnapshot { command } => {
             repair::set_portfolio_snapshot_mark_command(stdout, pool, command, ctx).await
         }
-        SimpleCommand::FailTransfer {
+        SimpleCommand::Transfer { command } => {
+            run_transfer_command(command, ctx, pool, stdout).await
+        }
+    }
+}
+
+/// Runs the transfer-family commands routed here as one group by
+/// [`run_simple_command`]; the id-bearing ones print the configured log query
+/// link, `ResumeInterruptedTransfers` names no id and prints none.
+async fn run_transfer_command<W: Write>(
+    command: TransferRecoveryCommand,
+    ctx: &Ctx,
+    pool: &SqlitePool,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    match command {
+        TransferRecoveryCommand::FailTransfer {
             transfer_type,
             id,
             reason,
-        } => rebalancing::fail_transfer_command(stdout, pool, transfer_type, &id, &reason).await,
-        SimpleCommand::RecheckTransfer { transfer_type, id } => {
-            rebalancing::recheck_transfer_command(stdout, transfer_type, &id, ctx).await
+        } => {
+            let result =
+                rebalancing::fail_transfer_command(stdout, pool, transfer_type, &id, &reason).await;
+            finish_with_log_query_url(stdout, ctx, &id, result)
         }
-        SimpleCommand::ResumeInterruptedTransfers => {
+        TransferRecoveryCommand::RecheckTransfer { transfer_type, id } => {
+            let result =
+                rebalancing::recheck_transfer_command(stdout, transfer_type, &id, ctx).await;
+            finish_with_log_query_url(stdout, ctx, &id, result)
+        }
+        TransferRecoveryCommand::ResumeInterruptedTransfers => {
             rebalancing::resume_interrupted_transfers_command(stdout, ctx).await
         }
-        SimpleCommand::ReconcileUsdcTransfer { id, reason } => {
+        TransferRecoveryCommand::ReconcileUsdcTransfer { id, reason } => {
             let id = id.parse::<Uuid>().map_err(|error| {
                 anyhow::anyhow!("transfer reconcile --kind usdc: invalid id {id:?}: {error}")
             })?;
             // `AuditReason` rejects blanks at the CLI boundary. This secondary
             // parse also constrains USDC reconciliation to its fixed vocabulary.
             let reason = parse_usdc_reconcile_reason(reason.as_ref())?;
-            rebalancing::reconcile_usdc_transfer_command(stdout, id, reason.into(), pool).await
+            let result =
+                rebalancing::reconcile_usdc_transfer_command(stdout, id, reason.into(), pool).await;
+            finish_with_log_query_url(stdout, ctx, &id.to_string(), result)
         }
-        SimpleCommand::FailUsdcTransfer { id, reason } => {
-            rebalancing::fail_usdc_transfer_command(stdout, id, &reason, pool).await
+        TransferRecoveryCommand::FailUsdcTransfer { id, reason } => {
+            let result = rebalancing::fail_usdc_transfer_command(stdout, id, &reason, pool).await;
+            finish_with_log_query_url(stdout, ctx, &id.to_string(), result)
         }
-        SimpleCommand::ReconcileEquityTransfer {
+        TransferRecoveryCommand::ReconcileEquityTransfer {
             transfer_type,
             id,
             reason,
         } => {
-            rebalancing::reconcile_equity_transfer_command(stdout, transfer_type, &id, reason, pool)
-                .await
+            let result = rebalancing::reconcile_equity_transfer_command(
+                stdout,
+                transfer_type,
+                &id,
+                reason,
+                pool,
+            )
+            .await;
+            finish_with_log_query_url(stdout, ctx, &id, result)
         }
-        SimpleCommand::ClearPendingBurn { id, reason } => {
-            rebalancing::clear_pending_burn_command(stdout, id, &reason, pool).await
+        TransferRecoveryCommand::ClearPendingBurn { id, reason } => {
+            let result = rebalancing::clear_pending_burn_command(stdout, id, &reason, pool).await;
+            finish_with_log_query_url(stdout, ctx, &id.to_string(), result)
         }
     }
+}
+
+/// Prints the log query link after a transfer command. The command's error
+/// wins when both it and the link write fail; a link write failure surfaces
+/// only for a command that succeeded.
+fn finish_with_log_query_url<W: Write>(
+    stdout: &mut W,
+    ctx: &Ctx,
+    id: &str,
+    result: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let link = write_log_query_url(stdout, ctx, id);
+    result.and(link)
+}
+
+/// Prints `log_query_url_template` with `{id}` substituted, after the command
+/// regardless of its outcome. `None` prints nothing.
+fn write_log_query_url<W: Write>(stdout: &mut W, ctx: &Ctx, id: &str) -> anyhow::Result<()> {
+    let Some(template) = &ctx.log_query_url_template else {
+        return Ok(());
+    };
+    let url = template.substitute(id);
+    writeln!(stdout, "Logs: {url}")?;
+    Ok(())
 }
 
 async fn rebuild_view<W: Write>(
@@ -2029,7 +2107,7 @@ mod tests {
 
     use st0x_config::ExecutionThreshold;
     use st0x_config::create_test_issuance_ctx;
-    use st0x_config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
+    use st0x_config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogFormat, LogLevel, TradingMode};
     use st0x_config::{EvmCtx, IngestionCutoff, InventoryAdapters, InventoryMode};
     use st0x_event_sorcery::StoreBuilder;
     use st0x_float_macro::float;
@@ -2051,6 +2129,8 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             log_dir: None,
+            log_format: LogFormat::Text,
+            log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
             evm: EvmCtx {
@@ -2096,6 +2176,63 @@ mod tests {
             bot_gas_valuation: None,
             orchestrator: None,
         }
+    }
+
+    /// The link is deployment config: no template prints nothing, a template
+    /// prints one line with `{id}` substituted verbatim.
+    #[test]
+    fn write_log_query_url_substitutes_id_and_skips_when_unset() {
+        let mut ctx = create_test_ctx();
+        let mut out = Vec::new();
+        write_log_query_url(&mut out, &ctx, "abc-123").unwrap();
+        assert!(out.is_empty(), "no template must print nothing");
+
+        ctx.log_query_url_template = Some(
+            st0x_config::LogQueryUrlTemplate::parse("https://logs.example/q?id={id}".to_string())
+                .unwrap(),
+        );
+        write_log_query_url(&mut out, &ctx, "abc-123").unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "Logs: https://logs.example/q?id=abc-123\n"
+        );
+    }
+
+    /// A writer that refuses every write, standing in for a closed stdout.
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("stdout closed"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The command's error must survive a failed link write; the link write
+    /// error surfaces only when the command succeeded.
+    #[test]
+    fn finish_with_log_query_url_keeps_the_command_error() {
+        let mut ctx = create_test_ctx();
+        ctx.log_query_url_template = Some(
+            st0x_config::LogQueryUrlTemplate::parse("https://logs.example/q?id={id}".to_string())
+                .unwrap(),
+        );
+
+        let command_error = finish_with_log_query_url(
+            &mut FailingWriter,
+            &ctx,
+            "abc",
+            Err(anyhow::anyhow!("command failed")),
+        )
+        .unwrap_err();
+        assert_eq!(command_error.to_string(), "command failed");
+
+        let link_error =
+            finish_with_log_query_url(&mut FailingWriter, &ctx, "abc", Ok(())).unwrap_err();
+        assert_eq!(link_error.to_string(), "stdout closed");
     }
 
     #[test]
@@ -2344,7 +2481,9 @@ mod tests {
         };
 
         match classify_command(command) {
-            Ok(SimpleCommand::FailUsdcTransfer { .. }) => {}
+            Ok(SimpleCommand::Transfer {
+                command: TransferRecoveryCommand::FailUsdcTransfer { .. },
+            }) => {}
             Ok(_) => panic!("expected fail-usdc-transfer simple command"),
             Err(
                 ProviderCommand::ProcessTx { .. }
@@ -2488,7 +2627,9 @@ mod tests {
         };
 
         match classify_command(command) {
-            Ok(SimpleCommand::ClearPendingBurn { .. }) => {}
+            Ok(SimpleCommand::Transfer {
+                command: TransferRecoveryCommand::ClearPendingBurn { .. },
+            }) => {}
             Ok(_) => panic!("expected clear-pending-burn simple command"),
             Err(
                 ProviderCommand::ProcessTx { .. }
@@ -3268,9 +3409,12 @@ mod tests {
         .unwrap();
 
         match classify_command(cli.command) {
-            Ok(SimpleCommand::ReconcileUsdcTransfer {
-                id: parsed_id,
-                reason,
+            Ok(SimpleCommand::Transfer {
+                command:
+                    TransferRecoveryCommand::ReconcileUsdcTransfer {
+                        id: parsed_id,
+                        reason,
+                    },
             }) => {
                 assert_eq!(parsed_id, id.to_string());
                 assert_eq!(reason.as_ref(), "deposit-credited-offline");
@@ -3295,10 +3439,13 @@ mod tests {
         .unwrap();
 
         match classify_command(cli.command) {
-            Ok(SimpleCommand::ReconcileEquityTransfer {
-                transfer_type,
-                id,
-                reason,
+            Ok(SimpleCommand::Transfer {
+                command:
+                    TransferRecoveryCommand::ReconcileEquityTransfer {
+                        transfer_type,
+                        id,
+                        reason,
+                    },
             }) => {
                 assert!(matches!(transfer_type, TransferType::Mint));
                 assert_eq!(id, "ISS001");
@@ -3324,10 +3471,13 @@ mod tests {
         .unwrap();
 
         match classify_command(cli.command) {
-            Ok(SimpleCommand::ReconcileEquityTransfer {
-                transfer_type,
-                id,
-                reason,
+            Ok(SimpleCommand::Transfer {
+                command:
+                    TransferRecoveryCommand::ReconcileEquityTransfer {
+                        transfer_type,
+                        id,
+                        reason,
+                    },
             }) => {
                 assert!(matches!(transfer_type, TransferType::Redemption));
                 assert_eq!(id, "RED-001");
@@ -3392,10 +3542,13 @@ mod tests {
         .unwrap();
 
         match classify_command(cli.command) {
-            Ok(SimpleCommand::FailTransfer {
-                transfer_type,
-                id,
-                reason,
+            Ok(SimpleCommand::Transfer {
+                command:
+                    TransferRecoveryCommand::FailTransfer {
+                        transfer_type,
+                        id,
+                        reason,
+                    },
             }) => {
                 assert!(matches!(transfer_type, TransferType::Mint));
                 assert_eq!(id, "ISS001");
@@ -3419,7 +3572,9 @@ mod tests {
         .unwrap();
 
         match classify_command(cli.command) {
-            Ok(SimpleCommand::RecheckTransfer { transfer_type, id }) => {
+            Ok(SimpleCommand::Transfer {
+                command: TransferRecoveryCommand::RecheckTransfer { transfer_type, id },
+            }) => {
                 assert!(matches!(transfer_type, TransferType::Redemption));
                 assert_eq!(id, "redemption-1");
             }
@@ -3588,7 +3743,9 @@ mod tests {
         validate_command(&clean.command).unwrap();
         assert!(matches!(
             classify_command(clean.command),
-            Ok(SimpleCommand::ResumeInterruptedTransfers)
+            Ok(SimpleCommand::Transfer {
+                command: TransferRecoveryCommand::ResumeInterruptedTransfers
+            })
         ));
     }
 
@@ -3659,7 +3816,9 @@ mod tests {
         ])
         .unwrap();
         match classify_command(long.command) {
-            Ok(SimpleCommand::FailTransfer { transfer_type, .. }) => {
+            Ok(SimpleCommand::Transfer {
+                command: TransferRecoveryCommand::FailTransfer { transfer_type, .. },
+            }) => {
                 assert!(matches!(transfer_type, TransferType::Mint));
             }
             _ => panic!("expected transfer fail simple command via --type"),
@@ -3670,7 +3829,9 @@ mod tests {
         ])
         .unwrap();
         match classify_command(short.command) {
-            Ok(SimpleCommand::FailTransfer { transfer_type, .. }) => {
+            Ok(SimpleCommand::Transfer {
+                command: TransferRecoveryCommand::FailTransfer { transfer_type, .. },
+            }) => {
                 assert!(matches!(transfer_type, TransferType::Mint));
             }
             _ => panic!("expected transfer fail simple command via -t"),
@@ -3693,7 +3854,9 @@ mod tests {
         ])
         .unwrap();
         match classify_command(long.command) {
-            Ok(SimpleCommand::RecheckTransfer { transfer_type, .. }) => {
+            Ok(SimpleCommand::Transfer {
+                command: TransferRecoveryCommand::RecheckTransfer { transfer_type, .. },
+            }) => {
                 assert!(matches!(transfer_type, TransferType::Redemption));
             }
             _ => panic!("expected transfer recheck simple command via --type"),
@@ -3710,7 +3873,9 @@ mod tests {
         ])
         .unwrap();
         match classify_command(short.command) {
-            Ok(SimpleCommand::RecheckTransfer { transfer_type, .. }) => {
+            Ok(SimpleCommand::Transfer {
+                command: TransferRecoveryCommand::RecheckTransfer { transfer_type, .. },
+            }) => {
                 assert!(matches!(transfer_type, TransferType::Redemption));
             }
             _ => panic!("expected transfer recheck simple command via -t"),

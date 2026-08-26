@@ -246,7 +246,9 @@ mod tests {
     use rain_math_float::Float;
     use st0x_config::ExecutionThreshold;
     use st0x_config::create_test_issuance_ctx;
-    use st0x_config::{AssetsConfig, BrokerCtx, CtxError, EquitiesConfig, LogLevel, TradingMode};
+    use st0x_config::{
+        AssetsConfig, BrokerCtx, CtxError, EquitiesConfig, LogFormat, LogLevel, TradingMode,
+    };
     use st0x_config::{EvmCtx, IngestionCutoff, InventoryAdapters, InventoryMode};
     use st0x_evm::OpenChainErrorRegistry;
     use st0x_finance::Usdc;
@@ -258,6 +260,8 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             log_dir: None,
+            log_format: LogFormat::Text,
+            log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
             evm: EvmCtx {

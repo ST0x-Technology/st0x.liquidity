@@ -1204,7 +1204,8 @@ mod tests {
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
         AssetsConfig, BrokerCtx, EquitiesConfig, EquityAssetConfig, EvmCtx, ExecutionThreshold,
-        IngestionCutoff, InventoryAdapters, InventoryMode, LogLevel, OperationMode, TradingMode,
+        IngestionCutoff, InventoryAdapters, InventoryMode, LogFormat, LogLevel, OperationMode,
+        TradingMode,
     };
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, CancellationOutcome,
@@ -1416,6 +1417,8 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             log_dir: None,
+            log_format: LogFormat::Text,
+            log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
             evm: EvmCtx {
