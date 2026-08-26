@@ -786,15 +786,24 @@ impl BrokerCtx {
                 kms_key_version,
                 account_id,
                 mode,
-            } => Self::alpaca_ctx(
-                AlpacaBrokerAuth::KmsJwt {
-                    client_id,
-                    kms_key_version,
-                },
-                account_id,
-                mode,
-                broker_config,
-            ),
+            } => {
+                // The keyless mint targets the LIVE authx token endpoint;
+                // a sandbox (or mock) broker mode paired with it would
+                // silently mint production bearer tokens. Fail loud until
+                // a sandbox authx URL is wired through.
+                if !matches!(mode, Some(AlpacaBrokerApiMode::Production)) {
+                    return Err(CtxError::KmsBrokerRequiresProductionMode);
+                }
+                Self::alpaca_ctx(
+                    AlpacaBrokerAuth::KmsJwt {
+                        client_id,
+                        kms_key_version,
+                    },
+                    account_id,
+                    mode,
+                    broker_config,
+                )
+            }
 
             BrokerSecrets::DryRun => Ok(Self::DryRun),
         }
@@ -1812,6 +1821,12 @@ pub enum CtxError {
     Pricing(#[from] PricingCtxError),
     #[error("log_query_url_template must contain the {{id}} placeholder")]
     LogQueryUrlTemplateMissingIdPlaceholder,
+    #[error(
+        "[broker] type = \"alpaca-broker-api-kms\" requires mode = \"production\": the \
+         keyless token mint targets the live authx.alpaca.markets endpoint, so a sandbox or \
+         mock broker mode would silently mint production bearer tokens"
+    )]
+    KmsBrokerRequiresProductionMode,
     #[error("log_query_url_template is not a valid URL")]
     LogQueryUrlTemplateNotAUrl {
         #[source]
@@ -7149,6 +7164,73 @@ mod tests {
             }
             ref other => panic!("expected keyless broker secrets, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn kms_broker_secrets_reject_non_production_mode() {
+        // The keyless mint targets live authx; pairing it with sandbox
+        // must fail at startup, not silently mint production tokens.
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [broker]
+            counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
+            extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
+            extended_hours_close_flatten_window_secs = 900
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Corp"
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#,
+        );
+
+        let secrets = toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.example.com"
+            hyperevm_rpc_url = "https://rpc.hyperliquid.example.com"
+
+            [broker]
+            type = "alpaca-broker-api-kms"
+            client_id = "CKTEST"
+            kms_key_version = "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#,
+        );
+
+        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        assert!(
+            matches!(result, Err(CtxError::KmsBrokerRequiresProductionMode)),
+            "Expected KmsBrokerRequiresProductionMode, got {result:?}"
+        );
     }
 
     #[test]

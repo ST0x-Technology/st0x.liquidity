@@ -42,8 +42,8 @@ use st0x_evm::{
     OpenChainErrorRegistry, Wallet, wait_for_node_sync,
 };
 use st0x_execution::{
-    AlpacaAccountId, AlpacaBrokerAuth, AuthRuntime, Backpressure, FractionalShares, Network,
-    PollingConfig, Symbol, retry_after_from_response_headers,
+    AlpacaAccountId, AlpacaBrokerAuth, AuthRuntime, Backpressure, FractionalShares, KmsJwtError,
+    Network, PollingConfig, Symbol, retry_after_from_response_headers,
 };
 
 use super::{
@@ -421,7 +421,7 @@ pub enum AlpacaTokenizationError {
     Reqwest(#[from] reqwest::Error),
 
     #[error("tokenization auth failed: {0}")]
-    Auth(String),
+    Auth(#[from] KmsJwtError),
 
     #[error("Failed to parse API response: {0}")]
     JsonParse(#[from] serde_json::Error),
@@ -540,6 +540,12 @@ impl AlpacaTokenizationError {
                 retry_after: *retry_after,
             }),
 
+            // A rate-limited token mint throttles every keyless call at
+            // once; surface it with its Retry-After hint.
+            Self::Auth(error) if error.is_rate_limited() => Some(Backpressure {
+                retry_after: error.retry_after(),
+            }),
+
             Self::ApiError { .. }
             | Self::Reqwest(_)
             | Self::Auth(_)
@@ -605,8 +611,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             http_client: Client::new(),
             base_url,
             account_id,
-            auth: AuthRuntime::build(&auth)
-                .map_err(|error| AlpacaTokenizationError::Auth(error.to_string()))?,
+            auth: AuthRuntime::build(&auth)?,
             wallet,
             network,
             redemption_wallet,
@@ -643,8 +648,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         let response = self
             .auth
             .apply_apca(self.http_client.post(&url))
-            .await
-            .map_err(|error| AlpacaTokenizationError::Auth(error.to_string()))?
+            .await?
             .json(&request)
             .send()
             .await?;
@@ -948,11 +952,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             self.base_url, self.account_id
         );
 
-        let mut request = self
-            .auth
-            .apply_apca(self.http_client.get(&url))
-            .await
-            .map_err(|error| AlpacaTokenizationError::Auth(error.to_string()))?;
+        let mut request = self.auth.apply_apca(self.http_client.get(&url)).await?;
 
         if let Some(ref request_type) = params.request_type {
             request = request.query(&[("type", request_type.to_string())]);

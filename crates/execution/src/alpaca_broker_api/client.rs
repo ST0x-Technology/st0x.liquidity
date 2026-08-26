@@ -29,7 +29,6 @@ pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// rotating token is always current.
 pub(crate) struct AlpacaBrokerApiClient {
     http_client: reqwest::Client,
-    market_data_http_client: reqwest::Client,
     auth: AuthRuntime,
     base_url: String,
     market_data_base_url: String,
@@ -54,12 +53,10 @@ impl AlpacaBrokerApiClient {
         let headers =
             HeaderMap::from_iter([(CONTENT_TYPE, HeaderValue::from_static("application/json"))]);
 
+        // One client serves broker and market-data hosts alike: with
+        // auth injected per request the two pools had no remaining
+        // behavioral difference (reqwest pools per host internally).
         let http_client = reqwest::Client::builder()
-            .default_headers(headers.clone())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(HTTP_REQUEST_TIMEOUT)
-            .build()?;
-        let market_data_http_client = reqwest::Client::builder()
             .default_headers(headers)
             .connect_timeout(Duration::from_secs(10))
             .timeout(HTTP_REQUEST_TIMEOUT)
@@ -67,7 +64,6 @@ impl AlpacaBrokerApiClient {
 
         Ok(Self {
             http_client,
-            market_data_http_client,
             auth,
             base_url: ctx.base_url().to_string(),
             market_data_base_url: ctx.mode().market_data_base_url().to_string(),
@@ -88,19 +84,15 @@ impl AlpacaBrokerApiClient {
         !matches!(self.mode, AlpacaBrokerApiMode::Production)
     }
 
-    pub(crate) fn market_data_base_url(&self) -> &str {
-        &self.market_data_base_url
-    }
-
-    /// A Market Data API GET with the right credentials attached (APCA
-    /// header pair for Basic, bearer token for keyless).
+    /// A Market Data API GET for `path` (e.g. `/v2/stocks/AAPL/trades/latest`)
+    /// with the right credentials attached (APCA header pair for Basic,
+    /// bearer token for keyless).
     pub(crate) async fn market_data_get(
         &self,
-        url: String,
-    ) -> Result<reqwest::RequestBuilder, AlpacaBrokerApiError> {
-        self.auth
-            .apply_apca(self.market_data_http_client.get(url))
-            .await
+        path: &str,
+    ) -> Result<reqwest::RequestBuilder, super::kms_jwt::KmsJwtError> {
+        let url = format!("{}{path}", self.market_data_base_url);
+        self.auth.apply_apca(self.http_client.get(url)).await
     }
 
     /// Verify the account by fetching account details

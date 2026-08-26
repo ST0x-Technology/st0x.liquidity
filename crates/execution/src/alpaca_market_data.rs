@@ -2,11 +2,12 @@
 
 use rain_math_float::Float;
 use reqwest::{RequestBuilder, StatusCode};
-
-use crate::alpaca_broker_api::AlpacaBrokerApiClient;
 use serde::Deserialize;
 use std::time::Duration;
 use tracing::trace;
+
+use crate::alpaca_broker_api::AlpacaBrokerApiClient;
+use crate::alpaca_broker_api::kms_jwt::KmsJwtError;
 
 use crate::rate_limit::retry_after_from_response_headers;
 use crate::{
@@ -31,7 +32,7 @@ pub enum AlpacaMarketDataError {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("market data auth failed: {0}")]
-    Auth(String),
+    Auth(#[from] KmsJwtError),
     #[error("API error (status {status}): {body}")]
     ApiError {
         status: StatusCode,
@@ -88,6 +89,12 @@ impl AlpacaMarketDataError {
                 retry_after: *retry_after,
             }),
 
+            // A rate-limited token mint throttles every keyless call at
+            // once; surface it with its Retry-After hint.
+            Self::Auth(error) if error.is_rate_limited() => Some(Backpressure {
+                retry_after: error.retry_after(),
+            }),
+
             Self::ApiError { .. }
             | Self::Http(_)
             | Self::Auth(_)
@@ -111,7 +118,10 @@ impl AlpacaMarketDataError {
         match self {
             Self::ApiError { status, .. } => status_permanence(*status),
 
-            // A keyless-auth mint failure is network-shaped; retryable.
+            // Deterministic mint failures (revoked IAM grant, disabled
+            // credential) fail identically on every retry; the rest of a
+            // mint is network-shaped.
+            Self::Auth(error) if error.is_deterministic() => Permanence::Permanent,
             Self::Auth(_) => Permanence::Transient,
 
             // A malformed response is deterministic for the response that
@@ -218,13 +228,9 @@ pub(crate) async fn fetch_latest_trade_price(
     client: &AlpacaBrokerApiClient,
     symbol: &Symbol,
 ) -> Result<Positive<Usd>, AlpacaMarketDataError> {
-    let market_data_base_url = client.market_data_base_url();
     let request = client
-        .market_data_get(format!(
-            "{market_data_base_url}/v2/stocks/{symbol}/trades/latest"
-        ))
-        .await
-        .map_err(|error| AlpacaMarketDataError::Auth(error.to_string()))?;
+        .market_data_get(&format!("/v2/stocks/{symbol}/trades/latest"))
+        .await?;
     let bytes = get_market_data_bytes(request).await?;
 
     let response: LatestTradeEnvelope = serde_json::from_slice(&bytes)?;
@@ -249,13 +255,9 @@ pub(crate) async fn fetch_latest_quote(
     client: &AlpacaBrokerApiClient,
     symbol: &Symbol,
 ) -> Result<LatestQuote, AlpacaMarketDataError> {
-    let market_data_base_url = client.market_data_base_url();
     let request = client
-        .market_data_get(format!(
-            "{market_data_base_url}/v2/stocks/{symbol}/quotes/latest"
-        ))
-        .await
-        .map_err(|error| AlpacaMarketDataError::Auth(error.to_string()))?;
+        .market_data_get(&format!("/v2/stocks/{symbol}/quotes/latest"))
+        .await?;
     let bytes = get_market_data_bytes(request.query(&[("feed", QUOTE_FEED)])).await?;
 
     let response: LatestQuoteEnvelope =

@@ -11,7 +11,7 @@ use tracing::{trace, warn};
 use super::transfer::{AlpacaTransferId, Network, TokenSymbol, TransferStatus};
 use super::whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
 use crate::alpaca_broker_api::AlpacaBrokerAuth;
-use crate::alpaca_broker_api::kms_jwt::AuthRuntime;
+use crate::alpaca_broker_api::kms_jwt::{AuthRuntime, KmsJwtError};
 use crate::rate_limit::retry_after_from_response_headers;
 use crate::{AlpacaAccountId, Backpressure};
 
@@ -20,7 +20,7 @@ pub enum AlpacaWalletError {
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
     #[error("wallet auth failed: {0}")]
-    Auth(String),
+    Auth(#[from] KmsJwtError),
     #[error("API error (status {status}): {message}")]
     ApiError {
         status: StatusCode,
@@ -91,6 +91,12 @@ impl AlpacaWalletError {
                 retry_after: *retry_after,
             }),
 
+            // A rate-limited token mint throttles every keyless call at
+            // once; surface it with its Retry-After hint.
+            Self::Auth(error) if error.is_rate_limited() => Some(Backpressure {
+                retry_after: error.retry_after(),
+            }),
+
             Self::ApiError { .. }
             | Self::Reqwest(_)
             | Self::Auth(_)
@@ -126,8 +132,7 @@ impl AlpacaWalletClient {
             client: Client::new(),
             account_id,
             base_url,
-            auth: AuthRuntime::build(&auth)
-                .map_err(|error| AlpacaWalletError::Auth(error.to_string()))?,
+            auth: AuthRuntime::build(&auth)?,
         })
     }
 
@@ -135,11 +140,7 @@ impl AlpacaWalletClient {
         let url = format!("{}{}", self.base_url, path);
         trace!(target: "wallet", "GET {url}");
 
-        let request = self
-            .auth
-            .apply_wallet(self.client.get(&url))
-            .await
-            .map_err(|error| AlpacaWalletError::Auth(error.to_string()))?;
+        let request = self.auth.apply_wallet(self.client.get(&url)).await?;
         let response = request.send().await?;
 
         read_response_body(Method::GET, response).await
@@ -156,11 +157,7 @@ impl AlpacaWalletClient {
         // The legacy pair sends both Basic auth AND the APCA headers (the
         // wallet endpoints historically wanted both); keyless sends the
         // bearer token. AuthRuntime::apply_wallet owns that split.
-        let request = self
-            .auth
-            .apply_wallet(self.client.post(&url))
-            .await
-            .map_err(|error| AlpacaWalletError::Auth(error.to_string()))?;
+        let request = self.auth.apply_wallet(self.client.post(&url)).await?;
         let response = request.json(body).send().await?;
 
         read_response_body(Method::POST, response).await
@@ -170,11 +167,7 @@ impl AlpacaWalletClient {
         let url = format!("{}{}", self.base_url, path);
         trace!(target: "wallet", "DELETE {url}");
 
-        let request = self
-            .auth
-            .apply_wallet(self.client.delete(&url))
-            .await
-            .map_err(|error| AlpacaWalletError::Auth(error.to_string()))?;
+        let request = self.auth.apply_wallet(self.client.delete(&url)).await?;
         let response = request.send().await?;
 
         read_response_body(Method::DELETE, response).await
@@ -188,11 +181,7 @@ impl AlpacaWalletClient {
         let url = format!("{}{}", self.base_url, path);
         trace!(target: "wallet", "PATCH {url}");
 
-        let request = self
-            .auth
-            .apply_wallet(self.client.patch(&url))
-            .await
-            .map_err(|error| AlpacaWalletError::Auth(error.to_string()))?;
+        let request = self.auth.apply_wallet(self.client.patch(&url)).await?;
         let response = request.json(body).send().await?;
 
         read_response_body(Method::PATCH, response).await

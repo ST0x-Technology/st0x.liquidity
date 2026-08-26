@@ -475,6 +475,12 @@ impl AlpacaBrokerApiError {
                 retry_after: *retry_after,
             }),
 
+            // A rate-limited token mint throttles every keyless call at
+            // once; surface it with its Retry-After hint.
+            Self::KmsJwt(error) if error.is_rate_limited() => Some(Backpressure {
+                retry_after: error.retry_after(),
+            }),
+
             Self::ApiError { .. }
             | Self::HttpClient(_)
             | Self::KmsJwt(_)
@@ -538,8 +544,12 @@ impl AlpacaBrokerApiError {
             // routing/cache failure: a fresh request can clear it, but the
             // mismatched financial value must never be consumed.
             Self::HttpClient(source) if source.is_builder() => Permanence::Permanent,
-            // A keyless-auth mint failure is network-shaped (metadata, KMS,
-            // or token-endpoint round-trip); a fresh attempt can clear it.
+            // A deterministic mint failure (revoked signerVerifier grant,
+            // disabled BrokerDash credential: 4xx from KMS or the token
+            // endpoint) fails identically on every retry, exactly like a
+            // Basic-auth 401/403; everything else about a mint is
+            // network-shaped and retryable.
+            Self::KmsJwt(error) if error.is_deterministic() => Permanence::Permanent,
             Self::HttpClient(_) | Self::KmsJwt(_) | Self::PositionSymbolMismatch { .. } => {
                 Permanence::Transient
             }

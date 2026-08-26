@@ -64,6 +64,7 @@ const TOKEN_MAX_LIFETIME: Duration = Duration::from_secs(3600);
 use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 
 use super::auth::AlpacaBrokerAuth;
+use crate::rate_limit::retry_after_from_response_headers;
 
 /// Errors from minting an Alpaca access token via Cloud KMS. HTTP error
 /// bodies are Google/Alpaca error JSON; no tokens or signatures are ever
@@ -75,19 +76,68 @@ pub enum KmsJwtError {
     #[error("KMS AsymmetricSign returned HTTP {status}: {body}")]
     KmsStatus { status: u16, body: String },
     #[error("Alpaca token endpoint returned HTTP {status}: {body}")]
-    TokenStatus { status: u16, body: String },
+    TokenStatus {
+        status: u16,
+        body: String,
+        /// The endpoint's `Retry-After` hint, captured so a token 429
+        /// keeps its backpressure signal through the error chain.
+        retry_after: Option<Duration>,
+    },
     #[error("base64 decode of KMS response failed: {0}")]
     Base64(#[from] base64::DecodeError),
     #[error("malformed DER ECDSA signature from KMS: {0}")]
     MalformedSignature(#[from] p256::ecdsa::Error),
     #[error("claims serialization failed: {0}")]
     Claims(#[from] serde_json::Error),
+    #[error("credential contains bytes invalid in an HTTP header: {0}")]
+    InvalidHeader(#[from] reqwest::header::InvalidHeaderValue),
+    #[error("system clock is before the UNIX epoch")]
+    ClockBeforeEpoch,
+}
+
+impl KmsJwtError {
+    /// True when retrying the same mint deterministically fails again:
+    /// a non-429/408 HTTP 4xx from KMS or the token endpoint (revoked
+    /// IAM grant, disabled or mis-registered BrokerDash credential),
+    /// or a local encoding failure. Under Basic auth the equivalent
+    /// 401/403 classifies Permanent via `status_permanence`; this keeps
+    /// keyless auth failing fast the same way.
+    pub fn is_deterministic(&self) -> bool {
+        match self {
+            Self::KmsStatus { status, .. } | Self::TokenStatus { status, .. } => {
+                (400..500).contains(status) && *status != 429 && *status != 408
+            }
+            Self::Base64(_)
+            | Self::MalformedSignature(_)
+            | Self::Claims(_)
+            | Self::InvalidHeader(_)
+            | Self::ClockBeforeEpoch => true,
+            Self::Http(_) => false,
+        }
+    }
+
+    /// True when the token endpoint rate-limited the mint.
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(
+            self,
+            Self::TokenStatus { status: 429, .. } | Self::KmsStatus { status: 429, .. }
+        )
+    }
+
+    /// The token endpoint's `Retry-After` hint, when it sent one.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::TokenStatus { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
 }
 
 /// Signs client assertions with Cloud KMS and exchanges them for cached
-/// bearer tokens. Shared behind an `Arc` so every client reuses one
-/// token cache.
-#[derive(Debug)]
+/// bearer tokens. Shared behind an `Arc` so every clone of one client
+/// reuses that client's token cache. (Each client builds its own
+/// runtime today, so a process runs one cache per client; Alpaca
+/// accepts concurrent tokens per client_id, observed live 2026-08-25.)
 pub struct KmsJwtAuth {
     client_id: String,
     /// Full KMS key-version resource name
@@ -105,13 +155,36 @@ pub struct KmsJwtAuth {
     mint_lock: Mutex<()>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CachedToken {
     access_token: String,
     /// Soft deadline: past this, try to mint a replacement.
     refresh_after: Instant,
     /// Hard deadline: past this, the token must not be sent.
     hard_expiry: Instant,
+}
+
+// Manual Debug impls: the cache holds a LIVE bearer token, which must
+// never reach logs (the same reason the ctx and client Debug impls
+// redact credentials).
+impl std::fmt::Debug for KmsJwtAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KmsJwtAuth")
+            .field("client_id", &self.client_id)
+            .field("kms_key_version", &self.kms_key_version)
+            .field("token_url", &self.token_url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for CachedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedToken")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_after", &self.refresh_after)
+            .field("hard_expiry", &self.hard_expiry)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,7 +237,13 @@ impl KmsJwtAuth {
 
     /// The cached token if `deadline(token)` is still ahead of now.
     fn cached_before(&self, deadline: impl Fn(&CachedToken) -> Instant) -> Option<String> {
-        let cached = self.cached.lock().expect("token cache poisoned");
+        // A panic while holding this lock cannot corrupt the value (it
+        // only ever holds a fully-formed token), so recover from poison
+        // instead of cascading the panic.
+        let cached = self
+            .cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cached
             .as_ref()
             .filter(|tok| Instant::now() < deadline(tok))
@@ -229,9 +308,11 @@ impl KmsJwtAuth {
             .await?;
         let status = resp.status();
         if !status.is_success() {
+            let retry_after = retry_after_from_response_headers(resp.headers());
             return Err(KmsJwtError::TokenStatus {
                 status: status.as_u16(),
                 body: resp.text().await.unwrap_or_default(),
+                retry_after,
             });
         }
         let token: TokenResponse = resp.json().await?;
@@ -241,17 +322,24 @@ impl KmsJwtAuth {
         // window even on short-lived tokens.
         let lifetime = Duration::from_secs(token.expires_in).min(TOKEN_MAX_LIFETIME);
         let now = Instant::now();
-        let refresh_after = now
+        let hard_expiry = now + lifetime.saturating_sub(TOKEN_HARD_MARGIN);
+        // Clamped to the hard deadline: for a very short lifetime the
+        // margin arithmetic could otherwise place the refresh AFTER the
+        // point the token must no longer be sent.
+        let refresh_after = (now
             + lifetime
                 .saturating_sub(TOKEN_REFRESH_MARGIN)
-                .max(lifetime / 2);
-        let hard_expiry = now + lifetime.saturating_sub(TOKEN_HARD_MARGIN);
+                .max(lifetime / 2))
+        .min(hard_expiry);
         tracing::info!(
             expires_in = token.expires_in,
             "Minted Alpaca access token via KMS client assertion"
         );
         let access = token.access_token.clone();
-        *self.cached.lock().expect("token cache poisoned") = Some(CachedToken {
+        *self
+            .cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(CachedToken {
             access_token: token.access_token,
             refresh_after,
             hard_expiry,
@@ -263,7 +351,7 @@ impl KmsJwtAuth {
     async fn sign_assertion(&self) -> Result<String, KmsJwtError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock before 1970");
+            .map_err(|_| KmsJwtError::ClockBeforeEpoch)?;
 
         // jti only has to be unique per assertion; a nanosecond stamp
         // plus a process-local counter is plenty without a rand dep.
@@ -295,16 +383,25 @@ impl KmsJwtAuth {
     /// One KMS `AsymmetricSign` over a SHA-256 digest, authorized by the
     /// instance service account's metadata token. Returns the DER
     /// signature bytes.
+    ///
+    /// `GOOGLE_OAUTH_ACCESS_TOKEN` overrides the metadata server, the
+    /// same break-glass the Turnkey stamper honors, so an operator can
+    /// run the bot off-VM with `gcloud auth print-access-token`.
     async fn kms_sign(&self, digest: &[u8]) -> Result<Vec<u8>, KmsJwtError> {
-        let meta = self
-            .http
-            .get(&self.metadata_token_url)
-            .header("Metadata-Flavor", "Google")
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<MetadataToken>()
-            .await?;
+        let access_token = match std::env::var("GOOGLE_OAUTH_ACCESS_TOKEN") {
+            Ok(token) if !token.trim().is_empty() => token,
+            _ => {
+                self.http
+                    .get(&self.metadata_token_url)
+                    .header("Metadata-Flavor", "Google")
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json::<MetadataToken>()
+                    .await?
+                    .access_token
+            }
+        };
 
         let url = format!(
             "{}/{}:asymmetricSign",
@@ -313,7 +410,7 @@ impl KmsJwtAuth {
         let resp = self
             .http
             .post(&url)
-            .bearer_auth(meta.access_token)
+            .bearer_auth(access_token)
             .json(&serde_json::json!({
                 "digest": { "sha256": BASE64_STD.encode(digest) }
             }))
@@ -347,9 +444,9 @@ mod tests {
     use super::*;
 
     // SEQUENCE of two INTEGERs, DER-style.
-    fn der(r: &[u8], s: &[u8]) -> Vec<u8> {
-        let mut out = vec![0x30, (4 + r.len() + s.len()) as u8];
-        for int in [r, s] {
+    fn der(r_int: &[u8], s_int: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x30, (4 + r_int.len() + s_int.len()) as u8];
+        for int in [r_int, s_int] {
             out.push(0x02);
             out.push(int.len() as u8);
             out.extend_from_slice(int);
@@ -359,33 +456,42 @@ mod tests {
 
     #[test]
     fn der_full_width_integers_pass_through() {
-        let r = [0x11u8; 32];
-        let s = [0x22u8; 32];
-        let raw = der_ecdsa_to_raw(&der(&r, &s)).unwrap();
-        assert_eq!(&raw[..32], &r);
-        assert_eq!(&raw[32..], &s);
+        let r_int = [0x11u8; 32];
+        let s_int = [0x22u8; 32];
+        let raw = der_ecdsa_to_raw(&der(&r_int, &s_int)).unwrap();
+        assert_eq!(&raw[..32], &r_int);
+        assert_eq!(&raw[32..], &s_int);
     }
 
     #[test]
     fn der_short_integers_left_pad_and_leading_zero_strips() {
         // r fits in 31 bytes; s carries the 0x00 prefix DER adds when
         // the high bit is set (0xF0... stays below the group order).
-        let r = [0x01u8; 31];
+        let r_int = [0x01u8; 31];
         let mut s_int = vec![0x00];
         s_int.extend_from_slice(&[0xF0u8; 32]);
-        let raw = der_ecdsa_to_raw(&der(&r, &s_int)).unwrap();
+        let raw = der_ecdsa_to_raw(&der(&r_int, &s_int)).unwrap();
         assert_eq!(raw[0], 0x00);
-        assert_eq!(&raw[1..32], &r);
+        assert_eq!(&raw[1..32], &r_int);
         assert_eq!(&raw[32..], &[0xF0u8; 32]);
     }
 
     #[test]
     fn der_garbage_is_rejected() {
-        assert!(der_ecdsa_to_raw(&[]).is_err());
-        assert!(der_ecdsa_to_raw(&[0x30, 0x02, 0x02, 0x00]).is_err());
+        assert!(matches!(
+            der_ecdsa_to_raw(&[]),
+            Err(KmsJwtError::MalformedSignature(_))
+        ));
+        assert!(matches!(
+            der_ecdsa_to_raw(&[0x30, 0x02, 0x02, 0x00]),
+            Err(KmsJwtError::MalformedSignature(_))
+        ));
         let mut trailing = der(&[0x01; 32], &[0x02; 32]);
         trailing[1] -= 1; // length no longer covers the whole buffer
-        assert!(der_ecdsa_to_raw(&trailing).is_err());
+        assert!(matches!(
+            der_ecdsa_to_raw(&trailing),
+            Err(KmsJwtError::MalformedSignature(_))
+        ));
     }
 
     fn stub_auth(server: &MockServer) -> KmsJwtAuth {
@@ -459,7 +565,10 @@ mod tests {
         // Past the hard expiry the failure must surface instead.
         auth.cached.lock().unwrap().as_mut().unwrap().hard_expiry =
             Instant::now() - Duration::from_secs(1);
-        assert!(auth.access_token().await.is_err());
+        assert!(matches!(
+            auth.access_token().await,
+            Err(KmsJwtError::TokenStatus { status: 500, .. })
+        ));
     }
 }
 
@@ -478,7 +587,7 @@ pub enum AuthRuntime {
 }
 
 impl AuthRuntime {
-    pub fn build(auth: &AlpacaBrokerAuth) -> Result<Self, super::AlpacaBrokerApiError> {
+    pub fn build(auth: &AlpacaBrokerAuth) -> Result<Self, KmsJwtError> {
         match auth {
             AlpacaBrokerAuth::Basic {
                 api_key,
@@ -519,7 +628,7 @@ impl AuthRuntime {
     }
 
     /// `Authorization` header for a Broker API request.
-    pub async fn broker_authorization(&self) -> Result<HeaderValue, super::AlpacaBrokerApiError> {
+    pub async fn broker_authorization(&self) -> Result<HeaderValue, KmsJwtError> {
         match self {
             Self::Basic { authorization, .. } => Ok(authorization.clone()),
             Self::KmsJwt(auth) => {
@@ -539,7 +648,7 @@ impl AuthRuntime {
     pub async fn apply_apca(
         &self,
         request: reqwest::RequestBuilder,
-    ) -> Result<reqwest::RequestBuilder, super::AlpacaBrokerApiError> {
+    ) -> Result<reqwest::RequestBuilder, KmsJwtError> {
         match self {
             Self::Basic {
                 api_key,
@@ -557,31 +666,19 @@ impl AuthRuntime {
         }
     }
 
-    /// Attach Alpaca wallet-endpoint credentials to a request. The
-    /// legacy pair sends BOTH Basic auth and the APCA header pair (the
-    /// wallet endpoints historically wanted both); keyless sends the
-    /// bearer token, which the same endpoints accept (verified
-    /// 2026-08-25).
+    /// Attach Alpaca wallet-endpoint credentials to a request: the
+    /// APCA treatment plus, for the legacy pair, the Basic
+    /// `Authorization` the wallet endpoints historically wanted on top.
     pub async fn apply_wallet(
         &self,
         request: reqwest::RequestBuilder,
-    ) -> Result<reqwest::RequestBuilder, super::AlpacaBrokerApiError> {
-        match self {
-            Self::Basic {
-                authorization,
-                api_key,
-                api_secret,
-            } => Ok(request
-                .header(reqwest::header::AUTHORIZATION, authorization.clone())
-                .header(HeaderName::from_static("apca-api-key-id"), api_key.clone())
-                .header(
-                    HeaderName::from_static("apca-api-secret-key"),
-                    api_secret.clone(),
-                )),
-            Self::KmsJwt(_) => Ok(request.header(
-                reqwest::header::AUTHORIZATION,
-                self.broker_authorization().await?,
-            )),
-        }
+    ) -> Result<reqwest::RequestBuilder, KmsJwtError> {
+        let request = self.apply_apca(request).await?;
+        Ok(match self {
+            Self::Basic { authorization, .. } => {
+                request.header(AUTHORIZATION, authorization.clone())
+            }
+            Self::KmsJwt(_) => request,
+        })
     }
 }
