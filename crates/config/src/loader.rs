@@ -877,7 +877,7 @@ impl LogQueryUrlTemplate {
 
         let sample = template.replace(LOG_QUERY_ID_PLACEHOLDER, "sample-id");
         if let Err(source) = Url::parse(&sample) {
-            return Err(CtxError::LogQueryUrlTemplateNotAUrl { template, source });
+            return Err(CtxError::LogQueryUrlTemplateNotAUrl { source });
         }
 
         Ok(Self(template))
@@ -886,7 +886,8 @@ impl LogQueryUrlTemplate {
     /// The template with `{id}` replaced by `id`.
     #[must_use]
     pub fn substitute(&self, id: &str) -> String {
-        self.0.replace(LOG_QUERY_ID_PLACEHOLDER, id)
+        let Self(template) = self;
+        template.replace(LOG_QUERY_ID_PLACEHOLDER, id)
     }
 }
 
@@ -1773,9 +1774,8 @@ pub enum CtxError {
     Pricing(#[from] PricingCtxError),
     #[error("log_query_url_template must contain the {{id}} placeholder")]
     LogQueryUrlTemplateMissingIdPlaceholder,
-    #[error("log_query_url_template is not a valid URL: {template}")]
+    #[error("log_query_url_template is not a valid URL")]
     LogQueryUrlTemplateNotAUrl {
-        template: String,
         #[source]
         source: url::ParseError,
     },
