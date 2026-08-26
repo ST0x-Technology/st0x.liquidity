@@ -700,6 +700,16 @@ mod tests {
         token_mock.assert_calls(1);
     }
 
+    /// Expire both cache deadlines, in a sync helper so no `MutexGuard`
+    /// scope overlaps an await point.
+    fn expire_cached_token(auth: &KmsJwtAuth) {
+        let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        let mut cached = auth.cached.lock().unwrap();
+        let token = cached.as_mut().unwrap();
+        token.refresh_after = expired;
+        token.hard_expiry = expired;
+    }
+
     fn basic_runtime() -> AuthRuntime {
         AuthRuntime::build(AlpacaBrokerAuth::Basic {
             api_key: "key-id".to_string(),
@@ -784,12 +794,7 @@ mod tests {
         // successful fallback above deferred refresh_after by the failed-
         // mint backoff, so expire both deadlines to model a cache whose
         // token is truly dead.)
-        let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
-        let mut cached = auth.cached.lock().unwrap();
-        let token = cached.as_mut().unwrap();
-        token.refresh_after = expired;
-        token.hard_expiry = expired;
-        drop(cached);
+        expire_cached_token(&auth);
         assert!(matches!(
             auth.access_token().await,
             Err(KmsJwtError::TokenStatus { status: 500, .. })
