@@ -790,9 +790,13 @@ impl BrokerCtx {
                 // The keyless mint targets the LIVE authx token endpoint;
                 // a sandbox (or mock) broker mode paired with it would
                 // silently mint production bearer tokens. Fail loud until
-                // a sandbox authx URL is wired through.
-                if !matches!(mode, Some(AlpacaBrokerApiMode::Production)) {
-                    return Err(CtxError::KmsBrokerRequiresProductionMode);
+                // a sandbox authx URL is wired through. Exhaustive so a
+                // future mode forces an explicit keyless decision.
+                match mode {
+                    Some(AlpacaBrokerApiMode::Production) => {}
+                    None | Some(_) => {
+                        return Err(CtxError::KmsBrokerRequiresProductionMode);
+                    }
                 }
                 Self::alpaca_ctx(
                     AlpacaBrokerAuth::KmsJwt {
@@ -7232,6 +7236,23 @@ mod tests {
             matches!(result, Err(CtxError::KmsBrokerRequiresProductionMode)),
             "Expected KmsBrokerRequiresProductionMode, got {result:?}"
         );
+
+        // With mode = "production" the same secrets must assemble into a
+        // KmsJwt broker context: this pins the from_parts mapping, not
+        // just the TOML shape.
+        let production_secrets = toml_file(
+            &std::fs::read_to_string(secrets.path())
+                .unwrap()
+                .replace("mode = \"sandbox\"", "mode = \"production\""),
+        );
+        let ctx = Ctx::load_files(config.path(), production_secrets.path())
+            .await
+            .unwrap();
+        assert!(matches!(
+            &ctx.broker,
+            BrokerCtx::AlpacaBrokerApi(broker_ctx)
+                if matches!(broker_ctx.auth, AlpacaBrokerAuth::KmsJwt { .. })
+        ));
     }
 
     #[test]

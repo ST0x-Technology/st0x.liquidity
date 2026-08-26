@@ -1285,6 +1285,12 @@ mod tests {
     use tracing_test::traced_test;
     use uuid::uuid;
 
+    #[test]
+    fn kms_jwt_errors_are_never_the_duplicate_order_case() {
+        let error = AlpacaBrokerApiError::KmsJwt(crate::KmsJwtError::ClockBeforeEpoch);
+        assert!(!is_duplicate_client_order_id(&error));
+    }
+
     use super::*;
     use crate::ClientOrderId;
     use crate::alpaca_broker_api::auth::{

@@ -33,9 +33,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as BASE64_STD, URL_SAFE_NO_PAD as BASE64_URL};
+use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+
+use super::auth::AlpacaBrokerAuth;
+use crate::rate_limit::retry_after_from_response_headers;
 
 /// Alpaca's token endpoint for live broker partners. Doubles as the
 /// assertion audience, per RFC 7523.
@@ -56,15 +60,16 @@ const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(120);
 /// Stop USING a cached token this long before its stated expiry.
 const TOKEN_HARD_MARGIN: Duration = Duration::from_secs(10);
 
+/// After a failed refresh that fell back to the cached token, wait this
+/// long before the next attempt: without it, sub-second pollers would
+/// re-run the full three-round-trip mint back to back for the whole
+/// refresh window.
+const FAILED_MINT_BACKOFF: Duration = Duration::from_secs(15);
+
 /// Ceiling on the token lifetime we believe from the endpoint. Alpaca
 /// says 15 minutes; a wild `expires_in` must not push the expiry
 /// Instants past what the arithmetic below can represent.
 const TOKEN_MAX_LIFETIME: Duration = Duration::from_secs(3600);
-
-use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
-
-use super::auth::AlpacaBrokerAuth;
-use crate::rate_limit::retry_after_from_response_headers;
 
 /// Errors from minting an Alpaca access token via Cloud KMS. HTTP error
 /// bodies are Google/Alpaca error JSON; no tokens or signatures are ever
@@ -74,7 +79,12 @@ pub enum KmsJwtError {
     #[error("KMS JWT HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("KMS AsymmetricSign returned HTTP {status}: {body}")]
-    KmsStatus { status: u16, body: String },
+    KmsStatus {
+        status: u16,
+        body: String,
+        /// KMS's `Retry-After` hint on a 429, kept for backpressure.
+        retry_after: Option<Duration>,
+    },
     #[error("Alpaca token endpoint returned HTTP {status}: {body}")]
     TokenStatus {
         status: u16,
@@ -124,10 +134,12 @@ impl KmsJwtError {
         )
     }
 
-    /// The token endpoint's `Retry-After` hint, when it sent one.
+    /// The rate-limiting endpoint's `Retry-After` hint, when sent.
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
-            Self::TokenStatus { retry_after, .. } => *retry_after,
+            Self::TokenStatus { retry_after, .. } | Self::KmsStatus { retry_after, .. } => {
+                *retry_after
+            }
             _ => None,
         }
     }
@@ -282,10 +294,24 @@ impl KmsJwtAuth {
                         %error,
                         "Alpaca token refresh failed; riding the still-valid cached token"
                     );
+                    self.defer_next_refresh();
                     return Ok(token);
                 }
                 Err(error)
             }
+        }
+    }
+
+    /// Push the soft refresh deadline forward after a failed mint, so
+    /// the next attempt waits [`FAILED_MINT_BACKOFF`] instead of firing
+    /// on the very next request (still clamped to the hard expiry).
+    fn defer_next_refresh(&self) {
+        let mut cached = self
+            .cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(token) = cached.as_mut() {
+            token.refresh_after = (Instant::now() + FAILED_MINT_BACKOFF).min(token.hard_expiry);
         }
     }
 
@@ -312,7 +338,7 @@ impl KmsJwtAuth {
             let retry_after = retry_after_from_response_headers(resp.headers());
             return Err(KmsJwtError::TokenStatus {
                 status: status.as_u16(),
-                body: resp.text().await.unwrap_or_default(),
+                body: truncate_error_body(resp.text().await.unwrap_or_default()),
                 retry_after,
             });
         }
@@ -419,14 +445,32 @@ impl KmsJwtAuth {
             .await?;
         let status = resp.status();
         if !status.is_success() {
+            let retry_after = retry_after_from_response_headers(resp.headers());
             return Err(KmsJwtError::KmsStatus {
                 status: status.as_u16(),
-                body: resp.text().await.unwrap_or_default(),
+                body: truncate_error_body(resp.text().await.unwrap_or_default()),
+                retry_after,
             });
         }
         let signed: SignResponse = resp.json().await?;
         Ok(BASE64_STD.decode(signed.signature)?)
     }
+}
+
+/// Error bodies are Google/Alpaca error JSON, but nothing guarantees an
+/// endpoint never echoes request material back; cap what an error can
+/// carry into logs.
+fn truncate_error_body(mut body: String) -> String {
+    const MAX: usize = 512;
+    if body.len() > MAX {
+        let mut end = MAX;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+        body.push_str("... [truncated]");
+    }
+    body
 }
 
 /// KMS returns ECDSA signatures DER-encoded (`SEQUENCE { INTEGER r,
@@ -436,142 +480,6 @@ impl KmsJwtAuth {
 fn der_ecdsa_to_raw(der: &[u8]) -> Result<[u8; 64], KmsJwtError> {
     let sig = p256::ecdsa::Signature::from_der(der)?;
     Ok(sig.to_bytes().into())
-}
-
-#[cfg(test)]
-mod tests {
-    use httpmock::MockServer;
-
-    use super::*;
-
-    // SEQUENCE of two INTEGERs, DER-style.
-    fn der(r_int: &[u8], s_int: &[u8]) -> Vec<u8> {
-        let total = u8::try_from(4 + r_int.len() + s_int.len()).unwrap();
-        let mut out = vec![0x30, total];
-        for int in [r_int, s_int] {
-            out.push(0x02);
-            out.push(u8::try_from(int.len()).unwrap());
-            out.extend_from_slice(int);
-        }
-        out
-    }
-
-    #[test]
-    fn der_full_width_integers_pass_through() {
-        let r_int = [0x11u8; 32];
-        let s_int = [0x22u8; 32];
-        let raw = der_ecdsa_to_raw(&der(&r_int, &s_int)).unwrap();
-        assert_eq!(&raw[..32], &r_int);
-        assert_eq!(&raw[32..], &s_int);
-    }
-
-    #[test]
-    fn der_short_integers_left_pad_and_leading_zero_strips() {
-        // r fits in 31 bytes; s carries the 0x00 prefix DER adds when
-        // the high bit is set (0xF0... stays below the group order).
-        let r_int = [0x01u8; 31];
-        let mut s_int = vec![0x00];
-        s_int.extend_from_slice(&[0xF0u8; 32]);
-        let raw = der_ecdsa_to_raw(&der(&r_int, &s_int)).unwrap();
-        assert_eq!(raw[0], 0x00);
-        assert_eq!(&raw[1..32], &r_int);
-        assert_eq!(&raw[32..], &[0xF0u8; 32]);
-    }
-
-    #[test]
-    fn der_garbage_is_rejected() {
-        assert!(matches!(
-            der_ecdsa_to_raw(&[]),
-            Err(KmsJwtError::MalformedSignature(_))
-        ));
-        assert!(matches!(
-            der_ecdsa_to_raw(&[0x30, 0x02, 0x02, 0x00]),
-            Err(KmsJwtError::MalformedSignature(_))
-        ));
-        let mut trailing = der(&[0x01; 32], &[0x02; 32]);
-        trailing[1] -= 1; // length no longer covers the whole buffer
-        assert!(matches!(
-            der_ecdsa_to_raw(&trailing),
-            Err(KmsJwtError::MalformedSignature(_))
-        ));
-    }
-
-    fn stub_auth(server: &MockServer) -> KmsJwtAuth {
-        KmsJwtAuth::with_urls(
-            "CKTEST",
-            "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1",
-            reqwest::Client::new(),
-            &server.url("/token"),
-            &server.base_url(),
-            &server.url("/meta"),
-        )
-    }
-
-    fn mock_sign_chain(server: &MockServer) {
-        server.mock(|when, then| {
-            when.method(httpmock::Method::GET).path("/meta");
-            then.status(200)
-                .json_body(serde_json::json!({ "access_token": "metadata-token" }));
-        });
-        server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path_includes(":asymmetricSign");
-            then.status(200).json_body(serde_json::json!({
-                "signature": BASE64_STD.encode(der(&[0x11; 32], &[0x22; 32]))
-            }));
-        });
-    }
-
-    #[tokio::test]
-    async fn mints_a_well_formed_assertion_and_caches_the_token() {
-        let server = MockServer::start_async().await;
-        mock_sign_chain(&server);
-        let token_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/token")
-                .body_includes("grant_type=client_credentials")
-                .body_includes("client_id=CKTEST")
-                .body_includes(
-                    "client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer",
-                );
-            then.status(200)
-                .json_body(serde_json::json!({ "access_token": "tok-1", "expires_in": 900 }));
-        });
-
-        let auth = stub_auth(&server);
-        assert_eq!(auth.access_token().await.unwrap(), "tok-1");
-        // Second call inside the refresh window: cached, no new exchange.
-        assert_eq!(auth.access_token().await.unwrap(), "tok-1");
-        token_mock.assert_calls(1);
-    }
-
-    #[tokio::test]
-    async fn refresh_failure_rides_the_still_valid_cached_token() {
-        let server = MockServer::start_async().await;
-        mock_sign_chain(&server);
-        server.mock(|when, then| {
-            when.method(httpmock::Method::POST).path("/token");
-            then.status(500).body("boom");
-        });
-
-        let auth = stub_auth(&server);
-        // Seed a token past its soft refresh deadline but inside the
-        // hard expiry: a failing refresh must fall back to it.
-        *auth.cached.lock().unwrap() = Some(CachedToken {
-            access_token: "seeded".into(),
-            refresh_after: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
-            hard_expiry: Instant::now() + Duration::from_secs(60),
-        });
-        assert_eq!(auth.access_token().await.unwrap(), "seeded");
-
-        // Past the hard expiry the failure must surface instead.
-        auth.cached.lock().unwrap().as_mut().unwrap().hard_expiry =
-            Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
-        assert!(matches!(
-            auth.access_token().await,
-            Err(KmsJwtError::TokenStatus { status: 500, .. })
-        ));
-    }
 }
 
 /// Runtime side of [`AlpacaBrokerAuth`]: precomputed header values for
@@ -682,5 +590,210 @@ impl AuthRuntime {
             }
             Self::KmsJwt(_) => request,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use httpmock::MockServer;
+
+    use super::*;
+
+    // SEQUENCE of two INTEGERs, DER-style.
+    fn der(r_int: &[u8], s_int: &[u8]) -> Vec<u8> {
+        let total = u8::try_from(4 + r_int.len() + s_int.len()).unwrap();
+        let mut out = vec![0x30, total];
+        for int in [r_int, s_int] {
+            out.push(0x02);
+            out.push(u8::try_from(int.len()).unwrap());
+            out.extend_from_slice(int);
+        }
+        out
+    }
+
+    #[test]
+    fn der_full_width_integers_pass_through() {
+        let r_int = [0x11u8; 32];
+        let s_int = [0x22u8; 32];
+        let raw = der_ecdsa_to_raw(&der(&r_int, &s_int)).unwrap();
+        assert_eq!(&raw[..32], &r_int);
+        assert_eq!(&raw[32..], &s_int);
+    }
+
+    #[test]
+    fn der_short_integers_left_pad_and_leading_zero_strips() {
+        // r fits in 31 bytes; s carries the 0x00 prefix DER adds when
+        // the high bit is set (0xF0... stays below the group order).
+        let r_int = [0x01u8; 31];
+        let mut s_int = vec![0x00];
+        s_int.extend_from_slice(&[0xF0u8; 32]);
+        let raw = der_ecdsa_to_raw(&der(&r_int, &s_int)).unwrap();
+        assert_eq!(raw[0], 0x00);
+        assert_eq!(&raw[1..32], &r_int);
+        assert_eq!(&raw[32..], &[0xF0u8; 32]);
+    }
+
+    #[test]
+    fn der_garbage_is_rejected() {
+        assert!(matches!(
+            der_ecdsa_to_raw(&[]),
+            Err(KmsJwtError::MalformedSignature(_))
+        ));
+        assert!(matches!(
+            der_ecdsa_to_raw(&[0x30, 0x02, 0x02, 0x00]),
+            Err(KmsJwtError::MalformedSignature(_))
+        ));
+        let mut trailing = der(&[0x01; 32], &[0x02; 32]);
+        trailing[1] -= 1; // length no longer covers the whole buffer
+        assert!(matches!(
+            der_ecdsa_to_raw(&trailing),
+            Err(KmsJwtError::MalformedSignature(_))
+        ));
+    }
+
+    fn stub_auth(server: &MockServer) -> KmsJwtAuth {
+        KmsJwtAuth::with_urls(
+            "CKTEST",
+            "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1",
+            reqwest::Client::new(),
+            &server.url("/token"),
+            &server.base_url(),
+            &server.url("/meta"),
+        )
+    }
+
+    fn mock_sign_chain(server: &MockServer) {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/meta");
+            then.status(200)
+                .json_body(serde_json::json!({ "access_token": "metadata-token" }));
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path_includes(":asymmetricSign");
+            then.status(200).json_body(serde_json::json!({
+                "signature": BASE64_STD.encode(der(&[0x11; 32], &[0x22; 32]))
+            }));
+        });
+    }
+
+    #[tokio::test]
+    async fn mints_a_well_formed_assertion_and_caches_the_token() {
+        let server = MockServer::start_async().await;
+        mock_sign_chain(&server);
+        let token_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/token")
+                .body_includes("grant_type=client_credentials")
+                .body_includes("client_id=CKTEST")
+                .body_includes(
+                    "client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer",
+                );
+            then.status(200)
+                .json_body(serde_json::json!({ "access_token": "tok-1", "expires_in": 900 }));
+        });
+
+        let auth = stub_auth(&server);
+        assert_eq!(auth.access_token().await.unwrap(), "tok-1");
+        // Second call inside the refresh window: cached, no new exchange.
+        assert_eq!(auth.access_token().await.unwrap(), "tok-1");
+        token_mock.assert_calls(1);
+    }
+
+    fn basic_runtime() -> AuthRuntime {
+        AuthRuntime::build(AlpacaBrokerAuth::Basic {
+            api_key: "key-id".to_string(),
+            api_secret: "secret".to_string(),
+        })
+        .unwrap()
+    }
+
+    fn built_headers(request: reqwest::RequestBuilder) -> reqwest::header::HeaderMap {
+        request.build().unwrap().headers().clone()
+    }
+
+    #[tokio::test]
+    async fn basic_apca_sends_the_header_pair_and_no_authorization() {
+        let runtime = basic_runtime();
+        let request = reqwest::Client::new().get("http://example.invalid");
+        let headers = built_headers(runtime.apply_apca(request).await.unwrap());
+        assert_eq!(headers.get("apca-api-key-id").unwrap(), "key-id");
+        assert_eq!(headers.get("apca-api-secret-key").unwrap(), "secret");
+        assert!(headers.get(AUTHORIZATION).is_none());
+    }
+
+    #[tokio::test]
+    async fn basic_wallet_sends_basic_authorization_plus_the_apca_pair() {
+        let runtime = basic_runtime();
+        let request = reqwest::Client::new().get("http://example.invalid");
+        let headers = built_headers(runtime.apply_wallet(request).await.unwrap());
+        assert_eq!(headers.get("apca-api-key-id").unwrap(), "key-id");
+        assert_eq!(headers.get("apca-api-secret-key").unwrap(), "secret");
+        // base64("key-id:secret")
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap(),
+            "Basic a2V5LWlkOnNlY3JldA=="
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_apca_and_wallet_send_the_bearer_token_only() {
+        let server = MockServer::start_async().await;
+        mock_sign_chain(&server);
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/token");
+            then.status(200)
+                .json_body(serde_json::json!({ "access_token": "tok-1", "expires_in": 900 }));
+        });
+        let runtime = AuthRuntime::KmsJwt(std::sync::Arc::new(stub_auth(&server)));
+
+        for apply_wallet in [false, true] {
+            let request = reqwest::Client::new().get("http://example.invalid");
+            let request = if apply_wallet {
+                runtime.apply_wallet(request).await.unwrap()
+            } else {
+                runtime.apply_apca(request).await.unwrap()
+            };
+            let headers = built_headers(request);
+            assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer tok-1");
+            assert!(headers.get("apca-api-key-id").is_none());
+            assert!(headers.get("apca-api-secret-key").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_rides_the_still_valid_cached_token() {
+        let server = MockServer::start_async().await;
+        mock_sign_chain(&server);
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/token");
+            then.status(500).body("boom");
+        });
+
+        let auth = stub_auth(&server);
+        // Seed a token past its soft refresh deadline but inside the
+        // hard expiry: a failing refresh must fall back to it.
+        *auth.cached.lock().unwrap() = Some(CachedToken {
+            access_token: "seeded".into(),
+            refresh_after: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            hard_expiry: Instant::now() + Duration::from_secs(60),
+        });
+        assert_eq!(auth.access_token().await.unwrap(), "seeded");
+
+        // Past the hard expiry the failure must surface instead. (The
+        // successful fallback above deferred refresh_after by the failed-
+        // mint backoff, so expire both deadlines to model a cache whose
+        // token is truly dead.)
+        {
+            let mut cached = auth.cached.lock().unwrap();
+            let token = cached.as_mut().unwrap();
+            let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+            token.refresh_after = expired;
+            token.hard_expiry = expired;
+        }
+        assert!(matches!(
+            auth.access_token().await,
+            Err(KmsJwtError::TokenStatus { status: 500, .. })
+        ));
     }
 }

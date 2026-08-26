@@ -521,6 +521,9 @@ impl AlpacaTokenizationError {
         match self {
             Self::ApiError { status, .. } => Some(*status),
             Self::Reqwest(error) => error.status(),
+            Self::Auth(
+                KmsJwtError::KmsStatus { status, .. } | KmsJwtError::TokenStatus { status, .. },
+            ) => StatusCode::from_u16(*status).ok(),
             _ => None,
         }
     }

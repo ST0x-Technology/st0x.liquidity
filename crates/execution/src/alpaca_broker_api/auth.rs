@@ -393,6 +393,28 @@ mod tests {
     }
 
     #[test]
+    fn kms_auth_debug_prints_identifiers_and_parses_from_fields() {
+        // The KmsJwt Debug arm intentionally prints both fields: neither
+        // is a secret, and hiding them would hurt diagnosis.
+        let auth = AlpacaBrokerAuth::KmsJwt {
+            client_id: "CKTEST".to_string(),
+            kms_key_version: "projects/p/cryptoKeyVersions/1".to_string(),
+        };
+        let output = format!("{auth:?}");
+        assert!(output.contains("CKTEST"));
+        assert!(output.contains("projects/p/cryptoKeyVersions/1"));
+        assert!(!output.contains("REDACTED"));
+
+        // Untagged deserialization picks the variant from field names.
+        let parsed: AlpacaBrokerAuth = serde_json::from_value(serde_json::json!({
+            "client_id": "CKTEST",
+            "kms_key_version": "projects/p/cryptoKeyVersions/1",
+        }))
+        .unwrap();
+        assert!(matches!(parsed, AlpacaBrokerAuth::KmsJwt { .. }));
+    }
+
+    #[test]
     fn test_alpaca_broker_api_auth_env_debug_redacts_secrets() {
         let ctx = AlpacaBrokerApiCtx {
             auth: crate::AlpacaBrokerAuth::Basic {

@@ -25,12 +25,12 @@ pub mod mock;
 pub mod order;
 mod rate_limit;
 
-pub use alpaca_broker_api::kms_jwt::{AuthRuntime, KmsJwtError};
 pub use alpaca_broker_api::{
     AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError,
     AlpacaBrokerApiMode, AlpacaBrokerAuth, ConversionDirection, ConversionOrder,
     CryptoOrderOutcome, DeadlineCancel, JournalResponse, JournalStatus, TimeInForce,
 };
+pub use alpaca_broker_api::{AuthRuntime, KmsJwtError};
 // `AlpacaMarketDataError` is wrapped by `AlpacaBrokerApiError::LatestTrade`,
 // which delegates its own `backpressure()` classification straight to the
 // wrapped error (RAI-1494), so the parent app never needs to name or
