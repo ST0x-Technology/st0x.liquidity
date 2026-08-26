@@ -4053,12 +4053,15 @@ mod tests {
         let tokenization_service = AlpacaTokenizationService::new(
             server.base_url(),
             account_id,
-            "test_key".to_string(),
-            "test_secret".to_string(),
+            st0x_execution::AlpacaBrokerAuth::Basic {
+                api_key: "test_key".to_string(),
+                api_secret: "test_secret".to_string(),
+            },
             st0x_evm::StubWallet::stub(Address::ZERO),
             Network::new("base"),
             None,
-        );
+        )
+        .expect("basic-auth tokenization service");
         let issuer_request_id = IssuerRequestId::generate();
 
         let error = retry_on_backpressure(
@@ -4106,12 +4109,15 @@ mod tests {
         let tokenization_service = AlpacaTokenizationService::new(
             server.base_url(),
             account_id,
-            "test_key".to_string(),
-            "test_secret".to_string(),
+            st0x_execution::AlpacaBrokerAuth::Basic {
+                api_key: "test_key".to_string(),
+                api_secret: "test_secret".to_string(),
+            },
             st0x_evm::StubWallet::stub(Address::ZERO),
             Network::new("base"),
             None,
-        );
+        )
+        .expect("basic-auth tokenization service");
         let tx_hash = alloy::primitives::TxHash::ZERO;
 
         let error = retry_on_backpressure(

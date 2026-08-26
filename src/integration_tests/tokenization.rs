@@ -43,12 +43,15 @@ pub(crate) async fn create_test_service_from_mock(
     AlpacaTokenizationService::new(
         server.base_url(),
         TEST_ACCOUNT_ID,
-        "test_api_key".to_string(),
-        "test_api_secret".to_string(),
+        st0x_execution::AlpacaBrokerAuth::Basic {
+            api_key: "test_api_key".to_string(),
+            api_secret: "test_api_secret".to_string(),
+        },
         wallet,
         Network::new("base"),
         Some(redemption_wallet),
     )
+    .expect("basic-auth tokenization service")
     .with_polling_config(PollingConfig {
         interval: Duration::from_millis(10),
         timeout: Duration::from_secs(5),
