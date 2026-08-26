@@ -18,6 +18,7 @@ use alloy::sol_types::SolEvent as _;
 use rain_math_float::Float;
 use std::collections::HashMap;
 
+use st0x_evm::Chain;
 use st0x_evm::test_chain::{evm_mapping_slot, solidity_short_string};
 pub use st0x_evm::{IERC20, USDC_BASE};
 pub use st0x_hedge::bindings::DeployableERC20;
@@ -230,8 +231,11 @@ impl BaseChain<()> {
         // to a couple of blocks, which the 1s auto-mining clears within
         // seconds. (If a future Anvil changes this relationship the failure
         // is a loud e2e timeout, not a silent pass.)
+        // Report Base's real chain id: startup confirms the RPC is the chain
+        // its registry entry names, so a default 31337 would fail every e2e.
         let anvil = Anvil::new()
             .block_time(1)
+            .chain_id(Chain::Base.chain_id())
             .arg("--slots-in-an-epoch")
             .arg("1")
             .spawn();

@@ -898,6 +898,9 @@ fn validate_wallet_inputs(
                 None => return Err(CtxError::WalletSecretsMissing),
             };
 
+            // A disabled chain is absent from the registry, so this lookup
+            // covers both "never configured" and "configured but disabled".
+            // Neither can stand while the wallet signs on that chain.
             let signing_chain = |chain: Chain| -> Result<SigningChain, CtxError> {
                 let rpc_url = chains
                     .rpc_url(chain)
@@ -1784,8 +1787,10 @@ pub enum CtxError {
     #[error(transparent)]
     Wallet(#[from] crate::wallet::WalletCtxError),
     #[error(
-        "[chains.{chain}] is required when [wallet] is configured: the wallet signs \
-         on that chain and needs its rpc_url"
+        "[wallet] is configured but no rpc_url is available for {chain}: this build \
+         constructs a signer for every chain it may hold funds on, so {chain} needs a \
+         [chains.{chain}] table with a matching secrets entry, and cannot be \
+         lifecycle = \"disabled\""
     )]
     WalletMissingChain { chain: Chain },
     #[error("[wallet] config present but [wallet] secrets missing")]
@@ -2141,8 +2146,14 @@ mod tests {
 
     fn minimal_config_toml() -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
-        file.write_all(
-            br#"
+        file.write_all(minimal_config_toml_bytes()).unwrap();
+        file
+    }
+
+    /// The minimal config's raw bytes, so a test can vary a single line of it
+    /// rather than restating the whole file.
+    fn minimal_config_toml_bytes() -> &'static [u8] {
+        br#"
             database_url = ":memory:"
             server_port = 8080
             board_port = 8081
@@ -2152,6 +2163,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -2164,18 +2176,102 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
-        "#,
-        )
-        .unwrap();
-        file
+        "#
+    }
+
+    /// The enablement predicate has to run on the real load path, not just as
+    /// a unit. HyperEVM is the case that matters: the chain exists, a signer
+    /// is built for it, and nothing else is -- so a config raising it to
+    /// "active" reads as reasonable and must still be refused.
+    #[tokio::test]
+    async fn hyperevm_cannot_be_raised_to_active() {
+        let config = toml_file(
+            &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
+                "[chains.hyperevm]\n            lifecycle = \"observe-only\"",
+                "[chains.hyperevm]\n            lifecycle = \"active\"",
+            ),
+        );
+        let secrets = dry_run_secrets_toml();
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("hyperevm") && message.contains("gas valuation"),
+            "expected the predicate to name hyperevm and its missing capability, got: {message}"
+        );
+    }
+
+    /// A disabled chain is dropped from the registry, so a wallet that signs
+    /// on it finds no endpoint. This build constructs a signer for all three
+    /// chains, so disabling one is not yet expressible; the refusal names the
+    /// chain rather than failing later inside wallet construction.
+    #[tokio::test]
+    async fn a_signing_chain_cannot_be_disabled() {
+        let config = toml_file(
+            &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
+                "[chains.hyperevm]\n            lifecycle = \"observe-only\"",
+                "[chains.hyperevm]\n            lifecycle = \"disabled\"",
+            ),
+        );
+        // Its secrets entry goes too: a disabled chain leaves the registry, so
+        // keeping the entry would be refused as unconfigured instead.
+        let secrets = toml_file(
+            r#"
+            [chains.base]
+            rpc_url = "http://localhost:8545"
+
+            [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [broker]
+            type = "dry-run"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            "#,
+        );
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::WalletMissingChain {
+                    chain: Chain::HyperEvm
+                }
+            ),
+            "expected WalletMissingChain for hyperevm, got: {error:?}"
+        );
+    }
+
+    /// Every chain disabled is not a quiet no-op: the bot would act on nothing
+    /// at all, which is a misconfiguration rather than a valid idle state.
+    #[tokio::test]
+    async fn every_chain_disabled_is_refused() {
+        let config = toml_file(
+            &String::from_utf8_lossy(minimal_config_toml_bytes())
+                .replace("lifecycle = \"active\"", "lifecycle = \"disabled\"")
+                .replace("lifecycle = \"observe-only\"", "lifecycle = \"disabled\""),
+        );
+        let secrets = dry_run_secrets_toml();
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+
+        assert!(
+            error.to_string().contains("no chain at all"),
+            "expected the all-disabled refusal, got: {error}"
+        );
     }
 
     /// Pyth enrichment was removed (#1265): a config still carrying a feed id
@@ -2191,6 +2287,7 @@ mod tests {
             inventory_divergence_threshold = 10
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -2211,9 +2308,11 @@ mod tests {
             wrapped_equity_recovery = "disabled"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [assets.equities.AAPL]
@@ -2245,6 +2344,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -2257,9 +2357,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -2299,6 +2401,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -2311,9 +2414,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -2378,6 +2483,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -2390,9 +2496,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -2482,6 +2590,7 @@ mod tests {
             {pricing}
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -2494,9 +2603,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -2615,6 +2726,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -2623,9 +2735,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
         "#,
@@ -2665,6 +2779,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -2677,9 +2792,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -2723,6 +2840,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -2735,9 +2853,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -2778,6 +2898,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -2790,9 +2911,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -2833,6 +2956,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -2845,9 +2969,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -3012,6 +3138,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -3024,9 +3151,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
         "#,
@@ -3061,6 +3190,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -3073,9 +3203,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
         "#,
         );
@@ -3110,6 +3242,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -3122,9 +3255,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
         "#,
         );
@@ -3158,6 +3293,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -3170,9 +3306,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
         "#,
@@ -3207,6 +3345,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -3219,9 +3358,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
         "#,
@@ -3266,6 +3407,7 @@ mod tests {
             wrapped_equity_recovery = "disabled"
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -3278,9 +3420,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
         "#,
@@ -3315,6 +3459,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -3327,9 +3472,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -3367,6 +3514,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -3379,9 +3527,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -3418,6 +3568,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -3430,9 +3581,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -3496,6 +3649,7 @@ mod tests {
             operational_limit = 52
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -3509,9 +3663,11 @@ mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -3579,6 +3735,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -3591,9 +3748,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -3637,6 +3796,7 @@ mod tests {
             [assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -3649,9 +3809,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
             [wallet]
             kind = "private-key"
@@ -3685,6 +3847,7 @@ mod tests {
             [assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -3697,9 +3860,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
             [wallet]
             kind = "private-key"
@@ -3753,6 +3918,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -3766,9 +3932,11 @@ mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
             [rebalancing]
             transfer_timeout_secs = 1800
@@ -3856,6 +4024,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -3868,9 +4037,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -3926,6 +4097,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -3939,9 +4111,11 @@ mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -4008,6 +4182,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -4021,9 +4196,11 @@ mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -4094,6 +4271,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -4106,9 +4284,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -4190,6 +4370,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -4203,9 +4384,11 @@ mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -4422,6 +4605,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -4434,9 +4618,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -4492,6 +4678,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -4504,9 +4691,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -4572,6 +4761,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -4584,9 +4774,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -4646,6 +4838,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -4658,9 +4851,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -4718,6 +4913,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -4730,9 +4926,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -4904,6 +5102,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -4916,9 +5115,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -5109,6 +5310,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -5121,9 +5323,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -5181,6 +5385,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -5193,9 +5398,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -5257,6 +5464,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -5269,9 +5477,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -5330,6 +5540,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -5342,9 +5553,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -5406,6 +5619,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -5418,9 +5632,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -5882,6 +6098,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -5895,9 +6112,11 @@ mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
             [rebalancing]
             transfer_timeout_secs = 1800
@@ -6341,6 +6560,7 @@ mod tests {
             bogus_field = "should fail"
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -6353,9 +6573,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
         "#,
@@ -6387,6 +6609,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -6399,9 +6622,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
         "#,
@@ -6439,6 +6664,7 @@ mod tests {
             bogus_field = "should fail"
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -6451,9 +6677,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
         "#,
@@ -6484,6 +6712,7 @@ mod tests {
             bogus_field = "should fail"
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -6496,9 +6725,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
         "#,
@@ -6596,6 +6827,7 @@ mod tests {
             bogus_field = "should fail"
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -6608,9 +6840,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
         "#,
@@ -6863,6 +7097,7 @@ mod tests {
             ws_url = "wss://pricing.test/ws"
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -6875,9 +7110,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -6977,6 +7214,7 @@ mod tests {
             ws_url = "wss://pricing.test/ws"
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -6988,9 +7226,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -7035,6 +7275,7 @@ mod tests {
             ws_url = "wss://pricing.test/ws"
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -7046,9 +7287,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -7091,6 +7334,7 @@ mod tests {
             ws_url = "wss://pricing.test/ws"
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -7102,9 +7346,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -7147,6 +7393,7 @@ mod tests {
             ws_url = "wss://pricing.test/ws"
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -7158,9 +7405,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -7222,6 +7471,7 @@ mod tests {
             ws_url = "wss://pricing.test/ws"
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -7233,9 +7483,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -7325,6 +7577,7 @@ mod tests {
             ws_url = "wss://pricing.test/ws"
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -7336,9 +7589,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -7371,6 +7626,7 @@ mod tests {
             bogus_field = "should fail"
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -7383,9 +7639,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
         "#,
@@ -7440,6 +7698,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -7452,9 +7711,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
         "#,
         );
@@ -7495,6 +7756,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -7507,9 +7769,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -7568,6 +7832,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -7580,9 +7845,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [broker]
@@ -7668,6 +7935,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -7680,9 +7948,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]
@@ -7722,6 +7992,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base]
+            lifecycle = "active"
             required_confirmations = 3
 
             [chains.base.trading]
@@ -7734,9 +8005,11 @@ mod tests {
             ingestion_cutoff = "safe"
 
             [chains.ethereum]
+            lifecycle = "active"
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
             required_confirmations = 1
 
             [wallet]

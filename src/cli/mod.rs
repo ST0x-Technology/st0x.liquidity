@@ -3982,6 +3982,7 @@ mod tests {
                 [chains.base.trading.assets.equities]
 
                 [chains.base]
+                lifecycle = "active"
                 required_confirmations = 3
 
                 [chains.base.trading]
@@ -3994,9 +3995,11 @@ mod tests {
                 ingestion_cutoff = "safe"
 
                 [chains.ethereum]
+                lifecycle = "active"
                 required_confirmations = 12
 
                 [chains.hyperevm]
+                lifecycle = "observe-only"
                 required_confirmations = 1
 
                 [wallet]

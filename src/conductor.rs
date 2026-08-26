@@ -754,6 +754,8 @@ where
         .await
         .context("failed to reach RPC endpoint at startup")?;
 
+    confirm_chain_id(&provider, trading_chain.chain).await?;
+
     // Probe the configured cutoff block tag at startup to surface a
     // misconfigured or unsupported endpoint before the fill monitor starts
     // polling. A null response is allowed through (cold start); an error or
@@ -848,6 +850,8 @@ impl Conductor {
     {
         let (executor, provider, telemetry_writer, telemetry) =
             setup_instrumentation(executor_ctx, ctx.chains.sole_trading(), pool.clone()).await?;
+
+        confirm_transport_chain_ids(&ctx).await?;
         let cache = SymbolCache::default();
 
         let (job_queue, backfill_queue, dashboard_delivery, schedulers) =
@@ -2094,6 +2098,64 @@ fn build_rebalancing_raindex_service<Signer: Wallet + Clone>(
 /// gas reverting on the first rebalance (the shared-inventory cutover grants
 /// the role before rebalancing runs).
 ///
+/// Refuses an endpoint that is not the chain its registry entry names.
+///
+/// Every address in the entry -- orderbook, inventory, vaults, tokens -- is
+/// meaningful only on one chain, so an endpoint pointed at a different network
+/// would route funds by addresses that mean something else there, or nothing
+/// at all. The id comes from the [`Chain`] type rather than from config: a
+/// config-supplied id would be the very value being checked.
+/// The trading chain's id is confirmed inside `setup_instrumentation`; the
+/// transport chains hold funds through their signers, so a signer pointed at
+/// the wrong network must fail startup the same way.
+///
+/// Scoped to chains the registry actually holds: the wallet builds a signer
+/// for every chain unconditionally, but a chain absent from the registry has
+/// no configured addresses to protect, and its signer endpoint is never used.
+///
+/// Iterates [`Chain::ALL`] with an exhaustive signer match, so a future
+/// variant is covered by construction: the compiler demands its signer arm,
+/// and any configured transport endpoint gets confirmed without anyone
+/// remembering to add another check here.
+async fn confirm_transport_chain_ids(ctx: &Ctx) -> anyhow::Result<()> {
+    let Ok(wallet_ctx) = ctx.wallet() else {
+        return Ok(());
+    };
+
+    for chain in Chain::ALL {
+        if chain == ctx.chains.sole_trading().chain || ctx.chains.rpc_url(chain).is_none() {
+            continue;
+        }
+
+        let signer = match chain {
+            Chain::Base => wallet_ctx.base_wallet(),
+            Chain::Ethereum => wallet_ctx.ethereum_wallet(),
+            Chain::HyperEvm => wallet_ctx.hyperevm_wallet(),
+        };
+        confirm_chain_id(signer.provider(), chain).await?;
+    }
+
+    Ok(())
+}
+
+async fn confirm_chain_id<P: Provider>(provider: &P, chain: Chain) -> anyhow::Result<()> {
+    let reported = provider
+        .get_chain_id()
+        .await
+        .context("failed to read the chain id at startup")?;
+
+    anyhow::ensure!(
+        reported == chain.chain_id(),
+        "[chains.{chain}] points at an endpoint reporting chain id {reported}, but {chain} \
+         is chain id {}; every configured address means something different there",
+        chain.chain_id(),
+    );
+
+    info!(target: "startup", %chain, chain_id = reported, "Confirmed RPC chain id");
+
+    Ok(())
+}
+
 /// Skipped in [`InventoryMode::Legacy`]: no distinct inventory contract is in
 /// play (integration tests and any not-yet-migrated setup), so there is no
 /// `OPERATOR_ROLE` to check and the orderbook allowance is the live one, not a
@@ -4622,6 +4684,33 @@ mod tests {
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
+    }
+
+    /// An RPC pointed at the wrong network is the failure the chain-id check
+    /// exists for: every configured address means something different there,
+    /// so startup must refuse it rather than route funds by them.
+    #[tokio::test]
+    async fn confirm_chain_id_refuses_an_endpoint_on_another_network() {
+        let asserter = Asserter::new();
+        asserter.push_success(&format!("0x{:x}", Chain::Ethereum.chain_id()));
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let error = confirm_chain_id(&provider, Chain::Base).await.unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("8453") && message.contains('1'),
+            "the error must name both the expected and the reported id: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_chain_id_accepts_the_matching_network() {
+        let asserter = Asserter::new();
+        asserter.push_success(&format!("0x{:x}", Chain::Base.chain_id()));
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+
+        confirm_chain_id(&provider, Chain::Base).await.unwrap();
     }
 
     /// A wallet-backed `RaindexService` whose provider is an [`Asserter`] mock, so

@@ -554,6 +554,7 @@ extended_hours_counter_trading = "disabled"
 extended_hours_counter_trading = "disabled"
 
 [chains.base]
+lifecycle = "active"
 required_confirmations = 0
 
 [chains.base.trading]
@@ -566,9 +567,11 @@ ingestion_cutoff = "safe"
 redemption_wallet = "{redemption_wallet}"
 
 [chains.ethereum]
+lifecycle = "active"
 required_confirmations = 1
 
 [chains.hyperevm]
+lifecycle = "observe-only"
 required_confirmations = 1
 
 [wallet]

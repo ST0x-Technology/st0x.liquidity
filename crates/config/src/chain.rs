@@ -15,6 +15,7 @@ use url::Url;
 use st0x_evm::Chain;
 
 use crate::assets::ChainAssets;
+use crate::enablement::{ChainEnablementError, ChainLifecycle, check_enablement};
 
 /// Which block tag to use as the fill-ingestion cutoff.
 ///
@@ -174,6 +175,10 @@ pub enum ChainConfigError {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainConfig {
+    /// How far along this chain is in its bring-up. Required and explicit: a
+    /// chain silently defaulting to `active` would start moving funds the
+    /// moment it was described.
+    pub lifecycle: ChainLifecycle,
     /// Block-confirmation depth required before a transaction this bot submits
     /// to this chain is treated as settled. Per-chain because it encodes one
     /// chain's reorg behaviour; a single global value cannot be right for
@@ -387,6 +392,11 @@ pub enum ChainRegistryError {
     #[error("no [chains.<name>] table is configured; the bot must act on at least one chain")]
     NoChains,
     #[error(
+        "every configured chain has lifecycle = \"disabled\"; the bot would act on \
+         no chain at all"
+    )]
+    NoEnabledChains,
+    #[error(
         "no configured chain has a [chains.<name>.trading] table; the bot would have \
          no orderbook to watch and would place no hedges"
     )]
@@ -397,8 +407,9 @@ pub enum ChainRegistryError {
     )]
     MissingSecrets { chain: Chain },
     #[error(
-        "the secrets file has a [chains.{chain}] entry but the config file has no \
-         [chains.{chain}] table describing that chain"
+        "the secrets file has a [chains.{chain}] entry but the config file has no enabled \
+         [chains.{chain}] table: the table is missing, or its lifecycle is \"disabled\" and \
+         its rpc_url was left behind"
     )]
     UnconfiguredSecrets { chain: Chain },
     #[error(
@@ -411,6 +422,8 @@ pub enum ChainRegistryError {
     MultipleTradingChains { chains: Vec<Chain> },
     #[error(transparent)]
     Entry(#[from] ChainConfigError),
+    #[error(transparent)]
+    Enablement(#[from] ChainEnablementError),
 }
 
 impl ChainRegistry {
@@ -429,13 +442,25 @@ impl ChainRegistry {
             return Err(ChainRegistryError::NoChains);
         }
 
+        // A disabled chain is not constructed at all, so it needs no secrets
+        // entry and contributes nothing to the checks below.
+        let configs: BTreeMap<Chain, &ChainConfig> = configs
+            .iter()
+            .filter(|(_, config)| config.lifecycle != ChainLifecycle::Disabled)
+            .map(|(chain, config)| (*chain, config))
+            .collect();
+
+        if configs.is_empty() {
+            return Err(ChainRegistryError::NoEnabledChains);
+        }
+
         let trading_chains: Vec<(Chain, &ChainConfig, &TradingConfig)> = configs
             .iter()
             .filter_map(|(chain, config)| {
                 config
                     .trading
                     .as_ref()
-                    .map(|trading| (*chain, config, trading))
+                    .map(|trading| (*chain, *config, trading))
             })
             .collect();
 
@@ -448,6 +473,15 @@ impl ChainRegistry {
                 });
             }
         };
+
+        for (chain, config) in &configs {
+            check_enablement(
+                *chain,
+                config.lifecycle,
+                config.trading.is_some(),
+                config.trading.as_ref().map(|trading| &trading.assets),
+            )?;
+        }
 
         let mut take_rpc_url = |chain: Chain| {
             secrets
@@ -464,7 +498,7 @@ impl ChainRegistry {
         )?;
 
         let mut transport = BTreeMap::new();
-        for (chain, config) in configs {
+        for (chain, config) in &configs {
             if *chain == trading_chain {
                 continue;
             }
@@ -558,6 +592,7 @@ mod tests {
     /// so a fixture can exercise `TradingConfig` on its own.
     fn base_chain_config() -> ChainConfig {
         ChainConfig {
+            lifecycle: ChainLifecycle::Active,
             required_confirmations: 3,
             trading: None,
         }
@@ -740,6 +775,7 @@ mod tests {
 
     fn chain_config(trading: Option<TradingConfig>) -> ChainConfig {
         ChainConfig {
+            lifecycle: ChainLifecycle::Active,
             required_confirmations: 3,
             trading,
         }
@@ -771,6 +807,52 @@ mod tests {
 
         assert!(
             matches!(error, ChainRegistryError::NoChains),
+            "got: {error}"
+        );
+    }
+
+    /// Disabling a chain without scrubbing its secrets entry fails closed:
+    /// the leftover rpc_url raises [`ChainRegistryError::UnconfiguredSecrets`],
+    /// whose message names this exact case.
+    #[test]
+    fn registry_rejects_a_disabled_chain_with_a_leftover_secrets_entry() {
+        let mut ethereum = chain_config(None);
+        ethereum.lifecycle = ChainLifecycle::Disabled;
+        let configs = BTreeMap::from([
+            (Chain::Base, chain_config(Some(trading_config_toml()))),
+            (Chain::Ethereum, ethereum),
+        ]);
+
+        let error =
+            ChainRegistry::new(&configs, secrets_for(&[Chain::Base, Chain::Ethereum])).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                ChainRegistryError::UnconfiguredSecrets {
+                    chain: Chain::Ethereum
+                }
+            ),
+            "got: {error}"
+        );
+        assert!(
+            error.to_string().contains("lifecycle is \"disabled\""),
+            "the message must name the disabled case, got: {error}"
+        );
+    }
+
+    /// Every chain disabled is a misconfiguration, not a valid idle state:
+    /// the bot would act on nothing at all.
+    #[test]
+    fn registry_rejects_a_config_with_every_chain_disabled() {
+        let mut config = chain_config(Some(trading_config_toml()));
+        config.lifecycle = ChainLifecycle::Disabled;
+        let configs = BTreeMap::from([(Chain::Base, config)]);
+
+        let error = ChainRegistry::new(&configs, BTreeMap::new()).unwrap_err();
+
+        assert!(
+            matches!(error, ChainRegistryError::NoEnabledChains),
             "got: {error}"
         );
     }
@@ -884,6 +966,7 @@ mod tests {
             (
                 Chain::Base,
                 ChainConfig {
+                    lifecycle: ChainLifecycle::Active,
                     required_confirmations: 3,
                     trading: Some(trading_config_toml()),
                 },
@@ -891,6 +974,7 @@ mod tests {
             (
                 Chain::Ethereum,
                 ChainConfig {
+                    lifecycle: ChainLifecycle::Active,
                     required_confirmations: 12,
                     trading: None,
                 },

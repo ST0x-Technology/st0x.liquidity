@@ -12,7 +12,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 
-use crate::USDC_BASE;
+use crate::{Chain, USDC_BASE};
 
 sol!(
     #![sol(all_derives = true, rpc)]
@@ -54,7 +54,12 @@ impl AnvilTestChain<()> {
     /// Spawns a fresh Anvil instance with auto-mining (1s block time),
     /// deploys USDC at `USDC_BASE`, and funds owner + taker accounts.
     pub async fn start() -> anyhow::Result<AnvilTestChain<impl Provider + Clone>> {
-        let anvil = Anvil::new().block_time(1).spawn();
+        // Report Base's chain id so the startup chain-id confirmation runs
+        // against the harness instead of being skipped in tests.
+        let anvil = Anvil::new()
+            .block_time(1)
+            .chain_id(Chain::Base.chain_id())
+            .spawn();
 
         let key = B256::from_slice(&anvil.keys()[0].to_bytes());
         let signer = PrivateKeySigner::from_bytes(&key)?;
