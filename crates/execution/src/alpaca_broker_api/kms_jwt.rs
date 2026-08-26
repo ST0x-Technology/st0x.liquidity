@@ -590,7 +590,7 @@ pub enum AuthRuntime {
 
 impl AuthRuntime {
     pub fn build(auth: AlpacaBrokerAuth) -> Result<Self, KmsJwtError> {
-        match &auth {
+        match auth {
             AlpacaBrokerAuth::Basic {
                 api_key,
                 api_secret,
@@ -599,9 +599,9 @@ impl AuthRuntime {
                 let encoded = BASE64_STD.encode(credentials.as_bytes());
                 let mut authorization = HeaderValue::from_str(&format!("Basic {encoded}"))?;
                 authorization.set_sensitive(true);
-                let mut api_key = HeaderValue::from_str(api_key)?;
+                let mut api_key = HeaderValue::from_str(&api_key)?;
                 api_key.set_sensitive(true);
-                let mut api_secret = HeaderValue::from_str(api_secret)?;
+                let mut api_secret = HeaderValue::from_str(&api_secret)?;
                 api_secret.set_sensitive(true);
                 Ok(Self::Basic {
                     authorization,
@@ -621,8 +621,8 @@ impl AuthRuntime {
                     .timeout(Duration::from_secs(10))
                     .build()?;
                 Ok(Self::KmsJwt(std::sync::Arc::new(KmsJwtAuth::new(
-                    client_id,
-                    kms_key_version,
+                    &client_id,
+                    &kms_key_version,
                     http,
                 ))))
             }
