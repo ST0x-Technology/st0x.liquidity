@@ -33,6 +33,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as BASE64_STD, URL_SAFE_NO_PAD as BASE64_URL};
+use p256::{SecretKey, ecdsa, elliptic_curve, pkcs8};
 use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -44,6 +45,11 @@ use crate::rate_limit::retry_after_from_response_headers;
 /// Alpaca's token endpoint for live broker partners. Doubles as the
 /// assertion audience, per RFC 7523.
 pub const ALPACA_TOKEN_URL: &str = "https://authx.alpaca.markets/v1/oauth2/token";
+
+/// The sandbox token endpoint: sandbox BrokerDash credentials mint here,
+/// mirroring the broker/market-data host split by mode.
+pub(crate) const ALPACA_SANDBOX_TOKEN_URL: &str =
+    "https://authx.sandbox.alpaca.markets/v1/oauth2/token";
 
 const DEFAULT_KMS_BASE_URL: &str = "https://cloudkms.googleapis.com/v1";
 const METADATA_TOKEN_URL: &str =
@@ -65,6 +71,13 @@ const TOKEN_HARD_MARGIN: Duration = Duration::from_secs(10);
 /// re-run the full three-round-trip mint back to back for the whole
 /// refresh window.
 const FAILED_MINT_BACKOFF: Duration = Duration::from_secs(15);
+
+/// Connect and request timeout for each mint round-trip (KMS sign,
+/// metadata token, authx exchange). A compile-time constant like the
+/// broker client's `HTTP_REQUEST_TIMEOUT`, not deployment config: the
+/// bound protects the token cache's refresh margin, and no environment
+/// tunes it independently.
+const MINT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Ceiling on the token lifetime we believe from the endpoint. Alpaca
 /// says 15 minutes; a wild `expires_in` must not push the expiry
@@ -96,7 +109,17 @@ pub enum KmsJwtError {
     #[error("base64 decode of KMS response failed: {0}")]
     Base64(#[from] base64::DecodeError),
     #[error("malformed DER ECDSA signature from KMS: {0}")]
-    MalformedSignature(#[from] p256::ecdsa::Error),
+    MalformedSignature(#[from] ecdsa::Error),
+    /// Same source type as [`Self::MalformedSignature`] but a different
+    /// operation: the local PEM key failed to produce a signature at
+    /// all. Mapped explicitly (no `#[from]`) since the derive can only
+    /// route `ecdsa::Error` to one variant.
+    #[error("local PEM signing failed: {0}")]
+    LocalSign(#[source] ecdsa::Error),
+    #[error("invalid SEC1 EC private key PEM: {0}")]
+    Sec1PrivateKey(#[from] elliptic_curve::Error),
+    #[error("invalid PKCS#8 private key PEM: {0}")]
+    Pkcs8PrivateKey(#[from] pkcs8::Error),
     #[error("claims serialization failed: {0}")]
     Claims(#[from] serde_json::Error),
     #[error("credential contains bytes invalid in an HTTP header: {0}")]
@@ -119,6 +142,9 @@ impl KmsJwtError {
             }
             Self::Base64(_)
             | Self::MalformedSignature(_)
+            | Self::LocalSign(_)
+            | Self::Sec1PrivateKey(_)
+            | Self::Pkcs8PrivateKey(_)
             | Self::Claims(_)
             | Self::InvalidHeader(_)
             | Self::ClockBeforeEpoch => true,
@@ -145,8 +171,11 @@ impl KmsJwtError {
     }
 }
 
-/// Signs client assertions with Cloud KMS and exchanges them for
-/// cached bearer tokens.
+/// Signs client assertions and exchanges them for cached bearer tokens.
+///
+/// The signature comes from one of two places (see [`AssertionSigner`]);
+/// everything else -- the assertion claims, the token exchange, and the
+/// cache -- is shared between them.
 ///
 /// Shared behind an `Arc` so every clone of one client reuses that
 /// client's token cache. (Each client builds its own runtime today, so
@@ -154,12 +183,8 @@ impl KmsJwtError {
 /// tokens per client_id, observed live 2026-08-25.)
 pub struct KmsJwtAuth {
     client_id: String,
-    /// Full KMS key-version resource name
-    /// (`projects/.../cryptoKeyVersions/1`).
-    kms_key_version: String,
+    signer: AssertionSigner,
     token_url: String,
-    kms_base_url: String,
-    metadata_token_url: String,
     http: reqwest::Client,
     /// Read on every request (std mutex, never held across await); a
     /// caller holding a still-valid token never waits on a mint.
@@ -167,6 +192,39 @@ pub struct KmsJwtAuth {
     /// Serializes mints so concurrent stale callers cannot stampede the
     /// token endpoint.
     mint_lock: Mutex<()>,
+}
+
+/// Where the ES256 signature over a client assertion comes from.
+enum AssertionSigner {
+    /// A non-extractable `EC_SIGN_P256_SHA256` key in Cloud KMS,
+    /// authorized by ambient GCP identity. The production posture.
+    Kms {
+        /// Full KMS key-version resource name
+        /// (`projects/.../cryptoKeyVersions/1`).
+        kms_key_version: String,
+        kms_base_url: String,
+        metadata_token_url: String,
+    },
+    /// The BrokerDash credential's EC P-256 private key held in memory
+    /// (parsed from the dashboard's `private_key_jwt` PEM export). For
+    /// operator/CLI use against the sandbox, where no KMS key or IAM
+    /// grant exists; the production bot stays on [`Self::Kms`].
+    LocalPem(ecdsa::SigningKey),
+}
+
+// The signing key must never reach logs.
+impl std::fmt::Debug for AssertionSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Kms {
+                kms_key_version, ..
+            } => f
+                .debug_struct("Kms")
+                .field("kms_key_version", kms_key_version)
+                .finish_non_exhaustive(),
+            Self::LocalPem(_) => f.debug_tuple("LocalPem").field(&"[REDACTED]").finish(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -185,7 +243,7 @@ impl std::fmt::Debug for KmsJwtAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KmsJwtAuth")
             .field("client_id", &self.client_id)
-            .field("kms_key_version", &self.kms_key_version)
+            .field("signer", &self.signer)
             .field("token_url", &self.token_url)
             .finish_non_exhaustive()
     }
@@ -239,14 +297,72 @@ impl KmsJwtAuth {
     ) -> Self {
         Self {
             client_id: client_id.to_string(),
-            kms_key_version: kms_key_version.to_string(),
+            signer: AssertionSigner::Kms {
+                kms_key_version: kms_key_version.to_string(),
+                kms_base_url: kms_base_url.to_string(),
+                metadata_token_url: metadata_token_url.to_string(),
+            },
             token_url: token_url.to_string(),
-            kms_base_url: kms_base_url.to_string(),
-            metadata_token_url: metadata_token_url.to_string(),
             http,
             cached: StdMutex::new(None),
             mint_lock: Mutex::new(()),
         }
+    }
+
+    /// Signs assertions with a locally held EC P-256 private key (the
+    /// BrokerDash `private_key_jwt` PEM export). Accepts SEC1
+    /// (`BEGIN EC PRIVATE KEY`) and PKCS#8 (`BEGIN PRIVATE KEY`) PEMs.
+    ///
+    /// The raw export file works as-is: exports bundle the key with
+    /// other PEM blocks (`EC PARAMETERS`, the public key), and only the
+    /// private-key block between its BEGIN/END markers is parsed.
+    fn local_pem(
+        client_id: &str,
+        private_key_pem: &str,
+        http: reqwest::Client,
+        token_url: &str,
+    ) -> Result<Self, KmsJwtError> {
+        const SEC1_BEGIN: &str = "-----BEGIN EC PRIVATE KEY-----";
+        const SEC1_END: &str = "-----END EC PRIVATE KEY-----";
+        const PKCS8_BEGIN: &str = "-----BEGIN PRIVATE KEY-----";
+        const PKCS8_END: &str = "-----END PRIVATE KEY-----";
+
+        let secret_key = if let Some(wrapped_body) =
+            rewrapped_block_body(private_key_pem, SEC1_BEGIN, SEC1_END)
+        {
+            let normalized = format!("{SEC1_BEGIN}\n{wrapped_body}\n{SEC1_END}\n");
+            match SecretKey::from_sec1_pem(&normalized) {
+                Ok(secret_key) => secret_key,
+                Err(sec1_error) => {
+                    // Some exports wrap a PKCS#8 document in SEC1
+                    // markers (openssl parses by content, not label), so
+                    // retry the same body as PKCS#8. When both parses
+                    // fail, report the error matching the block's
+                    // declared SEC1 label.
+                    let relabeled = format!("{PKCS8_BEGIN}\n{wrapped_body}\n{PKCS8_END}\n");
+                    pkcs8::DecodePrivateKey::from_pkcs8_pem(&relabeled)
+                        .map_err(|_: pkcs8::Error| KmsJwtError::Sec1PrivateKey(sec1_error))?
+                }
+            }
+        } else if let Some(wrapped_body) =
+            rewrapped_block_body(private_key_pem, PKCS8_BEGIN, PKCS8_END)
+        {
+            let normalized = format!("{PKCS8_BEGIN}\n{wrapped_body}\n{PKCS8_END}\n");
+            pkcs8::DecodePrivateKey::from_pkcs8_pem(&normalized)?
+        } else {
+            // No recognizable private-key markers: hand the input to the
+            // PKCS#8 parser so it reports the malformed PEM itself.
+            pkcs8::DecodePrivateKey::from_pkcs8_pem(private_key_pem)?
+        };
+
+        Ok(Self {
+            client_id: client_id.to_string(),
+            signer: AssertionSigner::LocalPem(ecdsa::SigningKey::from(secret_key)),
+            token_url: token_url.to_string(),
+            http,
+            cached: StdMutex::new(None),
+            mint_lock: Mutex::new(()),
+        })
     }
 
     /// The cached token if `deadline(token)` is still ahead of now.
@@ -360,7 +476,11 @@ impl KmsJwtAuth {
         .min(hard_expiry);
         tracing::info!(
             expires_in = token.expires_in,
-            "Minted Alpaca access token via KMS client assertion"
+            signer = match &self.signer {
+                AssertionSigner::Kms { .. } => "kms",
+                AssertionSigner::LocalPem(_) => "local-pem",
+            },
+            "Minted Alpaca access token via client assertion"
         );
         let access = token.access_token.clone();
         *self
@@ -401,9 +521,29 @@ impl KmsJwtAuth {
         }))?);
         let signing_input = format!("{header}.{claims}");
 
-        let digest = Sha256::digest(signing_input.as_bytes());
-        let der = self.kms_sign(&digest).await?;
-        let raw = der_ecdsa_to_raw(&der)?;
+        let raw: [u8; 64] = match &self.signer {
+            AssertionSigner::Kms {
+                kms_key_version,
+                kms_base_url,
+                metadata_token_url,
+            } => {
+                let digest = Sha256::digest(signing_input.as_bytes());
+                let der = self
+                    .kms_sign(&digest, kms_key_version, kms_base_url, metadata_token_url)
+                    .await?;
+                der_ecdsa_to_raw(&der)?
+            }
+            // ES256 is ECDSA over SHA-256 of the message; the signer
+            // hashes internally and yields the raw `r || s` directly.
+            // `try_sign`, not `sign`: the infallible wrapper panics on a
+            // signing error, which production code must never do.
+            AssertionSigner::LocalPem(key) => {
+                let signature: ecdsa::Signature =
+                    ecdsa::signature::Signer::try_sign(key, signing_input.as_bytes())
+                        .map_err(KmsJwtError::LocalSign)?;
+                signature.to_bytes().into()
+            }
+        };
         Ok(format!("{signing_input}.{}", BASE64_URL.encode(raw)))
     }
 
@@ -414,12 +554,18 @@ impl KmsJwtAuth {
     /// `GOOGLE_OAUTH_ACCESS_TOKEN` overrides the metadata server, the
     /// same break-glass the Turnkey stamper honors, so an operator can
     /// run the bot off-VM with `gcloud auth print-access-token`.
-    async fn kms_sign(&self, digest: &[u8]) -> Result<Vec<u8>, KmsJwtError> {
+    async fn kms_sign(
+        &self,
+        digest: &[u8],
+        kms_key_version: &str,
+        kms_base_url: &str,
+        metadata_token_url: &str,
+    ) -> Result<Vec<u8>, KmsJwtError> {
         let access_token = match std::env::var("GOOGLE_OAUTH_ACCESS_TOKEN") {
             Ok(token) if !token.trim().is_empty() => token,
             _ => {
                 self.http
-                    .get(&self.metadata_token_url)
+                    .get(metadata_token_url)
                     .header("Metadata-Flavor", "Google")
                     .send()
                     .await?
@@ -430,10 +576,7 @@ impl KmsJwtAuth {
             }
         };
 
-        let url = format!(
-            "{}/{}:asymmetricSign",
-            self.kms_base_url, self.kms_key_version
-        );
+        let url = format!("{kms_base_url}/{kms_key_version}:asymmetricSign");
         let resp = self
             .http
             .post(&url)
@@ -478,8 +621,33 @@ fn truncate_error_body(mut body: String) -> String {
 /// the parsing (and rejects out-of-range scalars), the same crate the
 /// Turnkey stamper leans on.
 fn der_ecdsa_to_raw(der: &[u8]) -> Result<[u8; 64], KmsJwtError> {
-    let sig = p256::ecdsa::Signature::from_der(der)?;
+    let sig = ecdsa::Signature::from_der(der)?;
     Ok(sig.to_bytes().into())
+}
+
+/// The base64 body of the PEM block delimited by the given markers,
+/// whitespace-stripped and re-wrapped at 64 columns: the strict RFC 7468
+/// parser rejects longer lines, and exports write the body as one long
+/// line (openssl tolerates that, the parser does not). Bounding at the
+/// end marker keeps blocks before or after the key (parameters, the
+/// public key) away from the parser. `None` when the begin marker is
+/// absent; a missing end marker leaves trailing junk in the body, which
+/// the key parser then reports itself.
+fn rewrapped_block_body(pem: &str, begin_marker: &str, end_marker: &str) -> Option<String> {
+    let block_start = pem.find(begin_marker)?;
+    let after_begin = &pem[block_start + begin_marker.len()..];
+    let body = after_begin
+        .find(end_marker)
+        .map_or(after_begin, |end_offset| &after_begin[..end_offset]);
+
+    let mut wrapped_body = String::with_capacity(body.len() + body.len() / 64 + 1);
+    for (index, character) in body.split_whitespace().flat_map(str::chars).enumerate() {
+        if index > 0 && index % 64 == 0 {
+            wrapped_body.push('\n');
+        }
+        wrapped_body.push(character);
+    }
+    Some(wrapped_body)
 }
 
 /// Runtime side of [`AlpacaBrokerAuth`]: precomputed header values for
@@ -497,7 +665,10 @@ pub enum AuthRuntime {
 }
 
 impl AuthRuntime {
-    pub fn build(auth: AlpacaBrokerAuth) -> Result<Self, KmsJwtError> {
+    /// Builds the runtime for `auth`, minting JWT-variant tokens at
+    /// `token_url` (derive it from the mode so sandbox credentials mint
+    /// at the sandbox authx host; Basic ignores it).
+    pub fn build(auth: AlpacaBrokerAuth, token_url: &str) -> Result<Self, KmsJwtError> {
         match auth {
             AlpacaBrokerAuth::Basic {
                 api_key,
@@ -521,20 +692,38 @@ impl AuthRuntime {
                 client_id,
                 kms_key_version,
             } => {
-                // Own client: the mint's three round-trips (metadata,
-                // KMS, token endpoint) should not inherit the broker
-                // client's default headers.
-                let http = reqwest::Client::builder()
-                    .connect_timeout(Duration::from_secs(10))
-                    .timeout(Duration::from_secs(10))
-                    .build()?;
-                Ok(Self::KmsJwt(std::sync::Arc::new(KmsJwtAuth::new(
+                let http = Self::mint_http_client()?;
+                Ok(Self::KmsJwt(std::sync::Arc::new(KmsJwtAuth::with_urls(
                     &client_id,
                     &kms_key_version,
                     http,
+                    token_url,
+                    DEFAULT_KMS_BASE_URL,
+                    METADATA_TOKEN_URL,
                 ))))
             }
+            AlpacaBrokerAuth::PrivateKeyJwt {
+                client_id,
+                private_key_pem,
+            } => {
+                let http = Self::mint_http_client()?;
+                Ok(Self::KmsJwt(std::sync::Arc::new(KmsJwtAuth::local_pem(
+                    &client_id,
+                    &private_key_pem,
+                    http,
+                    token_url,
+                )?)))
+            }
         }
+    }
+
+    /// Own client for the mint round-trips: they should not inherit the
+    /// broker client's default headers.
+    fn mint_http_client() -> Result<reqwest::Client, KmsJwtError> {
+        Ok(reqwest::Client::builder()
+            .connect_timeout(MINT_HTTP_TIMEOUT)
+            .timeout(MINT_HTTP_TIMEOUT)
+            .build()?)
     }
 
     /// `Authorization` header for a Broker API request.
@@ -700,6 +889,245 @@ mod tests {
         token_mock.assert_calls(1);
     }
 
+    /// A deterministic P-256 key for the local-PEM tests, round-tripped
+    /// through the same SEC1 PEM encoding the BrokerDash export uses.
+    fn test_key_pem() -> (SecretKey, String) {
+        let secret = SecretKey::from_slice(&[0x37; 32]).unwrap();
+        let pem = secret
+            .to_sec1_pem(pkcs8::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        (secret, pem)
+    }
+
+    #[tokio::test]
+    async fn local_pem_assertion_verifies_against_the_public_key() {
+        let (secret, pem) = test_key_pem();
+        let auth = KmsJwtAuth::local_pem(
+            "CKLOCAL",
+            &pem,
+            reqwest::Client::new(),
+            "https://authx.test/t",
+        )
+        .unwrap();
+
+        let assertion = auth.sign_assertion().await.unwrap();
+        let [header, claims, signature]: [&str; 3] =
+            assertion.split('.').collect::<Vec<_>>().try_into().unwrap();
+
+        let claims: serde_json::Value =
+            serde_json::from_slice(&BASE64_URL.decode(claims).unwrap()).unwrap();
+        assert_eq!(claims["iss"], "CKLOCAL");
+        assert_eq!(claims["sub"], "CKLOCAL");
+        assert_eq!(claims["aud"], "https://authx.test/t");
+
+        assert_eq!(
+            String::from_utf8(BASE64_URL.decode(header).unwrap()).unwrap(),
+            r#"{"alg":"ES256","typ":"JWT"}"#
+        );
+
+        let verifying = ecdsa::VerifyingKey::from(secret.public_key());
+        let raw = BASE64_URL.decode(signature).unwrap();
+        let signature = ecdsa::Signature::from_slice(&raw).unwrap();
+        let signing_input = assertion.rsplit_once('.').unwrap().0;
+        ecdsa::signature::Verifier::verify(&verifying, signing_input.as_bytes(), &signature)
+            .expect("the local ES256 signature must verify against the key's public half");
+    }
+
+    #[tokio::test]
+    async fn local_pem_mints_without_any_kms_round_trip() {
+        // Only the token endpoint is mocked: a metadata or KMS request
+        // would hit an unmatched route and fail the mint, so success
+        // proves the local signer makes no KMS round trips.
+        let server = MockServer::start_async().await;
+        let token_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/token")
+                .body_includes("grant_type=client_credentials")
+                .body_includes("client_id=CKLOCAL")
+                .body_includes("client_assertion=");
+            then.status(200)
+                .json_body(serde_json::json!({ "access_token": "tok-local", "expires_in": 900 }));
+        });
+
+        let (_, pem) = test_key_pem();
+        let auth = KmsJwtAuth::local_pem(
+            "CKLOCAL",
+            &pem,
+            reqwest::Client::new(),
+            &server.url("/token"),
+        )
+        .unwrap();
+
+        assert_eq!(auth.access_token().await.unwrap(), "tok-local");
+        // Cached inside the refresh window: still exactly one exchange.
+        assert_eq!(auth.access_token().await.unwrap(), "tok-local");
+        token_mock.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn private_key_jwt_runtime_builds_and_mints_through_the_token_url() {
+        // The AuthRuntime::build branch, not the KmsJwtAuth constructor
+        // directly: proves the config-level PrivateKeyJwt variant parses
+        // the PEM, forwards the caller's token URL, and answers broker
+        // requests with the minted bearer.
+        let server = MockServer::start_async().await;
+        let token_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/token")
+                .body_includes("grant_type=client_credentials")
+                .body_includes("client_id=CKRUNTIME")
+                .body_includes("client_assertion=");
+            then.status(200)
+                .json_body(serde_json::json!({ "access_token": "tok-runtime", "expires_in": 900 }));
+        });
+
+        let (_, pem) = test_key_pem();
+        let runtime = AuthRuntime::build(
+            AlpacaBrokerAuth::PrivateKeyJwt {
+                client_id: "CKRUNTIME".to_string(),
+                private_key_pem: pem,
+            },
+            &server.url("/token"),
+        )
+        .unwrap();
+
+        let header = runtime.broker_authorization().await.unwrap();
+
+        assert_eq!(header.to_str().unwrap(), "Bearer tok-runtime");
+        token_mock.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn local_pem_accepts_an_ec_parameters_prefixed_export() {
+        // Raw exports bundle the private key with other PEM blocks: the
+        // BrokerDash export puts the public key first, openssl prepends
+        // the named-curve parameters block (this base64 is the
+        // prime256v1 OID), and trailing content can follow. Exports also
+        // write the key body as ONE long base64 line, which strict
+        // RFC 7468 parsing rejects unwrapped. The private-key block must
+        // parse and sign from that bundle as-is.
+        let (secret, pem) = test_key_pem();
+        let single_line_body: String = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let bundled = format!(
+            "-----BEGIN EC PUBLIC KEY-----\nfixture\n-----END EC PUBLIC KEY-----\n\n\
+             -----BEGIN EC PARAMETERS-----\nBggqhkjOPQMBBw==\n-----END EC PARAMETERS-----\n\
+             -----BEGIN EC PRIVATE KEY-----\n{single_line_body}\n\
+             -----END EC PRIVATE KEY-----\ntrailing notes"
+        );
+
+        let auth = KmsJwtAuth::local_pem(
+            "CKLOCAL",
+            &bundled,
+            reqwest::Client::new(),
+            "https://authx.test/t",
+        )
+        .unwrap();
+
+        let assertion = auth.sign_assertion().await.unwrap();
+        let signing_input = assertion.rsplit_once('.').unwrap().0;
+        let raw = BASE64_URL
+            .decode(assertion.rsplit_once('.').unwrap().1)
+            .unwrap();
+        let signature = ecdsa::Signature::from_slice(&raw).unwrap();
+        let verifying = ecdsa::VerifyingKey::from(secret.public_key());
+        ecdsa::signature::Verifier::verify(&verifying, signing_input.as_bytes(), &signature)
+            .expect("the bundled-PEM key must sign a verifiable assertion");
+    }
+
+    #[tokio::test]
+    async fn local_pem_accepts_a_pkcs8_body_under_sec1_markers() {
+        // The BrokerDash export observed 2026-08-27 wraps a PKCS#8
+        // document in `EC PRIVATE KEY` markers, with the public key
+        // block first and the body on one long line. openssl parses it
+        // by content; local_pem must too.
+        let (secret, _) = test_key_pem();
+        let pkcs8_pem =
+            pkcs8::EncodePrivateKey::to_pkcs8_pem(&secret, pkcs8::LineEnding::LF).unwrap();
+        let single_line_body: String = pkcs8_pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let bundled = format!(
+            "-----BEGIN EC PUBLIC KEY-----\nfixture\n-----END EC PUBLIC KEY-----\n\n\
+             -----BEGIN EC PRIVATE KEY-----\n{single_line_body}\n-----END EC PRIVATE KEY-----\n"
+        );
+
+        let auth = KmsJwtAuth::local_pem(
+            "CKLOCAL",
+            &bundled,
+            reqwest::Client::new(),
+            "https://authx.test/t",
+        )
+        .unwrap();
+
+        let assertion = auth.sign_assertion().await.unwrap();
+        let signing_input = assertion.rsplit_once('.').unwrap().0;
+        let raw = BASE64_URL
+            .decode(assertion.rsplit_once('.').unwrap().1)
+            .unwrap();
+        let signature = ecdsa::Signature::from_slice(&raw).unwrap();
+        let verifying = ecdsa::VerifyingKey::from(secret.public_key());
+        ecdsa::signature::Verifier::verify(&verifying, signing_input.as_bytes(), &signature)
+            .expect("the PKCS#8-under-SEC1-markers key must sign a verifiable assertion");
+    }
+
+    #[tokio::test]
+    async fn local_pem_accepts_a_single_line_pkcs8_export() {
+        // A PKCS#8 export under its own markers gets the same 64-column
+        // body normalization as the SEC1 branch: a single-line body must
+        // parse and sign, not trip the strict parser's line limit.
+        let (secret, _) = test_key_pem();
+        let pkcs8_pem =
+            pkcs8::EncodePrivateKey::to_pkcs8_pem(&secret, pkcs8::LineEnding::LF).unwrap();
+        let single_line_body: String = pkcs8_pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let flattened =
+            format!("-----BEGIN PRIVATE KEY-----\n{single_line_body}\n-----END PRIVATE KEY-----\n");
+
+        let auth = KmsJwtAuth::local_pem(
+            "CKLOCAL",
+            &flattened,
+            reqwest::Client::new(),
+            "https://authx.test/t",
+        )
+        .unwrap();
+
+        let assertion = auth.sign_assertion().await.unwrap();
+        let signing_input = assertion.rsplit_once('.').unwrap().0;
+        let raw = BASE64_URL
+            .decode(assertion.rsplit_once('.').unwrap().1)
+            .unwrap();
+        let signature = ecdsa::Signature::from_slice(&raw).unwrap();
+        let verifying = ecdsa::VerifyingKey::from(secret.public_key());
+        ecdsa::signature::Verifier::verify(&verifying, signing_input.as_bytes(), &signature)
+            .expect("the single-line PKCS#8 key must sign a verifiable assertion");
+    }
+
+    #[test]
+    fn local_pem_rejects_invalid_keys() {
+        let sec1_garbage = "-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n";
+        assert!(matches!(
+            KmsJwtAuth::local_pem("CK", sec1_garbage, reqwest::Client::new(), "https://t"),
+            Err(KmsJwtError::Sec1PrivateKey(_))
+        ));
+
+        assert!(matches!(
+            KmsJwtAuth::local_pem(
+                "CK",
+                "not a pem at all",
+                reqwest::Client::new(),
+                "https://t"
+            ),
+            Err(KmsJwtError::Pkcs8PrivateKey(_))
+        ));
+    }
+
     /// Expire both cache deadlines. Take-modify-reinsert keeps each
     /// `MutexGuard` a same-statement temporary, so neither the
     /// guard-across-await nor the significant-drop lint can fire.
@@ -712,10 +1140,14 @@ mod tests {
     }
 
     fn basic_runtime() -> AuthRuntime {
-        AuthRuntime::build(AlpacaBrokerAuth::Basic {
-            api_key: "key-id".to_string(),
-            api_secret: "secret".to_string(),
-        })
+        // Basic ignores the token URL; any value satisfies the signature.
+        AuthRuntime::build(
+            AlpacaBrokerAuth::Basic {
+                api_key: "key-id".to_string(),
+                api_secret: "secret".to_string(),
+            },
+            ALPACA_TOKEN_URL,
+        )
         .unwrap()
     }
 

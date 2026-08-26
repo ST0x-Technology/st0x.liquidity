@@ -48,7 +48,7 @@ impl std::fmt::Debug for AlpacaBrokerApiClient {
 
 impl AlpacaBrokerApiClient {
     pub(crate) fn new(ctx: &AlpacaBrokerApiCtx) -> Result<Self, AlpacaBrokerApiError> {
-        let auth = AuthRuntime::build(ctx.auth.clone())?;
+        let auth = AuthRuntime::build(ctx.auth.clone(), &ctx.mode().token_url())?;
 
         let headers =
             HeaderMap::from_iter([(CONTENT_TYPE, HeaderValue::from_static("application/json"))]);

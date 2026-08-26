@@ -434,16 +434,27 @@ fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
 
     /// Domain-based log targets used via `target: "..."` in tracing macros.
     /// These must be listed here so the `EnvFilter` captures them alongside
-    /// module-path-based crate targets.
-    const DOMAIN_TARGETS: [&str; 11] = [
+    /// module-path-based crate targets -- a `target:` overrides the module
+    /// path, so an unlisted target's events are silently dropped at every
+    /// level. Keep in sync with
+    /// `grep -rhoE 'target: "[a-z_]+"' src/ crates/` (plus `cqrs` from the
+    /// external st0x-event-sorcery crate).
+    const DOMAIN_TARGETS: [&str; 18] = [
+        "backfill",
         "bridge",
         "broker",
         "cqrs",
         "dashboard",
+        "equity",
+        "evm",
+        "gas",
         "hedge",
         "inventory",
+        "market_data",
         "orderbook",
         "rebalance",
+        "reliability",
+        "shutdown",
         "startup",
         "tokenization",
         "wallet",
@@ -469,6 +480,44 @@ mod tests {
     use tempfile::{NamedTempFile, tempdir};
 
     use super::*;
+
+    #[test]
+    fn crate_filter_enables_every_domain_target_in_use() {
+        // A `target: "..."` overrides the module path, so a target absent
+        // from DOMAIN_TARGETS is silently dropped at every level. This
+        // list mirrors `grep -rhoE 'target: "[a-z_]+"' src/ crates/` in
+        // the workspace; extend both when introducing a new target.
+        let filter = mk_crate_filter(tracing::Level::TRACE).to_string();
+
+        for target in [
+            "backfill",
+            "bridge",
+            "broker",
+            // From the external st0x-event-sorcery crate, so the grep in
+            // the DOMAIN_TARGETS doc cannot find it -- pinned here so
+            // removing it from the filter fails this test.
+            "cqrs",
+            "dashboard",
+            "equity",
+            "evm",
+            "gas",
+            "hedge",
+            "inventory",
+            "market_data",
+            "orderbook",
+            "rebalance",
+            "reliability",
+            "shutdown",
+            "startup",
+            "tokenization",
+            "wallet",
+        ] {
+            assert!(
+                filter.contains(&format!("{target}=trace")),
+                "domain target {target} is missing from the env filter: {filter}"
+            );
+        }
+    }
 
     /// Captures everything written through a subscriber layer so tests can
     /// assert on the emitted bytes.

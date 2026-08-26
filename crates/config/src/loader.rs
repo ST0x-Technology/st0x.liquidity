@@ -572,6 +572,22 @@ enum BrokerSecrets {
         account_id: AlpacaAccountId,
         mode: Option<AlpacaBrokerApiMode>,
     },
+    /// The same client-assertion flow signed with a locally held EC
+    /// private key (the BrokerDash `private_key_jwt` PEM export) instead
+    /// of KMS. Operator/CLI use — e.g. the sandbox demo, where no KMS
+    /// key exists; tokens mint at the authx host matching `mode`. The
+    /// path points at the exported PEM file (SEC1 or PKCS#8), read once
+    /// at startup, so the key never has to be inlined into the secrets
+    /// TOML.
+    AlpacaBrokerApiJwt {
+        client_id: String,
+        private_key_pem_path: PathBuf,
+        account_id: AlpacaAccountId,
+        /// Required (unlike the sibling variants): the mode selects the
+        /// authx token host, so an implicit default would silently pick
+        /// the token environment.
+        mode: AlpacaBrokerApiMode,
+    },
     DryRun,
 }
 
@@ -772,6 +788,34 @@ impl BrokerCtx {
                     },
                     account_id,
                     mode,
+                    broker_config,
+                )
+            }
+
+            // No mode restriction, unlike the KMS variant: the token URL
+            // follows the (required) mode, so sandbox credentials mint at
+            // the sandbox authx host and no mode fails parsing instead of
+            // silently minting against a default environment.
+            BrokerSecrets::AlpacaBrokerApiJwt {
+                client_id,
+                private_key_pem_path,
+                account_id,
+                mode,
+            } => {
+                let private_key_pem =
+                    std::fs::read_to_string(&private_key_pem_path).map_err(|source| {
+                        CtxError::BrokerPrivateKeyIo {
+                            path: private_key_pem_path,
+                            source,
+                        }
+                    })?;
+                Self::alpaca_ctx(
+                    AlpacaBrokerAuth::PrivateKeyJwt {
+                        client_id,
+                        private_key_pem,
+                    },
+                    account_id,
+                    Some(mode),
                     broker_config,
                 )
             }
@@ -1807,6 +1851,11 @@ pub enum CtxError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("failed to read broker private key file {path}")]
+    BrokerPrivateKeyIo {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("failed to parse config {path}")]
     ConfigToml {
         path: PathBuf,
@@ -1959,6 +2008,7 @@ impl CtxError {
             Self::MissingBotGasValuation => "missing bot gas valuation config",
             Self::ConfigIo { .. } => "failed to read config file",
             Self::SecretsIo { .. } => "failed to read secrets file",
+            Self::BrokerPrivateKeyIo { .. } => "failed to read broker private key file",
             Self::ConfigToml { .. } => "failed to parse config",
             Self::SecretsToml { .. } => "failed to parse secrets",
             Self::InvalidThreshold(_) => "invalid execution threshold",
@@ -6994,6 +7044,145 @@ mod tests {
             }
             ref other => panic!("expected keyless broker secrets, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn jwt_broker_secrets_parse_with_local_private_key_path() {
+        // The local private_key_jwt variant: a client id plus a path to
+        // the BrokerDash credential's PEM export. Sandbox mode is
+        // allowed — unlike the KMS variant, its token URL follows the
+        // mode.
+        let secrets: Secrets = toml::from_str(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api-jwt"
+            client_id = "CKTEST"
+            private_key_pem_path = "/keys/alpaca-sandbox.pem"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+            "#,
+        )
+        .unwrap();
+
+        match secrets.broker {
+            BrokerSecrets::AlpacaBrokerApiJwt {
+                ref client_id,
+                ref private_key_pem_path,
+                ref mode,
+                ..
+            } => {
+                assert_eq!(client_id, "CKTEST");
+                assert_eq!(
+                    private_key_pem_path,
+                    &PathBuf::from("/keys/alpaca-sandbox.pem")
+                );
+                assert_eq!(mode, &AlpacaBrokerApiMode::Sandbox);
+            }
+            ref other => panic!("expected jwt broker secrets, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jwt_broker_secrets_reject_an_omitted_mode() {
+        // The mode selects the authx token host, so omitting it must
+        // fail parsing instead of silently defaulting an environment.
+        let Err(error) = toml::from_str::<Secrets>(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api-jwt"
+            client_id = "CKTEST"
+            private_key_pem_path = "/keys/alpaca-sandbox.pem"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            "#,
+        ) else {
+            panic!("expected parsing to fail without a mode");
+        };
+
+        assert!(
+            error.to_string().contains("missing field `mode`"),
+            "expected a missing-mode parse error, got: {error}"
+        );
+    }
+
+    fn jwt_test_broker_config() -> BrokerConfig {
+        BrokerConfig {
+            counter_trade_slippage_bps: Some(100),
+            extended_hours_reprice_timeout_secs: None,
+            close_flatten_reprice_timeout_secs: None,
+            extended_hours_close_flatten_window_secs: None,
+            close_flatten_cross_max_bps: None,
+            travel_rule: None,
+        }
+    }
+
+    #[test]
+    fn jwt_broker_secrets_build_a_ctx_in_sandbox_mode() {
+        // The KMS variant rejects non-production modes; the local-PEM
+        // variant must NOT, since sandbox credentials mint at the
+        // sandbox authx host. The PEM is read from the referenced file.
+        let pem_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            pem_file.path(),
+            "-----BEGIN EC PRIVATE KEY-----\nfixture\n-----END EC PRIVATE KEY-----",
+        )
+        .unwrap();
+
+        let ctx = BrokerCtx::from_parts(
+            BrokerSecrets::AlpacaBrokerApiJwt {
+                client_id: "CKTEST".to_string(),
+                private_key_pem_path: pem_file.path().to_path_buf(),
+                account_id: "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef".parse().unwrap(),
+                mode: AlpacaBrokerApiMode::Sandbox,
+            },
+            Some(&jwt_test_broker_config()),
+        )
+        .unwrap();
+
+        let BrokerCtx::AlpacaBrokerApi(alpaca) = ctx else {
+            panic!("expected an Alpaca broker ctx");
+        };
+        assert!(
+            matches!(
+                alpaca.auth,
+                st0x_execution::AlpacaBrokerAuth::PrivateKeyJwt {
+                    ref client_id,
+                    ref private_key_pem,
+                } if client_id == "CKTEST"
+                    && private_key_pem.contains("BEGIN EC PRIVATE KEY")
+            ),
+            "expected PrivateKeyJwt auth with the file's PEM, got {:?}",
+            alpaca.auth
+        );
+    }
+
+    #[test]
+    fn jwt_broker_secrets_fail_on_a_missing_key_file() {
+        let missing = PathBuf::from("/nonexistent/alpaca-sandbox.pem");
+
+        let error = BrokerCtx::from_parts(
+            BrokerSecrets::AlpacaBrokerApiJwt {
+                client_id: "CKTEST".to_string(),
+                private_key_pem_path: missing.clone(),
+                account_id: "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef".parse().unwrap(),
+                mode: AlpacaBrokerApiMode::Sandbox,
+            },
+            Some(&jwt_test_broker_config()),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::BrokerPrivateKeyIo { ref path, .. } if path == &missing
+            ),
+            "expected BrokerPrivateKeyIo, got {error:?}"
+        );
     }
 
     #[test]
