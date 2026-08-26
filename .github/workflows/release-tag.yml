@@ -1,27 +1,17 @@
 name: release-tag
 
-# Promote-on-tag: "steady master -> push a vX.Y.Z tag -> the tagged artifact
-# exists" (design settled in #1289 review). Pushing a release tag LABELS the
-# images master CI already built and attested for that commit — it does not
-# build, does not deploy, and cannot touch images.env or staging. Tagging an
-# old commit is a normal git operation and here it only labels old images.
-#
-# The version tag is consumed by exactly one thing: t0.devops'
-# images-version.yml guard, which refuses a production manifest whose
-# `version:` does not resolve to the pinned digests. Two refusals keep the
-# label honest end to end:
-#   - no image for the tagged commit  -> fail: tag a commit master CI built;
-#   - no BinAuthz attestation on it   -> fail: a version tag must never
-#     bless an unattested digest.
-#
-# Auth: NOT the deployer — its WIF binding is exact-match
-# repository_ref@refs/heads/master and can never satisfy a refs/tags/*
-# subject (review catch: the first version of this workflow would have
-# died at auth). Tags authenticate as liquidity-labeler, a dedicated SA
-# bound via attribute.repository (any ref of this repo) whose CUSTOM role
-# can create/update AR tags and read images but structurally cannot push;
-# the verify phase below means it can only ever name digests master CI
-# built and attested. t0.devops production-artifacts/liquidity.tf.
+# Promote-on-tag, the org-standard release flow (settled in
+# st0x.liquidity#1289): "steady master -> push a vX.Y.Z tag -> the tagged
+# artifact exists". Pushing a release tag LABELS the images master CI
+# already built and attested for that commit — it does not build, does not
+# deploy, and cannot touch any manifest or environment. The verify-then-
+# label logic is inherited from ST0x-Technology/.github (release-label
+# composite action); the identity below is minted by t0.devops
+# production-artifacts (modules/ar-labeler): a dedicated labeler SA whose
+# custom role can create/update AR tags and read images but structurally
+# cannot push. The version tag is consumed by t0.devops' images-version.yml
+# guard, which refuses a production manifest whose `version:` does not
+# resolve to the pinned digest(s), and by the GitHub release the action cuts.
 
 on:
   push:
@@ -30,72 +20,32 @@ on:
 
 permissions:
   id-token: write
-  contents: read
-
-env:
-  REGION: europe-west3
-  AR_REPO: europe-west3-docker.pkg.dev/t0-artifacts/t0-liquidity
-  WIF_PROVIDER: projects/684788085322/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
-  LABELER_SA: liquidity-labeler@t0-artifacts.iam.gserviceaccount.com
-  ATTESTOR: projects/t0-artifacts/attestors/liquidity-image
+  # write: the action cuts the GitHub release for the tag.
+  contents: write
 
 jobs:
   label:
     runs-on: ubuntu-latest
     steps:
-      # Needed to peel the tag: on an ANNOTATED tag push GITHUB_SHA is the
-      # tag OBJECT's sha, not the commit (actions/runner#712) — resolving
-      # images by it would fail for exactly the tags `git tag -a` creates.
+      # The action peels annotated tags itself (actions/runner#712), but
+      # needs the checkout to do it.
       - uses: actions/checkout@v4
 
       - id: auth
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
         with:
-          workload_identity_provider: ${{ env.WIF_PROVIDER }}
-          service_account: ${{ env.LABELER_SA }}
+          workload_identity_provider: projects/684788085322/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+          service_account: liquidity-labeler@t0-artifacts.iam.gserviceaccount.com
 
       - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f  # v2
         with:
+          # attestation listing lives in the beta component.
           install_components: beta
 
-      - name: Label the tagged commit's attested images
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME}"
-          # Peel to the COMMIT: for annotated tags GITHUB_SHA is the tag
-          # object, not the commit (actions/runner#712); ^{commit} handles
-          # lightweight and annotated identically.
-          COMMIT=$(git rev-parse "HEAD^{commit}")
-          echo "tag ${VERSION} -> commit ${COMMIT} (GITHUB_SHA was ${GITHUB_SHA})"
-
-          # Phase 1: resolve and verify EVERY image before tagging ANY —
-          # a failure mid-loop must not leave earlier images carrying a
-          # version label the set as a whole never earned (review catch).
-          images="t0-liquidity t0-liquidity-dashboard t0-liquidity-datasette"
-          declare -A digest_for
-          for image in $images; do
-            digest=$(gcloud artifacts docker images describe \
-              "${AR_REPO}/${image}:${COMMIT}" \
-              --format='value(image_summary.digest)' 2>/dev/null) || true
-            if [ -z "${digest:-}" ]; then
-              echo "::error::no ${image} image exists for ${COMMIT} — tag a commit that master CI has built (and wait for its build to finish)."
-              exit 1
-            fi
-            attested=$(gcloud beta container binauthz attestations list \
-              --project=t0-artifacts --attestor="${ATTESTOR}" \
-              --artifact-url="${AR_REPO}/${image}@${digest}" \
-              --format='value(name)' | head -1)
-            if [ -z "${attested}" ]; then
-              echo "::error::${image}@${digest} carries NO liquidity-image attestation — refusing to put a version label on an unattested digest."
-              exit 1
-            fi
-            digest_for[$image]="$digest"
-          done
-
-          # Phase 2: all verified — label them all.
-          for image in $images; do
-            gcloud artifacts docker tags add \
-              "${AR_REPO}/${image}@${digest_for[$image]}" \
-              "${AR_REPO}/${image}:${VERSION}"
-            echo "labeled ${image}@${digest_for[$image]} as ${VERSION}"
-          done
+      - uses: ST0x-Technology/.github/release-label@main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ar_repo: europe-west3-docker.pkg.dev/t0-artifacts/t0-liquidity
+          images: t0-liquidity t0-liquidity-dashboard t0-liquidity-datasette
+          attestor: projects/t0-artifacts/attestors/liquidity-image
