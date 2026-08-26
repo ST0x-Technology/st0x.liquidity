@@ -2007,6 +2007,7 @@ impl CtxError {
             Self::SecretsToml { .. } => "failed to parse secrets",
             Self::InvalidThreshold(_) => "invalid execution threshold",
             Self::MissingCounterTradeSlippageBps => "missing counter trade slippage bps",
+            Self::KmsBrokerRequiresProductionMode => "kms broker auth requires production mode",
             Self::MissingCloseFlattenCrossMaxBps => "missing close flatten cross max bps",
             Self::CloseFlattenCrossMaxBpsOutOfRange { .. } => {
                 "close flatten cross max bps out of range"
