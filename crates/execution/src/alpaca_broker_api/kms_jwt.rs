@@ -784,13 +784,12 @@ mod tests {
         // successful fallback above deferred refresh_after by the failed-
         // mint backoff, so expire both deadlines to model a cache whose
         // token is truly dead.)
-        {
-            let mut cached = auth.cached.lock().unwrap();
-            let token = cached.as_mut().unwrap();
-            let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
-            token.refresh_after = expired;
-            token.hard_expiry = expired;
-        }
+        let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        let mut cached = auth.cached.lock().unwrap();
+        let token = cached.as_mut().unwrap();
+        token.refresh_after = expired;
+        token.hard_expiry = expired;
+        drop(cached);
         assert!(matches!(
             auth.access_token().await,
             Err(KmsJwtError::TokenStatus { status: 500, .. })
