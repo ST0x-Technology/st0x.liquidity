@@ -239,6 +239,7 @@ struct Config {
     log_level: Option<LogLevel>,
     log_dir: Option<String>,
     log_format: Option<LogFormat>,
+    log_query_url_template: Option<String>,
     server_port: u16,
     board_port: u16,
     raindex: EvmConfig,
@@ -617,6 +618,9 @@ pub struct Ctx {
     pub log_level: LogLevel,
     pub log_dir: Option<String>,
     pub log_format: LogFormat,
+    /// Log query link printed by CLI transfer commands, with `{id}`
+    /// substituted. `None` prints nothing.
+    pub log_query_url_template: Option<LogQueryUrlTemplate>,
     pub server_port: u16,
     pub board_port: u16,
     pub evm: EvmCtx,
@@ -776,6 +780,7 @@ impl std::fmt::Debug for Ctx {
             .field("log_level", &self.log_level)
             .field("log_dir", &self.log_dir)
             .field("log_format", &self.log_format)
+            .field("log_query_url_template", &self.log_query_url_template)
             .field("server_port", &self.server_port)
             .field("board_port", &self.board_port)
             .field("evm", &self.evm)
@@ -850,6 +855,42 @@ pub enum LogFormat {
     Json,
 }
 
+/// Placeholder in `log_query_url_template` replaced with the transfer or
+/// aggregate id.
+const LOG_QUERY_ID_PLACEHOLDER: &str = "{id}";
+
+/// Log query link template printed by CLI transfer commands.
+///
+/// Construction proves the template contains the `{id}` placeholder and
+/// parses as a URL once the placeholder is substituted, so consumers can
+/// call [`Self::substitute`] without re-validating either half.
+#[derive(Clone, Debug)]
+pub struct LogQueryUrlTemplate(String);
+
+impl LogQueryUrlTemplate {
+    /// Validates that `template` carries the `{id}` placeholder and parses as
+    /// a URL once the placeholder is substituted.
+    pub fn parse(template: String) -> Result<Self, CtxError> {
+        if !template.contains(LOG_QUERY_ID_PLACEHOLDER) {
+            return Err(CtxError::LogQueryUrlTemplateMissingIdPlaceholder);
+        }
+
+        let sample = template.replace(LOG_QUERY_ID_PLACEHOLDER, "sample-id");
+        if let Err(source) = Url::parse(&sample) {
+            return Err(CtxError::LogQueryUrlTemplateNotAUrl { source });
+        }
+
+        Ok(Self(template))
+    }
+
+    /// The template with `{id}` replaced by `id`.
+    #[must_use]
+    pub fn substitute(&self, id: &str) -> String {
+        let Self(template) = self;
+        template.replace(LOG_QUERY_ID_PLACEHOLDER, id)
+    }
+}
+
 impl From<LogLevel> for Level {
     fn from(log_level: LogLevel) -> Self {
         match log_level {
@@ -881,6 +922,7 @@ struct ValidatedParts {
     log_level: LogLevel,
     log_dir: Option<String>,
     log_format: LogFormat,
+    log_query_url_template: Option<LogQueryUrlTemplate>,
     server_port: u16,
     board_port: u16,
     evm: EvmCtx,
@@ -1156,6 +1198,10 @@ fn parse_and_validate(
 
     let log_level = config.log_level.unwrap_or(LogLevel::Debug);
     let log_format = config.log_format.unwrap_or(LogFormat::Text);
+    let log_query_url_template = config
+        .log_query_url_template
+        .map(LogQueryUrlTemplate::parse)
+        .transpose()?;
 
     let ExtendedHoursBrokerWindows {
         reprice_timeout_secs: extended_hours_reprice_timeout_secs,
@@ -1189,6 +1235,7 @@ fn parse_and_validate(
         log_level,
         log_dir: config.log_dir,
         log_format,
+        log_query_url_template,
         server_port: config.server_port,
         board_port: config.board_port,
         evm,
@@ -1343,6 +1390,7 @@ impl Ctx {
             log_level: parts.log_level,
             log_dir: parts.log_dir,
             log_format: parts.log_format,
+            log_query_url_template: parts.log_query_url_template,
             server_port: parts.server_port,
             board_port: parts.board_port,
             evm: parts.evm,
@@ -1674,6 +1722,7 @@ impl Ctx {
             log_level: LogLevel::Debug,
             log_dir: None,
             log_format: LogFormat::Text,
+            log_query_url_template: None,
             server_port,
             board_port,
             evm: EvmCtx {
@@ -1723,6 +1772,13 @@ pub enum CtxError {
     Rebalancing(Box<RebalancingCtxError>),
     #[error(transparent)]
     Pricing(#[from] PricingCtxError),
+    #[error("log_query_url_template must contain the {{id}} placeholder")]
+    LogQueryUrlTemplateMissingIdPlaceholder,
+    #[error("log_query_url_template is not a valid URL")]
+    LogQueryUrlTemplateNotAUrl {
+        #[source]
+        source: url::ParseError,
+    },
     #[error("failed to build REST API HTTP client")]
     RestApiClient(#[source] reqwest::Error),
     #[error("[issuance] section is required in secrets but was not configured")]
@@ -1941,6 +1997,10 @@ impl CtxError {
             Self::RestApiClient(_) => "failed to build REST API HTTP client",
             Self::MissingIssuanceConfig => "missing issuance config",
             Self::InvalidIssuanceApiKey { .. } => "invalid issuance api_key",
+            Self::LogQueryUrlTemplateMissingIdPlaceholder => {
+                "log_query_url_template missing {id} placeholder"
+            }
+            Self::LogQueryUrlTemplateNotAUrl { .. } => "log_query_url_template is not a valid URL",
         }
     }
 }
@@ -2026,6 +2086,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         log_level: LogLevel::Debug,
         log_dir: None,
         log_format: LogFormat::Text,
+        log_query_url_template: None,
         server_port: 8080,
         board_port: 8081,
         evm: EvmCtx {
@@ -3359,6 +3420,7 @@ mod tests {
             inventory_divergence_threshold = 10
             log_level = "warn"
             log_format = "json"
+            log_query_url_template = "https://logs.example/query?id={id}"
             server_port = 9090
             order_polling_interval = 30
             order_polling_max_jitter = 10
@@ -3390,11 +3452,101 @@ mod tests {
             .unwrap();
         assert!(matches!(ctx.log_level, LogLevel::Warn));
         assert!(matches!(ctx.log_format, LogFormat::Json));
+        assert_eq!(
+            ctx.log_query_url_template
+                .expect("template is configured")
+                .substitute("abc-123"),
+            "https://logs.example/query?id=abc-123"
+        );
         assert_eq!(ctx.server_port, 9090);
         assert_eq!(ctx.order_polling_interval, 30);
         assert_eq!(ctx.order_polling_max_jitter, 10);
         assert_eq!(ctx.position_check_interval, 120);
         assert_eq!(ctx.inventory_poll_interval, 90);
+    }
+
+    /// A template without the `{id}` placeholder can never carry the id it
+    /// exists to link, so startup refuses it instead of printing dead links.
+    #[tokio::test]
+    async fn log_query_url_template_without_id_placeholder_fails() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+            server_port = 9090
+            log_query_url_template = "https://logs.example/query?id=missing"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory_adapters = []
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
+
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CtxError::LogQueryUrlTemplateMissingIdPlaceholder),
+            "expected LogQueryUrlTemplateMissingIdPlaceholder, got: {error:?}"
+        );
+    }
+
+    /// A template that is not a URL would print a dead link on every transfer
+    /// command, so startup refuses it even when the placeholder is present.
+    #[tokio::test]
+    async fn log_query_url_template_that_is_not_a_url_fails() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+            server_port = 9090
+            log_query_url_template = "not a url {id}"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+           inventory_mode = "managed"
+           inventory_adapters = []
+           inventory = "0x2222222222222222222222222222222222222222"
+           vault_owner = "0x3333333333333333333333333333333333333333"
+
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CtxError::LogQueryUrlTemplateNotAUrl { .. }),
+            "expected LogQueryUrlTemplateNotAUrl, got: {error:?}"
+        );
     }
 
     #[tokio::test]

@@ -215,6 +215,7 @@ mod tests {
             log_level: LogLevel::Debug,
             log_dir: None,
             log_format: LogFormat::Text,
+            log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
             evm: EvmCtx {
@@ -268,6 +269,7 @@ mod tests {
             log_level: LogLevel::Debug,
             log_dir: None,
             log_format: LogFormat::Text,
+            log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
             evm: EvmCtx {
