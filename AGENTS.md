@@ -322,8 +322,8 @@ directly.
 
 - `nix develop` - Enter development shell with all dependencies. ABIs from
   upstream Solidity repos are built by per-feature Nix derivations under `nix/`
-  (`forge-std.nix`, `pyth.nix`, `rain-math-float.nix`, `rain-orderbook.nix`) and
-  exposed via `ST0X_*_ABI` environment variables.
+  (`forge-std.nix`, `rain-math-float.nix`, `rain-orderbook.nix`) and exposed via
+  `ST0X_*_ABI` environment variables.
 
 ### Generated paths
 

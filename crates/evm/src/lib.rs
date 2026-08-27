@@ -40,7 +40,7 @@ pub mod nonce;
 pub use nonce::ResettableNonceManager;
 
 mod bindings;
-pub use bindings::{IERC20, IPyth, PythStructs};
+pub use bindings::IERC20;
 
 mod tokens;
 pub use tokens::{USDC_BASE, USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};

@@ -34,7 +34,6 @@ let
       inherit mkSoldeerAbi;
       src = sources.st0x-deploy;
     };
-    pyth = import ./pyth.nix { inherit pkgs; };
   };
 
   envs = builtins.mapAttrs (_: feature: feature.abiEnv) features;

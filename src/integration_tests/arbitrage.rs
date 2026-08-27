@@ -51,7 +51,6 @@ use crate::offchain::order::{
     OffchainOrderCommand, OffchainOrderId, PollOrderStatus, ReconcileOrderFillJobQueue,
 };
 use crate::onchain::OnchainTrade;
-use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::position::{AnchorDisposition, Position, PositionCommand};
 use crate::test_utils::{
@@ -493,7 +492,6 @@ struct AnvilOrderBook<P> {
     usdc_addr: Address,
     equity_tokens: HashMap<String, Address>,
     symbol_cache: SymbolCache,
-    pyth_feed_ids: PythFeedIds,
 }
 
 /// Places USDC contract code and storage directly at the canonical `USDC_BASE` address
@@ -616,7 +614,6 @@ async fn setup_anvil_orderbook() -> AnvilOrderBook<impl alloy::providers::Provid
         usdc_addr: USDC_BASE,
         equity_tokens: HashMap::new(),
         symbol_cache: SymbolCache::default(),
-        pyth_feed_ids: PythFeedIds::default(),
     }
 }
 
@@ -675,7 +672,6 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
             take_event,
             log_metadata,
             order_owner,
-            &self.pyth_feed_ids,
         )
         .await
         .unwrap()
@@ -2774,7 +2770,6 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
                 EquityAssetConfig {
                     tokenized_equity: Address::ZERO,
                     tokenized_equity_derivative: Address::ZERO,
-                    pyth_feed_id: None,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
@@ -2986,7 +2981,6 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
                 EquityAssetConfig {
                     tokenized_equity: Address::ZERO,
                     tokenized_equity_derivative: Address::ZERO,
-                    pyth_feed_id: None,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
