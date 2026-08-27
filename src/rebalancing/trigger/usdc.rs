@@ -713,21 +713,20 @@ impl RebalancingService {
         // on a failure that could be post-burn. So:
         //   - `DepositFailed` is only reachable from `DepositInitiated`
         //     (post-mint), hence unconditionally post-burn.
-        //   - `ConversionFailed` defaults to preserve when tracking is absent
-        //     (the BaseToAlpaca post-deposit leg must hold; the rare lost-track
-        //     AlpacaToBase pre-burn case holds conservatively rather than risk a
-        //     re-burn -- safe, at worst it wedges that one rebalance until an
-        //     operator clears it).
+        //   - `ConversionFailed` with tracking absent falls back to the durable
+        //     `holds_rebalance_guard` classifier (the same one restart recovery
+        //     uses): the BaseToAlpaca post-deposit leg preserves, the lost-track
+        //     AlpacaToBase pre-burn leg clears without needing a restart. Only
+        //     when the durable state cannot be consulted does it preserve
+        //     conservatively (fail closed).
         //   - `WithdrawalFailed` / pre-burn `BridgingFailed` are always pre-burn,
         //     so absent tracking correctly clears.
         match event {
             DepositFailed { .. } => true,
-            ConversionFailed { .. } => self
-                .usdc_tracking
-                .read()
-                .await
-                .get(id)
-                .is_none_or(UsdcRebalanceTracking::is_post_burn),
+            ConversionFailed { .. } => match self.usdc_tracking.read().await.get(id) {
+                Some(tracking) => tracking.is_post_burn(),
+                None => self.durable_guard_hold(id).await,
+            },
             WithdrawalFailed { .. } | BridgingFailed { .. } => self
                 .usdc_tracking
                 .read()
@@ -735,6 +734,48 @@ impl RebalancingService {
                 .get(id)
                 .is_some_and(UsdcRebalanceTracking::is_post_burn),
             _ => false,
+        }
+    }
+
+    /// Durable fallback for a terminal failure with no in-memory tracking:
+    /// loads the aggregate and applies `holds_rebalance_guard`, the same
+    /// direction-aware classifier startup guard recovery uses. Fails closed:
+    /// a missing store handle, a missing aggregate, or a load failure
+    /// preserves the guard rather than risking a fresh burn against
+    /// unresolved funds.
+    async fn durable_guard_hold(&self, id: &UsdcRebalanceId) -> bool {
+        let store = self.usdc_store.read().await.as_ref().map(Arc::clone);
+        let Some(store) = store else {
+            warn!(
+                target: "rebalance",
+                %id,
+                "No usdc_store handle to re-derive guard state for an \
+                 untracked terminal failure; preserving the guard (fail closed)"
+            );
+            return true;
+        };
+
+        match store.load(id).await {
+            Ok(Some(entity)) => entity.holds_rebalance_guard(),
+            Ok(None) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    "Untracked terminal failure for an aggregate the store \
+                     cannot find; preserving the guard (fail closed)"
+                );
+                true
+            }
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    ?error,
+                    "Failed to load aggregate to re-derive guard state for an \
+                     untracked terminal failure; preserving the guard (fail closed)"
+                );
+                true
+            }
         }
     }
 
