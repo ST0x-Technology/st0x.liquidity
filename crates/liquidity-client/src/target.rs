@@ -24,6 +24,8 @@ impl Env {
 pub struct Target {
     pub base_url: Url,
     pub audience: String,
+    /// Optional T0 Cloud Logging console URL, printed alongside API errors.
+    pub logging_url: Option<String>,
 }
 
 fn required(variable: &str, hint: &str) -> Result<String> {
@@ -42,5 +44,10 @@ pub fn resolve(env: Env) -> Result<Target> {
         &format!("{prefix}_AUDIENCE"),
         "to the IAP OAuth client ID (the ID token audience) for this environment",
     )?;
-    Ok(Target { base_url, audience })
+    let logging_url = std::env::var(format!("{prefix}_LOGGING_URL")).ok();
+    Ok(Target {
+        base_url,
+        audience,
+        logging_url,
+    })
 }

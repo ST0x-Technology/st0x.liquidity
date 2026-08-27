@@ -19,14 +19,57 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Read-only queries against the liquidity bot.
-    Read(ReadArgs),
-    /// State-changing capital operations.
     #[command(subcommand)]
-    Capital(Capital),
+    Read(Read),
+    /// Safe recovery operations (debug tier).
+    #[command(subcommand)]
+    Debug(Debug),
 }
 
 #[derive(Subcommand)]
-pub enum Capital {
+pub enum Read {
+    /// Fetch a fixed read resource (pnl, trades, health, and so on).
+    Resource(ResourceArgs),
+    /// Lifecycle events for one trade aggregate.
+    TradeEvents(TradeEventsArgs),
+    /// Lifecycle events for one transfer aggregate.
+    TransferEvents(TransferEventsArgs),
+}
+
+#[derive(Args)]
+pub struct ResourceArgs {
+    /// Resource to read.
+    #[arg(value_enum)]
+    pub resource: ReadResource,
+    /// Extra query parameter, repeatable: --param key=value
+    #[arg(long = "param", value_parser = parse_key_value)]
+    pub params: Vec<(String, String)>,
+}
+
+#[derive(Args)]
+pub struct TradeEventsArgs {
+    /// Trading venue path segment.
+    pub venue: String,
+    /// Aggregate id path segment.
+    pub aggregate_id: String,
+    /// Extra query parameter, repeatable: --param key=value
+    #[arg(long = "param", value_parser = parse_key_value)]
+    pub params: Vec<(String, String)>,
+}
+
+#[derive(Args)]
+pub struct TransferEventsArgs {
+    /// Transfer kind path segment (for example mint or redemption).
+    pub kind: String,
+    /// Aggregate id path segment.
+    pub aggregate_id: String,
+    /// Extra query parameter, repeatable: --param key=value
+    #[arg(long = "param", value_parser = parse_key_value)]
+    pub params: Vec<(String, String)>,
+}
+
+#[derive(Subcommand)]
+pub enum Debug {
     /// Resume interrupted mint and redemption transfers.
     Resume,
     /// Re-check a stuck transfer by kind and aggregate id.
@@ -36,16 +79,6 @@ pub enum Capital {
         /// Aggregate id path segment.
         id: String,
     },
-}
-
-#[derive(Args)]
-pub struct ReadArgs {
-    /// Resource to read.
-    #[arg(value_enum)]
-    pub resource: ReadResource,
-    /// Extra query parameter, repeatable: --param key=value
-    #[arg(long = "param", value_parser = parse_key_value)]
-    pub params: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]

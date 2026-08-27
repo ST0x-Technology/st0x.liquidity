@@ -10,62 +10,68 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use crate::auth::Adc;
-use crate::cli::{Capital, Cli, Command};
+use crate::cli::{Cli, Command, Debug, Read};
 use crate::error::Error;
 use crate::transport::Client;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match run(Cli::parse()).await {
+    match execute(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
-        Err(RunError::Setup(error)) => {
+        Err(Failure::Setup(error)) => {
             eprintln!("error: {error:#}");
             ExitCode::from(2)
         }
-        Err(RunError::Api(error)) => {
+        Err(Failure::Api { error, logging_url }) => {
             eprintln!("error: {error}");
+            if let Some(url) = logging_url {
+                eprintln!("\nT0 Cloud Logging: {url}");
+            }
             ExitCode::from(error.exit_code())
         }
     }
 }
 
-enum RunError {
+enum Failure {
     Setup(anyhow::Error),
-    Api(Error),
+    Api {
+        error: Error,
+        logging_url: Option<String>,
+    },
 }
 
-impl From<anyhow::Error> for RunError {
-    fn from(error: anyhow::Error) -> Self {
-        Self::Setup(error)
-    }
+async fn execute(cli: Cli) -> Result<(), Failure> {
+    let target = target::resolve(cli.env).map_err(Failure::Setup)?;
+    let logging_url = target.logging_url;
+    let auth = Adc::new(&target.audience).map_err(|error| Failure::Api {
+        error,
+        logging_url: logging_url.clone(),
+    })?;
+    let client = Client::new(target.base_url, auth).map_err(Failure::Setup)?;
+    dispatch(&client, cli.command)
+        .await
+        .map_err(|error| Failure::Api { error, logging_url })
 }
 
-impl From<Error> for RunError {
-    fn from(error: Error) -> Self {
-        Self::Api(error)
-    }
-}
-
-async fn run(cli: Cli) -> Result<(), RunError> {
-    let target = target::resolve(cli.env)?;
-    let auth = Adc::new(&target.audience)?;
-    let client = Client::new(target.base_url, auth)?;
-    match cli.command {
-        Command::Read(args) => {
-            let value = client.get(args.resource.path(), &args.params).await?;
-            output::print(&value)?;
+async fn dispatch(client: &Client<Adc>, command: Command) -> Result<(), Error> {
+    let value = match command {
+        Command::Read(Read::Resource(args)) => {
+            client.get(args.resource.path(), &args.params).await?
         }
-        Command::Capital(command) => {
-            let value = match command {
-                Capital::Resume => client.post("/transfers/resume").await?,
-                Capital::Recheck { kind, id } => {
-                    client
-                        .post(&format!("/transfers/recheck/{kind}/{id}"))
-                        .await?
-                }
-            };
-            output::print(&value)?;
+        Command::Read(Read::TradeEvents(args)) => {
+            let path = format!("/trades/{}/{}/events", args.venue, args.aggregate_id);
+            client.get(&path, &args.params).await?
         }
-    }
-    Ok(())
+        Command::Read(Read::TransferEvents(args)) => {
+            let path = format!("/transfers/{}/{}/events", args.kind, args.aggregate_id);
+            client.get(&path, &args.params).await?
+        }
+        Command::Debug(Debug::Resume) => client.post("/transfers/resume").await?,
+        Command::Debug(Debug::Recheck { kind, id }) => {
+            client
+                .post(&format!("/transfers/recheck/{kind}/{id}"))
+                .await?
+        }
+    };
+    output::print(&value)
 }
