@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use st0x_config::BrokerCtx;
+use st0x_config::{BrokerCtx, OpsApiConfig};
 use st0x_dto::{
     EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, TradingVenue,
 };
@@ -33,6 +33,7 @@ use crate::dashboard::pnl::{
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
 use crate::dashboard::{TradePage, TradeProtocol, TradeQuery, query_trades};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
+use crate::iap_auth::{IapVerifier, require_iap};
 use crate::performance::equity_timing::load_equity_timings;
 use crate::performance::infra::{load_dependency_stats, load_monitor_telemetry};
 use crate::performance::rebalance::load_rebalance_timings;
@@ -1672,8 +1673,56 @@ async fn performance_infra(
     }))
 }
 
-pub(crate) fn routes() -> Router<AppState> {
+/// The role-gated ops API: the same handlers the dashboard routes use, mounted
+/// under a prefix the load balancer routes to a role-specific IAP backend.
+///
+/// The prefix is the role. The URL map sends `/liquidity-read/*` and
+/// `/liquidity-write/*` to different backend services, each with its own IAP
+/// policy bound to a Workspace group, so who may call which prefix is group
+/// membership. The middleware here re-checks the assertion and pins the
+/// audience per prefix, which is what stops a read-tier token being replayed
+/// against the write path and what refuses a caller who reached the VM from
+/// inside the VPC without passing IAP at all.
+///
+/// Returns nothing when no audiences are configured: a deployment with no load
+/// balancer in front of it must not expose these paths, and unmounting them is
+/// a stronger guarantee than serving a 401.
+fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
+    let Some(ops_api) = ops_api else {
+        return Router::new();
+    };
+
+    let read_verifier = Arc::new(IapVerifier::new(ops_api.read_audience.clone(), "read"));
+    let write_verifier = Arc::new(IapVerifier::new(ops_api.write_audience.clone(), "write"));
+
+    let read = Router::new()
+        .route(
+            "/liquidity-read/transfers/interrupted",
+            get(interrupted_transfers),
+        )
+        .layer(axum::middleware::from_fn(move |request, next| {
+            let verifier = Arc::clone(&read_verifier);
+            async move { require_iap(verifier, request, next).await }
+        }));
+
+    // `recheck` re-drives a transfer and completes it if the provider has
+    // settled it, so it moves real state and belongs to the narrower group.
+    let write = Router::new()
+        .route(
+            "/liquidity-write/transfers/recheck/{kind}/{id}",
+            post(recheck_transfer),
+        )
+        .layer(axum::middleware::from_fn(move |request, next| {
+            let verifier = Arc::clone(&write_verifier);
+            async move { require_iap(verifier, request, next).await }
+        }));
+
+    read.merge(write)
+}
+
+pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
     Router::new()
+        .merge(ops_api_routes(ops_api))
         .route("/health", get(health))
         .route("/performance/latencies", get(performance_latencies))
         .route("/performance/rebalances", get(performance_rebalances))
@@ -2737,7 +2786,7 @@ mod tests {
     }
 
     fn build_app(state: AppState) -> Router {
-        routes().with_state(state)
+        routes(None).with_state(state)
     }
 
     async fn body_to_string(response: axum::response::Response) -> String {

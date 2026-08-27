@@ -165,6 +165,21 @@ let
         location /trades      { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
         location /transfers   { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
         location /performance { limit_except GET { deny all; } proxy_pass http://$bot_upstream; }
+
+        # Role-gated ops API. Unlike the dashboard locations above, the load
+        # balancer sends each of these prefixes to its own IAP backend, and
+        # the bot verifies the assertion and pins the audience per prefix
+        # before running the handler. So the method restriction here is not
+        # the thing keeping mutations safe -- it is a second, cheaper fence
+        # that keeps a prefix from carrying verbs its role never intended,
+        # the same way the dashboard locations do.
+        #
+        # /liquidity-write is the one location in this file that admits POST.
+        # It stays a single exact-ish prefix for that reason: widening it, or
+        # adding another writable location, hands the method past the point
+        # where the audience check can distinguish roles.
+        location /liquidity-read/  { limit_except GET  { deny all; } proxy_pass http://$bot_upstream; }
+        location /liquidity-write/ { limit_except POST { deny all; } proxy_pass http://$bot_upstream; }
       }
     }
   '';

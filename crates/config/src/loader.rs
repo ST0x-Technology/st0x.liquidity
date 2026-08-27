@@ -167,6 +167,7 @@ struct Config {
     /// Non-secret issuance settings (`base_url`). The issuance `api_key`
     /// stays in the secrets file.
     issuance: Option<IssuanceConfig>,
+    ops_api: Option<OpsApiConfig>,
     /// ETH/USD valuation source for bot-gas cost recording. See
     /// [`Ctx::bot_gas_valuation`] for when this is required.
     bot_gas_valuation: Option<BotGasValuationConfig>,
@@ -285,6 +286,27 @@ impl std::fmt::Debug for IssuanceStatusCtx {
             .field("api_key", &self.api_key)
             .finish()
     }
+}
+
+/// IAP audiences for the role-gated ops API paths.
+///
+/// Each audience names the load balancer backend service that fronts one role
+/// prefix (`terraform/staging-liquidity/ops-api-iap.tf`, published as the
+/// `ops_api_audiences` output). IAP binds the token it mints to the backend
+/// that admitted the caller, so pinning the audience per prefix is what makes
+/// a read-tier token useless against the write path.
+///
+/// Not a secret: these name IAM-gated backends and are worthless without an
+/// identity Google will sign for. Absent from config means the role-gated
+/// routes are not mounted at all, which is the correct posture for any
+/// deployment that has no load balancer in front of it.
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OpsApiConfig {
+    /// Audience of the backend serving `/liquidity-read/*`.
+    pub read_audience: String,
+    /// Audience of the backend serving `/liquidity-write/*`.
+    pub write_audience: String,
 }
 
 /// Combined REST API runtime context assembled from config + secrets.
@@ -661,6 +683,9 @@ pub struct Ctx {
     pub assets: HedgingAssets,
     pub travel_rule: Option<TravelRuleConfig>,
     pub rest_api: Option<RestApiCtx>,
+    /// IAP audiences per ops-API role. `None` leaves the role-gated routes
+    /// unmounted.
+    pub ops_api: Option<OpsApiConfig>,
     pub issuance: IssuanceStatusCtx,
     /// Alpaca redemption wallet from `[chains.<name>.trading].redemption_wallet`.
     /// `Some` when the config includes a `[chains.<name>.trading].redemption_wallet` section.
@@ -1152,6 +1177,7 @@ impl std::fmt::Debug for Ctx {
             .field("travel_rule_configured", &self.travel_rule.is_some())
             .field("redemption_wallet", &self.redemption_wallet)
             .field("rest_api", &self.rest_api)
+            .field("ops_api", &self.ops_api)
             .field("issuance", &self.issuance)
             .field("bot_gas_valuation", &self.bot_gas_valuation)
             .field("orchestrator", &self.orchestrator);
@@ -1273,6 +1299,7 @@ struct ValidatedParts {
     assets: HedgingAssets,
     travel_rule: Option<TravelRuleConfig>,
     rest_api: Option<RestApiCtx>,
+    ops_api: Option<OpsApiConfig>,
     issuance: IssuanceStatusCtx,
     redemption_wallet: Option<Address>,
     bot_gas_valuation: Option<BotGasValuationConfig>,
@@ -1661,6 +1688,7 @@ fn parse_and_validate(
             })
             .transpose()?,
         issuance: issuance_ctx(config.issuance, secrets.issuance, &mut startup_notices)?,
+        ops_api: config.ops_api,
         startup_notices,
         redemption_wallet,
         bot_gas_valuation: config.bot_gas_valuation,
@@ -1828,6 +1856,7 @@ impl Ctx {
             assets: parts.assets,
             travel_rule: parts.travel_rule,
             rest_api: parts.rest_api,
+            ops_api: parts.ops_api,
             issuance: parts.issuance,
             redemption_wallet: parts.redemption_wallet,
             bot_gas_valuation: parts.bot_gas_valuation,
@@ -2031,6 +2060,7 @@ impl Ctx {
         execution_threshold_override: Option<ExecutionThreshold>,
         travel_rule: Option<TravelRuleConfig>,
         rest_api: Option<RestApiCtx>,
+        ops_api: Option<OpsApiConfig>,
         #[builder(default = create_test_issuance_ctx())] issuance: IssuanceStatusCtx,
         redemption_wallet: Option<Address>,
         bot_gas_valuation: Option<BotGasValuationConfig>,
@@ -2130,6 +2160,7 @@ impl Ctx {
             assets: hedging,
             travel_rule,
             rest_api,
+            ops_api,
             issuance,
             redemption_wallet,
             bot_gas_valuation,
@@ -2569,6 +2600,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         assets: HedgingAssets::default(),
         travel_rule: None,
         rest_api: None,
+        ops_api: None,
         issuance: create_test_issuance_ctx(),
         redemption_wallet: None,
         bot_gas_valuation: None,

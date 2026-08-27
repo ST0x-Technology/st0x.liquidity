@@ -51,6 +51,7 @@ pub mod cli;
 mod conductor;
 pub(crate) mod dashboard;
 mod equity_redemption;
+mod iap_auth;
 mod inventory;
 mod issuance;
 pub(crate) mod metrics;
@@ -489,8 +490,11 @@ fn spawn_server_supervisor(
     main_startup_token: startup::StartupToken,
     board_startup_token: startup::StartupToken,
 ) -> SupervisorHandle {
+    // Read before `state` moves into the router below.
+    let ops_api = state.ctx.ops_api.clone();
+
     let main_router = Router::new()
-        .merge(api::routes())
+        .merge(api::routes(ops_api.as_ref()))
         .nest("/api", dashboard::routes())
         .route("/metrics", axum::routing::get(metrics::endpoint))
         .with_state(state);
