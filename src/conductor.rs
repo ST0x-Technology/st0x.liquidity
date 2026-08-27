@@ -807,19 +807,6 @@ where
     Ok((executor, provider, telemetry_writer, telemetry))
 }
 
-/// Resolves the rebalancing configuration, which is optional.
-///
-/// Standalone mode is a supported deployment, not a failure, so
-/// [`CtxError::NotRebalancing`] maps to `None`. Every other error is a real
-/// misconfiguration and propagates.
-fn optional_rebalancing_ctx(ctx: &Ctx) -> anyhow::Result<Option<RebalancingCtx>> {
-    match ctx.rebalancing_ctx() {
-        Ok(rebalancing) => Ok(Some(rebalancing.clone())),
-        Err(CtxError::NotRebalancing) => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
 /// Publishes the recovery handle that backs `/transfers/resume`.
 ///
 /// Called only after all startup work (inventory hydration, orphan recovery,
@@ -909,7 +896,10 @@ impl Conductor {
 
         run_startup_maintenance(&ctx, &pool).await?;
 
-        let rebalancing = optional_rebalancing_ctx(&ctx)?;
+        // `PositionAndRebalancing::setup` keeps its `Option` parameter until
+        // the conductor collapses to the single topology; the `[rebalancing]`
+        // section is required, so this is always `Some`.
+        let rebalancing = Some((*ctx.rebalancing).clone());
         let notifier = build_alert_notifier(ctx.alerts.as_ref(), "Operational alerting")?;
 
         let PositionAndRebalancing {
@@ -1739,7 +1729,7 @@ struct PositionAndRebalancing {
     /// portfolio-snapshot capture gate never actually needs to resolve a
     /// vault ratio in that case (`crate::portfolio_snapshot::write`). `Some`
     /// regardless of whether rebalancing itself is enabled -- a wallet can be
-    /// configured for trading alone (`TradingMode::Standalone`), and market
+    /// configured for trading alone (the removed Standalone topology), and market
     /// making still holds wrapped vault shares in that mode.
     wrapper: Option<Arc<dyn Wrapper>>,
     service: Option<Arc<RebalancingService>>,
@@ -1866,7 +1856,7 @@ impl PositionAndRebalancing {
                 .build(())
                 .await?;
 
-            // Rebalancing itself may be disabled (`TradingMode::Standalone`)
+            // Rebalancing itself may be disabled (the removed Standalone topology)
             // while a wallet is still configured for trading alone -- market
             // making then still holds wrapped vault shares onchain, so the
             // portfolio-snapshot job still needs a ratio source. Mirrors
@@ -2302,8 +2292,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let BaseWallet(base_wallet) = wallets.base();
         let market_maker_wallet = base_wallet.address();
 
-        // This function only runs under `TradingMode::Rebalancing`, which
-        // requires `[wallet]` to be configured (see `CtxError::WalletNotConfigured`),
+        // This function runs for every boot (the [rebalancing] section is
+        // required and demands a configured [wallet]; see CtxError),
         // so `[wallet]` presence is guaranteed here -- unlike
         // `build_record_bot_gas_receipt_cost_ctx`, which also runs in
         // Standalone mode and must check both. With that precondition met,

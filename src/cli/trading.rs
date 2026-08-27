@@ -1205,7 +1205,6 @@ mod tests {
     use st0x_config::{
         AssetsConfig, BrokerCtx, EquitiesConfig, EquityAssetConfig, EvmCtx, ExecutionThreshold,
         IngestionCutoff, InventoryAdapters, InventoryMode, LogFormat, LogLevel, OperationMode,
-        TradingMode,
     };
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, CancellationOutcome,
@@ -1448,7 +1447,7 @@ mod tests {
             telemetry: None,
             alerts: None,
             pricing: None,
-            trading_mode: TradingMode::Standalone,
+            rebalancing: st0x_config::default_test_rebalancing_ctx(),
             order_owner: Address::ZERO,
             wallet: None,
             wallet_meta: None,
