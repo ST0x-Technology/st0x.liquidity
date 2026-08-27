@@ -197,8 +197,7 @@ mod tests {
     use st0x_config::RebalancingCtx;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
-        AssetsConfig, BrokerCtx, CashAssetConfig, EquitiesConfig, LogFormat, LogLevel,
-        OperationMode,
+        AssetsConfig, CashAssetConfig, EquitiesConfig, LogFormat, LogLevel, OperationMode,
     };
     use st0x_config::{EvmCtx, IngestionCutoff, InventoryAdapters, InventoryMode};
     use st0x_evm::IERC20::decimalsCall;
@@ -241,7 +240,7 @@ mod tests {
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,
             apalis_finished_job_cleanup_interval_secs: 3600,
-            broker: BrokerCtx::DryRun,
+            broker: st0x_config::test_alpaca_broker_ctx(),
             telemetry: None,
             alerts: None,
             pricing: None,
@@ -295,7 +294,7 @@ mod tests {
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,
             apalis_finished_job_cleanup_interval_secs: 3600,
-            broker: BrokerCtx::DryRun,
+            broker: st0x_config::test_alpaca_broker_ctx(),
             telemetry: None,
             alerts: None,
             pricing: None,
