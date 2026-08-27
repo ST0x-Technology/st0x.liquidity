@@ -95,7 +95,7 @@ struct CachedKeys {
 /// Verifies IAP assertions against one expected audience.
 ///
 /// One instance per role prefix: the audience is what separates them.
-pub struct IapVerifier {
+pub(crate) struct IapVerifier {
     audience: String,
     role: &'static str,
     http: reqwest::Client,
@@ -104,7 +104,7 @@ pub struct IapVerifier {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum IapAuthError {
+pub(crate) enum IapError {
     #[error("missing IAP assertion")]
     MissingAssertion,
     #[error("malformed IAP assertion")]
@@ -117,7 +117,7 @@ pub enum IapAuthError {
     Rejected,
 }
 
-impl IapAuthError {
+impl IapError {
     const fn status(&self) -> StatusCode {
         match self {
             // Every failure here is "you did not present a usable IAP
@@ -137,7 +137,7 @@ impl IapAuthError {
     }
 }
 
-impl IntoResponse for IapAuthError {
+impl IntoResponse for IapError {
     fn into_response(self) -> Response {
         // The body stays deliberately vague. A caller who failed to
         // authenticate learns nothing about which check failed; the detail
@@ -147,7 +147,7 @@ impl IntoResponse for IapAuthError {
 }
 
 impl IapVerifier {
-    pub fn new(audience: String, role: &'static str) -> Self {
+    pub(crate) fn new(audience: String, role: &'static str) -> Self {
         Self {
             audience,
             role,
@@ -166,15 +166,15 @@ impl IapVerifier {
     }
 
     /// Returns the caller's stable subject id once the assertion checks out.
-    async fn verify(&self, token: &str) -> Result<String, IapAuthError> {
+    async fn verify(&self, token: &str) -> Result<String, IapError> {
         let header = decode_header(token).map_err(|error| {
             warn!(target: "iap", role = self.role, %error, "Malformed IAP assertion header");
-            IapAuthError::MalformedAssertion
+            IapError::MalformedAssertion
         })?;
 
         let kid = header.kid.ok_or_else(|| {
             warn!(target: "iap", role = self.role, "IAP assertion carries no key id");
-            IapAuthError::MalformedAssertion
+            IapError::MalformedAssertion
         })?;
 
         let key = self.decoding_key(&kid).await?;
@@ -186,8 +186,8 @@ impl IapVerifier {
         // `exp` is what bounds a stolen token's usefulness, so its absence
         // must be a rejection rather than an unbounded token.
         validation.required_spec_claims = ["exp", "aud", "iss"]
-            .iter()
-            .map(|c| (*c).to_string())
+            .into_iter()
+            .map(String::from)
             .collect();
 
         let claims = decode::<IapClaims>(token, &key, &validation).map_err(|error| {
@@ -197,7 +197,7 @@ impl IapVerifier {
                 target: "iap", role = self.role, %error,
                 "IAP assertion failed validation"
             );
-            IapAuthError::Rejected
+            IapError::Rejected
         })?;
 
         info!(
@@ -211,7 +211,7 @@ impl IapVerifier {
         Ok(claims.claims.sub)
     }
 
-    async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, IapAuthError> {
+    async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, IapError> {
         if let Some(key) = self.cached_key(kid).await {
             return Ok(key);
         }
@@ -222,7 +222,7 @@ impl IapVerifier {
 
         self.cached_key(kid).await.ok_or_else(|| {
             warn!(target: "iap", role = self.role, kid, "IAP assertion names an unknown key");
-            IapAuthError::UnknownKey
+            IapError::UnknownKey
         })
     }
 
@@ -241,7 +241,7 @@ impl IapVerifier {
             .map(|(_, key)| key.clone())
     }
 
-    async fn refresh(&self, kid: &str) -> Result<(), IapAuthError> {
+    async fn refresh(&self, kid: &str) -> Result<(), IapError> {
         let mut guard = self.keys.write().await;
 
         // Another task may have refreshed while this one waited for the lock.
@@ -281,7 +281,7 @@ impl IapVerifier {
                         cached.last_refresh_attempt = now;
                         Ok(())
                     }
-                    None => Err(IapAuthError::KeysUnavailable),
+                    None => Err(IapError::KeysUnavailable),
                 }
             }
         }
@@ -316,11 +316,11 @@ impl IapVerifier {
 }
 
 /// Rejects any request that did not arrive through IAP for this role.
-pub async fn require_iap(
+pub(crate) async fn require_iap(
     verifier: Arc<IapVerifier>,
     request: Request,
     next: Next,
-) -> Result<Response, IapAuthError> {
+) -> Result<Response, IapError> {
     let token = request
         .headers()
         .get(ASSERTION_HEADER)
@@ -333,10 +333,10 @@ pub async fn require_iap(
                 path = %request.uri().path(),
                 "Request carries no IAP assertion"
             );
-            IapAuthError::MissingAssertion
+            IapError::MissingAssertion
         })?
         .to_str()
-        .map_err(|_| IapAuthError::MalformedAssertion)?
+        .map_err(|_| IapError::MalformedAssertion)?
         .to_string();
 
     verifier.verify(&token).await?;
