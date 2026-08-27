@@ -35,6 +35,7 @@ mod auth;
 mod client;
 mod executor;
 mod journal;
+pub(crate) mod kms_jwt;
 mod market_hours;
 #[cfg(feature = "mock")]
 mod mock_api;
@@ -56,12 +57,19 @@ pub enum AssetStatus {
 }
 
 pub use activity::{AccountActivitiesQuery, AccountActivity};
-pub use auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+pub use auth::{
+    AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaBrokerAuth,
+};
 // Exposed as the single source of truth for the broker HTTP request timeout so
 // timing-sensitive integration tests derive their boundaries from it.
 pub use client::HTTP_REQUEST_TIMEOUT;
+// Crate-visible so the market-data module can build authenticated
+// requests through the client instead of reaching for raw reqwest.
+pub(crate) use client::AlpacaBrokerApiClient;
+// The only kms_jwt items that cross the module (and crate) boundary.
 pub use executor::AlpacaBrokerApi;
 pub use journal::{JournalResponse, JournalStatus};
+pub use kms_jwt::{AuthRuntime, KmsJwtError};
 pub use order::{
     AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, ConversionOrder, CryptoOrderOutcome,
     CryptoOrderResponse, ParseAlpacaLimitPriceError,
@@ -242,6 +250,9 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Invalid header value: {0}")]
     InvalidHeader(#[from] reqwest::header::InvalidHeaderValue),
+
+    #[error("keyless Alpaca auth failed: {0}")]
+    KmsJwt(#[from] kms_jwt::KmsJwtError),
 
     #[error("{}", format_api_error(*status, alpaca_code.as_ref(), message))]
     ApiError {
@@ -468,8 +479,15 @@ impl AlpacaBrokerApiError {
                 retry_after: *retry_after,
             }),
 
+            // A rate-limited token mint throttles every keyless call at
+            // once; surface it with its Retry-After hint.
+            Self::KmsJwt(error) if error.is_rate_limited() => Some(Backpressure {
+                retry_after: error.retry_after(),
+            }),
+
             Self::ApiError { .. }
             | Self::HttpClient(_)
+            | Self::KmsJwt(_)
             | Self::JsonParse(_)
             | Self::PositionSymbolMismatch { .. }
             | Self::InvalidHeader(_)
@@ -530,7 +548,15 @@ impl AlpacaBrokerApiError {
             // routing/cache failure: a fresh request can clear it, but the
             // mismatched financial value must never be consumed.
             Self::HttpClient(source) if source.is_builder() => Permanence::Permanent,
-            Self::HttpClient(_) | Self::PositionSymbolMismatch { .. } => Permanence::Transient,
+            // A deterministic mint failure (revoked signerVerifier grant,
+            // disabled BrokerDash credential: 4xx from KMS or the token
+            // endpoint) fails identically on every retry, exactly like a
+            // Basic-auth 401/403; everything else about a mint is
+            // network-shaped and retryable.
+            Self::KmsJwt(error) if error.is_deterministic() => Permanence::Permanent,
+            Self::HttpClient(_) | Self::KmsJwt(_) | Self::PositionSymbolMismatch { .. } => {
+                Permanence::Transient
+            }
 
             // Everything else is decided locally -- from a response that
             // already arrived, from configuration, or from arithmetic on

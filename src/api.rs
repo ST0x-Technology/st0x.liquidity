@@ -2761,8 +2761,10 @@ mod tests {
         });
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.broker = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
-            api_key: "test_key_id".to_owned(),
-            api_secret: "test_secret_key".to_owned(),
+            auth: st0x_execution::AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_owned(),
+                api_secret: "test_secret_key".to_owned(),
+            },
             account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Mock(mock_server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),

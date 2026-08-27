@@ -1,9 +1,7 @@
 use std::time::Duration;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use reqwest::Method;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, trace};
 use uuid::Uuid;
@@ -12,6 +10,7 @@ use super::AlpacaBrokerApiError;
 use super::auth::{AccountResponse, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 use super::executor::AssetResponse;
 use super::journal::{JournalRequest, JournalResponse};
+use super::kms_jwt::AuthRuntime;
 use super::order::{
     CryptoOrderRequest, CryptoOrderResponse, LimitOrderRequest, OrderRequest, OrderResponse,
 };
@@ -25,10 +24,12 @@ use crate::{CancellationOutcome, ClientOrderId, FractionalShares, Positive, Symb
 /// change here then cannot silently invalidate those tests.
 pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Alpaca Broker API HTTP client with Basic authentication
+/// Alpaca Broker API HTTP client. Basic (key/secret) or keyless
+/// (KMS-signed bearer tokens) authentication, injected per request so a
+/// rotating token is always current.
 pub(crate) struct AlpacaBrokerApiClient {
     http_client: reqwest::Client,
-    market_data_http_client: reqwest::Client,
+    auth: AuthRuntime,
     base_url: String,
     market_data_base_url: String,
     account_id: AlpacaAccountId,
@@ -47,36 +48,23 @@ impl std::fmt::Debug for AlpacaBrokerApiClient {
 
 impl AlpacaBrokerApiClient {
     pub(crate) fn new(ctx: &AlpacaBrokerApiCtx) -> Result<Self, AlpacaBrokerApiError> {
-        let credentials = format!("{}:{}", ctx.api_key, ctx.api_secret);
-        let encoded_credentials = BASE64_STANDARD.encode(credentials.as_bytes());
-        let auth_value = format!("Basic {encoded_credentials}");
+        let auth = AuthRuntime::build(ctx.auth.clone())?;
 
-        let headers = HeaderMap::from_iter([
-            (AUTHORIZATION, HeaderValue::from_str(&auth_value)?),
-            (CONTENT_TYPE, HeaderValue::from_static("application/json")),
-        ]);
+        let headers =
+            HeaderMap::from_iter([(CONTENT_TYPE, HeaderValue::from_static("application/json"))]);
 
+        // One client serves broker and market-data hosts alike: with
+        // auth injected per request the two pools had no remaining
+        // behavioral difference (reqwest pools per host internally).
         let http_client = reqwest::Client::builder()
             .default_headers(headers)
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(HTTP_REQUEST_TIMEOUT)
-            .build()?;
-        let api_key_header = HeaderName::from_static("apca-api-key-id");
-        let api_secret_header = HeaderName::from_static("apca-api-secret-key");
-        let market_data_headers = HeaderMap::from_iter([
-            (api_key_header, HeaderValue::from_str(&ctx.api_key)?),
-            (api_secret_header, HeaderValue::from_str(&ctx.api_secret)?),
-            (CONTENT_TYPE, HeaderValue::from_static("application/json")),
-        ]);
-        let market_data_http_client = reqwest::Client::builder()
-            .default_headers(market_data_headers)
             .connect_timeout(Duration::from_secs(10))
             .timeout(HTTP_REQUEST_TIMEOUT)
             .build()?;
 
         Ok(Self {
             http_client,
-            market_data_http_client,
+            auth,
             base_url: ctx.base_url().to_string(),
             market_data_base_url: ctx.mode().market_data_base_url().to_string(),
             account_id: ctx.account_id,
@@ -96,12 +84,15 @@ impl AlpacaBrokerApiClient {
         !matches!(self.mode, AlpacaBrokerApiMode::Production)
     }
 
-    pub(crate) fn market_data_base_url(&self) -> &str {
-        &self.market_data_base_url
-    }
-
-    pub(crate) fn market_data_http_client(&self) -> &reqwest::Client {
-        &self.market_data_http_client
+    /// A Market Data API GET for `path` (e.g. `/v2/stocks/AAPL/trades/latest`)
+    /// with the right credentials attached (APCA header pair for Basic,
+    /// bearer token for keyless).
+    pub(crate) async fn market_data_get(
+        &self,
+        path: &str,
+    ) -> Result<reqwest::RequestBuilder, super::kms_jwt::KmsJwtError> {
+        let url = format!("{}{path}", self.market_data_base_url);
+        self.auth.apply_apca(self.http_client.get(url)).await
     }
 
     /// Verify the account by fetching account details
@@ -344,14 +335,24 @@ impl AlpacaBrokerApiClient {
         &self,
         url: &str,
     ) -> Result<T, AlpacaBrokerApiError> {
-        let response = self.http_client.get(url).send().await?;
+        let response = self
+            .http_client
+            .get(url)
+            .header(AUTHORIZATION, self.auth.broker_authorization().await?)
+            .send()
+            .await?;
 
         self.handle_response(Method::GET, response).await
     }
 
     /// Perform a DELETE request, expecting no response body.
     pub(super) async fn delete(&self, url: &str) -> Result<(), AlpacaBrokerApiError> {
-        let response = self.http_client.delete(url).send().await?;
+        let response = self
+            .http_client
+            .delete(url)
+            .header(AUTHORIZATION, self.auth.broker_authorization().await?)
+            .send()
+            .await?;
         let status = response.status();
 
         if status.is_success() {
@@ -370,7 +371,13 @@ impl AlpacaBrokerApiClient {
         url: &str,
         body: &B,
     ) -> Result<T, AlpacaBrokerApiError> {
-        let response = self.http_client.post(url).json(body).send().await?;
+        let response = self
+            .http_client
+            .post(url)
+            .json(body)
+            .header(AUTHORIZATION, self.auth.broker_authorization().await?)
+            .send()
+            .await?;
 
         self.handle_response(Method::POST, response).await
     }
@@ -453,8 +460,10 @@ mod tests {
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
-            api_key: "test_key_id".to_string(),
-            api_secret: "test_secret_key".to_string(),
+            auth: crate::AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
             account_id: TEST_ACCOUNT_ID,
             mode: Some(mode),
             asset_cache_ttl: std::time::Duration::from_secs(3600),

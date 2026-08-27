@@ -187,8 +187,10 @@ mod tests {
 
     fn create_test_ctx(server: &MockServer) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
-            api_key: "test_key_id".to_string(),
-            api_secret: "test_secret_key".to_string(),
+            auth: crate::AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
             account_id: TEST_ACCOUNT_ID,
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),

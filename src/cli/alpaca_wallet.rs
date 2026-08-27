@@ -38,9 +38,8 @@ pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
         alpaca_auth.account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
-    );
+        alpaca_auth.auth.clone(),
+    )?;
 
     writeln!(stdout, "   Fetching Alpaca deposit address...")?;
     let usdc_symbol = TokenSymbol::new("USDC");
@@ -208,9 +207,8 @@ pub(super) async fn alpaca_withdraw_command<Registry: IntoErrorRegistry, W: Writ
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
         alpaca_auth.account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
-    );
+        alpaca_auth.auth.clone(),
+    )?;
 
     let usdc_asset = TokenSymbol::new("USDC");
 
@@ -366,9 +364,8 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
         alpaca_auth.account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
-    );
+        alpaca_auth.auth.clone(),
+    )?;
 
     writeln!(stdout, "   Checking existing whitelist entries...")?;
     let existing = retry_on_backpressure(
@@ -426,9 +423,8 @@ pub(super) async fn alpaca_whitelist_list_command<W: Write>(
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
         alpaca_auth.account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
-    );
+        alpaca_auth.auth.clone(),
+    )?;
 
     writeln!(stdout, "Fetching whitelisted addresses...")?;
 
@@ -479,9 +475,8 @@ pub(super) async fn alpaca_whitelist_patch_travel_rule_command<W: Write>(
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
         alpaca_auth.account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
-    );
+        alpaca_auth.auth.clone(),
+    )?;
 
     let patched = alpaca_wallet
         .patch_all_whitelist_travel_rules(&travel_rule_info)
@@ -518,9 +513,8 @@ pub(super) async fn alpaca_unwhitelist_command<W: Write>(
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
         alpaca_auth.account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
-    );
+        alpaca_auth.auth.clone(),
+    )?;
 
     let removed = alpaca_wallet.remove_whitelist_entries(&address).await?;
 
@@ -547,9 +541,8 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
         alpaca_auth.account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
-    );
+        alpaca_auth.auth.clone(),
+    )?;
 
     writeln!(stdout, "Fetching Alpaca crypto wallet transfers...")?;
     writeln!(stdout, "   Account: {}", alpaca_auth.account_id)?;
@@ -808,8 +801,10 @@ mod tests {
     fn create_alpaca_ctx_without_rebalancing() -> Ctx {
         let mut ctx = create_ctx_without_alpaca();
         ctx.broker = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            auth: st0x_execution::AlpacaBrokerAuth::Basic {
+                api_key: "test-key".to_string(),
+                api_secret: "test-secret".to_string(),
+            },
             account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
@@ -822,8 +817,10 @@ mod tests {
     fn create_mock_alpaca_ctx(base_url: String) -> Ctx {
         let mut ctx = create_ctx_without_alpaca();
         ctx.broker = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
+            auth: st0x_execution::AlpacaBrokerAuth::Basic {
+                api_key: "test-key".to_string(),
+                api_secret: "test-secret".to_string(),
+            },
             account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Mock(base_url)),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
@@ -871,8 +868,10 @@ mod tests {
             close_flatten_cross_max_bps: 400,
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
-                api_key: "test-key".to_string(),
-                api_secret: "test-secret".to_string(),
+                auth: st0x_execution::AlpacaBrokerAuth::Basic {
+                    api_key: "test-key".to_string(),
+                    api_secret: "test-secret".to_string(),
+                },
                 account_id: alpaca_account_id,
                 mode: Some(mode),
                 asset_cache_ttl: std::time::Duration::from_secs(3600),

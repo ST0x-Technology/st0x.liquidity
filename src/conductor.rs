@@ -2213,9 +2213,8 @@ async fn build_rebalancer_services<Chain: Wallet + Clone>(
     let alpaca_wallet = Arc::new(AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
         alpaca_auth.account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
-    ));
+        alpaca_auth.auth.clone(),
+    )?);
 
     let broker = InstrumentedAlpacaBroker::new(
         AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?,
@@ -2297,12 +2296,11 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let tokenization = Arc::new(AlpacaTokenizationService::new(
             alpaca_auth.base_url().to_string(),
             alpaca_auth.account_id,
-            alpaca_auth.api_key.clone(),
-            alpaca_auth.api_secret.clone(),
+            alpaca_auth.auth.clone(),
             base_wallet.clone(),
             Network::new("base"),
             Some(redemption_wallet),
-        ));
+        )?);
 
         let tokenizer: Arc<dyn Tokenizer> = tokenization;
 

@@ -53,8 +53,10 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         |url| url.to_string().trim_end_matches('/').to_owned(),
     );
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
-        api_key: TEST_API_KEY.to_owned(),
-        api_secret: TEST_API_SECRET.to_owned(),
+        auth: st0x_execution::AlpacaBrokerAuth::Basic {
+            api_key: TEST_API_KEY.to_owned(),
+            api_secret: TEST_API_SECRET.to_owned(),
+        },
         account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
         mode: Some(AlpacaBrokerApiMode::Mock(broker_url)),
         asset_cache_ttl: Duration::from_secs(3600),

@@ -51,6 +51,8 @@ mod tests {
 
     use super::*;
 
+    use crate::alpaca_broker_api::AlpacaBrokerAuth;
+
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
@@ -76,9 +78,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let result = client
             .get_wallet_address(&TokenSymbol::new("USDC"), &Network::new("ethereum"))
@@ -111,9 +116,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         assert!(matches!(
             client
@@ -142,9 +150,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         assert!(matches!(
             client

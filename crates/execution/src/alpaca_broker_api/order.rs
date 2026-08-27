@@ -29,7 +29,7 @@ const ALPACA_NOTIONAL_MAX_DECIMAL_PLACES: u8 = 2;
 /// Order side
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(super) enum OrderSide {
+pub(crate) enum OrderSide {
     Buy,
     Sell,
 }
@@ -592,6 +592,7 @@ fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
                 && message.contains("client_order_id must be unique")
         }
         HttpClient(_)
+        | KmsJwt(_)
         | JsonParse(_)
         | PositionSymbolMismatch { .. }
         | InvalidHeader(_)
@@ -1284,6 +1285,12 @@ mod tests {
     use tracing_test::traced_test;
     use uuid::uuid;
 
+    #[test]
+    fn kms_jwt_errors_are_never_the_duplicate_order_case() {
+        let error = AlpacaBrokerApiError::KmsJwt(crate::KmsJwtError::ClockBeforeEpoch);
+        assert!(!is_duplicate_client_order_id(&error));
+    }
+
     use super::*;
     use crate::ClientOrderId;
     use crate::alpaca_broker_api::auth::{
@@ -1297,8 +1304,10 @@ mod tests {
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
-            api_key: "test_key".to_string(),
-            api_secret: "test_secret".to_string(),
+            auth: crate::AlpacaBrokerAuth::Basic {
+                api_key: "test_key".to_string(),
+                api_secret: "test_secret".to_string(),
+            },
             account_id: TEST_ACCOUNT_ID,
             mode: Some(mode),
             asset_cache_ttl: std::time::Duration::from_secs(3600),

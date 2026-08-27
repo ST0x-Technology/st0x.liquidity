@@ -5174,8 +5174,10 @@ mod tests {
         let _account_mock = create_broker_account_mock(server);
 
         let auth = AlpacaBrokerApiCtx {
-            api_key: "test_key".to_string(),
-            api_secret: "test_secret".to_string(),
+            auth: st0x_execution::AlpacaBrokerAuth::Basic {
+                api_key: "test_key".to_string(),
+                api_secret: "test_secret".to_string(),
+            },
             account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
@@ -5192,9 +5194,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key".to_string(),
-            "test_secret".to_string(),
-        );
+            st0x_execution::AlpacaBrokerAuth::Basic {
+                api_key: "test_key".to_string(),
+                api_secret: "test_secret".to_string(),
+            },
+        )
+        .unwrap();
 
         AlpacaWalletService::new_with_client(client, None)
     }
@@ -10788,9 +10793,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key".to_string(),
-            "test_secret".to_string(),
-        );
+            st0x_execution::AlpacaBrokerAuth::Basic {
+                api_key: "test_key".to_string(),
+                api_secret: "test_secret".to_string(),
+            },
+        )
+        .unwrap();
         let polling = PollingConfig {
             interval: Duration::from_millis(10),
             timeout: Duration::from_millis(200),

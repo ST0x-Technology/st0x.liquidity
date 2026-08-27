@@ -66,6 +66,8 @@ mod tests {
     use super::super::transfer::{Network, TokenSymbol};
     use super::*;
 
+    use crate::alpaca_broker_api::AlpacaBrokerAuth;
+
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
@@ -103,9 +105,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let result = client.get_whitelisted_addresses().await.unwrap();
 
@@ -143,9 +148,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
@@ -184,9 +192,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
@@ -226,9 +237,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
@@ -278,9 +292,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
@@ -323,9 +340,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let address = address!("0x1234567890abcdef1234567890abcdef12345678");
         let asset = TokenSymbol::new("USDC");
@@ -350,12 +370,17 @@ mod tests {
         let account_id_str = std::env::var("ALPACA_BROKER_ACCOUNT_ID").ok()?;
         let account_id = AlpacaAccountId::new(account_id_str.parse::<Uuid>().expect("valid UUID"));
 
-        Some(AlpacaWalletClient::new(
-            "https://broker-api.sandbox.alpaca.markets".to_string(),
-            account_id,
-            api_key,
-            api_secret,
-        ))
+        Some(
+            AlpacaWalletClient::new(
+                "https://broker-api.sandbox.alpaca.markets".to_string(),
+                account_id,
+                AlpacaBrokerAuth::Basic {
+                    api_key,
+                    api_secret,
+                },
+            )
+            .expect("basic auth wallet client"),
+        )
     }
 
     /// Exercises the Alpaca sandbox wallet API: list, create, patch, delete.

@@ -10,6 +10,7 @@ use tracing::{trace, warn};
 
 use super::transfer::{AlpacaTransferId, Network, TokenSymbol, TransferStatus};
 use super::whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
+use crate::alpaca_broker_api::{AlpacaBrokerAuth, AuthRuntime, KmsJwtError};
 use crate::rate_limit::retry_after_from_response_headers;
 use crate::{AlpacaAccountId, Backpressure};
 
@@ -17,6 +18,8 @@ use crate::{AlpacaAccountId, Backpressure};
 pub enum AlpacaWalletError {
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
+    #[error("wallet auth failed: {0}")]
+    Auth(#[from] KmsJwtError),
     #[error("API error (status {status}): {message}")]
     ApiError {
         status: StatusCode,
@@ -87,8 +90,15 @@ impl AlpacaWalletError {
                 retry_after: *retry_after,
             }),
 
+            // A rate-limited token mint throttles every keyless call at
+            // once; surface it with its Retry-After hint.
+            Self::Auth(error) if error.is_rate_limited() => Some(Backpressure {
+                retry_after: error.retry_after(),
+            }),
+
             Self::ApiError { .. }
             | Self::Reqwest(_)
+            | Self::Auth(_)
             | Self::ParseError(_)
             | Self::Utf8(_)
             | Self::FromHex(_)
@@ -108,38 +118,29 @@ pub struct AlpacaWalletClient {
     client: Client,
     account_id: AlpacaAccountId,
     base_url: String,
-    api_key: String,
-    api_secret: String,
+    auth: AuthRuntime,
 }
 
 impl AlpacaWalletClient {
     pub fn new(
         base_url: String,
         account_id: AlpacaAccountId,
-        api_key: String,
-        api_secret: String,
-    ) -> Self {
-        Self {
+        auth: AlpacaBrokerAuth,
+    ) -> Result<Self, AlpacaWalletError> {
+        Ok(Self {
             client: Client::new(),
             account_id,
             base_url,
-            api_key,
-            api_secret,
-        }
+            auth: AuthRuntime::build(auth)?,
+        })
     }
 
     pub(super) async fn get(&self, path: &str) -> Result<String, AlpacaWalletError> {
         let url = format!("{}{}", self.base_url, path);
         trace!(target: "wallet", "GET {url}");
 
-        let response = self
-            .client
-            .get(&url)
-            .basic_auth(&self.api_key, Some(&self.api_secret))
-            .header("APCA-API-KEY-ID", &self.api_key)
-            .header("APCA-API-SECRET-KEY", &self.api_secret)
-            .send()
-            .await?;
+        let request = self.auth.apply_wallet(self.client.get(&url)).await?;
+        let response = request.send().await?;
 
         read_response_body(Method::GET, response).await
     }
@@ -152,16 +153,11 @@ impl AlpacaWalletClient {
         let url = format!("{}{}", self.base_url, path);
         trace!(target: "wallet", "POST {url}");
 
-        // Alpaca API requires both Basic auth AND APCA headers for authentication
-        let response = self
-            .client
-            .post(&url)
-            .basic_auth(&self.api_key, Some(&self.api_secret))
-            .header("APCA-API-KEY-ID", &self.api_key)
-            .header("APCA-API-SECRET-KEY", &self.api_secret)
-            .json(body)
-            .send()
-            .await?;
+        // The legacy pair sends both Basic auth AND the APCA headers (the
+        // wallet endpoints historically wanted both); keyless sends the
+        // bearer token. AuthRuntime::apply_wallet owns that split.
+        let request = self.auth.apply_wallet(self.client.post(&url)).await?;
+        let response = request.json(body).send().await?;
 
         read_response_body(Method::POST, response).await
     }
@@ -170,14 +166,8 @@ impl AlpacaWalletClient {
         let url = format!("{}{}", self.base_url, path);
         trace!(target: "wallet", "DELETE {url}");
 
-        let response = self
-            .client
-            .delete(&url)
-            .basic_auth(&self.api_key, Some(&self.api_secret))
-            .header("APCA-API-KEY-ID", &self.api_key)
-            .header("APCA-API-SECRET-KEY", &self.api_secret)
-            .send()
-            .await?;
+        let request = self.auth.apply_wallet(self.client.delete(&url)).await?;
+        let response = request.send().await?;
 
         read_response_body(Method::DELETE, response).await
     }
@@ -190,15 +180,8 @@ impl AlpacaWalletClient {
         let url = format!("{}{}", self.base_url, path);
         trace!(target: "wallet", "PATCH {url}");
 
-        let response = self
-            .client
-            .patch(&url)
-            .basic_auth(&self.api_key, Some(&self.api_secret))
-            .header("APCA-API-KEY-ID", &self.api_key)
-            .header("APCA-API-SECRET-KEY", &self.api_secret)
-            .json(body)
-            .send()
-            .await?;
+        let request = self.auth.apply_wallet(self.client.patch(&url)).await?;
+        let response = request.json(body).send().await?;
 
         read_response_body(Method::PATCH, response).await
     }
@@ -437,13 +420,14 @@ mod tests {
         let client = AlpacaWalletClient::new(
             "https://broker-api.sandbox.alpaca.markets".to_string(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         assert_eq!(*client.account_id(), TEST_ACCOUNT_ID);
-        assert_eq!(client.api_key, "test_key_id");
-        assert_eq!(client.api_secret, "test_secret_key");
     }
 
     #[tokio::test]
@@ -468,9 +452,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let response = client.get("/v1/test").await.unwrap();
 
@@ -492,9 +479,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         assert!(matches!(
             client.get("/v1/error").await.unwrap_err(),
@@ -516,9 +506,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         assert!(matches!(
             client.get("/v1/server_error").await.unwrap_err(),
@@ -542,9 +535,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let error = client.get("/v1/rate_limited").await.unwrap_err();
 
@@ -569,9 +565,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let error = client.get("/v1/rate_limited").await.unwrap_err();
 
@@ -593,9 +592,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let error = client.get("/v1/server_error").await.unwrap_err();
 
@@ -620,9 +622,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let body = json!({"amount": "10.5", "asset": "USDC"});
         let response = client.post("/v1/test", &body).await.unwrap();
@@ -646,9 +651,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         client.get("/v1/test").await.unwrap();
 
@@ -672,9 +680,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let error = client.get("/v1/error").await.unwrap_err();
 
@@ -775,9 +786,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let body = client.get("/v1/whitelists").await.unwrap();
 
@@ -815,9 +829,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let AlpacaWalletError::ApiError {
             status, message, ..
@@ -858,9 +875,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         assert!(matches!(
             client.get("/v1/test").await.unwrap_err(),
@@ -882,9 +902,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         let body = json!({"test": "data"});
 
@@ -923,9 +946,12 @@ mod tests {
         let client = AlpacaWalletClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
 
         client
             .patch_whitelist_travel_rule(whitelist_id, &travel_rule)

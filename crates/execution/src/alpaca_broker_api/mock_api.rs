@@ -2317,8 +2317,10 @@ mod tests {
             .await;
 
         let ctx = AlpacaBrokerApiCtx {
-            api_key: TEST_API_KEY.to_string(),
-            api_secret: TEST_API_SECRET.to_string(),
+            auth: crate::AlpacaBrokerAuth::Basic {
+                api_key: TEST_API_KEY.to_string(),
+                api_secret: TEST_API_SECRET.to_string(),
+            },
             account_id: AlpacaAccountId::new(Uuid::parse_str(TEST_ACCOUNT_ID).unwrap()),
             mode: Some(AlpacaBrokerApiMode::Mock(mock.base_url())),
             asset_cache_ttl: Duration::from_secs(3600),
@@ -2373,8 +2375,10 @@ mod tests {
             .await;
 
         let ctx = AlpacaBrokerApiCtx {
-            api_key: TEST_API_KEY.to_string(),
-            api_secret: TEST_API_SECRET.to_string(),
+            auth: crate::AlpacaBrokerAuth::Basic {
+                api_key: TEST_API_KEY.to_string(),
+                api_secret: TEST_API_SECRET.to_string(),
+            },
             account_id: AlpacaAccountId::new(Uuid::parse_str(TEST_ACCOUNT_ID).unwrap()),
             mode: Some(AlpacaBrokerApiMode::Mock(mock.base_url())),
             asset_cache_ttl: Duration::from_secs(3600),
@@ -2393,8 +2397,10 @@ mod tests {
     /// account-activities client against it.
     fn activities_ctx(mock: &AlpacaBrokerMock) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
-            api_key: TEST_API_KEY.to_string(),
-            api_secret: TEST_API_SECRET.to_string(),
+            auth: crate::AlpacaBrokerAuth::Basic {
+                api_key: TEST_API_KEY.to_string(),
+                api_secret: TEST_API_SECRET.to_string(),
+            },
             account_id: AlpacaAccountId::new(Uuid::parse_str(TEST_ACCOUNT_ID).unwrap()),
             mode: Some(AlpacaBrokerApiMode::Mock(mock.base_url())),
             asset_cache_ttl: Duration::from_secs(3600),
@@ -2412,8 +2418,10 @@ mod tests {
             .call()
             .await;
         let ctx = AlpacaBrokerApiCtx {
-            api_key: TEST_API_KEY.to_string(),
-            api_secret: TEST_API_SECRET.to_string(),
+            auth: crate::AlpacaBrokerAuth::Basic {
+                api_key: TEST_API_KEY.to_string(),
+                api_secret: TEST_API_SECRET.to_string(),
+            },
             account_id: AlpacaAccountId::new(Uuid::parse_str(TEST_ACCOUNT_ID).unwrap()),
             mode: Some(AlpacaBrokerApiMode::Mock(mock.base_url())),
             asset_cache_ttl: Duration::from_secs(3600),
@@ -2445,8 +2453,10 @@ mod tests {
             .call()
             .await;
         let ctx = AlpacaBrokerApiCtx {
-            api_key: TEST_API_KEY.to_string(),
-            api_secret: TEST_API_SECRET.to_string(),
+            auth: crate::AlpacaBrokerAuth::Basic {
+                api_key: TEST_API_KEY.to_string(),
+                api_secret: TEST_API_SECRET.to_string(),
+            },
             account_id: AlpacaAccountId::new(Uuid::parse_str(TEST_ACCOUNT_ID).unwrap()),
             mode: Some(AlpacaBrokerApiMode::Mock(mock.base_url())),
             asset_cache_ttl: Duration::from_secs(3600),
