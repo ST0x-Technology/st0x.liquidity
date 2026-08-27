@@ -700,14 +700,15 @@ mod tests {
         token_mock.assert_calls(1);
     }
 
-    /// Expire both cache deadlines, in a sync helper so no `MutexGuard`
-    /// scope overlaps an await point.
+    /// Expire both cache deadlines. Take-modify-reinsert keeps each
+    /// `MutexGuard` a same-statement temporary, so neither the
+    /// guard-across-await nor the significant-drop lint can fire.
     fn expire_cached_token(auth: &KmsJwtAuth) {
         let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
-        let mut cached = auth.cached.lock().unwrap();
-        let token = cached.as_mut().unwrap();
+        let mut token = auth.cached.lock().unwrap().take().unwrap();
         token.refresh_after = expired;
         token.hard_expiry = expired;
+        *auth.cached.lock().unwrap() = Some(token);
     }
 
     fn basic_runtime() -> AuthRuntime {
