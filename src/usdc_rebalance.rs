@@ -481,6 +481,15 @@ pub(crate) enum UsdcRebalanceCommand {
     },
     /// Record deposit failure. Valid only from `DepositInitiated` state.
     FailDeposit { reason: String },
+    /// Recover a BaseToAlpaca `DepositFailed` whose Alpaca deposit actually
+    /// settled after the polling deadline (the provider completed the
+    /// transfer the bot had already failed). Transitions to
+    /// `DepositConfirmed` so the USDC->USD conversion leg completes and the
+    /// in-progress guard clears via the normal terminal path. Valid ONLY
+    /// from a BaseToAlpaca `DepositFailed` carrying an on-chain deposit
+    /// ref. Driven by `transfer recheck` after verifying the exact transfer
+    /// at Alpaca.
+    RecoverDeposit,
     /// Reconcile a USDC rebalance stranded in the post-burn terminal
     /// `DepositFailed` state to a guard-clearing terminal `Reconciled` state.
     /// The minted USDC was handled out-of-band, so this resolves the transfer
@@ -642,6 +651,12 @@ pub(crate) enum UsdcRebalanceEvent {
         reason: String,
         failed_at: DateTime<Utc>,
     },
+    /// A BaseToAlpaca `DepositFailed` whose Alpaca deposit settled after the
+    /// polling deadline. Un-fails the aggregate to `DepositConfirmed` so the
+    /// USDC->USD conversion leg completes. Mirrors
+    /// `BridgingCompletionRecovered`; recorded by `transfer recheck` after
+    /// verifying the exact transfer at Alpaca.
+    DepositCompletionRecovered { recovered_at: DateTime<Utc> },
     /// An operator reconciled a post-burn `DepositFailed` rebalance to the
     /// guard-clearing terminal `Reconciled` state. Carries `direction` so the
     /// reactor derives the source venue without in-memory tracking (which may
@@ -688,6 +703,9 @@ impl DomainEvent for UsdcRebalanceEvent {
             Self::DepositInitiated { .. } => "UsdcRebalanceEvent::DepositInitiated",
             Self::DepositConfirmed { .. } => "UsdcRebalanceEvent::DepositConfirmed",
             Self::DepositFailed { .. } => "UsdcRebalanceEvent::DepositFailed",
+            Self::DepositCompletionRecovered { .. } => {
+                "UsdcRebalanceEvent::DepositCompletionRecovered"
+            }
             Self::OperatorReconciled { .. } => "UsdcRebalanceEvent::OperatorReconciled",
         }
         .to_string()
@@ -898,6 +916,30 @@ pub(crate) enum UsdcRebalance {
 }
 
 impl UsdcRebalance {
+    /// The state's variant name, for operator-facing diagnostics (e.g. the
+    /// `transfer recheck` refusal naming the state it cannot recover).
+    pub(crate) const fn state_name(&self) -> &'static str {
+        match self {
+            Self::Converting { .. } => "Converting",
+            Self::ConversionComplete { .. } => "ConversionComplete",
+            Self::ConversionFailed { .. } => "ConversionFailed",
+            Self::WithdrawalSubmitting { .. } => "WithdrawalSubmitting",
+            Self::Withdrawing { .. } => "Withdrawing",
+            Self::WithdrawalComplete { .. } => "WithdrawalComplete",
+            Self::WithdrawalFailed { .. } => "WithdrawalFailed",
+            Self::BridgingSubmitting { .. } => "BridgingSubmitting",
+            Self::Bridging { .. } => "Bridging",
+            Self::AwaitingAttestation { .. } => "AwaitingAttestation",
+            Self::Attested { .. } => "Attested",
+            Self::Bridged { .. } => "Bridged",
+            Self::BridgingFailed { .. } => "BridgingFailed",
+            Self::DepositInitiated { .. } => "DepositInitiated",
+            Self::DepositConfirmed { .. } => "DepositConfirmed",
+            Self::DepositFailed { .. } => "DepositFailed",
+            Self::Reconciled { .. } => "Reconciled",
+        }
+    }
+
     /// Whether a failed rebalance failed POST-burn -- the only USDC failures
     /// `transfer reconcile --kind usdc` accepts (a pre-burn failure strands
     /// nothing and the CLI rejects it). MUST stay in sync with the reconcilable
@@ -1601,6 +1643,7 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
                'UsdcRebalanceEvent::BridgingCompletionRecovered', \
                'UsdcRebalanceEvent::DepositInitiated', \
                'UsdcRebalanceEvent::DepositConfirmed', \
+               'UsdcRebalanceEvent::DepositCompletionRecovered', \
                'UsdcRebalanceEvent::DepositFailed' \
            ) \
          ORDER BY latest.aggregate_id",
@@ -1673,6 +1716,11 @@ impl EventSourced for UsdcRebalance {
     // snapshots carry the old timestamp, which would skew the 4-hour operator
     // alert deadline. Bumped so snapshots are cleared and `initiated_at` is
     // rebuilt from events on the next load.
+    //
+    // `DepositCompletionRecovered` (RecoverDeposit un-failing a late-settled
+    // Alpaca deposit) needed NO bump, like `BridgingCompletionRecovered`
+    // before it: a new event type changes no state shape, so existing
+    // snapshots stay valid and replay forward through the new evolve arm.
     const SCHEMA_VERSION: u64 = 8;
 
     fn originate(event: &Self::Event) -> Option<Self> {
@@ -2193,6 +2241,30 @@ impl EventSourced for UsdcRebalance {
                 failed_at: *failed_at,
             },
 
+            // Un-fail a BaseToAlpaca `DepositFailed` whose Alpaca deposit
+            // settled after the polling deadline. Only matches the shape the
+            // command validates (BaseToAlpaca with an on-chain deposit ref);
+            // any other pairing falls through to an invalid transition.
+            (
+                DepositCompletionRecovered { recovered_at },
+                Self::DepositFailed {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    burn_tx_hash,
+                    mint_tx_hash,
+                    deposit_ref: Some(TransferRef::OnchainTx(_)),
+                    initiated_at,
+                    ..
+                },
+            ) => Self::DepositConfirmed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                mint_tx_hash: *mint_tx_hash,
+                initiated_at: *initiated_at,
+                deposit_confirmed_at: *recovered_at,
+            },
+
             // OperatorReconciled: derive failure_reason from the prior state and
             // transition to Reconciled, or return Ok(None) for non-reconcilable
             // states. The nested match enumerates every UsdcRebalance variant
@@ -2388,7 +2460,9 @@ impl EventSourced for UsdcRebalance {
             #[cfg(any(test, feature = "test-support"))]
             InitiateDepositAt { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
 
-            ConfirmDeposit | FailDeposit { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
+            ConfirmDeposit | FailDeposit { .. } | RecoverDeposit => {
+                Err(UsdcRebalanceError::DepositNotInitiated)
+            }
             #[cfg(any(test, feature = "test-support"))]
             ConfirmDepositAt { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
 
@@ -2560,6 +2634,7 @@ impl EventSourced for UsdcRebalance {
             } => self.transition_confirm_deposit(deposit_confirmed_at),
 
             FailDeposit { reason } => self.transition_fail_deposit(reason),
+            RecoverDeposit => self.transition_recover_deposit(),
             ReconcileStuckRebalance { reason } => self.transition_reconcile_stuck_rebalance(reason),
         }
     }
@@ -3298,6 +3373,51 @@ impl UsdcRebalance {
             | Self::Reconciled { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "FailDeposit".to_string(),
                 state: format!("{self:?}"),
+            }),
+        }
+    }
+
+    /// Un-fail a BaseToAlpaca `DepositFailed` whose Alpaca deposit settled
+    /// after the polling deadline, transitioning to `DepositConfirmed` so
+    /// the USDC->USD conversion leg completes. Valid only from a
+    /// BaseToAlpaca `DepositFailed` carrying an on-chain deposit ref: the
+    /// send tx is the identity the recheck verified at Alpaca, while an
+    /// AlpacaToBase deposit is the bot's own on-chain tx (reconcile
+    /// territory, not provider recheck).
+    fn transition_recover_deposit(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::DepositFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_ref: Some(TransferRef::OnchainTx(_)),
+                ..
+            } => Ok(vec![DepositCompletionRecovered {
+                recovered_at: Utc::now(),
+            }]),
+            Self::DepositFailed {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "RecoverDeposit".to_string(),
+                state: "AlpacaToBase DepositFailed (its deposit is the bot's \
+                        own on-chain tx, not a provider-settled transfer -- \
+                        use `transfer reconcile --kind usdc` instead)"
+                    .to_string(),
+            }),
+            Self::DepositFailed { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "RecoverDeposit".to_string(),
+                state: "DepositFailed without an on-chain deposit ref (no \
+                        send tx to verify at Alpaca -- use `transfer \
+                        reconcile --kind usdc` instead)"
+                    .to_string(),
+            }),
+            // Recovery only makes sense for a terminally-failed deposit;
+            // from any other state there is nothing to un-fail.
+            _ => Err(UsdcRebalanceError::InvalidCommand {
+                command: "RecoverDeposit".to_string(),
+                state: "non-failed (RecoverDeposit is only valid from a \
+                        BaseToAlpaca DepositFailed)"
+                    .to_string(),
             }),
         }
     }
@@ -6781,8 +6901,235 @@ mod tests {
         ));
     }
 
+    /// The prod incident shape: Alpaca still reported the deposit
+    /// PROCESSING when the polling deadline failed the aggregate, then
+    /// completed the transfer later. `RecoverDeposit` un-fails the aggregate
+    /// to `DepositConfirmed` -- carrying the original amount and tx hashes --
+    /// so the USDC->USD conversion leg can run to the normal terminal.
+    #[tokio::test]
+    async fn recover_deposit_unfails_base_to_alpaca_deposit_failure() {
+        let history = deposit_failed_history();
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(history.clone())
+            .when(UsdcRebalanceCommand::RecoverDeposit)
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::DepositCompletionRecovered { recovered_at } = &events[0] else {
+            panic!("Expected DepositCompletionRecovered, got {:?}", events[0]);
+        };
+
+        let state =
+            replay::<UsdcRebalance>(history.into_iter().chain([events[0].clone()])).unwrap();
+        let Some(UsdcRebalance::DepositConfirmed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount,
+            burn_tx_hash,
+            mint_tx_hash,
+            deposit_confirmed_at,
+            ..
+        }) = state
+        else {
+            panic!("recovery must replay to a BaseToAlpaca DepositConfirmed, got {state:?}");
+        };
+        // The deposit-leg states carry the bridged `amount_received` (the
+        // USDC that actually reached Alpaca), not the nominal amount.
+        assert_eq!(amount, Usdc::new(float!(99.99)));
+        assert_eq!(
+            burn_tx_hash,
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001")
+        );
+        assert_eq!(
+            mint_tx_hash,
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111")
+        );
+        assert_eq!(deposit_confirmed_at, *recovered_at);
+    }
+
+    /// AlpacaToBase's deposit is the bot's own on-chain tx: resume territory,
+    /// not provider recheck. Recovery must refuse rather than confirm a
+    /// deposit no provider ever settled.
+    #[tokio::test]
+    async fn recover_deposit_rejects_alpaca_to_base_deposit_failure() {
+        let deposit_tx =
+            fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
+        let mut history = deposit_failed_history();
+        replace_matching_event(
+            &mut history,
+            |event| matches!(event, UsdcRebalanceEvent::Initiated { .. }),
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc::new(float!(100.00)),
+                withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                initiated_at: Utc::now(),
+            },
+        );
+        replace_matching_event(
+            &mut history,
+            |event| matches!(event, UsdcRebalanceEvent::DepositFailed { .. }),
+            UsdcRebalanceEvent::DepositFailed {
+                deposit_ref: Some(TransferRef::OnchainTx(deposit_tx)),
+                reason: "deposit tx reverted".to_string(),
+                failed_at: Utc::now(),
+            },
+        );
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(history)
+            .when(UsdcRebalanceCommand::RecoverDeposit)
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+        ));
+    }
+
+    /// Without an on-chain deposit ref there is no send tx to verify at
+    /// Alpaca, so recovery has nothing to recheck and must refuse -- both for
+    /// a ref lost to legacy serialization (`None`) and for a non-onchain ref.
+    #[tokio::test]
+    async fn recover_deposit_rejects_missing_onchain_deposit_ref() {
+        for deposit_ref in [
+            None,
+            Some(TransferRef::AlpacaId(
+                AlpacaTransferId::from(Uuid::new_v4()),
+            )),
+        ] {
+            let mut history = deposit_failed_history();
+            replace_matching_event(
+                &mut history,
+                |event| matches!(event, UsdcRebalanceEvent::DepositFailed { .. }),
+                UsdcRebalanceEvent::DepositFailed {
+                    deposit_ref: deposit_ref.clone(),
+                    reason: "deposit rejected".to_string(),
+                    failed_at: Utc::now(),
+                },
+            );
+
+            let error = TestHarness::<UsdcRebalance>::with(())
+                .given(history)
+                .when(UsdcRebalanceCommand::RecoverDeposit)
+                .await
+                .then_expect_error();
+
+            assert!(
+                matches!(
+                    error,
+                    LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+                ),
+                "deposit_ref {deposit_ref:?} must refuse recovery, got: {error:?}"
+            );
+        }
+    }
+
+    /// Recovery only makes sense for a terminally-failed deposit; from a
+    /// still-in-flight `DepositInitiated` the poller owns the outcome.
+    #[tokio::test]
+    async fn recover_deposit_rejects_non_failed_state() {
+        let mut history = deposit_failed_history();
+        let deposit_failed_position = history
+            .iter()
+            .position(|event| matches!(event, UsdcRebalanceEvent::DepositFailed { .. }))
+            .expect("fixture must contain the DepositFailed terminal");
+        history.truncate(deposit_failed_position);
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(history)
+            .when(UsdcRebalanceCommand::RecoverDeposit)
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+        ));
+    }
+
+    /// A second recovery finds the aggregate already un-failed
+    /// (`DepositConfirmed`) and must refuse -- idempotency at the aggregate
+    /// boundary; the recheck flow reports already-completed instead.
+    #[tokio::test]
+    async fn recover_deposit_twice_is_rejected() {
+        let mut history = deposit_failed_history();
+        history.push(UsdcRebalanceEvent::DepositCompletionRecovered {
+            recovered_at: Utc::now(),
+        });
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(history)
+            .when(UsdcRebalanceCommand::RecoverDeposit)
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn recover_deposit_on_uninitialized_aggregate_is_rejected() {
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::RecoverDeposit)
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::DepositNotInitiated)
+        ));
+    }
+
+    /// Pins the persisted wire shape and event-type string of
+    /// `DepositCompletionRecovered`: replay of recovered aggregates and the
+    /// interrupted-rebalance SQL both depend on these exact values.
+    #[test]
+    fn deposit_completion_recovered_wire_format_is_pinned() {
+        let recovered_at: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let event = UsdcRebalanceEvent::DepositCompletionRecovered { recovered_at };
+
+        assert_eq!(
+            event.event_type(),
+            "UsdcRebalanceEvent::DepositCompletionRecovered"
+        );
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({
+                "DepositCompletionRecovered": { "recovered_at": "2026-01-01T00:00:00Z" }
+            })
+        );
+
+        let round_tripped: UsdcRebalanceEvent = from_value(json!({
+            "DepositCompletionRecovered": { "recovered_at": "2026-01-01T00:00:00Z" }
+        }))
+        .unwrap();
+        assert_eq!(round_tripped, event);
+    }
+
+    /// Replaces the single fixture event matching `matches_event`, panicking
+    /// when the fixture no longer contains one, so event-order drift in
+    /// `deposit_failed_history` cannot silently change which event a test
+    /// overrides.
+    fn replace_matching_event(
+        history: &mut [UsdcRebalanceEvent],
+        matches_event: fn(&UsdcRebalanceEvent) -> bool,
+        replacement: UsdcRebalanceEvent,
+    ) {
+        let position = history
+            .iter()
+            .position(matches_event)
+            .expect("fixture must contain the event this test replaces");
+        history[position] = replacement;
+    }
+
     /// Event history that lands a BaseToAlpaca aggregate in the post-burn
-    /// terminal `DepositFailed` state, for the operator-reconcile tests.
+    /// terminal `DepositFailed` state, for the operator-reconcile and
+    /// deposit-recovery tests.
     fn deposit_failed_history() -> Vec<UsdcRebalanceEvent> {
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
@@ -6817,8 +7164,13 @@ mod tests {
                 fee_collected: Usdc::new(float!(0.01)),
                 minted_at: Utc::now(),
             },
+            // The same on-chain ref in both events, as production produces
+            // them: a BaseToAlpaca deposit is initiated with the USDC send
+            // tx as its reference, and `transition_fail_deposit` always
+            // preserves the initiated ref (see
+            // `test_deposit_failed_preserves_deposit_ref_when_available`).
             UsdcRebalanceEvent::DepositInitiated {
-                deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                deposit_ref: TransferRef::OnchainTx(mint_tx),
                 deposit_initiated_at: Utc::now(),
             },
             UsdcRebalanceEvent::DepositFailed {
@@ -10053,6 +10405,46 @@ mod tests {
         )
         .await;
 
+        // Recovered late-settled deposit (latest event
+        // DepositCompletionRecovered, state DepositConfirmed BaseToAlpaca) --
+        // mid-flight after un-fail with the conversion leg still owed, holds
+        // the guard, must be included so a crash between recovery and
+        // conversion resumes instead of stranding.
+        let recovered_deposit = seed_through(
+            &store,
+            vec![
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(BURN_TX),
+                },
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+                UsdcRebalanceCommand::InitiateBridging { burn_tx: BURN_TX },
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "transient receipt error".to_string(),
+                },
+                UsdcRebalanceCommand::RecoverBridging {
+                    mint_tx: fixed_bytes!(
+                        "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    ),
+                    amount_received: Usdc::new(float!(399.99)),
+                    fee_collected: Usdc::new(float!(0.01)),
+                },
+                UsdcRebalanceCommand::InitiateDeposit {
+                    deposit: TransferRef::OnchainTx(fixed_bytes!(
+                        "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    )),
+                },
+                UsdcRebalanceCommand::FailDeposit {
+                    reason: "Deposit ended in status: Processing".to_string(),
+                },
+                UsdcRebalanceCommand::RecoverDeposit,
+            ],
+        )
+        .await;
+
         // Pre-burn mid-flight whose LATEST event is PendingBurnRecorded (the burn
         // hash was recorded before its receipt) -- must be included, else the guard
         // latches with no driving job (the double-burn-safe redrive never runs).
@@ -10096,6 +10488,7 @@ mod tests {
                 bridge_failed,
                 awaiting_attestation,
                 recovered,
+                recovered_deposit,
                 pending_burn_recorded,
                 withdrawing
             ])

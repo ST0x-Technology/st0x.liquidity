@@ -47,7 +47,7 @@ use st0x_execution::{
     DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, FractionalShares, Symbol, TimeInForce,
 };
 use st0x_finance::{Positive, Usd};
-use st0x_hedge::cli::TransferType;
+use st0x_hedge::cli::{RecheckTransferType, TransferType};
 use st0x_hedge::mock_api::{
     REDEMPTION_WALLET, RedemptionOutcome, TokenizationRequestType, TokenizationStatus,
 };
@@ -636,12 +636,13 @@ fn find_equity_addresses<P>(
 fn log_recheck_command(
     config_path: &Path,
     secrets_path: &Path,
-    transfer_type: TransferType,
+    transfer_type: RecheckTransferType,
     id: &str,
 ) {
     let transfer_type_arg = match transfer_type {
-        TransferType::Mint => "mint",
-        TransferType::Redemption => "redemption",
+        RecheckTransferType::Mint => "mint",
+        RecheckTransferType::Redemption => "redemption",
+        RecheckTransferType::Usdc => "usdc",
     };
     let command = format!(
         "nix develop --command cargo run --features mock --bin cli -- \
@@ -1412,7 +1413,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
     log_recheck_command(
         &config_path,
         &secrets_path,
-        TransferType::Mint,
+        RecheckTransferType::Mint,
         &accepted_mint.issuer_request_id,
     );
 
@@ -1472,14 +1473,14 @@ async fn simulate_failures() -> anyhow::Result<()> {
     log_recheck_command(
         &config_path,
         &secrets_path,
-        TransferType::Redemption,
+        RecheckTransferType::Redemption,
         &rejected_redemption.redemption_id,
     );
 
     if std::env::var_os("SIMULATE_EXIT_AFTER_SELF_HEAL").is_some() {
         st0x_hedge::cli::recheck_transfer_for_test(
             &cli_ctx,
-            TransferType::Mint,
+            RecheckTransferType::Mint,
             &accepted_mint.issuer_request_id,
         )
         .await?;
@@ -1499,7 +1500,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
 
         st0x_hedge::cli::recheck_transfer_for_test(
             &cli_ctx,
-            TransferType::Redemption,
+            RecheckTransferType::Redemption,
             &rejected_redemption.redemption_id,
         )
         .await?;

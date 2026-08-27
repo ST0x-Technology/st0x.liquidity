@@ -20,8 +20,8 @@ use st0x_config::BrokerCtx;
 use st0x_dto::{
     EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, TradingVenue,
 };
-use st0x_execution::Symbol;
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
+use st0x_execution::{AlpacaWalletError, Symbol};
 use st0x_finance::FractionalShares;
 use st0x_tokenization::IssuerRequestId;
 
@@ -42,7 +42,9 @@ use crate::performance::reliability::{
 use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performance};
 use crate::rebalancing::RebalancingService;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, RecheckError, RecheckOutcome};
+use crate::rebalancing::usdc::{RecheckUsdcDeposit, UsdcRecheckError};
 use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
+use crate::usdc_rebalance::UsdcRebalanceId;
 
 /// Comma-separated filter for transfer kinds in query parameters.
 ///
@@ -1247,6 +1249,10 @@ pub(crate) struct RecoveryHandle {
     /// recovery event is dispatched, so the reactor applies its inventory
     /// effect on the live bot.
     pub(crate) rebalancing_service: Arc<RebalancingService>,
+    /// Operator `transfer recheck` entry point for a failed USDC deposit.
+    /// Runs in the bot process, so the recovery events reach the live
+    /// trigger reactor and clear the in-progress guard without a restart.
+    pub(crate) usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
 }
 
 /// Prevents concurrent `/transfers/resume` requests from racing through
@@ -1466,12 +1472,27 @@ async fn recheck_transfer(
         }
 
         TransferKind::UsdcBridge => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: "recheck is not supported for USDC bridges".to_string(),
-                }),
-            ));
+            let rebalance_id: UsdcRebalanceId = id.parse().map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("Invalid USDC rebalance ID: {error}"),
+                    }),
+                )
+            })?;
+
+            let outcome = handle
+                .usdc_recheck
+                .recheck_deposit(&rebalance_id)
+                .await
+                .map_err(|error| {
+                    error!(?error, %id, "Failed to recheck USDC deposit");
+                    let (status, message) = usdc_recheck_error_response(&error);
+                    (status, Json(ErrorResponse { error: message }))
+                })?;
+
+            info!(%id, ?outcome, "USDC deposit recheck completed via API");
+            return Ok(Json(RecheckResponse { outcome }));
         }
     }
     .map_err(|error| {
@@ -1515,6 +1536,38 @@ fn recheck_error_response(error: &RecheckError) -> (StatusCode, String) {
         Mint(_) | Redemption(_) | Rebalancing(_) | Database(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to recheck transfer".to_string(),
+        ),
+    }
+}
+
+/// Maps a [`UsdcRecheckError`] to an HTTP status and operator-facing message,
+/// with the same recoverability split as [`recheck_error_response`]: the
+/// not-recoverable refusals carry the typed error's message (they only
+/// reference aggregate ids), the transient provider failure maps to 502 so
+/// the operator knows to retry, and internal failures stay generic (the full
+/// error is logged at the call site). A deposit Alpaca has not detected or
+/// settled yet is a 200 [`RecheckOutcome`], not an error, matching the
+/// equity recheck contract.
+fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String) {
+    use UsdcRecheckError::{
+        Alpaca, AlpacaToBaseDeposit, NoOnchainDepositRef, NotDepositFailed, NotFound, Transfer,
+    };
+
+    match error {
+        NotFound(_) => (StatusCode::NOT_FOUND, error.to_string()),
+        AlpacaToBaseDeposit(_) | NoOnchainDepositRef(_) | NotDepositFailed { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+        }
+        // A parse failure is deterministic -- the same payload fails
+        // identically on every retry -- so "retry later" would misguide;
+        // only the transport/API failures are transient and keep the 502.
+        Alpaca(AlpacaWalletError::ParseError(_)) | Transfer(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to recheck transfer".to_string(),
+        ),
+        Alpaca(_) => (
+            StatusCode::BAD_GATEWAY,
+            "Alpaca unavailable; retry later".to_string(),
         ),
     }
 }
@@ -1716,7 +1769,7 @@ mod tests {
     use st0x_dto::TradeOutcome;
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
     use st0x_execution::{
-        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletError,
         DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutorOrderId, Positive,
         SupportedExecutor, Symbol, TimeInForce,
     };
@@ -1742,6 +1795,7 @@ mod tests {
         PortfolioSnapshotId, PortfolioSnapshotProjection, et_day,
     };
     use crate::position::{Position, PositionCommand, TradeId};
+    use crate::rebalancing::usdc::UsdcTransferError;
     use crate::tokenized_equity_mint::TokenizedEquityMint;
 
     async fn empty_app_state(ctx: Ctx) -> AppState {
@@ -4291,6 +4345,25 @@ mod tests {
         );
     }
 
+    /// The recheck endpoints' wire envelope is `{"outcome":"<snake_case>"}`.
+    /// The CLI surfaces these exact values to operators (documented in
+    /// docs/cli-ops.md), so the serialization is pinned against literals.
+    #[test]
+    fn recheck_response_serializes_snake_case_outcomes() {
+        for (outcome, wire) in [
+            (RecheckOutcome::Recovered, "recovered"),
+            (RecheckOutcome::Resumed, "resumed"),
+            (RecheckOutcome::AlreadyCompleted, "already_completed"),
+            (RecheckOutcome::LeftUnchanged, "left_unchanged"),
+            (RecheckOutcome::NotDetectedYet, "not_detected_yet"),
+            (RecheckOutcome::Conflict, "conflict"),
+            (RecheckOutcome::NotRecoverable, "not_recoverable"),
+        ] {
+            let json = serde_json::to_value(RecheckResponse { outcome }).unwrap();
+            assert_eq!(json, serde_json::json!({ "outcome": wire }));
+        }
+    }
+
     #[test]
     fn recheck_error_response_distinguishes_recoverability() {
         // Not-recoverable: the persisted aggregate state forbids recovery, so
@@ -4329,6 +4402,60 @@ mod tests {
         // Genuinely internal failure -> 500 with a generic body.
         let (status, message) =
             recheck_error_response(&RecheckError::Database(sqlx::Error::RowNotFound));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "Failed to recheck transfer");
+    }
+
+    /// Mirrors `recheck_error_response_distinguishes_recoverability` for the
+    /// USDC recheck: an unknown rebalance is 404, aggregate-state refusals
+    /// are 422 carrying the typed reason, the transient provider failure is
+    /// 502 so the operator knows to retry, and internal failures stay a
+    /// generic 500.
+    #[test]
+    fn usdc_recheck_error_response_distinguishes_recoverability() {
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+
+        let (status, message) =
+            usdc_recheck_error_response(&UsdcRecheckError::NotFound(id.clone()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(message, format!("no USDC rebalance found for {id}"));
+
+        let (status, _) =
+            usdc_recheck_error_response(&UsdcRecheckError::AlpacaToBaseDeposit(id.clone()));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, _) =
+            usdc_recheck_error_response(&UsdcRecheckError::NoOnchainDepositRef(id.clone()));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, _) = usdc_recheck_error_response(&UsdcRecheckError::NotDepositFailed {
+            id: id.clone(),
+            state: "Withdrawing",
+        });
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, message) =
+            usdc_recheck_error_response(&UsdcRecheckError::Alpaca(AlpacaWalletError::ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "down".to_string(),
+                retry_after: None,
+            }));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(message, "Alpaca unavailable; retry later");
+
+        // A response that fails to parse is deterministic: the same payload
+        // fails identically on every retry, so "retry later" would misguide
+        // -- it must map to the generic 500, not the transient 502.
+        let parse_error = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Alpaca(
+            AlpacaWalletError::ParseError(parse_error),
+        ));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "Failed to recheck transfer");
+
+        let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
+            UsdcTransferError::PreviouslyFailedAggregate { id },
+        )));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "Failed to recheck transfer");
     }

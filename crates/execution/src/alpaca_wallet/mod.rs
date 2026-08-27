@@ -145,6 +145,24 @@ impl AlpacaWalletService {
         status::poll_deposit_by_tx_hash(&self.client, tx_hash, &self.polling_config).await
     }
 
+    /// Finds an incoming deposit by its on-chain transaction hash with a
+    /// single query -- no polling deadline. `transfer recheck` uses this to
+    /// verify whether a deposit the poller once gave up on has since settled
+    /// at Alpaca: by recheck time the deposit either settled or it did not,
+    /// so waiting adds nothing. Returns `None` when Alpaca has not detected
+    /// the transfer, or when the hash matches an outgoing transfer (never a
+    /// deposit).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API call fails.
+    pub async fn find_deposit_by_tx_hash(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Result<Option<Transfer>, AlpacaWalletError> {
+        transfer::find_deposit_by_tx_hash(&self.client, tx_hash).await
+    }
+
     pub async fn get_wallet_address(
         &self,
         asset: &TokenSymbol,
