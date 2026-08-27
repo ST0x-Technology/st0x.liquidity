@@ -33,8 +33,8 @@ ingestion_cutoff = "safe"
 [rest_api]
 url = "http://localhost:8099"
 
-# ETH/USD valuation source for bot-gas cost recording (ADR 0017). Only
-# required once [rebalancing] is enabled. `pyth_contract` here is the real
+# ETH/USD valuation source for bot-gas cost recording (ADR 0017). Always
+# required. `pyth_contract` here is the real
 # Base mainnet address -- a PLACEHOLDER with no deployed code on the local
 # anvil chain the e2e harness runs against, so it is NOT usable as-is for a
 # server started from this file with rebalancing on. Rebalancing e2e
@@ -47,3 +47,34 @@ url = "http://localhost:8099"
 [bot_gas_valuation]
 pyth_contract = "0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a"
 eth_usd_feed_id = "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"
+
+# The [rebalancing] section is required for every parseable config. The e2e
+# template keeps every trigger inert: per-asset `rebalancing` is disabled
+# above, USDC rebalancing is disabled below, and the freeze guard is off.
+[rebalancing]
+transfer_timeout_secs = 1800
+transfer_attempt_timeout_secs = 3600
+attestation_retry_deadline_secs = 86400
+max_burn_revert_redrives = 5
+freeze_check = "disabled"
+
+[rebalancing.equity]
+target = "0.5"
+deviation = "0.2"
+
+[rebalancing.usdc]
+mode = "disabled"
+
+# Matches [raindex].vault_owner: in legacy inventory mode the bot's EOA owns
+# the vaults. Runtime e2e ctxs build their wallets programmatically
+# (TestWallet); this section exists so the template parses like a deployable
+# config.
+[wallet]
+kind = "private-key"
+address = "0x3333333333333333333333333333333333333333"
+
+# Alpaca issuer wallet placeholder; required by config validation. Runtime
+# e2e ctxs override the redemption wallet programmatically (REDEMPTION_WALLET
+# in the mock tokenization API).
+[tokenization]
+redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
