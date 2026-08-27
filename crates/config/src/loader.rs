@@ -7171,87 +7171,54 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn kms_broker_secrets_reject_non_production_mode() {
-        // The keyless mint targets live authx; pairing it with sandbox
-        // must fail at startup, not silently mint production tokens.
-        let config = toml_file(
+    #[test]
+    fn kms_broker_mapping_requires_production_and_assembles_kms_auth() {
+        let broker_config: BrokerConfig = toml::from_str(
             r#"
-            database_url = ":memory:"
-            server_port = 8080
-            board_port = 8081
-            apalis_finished_job_cleanup_interval_secs = 3600
-            inventory_divergence_threshold = 10
-
-            [assets.equities]
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            inventory_mode = "managed"
-            inventory_adapters = []
-            inventory = "0x2222222222222222222222222222222222222222"
-            vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
-            required_confirmations = 3
-            ingestion_cutoff = "safe"
-
-            [broker]
             counter_trade_slippage_bps = 100
             close_flatten_cross_max_bps = 400
             extended_hours_reprice_timeout_secs = 300
             close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
 
-            [broker.travel_rule]
+            [travel_rule]
             beneficiary_entity_name = "Test Corp"
+            "#,
+        )
+        .unwrap();
+        let kms_secrets = |mode: AlpacaBrokerApiMode| BrokerSecrets::AlpacaBrokerApiKms {
+            client_id: "CKTEST".to_string(),
+            kms_key_version: "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1"
+                .to_string(),
+            account_id: "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef".parse().unwrap(),
+            mode: Some(mode),
+        };
 
-            [wallet]
-            kind = "private-key"
-            address = "0x0000000000000000000000000000000000000001"
-        "#,
+        // The keyless mint targets live authx; pairing it with sandbox
+        // must fail at assembly, not silently mint production tokens.
+        let rejected = BrokerCtx::from_parts(
+            kms_secrets(AlpacaBrokerApiMode::Sandbox),
+            Some(&broker_config),
         );
-
-        let secrets = toml_file(
-            r#"
-            [evm]
-            rpc_url = "http://localhost:8545"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.example.com"
-            hyperevm_rpc_url = "https://rpc.hyperliquid.example.com"
-
-            [broker]
-            type = "alpaca-broker-api-kms"
-            client_id = "CKTEST"
-            kms_key_version = "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1"
-            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
-            mode = "sandbox"
-
-            [wallet]
-            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        "#,
-        );
-
-        let result = Ctx::load_files(config.path(), secrets.path()).await;
-        assert!(
-            matches!(result, Err(CtxError::KmsBrokerRequiresProductionMode)),
-            "Expected KmsBrokerRequiresProductionMode, got {result:?}"
-        );
-
-        // With mode = "production" the same secrets must assemble into a
-        // KmsJwt broker context: this pins the from_parts mapping, not
-        // just the TOML shape.
-        let production_secrets = toml_file(
-            &std::fs::read_to_string(secrets.path())
-                .unwrap()
-                .replace("mode = \"sandbox\"", "mode = \"production\""),
-        );
-        let ctx = Ctx::load_files(config.path(), production_secrets.path())
-            .await
-            .unwrap();
         assert!(matches!(
-            &ctx.broker,
+            rejected,
+            Err(CtxError::KmsBrokerRequiresProductionMode)
+        ));
+
+        // Production mode assembles a KmsJwt broker context: this pins
+        // the from_parts mapping, not just the TOML shape.
+        let ctx = BrokerCtx::from_parts(
+            kms_secrets(AlpacaBrokerApiMode::Production),
+            Some(&broker_config),
+        )
+        .unwrap();
+        assert!(matches!(
+            &ctx,
             BrokerCtx::AlpacaBrokerApi(broker_ctx)
-                if matches!(broker_ctx.auth, AlpacaBrokerAuth::KmsJwt { .. })
+                if matches!(
+                    &broker_ctx.auth,
+                    AlpacaBrokerAuth::KmsJwt { client_id, .. } if client_id == "CKTEST"
+                )
         ));
     }
 
