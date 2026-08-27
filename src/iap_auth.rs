@@ -228,17 +228,26 @@ impl IapVerifier {
 
     async fn cached_key(&self, kid: &str) -> Option<DecodingKey> {
         let guard = self.keys.read().await;
-        let cached = guard.as_ref()?;
 
-        if cached.fetched_at.elapsed() > JWKS_TTL {
-            return None;
-        }
+        // Cloning the key out and dropping the guard before returning keeps
+        // the read lock held for the lookup only, so a refresh waiting for the
+        // write lock is not queued behind a caller that has already finished
+        // reading.
+        let key = guard.as_ref().and_then(|cached| {
+            if cached.fetched_at.elapsed() > JWKS_TTL {
+                return None;
+            }
 
-        cached
-            .keys
-            .iter()
-            .find(|(id, _)| id == kid)
-            .map(|(_, key)| key.clone())
+            cached
+                .keys
+                .iter()
+                .find(|(id, _)| id == kid)
+                .map(|(_, key)| key.clone())
+        });
+
+        drop(guard);
+
+        key
     }
 
     async fn refresh(&self, kid: &str) -> Result<(), IapError> {
