@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use url::Url;
 
 /// Deployment the client talks to. Selects the IAP-fronted API base URL and
-/// the ID token audience.
+/// the per-role ID token audiences.
 #[derive(Clone, Copy, clap::ValueEnum)]
 pub enum Env {
     Staging,
@@ -19,11 +19,13 @@ impl Env {
 }
 
 /// Non-secret connection settings for one environment. The base URL is the
-/// IAP-fronted HTTPS endpoint; the audience is the IAP OAuth client ID the ID
-/// token is minted for. Neither is a credential.
+/// IAP-fronted HTTPS endpoint; the two audiences name the read and write
+/// backend services the ID tokens are minted for. None of these is a
+/// credential - each audience is worthless without an identity Google signs.
 pub struct Target {
     pub base_url: Url,
-    pub audience: String,
+    pub read_audience: String,
+    pub write_audience: String,
     /// Optional T0 Cloud Logging console URL, printed alongside API errors.
     pub logging_url: Option<String>,
 }
@@ -40,14 +42,19 @@ pub fn resolve(env: Env) -> Result<Target> {
     )?;
     let base_url = Url::parse(&raw_url)
         .with_context(|| format!("{prefix}_URL is not a valid URL: {raw_url}"))?;
-    let audience = required(
-        &format!("{prefix}_AUDIENCE"),
-        "to the IAP OAuth client ID (the ID token audience) for this environment",
+    let read_audience = required(
+        &format!("{prefix}_READ_AUDIENCE"),
+        "to the read backend audience (the terraform ops_api_audiences read value)",
+    )?;
+    let write_audience = required(
+        &format!("{prefix}_WRITE_AUDIENCE"),
+        "to the write backend audience (the terraform ops_api_audiences write value)",
     )?;
     let logging_url = std::env::var(format!("{prefix}_LOGGING_URL")).ok();
     Ok(Target {
         base_url,
-        audience,
+        read_audience,
+        write_audience,
         logging_url,
     })
 }

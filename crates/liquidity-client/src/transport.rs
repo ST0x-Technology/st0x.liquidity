@@ -4,28 +4,40 @@ use url::Url;
 use crate::auth::TokenSource;
 use crate::error::Error;
 
-/// Thin HTTP wrapper over the liquidity bot API. Holds no domain logic: it
-/// mints a bearer token, builds the request, sends it, and returns the decoded
-/// JSON or a mapped error.
+/// Role prefix the load balancer routes to the read IAP backend.
+const READ_PREFIX: &str = "/liquidity-read";
+/// Role prefix the load balancer routes to the write IAP backend.
+const WRITE_PREFIX: &str = "/liquidity-write";
+
+/// Thin HTTP wrapper over the liquidity bot ops API. Holds no domain logic: it
+/// mints the token for the role, builds the request under the role prefix,
+/// sends it, and returns the decoded JSON or a mapped error.
+///
+/// Reads go to `/liquidity-read/*` with a token minted for the read audience;
+/// writes go to `/liquidity-write/*` with a token minted for the write
+/// audience. IAP admits each prefix per Workspace group and the bot pins the
+/// audience, so a read-audience token presented to the write path is rejected.
 pub struct Client<A> {
     http: reqwest::Client,
     base_url: Url,
-    auth: A,
+    read_auth: A,
+    write_auth: A,
 }
 
 impl<A: TokenSource + Sync> Client<A> {
-    pub fn new(base_url: Url, auth: A) -> anyhow::Result<Self> {
+    pub fn new(base_url: Url, read_auth: A, write_auth: A) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder().build()?;
         Ok(Self {
             http,
             base_url,
-            auth,
+            read_auth,
+            write_auth,
         })
     }
 
-    fn url(&self, path: &str, params: &[(String, String)]) -> Url {
+    fn url(&self, prefix: &str, path: &str, params: &[(String, String)]) -> Url {
         let mut url = self.base_url.clone();
-        url.set_path(path);
+        url.set_path(&format!("{prefix}{path}"));
         url.set_query(None);
         if !params.is_empty() {
             let mut query = url.query_pairs_mut();
@@ -36,12 +48,30 @@ impl<A: TokenSource + Sync> Client<A> {
         url
     }
 
+    pub async fn get(
+        &self,
+        path: &str,
+        params: &[(String, String)],
+    ) -> Result<serde_json::Value, Error> {
+        let url = self.url(READ_PREFIX, path, params);
+        let target = url.to_string();
+        let token = self.read_auth.bearer().await?;
+        self.dispatch(self.http.get(url), target, token).await
+    }
+
+    pub async fn post(&self, path: &str) -> Result<serde_json::Value, Error> {
+        let url = self.url(WRITE_PREFIX, path, &[]);
+        let target = url.to_string();
+        let token = self.write_auth.bearer().await?;
+        self.dispatch(self.http.post(url), target, token).await
+    }
+
     async fn dispatch(
         &self,
         request: reqwest::RequestBuilder,
         target: String,
+        token: String,
     ) -> Result<serde_json::Value, Error> {
-        let token = self.auth.bearer().await?;
         let response = request
             .bearer_auth(token)
             .send()
@@ -60,22 +90,6 @@ impl<A: TokenSource + Sync> Client<A> {
             StatusCode::FORBIDDEN => Error::Forbidden(body),
             other => Error::Http(other, body),
         })
-    }
-
-    pub async fn get(
-        &self,
-        path: &str,
-        params: &[(String, String)],
-    ) -> Result<serde_json::Value, Error> {
-        let url = self.url(path, params);
-        let target = url.to_string();
-        self.dispatch(self.http.get(url), target).await
-    }
-
-    pub async fn post(&self, path: &str) -> Result<serde_json::Value, Error> {
-        let url = self.url(path, &[]);
-        let target = url.to_string();
-        self.dispatch(self.http.post(url), target).await
     }
 }
 
@@ -115,51 +129,60 @@ mod tests {
         Ok((port, receiver))
     }
 
-    #[tokio::test]
-    async fn attaches_bearer_token_and_builds_request() -> Result<(), Box<dyn std::error::Error>> {
-        let (port, requests) = capture_server()?;
+    fn fake_client(port: u16) -> Result<Client<FakeToken>, Box<dyn std::error::Error>> {
         let base = url::Url::parse(&format!("http://127.0.0.1:{port}/"))?;
-        let client = Client::new(base, FakeToken("test-token"))?;
+        Ok(Client::new(
+            base,
+            FakeToken("read-token"),
+            FakeToken("write-token"),
+        )?)
+    }
+
+    #[tokio::test]
+    async fn read_uses_read_prefix_and_read_token() -> Result<(), Box<dyn std::error::Error>> {
+        let (port, requests) = capture_server()?;
+        let client = fake_client(port)?;
 
         let value = client
             .get(
-                "/performance/latencies",
-                &[("from".to_owned(), "x".to_owned())],
+                "/transfers/interrupted",
+                &[("since".to_owned(), "0".to_owned())],
             )
             .await?;
         assert_eq!(value, serde_json::json!({}));
 
         let request = requests.recv()?;
-        let lower = request.to_lowercase();
         assert!(
-            lower.contains("authorization: bearer test-token"),
-            "bearer token not attached: {request}"
+            request
+                .to_lowercase()
+                .contains("authorization: bearer read-token"),
+            "read did not use the read token: {request}"
         );
         assert!(
-            request.contains("GET /performance/latencies?from=x "),
-            "unexpected request line: {request}"
+            request.contains("GET /liquidity-read/transfers/interrupted?since=0 "),
+            "read did not use the read prefix: {request}"
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn post_sends_bearer_and_method() -> Result<(), Box<dyn std::error::Error>> {
+    async fn write_uses_write_prefix_and_write_token() -> Result<(), Box<dyn std::error::Error>> {
         let (port, requests) = capture_server()?;
-        let base = url::Url::parse(&format!("http://127.0.0.1:{port}/"))?;
-        let client = Client::new(base, FakeToken("test-token"))?;
+        let client = fake_client(port)?;
 
-        let value = client.post("/transfers/resume").await?;
+        let value = client.post("/transfers/recheck/mint/abc").await?;
         assert_eq!(value, serde_json::json!({}));
 
         let request = requests.recv()?;
-        let lower = request.to_lowercase();
         assert!(
-            lower.contains("authorization: bearer test-token"),
-            "bearer token not attached: {request}"
+            request
+                .to_lowercase()
+                .contains("authorization: bearer write-token"),
+            "write did not use the write token: {request}"
         );
         assert!(
-            request.contains("POST /transfers/resume "),
-            "unexpected request line: {request}"
+            request.contains("POST /liquidity-write/transfers/recheck/mint/abc "),
+            "write did not use the write prefix: {request}"
         );
         Ok(())
     }

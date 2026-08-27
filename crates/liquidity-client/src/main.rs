@@ -43,11 +43,15 @@ enum Failure {
 async fn execute(cli: Cli) -> Result<(), Failure> {
     let target = target::resolve(cli.env).map_err(Failure::Setup)?;
     let logging_url = target.logging_url;
-    let auth = Adc::new(&target.audience).map_err(|error| Failure::Api {
+    let read_auth = Adc::new(&target.read_audience).map_err(|error| Failure::Api {
         error,
         logging_url: logging_url.clone(),
     })?;
-    let client = Client::new(target.base_url, auth).map_err(Failure::Setup)?;
+    let write_auth = Adc::new(&target.write_audience).map_err(|error| Failure::Api {
+        error,
+        logging_url: logging_url.clone(),
+    })?;
+    let client = Client::new(target.base_url, read_auth, write_auth).map_err(Failure::Setup)?;
     dispatch(&client, cli.command)
         .await
         .map_err(|error| Failure::Api { error, logging_url })
