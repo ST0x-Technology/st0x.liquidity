@@ -45,8 +45,9 @@ use crate::dashboard::{
     DeliverDashboardTrade,
 };
 use crate::inventory::{
-    BroadcastingInventory, InventoryDivergenceRecoveryCtx, InventoryPollingService,
-    InventorySnapshot, InventorySnapshotId, PollFreshness, WalletPollingCtx,
+    BroadcastingInventory, HedgeOrderGateReconciliationCtx, InventoryDivergenceRecoveryCtx,
+    InventoryPollingService, InventorySnapshot, InventorySnapshotId, PollFreshness,
+    WalletPollingCtx,
 };
 use crate::offchain::order::handle_rejection::HandleOrderRejectionCtx;
 use crate::offchain::order::poll_status::PollOrderStatusCtx;
@@ -323,6 +324,17 @@ where
         gate: rebalancing_service
             .as_ref()
             .map_or_else(Arc::default, |service| service.divergence_gate()),
+    })
+    .with_hedge_order_gate_reconciliation(HedgeOrderGateReconciliationCtx {
+        inventory: context.inventory.clone(),
+        positions: context.frameworks.position.clone(),
+        notifier: worker_failure_notifier.clone(),
+        deadline: std::time::Duration::from_secs(
+            context
+                .ctx
+                .hedge_order_gate_reconciliation_timeout_secs
+                .get(),
+        ),
     });
 
     if let Some(rebalancing_service) = &rebalancing_service {

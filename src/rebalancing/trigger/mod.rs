@@ -46,6 +46,7 @@ use crate::inventory::{
     InventoryView, InventoryViewError, Operator, PendingRequestOwnership,
     PendingRequestOwnershipSnapshot, TransferOp, Venue,
 };
+use crate::offchain::order::OffchainOrderId;
 use crate::position::{Position, PositionEvent};
 use crate::rebalancing::equity::{
     TransferEquityToHedging, TransferEquityToHedgingJobQueue, TransferEquityToMarketMaking,
@@ -753,27 +754,32 @@ impl RebalancingService {
         self.freeze_status.read().await.is_some()
     }
 
-    pub(crate) async fn recover_pending_offchain_order_symbols(
+    pub(crate) async fn recover_pending_offchain_orders(
         &self,
         position_projection: &Projection<Position>,
     ) -> Result<(), ProjectionError<Position>> {
-        let pending_symbols = position_projection
+        let pending_orders = Self::pending_offchain_orders(position_projection).await?;
+
+        self.inventory
+            .write_without_broadcast()
+            .await
+            .set_pending_offchain_orders(pending_orders);
+        Ok(())
+    }
+
+    async fn pending_offchain_orders(
+        position_projection: &Projection<Position>,
+    ) -> Result<HashMap<Symbol, OffchainOrderId>, ProjectionError<Position>> {
+        Ok(position_projection
             .load_all()
             .await?
             .into_iter()
             .filter_map(|(symbol, position)| {
                 position
                     .pending_offchain_order_id
-                    .is_some()
-                    .then_some(symbol)
+                    .map(|order_id| (symbol, order_id))
             })
-            .collect();
-
-        self.inventory
-            .write_without_broadcast()
-            .await
-            .set_pending_offchain_order_symbols(pending_symbols);
-        Ok(())
+            .collect())
     }
 
     async fn expire_stuck_operations(
@@ -2190,7 +2196,7 @@ impl Reactor for RebalancingService {
                 use PositionEvent::*;
 
                 let timestamp = event.timestamp();
-                let (equity_update, usdc_update) = match &event {
+                let (equity_update, usdc_update, offchain_order_id) = match &event {
                     OnChainOrderFilled {
                         amount,
                         direction,
@@ -2255,6 +2261,7 @@ impl Reactor for RebalancingService {
                         return Ok(());
                     }
                     OffChainOrderFilled {
+                        offchain_order_id,
                         shares_filled,
                         direction,
                         price,
@@ -2271,9 +2278,12 @@ impl Reactor for RebalancingService {
                                 equity_op.inverse(),
                                 Usdc::new(usdc_value),
                             ),
+                            *offchain_order_id,
                         )
                     }
-                    OffChainOrderPlaced { .. } => {
+                    OffChainOrderPlaced {
+                        offchain_order_id, ..
+                    } => {
                         // Also stops offchain snapshots from writing this
                         // symbol's balance while the order is open. The polled
                         // figure is the broker's qty_available, which moves before
@@ -2284,13 +2294,19 @@ impl Reactor for RebalancingService {
                         self.inventory
                             .write_without_broadcast()
                             .await
-                            .mark_offchain_order_pending(symbol);
+                            .mark_offchain_order_pending(symbol, *offchain_order_id);
                         return Ok(());
                     }
-                    OffChainOrderFailed { .. } | OffChainOrderCancelled { .. } => {
-                        // A failure or an intentional cancellation both release
-                        // the symbol's pending-offchain-order gate; nudge an
-                        // immediate equity check rather than waiting a poll cycle.
+                    OffChainOrderFailed {
+                        offchain_order_id, ..
+                    }
+                    | OffChainOrderCancelled {
+                        offchain_order_id, ..
+                    } => {
+                        // A failure or an intentional cancellation releases the
+                        // symbol's gate only if it still belongs to this order;
+                        // nudge an immediate equity check rather than waiting a
+                        // poll cycle.
                         // No fill was applied, so nothing bars the next snapshot
                         // from taking the balance back over. A restart taint
                         // deliberately survives this arm: the pre-restart
@@ -2300,7 +2316,7 @@ impl Reactor for RebalancingService {
                         self.inventory
                             .write_without_broadcast()
                             .await
-                            .clear_offchain_order_pending(&symbol, None);
+                            .clear_offchain_order_pending(&symbol, *offchain_order_id, None);
                         self.equity_scheduler.enqueue_check(symbol).await;
                         return Ok(());
                     }
@@ -2350,22 +2366,24 @@ impl Reactor for RebalancingService {
                              symbol; the poller re-bases the balance from \
                              broker truth"
                         );
-                        inventory.clear_offchain_order_pending(&symbol, None);
+                        inventory.clear_offchain_order_pending(
+                            &symbol,
+                            offchain_order_id,
+                            None,
+                        );
                         drop(inventory);
                         self.equity_scheduler.enqueue_check(symbol).await;
                         return Ok(());
                     }
                 }
 
-                // Always clear the gate on a Filled event, even if the
-                // inventory update fails. A fail-closed gate would deadlock
-                // equity rebalancing for the symbol until the next bot
-                // restart, because the only event that could re-clear it (a
-                // later terminal offchain event) is itself gated. The
-                // polling cycle is the source of truth for the broker
-                // balance, so any local bookkeeping miss self-heals within
-                // ~60s and is bounded to wasted rebalances, not lost
-                // capital.
+                // Clear this order's gate on a Filled event even if the
+                // inventory update fails, but preserve a replacement order's
+                // gate. A fail-closed matching gate would deadlock equity
+                // rebalancing for the symbol until reconciliation. The polling
+                // cycle is the source of truth for the broker balance, so any
+                // local bookkeeping miss self-heals within ~60s and is bounded
+                // to wasted rebalances, not lost capital.
                 let inventory_result = {
                     let mut inventory = self.inventory.write().await;
                     let result = inventory
@@ -2376,14 +2394,19 @@ impl Reactor for RebalancingService {
                         *inventory = updated.clone();
                     }
 
-                    // Release the snapshot block in the same critical
-                    // section that applied the delta, so no snapshot can
-                    // land in between and overwrite the fill just recorded.
-                    // Stamp the local clock rather than reusing `timestamp`
-                    // (the event's `broker_timestamp`): this is compared
-                    // against snapshot `fetched_at`, which is stamped from
-                    // this host's clock.
-                    inventory.clear_offchain_order_pending(&symbol, result.is_ok().then(Utc::now));
+                    // Release the matching snapshot block in the same critical
+                    // section that applied the delta, so no snapshot can land
+                    // in between and overwrite the fill just recorded. A
+                    // replacement gate remains, while a successfully applied
+                    // older fill still stamps its watermark. Stamp the local
+                    // clock rather than reusing `timestamp` (the event's
+                    // `broker_timestamp`): this is compared against snapshot
+                    // `fetched_at`, which is stamped from this host's clock.
+                    inventory.clear_offchain_order_pending(
+                        &symbol,
+                        offchain_order_id,
+                        result.is_ok().then(Utc::now),
+                    );
 
                     result
                 };
@@ -7805,6 +7828,10 @@ mod tests {
         FractionalShares::new(float!(&n.to_string()))
     }
 
+    fn test_order_id() -> OffchainOrderId {
+        OffchainOrderId::from_uuid(Uuid::nil())
+    }
+
     fn make_onchain_fill(amount: FractionalShares, direction: Direction) -> PositionEvent {
         make_onchain_fill_at(amount, direction, Utc::now())
     }
@@ -7857,7 +7884,7 @@ mod tests {
         broker_timestamp: DateTime<Utc>,
     ) -> PositionEvent {
         PositionEvent::OffChainOrderFilled {
-            offchain_order_id: OffchainOrderId::new(),
+            offchain_order_id: test_order_id(),
             shares_filled: Positive::new(shares_filled).unwrap(),
             direction,
             executor_order_id: ExecutorOrderId::new("ORD1"),
@@ -9599,7 +9626,7 @@ mod tests {
             .inventory
             .write()
             .await
-            .mark_offchain_order_pending(symbol.clone());
+            .mark_offchain_order_pending(symbol.clone(), test_order_id());
 
         // Initialized, ThresholdUpdated, and ManualPositionAdjusted all return
         // Ok(()) without touching inventory or the pending-hedge gate.
@@ -23143,7 +23170,7 @@ mod tests {
             .inventory
             .write()
             .await
-            .mark_offchain_order_pending(symbol.clone());
+            .mark_offchain_order_pending(symbol.clone(), test_order_id());
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
@@ -23167,7 +23194,7 @@ mod tests {
     #[tokio::test]
     async fn position_offchain_order_lifecycle_blocks_then_releases_equity_check() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
+        let offchain_order_id = test_order_id();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(20), shares(80))
             .with_usdc(usdc(500), usdc(500));
@@ -23199,7 +23226,7 @@ mod tests {
     #[tokio::test]
     async fn offchain_order_filled_releases_equity_rebalancing_block() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
+        let offchain_order_id = test_order_id();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(20), shares(80))
             .with_usdc(usdc(5000), usdc(5000));
@@ -23247,7 +23274,7 @@ mod tests {
     #[tokio::test]
     async fn offchain_order_filled_releases_gate_even_when_inventory_update_fails() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
+        let offchain_order_id = test_order_id();
         // Offchain shows only 4 shares (e.g., the polling snapshot already
         // reflects a 10-share sell that the broker filled before the reactor
         // got a chance to record it). The fill below subtracts 10, which
@@ -23267,7 +23294,7 @@ mod tests {
             .inventory
             .write_without_broadcast()
             .await
-            .clear_offchain_order_pending(&symbol, Some(prior_fill_at));
+            .clear_offchain_order_pending(&symbol, OffchainOrderId::new(), Some(prior_fill_at));
 
         harness
             .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
@@ -23355,7 +23382,7 @@ mod tests {
     #[tokio::test]
     async fn offchain_snapshot_absorbing_a_fill_is_not_subtracted_twice() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
+        let offchain_order_id = test_order_id();
         // Pre-fill broker truth: 100 shares offchain.
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(20), shares(100))
@@ -23418,7 +23445,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_fetched_before_applied_fill_does_not_overwrite_it() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
+        let offchain_order_id = test_order_id();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(20), shares(100))
             .with_usdc(usdc(5000), usdc(5000));
@@ -23510,7 +23537,7 @@ mod tests {
     #[tokio::test]
     async fn offchain_cash_snapshot_absorbing_a_sell_fill_is_not_applied_twice() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
+        let offchain_order_id = test_order_id();
         // Pre-fill: $5000 cash, 100 shares offchain.
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(20), shares(100))
@@ -23590,7 +23617,7 @@ mod tests {
     #[tokio::test]
     async fn offchain_cash_snapshot_absorbing_a_buy_fill_is_not_applied_twice() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
+        let offchain_order_id = test_order_id();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(20), shares(100))
             .with_usdc(usdc(5000), usdc(5000));
@@ -23647,7 +23674,7 @@ mod tests {
     #[tokio::test]
     async fn cash_snapshot_fetched_before_applied_fill_does_not_overwrite_it() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
+        let offchain_order_id = test_order_id();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(20), shares(100))
             .with_usdc(usdc(5000), usdc(5000));
@@ -23793,7 +23820,7 @@ mod tests {
             .inventory
             .write_without_broadcast()
             .await
-            .mark_offchain_order_pending(gated.clone());
+            .mark_offchain_order_pending(gated.clone(), test_order_id());
 
         let error = RebalancingServiceError::Inventory(InventoryViewError::Equity(
             InventoryError::InsufficientAvailable {
@@ -23848,7 +23875,7 @@ mod tests {
             .inventory
             .write_without_broadcast()
             .await
-            .mark_offchain_order_pending(symbol.clone());
+            .mark_offchain_order_pending(symbol.clone(), test_order_id());
 
         let error = RebalancingServiceError::Inventory(InventoryViewError::Equity(
             InventoryError::InsufficientAvailable {
@@ -23886,7 +23913,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_recovery_reset_preserves_open_hedge_gate() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
+        let offchain_order_id = test_order_id();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(20), shares(100))
             .with_usdc(usdc(5000), usdc(5000));
@@ -23980,7 +24007,7 @@ mod tests {
     #[tokio::test]
     async fn reverse_race_late_handled_pre_fill_read_does_not_resurrect_balance() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
+        let offchain_order_id = test_order_id();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(20), shares(100))
             .with_usdc(usdc(5000), usdc(5000));
@@ -24050,7 +24077,7 @@ mod tests {
     #[tokio::test]
     async fn offchain_order_failed_enqueues_equity_recheck() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
+        let offchain_order_id = test_order_id();
         // Balanced venues so the drained recheck evaluates cleanly without
         // dispatching a rebalance.
         let inventory = InventoryView::default()
@@ -24080,7 +24107,7 @@ mod tests {
     #[tokio::test]
     async fn offchain_order_filled_enqueues_equity_recheck() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
+        let offchain_order_id = test_order_id();
         // Sized so the Hedging sell fill leaves both venues balanced (50/50),
         // letting the drained recheck run to completion without dispatching.
         let inventory = InventoryView::default()
@@ -24236,6 +24263,44 @@ mod tests {
         assert!(!trigger.is_restart_cash_tainted().await);
     }
 
+    #[tokio::test]
+    async fn boot_without_rebalancing_hydrates_snapshot_and_clears_pending_orders() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut view = InventoryView::default();
+        view.mark_offchain_order_pending(symbol.clone(), OffchainOrderId::new());
+        let trigger = make_trigger_with_inventory(view).await;
+        let pool = crate::test_utils::setup_test_db().await;
+        let snapshot_store = test_store::<InventorySnapshot>(pool.clone(), ());
+        snapshot_store
+            .send(
+                &InventorySnapshotId {
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+                InventorySnapshotCommand::OffchainEquity {
+                    positions: BTreeMap::from([(symbol.clone(), shares(90))]),
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        let projection = Projection::<Position>::sqlite(pool.clone());
+
+        crate::conductor::restore_inventory_at_boot(&pool, &trigger.inventory, None, &projection)
+            .await
+            .unwrap();
+
+        let (available, has_pending_order) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.equity_available(&symbol, Venue::Hedging),
+                inventory.has_pending_offchain_order(&symbol),
+            )
+        };
+        assert_eq!(available, Some(shares(90)));
+        assert!(!has_pending_order);
+    }
+
     /// The headline RAI-1501 race: a hedge order straddles a restart, and
     /// the persisted snapshot already recorded the mid-order broker number
     /// (the aggregate records every poll; the guard state that refused the
@@ -24247,6 +24312,7 @@ mod tests {
     #[tokio::test]
     async fn restart_across_open_order_does_not_double_apply_fill() {
         let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = test_order_id();
         let trigger = make_trigger_with_inventory(InventoryView::default()).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let pool = crate::test_utils::setup_test_db().await;
@@ -24294,7 +24360,7 @@ mod tests {
             .send(
                 &symbol,
                 PositionCommand::PlaceOffChainOrder {
-                    offchain_order_id: OffchainOrderId::new(),
+                    offchain_order_id,
                     shares: Positive::new(shares(10)).unwrap(),
                     direction: Direction::Sell,
                     executor: SupportedExecutor::DryRun,
@@ -24358,11 +24424,11 @@ mod tests {
     #[tokio::test]
     async fn restart_tainted_fill_skips_both_legs_and_failed_keeps_taint() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
+        let offchain_order_id = test_order_id();
         let mut view = InventoryView::default()
             .with_equity(symbol.clone(), shares(50), shares(60))
             .with_usdc(usdc(500), usdc(500));
-        view.set_pending_offchain_order_symbols(HashSet::from([symbol.clone()]));
+        view.set_pending_offchain_orders(HashMap::from([(symbol.clone(), test_order_id())]));
 
         let trigger = make_trigger_with_inventory_and_registry(view, &symbol).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
@@ -24423,8 +24489,8 @@ mod tests {
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
         // Taint without an open order: the state a tainted fill leaves
         // behind (gate cleared, taint pending poller resolution).
-        view.set_pending_offchain_order_symbols(HashSet::from([symbol.clone()]));
-        view.clear_offchain_order_pending(&symbol, None);
+        view.set_pending_offchain_orders(HashMap::from([(symbol.clone(), test_order_id())]));
+        view.clear_offchain_order_pending(&symbol, test_order_id(), None);
 
         let reactor = make_trigger_with_inventory_and_registry(view, &symbol).await;
         let trigger = reactor.clone();
@@ -24468,8 +24534,8 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         // 900 onchain, 100 offchain -> TooMuchOnchain would dispatch.
         let mut view = InventoryView::default().with_usdc(usdc(900), usdc(100));
-        view.set_pending_offchain_order_symbols(HashSet::from([symbol.clone()]));
-        view.clear_offchain_order_pending(&symbol, None);
+        view.set_pending_offchain_orders(HashMap::from([(symbol.clone(), test_order_id())]));
+        view.clear_offchain_order_pending(&symbol, test_order_id(), None);
 
         let reactor = make_trigger_with_inventory(view).await;
         let trigger = reactor.clone();
@@ -24496,7 +24562,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_pending_offchain_order_symbols_restores_block_from_projection() {
+    async fn recover_pending_offchain_orders_restores_block_from_projection() {
         let pending_symbol = Symbol::new("AAPL").unwrap();
         let clear_symbol = Symbol::new("TSLA").unwrap();
         let trigger = make_trigger_with_inventory(InventoryView::default()).await;
@@ -24569,10 +24635,10 @@ mod tests {
             .inventory
             .write()
             .await
-            .mark_offchain_order_pending(clear_symbol.clone());
+            .mark_offchain_order_pending(clear_symbol.clone(), test_order_id());
 
         trigger
-            .recover_pending_offchain_order_symbols(&projection)
+            .recover_pending_offchain_orders(&projection)
             .await
             .unwrap();
 
@@ -24583,6 +24649,29 @@ mod tests {
         assert!(
             !trigger.has_pending_offchain_order(&clear_symbol).await,
             "recovery must clear a symbol whose position has no pending offchain order"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_terminal_for_replaced_order_preserves_the_current_gate() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let replaced_order_id = OffchainOrderId::new();
+        let current_order_id = OffchainOrderId::new();
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_placed(current_order_id))
+            .await
+            .unwrap();
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_failed(replaced_order_id))
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.has_pending_offchain_order(&symbol).await,
+            "a late terminal event for order A must not clear order B's gate"
         );
     }
 
@@ -25578,7 +25667,7 @@ mod tests {
             .inventory
             .write_without_broadcast()
             .await
-            .mark_offchain_order_pending(symbol.clone());
+            .mark_offchain_order_pending(symbol.clone(), test_order_id());
 
         crate::conductor::restore_inventory_at_boot(
             &pool,

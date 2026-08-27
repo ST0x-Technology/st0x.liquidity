@@ -1,6 +1,6 @@
 //! Inventory view for tracking cross-venue asset positions.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::{Add, Sub};
 use std::sync::Arc;
 
@@ -21,6 +21,7 @@ use super::divergence::{PersistentBrokerCashDivergence, PersistentBrokerDivergen
 use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::equity_redemption::RedemptionAggregateId;
+use crate::offchain::order::OffchainOrderId;
 use crate::usdc_rebalance::UsdcRebalanceId;
 
 /// Error type for inventory view operations.
@@ -34,6 +35,15 @@ pub(crate) enum InventoryViewError {
     Float(#[from] FloatError),
     #[error("failed to convert USD balance cents {0} to USDC")]
     UsdBalanceConversion(i64),
+}
+
+/// A change that aligns one in-memory hedge-order gate with durable Position
+/// state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HedgeOrderGateCorrection {
+    pub(crate) symbol: Symbol,
+    pub(crate) stale_order_id: Option<OffchainOrderId>,
+    pub(crate) durable_order_id: Option<OffchainOrderId>,
 }
 
 /// Why an equity imbalance check failed.
@@ -729,9 +739,18 @@ pub(crate) struct InventoryView {
     /// Local-clock time, as above.
     #[serde(default)]
     offchain_equity_snapshot_watermarks: HashMap<Symbol, DateTime<Utc>>,
-    /// Symbols with an open offchain (hedge) order.
+    /// Exact open offchain (hedge) order by symbol.
     #[serde(default)]
-    pending_offchain_order_symbols: HashSet<Symbol>,
+    pending_offchain_orders: HashMap<Symbol, OffchainOrderId>,
+    /// Most recent terminal offchain order processed by this view, per symbol.
+    ///
+    /// This is local proof that the terminal reactor completed its inventory
+    /// side effects. Durable `Position` state can lead that reactor, so a
+    /// missing durable pending order is not sufficient evidence to remove a
+    /// snapshot gate. It also suppresses a placement delivered after its own
+    /// terminal event. One entry per symbol keeps the proof bounded.
+    #[serde(default)]
+    last_terminal_offchain_orders: HashMap<Symbol, OffchainOrderId>,
     /// Local-clock time at which the most recent offchain fill was *applied to
     /// this view*, by symbol -- not when the broker executed it, which is
     /// earlier by the observation lag. It is compared against snapshot
@@ -1164,7 +1183,8 @@ impl Default for InventoryView {
             previous_inflight_redemption_symbols: HashSet::new(),
             onchain_equity_snapshot_watermarks: HashMap::new(),
             offchain_equity_snapshot_watermarks: HashMap::new(),
-            pending_offchain_order_symbols: HashSet::new(),
+            pending_offchain_orders: HashMap::new(),
+            last_terminal_offchain_orders: HashMap::new(),
             last_offchain_fill_applied_at: HashMap::new(),
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
@@ -1382,7 +1402,8 @@ impl InventoryView {
             previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
             onchain_equity_snapshot_watermarks: self.onchain_equity_snapshot_watermarks,
             offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
-            pending_offchain_order_symbols: self.pending_offchain_order_symbols,
+            pending_offchain_orders: self.pending_offchain_orders,
+            last_terminal_offchain_orders: self.last_terminal_offchain_orders,
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
@@ -1419,7 +1440,8 @@ impl InventoryView {
             previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
             onchain_equity_snapshot_watermarks: self.onchain_equity_snapshot_watermarks,
             offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
-            pending_offchain_order_symbols: self.pending_offchain_order_symbols,
+            pending_offchain_orders: self.pending_offchain_orders,
+            last_terminal_offchain_orders: self.last_terminal_offchain_orders,
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
@@ -1563,8 +1585,21 @@ impl InventoryView {
 
     /// Marks a symbol as having an open offchain order, so offchain equity
     /// snapshots stop applying to it until the order reaches a terminal state.
-    pub(crate) fn mark_offchain_order_pending(&mut self, symbol: Symbol) {
-        self.pending_offchain_order_symbols.insert(symbol);
+    /// An existing different gate wins until durable reconciliation identifies
+    /// the authoritative replacement, and a placement delivered after its own
+    /// terminal event is ignored.
+    pub(crate) fn mark_offchain_order_pending(
+        &mut self,
+        symbol: Symbol,
+        offchain_order_id: OffchainOrderId,
+    ) {
+        if self.last_terminal_offchain_orders.get(&symbol) == Some(&offchain_order_id) {
+            return;
+        }
+
+        self.pending_offchain_orders
+            .entry(symbol)
+            .or_insert(offchain_order_id);
     }
 
     /// Whether a symbol has an open offchain order.
@@ -1573,11 +1608,11 @@ impl InventoryView {
     /// snapshots here and equity rebalancing dispatch in the rebalancing
     /// trigger. One copy under one lock keeps the two from disagreeing.
     pub(crate) fn has_pending_offchain_order(&self, symbol: &Symbol) -> bool {
-        self.pending_offchain_order_symbols.contains(symbol)
+        self.pending_offchain_orders.contains_key(symbol)
     }
 
-    /// Replaces the set of symbols with an open offchain order, for rebuilding
-    /// it from the `Position` projection at startup.
+    /// Replaces the open offchain orders, for rebuilding them from the
+    /// `Position` projection at startup.
     ///
     /// Also stamps the restart taint from the same set: a symbol whose hedge
     /// order straddled the restart has an ambiguous hydrated Hedging balance
@@ -1586,10 +1621,10 @@ impl InventoryView {
     /// taint impossible to desynchronize -- this setter is only called from
     /// the boot seam (`restore_inventory_at_boot`), where the taint is
     /// definitionally "the gate as of boot".
-    pub(crate) fn set_pending_offchain_order_symbols(&mut self, symbols: HashSet<Symbol>) {
-        self.restart_tainted_offchain_cash = !symbols.is_empty();
-        self.restart_tainted_offchain_symbols.clone_from(&symbols);
-        self.pending_offchain_order_symbols = symbols;
+    pub(crate) fn set_pending_offchain_orders(&mut self, orders: HashMap<Symbol, OffchainOrderId>) {
+        self.restart_tainted_offchain_cash = !orders.is_empty();
+        self.restart_tainted_offchain_symbols = orders.keys().cloned().collect();
+        self.pending_offchain_orders = orders;
     }
 
     /// Whether `symbol`'s Hedging balance is restart-tainted (hydrated while
@@ -1615,8 +1650,12 @@ impl InventoryView {
         self.restart_tainted_offchain_cash = false;
     }
 
-    /// Releases the snapshot block for a symbol whose offchain order reached a
-    /// terminal state.
+    /// Releases the snapshot block only when the terminal event identifies the
+    /// order currently guarded for `symbol`.
+    ///
+    /// A successful older fill still updates the watermarks when a replacement
+    /// order owns the gate: the fill delta was applied even though its terminal
+    /// event must not release the replacement gate.
     ///
     /// `applied_fill_at` carries the local-clock time of a fill whose delta was
     /// applied to the mirror, and is `None` when nothing was applied (a failed
@@ -1633,15 +1672,79 @@ impl InventoryView {
     pub(crate) fn clear_offchain_order_pending(
         &mut self,
         symbol: &Symbol,
+        offchain_order_id: OffchainOrderId,
         applied_fill_at: Option<DateTime<Utc>>,
     ) {
-        self.pending_offchain_order_symbols.remove(symbol);
+        self.last_terminal_offchain_orders
+            .insert(symbol.clone(), offchain_order_id);
+
+        if self.pending_offchain_orders.get(symbol) == Some(&offchain_order_id) {
+            self.pending_offchain_orders.remove(symbol);
+        }
 
         if let Some(applied_fill_at) = applied_fill_at {
             self.last_offchain_fill_applied_at
                 .insert(symbol.clone(), applied_fill_at);
             self.last_offchain_cash_fill_applied_at = Some(applied_fill_at);
         }
+    }
+
+    /// Snapshots the exact in-memory order gates before durable Position reads
+    /// so reconciliation cannot clear a replacement installed while those
+    /// reads are in flight.
+    pub(crate) fn pending_offchain_orders(&self) -> HashMap<Symbol, OffchainOrderId> {
+        self.pending_offchain_orders.clone()
+    }
+
+    /// Reconciles in-memory order gates with durable Position state. A gate
+    /// changes only when its current ID still matches the pre-read observation,
+    /// preserving any concurrent replacement. A missing durable order removes
+    /// the gate only when this view processed that same order's terminal event;
+    /// a different durable order replaces it, and a durable order without a
+    /// gate installs one.
+    pub(crate) fn reconcile_pending_offchain_orders(
+        &mut self,
+        observed_orders: &HashMap<Symbol, OffchainOrderId>,
+        durable_orders: &HashMap<Symbol, OffchainOrderId>,
+    ) -> Vec<HedgeOrderGateCorrection> {
+        let mut corrections = Vec::new();
+
+        let symbols = observed_orders
+            .keys()
+            .chain(durable_orders.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for symbol in symbols {
+            let observed_order_id = observed_orders.get(&symbol).copied();
+            if self.pending_offchain_orders.get(&symbol).copied() != observed_order_id {
+                continue;
+            }
+
+            let durable_order_id = durable_orders.get(&symbol).copied();
+            if durable_order_id == observed_order_id {
+                continue;
+            }
+
+            if let Some(durable_order_id) = durable_order_id {
+                self.pending_offchain_orders
+                    .insert(symbol.clone(), durable_order_id);
+            } else {
+                let terminal_reactor_applied = observed_order_id.is_some_and(|order_id| {
+                    self.last_terminal_offchain_orders.get(&symbol) == Some(&order_id)
+                });
+                if !terminal_reactor_applied {
+                    continue;
+                }
+                self.pending_offchain_orders.remove(&symbol);
+            }
+            corrections.push(HedgeOrderGateCorrection {
+                symbol,
+                stale_order_id: observed_order_id,
+                durable_order_id,
+            });
+        }
+
+        corrections
     }
 
     /// A fresh default view retaining only the offchain-order guard state
@@ -1667,7 +1770,7 @@ impl InventoryView {
         let equities = self
             .equities
             .iter()
-            .filter(|(symbol, _)| self.pending_offchain_order_symbols.contains(*symbol))
+            .filter(|(symbol, _)| self.pending_offchain_orders.contains_key(*symbol))
             .filter_map(|(symbol, inventory)| {
                 inventory.get_venue(Venue::Hedging).map(|balance| {
                     (
@@ -1687,7 +1790,8 @@ impl InventoryView {
 
         Self {
             equities,
-            pending_offchain_order_symbols: self.pending_offchain_order_symbols.clone(),
+            pending_offchain_orders: self.pending_offchain_orders.clone(),
+            last_terminal_offchain_orders: self.last_terminal_offchain_orders.clone(),
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at.clone(),
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols.clone(),
@@ -1763,10 +1867,10 @@ impl InventoryView {
     /// per-symbol membership to "any hedge order open" -- an open order on
     /// ANY symbol makes the venue's cash reading ambiguous.
     fn offchain_usd_snapshot_would_apply(&self, fetched_at: DateTime<Utc>) -> bool {
-        if !self.pending_offchain_order_symbols.is_empty() {
+        if !self.pending_offchain_orders.is_empty() {
             debug!(
                 target: "inventory",
-                pending_symbols = ?self.pending_offchain_order_symbols,
+                pending_orders = ?self.pending_offchain_orders,
                 ?fetched_at,
                 "Skipping offchain USD snapshot: a hedge order is still open",
             );
@@ -1824,7 +1928,7 @@ impl InventoryView {
         match venue {
             Venue::MarketMaking => {}
             Venue::Hedging => {
-                if self.pending_offchain_order_symbols.contains(symbol) {
+                if self.pending_offchain_orders.contains_key(symbol) {
                     debug!(
                         target: "inventory",
                         %symbol,
@@ -2071,7 +2175,8 @@ impl InventoryView {
             previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
             onchain_equity_snapshot_watermarks: self.onchain_equity_snapshot_watermarks,
             offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
-            pending_offchain_order_symbols: self.pending_offchain_order_symbols,
+            pending_offchain_orders: self.pending_offchain_orders,
+            last_terminal_offchain_orders: self.last_terminal_offchain_orders,
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
@@ -2109,7 +2214,8 @@ impl InventoryView {
             previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
             onchain_equity_snapshot_watermarks: self.onchain_equity_snapshot_watermarks,
             offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
-            pending_offchain_order_symbols: self.pending_offchain_order_symbols,
+            pending_offchain_orders: self.pending_offchain_orders,
+            last_terminal_offchain_orders: self.last_terminal_offchain_orders,
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
@@ -2427,7 +2533,7 @@ impl InventoryView {
             return Ok(Some(EquityReconcileBusy::Transfer));
         }
 
-        if !self.pending_offchain_order_symbols.is_empty() {
+        if !self.pending_offchain_orders.is_empty() {
             return Ok(Some(EquityReconcileBusy::PendingHedgeOrder));
         }
 
@@ -2874,10 +2980,10 @@ impl InventoryView {
                 // venue cash balance, and force-writing the ambiguous
                 // mid-order reading would re-open the double-count on the
                 // recovery path.
-                if !self.pending_offchain_order_symbols.is_empty() {
+                if !self.pending_offchain_orders.is_empty() {
                     warn!(
                         target: "inventory",
-                        pending_symbols = ?self.pending_offchain_order_symbols,
+                        pending_orders = ?self.pending_offchain_orders,
                         "Skipping forced offchain USD snapshot: a hedge \
                          order is still open",
                     );
@@ -2982,9 +3088,14 @@ mod tests {
 
     use super::*;
     use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotCommand};
+    use crate::offchain::order::OffchainOrderId;
 
     fn shares(amount: i64) -> FractionalShares {
         FractionalShares::new(float!(&amount.to_string()))
+    }
+
+    fn test_order_id() -> OffchainOrderId {
+        OffchainOrderId::from_uuid(Uuid::nil())
     }
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
@@ -3159,7 +3270,8 @@ mod tests {
             previous_inflight_redemption_symbols: HashSet::new(),
             onchain_equity_snapshot_watermarks: HashMap::new(),
             offchain_equity_snapshot_watermarks: HashMap::new(),
-            pending_offchain_order_symbols: HashSet::new(),
+            pending_offchain_orders: HashMap::new(),
+            last_terminal_offchain_orders: HashMap::new(),
             last_offchain_fill_applied_at: HashMap::new(),
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
@@ -3200,7 +3312,8 @@ mod tests {
             previous_inflight_redemption_symbols: HashSet::new(),
             onchain_equity_snapshot_watermarks: HashMap::new(),
             offchain_equity_snapshot_watermarks: HashMap::new(),
-            pending_offchain_order_symbols: HashSet::new(),
+            pending_offchain_orders: HashMap::new(),
+            last_terminal_offchain_orders: HashMap::new(),
             last_offchain_fill_applied_at: HashMap::new(),
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
@@ -4241,10 +4354,11 @@ mod tests {
     #[test]
     fn pending_offchain_order_skips_hedging_snapshot_without_advancing_watermark() {
         let aapl = Symbol::new("AAPL").unwrap();
+        let order_id = OffchainOrderId::new();
         let now = Utc::now();
 
         let mut view = InventoryView::default().with_equity(aapl.clone(), shares(20), shares(100));
-        view.mark_offchain_order_pending(aapl.clone());
+        view.mark_offchain_order_pending(aapl.clone(), order_id);
 
         let mut positions = BTreeMap::new();
         positions.insert(aapl.clone(), shares(90));
@@ -4265,7 +4379,7 @@ mod tests {
         // watermark` would reject the retry. (Whether the aggregate re-emits
         // an unchanged value at all is a separate, currently-open concern —
         // its dedupe suppresses it; this pins the view-side precondition.)
-        view.clear_offchain_order_pending(&aapl, None);
+        view.clear_offchain_order_pending(&aapl, order_id, None);
         let view = view.apply_snapshot_event(&snapshot, now).unwrap();
         assert_eq!(
             view.equity_available(&aapl, Venue::Hedging),
@@ -4275,13 +4389,181 @@ mod tests {
     }
 
     #[test]
+    fn terminal_event_only_clears_the_matching_pending_order() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let first_order_id = OffchainOrderId::new();
+        let replacement_order_id = OffchainOrderId::new();
+        let mut view = InventoryView::default();
+
+        view.mark_offchain_order_pending(aapl.clone(), replacement_order_id);
+        view.clear_offchain_order_pending(&aapl, first_order_id, None);
+
+        assert!(
+            view.has_pending_offchain_order(&aapl),
+            "a late terminal event for the replaced order must not clear the replacement gate"
+        );
+    }
+
+    #[test]
+    fn terminal_event_processed_before_placement_prevents_a_late_gate() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let order_id = OffchainOrderId::new();
+        let mut view = InventoryView::default();
+
+        view.clear_offchain_order_pending(&aapl, order_id, None);
+        view.mark_offchain_order_pending(aapl.clone(), order_id);
+
+        assert!(
+            !view.has_pending_offchain_order(&aapl),
+            "a placement delivered after its own terminal event must not strand a gate"
+        );
+    }
+
+    #[test]
+    fn older_placement_does_not_replace_a_newer_order_gate() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let older_order_id = OffchainOrderId::new();
+        let newer_order_id = OffchainOrderId::new();
+        let mut view = InventoryView::default();
+
+        view.mark_offchain_order_pending(aapl.clone(), newer_order_id);
+        view.mark_offchain_order_pending(aapl.clone(), older_order_id);
+
+        assert_eq!(
+            view.pending_offchain_orders().get(&aapl),
+            Some(&newer_order_id),
+            "a reordered older placement must not overwrite the protected order"
+        );
+    }
+
+    #[test]
+    fn reconciliation_preserves_an_order_replaced_after_observation() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let observed_order_id = OffchainOrderId::new();
+        let replacement_order_id = OffchainOrderId::new();
+        let mut view = InventoryView::default();
+
+        view.mark_offchain_order_pending(aapl.clone(), observed_order_id);
+        let observed_orders = view.pending_offchain_orders();
+        let replacement_corrections = view.reconcile_pending_offchain_orders(
+            &observed_orders,
+            &HashMap::from([(aapl.clone(), replacement_order_id)]),
+        );
+        assert_eq!(replacement_corrections.len(), 1);
+
+        let corrections = view.reconcile_pending_offchain_orders(&observed_orders, &HashMap::new());
+
+        assert!(corrections.is_empty());
+        assert_eq!(
+            view.pending_offchain_orders().get(&aapl),
+            Some(&replacement_order_id),
+            "reconciliation against an older projection snapshot must preserve the replacement"
+        );
+    }
+
+    #[test]
+    fn reconciliation_replaces_a_stale_id_with_the_durable_open_order() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let stale_order_id = OffchainOrderId::new();
+        let durable_order_id = OffchainOrderId::new();
+        let mut view = InventoryView::default();
+
+        view.mark_offchain_order_pending(aapl.clone(), stale_order_id);
+        let observed_orders = view.pending_offchain_orders();
+        let corrections = view.reconcile_pending_offchain_orders(
+            &observed_orders,
+            &HashMap::from([(aapl.clone(), durable_order_id)]),
+        );
+
+        assert_eq!(
+            corrections,
+            vec![HedgeOrderGateCorrection {
+                symbol: aapl.clone(),
+                stale_order_id: Some(stale_order_id),
+                durable_order_id: Some(durable_order_id),
+            }]
+        );
+        assert_eq!(
+            view.pending_offchain_orders().get(&aapl),
+            Some(&durable_order_id),
+            "a durable open order must remain protected by the gate"
+        );
+    }
+
+    #[test]
+    fn reconciliation_installs_a_durable_order_without_an_observed_gate() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let durable_order_id = OffchainOrderId::new();
+        let mut view = InventoryView::default();
+
+        let observed_orders = view.pending_offchain_orders();
+        let corrections = view.reconcile_pending_offchain_orders(
+            &observed_orders,
+            &HashMap::from([(aapl.clone(), durable_order_id)]),
+        );
+
+        assert_eq!(
+            corrections,
+            vec![HedgeOrderGateCorrection {
+                symbol: aapl.clone(),
+                stale_order_id: None,
+                durable_order_id: Some(durable_order_id),
+            }]
+        );
+        assert_eq!(
+            view.pending_offchain_orders().get(&aapl),
+            Some(&durable_order_id),
+            "a durable open order without an observed gate must be protected"
+        );
+    }
+
+    #[test]
+    fn reconciliation_preserves_a_gate_until_its_terminal_reactor_applies() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let stale_order_id = OffchainOrderId::new();
+        let mut view = InventoryView::default();
+
+        view.mark_offchain_order_pending(aapl.clone(), stale_order_id);
+        let observed_orders = view.pending_offchain_orders();
+        let corrections = view.reconcile_pending_offchain_orders(&observed_orders, &HashMap::new());
+
+        assert!(corrections.is_empty());
+        assert!(
+            view.has_pending_offchain_order(&aapl),
+            "durable absence can lead the terminal reactor, so it must not expose snapshots"
+        );
+    }
+
+    #[test]
+    fn reconciliation_removes_a_gate_after_its_terminal_reactor_applies() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let stale_order_id = OffchainOrderId::new();
+        let mut view = InventoryView::default();
+
+        view.clear_offchain_order_pending(&aapl, stale_order_id, None);
+        view.set_pending_offchain_orders(HashMap::from([(aapl.clone(), stale_order_id)]));
+        let observed_orders = view.pending_offchain_orders();
+        let corrections = view.reconcile_pending_offchain_orders(&observed_orders, &HashMap::new());
+
+        assert_eq!(
+            corrections,
+            vec![HedgeOrderGateCorrection {
+                symbol: aapl.clone(),
+                stale_order_id: Some(stale_order_id),
+                durable_order_id: None,
+            }]
+        );
+        assert!(!view.has_pending_offchain_order(&aapl));
+    }
+
+    #[test]
     fn snapshot_predating_last_applied_fill_is_skipped() {
         let aapl = Symbol::new("AAPL").unwrap();
         let applied_at = Utc::now();
 
         // A 10-share sell was already applied to the mirror (100 -> 90).
         let mut view = InventoryView::default().with_equity(aapl.clone(), shares(20), shares(90));
-        view.clear_offchain_order_pending(&aapl, Some(applied_at));
+        view.clear_offchain_order_pending(&aapl, test_order_id(), Some(applied_at));
 
         // A poll read before the fill executed reports the pre-fill 100; its
         // event lands after the fill was applied. Applying it would resurrect
@@ -4329,12 +4611,14 @@ mod tests {
     fn marketmaking_snapshot_unaffected_by_offchain_order_guards() {
         let aapl = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
+        let completed_order_id = OffchainOrderId::new();
+        let pending_order_id = OffchainOrderId::new();
 
         // Populate both guard fields: an applied-fill time, then a re-opened
         // pending order.
         let mut view = InventoryView::default().with_equity(aapl.clone(), shares(50), shares(100));
-        view.clear_offchain_order_pending(&aapl, Some(now));
-        view.mark_offchain_order_pending(aapl.clone());
+        view.clear_offchain_order_pending(&aapl, completed_order_id, Some(now));
+        view.mark_offchain_order_pending(aapl.clone(), pending_order_id);
 
         // An onchain snapshot older than the applied fill, arriving while the
         // hedge order is open, must still apply: both guards are scoped to the
@@ -4669,7 +4953,7 @@ mod tests {
         let mut view = InventoryView::default()
             .with_equity(aapl.clone(), shares(20), shares(100))
             .with_equity(tsla.clone(), shares(10), shares(50));
-        view.mark_offchain_order_pending(aapl.clone());
+        view.mark_offchain_order_pending(aapl.clone(), test_order_id());
 
         let positions = BTreeMap::from([(aapl.clone(), shares(90)), (tsla.clone(), shares(45))]);
         let forced = view
@@ -4701,12 +4985,14 @@ mod tests {
         let aapl = Symbol::new("AAPL").unwrap();
         let tsla = Symbol::new("TSLA").unwrap();
         let applied_at = Utc::now();
+        let completed_order_id = OffchainOrderId::new();
+        let pending_order_id = OffchainOrderId::new();
 
         let mut view = InventoryView::default()
             .with_equity(aapl.clone(), shares(20), shares(100))
             .with_equity(tsla.clone(), shares(10), shares(50));
-        view.clear_offchain_order_pending(&aapl, Some(applied_at));
-        view.mark_offchain_order_pending(aapl.clone());
+        view.clear_offchain_order_pending(&aapl, completed_order_id, Some(applied_at));
+        view.mark_offchain_order_pending(aapl.clone(), pending_order_id);
 
         let mut reset = view.reset_preserving_offchain_order_state();
 
@@ -4735,7 +5021,7 @@ mod tests {
         // Guard 2 state must survive too: with the pending flag cleared, a
         // snapshot predating the preserved applied-fill time is still
         // rejected. Had the reset dropped it, this snapshot would apply.
-        reset.clear_offchain_order_pending(&aapl, None);
+        reset.clear_offchain_order_pending(&aapl, pending_order_id, None);
         let mut positions = BTreeMap::new();
         positions.insert(aapl.clone(), shares(50));
         let healed = reset
@@ -4767,7 +5053,7 @@ mod tests {
         let mut view = InventoryView::default()
             .with_equity(aapl.clone(), shares(20), shares(100))
             .with_usdc(Usdc::new(float!(5000)), Usdc::new(float!(5000)));
-        view.mark_offchain_order_pending(aapl.clone());
+        view.mark_offchain_order_pending(aapl.clone(), test_order_id());
 
         let reason = Arc::new(InventoryViewError::UsdBalanceConversion(0));
         let event = InventorySnapshotEvent::OffchainUsd {
@@ -4792,7 +5078,7 @@ mod tests {
              be skipped with it"
         );
 
-        view.clear_offchain_order_pending(&aapl, None);
+        view.clear_offchain_order_pending(&aapl, test_order_id(), None);
         let ungated = view
             .force_apply_snapshot_event(&event, now, reason)
             .unwrap();
@@ -4814,7 +5100,7 @@ mod tests {
         let mut view = InventoryView::default()
             .with_equity(aapl.clone(), shares(20), shares(100))
             .with_usdc(Usdc::new(float!(5000)), Usdc::new(float!(5000)));
-        view.clear_offchain_order_pending(&aapl, Some(applied_at));
+        view.clear_offchain_order_pending(&aapl, test_order_id(), Some(applied_at));
 
         let reset = view.reset_preserving_offchain_order_state();
 
@@ -5179,7 +5465,8 @@ mod tests {
             previous_inflight_redemption_symbols: HashSet::new(),
             onchain_equity_snapshot_watermarks: HashMap::new(),
             offchain_equity_snapshot_watermarks: HashMap::new(),
-            pending_offchain_order_symbols: HashSet::new(),
+            pending_offchain_orders: HashMap::new(),
+            last_terminal_offchain_orders: HashMap::new(),
             last_offchain_fill_applied_at: HashMap::new(),
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
@@ -5242,7 +5529,8 @@ mod tests {
             previous_inflight_redemption_symbols: HashSet::new(),
             onchain_equity_snapshot_watermarks: HashMap::new(),
             offchain_equity_snapshot_watermarks: HashMap::new(),
-            pending_offchain_order_symbols: HashSet::new(),
+            pending_offchain_orders: HashMap::new(),
+            last_terminal_offchain_orders: HashMap::new(),
             last_offchain_fill_applied_at: HashMap::new(),
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: None,
@@ -6068,7 +6356,7 @@ mod tests {
         // A fill applied after the escalation's reading was fetched: the
         // reconcile would overwrite the fill's delta with a stale value.
         let mut view = InventoryView::default().with_equity(spym.clone(), shares(0), shares(126));
-        view.clear_offchain_order_pending(&spym, Some(fill_applied_at));
+        view.clear_offchain_order_pending(&spym, test_order_id(), Some(fill_applied_at));
 
         let result = view
             .apply_snapshot_event(
@@ -6135,7 +6423,7 @@ mod tests {
         let now = Utc::now();
 
         let mut view = InventoryView::default().with_equity(spym.clone(), shares(0), shares(136));
-        view.mark_offchain_order_pending(spym.clone());
+        view.mark_offchain_order_pending(spym.clone(), test_order_id());
 
         let gated = view
             .apply_snapshot_event(&reconciled_event(&spym, shares(0), None, now), now)
@@ -6149,7 +6437,7 @@ mod tests {
         // The aborted reconcile must not burn the watermark: once the order
         // terminates, delivering the same reconcile event again applies it.
         let mut released = gated;
-        released.clear_offchain_order_pending(&spym, None);
+        released.clear_offchain_order_pending(&spym, test_order_id(), None);
         let healed = released
             .apply_snapshot_event(&reconciled_event(&spym, shares(0), None, now), now)
             .unwrap();
@@ -6201,15 +6489,18 @@ mod tests {
         );
 
         let mut hedging = not_busy.clone();
-        hedging.mark_offchain_order_pending(spym.clone());
+        hedging.mark_offchain_order_pending(spym.clone(), test_order_id());
         assert_eq!(
             hedging.equity_reconciliation_busy(&spym, now).unwrap(),
             Some(EquityReconcileBusy::PendingHedgeOrder)
         );
 
         let mut fill_applied_after_reading = not_busy;
-        fill_applied_after_reading
-            .clear_offchain_order_pending(&spym, Some(now + Duration::seconds(1)));
+        fill_applied_after_reading.clear_offchain_order_pending(
+            &spym,
+            test_order_id(),
+            Some(now + Duration::seconds(1)),
+        );
         assert_eq!(
             fill_applied_after_reading
                 .equity_reconciliation_busy(&spym, now)
@@ -6434,7 +6725,7 @@ mod tests {
         let now = Utc::now();
 
         let mut view = InventoryView::default().with_usdc(Usdc::ZERO, usdc_cents(50_000));
-        view.mark_offchain_order_pending(spym.clone());
+        view.mark_offchain_order_pending(spym.clone(), test_order_id());
 
         let gated = view
             .apply_snapshot_event(&usd_reconciled_event(0, None, now), now)
@@ -6446,7 +6737,7 @@ mod tests {
         );
 
         let mut released = gated;
-        released.clear_offchain_order_pending(&spym, None);
+        released.clear_offchain_order_pending(&spym, test_order_id(), None);
         let healed = released
             .apply_snapshot_event(&usd_reconciled_event(0, None, now), now)
             .unwrap();
@@ -6464,7 +6755,7 @@ mod tests {
         let fill_applied_at = fetched_at + Duration::seconds(1);
 
         let mut view = InventoryView::default().with_usdc(Usdc::ZERO, usdc_cents(40_000));
-        view.clear_offchain_order_pending(&spym, Some(fill_applied_at));
+        view.clear_offchain_order_pending(&spym, test_order_id(), Some(fill_applied_at));
 
         let result = view
             .apply_snapshot_event(
@@ -6509,15 +6800,18 @@ mod tests {
         );
 
         let mut hedging = not_busy.clone();
-        hedging.mark_offchain_order_pending(spym.clone());
+        hedging.mark_offchain_order_pending(spym.clone(), test_order_id());
         assert_eq!(
             hedging.cash_reconciliation_busy(now).unwrap(),
             Some(EquityReconcileBusy::PendingHedgeOrder)
         );
 
         let mut fill_applied_after_reading = not_busy;
-        fill_applied_after_reading
-            .clear_offchain_order_pending(&spym, Some(now + Duration::seconds(1)));
+        fill_applied_after_reading.clear_offchain_order_pending(
+            &spym,
+            test_order_id(),
+            Some(now + Duration::seconds(1)),
+        );
         assert_eq!(
             fill_applied_after_reading
                 .cash_reconciliation_busy(now)
@@ -6542,7 +6836,7 @@ mod tests {
         let now = Utc::now();
 
         let mut view = InventoryView::default().with_usdc(Usdc::ZERO, usdc_cents(50_000));
-        view.mark_offchain_order_pending(spym);
+        view.mark_offchain_order_pending(spym, test_order_id());
 
         let snapshot = InventorySnapshotEvent::OffchainUsd {
             usd_balance_cents: 0,
@@ -6578,9 +6872,11 @@ mod tests {
     fn offchain_usd_snapshot_skip_streak_resets_on_apply() {
         let spym = Symbol::new("SPYM").unwrap();
         let now = Utc::now();
+        let first_order_id = OffchainOrderId::new();
+        let second_order_id = OffchainOrderId::new();
 
         let mut view = InventoryView::default().with_usdc(Usdc::ZERO, usdc_cents(50_000));
-        view.mark_offchain_order_pending(spym.clone());
+        view.mark_offchain_order_pending(spym.clone(), first_order_id);
 
         let snapshot = InventorySnapshotEvent::OffchainUsd {
             usd_balance_cents: 0,
@@ -6594,14 +6890,14 @@ mod tests {
 
         // An applied snapshot ends the starvation streak: the guard lifted
         // and broker truth reached the balance.
-        view.clear_offchain_order_pending(&spym, None);
+        view.clear_offchain_order_pending(&spym, first_order_id, None);
         view = view.apply_snapshot_event(&snapshot, now).unwrap();
         assert_eq!(
             view.offchain_usd_snapshot_skip_streak, 0,
             "an applied snapshot must reset the skip streak"
         );
 
-        view.mark_offchain_order_pending(spym);
+        view.mark_offchain_order_pending(spym, second_order_id);
         for _ in 0..(OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY - 1) {
             view = view.apply_snapshot_event(&snapshot, now).unwrap();
         }
@@ -6618,7 +6914,7 @@ mod tests {
         let now = Utc::now();
 
         let mut view = InventoryView::default().with_equity(spym.clone(), shares(0), shares(10));
-        view.mark_offchain_order_pending(spym.clone());
+        view.mark_offchain_order_pending(spym.clone(), test_order_id());
 
         let snapshot = InventorySnapshotEvent::OffchainEquity {
             positions: BTreeMap::from([(spym.clone(), shares(0))]),
@@ -6644,7 +6940,7 @@ mod tests {
         );
 
         // An applied snapshot drops the symbol's streak entirely.
-        view.clear_offchain_order_pending(&spym, None);
+        view.clear_offchain_order_pending(&spym, test_order_id(), None);
         let view = view
             .apply_snapshot_event(
                 &InventorySnapshotEvent::OffchainEquity {
@@ -6664,12 +6960,12 @@ mod tests {
     /// The boot seeding entry point stamps the restart taint together with
     /// the gate, and the seam's entry clear (empty set) drops both.
     #[test]
-    fn set_pending_offchain_order_symbols_stamps_restart_taint() {
+    fn set_pending_offchain_orders_stamps_restart_taint() {
         let spym = Symbol::new("SPYM").unwrap();
         let aapl = Symbol::new("AAPL").unwrap();
 
         let mut view = InventoryView::default();
-        view.set_pending_offchain_order_symbols(HashSet::from([spym.clone()]));
+        view.set_pending_offchain_orders(HashMap::from([(spym.clone(), test_order_id())]));
 
         assert!(view.is_restart_tainted(&spym));
         assert!(
@@ -6681,7 +6977,7 @@ mod tests {
             "any open order at boot taints the venue-level cash balance"
         );
 
-        view.set_pending_offchain_order_symbols(HashSet::new());
+        view.set_pending_offchain_orders(HashMap::new());
         assert!(
             !view.is_restart_tainted(&spym),
             "the seam's entry clear must drop the taint with the gate"
@@ -6697,8 +6993,8 @@ mod tests {
         let spym = Symbol::new("SPYM").unwrap();
 
         let mut view = InventoryView::default().with_equity(spym.clone(), shares(0), shares(136));
-        view.set_pending_offchain_order_symbols(HashSet::from([spym.clone()]));
-        view.clear_offchain_order_pending(&spym, None);
+        view.set_pending_offchain_orders(HashMap::from([(spym.clone(), test_order_id())]));
+        view.clear_offchain_order_pending(&spym, test_order_id(), None);
 
         let reset = view.reset_preserving_offchain_order_state();
 

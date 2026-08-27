@@ -98,6 +98,7 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
+    use crate::offchain::order::OffchainOrderId;
 
     fn create_broadcasting_inventory() -> (BroadcastingInventory, broadcast::Receiver<Statement>) {
         let (sender, receiver) = broadcast::channel(16);
@@ -143,7 +144,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         {
             let mut guard = inventory.write_without_broadcast().await;
-            guard.mark_offchain_order_pending(symbol.clone());
+            guard.mark_offchain_order_pending(symbol.clone(), OffchainOrderId::new());
         }
         assert!(
             matches!(

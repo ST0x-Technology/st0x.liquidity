@@ -3938,7 +3938,36 @@ know about cross-venue inventory.
   broker's cash reading comes from the same `get_inventory()` read as the equity
   positions and double-counts the fill in the same window the ADR 0015 equity
   guards close (the cash balance is venue-level, so its open-order guard is
-  venue-wide rather than per-symbol)
+  venue-wide rather than per-symbol). The open-order guard retains the exact
+  offchain order ID for each symbol. Placement installs a guard only when no
+  different order already owns it and is ignored when that exact order's
+  terminal event was already applied; reactor reordering therefore cannot let an
+  older or already-terminal placement displace the protected order. A filled,
+  failed, or cancelled event clears the guard only when its ID matches; a late
+  terminal event for an older order therefore cannot expose a newer order to
+  snapshots. After a broker inventory read and before any offchain snapshot
+  command reaches snapshot deduplication, the configured equity symbols and
+  every in-memory open-order guard are reconciled against their Position
+  aggregates loaded directly from the committed event store. A different durable
+  pending ID replaces the guarded ID, and a durable open order with no in-memory
+  entry installs its missing guard. Durable absence alone does not remove a
+  guard: the Position event is committed before its inventory reactor applies
+  the fill delta and local-clock watermark, so doing so could admit the same
+  poll's broker reading and double-count that fill. A missing durable order
+  removes the guard only after the inventory view has processed a terminal event
+  for that same order. Missing-guard installs are logged as warnings because an
+  in-flight placement may be the cause; proven stale removals and mismatched
+  replacements are logged as errors and produce one operator alert for the
+  actionable correction batch before the broker snapshots are recorded. A
+  Position aggregate load failure, including expiry of the required, positive
+  `hedge_order_gate_reconciliation_timeout_secs` durable-read deadline, aborts
+  the offchain portion of the tick: no offchain snapshot command or divergence
+  detection runs, and all existing in-memory guards remain unchanged. Failure to
+  deliver the operator alert is logged and does not abort the poll. This
+  ordering heals unchanged-value polls and placement events delivered after
+  their own terminal event without requiring a restart, while never treating the
+  Position store's lead over the inventory reactor as proof that its local side
+  effects have completed
 - `TokenizedEquityMintEvent::MintAccepted` - Moves shares to inflight (leaving
   Alpaca)
 - `TokenizedEquityMintEvent::TokensReceived` - Moves from inflight to Raindex

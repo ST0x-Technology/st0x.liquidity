@@ -152,6 +152,7 @@ struct Config {
     position_check_interval: Option<u64>,
     inventory_poll_interval: Option<u64>,
     inventory_divergence_threshold: NonZeroU32,
+    hedge_order_gate_reconciliation_timeout_secs: NonZeroU64,
     order_fill_poll_interval: Option<u64>,
     apalis_finished_job_cleanup_interval_secs: u64,
     telemetry: Option<TelemetryConfig>,
@@ -613,6 +614,10 @@ pub struct Ctx {
     /// snapshot reconciliation. Required and nonzero: a missing value must
     /// fail config parsing rather than silently defaulting.
     pub inventory_divergence_threshold: NonZeroU32,
+    /// Maximum duration (seconds) the inventory poller may wait for durable
+    /// Position state while holding the inventory write lock to reconcile
+    /// hedge-order gates. Required and nonzero.
+    pub hedge_order_gate_reconciliation_timeout_secs: NonZeroU64,
     /// Interval (seconds) between continuous `eth_getLogs` polls for orderbook
     /// fills. Each tick enqueues a backfill range over the unprocessed blocks
     /// (capped at the chain's latest finalized block).
@@ -1108,6 +1113,10 @@ impl std::fmt::Debug for Ctx {
                 "inventory_divergence_threshold",
                 &self.inventory_divergence_threshold,
             )
+            .field(
+                "hedge_order_gate_reconciliation_timeout_secs",
+                &self.hedge_order_gate_reconciliation_timeout_secs,
+            )
             .field("order_fill_poll_interval", &self.order_fill_poll_interval)
             .field(
                 "extended_hours_reprice_timeout_secs",
@@ -1247,6 +1256,7 @@ struct ValidatedParts {
     position_check_interval: u64,
     inventory_poll_interval: u64,
     inventory_divergence_threshold: NonZeroU32,
+    hedge_order_gate_reconciliation_timeout_secs: NonZeroU64,
     order_fill_poll_interval: u64,
     extended_hours_reprice_timeout_secs: Option<NonZeroU64>,
     close_flatten_reprice_timeout_secs: u64,
@@ -1618,6 +1628,8 @@ fn parse_and_validate(
         position_check_interval: polling_intervals.position_check_interval,
         inventory_poll_interval: polling_intervals.inventory_poll_interval,
         inventory_divergence_threshold: config.inventory_divergence_threshold,
+        hedge_order_gate_reconciliation_timeout_secs: config
+            .hedge_order_gate_reconciliation_timeout_secs,
         order_fill_poll_interval: polling_intervals.order_fill_poll_interval,
         extended_hours_reprice_timeout_secs,
         close_flatten_reprice_timeout_secs,
@@ -1793,6 +1805,8 @@ impl Ctx {
             position_check_interval: parts.position_check_interval,
             inventory_poll_interval: parts.inventory_poll_interval,
             inventory_divergence_threshold: parts.inventory_divergence_threshold,
+            hedge_order_gate_reconciliation_timeout_secs: parts
+                .hedge_order_gate_reconciliation_timeout_secs,
             order_fill_poll_interval: parts.order_fill_poll_interval,
             extended_hours_reprice_timeout_secs: parts.extended_hours_reprice_timeout_secs,
             close_flatten_reprice_timeout_secs: parts.close_flatten_reprice_timeout_secs,
@@ -2009,6 +2023,8 @@ impl Ctx {
         #[builder(default = 2)] inventory_poll_interval: u64,
         #[builder(default = const { NonZeroU32::new(10).unwrap() })]
         inventory_divergence_threshold: NonZeroU32,
+        #[builder(default = const { NonZeroU64::new(10).unwrap() })]
+        hedge_order_gate_reconciliation_timeout_secs: NonZeroU64,
         #[builder(default = 3600)] apalis_finished_job_cleanup_interval_secs: u64,
         #[builder(default = 0)] server_port: u16,
         #[builder(default = 0)] board_port: u16,
@@ -2094,6 +2110,7 @@ impl Ctx {
             position_check_interval: 2,
             inventory_poll_interval,
             inventory_divergence_threshold,
+            hedge_order_gate_reconciliation_timeout_secs,
             order_fill_poll_interval: 1,
             extended_hours_reprice_timeout_secs: NonZeroU64::new(300),
             close_flatten_reprice_timeout_secs: 60,
@@ -2532,6 +2549,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         position_check_interval: 60,
         inventory_poll_interval: 60,
         inventory_divergence_threshold: NonZeroU32::MIN,
+        hedge_order_gate_reconciliation_timeout_secs: NonZeroU64::MIN,
         order_fill_poll_interval: 5,
         extended_hours_reprice_timeout_secs: NonZeroU64::new(300),
         close_flatten_reprice_timeout_secs: 60,
@@ -2669,6 +2687,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -2850,6 +2869,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -2906,6 +2926,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -2988,6 +3009,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -3085,6 +3107,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "disabled"
@@ -3231,6 +3254,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -3284,6 +3308,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -3345,6 +3370,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -3403,6 +3429,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -3466,6 +3493,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -3640,6 +3668,7 @@ mod tests {
         assert_eq!(ctx.order_polling_max_jitter, 5);
         assert_eq!(ctx.position_check_interval, 60);
         assert_eq!(ctx.inventory_poll_interval, 60);
+        assert_eq!(ctx.hedge_order_gate_reconciliation_timeout_secs.get(), 10);
         assert_eq!(ctx.order_fill_poll_interval, 5);
     }
 
@@ -3651,6 +3680,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -3703,6 +3733,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -3747,6 +3778,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hedge_order_gate_reconciliation_timeout_is_required() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::ConfigToml { .. }),
+            "expected config parse failure for missing reconciliation timeout, got: {error:#}"
+        );
+
+        let source = std::error::Error::source(&error).unwrap();
+        let source_display = source.to_string();
+        assert!(
+            source_display.contains("hedge_order_gate_reconciliation_timeout_secs"),
+            "expected parse error to mention the reconciliation timeout field, got: \
+             {source_display}"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_hedge_order_gate_reconciliation_timeout_is_rejected() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 0
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::ConfigToml { .. }),
+            "expected config parse failure for zero reconciliation timeout, got: {error:#}"
+        );
+
+        let source = std::error::Error::source(&error).unwrap();
+        let source_display = source.to_string();
+        assert!(
+            source_display.contains("hedge_order_gate_reconciliation_timeout_secs"),
+            "expected parse error to mention the reconciliation timeout field, got: \
+             {source_display}"
+        );
+    }
+
+    #[tokio::test]
     async fn zero_inventory_divergence_threshold_is_rejected() {
         let config = toml_file(
             r#"
@@ -3755,6 +3871,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 0
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -3806,6 +3923,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -3858,6 +3976,7 @@ mod tests {
             server_port = 8080
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -3915,6 +4034,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -3972,6 +4092,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 0
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -4026,6 +4147,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
             order_fill_poll_interval = 0
 
             [chains.base.trading.assets.equities]
@@ -4081,6 +4203,7 @@ mod tests {
             board_port = 8080
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -4158,6 +4281,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -4240,6 +4364,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
             log_level = "warn"
             log_format = "json"
             log_query_url_template = "https://logs.example/query?id={id}"
@@ -4307,6 +4432,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
             server_port = 9090
             log_query_url_template = "https://logs.example/query?id=missing"
 
@@ -4358,6 +4484,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
             server_port = 9090
             log_query_url_template = "not a url {id}"
 
@@ -4431,6 +4558,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -4539,6 +4667,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -4904,6 +5033,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -4977,6 +5107,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -5062,6 +5193,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -5151,6 +5283,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -5250,6 +5383,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -5485,6 +5619,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -5558,6 +5693,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -5641,6 +5777,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -5718,6 +5855,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -5793,6 +5931,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -5982,6 +6121,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -6220,6 +6360,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -6295,6 +6436,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -6374,6 +6516,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -6450,6 +6593,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -6529,6 +6673,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -7019,6 +7164,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -7482,6 +7628,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
             bogus_field = "should fail"
 
             [chains.base]
@@ -7527,6 +7674,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [assets]
             bogus_field = "should fail"
@@ -7576,6 +7724,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "disabled"
@@ -7631,6 +7780,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.cash]
             rebalancing = "disabled"
@@ -7749,6 +7899,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
             bogus_field = "should fail"
 
             [chains.base]
@@ -8007,6 +8158,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "disabled"
@@ -8124,6 +8276,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "enabled"
@@ -8185,6 +8338,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "enabled"
@@ -8244,6 +8398,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "enabled"
@@ -8303,6 +8458,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "enabled"
@@ -8381,6 +8537,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "enabled"
@@ -8487,6 +8644,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "enabled"
@@ -8619,6 +8777,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -8677,6 +8836,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -8753,6 +8913,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -8856,6 +9017,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
 
             [chains.base.trading.assets.equities]
 
@@ -8912,6 +9074,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
             position_check_interval = 0
 
             [chains.base.trading.assets.equities]
