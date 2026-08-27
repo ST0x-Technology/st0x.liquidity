@@ -128,7 +128,7 @@ const MINT_RECOVERY_POST_DEADLINE_REDRIVE_DELAY: Duration = Duration::from_secs(
 /// fires, or `None` when there is no room for a distinct early warning.
 ///
 /// The threshold is set at `max/2 + 1` (integer division) so operators get
-/// time to investigate before the circuit opens. For `max >= 3` this always
+/// time to investigate before the redrive budget is exhausted. For `max >= 3` this always
 /// yields a threshold strictly less than `max`, giving one or more warn-only
 /// attempts before the limit alert. For `max <= 2` the formula would produce
 /// `threshold == max`, making the warn branch structurally unreachable (the
@@ -264,8 +264,8 @@ where
 ///
 /// Bot-gas cost recording is best-effort (see `BotGasReceiptCostEnqueuer`'s
 /// doc, ADR 0017 SS4), so the failure is redriven through the shared mechanism
-/// rather than consuming the apalis retry budget or opening the fail-stop
-/// circuit. Whether the enqueue site runs before or after its
+/// rather than consuming the apalis retry budget and dead-lettering the job.
+/// Whether the enqueue site runs before or after its
 /// aggregate-advancing command (see `CrossVenueCashTransfer::enqueue_bot_gas_cost`'s
 /// doc), the burn/withdraw/send resume paths scan-and-adopt rather than
 /// re-executing the on-chain step, so redriving is safe either way.
@@ -379,7 +379,7 @@ async fn log_and_alert_backpressure_outcome(
                 streak,
                 limit = BACKPRESSURE_RESCHEDULE_LIMIT,
                 "{direction} USDC transfer: {context} exceeded the reschedule \
-                 budget; dead-lettering instead of opening the circuit breaker -- \
+                 budget; dead-lettering without stopping the worker -- \
                  treat as a structurally-dead Alpaca integration needing manual \
                  reconciliation"
             );
@@ -517,7 +517,7 @@ pub(crate) struct TransferUsdcToHedgingCtx {
     pub(crate) timeout: Duration,
     pub(crate) job_queue: TransferUsdcToHedgingJobQueue,
     /// Maximum consecutive revert-class burn failures reclassified as safe
-    /// redrives before the circuit opens. From `RebalancingConfig`.
+    /// redrives before the job is dead-lettered. From `RebalancingConfig`.
     pub(crate) max_burn_revert_redrives: u32,
     /// Alerting channel: structured operational-alert logs in production.
     pub(crate) notifier: Arc<dyn Notifier>,
@@ -657,7 +657,7 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
             // (chain head not yet far enough past the scan lower bound) or another
             // settlement-phase RPC check failed transiently. The aggregate is in a
             // durable state (`BridgingSubmitting`), so this must delayed-redrive
-            // rather than consume the apalis retry budget or trip the circuit --
+            // rather than consume the apalis retry budget and dead-letter --
             // an inconclusive scan is a normal self-heal outcome. Re-pushing
             // `self.clone()` unchanged means this redrive intentionally does NOT
             // consume the burn-revert budget (`revert_redrive_attempts`) and is
@@ -829,9 +829,9 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
 impl TransferUsdcToHedging {
     /// Handles the generic (unclassified-by-name) terminal error arm:
     /// reschedules with a classified delay on broker rate-limiting (429)
-    /// instead of consuming the terminal retry budget and alerting, or falls
-    /// through to the pre-existing terminal alert+propagate path for any
-    /// other error. `TransferUsdcToHedging` is a "true retry" job (RAI-1494
+    /// instead of consuming the terminal retry budget, or propagates any other
+    /// error for apalis to retry and eventually alert once when durably terminal.
+    /// `TransferUsdcToHedging` is a "true retry" job (RAI-1494
     /// plan): `resume_base_to_alpaca` re-drives from the top on every attempt
     /// with no committed guard specific to this failure class, so every
     /// reschedule genuinely re-attempts the resume. Exception: the USDC->USD
@@ -855,13 +855,10 @@ impl TransferUsdcToHedging {
             })
             .await?;
 
-            // Per the RAI-1494 plan's binding M2 decision: this is a
-            // supervised worker, so dead-letter instead of propagating `Err`
-            // into the shared supervised on-event path. RAI-1494 pass 3:
-            // both dead-lettering and sustained rescheduling must page the
-            // operator -- rerouting a 429 through this reschedule machinery
-            // must not silently drop the alerting the pre-existing terminal
-            // path gave every sustained failure.
+            // This path returns `Ok` after explicitly dead-lettering or
+            // rescheduling, so it never reaches the worker-level terminal
+            // failure handler. It therefore retains ownership of its single
+            // operator alert.
             log_and_alert_backpressure_outcome(
                 &self.id,
                 BackpressureSite::Hedging,
@@ -874,35 +871,20 @@ impl TransferUsdcToHedging {
             return Ok(());
         }
 
-        // Terminal non-redriven error: fire notifier before surfacing
-        // to apalis so the operator is alerted before the circuit opens.
-        //
-        // KNOWN LIMITATION: this arm fires on every apalis attempt (up
-        // to 4x with the default RetryPolicy::retries(3)). Because the
-        // apalis retry uses the same serialized payload and `perform`
-        // has no visibility into the current attempt number, suppressing
-        // duplicates here is not feasible without threading apalis
-        // attempt context through. The bounded-limit path
-        // (BurnRevertLimitReached / TimeoutLimitReached) already fires
-        // exactly once via the Ok-return redrive pattern; this generic
-        // terminal arm is a best-effort alert that may duplicate.
+        // Let apalis retry the error. The best-effort worker's terminal event
+        // handler owns the single alert after retries are exhausted; alerting
+        // here would page once per attempt as well as at dead-letter time.
         let id = &self.id;
         error!(
             target: "rebalance",
             %id,
             %error,
-            "Base->Alpaca USDC transfer failed terminally; circuit will open"
+            "Base->Alpaca USDC transfer attempt failed; apalis will retry or dead-letter"
         );
-        let message = format!(
-            "USDC transfer {id} failed: {error}. Check if apalis will retry before acting."
-        );
-        if let Err(error) = ctx.notifier.notify(&message).await {
-            warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging terminal-error alert");
-        }
         Err(error.into())
     }
 
-    /// Handles a per-attempt timeout by either opening the circuit (when the
+    /// Handles a per-attempt timeout by either dead-lettering (when the
     /// redrive limit is reached) or scheduling a delayed redrive attempt.
     /// Extracted from `Job::perform` to mirror the market-making extraction and
     /// keep the perform body under the line-count lint threshold.
@@ -925,15 +907,9 @@ impl TransferUsdcToHedging {
                 "Base->Alpaca USDC transfer per-attempt timeout redrive limit reached; \
                  operator action required"
             );
-            // Alert fires only on the last successful redrive (next_attempts == max),
-            // not here. Apalis retries this Err up to 3 more times with the same
-            // payload, so alerting here would fire up to 4x for the same event.
-            //
-            // The operator is paged for this exhausted-budget circuit-open via the
-            // startup `recover_usdc_guard` stranded-alert path (the aggregate is
-            // found at `BridgingSubmitting` with only an exhausted-`Failed` job
-            // row). A live (non-restart) page on circuit-open is a known gap,
-            // tracked as a follow-up.
+            // Do not alert on each apalis attempt. The best-effort worker waits
+            // until this row is durably terminal, alerts exactly once, and keeps
+            // processing sibling jobs.
             return Err(TransferUsdcToHedgingJobError::TimeoutLimitReached { id: id.clone() });
         }
 
@@ -1001,7 +977,7 @@ impl TransferUsdcToHedging {
         Ok(())
     }
 
-    /// Handles a revert-class burn error by either opening the circuit (when the
+    /// Handles a revert-class burn error by either dead-lettering (when the
     /// redrive limit is reached) or scheduling a delayed redrive attempt. Symmetric
     /// to [`TransferUsdcToMarketMaking::handle_mm_burn_revert_redrive`].
     async fn handle_hedging_burn_revert_redrive(
@@ -1022,15 +998,9 @@ impl TransferUsdcToHedging {
                 "Base->Alpaca USDC burn revert redrive limit reached; \
                  operator action required"
             );
-            // Alert fires only on the last successful redrive (next_attempts == max),
-            // not here. Apalis retries this Err up to 3 more times with the same
-            // payload, so alerting here would fire up to 4x for the same event.
-            //
-            // The operator is paged for this exhausted-budget circuit-open via the
-            // startup `recover_usdc_guard` stranded-alert path (the aggregate is
-            // found at `BridgingSubmitting` with only an exhausted-`Failed` job
-            // row). A live (non-restart) page on circuit-open is a known gap,
-            // tracked as a follow-up.
+            // Do not alert on each apalis attempt. The best-effort worker waits
+            // until this row is durably terminal, alerts exactly once, and keeps
+            // processing sibling jobs.
             return Err(TransferUsdcToHedgingJobError::BurnRevertLimitReached { id: id.clone() });
         }
 
@@ -1134,7 +1104,7 @@ impl TransferUsdcToHedging {
 pub(crate) struct TransferUsdcToMarketMakingCtx {
     pub(crate) transfer: Arc<dyn ResumeAlpacaToBase>,
     pub(crate) job_queue: TransferUsdcToMarketMakingJobQueue,
-    /// Maximum consecutive revert-class burn failures before circuit opens.
+    /// Maximum consecutive revert-class burn failures before dead-lettering.
     pub(crate) max_burn_revert_redrives: u32,
     /// Alerting channel: structured operational-alert logs in production.
     pub(crate) notifier: Arc<dyn Notifier>,
@@ -1552,9 +1522,9 @@ impl TransferUsdcToMarketMaking {
 
     /// Handles the generic (unclassified-by-name) terminal error arm:
     /// reschedules with a classified delay on broker rate-limiting (429)
-    /// instead of consuming the terminal retry budget and alerting, or falls
-    /// through to the pre-existing terminal alert+propagate path for any
-    /// other error. `TransferUsdcToMarketMaking` is a "true retry" job
+    /// instead of consuming the terminal retry budget, or propagates any other
+    /// error for apalis to retry and eventually alert once when durably terminal.
+    /// `TransferUsdcToMarketMaking` is a "true retry" job
     /// (RAI-1494 plan): `resume_alpaca_to_base` re-drives from the top on
     /// every attempt with no committed guard specific to this failure class,
     /// so every reschedule genuinely re-attempts the resume. Exception: the
@@ -1579,13 +1549,10 @@ impl TransferUsdcToMarketMaking {
             })
             .await?;
 
-            // Per the RAI-1494 plan's binding M2 decision: this is a
-            // supervised worker, so dead-letter instead of propagating `Err`
-            // into the shared supervised on-event path. RAI-1494 pass 3:
-            // both dead-lettering and sustained rescheduling must page the
-            // operator -- rerouting a 429 through this reschedule machinery
-            // must not silently drop the alerting the pre-existing terminal
-            // path gave every sustained failure.
+            // This path returns `Ok` after explicitly dead-lettering or
+            // rescheduling, so it never reaches the worker-level terminal
+            // failure handler. It therefore retains ownership of its single
+            // operator alert.
             log_and_alert_backpressure_outcome(
                 &self.id,
                 BackpressureSite::MarketMaking,
@@ -1598,31 +1565,16 @@ impl TransferUsdcToMarketMaking {
             return Ok(());
         }
 
-        // Terminal non-redriven error: fire notifier before surfacing
-        // to apalis so the operator is alerted before the circuit opens.
-        //
-        // KNOWN LIMITATION: this arm fires on every apalis attempt (up
-        // to 4x with the default RetryPolicy::retries(3)). Because the
-        // apalis retry uses the same serialized payload and `perform`
-        // has no visibility into the current attempt number, suppressing
-        // duplicates here is not feasible without threading apalis
-        // attempt context through. The bounded-limit path
-        // (BurnRevertLimitReached) already fires exactly once via the
-        // Ok-return redrive pattern; this generic terminal arm is a
-        // best-effort alert that may duplicate.
+        // Let apalis retry the error. The best-effort worker's terminal event
+        // handler owns the single alert after retries are exhausted; alerting
+        // here would page once per attempt as well as at dead-letter time.
         let id = &self.id;
         error!(
             target: "rebalance",
             %id,
             %error,
-            "Alpaca->Base USDC transfer failed terminally; circuit will open"
+            "Alpaca->Base USDC transfer attempt failed; apalis will retry or dead-letter"
         );
-        let message = format!(
-            "USDC transfer {id} failed: {error}. Check if apalis will retry before acting."
-        );
-        if let Err(error) = ctx.notifier.notify(&message).await {
-            warn!(target: "rebalance", ?error, "Failed to deliver USDC market-making terminal-error alert");
-        }
         Err(error.into())
     }
 
@@ -1759,7 +1711,7 @@ impl TransferUsdcToMarketMaking {
         Ok(())
     }
 
-    /// Handles a revert-class burn error by either opening the circuit (when the
+    /// Handles a revert-class burn error by either dead-lettering (when the
     /// redrive limit is reached) or scheduling a delayed redrive attempt. Extracted
     /// to keep `Job::perform` under the line-count lint threshold.
     async fn handle_mm_burn_revert_redrive(
@@ -1780,15 +1732,9 @@ impl TransferUsdcToMarketMaking {
                 "Alpaca->Base USDC burn revert redrive limit reached; \
                  operator action required"
             );
-            // Alert fires only on the last successful redrive (next_attempts == max),
-            // not here. Apalis retries this Err up to 3 more times with the same
-            // payload, so alerting here would fire up to 4x for the same event.
-            //
-            // The operator is paged for this exhausted-budget circuit-open via the
-            // startup `recover_usdc_guard` stranded-alert path (the aggregate is
-            // found at `BridgingSubmitting` with only an exhausted-`Failed` job
-            // row). A live (non-restart) page on circuit-open is a known gap,
-            // tracked as a follow-up.
+            // Do not alert on each apalis attempt. The best-effort worker waits
+            // until this row is durably terminal, alerts exactly once, and keeps
+            // processing sibling jobs.
             return Err(TransferUsdcToMarketMakingJobError::BurnRevertLimitReached {
                 id: id.clone(),
             });
@@ -1896,7 +1842,7 @@ mod tests {
     }
 
     /// The classification gates whether a failure bypasses the apalis retry
-    /// budget and the fail-stop circuit, so each variant is asserted directly
+    /// budget and reaches a dead letter, so each variant is asserted directly
     /// rather than only transitively through `perform`.
     #[test]
     fn hedging_job_error_classifies_only_wrapped_bot_gas_enqueue_failures() {
@@ -2448,7 +2394,7 @@ mod tests {
     }
 
     /// A hung resume (RPC wedge) must be aborted by the per-attempt timeout
-    /// and reclassified as a safe redrive -- not propagated as a circuit-tripping
+    /// and reclassified as a safe redrive -- not propagated as a dead-lettering
     /// error -- because the scan-or-reburn path will adopt any burn that landed
     /// during the hang. Verify Ok + one Pending row with TIMEOUT_REDRIVE_DELAY,
     /// carrying `revert_redrive_attempts = 1`.
@@ -2478,7 +2424,7 @@ mod tests {
         assert_eq!(
             pending_job_count::<TransferUsdcToHedging>(&pool).await,
             1,
-            "a per-attempt timeout must redrive rather than trip the circuit breaker"
+            "a per-attempt timeout must redrive rather than dead-letter"
         );
 
         let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
@@ -2504,8 +2450,8 @@ mod tests {
     }
 
     /// After `max_burn_revert_redrives` consecutive timeouts the job must
-    /// propagate `TimeoutLimitReached` so the circuit opens and the operator
-    /// is alerted. No new Pending row must be created.
+    /// propagate `TimeoutLimitReached` so apalis can dead-letter and alert once.
+    /// No new Pending row must be created.
     #[tokio::test]
     async fn hedging_job_hits_redrive_limit_on_repeated_timeout() {
         let pool = setup_queue_pool().await;
@@ -4315,7 +4261,7 @@ mod tests {
 
     /// Hypothesis: SettlementCheckTransient on the hedging direction (e.g. an
     /// inconclusive Base burn scan) re-enqueues with SETTLEMENT_REDRIVE_DELAY and
-    /// returns Ok -- the job delayed-redrives without tripping the circuit, so the
+    /// returns Ok -- the job delayed-redrives without dead-lettering, so the
     /// guard is not latched on a normal self-heal outcome.
     #[tokio::test]
     async fn hedging_job_reschedules_settlement_check_transient() {
@@ -4348,7 +4294,7 @@ mod tests {
             notifier.messages().len(),
             0,
             "an inconclusive settlement check is a normal self-heal outcome and must not \
-             fire a terminal alert (which would page the operator and open the circuit)"
+             fire a terminal alert (which would page the operator)"
         );
 
         let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
@@ -4406,8 +4352,7 @@ mod tests {
     /// Acceptance criterion (ADR 0017 SS4): a bot-gas receipt cost enqueue
     /// failure must delayed-redrive like `SettlementCheckTransient`, not fall
     /// into the generic terminal arm -- otherwise a bookkeeping write can
-    /// consume the apalis retry budget and open this supervised worker's
-    /// fail-stop circuit.
+    /// consume the apalis retry budget and dead-letter this best-effort job.
     #[tokio::test]
     async fn market_making_job_reschedules_bot_gas_enqueue_failure() {
         let pool = setup_queue_pool().await;
@@ -4520,7 +4465,7 @@ mod tests {
             notifier.messages().len(),
             0,
             "a bot-gas enqueue failure is a best-effort accounting write and must not fire a \
-             terminal alert (which would page the operator and open the circuit)"
+             terminal alert (which would page the operator)"
         );
 
         let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
@@ -4655,7 +4600,7 @@ mod tests {
         assert_eq!(
             pending_job_count::<TransferUsdcToHedging>(&pool).await,
             1,
-            "a revert-class burn error must redrive rather than trip the circuit breaker"
+            "a revert-class burn error must redrive rather than dead-letter"
         );
 
         let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
@@ -4687,7 +4632,7 @@ mod tests {
     }
 
     /// After `max_burn_revert_redrives` redrives the job must propagate
-    /// `BurnRevertLimitReached` so the circuit opens and the operator is alerted.
+    /// `BurnRevertLimitReached` so apalis can dead-letter and alert once.
     #[tokio::test]
     async fn hedging_job_hits_redrive_limit_on_revert() {
         let pool = setup_queue_pool().await;
@@ -4723,7 +4668,7 @@ mod tests {
 
     /// A non-revert `CctpError` (e.g. `MessageSentEventNotFound`) is NOT a
     /// safe-to-redrive error; it must propagate immediately as `Err` so the
-    /// circuit opens.
+    /// job is dead-lettered for operator reconciliation.
     #[tokio::test]
     async fn hedging_job_does_not_redrive_non_revert_cctp_error() {
         let pool = setup_queue_pool().await;
@@ -4748,10 +4693,10 @@ mod tests {
         );
     }
 
-    /// A terminal non-redriven error must fire the notifier before the circuit
-    /// opens, so the operator receives an alert.
+    /// A terminal non-redriven error propagates without alerting per attempt;
+    /// the worker event handler owns the alert after retries are exhausted.
     #[tokio::test]
-    async fn hedging_job_fires_alert_on_terminal_error() {
+    async fn hedging_job_defers_terminal_error_alert_to_worker() {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
@@ -4770,16 +4715,10 @@ mod tests {
 
         Job::perform(&job, &ctx).await.unwrap_err();
 
-        let messages = notifier.messages();
         assert_eq!(
-            messages.len(),
-            1,
-            "exactly one alert must fire on a terminal non-redriven error"
-        );
-        assert!(
-            messages[0].contains(&job.id.to_string()),
-            "alert message must include the transfer id; got: {:?}",
-            messages[0]
+            notifier.messages().len(),
+            0,
+            "a retryable attempt must not alert before the worker dead-letters it",
         );
     }
 
@@ -5171,7 +5110,7 @@ mod tests {
         assert_eq!(
             pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
             1,
-            "a revert-class burn error must redrive rather than trip the circuit breaker"
+            "a revert-class burn error must redrive rather than dead-letter"
         );
 
         let (payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
@@ -5203,7 +5142,7 @@ mod tests {
     }
 
     /// After `max_burn_revert_redrives` redrives the market-making job must
-    /// propagate `BurnRevertLimitReached` so the circuit opens.
+    /// propagate `BurnRevertLimitReached` so apalis can dead-letter and alert once.
     #[tokio::test]
     async fn market_making_job_hits_redrive_limit_on_revert() {
         let pool = setup_queue_pool().await;
@@ -5368,10 +5307,10 @@ mod tests {
         );
     }
 
-    /// A terminal non-redriven error on the market-making job must fire the
-    /// notifier before the circuit opens.
+    /// A terminal non-redriven error propagates without alerting per attempt;
+    /// the worker event handler owns the alert after retries are exhausted.
     #[tokio::test]
-    async fn market_making_job_fires_alert_on_terminal_error() {
+    async fn market_making_job_defers_terminal_error_alert_to_worker() {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
 
@@ -5403,16 +5342,10 @@ mod tests {
 
         Job::perform(&job, &ctx).await.unwrap_err();
 
-        let messages = notifier.messages();
         assert_eq!(
-            messages.len(),
-            1,
-            "exactly one alert must fire on a terminal non-redriven error"
-        );
-        assert!(
-            messages[0].contains(&job.id.to_string()),
-            "alert message must include the transfer id; got: {:?}",
-            messages[0]
+            notifier.messages().len(),
+            0,
+            "a retryable attempt must not alert before the worker dead-letters it",
         );
     }
 
@@ -5543,16 +5476,10 @@ mod tests {
             0,
             "a mint-path Cctp revert must NOT enqueue a redrive job"
         );
-        // Operator alert must fire (terminal path fires alert)
         assert_eq!(
             notifier.messages().len(),
-            1,
-            "exactly one alert must fire for a mint-path terminal error"
-        );
-        assert!(
-            notifier.messages()[0].contains(&job.id.to_string()),
-            "terminal alert must include the transfer id; got: {:?}",
-            notifier.messages()[0]
+            0,
+            "the job attempt must defer alerting until the worker durably dead-letters it",
         );
     }
 
@@ -5605,13 +5532,8 @@ mod tests {
         );
         assert_eq!(
             notifier.messages().len(),
-            1,
-            "exactly one alert must fire for a mint-path terminal error in market-making"
-        );
-        assert!(
-            notifier.messages()[0].contains(&job.id.to_string()),
-            "terminal alert must include the transfer id; got: {:?}",
-            notifier.messages()[0]
+            0,
+            "the job attempt must defer alerting until the worker durably dead-letters it",
         );
     }
 

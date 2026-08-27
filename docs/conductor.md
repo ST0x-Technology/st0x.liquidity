@@ -125,6 +125,11 @@ reservation matches actual handler execution.
   polling worker will re-run it. `ack.sql` writes `Failed` in place without
   rescheduling; `done_at` being set does NOT make a `Failed` row terminal.
 
+Apalis' in-memory retry policy can emit `Event::Error` before SQLite terminality
+(for example, after attempt 4 while `max_attempts` is 5). Best-effort terminal
+alerting must therefore carry the row's attempt metadata and page only when
+`attempts >= max_attempts`; retry-policy exhaustion alone is not a dead letter.
+
 Dedupe/guard queries that want to detect all live rows must therefore use:
 `status IN ('Pending', 'Queued', 'Running') OR (status = 'Failed' AND attempts < max_attempts)`.
 
@@ -429,9 +434,9 @@ streak, then return `Ok(())`, so the row acks `Done` and
 `Event::Error`/`on_terminal_failure` never observe this cause at all. A genuine
 _non-backpressure_ `Err` on these jobs is completely untouched by this decision
 and still fail-stops exactly as before. A best-effort-worker job
-(`build_best_effort_worker!`) is already log-only-and-continue on any terminal
-failure (RAI-1110), so exhaustion there needs no special case: the existing
-best-effort terminal handling already covers it.
+(`build_best_effort_worker!`) alerts once and continues on any terminal failure,
+so exhaustion there needs no special case: the existing best-effort terminal
+handling already covers it.
 
 **True retry vs. reschedule-then-backstop -- not every job's reschedule
 re-drives the Alpaca call.** Whether a reschedule's successor attempt actually
@@ -585,11 +590,17 @@ distinguish success from failure.
 
 ```rust
 pub(crate) async fn work<Ctx, J>(
-    job: J, ctx: Data<Arc<Ctx>>,
+    job: J,
+    ctx: Data<Arc<Ctx>>,
+    attempt: Attempt,
+    sql_context: SqliteContext,
+    task_id: TaskId<impl Display + Clone + Send + Sync + 'static>,
 ) -> Result<(), JobError> {
     let label = job.label();
     info!(%label, "Processing job");
     job.perform(&ctx).await.map_err(|source| JobError::Failed {
+        task_identity: TaskIdentity::from(&task_id),
+        durably_terminal: is_durably_terminal(&attempt, &sql_context),
         label,
         source: Box::new(source),
     })
@@ -668,10 +679,11 @@ WorkerBuilder::new(name)
   does not prove this window is safe -- it only proves a sibling job survives a
   different job's terminal failure, never exercising shutdown or an in-flight
   retry backoff.
-- **`.on_event()`** — fires on `Event::Error` (after retries exhaust),
-  `Event::Success`, `Event::Start`, `Event::Stop`. Use for logging, recording
-  the failure info for the alert path (see below), and calling `ctx.stop()` on
-  terminal failure -- now the SOLE halt mechanism for a supervised worker.
+- **`.on_event()`** — fires on `Event::Error` (after the in-memory retry policy
+  exhausts), `Event::Success`, `Event::Start`, `Event::Stop`. Supervised workers
+  record failure info and call `ctx.stop()`. Best-effort workers inspect the
+  carried SQLite attempt metadata, alert only when the row is durably terminal,
+  and never stop the worker or conductor.
 
 ### Error propagation: handler failure -> bot shutdown
 

@@ -618,6 +618,7 @@ where
         deliver_mint_authorization_ctx,
         record_bot_gas_receipt_cost_queue,
         record_bot_gas_receipt_cost_ctx,
+        best_effort_failure_notifier: worker_failure_notifier.clone(),
         apalis_shutdown_token,
         seed_vault_registry_queue,
         startup_token: context.startup_token,
@@ -688,6 +689,7 @@ where
     deliver_mint_authorization_ctx: Option<Arc<DeliverMintAuthorizationCtx>>,
     record_bot_gas_receipt_cost_queue: RecordBotGasReceiptCostJobQueue,
     record_bot_gas_receipt_cost_ctx: Option<Arc<RecordBotGasReceiptCostCtx>>,
+    best_effort_failure_notifier: Arc<dyn Notifier>,
     apalis_shutdown_token: CancellationToken,
     seed_vault_registry_queue: SeedVaultRegistryJobQueue,
     startup_token: StartupToken,
@@ -744,6 +746,7 @@ where
             deliver_mint_authorization_ctx,
             record_bot_gas_receipt_cost_queue,
             record_bot_gas_receipt_cost_ctx,
+            best_effort_failure_notifier,
             apalis_shutdown_token,
             seed_vault_registry_queue,
             startup_token,
@@ -801,12 +804,9 @@ where
         let failure_notify_for_equity_rebalancing_check = failure_notify.clone();
         let failure_notify_for_usdc_rebalancing_check = failure_notify.clone();
         let failure_notify_for_seed_vault_registry = failure_notify.clone();
-        let failure_notify_for_wrapped_equity_recovery = failure_notify.clone();
-        let failure_notify_for_unwrapped_equity_recovery = failure_notify.clone();
         let failure_notify_for_check_positions = failure_notify.clone();
-        let failure_notify_for_transfer_usdc_to_hedging = failure_notify.clone();
-        let failure_notify_for_transfer_usdc_to_market_making = failure_notify.clone();
         let failure_notify_for_select = failure_notify.clone();
+        let best_effort_notifier_for_portfolio_snapshot = Arc::clone(&best_effort_failure_notifier);
 
         let accountant_ctx_for_backfill = accountant_ctx.clone();
 
@@ -814,6 +814,7 @@ where
             let monitor = Monitor::new()
                 .should_restart(|_ctx, _error, _attempt| false)
                 .register(move |index| {
+                    // Supervised: losing trade accounting compromises hedging state.
                     build_supervised_worker!(
                         ::<AccountantCtx<Prov, Exec>, AccountForDexTrade>,
                         index,
@@ -825,6 +826,7 @@ where
                     )
                 })
                 .register(move |index| {
+                    // Supervised: the durable dashboard trade handoff must not diverge.
                     build_supervised_worker!(
                         ::<DashboardTradeDeliveryCtx, DeliverDashboardTrade>,
                         index,
@@ -836,6 +838,7 @@ where
                     )
                 })
                 .register(move |index| {
+                    // Supervised: hedge placement is part of the core trading loop.
                     build_supervised_worker!(
                         ::<HedgeCtx, PlaceHedge>,
                         index,
@@ -847,6 +850,7 @@ where
                     )
                 })
                 .register(move |index| {
+                    // Supervised: an incomplete backfill can omit onchain trades.
                     build_supervised_worker!(
                         ::<AccountantCtx<Prov, Exec>, BackfillRange>,
                         index,
@@ -858,6 +862,7 @@ where
                     )
                 })
                 .register(move |index| {
+                    // Supervised: order polling protects offchain execution state.
                     build_supervised_worker!(
                         ::<PollOrderStatusCtx<Exec>, PollOrderStatus>,
                         index,
@@ -869,6 +874,7 @@ where
                     )
                 })
                 .register(move |index| {
+                    // Supervised: fill reconciliation protects position correctness.
                     build_supervised_worker!(
                         ::<ReconcileOrderFillCtx, ReconcileOrderFill>,
                         index,
@@ -880,6 +886,7 @@ where
                     )
                 })
                 .register(move |index| {
+                    // Supervised: rejection handling releases core order state.
                     build_supervised_worker!(
                         ::<HandleOrderRejectionCtx, HandleOrderRejection>,
                         index,
@@ -891,6 +898,7 @@ where
                     )
                 })
                 .register(move |index| {
+                    // Supervised: trading cannot proceed with an invalid vault registry.
                     build_supervised_worker!(
                         ::<SeedVaultRegistryCtx, SeedVaultRegistry>,
                         index,
@@ -902,6 +910,7 @@ where
                     )
                 })
                 .register(move |index| {
+                    // Supervised: position checks decide when hedges are required.
                     build_supervised_worker!(
                         ::<CheckPositionsCtx<Exec>, CheckPositions>,
                         index,
@@ -923,6 +932,7 @@ where
                         index,
                         portfolio_snapshot_queue.clone(),
                         portfolio_snapshot_ctx.clone(),
+                        best_effort_notifier_for_portfolio_snapshot.clone(),
                         #[cfg(any(test, feature = "test-support"))]
                         failure_injector_for_portfolio_snapshot.clone(),
                     )
@@ -935,6 +945,7 @@ where
                 let usdc_queue = usdc_check_scheduler.queue().clone();
                 monitor
                     .register(move |index| {
+                        // Supervised: missed equity checks can strand inventory imbalance.
                         build_supervised_worker!(
                             ::<RebalancingService, EquityRebalancingCheck>,
                             index,
@@ -946,6 +957,7 @@ where
                         )
                     })
                     .register(move |index| {
+                        // Supervised: missed USDC checks can strand inventory imbalance.
                         build_supervised_worker!(
                             ::<RebalancingService, UsdcRebalancingCheck>,
                             index,
@@ -964,7 +976,7 @@ where
                 apalis_monitor,
                 wrapped_equity_recovery_ctx,
                 wrapped_equity_recovery_queue,
-                failure_notify_for_wrapped_equity_recovery,
+                Arc::clone(&best_effort_failure_notifier),
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_wrapped_equity_recovery,
             );
@@ -973,7 +985,7 @@ where
                 apalis_monitor,
                 unwrapped_equity_recovery_ctx,
                 unwrapped_equity_recovery_queue,
-                failure_notify_for_unwrapped_equity_recovery,
+                Arc::clone(&best_effort_failure_notifier),
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_unwrapped_equity_recovery,
             );
@@ -982,7 +994,7 @@ where
                 apalis_monitor,
                 transfer_usdc_to_hedging_ctx,
                 transfer_usdc_to_hedging_queue,
-                failure_notify_for_transfer_usdc_to_hedging,
+                Arc::clone(&best_effort_failure_notifier),
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_transfer_usdc_to_hedging,
             );
@@ -991,7 +1003,7 @@ where
                 apalis_monitor,
                 transfer_usdc_to_market_making_ctx,
                 transfer_usdc_to_market_making_queue,
-                failure_notify_for_transfer_usdc_to_market_making,
+                Arc::clone(&best_effort_failure_notifier),
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_transfer_usdc_to_market_making,
             );
@@ -1000,6 +1012,7 @@ where
                 apalis_monitor,
                 transfer_equity_to_market_making_ctx,
                 transfer_equity_to_market_making_queue,
+                Arc::clone(&best_effort_failure_notifier),
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_transfer_equity_to_market_making,
             );
@@ -1008,6 +1021,7 @@ where
                 apalis_monitor,
                 transfer_equity_to_hedging_ctx,
                 transfer_equity_to_hedging_queue,
+                Arc::clone(&best_effort_failure_notifier),
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_transfer_equity_to_hedging,
             );
@@ -1016,6 +1030,7 @@ where
                 apalis_monitor,
                 resume_tokenization_ctx,
                 resume_tokenization_queue,
+                Arc::clone(&best_effort_failure_notifier),
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_resume_tokenization,
             );
@@ -1024,6 +1039,7 @@ where
                 apalis_monitor,
                 deliver_mint_authorization_ctx,
                 deliver_mint_authorization_queue,
+                Arc::clone(&best_effort_failure_notifier),
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_deliver_mint_authorization,
             );
@@ -1032,6 +1048,7 @@ where
                 apalis_monitor,
                 record_bot_gas_receipt_cost_ctx,
                 record_bot_gas_receipt_cost_queue,
+                best_effort_failure_notifier,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_record_bot_gas_receipt_cost,
             );
@@ -1153,7 +1170,7 @@ fn register_wrapped_equity_recovery_worker(
     monitor: Monitor,
     recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     recovery_queue: WrappedEquityRecoveryJobQueue,
-    failure_notify: Arc<TerminalFailureSignal>,
+    notifier: Arc<dyn Notifier>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
     let Some(recovery_ctx) = recovery_ctx else {
@@ -1164,13 +1181,14 @@ fn register_wrapped_equity_recovery_worker(
         return monitor;
     };
 
+    // Best effort: one recoverable wallet item must not halt the trading loop.
     monitor.register(move |index| {
-        build_supervised_worker!(
+        build_best_effort_worker!(
             ::<WrappedEquityRecoveryCtx, WrappedEquityRecoveryJob>,
             index,
             recovery_queue.clone(),
             recovery_ctx.clone(),
-            failure_notify.clone(),
+            notifier.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),
         )
@@ -1183,7 +1201,7 @@ fn register_unwrapped_equity_recovery_worker(
     monitor: Monitor,
     recovery_ctx: Option<Arc<UnwrappedEquityRecoveryCtx>>,
     recovery_queue: UnwrappedEquityRecoveryJobQueue,
-    failure_notify: Arc<TerminalFailureSignal>,
+    notifier: Arc<dyn Notifier>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
     let Some(recovery_ctx) = recovery_ctx else {
@@ -1194,13 +1212,14 @@ fn register_unwrapped_equity_recovery_worker(
         return monitor;
     };
 
+    // Best effort: one recoverable wallet item must not halt the trading loop.
     monitor.register(move |index| {
-        build_supervised_worker!(
+        build_best_effort_worker!(
             ::<UnwrappedEquityRecoveryCtx, UnwrappedEquityRecoveryJob>,
             index,
             recovery_queue.clone(),
             recovery_ctx.clone(),
-            failure_notify.clone(),
+            notifier.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),
         )
@@ -1215,7 +1234,7 @@ fn register_transfer_usdc_to_hedging_worker(
     monitor: Monitor,
     transfer_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
     transfer_queue: TransferUsdcToHedgingJobQueue,
-    failure_notify: Arc<TerminalFailureSignal>,
+    notifier: Arc<dyn Notifier>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
     let Some(transfer_ctx) = transfer_ctx else {
@@ -1226,13 +1245,14 @@ fn register_transfer_usdc_to_hedging_worker(
         return monitor;
     };
 
+    // Best effort: a poison transfer is an operator-owned dead letter.
     monitor.register(move |index| {
-        build_supervised_worker!(
+        build_best_effort_worker!(
             ::<TransferUsdcToHedgingCtx, TransferUsdcToHedging>,
             index,
             transfer_queue.clone(),
             transfer_ctx.clone(),
-            failure_notify.clone(),
+            notifier.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),
         )
@@ -1245,7 +1265,7 @@ fn register_transfer_usdc_to_market_making_worker(
     monitor: Monitor,
     transfer_ctx: Option<Arc<TransferUsdcToMarketMakingCtx>>,
     transfer_queue: TransferUsdcToMarketMakingJobQueue,
-    failure_notify: Arc<TerminalFailureSignal>,
+    notifier: Arc<dyn Notifier>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
     let Some(transfer_ctx) = transfer_ctx else {
@@ -1256,13 +1276,14 @@ fn register_transfer_usdc_to_market_making_worker(
         return monitor;
     };
 
+    // Best effort: a poison transfer is an operator-owned dead letter.
     monitor.register(move |index| {
-        build_supervised_worker!(
+        build_best_effort_worker!(
             ::<TransferUsdcToMarketMakingCtx, TransferUsdcToMarketMaking>,
             index,
             transfer_queue.clone(),
             transfer_ctx.clone(),
-            failure_notify.clone(),
+            notifier.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),
         )
@@ -1278,6 +1299,7 @@ fn register_transfer_equity_to_market_making_worker(
     monitor: Monitor,
     transfer_ctx: Option<Arc<TransferEquityToMarketMakingCtx>>,
     transfer_queue: TransferEquityToMarketMakingJobQueue,
+    notifier: Arc<dyn Notifier>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
     let Some(transfer_ctx) = transfer_ctx else {
@@ -1288,12 +1310,14 @@ fn register_transfer_equity_to_market_making_worker(
         return monitor;
     };
 
+    // Best effort: a poison transfer is an operator-owned dead letter.
     monitor.register(move |index| {
         build_best_effort_worker!(
             ::<TransferEquityToMarketMakingCtx, TransferEquityToMarketMaking>,
             index,
             transfer_queue.clone(),
             transfer_ctx.clone(),
+            notifier.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),
         )
@@ -1306,6 +1330,7 @@ fn register_transfer_equity_to_hedging_worker(
     monitor: Monitor,
     transfer_ctx: Option<Arc<TransferEquityToHedgingCtx>>,
     transfer_queue: TransferEquityToHedgingJobQueue,
+    notifier: Arc<dyn Notifier>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
     let Some(transfer_ctx) = transfer_ctx else {
@@ -1316,12 +1341,14 @@ fn register_transfer_equity_to_hedging_worker(
         return monitor;
     };
 
+    // Best effort: a poison transfer is an operator-owned dead letter.
     monitor.register(move |index| {
         build_best_effort_worker!(
             ::<TransferEquityToHedgingCtx, TransferEquityToHedging>,
             index,
             transfer_queue.clone(),
             transfer_ctx.clone(),
+            notifier.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),
         )
@@ -1336,6 +1363,7 @@ fn register_resume_tokenization_worker(
     monitor: Monitor,
     resume_ctx: Option<Arc<ResumeTokenizationCtx>>,
     resume_queue: ResumeTokenizationJobQueue,
+    notifier: Arc<dyn Notifier>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
     let Some(resume_ctx) = resume_ctx else {
@@ -1346,12 +1374,14 @@ fn register_resume_tokenization_worker(
         return monitor;
     };
 
+    // Best effort: one recovery dead letter must not block live trading.
     monitor.register(move |index| {
         build_best_effort_worker!(
             ::<ResumeTokenizationCtx, ResumeTokenizationAggregate>,
             index,
             resume_queue.clone(),
             resume_ctx.clone(),
+            notifier.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),
         )
@@ -1366,6 +1396,7 @@ fn register_deliver_mint_authorization_worker(
     monitor: Monitor,
     delivery_ctx: Option<Arc<DeliverMintAuthorizationCtx>>,
     delivery_queue: DeliverMintAuthorizationJobQueue,
+    notifier: Arc<dyn Notifier>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
     let Some(delivery_ctx) = delivery_ctx else {
@@ -1377,12 +1408,14 @@ fn register_deliver_mint_authorization_worker(
         return monitor;
     };
 
+    // Best effort: one failed authorization must not halt unrelated work.
     monitor.register(move |index| {
         build_best_effort_worker!(
             ::<DeliverMintAuthorizationCtx, DeliverMintAuthorization>,
             index,
             delivery_queue.clone(),
             delivery_ctx.clone(),
+            notifier.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),
         )
@@ -1400,6 +1433,7 @@ fn register_record_bot_gas_receipt_cost_worker(
     monitor: Monitor,
     record_ctx: Option<Arc<RecordBotGasReceiptCostCtx>>,
     record_queue: RecordBotGasReceiptCostJobQueue,
+    notifier: Arc<dyn Notifier>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> Monitor {
     let Some(record_ctx) = record_ctx else {
@@ -1411,12 +1445,14 @@ fn register_record_bot_gas_receipt_cost_worker(
         return monitor;
     };
 
+    // Best effort: receipt-cost bookkeeping cannot interrupt hedging.
     monitor.register(move |index| {
         build_best_effort_worker!(
             ::<RecordBotGasReceiptCostCtx, RecordBotGasReceiptCost>,
             index,
             record_queue.clone(),
             record_ctx.clone(),
+            notifier.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector.clone(),
         )
@@ -1440,6 +1476,7 @@ mod tests {
     };
     use st0x_event_sorcery::test_store;
     use st0x_execution::{FractionalShares, Symbol};
+    use st0x_finance::Usdc;
     use st0x_float_macro::float;
     use st0x_raindex::Raindex;
     use st0x_tokenization::IssuerRequestId;
@@ -1447,7 +1484,8 @@ mod tests {
     use st0x_wrapper::{MockWrapper, Wrapper};
 
     use super::*;
-    use crate::conductor::job::BackpressureStreak;
+    use crate::alerts::CapturingNotifier;
+    use crate::conductor::job::{BackpressureStreak, Job};
     use crate::equity_redemption::RedemptionAggregateId;
     use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::onchain::mock::MockRaindex;
@@ -1455,7 +1493,9 @@ mod tests {
         EquityTransferServices, MintError, MintTransferError, RedemptionError,
         ResumeEquityToHedging, ResumeEquityToMarketMaking,
     };
+    use crate::rebalancing::usdc::{ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcTransferError};
     use crate::test_utils::{setup_test_apalis_pool, setup_test_pools};
+    use crate::usdc_rebalance::UsdcRebalanceId;
     use crate::vault_lookup::MockVaultLookup;
 
     fn equity_asset(trading: OperationMode, rebalancing: OperationMode) -> ChainEquityAsset {
@@ -1643,6 +1683,47 @@ mod tests {
         healthy_completed: Arc<tokio::sync::Notify>,
     }
 
+    struct PoisonThenHealthyUsdcResume {
+        poison_id: UsdcRebalanceId,
+        healthy_completed: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for PoisonThenHealthyUsdcResume {
+        async fn resume_base_to_alpaca(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            if id == &self.poison_id {
+                return Err(UsdcTransferError::WithdrawalFailed {
+                    status: "injected terminal withdrawal failure".to_owned(),
+                });
+            }
+
+            self.healthy_completed.notify_one();
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for PoisonThenHealthyUsdcResume {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            if id == &self.poison_id {
+                return Err(UsdcTransferError::DepositFailed {
+                    status: "injected terminal deposit failure".to_owned(),
+                });
+            }
+
+            self.healthy_completed.notify_one();
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl ResumeEquityToMarketMaking for PoisonThenHealthyMintResume {
         async fn resume_equity_to_market_making(
@@ -1742,6 +1823,7 @@ mod tests {
             Monitor::new().should_restart(|_ctx, _error, _attempt| false),
             Some(transfer_ctx),
             queue,
+            Arc::new(crate::alerts::LogNotifier),
             FailureInjector::new(),
         );
         let monitor_handle = tokio::spawn(async move { monitor.run().await });
@@ -1781,6 +1863,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_usdc_transfer_does_not_stop_worker_or_sibling_work() {
+        let apalis_pool = setup_test_apalis_pool().await;
+        let mut queue = TransferUsdcToHedgingJobQueue::new(&apalis_pool);
+        let amount = Usdc::new(float!(100));
+        let poison_id = UsdcRebalanceId(uuid::Uuid::new_v4());
+
+        queue
+            .push(TransferUsdcToHedging {
+                id: poison_id.clone(),
+                amount,
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+        let mut push_queue = queue.clone();
+
+        let healthy_completed = Arc::new(tokio::sync::Notify::new());
+        let notifier = Arc::new(CapturingNotifier::default());
+        let transfer_ctx = Arc::new(TransferUsdcToHedgingCtx {
+            transfer: Arc::new(PoisonThenHealthyUsdcResume {
+                poison_id,
+                healthy_completed: healthy_completed.clone(),
+            }),
+            timeout: Duration::from_secs(1),
+            job_queue: queue.clone(),
+            max_burn_revert_redrives: 1,
+            notifier: notifier.clone(),
+        });
+        let failure_injector = FailureInjector::new();
+        let monitor = register_transfer_usdc_to_hedging_worker(
+            Monitor::new().should_restart(|_ctx, _error, _attempt| false),
+            Some(transfer_ctx),
+            queue,
+            notifier.clone(),
+            failure_injector,
+        );
+        let monitor_handle = tokio::spawn(async move { monitor.run().await });
+
+        wait_for_terminal_job::<TransferUsdcToHedging>(&apalis_pool).await;
+        push_queue
+            .push(TransferUsdcToHedging {
+                id: UsdcRebalanceId(uuid::Uuid::new_v4()),
+                amount,
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(15), healthy_completed.notified())
+            .await
+            .expect("the USDC worker must process sibling work after a terminal failure");
+        assert!(
+            !monitor_handle.is_finished(),
+            "a terminal USDC transfer must not stop the conductor monitor",
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while notifier.messages().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the terminal failure must alert the operator");
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "the terminal failure must alert once: {messages:?}"
+        );
+        assert!(
+            messages[0].contains(TransferUsdcToHedging::WORKER_NAME),
+            "the alert must name the worker: {}",
+            messages[0],
+        );
+        assert!(
+            messages[0].contains("injected terminal withdrawal failure"),
+            "the alert must include the terminal error: {}",
+            messages[0],
+        );
+        monitor_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn terminal_market_making_usdc_transfer_alerts_once_and_continues() {
+        let apalis_pool = setup_test_apalis_pool().await;
+        let mut queue = TransferUsdcToMarketMakingJobQueue::new(&apalis_pool);
+        let amount = Usdc::new(float!(100));
+        let poison_id = UsdcRebalanceId(uuid::Uuid::new_v4());
+
+        queue
+            .push(TransferUsdcToMarketMaking {
+                id: poison_id.clone(),
+                amount,
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+        let mut push_queue = queue.clone();
+
+        let healthy_completed = Arc::new(tokio::sync::Notify::new());
+        let notifier = Arc::new(CapturingNotifier::default());
+        let transfer_ctx = Arc::new(TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(PoisonThenHealthyUsdcResume {
+                poison_id,
+                healthy_completed: healthy_completed.clone(),
+            }),
+            job_queue: queue.clone(),
+            max_burn_revert_redrives: 1,
+            notifier: notifier.clone(),
+        });
+        let monitor = register_transfer_usdc_to_market_making_worker(
+            Monitor::new().should_restart(|_ctx, _error, _attempt| false),
+            Some(transfer_ctx),
+            queue,
+            notifier.clone(),
+            FailureInjector::new(),
+        );
+        let monitor_handle = tokio::spawn(async move { monitor.run().await });
+
+        wait_for_terminal_job::<TransferUsdcToMarketMaking>(&apalis_pool).await;
+        push_queue
+            .push(TransferUsdcToMarketMaking {
+                id: UsdcRebalanceId(uuid::Uuid::new_v4()),
+                amount,
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(15), healthy_completed.notified())
+            .await
+            .expect("the market-making USDC worker must process sibling work after dead-lettering");
+        assert!(
+            !monitor_handle.is_finished(),
+            "a terminal market-making USDC transfer must not stop the conductor monitor",
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while notifier.messages().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the terminal failure must alert the operator");
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "the terminal failure must alert once: {messages:?}",
+        );
+        assert!(
+            messages[0].contains(TransferUsdcToMarketMaking::WORKER_NAME),
+            "the alert must name the worker: {}",
+            messages[0],
+        );
+        assert!(
+            messages[0].contains("injected terminal deposit failure"),
+            "the alert must include the terminal error: {}",
+            messages[0],
+        );
+        monitor_handle.abort();
+    }
+
+    #[tokio::test]
     async fn terminal_equity_mint_is_dead_lettered_without_stopping_worker() {
         let (cqrs_pool, apalis_pool) = setup_test_pools().await;
         let mut queue = TransferEquityToMarketMakingJobQueue::new(&apalis_pool);
@@ -1814,6 +2064,7 @@ mod tests {
             Monitor::new().should_restart(|_ctx, _error, _attempt| false),
             Some(transfer_ctx),
             queue,
+            Arc::new(crate::alerts::LogNotifier),
             FailureInjector::new(),
         );
         let monitor_handle = tokio::spawn(async move { monitor.run().await });

@@ -794,27 +794,27 @@ migration files in `migrations/`.
   orphan-wrap) confirmation steps, the equity mint/redemption transfer jobs, and
   the startup `ResumeTokenizationAggregate` crash-recovery job all treat it as
   non-terminal and delayed-redrive without consuming the apalis retry budget or
-  tripping the supervised worker's fail-stop circuit, so recording self-heals
-  once the queue write succeeds (ADR 0017 SS4). Every one of these callers
-  classifies and redrives through one shared mechanism
-  (`crate::bot_gas::redrive`) rather than each hand-rolling its own check, so a
-  new caller inherits the same behavior by construction. On the mint side this
-  redrive also bypasses the post-receipt recovery handoff: a bot-gas enqueue
-  failure during wrap confirmation is never misclassified as a wrap/deposit
-  failure that would hand a healthy mint off to `UnwrappedEquityRecovery`.
-  `EquityRedemption::SendTokens` is the one call site that swallows the enqueue
-  failure and logs-and-continues instead of retrying, because retrying the send
-  itself would risk sending tokens twice; that gas fact is then permanently lost
-  (see "Known gaps" below). The wrapped/unwrapped equity-recovery aggregates'
-  `DispatchToMint`/`DispatchToRedemption` handoff to a mint/redemption resume is
-  a second such swallowing site: a bot-gas enqueue failure there is folded into
-  the aggregate's normal `RecoveryFailed` event rather than redriven, because
-  `WrappedEquityRecoveryJob` (and, for consistency, its unwrapped twin) has no
-  resume arm for the `Detected` state a redrive would land back on -- redriving
-  would re-send `Detect`, which is rejected as `AlreadyInitialized`, stranding
-  the aggregate non-terminal and permanently blocking rebalancing for the symbol
-  (see "Known gaps" below). This differs from a downstream job's own execution
-  failures, which dead-letter without blocking the caller
+  dead-lettering the job, so recording self-heals once the queue write succeeds
+  (ADR 0017 SS4). Every one of these callers classifies and redrives through one
+  shared mechanism (`crate::bot_gas::redrive`) rather than each hand-rolling its
+  own check, so a new caller inherits the same behavior by construction. On the
+  mint side this redrive also bypasses the post-receipt recovery handoff: a
+  bot-gas enqueue failure during wrap confirmation is never misclassified as a
+  wrap/deposit failure that would hand a healthy mint off to
+  `UnwrappedEquityRecovery`. `EquityRedemption::SendTokens` is the one call site
+  that swallows the enqueue failure and logs-and-continues instead of retrying,
+  because retrying the send itself would risk sending tokens twice; that gas
+  fact is then permanently lost (see "Known gaps" below). The wrapped/unwrapped
+  equity-recovery aggregates' `DispatchToMint`/`DispatchToRedemption` handoff to
+  a mint/redemption resume is a second such swallowing site: a bot-gas enqueue
+  failure there is folded into the aggregate's normal `RecoveryFailed` event
+  rather than redriven, because `WrappedEquityRecoveryJob` (and, for
+  consistency, its unwrapped twin) has no resume arm for the `Detected` state a
+  redrive would land back on -- redriving would re-send `Detect`, which is
+  rejected as `AlreadyInitialized`, stranding the aggregate non-terminal and
+  permanently blocking rebalancing for the symbol (see "Known gaps" below). This
+  differs from a downstream job's own execution failures, which dead-letter
+  without blocking the caller
 - The recording worker itself treats RPC-shaped receipt/block/valuation outcomes
   as self-healing rather than a genuine failure: a receipt (or its block) not
   yet visible to the RPC endpoint, or an outright RPC error fetching the
@@ -2237,13 +2237,18 @@ Four transfer jobs exist:
 | TransferUsdcToMarketMaking   | USDC   | Convert USD->USDC, withdraw, bridge via CCTP, deposit to vault |
 | TransferUsdcToHedging        | USDC   | Withdraw from vault, bridge via CCTP, deposit USDC to Alpaca   |
 
-Equity-transfer workers dead-letter a job that exhausts its retries: the Jobs
-row is recorded as terminal and retained as the durable ownership record, while
-the worker and conductor continue processing unrelated jobs. On startup, any
-equity-transfer row owns recovery of its aggregate: a non-terminal row is
-requeued, while a terminal row remains dead-lettered instead of being
-resurrected through generic tokenization recovery. A poison mint or redemption
-row therefore cannot put the bot into a process restart loop.
+Transfer workers are best effort. A transfer job that exhausts its retries is
+recorded as terminal and retained as the durable ownership record, and exactly
+one operator alert names the worker and terminal error. The worker and conductor
+remain running and continue processing unrelated jobs, so a poison transfer row
+cannot stop hedging or fill detection or put the bot into a process restart
+loop. Wrapped- and unwrapped-equity recovery jobs follow the same best-effort
+failure policy because they repair individual inventory items rather than
+protecting the bot's core trading loop.
+
+On startup, any equity-transfer row owns recovery of its aggregate: a
+non-terminal row is requeued, while a terminal row remains dead-lettered instead
+of being resurrected through generic tokenization recovery.
 
 The trigger enqueues at most one transfer per scope at a time, guarded both by
 an in-memory in-progress set and by a Jobs-table dedupe (the in-memory guard
@@ -3216,10 +3221,9 @@ over.
 
 A Base->Alpaca transfer job that receives a revert-class CCTP burn error (where
 `CctpError::is_revert()` is true, indicating a pre-submission chain revert with
-no on-chain effect) is reclassified as a safe redrive rather than a
-circuit-breaker trip. The job returns `Ok` and re-enqueues itself with a 15 s
-delay, re-entering the `resume_bridging_submitting` scan-or-reburn path on the
-next pickup.
+no on-chain effect) is reclassified as a safe redrive rather than a dead letter.
+The job returns `Ok` and re-enqueues itself with a 15 s delay, re-entering the
+`resume_bridging_submitting` scan-or-reburn path on the next pickup.
 
 The double-burn safety guarantee is NOT `is_revert()` classification -- it is
 the `resume_bridging_submitting` scan: `find_recent_burn` scans for an existing
@@ -3257,13 +3261,17 @@ misses) so a still-pending tx is never misclassified as dropped.
 **Bound**: Both revert and timeout redrives count against a shared
 `max_burn_revert_redrives` counter persisted in the job payload (durable across
 restarts). Once the bound is reached, the job propagates a
-`BurnRevertLimitReached` error so the circuit opens and the operator is alerted.
-Genuinely ambiguous failures (where the burn may have landed and `is_revert()`
-returns false, e.g. `MessageSentEventNotFound`) are never reclassified and
-always halt for operator review.
+`BurnRevertLimitReached` error through apalis retries. Once the queue row is
+durably terminal, the best-effort worker alerts the operator exactly once and
+continues processing sibling jobs; it does not stop the conductor. Genuinely
+ambiguous failures (where the burn may have landed and `is_revert()` returns
+false, e.g. `MessageSentEventNotFound`) are never reclassified: they follow the
+same durable dead-letter and operator-alert path without automatic redrive.
 
 **Alerting**: An operational alert fires at the warn threshold (`max / 2 + 1`
-redrives), at the limit, and before any terminal non-redriven error propagates.
+redrives) and at the final allowed redrive. Errors that propagate through apalis
+do not alert per attempt; the worker emits one operational alert only after the
+row reaches durable terminality.
 
 ##### Startup re-arm for `BridgingSubmitting` and `WithdrawalSubmitting{BaseToAlpaca}`
 
