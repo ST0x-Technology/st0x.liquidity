@@ -16,5 +16,5 @@ pub(crate) use trigger::drain_pending_jobs;
 pub(crate) use trigger::{
     EquityRebalancingCheck, EquityRebalancingCheckScheduler, RebalancingSchedulers,
     RebalancingService, RebalancingServiceConfig, UsdcRebalancingCheck,
-    UsdcRebalancingCheckScheduler,
+    UsdcRebalancingCheckScheduler, UsdcResumeError,
 };

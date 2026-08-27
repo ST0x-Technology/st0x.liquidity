@@ -230,11 +230,15 @@ so the recovery event dispatches through the in-process inventory reactor (which
 corrects the live inventory view) and shares the bot's resume lock (so it cannot
 race `/transfers/resume` into a double on-chain wrap).
 
-> **Operational guardrail:** like `/transfers/resume`, the `/transfers/recheck`
-> endpoint is currently **unauthenticated** — any caller that can reach
-> `server_port` can recover live transfers and trigger inventory-affecting
-> workflow steps. Until an auth guard is added, the bot's `server_port` **must**
-> be bound to an operator-only/firewalled interface and never exposed publicly.
+> **Operational guardrail:** the whole recovery surface — `/transfers/resume`,
+> `/transfers/recheck/{kind}/{id}`, and
+> `POST /transfers/usdc/resume/{direction}/{id}` — is currently
+> **unauthenticated**. Any caller that can reach `server_port` can recover live
+> transfers, enqueue a USDC resume for a persisted transfer, and trigger
+> inventory-affecting workflow steps; the endpoints' state and single-flight
+> checks do not authenticate the caller. Until an auth guard is added, the bot's
+> `server_port` **must** be bound to an operator-only/firewalled interface and
+> never exposed publicly.
 
 Recoverable cases:
 
@@ -271,11 +275,14 @@ Not covered by `transfer recheck` yet:
   their own recovery commands. A manual `transfer-usdc` prints its transfer id
   and, if interrupted after the burn, is resumed with
   `stox transfer resume --kind usdc --id <id> --direction <to-raindex|to-alpaca>`.
-  The `--direction` must match the original (a mismatch is rejected to avoid
-  mis-driving) and an unknown id is rejected rather than starting a fresh burn;
-  a resume uses the aggregate's persisted amount, so no amount is taken. Run it
-  only when the bot is not concurrently driving that same id, since it drives
-  the aggregate directly rather than through the bot's resume lock.
+  This routes through the RUNNING bot's
+  `POST /transfers/usdc/resume/{direction}/{id}` endpoint: the bot validates (an
+  unknown id is rejected rather than starting a fresh burn; a `--direction`
+  mismatch is rejected to avoid mis-driving; a clean terminal is rejected),
+  applies its single-flight gates, and enqueues the transfer for its own worker
+  to drive with the aggregate's persisted amount. The CLI never drives the
+  aggregate itself, so it cannot race the bot. Requires the bot to be running;
+  when it is down, a restart re-arms resumable transfers automatically.
 - Interrupted equity transfers (mints/redemptions) are resumed in bulk with
   `stox transfer resume --kind equity`, which calls the running bot's
   `/transfers/resume` endpoint (always resumes ALL interrupted transfers, no
@@ -322,11 +329,20 @@ When alerted, first check whether Alpaca connectivity/credentials are intact:
     # To manually re-poll immediately:
     stox transfer resume --kind usdc --id <uuid> --direction to-raindex
 
-This re-polls Alpaca for the recorded transfer and proceeds normally if the
-withdrawal has completed (the common case), or emits `FailWithdrawal` if Alpaca
-reports Failed with no tx hash. If Alpaca reports Failed with a tx hash, polling
-stays inconclusive and the guard remains held. The `--direction` must be
-`to-raindex` for AlpacaToBase.
+**Expected answer while the automatic re-poll is armed**: a 409
+`AlreadyInFlight` refusal that names the in-flight job row. This is the normal
+answer in this alerted condition. The unbounded redrive keeps a live or
+retryable job row for the transfer, and the resume endpoint refuses while such a
+row exists. The 409 confirms the bot is already re-polling; do not re-issue the
+resume. Instead, inspect the named job row and check the withdrawal on the
+Alpaca dashboard. The resume enqueues only when no live row exists (for example,
+after the job's retries are exhausted and the row is terminal `Failed`).
+
+When the resume does enqueue, the bot's worker re-polls Alpaca for the recorded
+transfer and proceeds normally if the withdrawal has completed (the common
+case), or emits `FailWithdrawal` if Alpaca reports Failed with no tx hash. If
+Alpaca reports Failed with a tx hash, polling stays inconclusive and the guard
+remains held. The `--direction` must be `to-raindex` for AlpacaToBase.
 
 **Known limitation -- permanent `TransferNotFound`**: if `transfer resume`
 consistently reports inconclusive and Alpaca's dashboard confirms the withdrawal
@@ -341,22 +357,59 @@ CLI command clears a `Withdrawing` aggregate whose Alpaca UUID is genuinely
 absent; escalate to the on-call engineer for direct recovery after confirming no
 funds moved.
 
+### The USDC single-rebalance guard lifecycle
+
+One in-memory atomic (`usdc_in_progress`) serializes USDC rebalancing: at most
+one transfer moves funds through the shared vault and market-maker wallet at a
+time. Who touches it, and when:
+
+- **Claim**: the automatic trigger claims it before it enqueues a transfer job
+  (RAII: a failed enqueue releases the claim). A manual resume via
+  `POST /transfers/usdc/resume/{direction}/{id}` claims it the same way; when
+  the guard is already latched for the SAME aggregate (boot recovery re-latched
+  it), the resume keeps the latch and enqueues.
+- **Clear (event-driven)**: the trigger reactor clears it when a rebalance
+  reaches a clearable terminal. Guard-holding terminals (post-burn failures, any
+  AlpacaToBase `BridgingFailed`, `DepositFailed`) keep it latched until
+  `transfer reconcile` settles them.
+- **Clear (worker)**: exactly one worker path releases it -- a pre-flight
+  refusal (`WalletUsdcAmbientPreflight` / `PreflightBalanceUnavailable`) emits
+  no aggregate event, so the worker releases through a durable-checked handle
+  that keeps the latch whenever any persisted rebalance still holds the guard.
+- **Restart**: the atomic resets to false; `recover_usdc_guard` re-derives it
+  from durable state (`holds_rebalance_guard`) and re-arms resumable jobs.
+- **Single-flight for manual commands**: the resume endpoint refuses while any
+  live or retryable USDC job row exists (either direction) or while another
+  aggregate durably holds the guard, so an operator command can never run
+  concurrently with the bot's own driving. A terminal `Failed` job row (retries
+  exhausted) does not refuse: re-enqueueing that transfer is the recovery case
+  this command exists for.
+
 ### Clearing a pre-burn guard latch
 
 Use `fail-usdc-transfer` when a USDC rebalance is stranded at
-`WithdrawalComplete` or `BridgingSubmitting` and the guard must be released.
-This transitions the aggregate to `BridgingFailed` (pre-burn,
-`burn_tx_hash: None`), which is non-guard-holding. The rebalancing guard clears
-on the next bot restart.
+`WithdrawalComplete` or `BridgingSubmitting`. This transitions the aggregate to
+`BridgingFailed` (pre-burn, `burn_tx_hash: None`). The guard outcome depends on
+the direction:
+
+- **BaseToAlpaca**: no funds left the source venue, so the failure is
+  non-guard-holding. The rebalancing guard clears on the next bot restart.
+- **AlpacaToBase**: the withdrawal already moved the funds off Alpaca, so the
+  failure KEEPS the guard -- releasing it would let a new transfer misattribute
+  those funds. Settle the funds with `transfer reconcile --kind usdc`, which
+  releases the guard; a restart re-latches it until then.
 
 **Stop the bot before running this command** to eliminate the race where the bot
 advances the transfer to `Bridging` between the preflight and the send.
 
 `WithdrawalComplete` is unconditionally pre-burn: no CCTP burn has been
-broadcast yet. However, the Alpaca->on-chain USDC withdrawal has already
-completed, so the USDC is sitting in the market-maker wallet. After clearing the
-guard with this command, reconcile or handle those funds separately as needed.
-The command is safe to run once the bot is stopped.
+broadcast yet, but the source withdrawal has completed in either direction. The
+guard outcome follows the direction split above. For AlpacaToBase the USDC left
+Alpaca and is expected in the market-maker wallet: the command does NOT release
+the guard -- settle the funds with `transfer reconcile --kind usdc`. For
+BaseToAlpaca the funds moved out of the Raindex vault but stayed on the
+market-making side: the failure reconciles to source and the guard clears on the
+next restart. The command is safe to run once the bot is stopped.
 
 `BridgingSubmitting` is NOT unconditionally safe. A crash at this state may have
 already broadcast a CCTP burn whose `BridgingInitiated` event never persisted.
@@ -364,7 +417,9 @@ Before running this command on a `BridgingSubmitting` transfer, verify on-chain
 that no recent CCTP burn was submitted from the market-maker wallet (e.g. via
 `cast` against the Circle CCTP contract or by inspecting recent wallet txs).
 
-- **If no burn is found**: run `fail-usdc-transfer` to clear the guard.
+- **If no burn is found**: run `fail-usdc-transfer`. For BaseToAlpaca the guard
+  then clears on restart; for AlpacaToBase it stays held until
+  `transfer reconcile --kind usdc` settles the withdrawn funds.
 - **If a burn IS found** while the aggregate is still `BridgingSubmitting`: do
   NOT run `fail-usdc-transfer` (strands the burned funds) and do NOT run
   `transfer reconcile` (its preflight rejects `BridgingSubmitting` -- it only

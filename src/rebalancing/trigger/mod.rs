@@ -64,7 +64,7 @@ use crate::unwrapped_equity_recovery::{
 };
 use crate::usdc_rebalance::{
     InterruptedUsdcRebalances, RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent,
-    UsdcRebalanceId, interrupted_usdc_rebalance_ids,
+    UsdcRebalanceId, any_rebalance_holds_guard, interrupted_usdc_rebalance_ids,
 };
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
@@ -140,6 +140,62 @@ pub(crate) enum RebalancingServiceError {
     ApalisSqlx(#[from] sqlx_apalis::Error),
     #[error("failed to re-arm a stranded USDC transfer job at startup: {0}")]
     RearmEnqueue(#[from] QueuePushError),
+}
+
+/// Why a manual USDC resume (`transfer resume --kind usdc`, routed through
+/// the bot) could not be enqueued. Distinguishes operator-actionable
+/// refusals (unknown id, direction mismatch, already terminal), single-flight
+/// conflicts (another transfer in flight, another guard holder), and
+/// transient infrastructure failures, mirroring the recoverability split the
+/// API maps onto HTTP statuses for `UsdcRecheckError`.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum UsdcResumeError {
+    #[error(
+        "no USDC rebalance found for {0}; refusing to start a new burn -- \
+         check the id and the database"
+    )]
+    NotFound(UsdcRebalanceId),
+    #[error(
+        "direction mismatch for {id}: the persisted transfer is {persisted:?}; \
+         refusing to mis-drive it"
+    )]
+    DirectionMismatch {
+        id: UsdcRebalanceId,
+        persisted: RebalanceDirection,
+    },
+    #[error("rebalance {id} is already terminal ({state}); nothing to resume")]
+    AlreadyTerminal {
+        id: UsdcRebalanceId,
+        state: &'static str,
+    },
+    #[error(
+        "another USDC transfer is already in flight (job row {row_id}, \
+         {age_secs}s old); the worker drives it -- wait or investigate that job"
+    )]
+    AlreadyInFlight { row_id: String, age_secs: i64 },
+    #[error(
+        "another persisted USDC rebalance still holds the single-rebalance \
+         guard; reconcile or resume that one first"
+    )]
+    GuardHeldElsewhere,
+    #[error("USDC rebalancing stores are not wired yet (conductor still starting)")]
+    NotReady,
+    #[error("aggregate error: {0}")]
+    Aggregate(#[source] Box<st0x_event_sorcery::SendError<UsdcRebalance>>),
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+    #[error(transparent)]
+    ApalisDatabase(#[from] sqlx_apalis::Error),
+    #[error("failed to enqueue the resume job: {0}")]
+    Queue(#[from] QueuePushError),
+}
+
+/// Builds the manual-resume idempotency key: the transfer id plus its
+/// row-count generation (how many job rows the id has ever had). One
+/// definition shared by `resume_usdc_transfer` and its tests, so the dedupe
+/// contract cannot drift between production and assertion.
+fn resume_idempotency_key(id: &UsdcRebalanceId, existing_rows: i64) -> String {
+    format!("usdc-resume:{id}:{existing_rows}")
 }
 
 /// Why loading a token address from the vault registry failed.
@@ -3463,6 +3519,180 @@ impl RebalancingService {
                 );
                 false
             }
+        }
+    }
+
+    /// Enqueues a manual resume of an existing USDC rebalance for the apalis
+    /// worker to drive, sharing the bot's single-flight gates so the resume
+    /// cannot race the bot's own driving (the CLI-vs-server race): the
+    /// direction-independent job-row dedupe (terminal `Failed` rows are NOT
+    /// counted -- re-enqueueing them is the recovery case), the durable
+    /// guard-holder scan (another aggregate's latch refuses; this id's own
+    /// latch is fine), and the in-memory `usdc_in_progress` claim. The
+    /// worker's `resume_*` dispatch owns all deeper state handling and uses
+    /// the aggregate's persisted amount, so no financial value is fabricated
+    /// here.
+    pub(crate) async fn resume_usdc_transfer(
+        &self,
+        pool: &SqlitePool,
+        id: &UsdcRebalanceId,
+        direction: RebalanceDirection,
+    ) -> Result<(), UsdcResumeError> {
+        let store = self.usdc_store.read().await.as_ref().map(Arc::clone);
+        let Some(store) = store else {
+            warn!(
+                target: "rebalance",
+                %id,
+                "Manual USDC resume refused: stores not wired yet"
+            );
+            return Err(UsdcResumeError::NotReady);
+        };
+
+        // An unknown id must refuse: the worker treats a `None`-state id as a
+        // fresh transfer and would burn a brand-new one -- a fund-moving
+        // foot-gun for a mistyped operator id.
+        let Some(state) = store
+            .load(id)
+            .await
+            .map_err(|error| UsdcResumeError::Aggregate(Box::new(error)))?
+        else {
+            return Err(UsdcResumeError::NotFound(id.clone()));
+        };
+
+        if state.direction() != direction {
+            return Err(UsdcResumeError::DirectionMismatch {
+                id: id.clone(),
+                persisted: state.direction(),
+            });
+        }
+
+        // Clean terminals have nothing to resume; refusing here beats
+        // enqueueing a job that immediately errors. Exhaustive so a new
+        // variant forces a conscious classification.
+        let clean_terminal = match &state {
+            UsdcRebalance::ConversionComplete {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            }
+            | UsdcRebalance::DepositConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            }
+            | UsdcRebalance::Reconciled { .. } => true,
+            UsdcRebalance::Converting { .. }
+            | UsdcRebalance::ConversionComplete { .. }
+            | UsdcRebalance::ConversionFailed { .. }
+            | UsdcRebalance::WithdrawalSubmitting { .. }
+            | UsdcRebalance::Withdrawing { .. }
+            | UsdcRebalance::WithdrawalComplete { .. }
+            | UsdcRebalance::WithdrawalFailed { .. }
+            | UsdcRebalance::BridgingSubmitting { .. }
+            | UsdcRebalance::Bridging { .. }
+            | UsdcRebalance::AwaitingAttestation { .. }
+            | UsdcRebalance::Attested { .. }
+            | UsdcRebalance::Bridged { .. }
+            | UsdcRebalance::BridgingFailed { .. }
+            | UsdcRebalance::DepositInitiated { .. }
+            | UsdcRebalance::DepositConfirmed { .. }
+            | UsdcRebalance::DepositFailed { .. } => false,
+        };
+        if clean_terminal {
+            return Err(UsdcResumeError::AlreadyTerminal {
+                id: id.clone(),
+                state: state.state_name(),
+            });
+        }
+
+        // Single-flight gate 1: any live or retryable USDC transfer job row,
+        // in either direction, blocks a manual resume (both directions move
+        // funds through the same vault and wallet). Terminal rows do not.
+        let queue_pool = self.transfer_usdc_to_market_making_queue.pool();
+        if let Some((row_id, age_secs)) =
+            Self::in_flight_usdc_transfer(queue_pool, Some(&store)).await?
+        {
+            return Err(UsdcResumeError::AlreadyInFlight { row_id, age_secs });
+        }
+
+        // Single-flight gate 2: another persisted rebalance still holding the
+        // durable guard refuses; this id's OWN latch (boot recovery re-latched
+        // it) is precisely what the operator is here to resolve.
+        if any_rebalance_holds_guard(pool, &store, Some(id)).await? {
+            return Err(UsdcResumeError::GuardHeldElsewhere);
+        }
+
+        // Claim the in-memory guard when it is free; when it is already
+        // latched, gate 2 proved no other durable holder, so the latch is this
+        // id's own (or a racing trigger claim, which the job-row dedupe
+        // resolves) and stays held for the worker's outcome to settle.
+        let claim = self.try_claim_usdc_guard();
+
+        // Single-flight for concurrent duplicate resumes: two racing calls
+        // for the same id can pass the read gates together (and a failed
+        // in-memory claim deliberately does not refuse), so the enqueue
+        // itself must dedupe. The idempotency key includes the count of rows
+        // this id has ever had: concurrent duplicates read the same count
+        // and collapse to one row, while a later resume after a terminal row
+        // sees a higher count and enqueues fresh.
+        let existing_rows: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs \
+             WHERE job_type IN (?, ?) AND json_extract(job, '$.id') = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .bind(id.to_string())
+        .fetch_one(queue_pool)
+        .await?;
+        let idempotency_key = resume_idempotency_key(id, existing_rows);
+
+        let amount = state.amount();
+        let push = match direction {
+            RebalanceDirection::AlpacaToBase => {
+                self.transfer_usdc_to_market_making_queue
+                    .clone()
+                    .push_idempotent(
+                        &idempotency_key,
+                        TransferUsdcToMarketMaking {
+                            id: id.clone(),
+                            amount,
+                            revert_redrive_attempts: 0,
+                            backpressure_streak: BackpressureStreak::default(),
+                        },
+                    )
+                    .await
+            }
+            RebalanceDirection::BaseToAlpaca => {
+                self.transfer_usdc_to_hedging_queue
+                    .clone()
+                    .push_idempotent(
+                        &idempotency_key,
+                        TransferUsdcToHedging {
+                            id: id.clone(),
+                            amount,
+                            revert_redrive_attempts: 0,
+                            backpressure_streak: BackpressureStreak::default(),
+                        },
+                    )
+                    .await
+            }
+        };
+
+        match push {
+            Ok(()) => {
+                if let Some(claim) = claim {
+                    claim.defuse();
+                }
+                info!(
+                    target: "rebalance",
+                    %id,
+                    ?direction,
+                    %amount,
+                    "Enqueued manual USDC resume for the transfer worker"
+                );
+                Ok(())
+            }
+            // A dropped `claim` releases a guard this call claimed; a
+            // pre-existing latch stays held.
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -11019,6 +11249,473 @@ mod tests {
         // The withdrawal reserved 399 from Hedging available into inflight;
         // preserving must NOT credit it back.
         assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(501), usdc(399)).await;
+    }
+
+    /// Builds a trigger wired to a seeded USDC store for the manual-resume
+    /// tests, returning the trigger and the cqrs pool the store lives on.
+    async fn make_resume_trigger() -> (
+        Arc<RebalancingService>,
+        sqlx::SqlitePool,
+        Arc<Store<UsdcRebalance>>,
+    ) {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let trigger =
+            make_trigger_with_inventory(InventoryView::default().with_usdc(usdc(500), usdc(900)))
+                .await;
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                store.clone(),
+            )
+            .await;
+        (trigger, pool, store)
+    }
+
+    /// Seeds an AlpacaToBase aggregate at `Converting` (its first mid-flight
+    /// state) and returns the id.
+    async fn seed_converting_alpaca_to_base(store: &Store<UsdcRebalance>) -> UsdcRebalanceId {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: usdc(400),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn market_making_job_rows(trigger: &RebalancingService) -> Vec<(String, Vec<u8>)> {
+        sqlx_apalis::query_as("SELECT status, job FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+            .fetch_all(trigger.transfer_usdc_to_market_making_queue.pool())
+            .await
+            .unwrap()
+    }
+
+    /// The fund-safety core of the manual resume: an unknown id must refuse,
+    /// never fall through to the worker's `None`-state fresh-burn path.
+    #[tokio::test]
+    async fn manual_resume_rejects_unknown_id() {
+        let (trigger, pool, _store) = make_resume_trigger().await;
+        let unknown = UsdcRebalanceId(Uuid::new_v4());
+
+        let error = trigger
+            .resume_usdc_transfer(&pool, &unknown, RebalanceDirection::AlpacaToBase)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::NotFound(ref id) if *id == unknown),
+            "an unknown id must refuse (fresh-burn foot-gun); got: {error:?}"
+        );
+        assert!(
+            market_making_job_rows(&trigger).await.is_empty(),
+            "a refused resume must not enqueue anything"
+        );
+    }
+
+    /// A `--direction` disagreeing with the persisted transfer must refuse
+    /// rather than mis-drive the opposite-direction resume path.
+    #[tokio::test]
+    async fn manual_resume_rejects_direction_mismatch() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = seed_converting_alpaca_to_base(&store).await;
+
+        let error = trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::BaseToAlpaca)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcResumeError::DirectionMismatch {
+                    persisted: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "a direction mismatch must refuse; got: {error:?}"
+        );
+    }
+
+    /// A clean terminal has nothing to resume; refusing beats enqueueing a
+    /// job that immediately errors.
+    #[tokio::test]
+    async fn manual_resume_rejects_reconciled_terminal() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000021");
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: usdc(400),
+                withdrawal: TransferRef::OnchainTx(burn_tx),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::InitiateBridging { burn_tx },
+            UsdcRebalanceCommand::FailBridging {
+                reason: "x".to_string(),
+            },
+            UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+
+        let error = trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::BaseToAlpaca)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcResumeError::AlreadyTerminal {
+                    state: "Reconciled",
+                    ..
+                }
+            ),
+            "a reconciled terminal must refuse; got: {error:?}"
+        );
+    }
+
+    /// Single-flight gate: a live transfer job row in EITHER direction blocks
+    /// a manual resume -- both directions move funds through the same vault
+    /// and wallet.
+    #[tokio::test]
+    async fn manual_resume_rejects_when_transfer_job_in_flight() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = seed_converting_alpaca_to_base(&store).await;
+
+        // A live row for a DIFFERENT id in the opposite direction.
+        trigger
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: usdc(50),
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        let error = trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::AlreadyInFlight { .. }),
+            "a live job row in either direction must refuse; got: {error:?}"
+        );
+    }
+
+    /// Single-flight gate: another persisted rebalance still holding the
+    /// durable guard refuses the resume; only the requested id's own latch is
+    /// exempt.
+    #[tokio::test]
+    async fn manual_resume_rejects_when_another_rebalance_holds_guard() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = seed_converting_alpaca_to_base(&store).await;
+
+        // A different aggregate in a guard-holding terminal (post-burn
+        // BridgingFailed).
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000022");
+        let other = UsdcRebalanceId(Uuid::new_v4());
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: usdc(400),
+                withdrawal: TransferRef::OnchainTx(burn_tx),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::InitiateBridging { burn_tx },
+            UsdcRebalanceCommand::FailBridging {
+                reason: "x".to_string(),
+            },
+        ] {
+            store.send(&other, command).await.unwrap();
+        }
+
+        let error = trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::GuardHeldElsewhere),
+            "another durable guard holder must refuse; got: {error:?}"
+        );
+    }
+
+    /// Happy path: the resume enqueues a job keyed by the EXISTING id with
+    /// the aggregate's persisted amount, and latches the in-memory guard.
+    #[tokio::test]
+    async fn manual_resume_enqueues_job_for_existing_id_and_latches_guard() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = seed_converting_alpaca_to_base(&store).await;
+
+        assert!(!trigger.usdc_in_progress.load(Ordering::SeqCst));
+
+        trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "the resume must latch the single-rebalance guard"
+        );
+        let rows = market_making_job_rows(&trigger).await;
+        assert_eq!(rows.len(), 1, "exactly one job row must be enqueued");
+        let job: TransferUsdcToMarketMaking = serde_json::from_slice(&rows[0].1).unwrap();
+        assert_eq!(
+            job.id, id,
+            "the job must resume the EXISTING id, never mint a new one"
+        );
+        assert_eq!(
+            job.amount,
+            usdc(400),
+            "the amount must come from the persisted aggregate"
+        );
+    }
+
+    /// A terminal `Failed` row (retries exhausted) must NOT block the resume:
+    /// re-enqueueing it is the recovery case the command exists for.
+    #[tokio::test]
+    async fn manual_resume_reenqueues_after_terminal_failed_row() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = seed_converting_alpaca_to_base(&store).await;
+
+        trigger
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                id: id.clone(),
+                amount: usdc(400),
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', attempts = max_attempts WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .execute(trigger.transfer_usdc_to_market_making_queue.pool())
+        .await
+        .unwrap();
+
+        trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
+            .await
+            .unwrap();
+
+        let rows = market_making_job_rows(&trigger).await;
+        let pending = rows
+            .iter()
+            .filter(|(status, _)| status == "Pending")
+            .count();
+        assert_eq!(
+            pending, 1,
+            "a fresh Pending row must exist alongside the terminal Failed one"
+        );
+    }
+
+    /// The `BaseToAlpaca` routing arm: a resume of a mid-flight BaseToAlpaca
+    /// aggregate must enqueue exactly one `TransferUsdcToHedging` job with
+    /// the persisted id and amount, and nothing on the market-making queue.
+    #[tokio::test]
+    async fn manual_resume_routes_base_to_alpaca_to_the_hedging_queue() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(400),
+                    withdrawal: TransferRef::OnchainTx(fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000033"
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::BaseToAlpaca)
+            .await
+            .unwrap();
+
+        let hedging_rows: Vec<(String, Vec<u8>)> =
+            sqlx_apalis::query_as("SELECT status, job FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<TransferUsdcToHedging>())
+                .fetch_all(trigger.transfer_usdc_to_hedging_queue.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            hedging_rows.len(),
+            1,
+            "exactly one hedging job row must be enqueued"
+        );
+        let job: TransferUsdcToHedging = serde_json::from_slice(&hedging_rows[0].1).unwrap();
+        assert_eq!(job.id, id, "the job must resume the EXISTING id");
+        assert_eq!(
+            job.amount,
+            usdc(400),
+            "the amount must come from the persisted aggregate"
+        );
+        assert!(
+            market_making_job_rows(&trigger).await.is_empty(),
+            "a BaseToAlpaca resume must not touch the market-making queue"
+        );
+    }
+
+    /// Concurrent duplicate resumes collapse to one row: the enqueue is
+    /// keyed on the id plus its row-count generation, so a second push with
+    /// the same generation cannot create a second job for the same transfer
+    /// even though the read gates raced.
+    #[tokio::test]
+    async fn manual_resume_enqueue_is_idempotent_within_a_generation() {
+        let (trigger, _pool, store) = make_resume_trigger().await;
+        let id = seed_converting_alpaca_to_base(&store).await;
+
+        // Simulate the race directly at the enqueue: both racing calls read
+        // the same row count (zero) and therefore build the same key.
+        for _ in 0..2 {
+            trigger
+                .transfer_usdc_to_market_making_queue
+                .clone()
+                .push_idempotent(
+                    &resume_idempotency_key(&id, 0),
+                    TransferUsdcToMarketMaking {
+                        id: id.clone(),
+                        amount: usdc(400),
+                        revert_redrive_attempts: 0,
+                        backpressure_streak: BackpressureStreak::default(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let rows = market_making_job_rows(&trigger).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "a duplicate enqueue with the same generation key must collapse \
+             to one job row"
+        );
+    }
+
+    /// Before the conductor wires the stores, a manual resume must refuse
+    /// with `NotReady` rather than treating the missing store as an unknown
+    /// id or panicking.
+    #[tokio::test]
+    async fn manual_resume_refuses_before_stores_wired() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let error = trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::NotReady),
+            "an unwired store must refuse NotReady; got: {error:?}"
+        );
+    }
+
+    /// Installs a SQLite trigger that aborts every INSERT of the
+    /// market-making transfer job, so the resume's enqueue fails while the
+    /// SELECT-based single-flight gates before it still work.
+    async fn force_market_making_push_failure(trigger: &RebalancingService) {
+        let ddl = format!(
+            "CREATE TRIGGER fail_mm_push BEFORE INSERT ON Jobs \
+             WHEN NEW.job_type = '{}' \
+             BEGIN SELECT RAISE(ABORT, 'forced push failure'); END",
+            std::any::type_name::<TransferUsdcToMarketMaking>()
+        );
+        sqlx_apalis::query(&ddl)
+            .execute(trigger.transfer_usdc_to_market_making_queue.pool())
+            .await
+            .unwrap();
+    }
+
+    /// A guard claim taken BY the resume call must be released when the
+    /// enqueue fails: nothing was enqueued, so a kept latch would wedge the
+    /// trigger with no job and no aggregate progress to ever clear it.
+    #[tokio::test]
+    async fn manual_resume_releases_claimed_guard_when_enqueue_fails() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = seed_converting_alpaca_to_base(&store).await;
+        force_market_making_push_failure(&trigger).await;
+
+        assert!(!trigger.usdc_in_progress.load(Ordering::SeqCst));
+
+        let error = trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::Queue(_)),
+            "the failed enqueue must surface; got: {error:?}"
+        );
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "a claim taken by the failed resume must be released"
+        );
+    }
+
+    /// A PRE-EXISTING latch (boot recovery re-latched it for this id) must
+    /// stay held when the enqueue fails: the latch belongs to the aggregate,
+    /// not to this call, and releasing it would drop a fail-closed guard.
+    #[tokio::test]
+    async fn manual_resume_keeps_preexisting_latch_when_enqueue_fails() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = seed_converting_alpaca_to_base(&store).await;
+        force_market_making_push_failure(&trigger).await;
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        let error = trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::Queue(_)),
+            "the failed enqueue must surface; got: {error:?}"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "a pre-existing latch must stay held across a failed enqueue"
+        );
     }
 
     #[tokio::test]
