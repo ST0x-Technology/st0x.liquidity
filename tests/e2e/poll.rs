@@ -522,6 +522,56 @@ pub async fn poll_for_running_job(
     }
 }
 
+/// Polls until the conductor's first `CheckPositions` tick completes
+/// (a `Done` row in the apalis `Jobs` table), panicking if the bot dies
+/// or the timeout passes first.
+///
+/// The worker loops only start after the whole boot sequence -- view
+/// rebuilds, startup approvals, rebalancing infrastructure (including
+/// its broker calls) -- so a completed tick proves boot has finished.
+/// Chaos tests must wait for this before they break infrastructure the
+/// boot path depends on (broker connectivity, the DB write lock);
+/// breaking it on a timer races the boot sequence instead of testing
+/// the steady state.
+pub async fn poll_for_conductor_ready(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+) {
+    let connect_opts = SqliteConnectOptions::new().filename(db_path);
+    let timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = "conductor readiness (first completed CheckPositions tick)";
+
+    loop {
+        sleep_or_crash(bot, context).await;
+
+        let Ok(pool) = SqlitePool::connect_with(connect_opts.clone()).await else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (database not ready)",
+            );
+            continue;
+        };
+
+        let done: Result<(i64,), _> =
+            sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Done'")
+                .bind(st0x_hedge::check_positions_job_type())
+                .fetch_one(&pool)
+                .await;
+
+        pool.close().await;
+
+        if matches!(done, Ok((count,)) if count >= 1) {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context}",
+        );
+    }
+}
+
 /// Polls until the backfill checkpoint has advanced to at least
 /// `block`, panicking if the bot dies or the timeout passes first. Once
 /// the checkpoint passes a fill's block, the fill's accounting job row
