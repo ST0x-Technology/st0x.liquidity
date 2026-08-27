@@ -143,7 +143,7 @@ impl AlpacaBrokerApiMode {
 ///
 /// `Basic` is the legacy stored key/secret pair. `KmsJwt` is keyless:
 /// bearer tokens bought with client assertions signed by a
-/// non-extractable Cloud KMS key (see [`super::kms_jwt`]). Untagged so
+/// non-extractable Cloud KMS key (see [`crate::AuthRuntime`]). Untagged so
 /// the flattened `[broker]` TOML stays field-shaped: the field names
 /// alone pick the variant.
 #[derive(Clone, Deserialize)]
