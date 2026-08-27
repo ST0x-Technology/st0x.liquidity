@@ -1,5 +1,5 @@
 //! Solidity contract ABI bindings for the raindex orderbook and related
-//! rainlang contracts. Shared EVM primitives (`IERC20`, `IPyth`) live in
+//! rainlang contracts. Shared EVM primitives such as `IERC20` live in
 //! `st0x-evm`.
 
 use alloy::sol;

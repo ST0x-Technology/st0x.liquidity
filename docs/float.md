@@ -85,7 +85,7 @@ let negated = (-a)?;
 | `Usdc` (threshold)  | `Usdc(Decimal)`             | `Usdc(Float)`             |
 | `Usdc` (onchain/io) | `Usdc(Decimal)`             | `Usdc(Float)`             |
 | `Usd`               | `Usd(Decimal)`              | `Usd(Float)`              |
-| Pyth prices         | `Decimal`                   | `Float`                   |
+| Oracle prices       | `Decimal`                   | `Float`                   |
 | Inventory balances  | `Decimal`                   | `Float`                   |
 | Position events     | `Decimal`                   | `Float`                   |
 | Dashboard DTOs      | `Decimal`                   | `Float`                   |

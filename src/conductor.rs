@@ -1321,7 +1321,7 @@ async fn setup_pnl_ledger(ledger: Arc<PnlLedger>) -> anyhow::Result<Arc<PnlLedge
     Ok(Arc::new(PnlLedgerReactor::new(ledger)))
 }
 
-/// Builds the bot-gas cost-recording wiring (ADR 0017): the event store, the
+/// Builds the bot-gas cost-recording wiring (ADR 0020): the event store, the
 /// job queue, and the ctx. The store and queue are constructed
 /// unconditionally because doing so is cheap and has no side effects,
 /// regardless of trading mode; only the ctx is conditional (see
@@ -1346,7 +1346,7 @@ async fn setup_bot_gas_receipt_cost(
 }
 
 /// Builds the [`RecordBotGasReceiptCostCtx`] whenever `[bot_gas_valuation]` is
-/// configured (ADR 0017), independent of trading mode -- `[bot_gas_valuation]`
+/// configured (ADR 0020), independent of trading mode -- `[bot_gas_valuation]`
 /// is mandatory when `[rebalancing]` is configured and optional otherwise, so
 /// this also returns `Some` in Standalone mode if the operator opted in. The
 /// worker is registered either way; in Standalone mode nothing enqueues to it
@@ -1376,8 +1376,7 @@ fn build_record_bot_gas_receipt_cost_ctx(
     Ok(Some(Arc::new(RecordBotGasReceiptCostCtx {
         base_wallet: wallet_ctx.base_wallet().clone(),
         ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
-        pyth_contract: bot_gas_valuation.pyth_contract,
-        eth_usd_feed_id: bot_gas_valuation.eth_usd_feed_id,
+        chainlink_feed: bot_gas_valuation.chainlink_feed,
         ledger: BotGasCostLedger::new(bot_gas_receipt_cost_store),
         job_queue,
     })))
@@ -3191,8 +3190,7 @@ pub(crate) async fn execute_witness_trade(
             Ok(true)
         }
         // A Witness command on an existing aggregate can only be rejected with
-        // AlreadyFilled (AlreadyEnriched is only ever produced by an Enrich
-        // command), so that is the one duplicate-skip case here.
+        // AlreadyFilled, so that is the one duplicate-skip case here.
         Err(AggregateError::UserError(LifecycleError::Apply(OnChainTradeError::AlreadyFilled))) => {
             warn!(
                 tx_hash = ?trade.tx_hash,
@@ -3236,54 +3234,6 @@ async fn execute_attribute_trade_source(
             Ok(())
         }
         Err(error) => Err(error),
-    }
-}
-
-pub(crate) async fn execute_enrich_trade(
-    onchain_trade: &Store<OnChainTrade>,
-    trade: &OnchainTrade,
-) {
-    let (Some(gas_used), Some(effective_gas_price), Some(pyth_price)) = (
-        trade.gas_used,
-        trade.effective_gas_price,
-        trade.pyth_price.clone(),
-    ) else {
-        warn!(
-            tx_hash = ?trade.tx_hash,
-            log_index = trade.log_index,
-            symbol = %trade.symbol,
-            gas_used = ?trade.gas_used,
-            effective_gas_price = ?trade.effective_gas_price,
-            pyth_price = ?trade.pyth_price,
-            "Cannot enrich trade: missing gas_used, effective_gas_price, or pyth_price"
-        );
-        return;
-    };
-
-    let trade_id = OnChainTradeId {
-        tx_hash: trade.tx_hash,
-        log_index: trade.log_index,
-    };
-
-    let command = OnChainTradeCommand::Enrich {
-        gas_used,
-        effective_gas_price,
-        pyth_price,
-    };
-
-    match onchain_trade.send(&trade_id, command).await {
-        Ok(()) => debug!(
-            tx_hash = ?trade.tx_hash,
-            log_index = trade.log_index,
-            symbol = %trade.symbol,
-            "Successfully executed OnChainTrade::Enrich command"
-        ),
-        Err(error) => error!(
-            tx_hash = ?trade.tx_hash,
-            log_index = trade.log_index,
-            symbol = %trade.symbol,
-            "Failed to execute OnChainTrade::Enrich command: {error}"
-        ),
     }
 }
 
@@ -3504,32 +3454,23 @@ pub(crate) async fn account_for_onchain_fill(
                 symbol = %trade.symbol,
                 "Trade witnessed but not acknowledged; resuming fill accounting"
             );
-
-            if !state.is_enriched() {
-                execute_enrich_trade(onchain_trade, trade).await;
-            }
         }
         Ok(None) => {
             let witnessed =
                 execute_witness_trade(onchain_trade, trade, block_number, block_timestamp).await?;
 
-            if witnessed {
-                execute_enrich_trade(onchain_trade, trade).await;
-            } else {
+            if !witnessed {
                 match onchain_trade.load(&trade_id).await? {
                     Some(reloaded) if reloaded.is_acknowledged() => {
                         execute_settle_fill(position, trade).await?;
                         return Ok(FillAccountingOutcome::AlreadyAcknowledged);
                     }
-                    Some(reloaded) => {
+                    Some(_) => {
                         info!(
                             ?trade_id,
                             symbol = %trade.symbol,
                             "Concurrent witness detected; resuming fill accounting"
                         );
-                        if !reloaded.is_enriched() {
-                            execute_enrich_trade(onchain_trade, trade).await;
-                        }
                     }
                     None => {
                         return Err(TradeAccountingError::InconsistentOnChainTradeState {
@@ -5900,7 +5841,6 @@ mod tests {
                 EquityAssetConfig {
                     tokenized_equity: alloy::primitives::Address::ZERO,
                     tokenized_equity_derivative: alloy::primitives::Address::ZERO,
-                    pyth_feed_id: None,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Disabled,
                     rebalancing: OperationMode::Enabled,
@@ -6415,7 +6355,6 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: aapl_token,
                 tokenized_equity_derivative: Address::random(),
-                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
@@ -6429,7 +6368,6 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: tsla_token,
                 tokenized_equity_derivative: Address::random(),
-                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
@@ -6443,7 +6381,6 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: spym_token,
                 tokenized_equity_derivative: Address::random(),
-                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
@@ -6457,7 +6394,6 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: coin_token,
                 tokenized_equity_derivative: Address::random(),
-                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
@@ -6513,7 +6449,6 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: aapl_wrapped_token,
-                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
@@ -6527,7 +6462,6 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: tsla_wrapped_token,
-                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
@@ -6541,7 +6475,6 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: spym_wrapped_token,
-                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
@@ -6555,7 +6488,6 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: coin_wrapped_token,
-                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
@@ -7117,7 +7049,6 @@ mod tests {
                     EquityAssetConfig {
                         tokenized_equity: Address::ZERO,
                         tokenized_equity_derivative: Address::ZERO,
-                        pyth_feed_id: None,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Enabled,
                         rebalancing: OperationMode::Disabled,
@@ -7593,14 +7524,10 @@ mod tests {
         );
     }
 
-    /// A crash in the witness->enrich window must not leave the fill
-    /// permanently un-enriched. The resume path enriches before
-    /// acknowledging when the trade carries enrichment data, so the
-    /// recovered trade ends up both enriched and acknowledged -- enrichment
-    /// stays best-effort (ADR 0005) but the resume path must not skip it
-    /// when the data is present.
+    /// A crash after witnessing a trade must resume accounting and
+    /// acknowledgement without producing the retired enrichment event.
     #[tokio::test]
-    async fn resume_path_enriches_trade_unenriched_at_crash() {
+    async fn resume_path_acknowledges_trade_without_enrichment() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
@@ -7611,18 +7538,11 @@ mod tests {
         );
 
         let trade_event = make_trade_event(60);
-        let pyth_price = crate::onchain_trade::PythPrice {
-            value: "150250000".to_string(),
-            expo: -6,
-            conf: "50000".to_string(),
-            publish_time: chrono::Utc::now(),
-        };
         let trade = OnchainTradeBuilder::default()
             .with_symbol("wtAAPL")
             .with_equity_token(TEST_EQUITY_TOKEN)
             .with_amount(float!("1.5"))
             .with_log_index(60)
-            .with_enrichment(50000, 1_000_000_000, pyth_price)
             .build();
         let block_timestamp = trade
             .block_timestamp
@@ -7648,10 +7568,7 @@ mod tests {
             .await
             .unwrap()
             .expect("witnessed aggregate exists");
-        assert!(
-            !witnessed_state.is_enriched(),
-            "premise: the crash left the trade un-enriched"
-        );
+        assert!(witnessed_state.enrichment.is_none());
 
         process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
             .await
@@ -7663,10 +7580,7 @@ mod tests {
             .await
             .unwrap()
             .expect("the aggregate exists after recovery");
-        assert!(
-            recovered.is_enriched(),
-            "the resume path must enrich a trade that crashed before enrichment"
-        );
+        assert!(recovered.enrichment.is_none());
         assert!(
             recovered.is_acknowledged(),
             "the resume path must still acknowledge the recovered fill"
@@ -8721,7 +8635,6 @@ mod tests {
                         EquityAssetConfig {
                             tokenized_equity: Address::ZERO,
                             tokenized_equity_derivative: Address::ZERO,
-                            pyth_feed_id: None,
                             vault_ids: Vec::new(),
                             trading: OperationMode::Enabled,
                             rebalancing: OperationMode::Disabled,
@@ -10772,59 +10685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrichment_fields_present_emits_enrich_event() {
-        let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
-            &frameworks,
-            &pool,
-            ExecutionThreshold::whole_share(),
-            &apalis_pool,
-        );
-
-        let trade_event = make_trade_event(50);
-
-        let pyth_price = crate::onchain_trade::PythPrice {
-            value: "150250000".to_string(),
-            expo: -6,
-            conf: "50000".to_string(),
-            publish_time: chrono::Utc::now(),
-        };
-
-        let trade = OnchainTradeBuilder::default()
-            .with_symbol("wtAAPL")
-            .with_equity_token(TEST_EQUITY_TOKEN)
-            .with_amount(float!("1.5"))
-            .with_log_index(50)
-            .with_enrichment(50000, 1_000_000_000, pyth_price)
-            .build();
-
-        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
-            .await
-            .unwrap();
-
-        let trade_id = OnChainTradeId {
-            tx_hash: fixed_bytes!(
-                "0x1111111111111111111111111111111111111111111111111111111111111111"
-            ),
-            log_index: 50,
-        };
-
-        let onchain_trade = cqrs
-            .onchain_trade
-            .load(&trade_id)
-            .await
-            .unwrap()
-            .expect("OnChainTrade should exist after processing");
-
-        assert!(
-            onchain_trade.enrichment.is_some(),
-            "Expected enrichment to be present when enrichment fields were provided"
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_enrichment_fields_skips_enrich_event() {
+    async fn trade_processing_does_not_emit_retired_enrichment_event() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let cqrs = trade_processing_cqrs_with_threshold(
@@ -10858,7 +10719,7 @@ mod tests {
 
         assert!(
             onchain_trade.enrichment.is_none(),
-            "Should not have enrichment when enrichment fields were None"
+            "current trade processing must not append legacy enrichment events"
         );
     }
 
@@ -13566,10 +13427,7 @@ mod tests {
 
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.bot_gas_valuation = Some(BotGasValuationConfig {
-            pyth_contract: address!("0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a"),
-            eth_usd_feed_id: b256!(
-                "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"
-            ),
+            chainlink_feed: address!("0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"),
         });
 
         let store = StoreBuilder::<BotGasReceiptCost>::new(pool.clone())
@@ -13587,7 +13445,7 @@ mod tests {
     }
 
     /// When both `[bot_gas_valuation]` and `[wallet]` are configured, the ctx
-    /// must be built and must thread `pyth_contract`/`eth_usd_feed_id` through
+    /// must be built and must thread `chainlink_feed` through
     /// unchanged -- a regression that unconditionally returned `None` would
     /// pass every other test in this module, since they only exercise the
     /// disabled paths.
@@ -13595,16 +13453,11 @@ mod tests {
     async fn record_bot_gas_receipt_cost_ctx_enabled_with_wallet_and_valuation() {
         let (pool, apalis_pool) = setup_test_pools().await;
 
-        let pyth_contract = address!("0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a");
-        let eth_usd_feed_id =
-            b256!("0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace");
+        let chainlink_feed = address!("0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70");
 
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
-        ctx.bot_gas_valuation = Some(BotGasValuationConfig {
-            pyth_contract,
-            eth_usd_feed_id,
-        });
+        ctx.bot_gas_valuation = Some(BotGasValuationConfig { chainlink_feed });
 
         let store = StoreBuilder::<BotGasReceiptCost>::new(pool.clone())
             .build(())
@@ -13616,8 +13469,7 @@ mod tests {
             .unwrap()
             .expect("wallet + bot_gas_valuation configured must build a ctx");
 
-        assert_eq!(result.pyth_contract, pyth_contract);
-        assert_eq!(result.eth_usd_feed_id, eth_usd_feed_id);
+        assert_eq!(result.chainlink_feed, chainlink_feed);
     }
 
     /// A wallet whose provider never answers -- mint-authorization

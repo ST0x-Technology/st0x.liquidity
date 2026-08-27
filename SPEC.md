@@ -22,10 +22,10 @@ helps establish price discovery by exploiting discrepancies between onchain
 tokenized equities and their traditional market counterparts.
 
 The bot monitors Raindex Orders from a specific owner that continuously offer
-tokenized equities at spreads around Pyth oracle prices. When a solver clears
-any of these orders, the bot immediately executes an offsetting trade on the
-supported brokerage backend (Alpaca Broker API), hedging directional exposure
-while capturing the spread differential.
+tokenized equities at spreads around the liquidity service's reference prices.
+When a solver clears any of these orders, the bot immediately executes an
+offsetting trade on the supported brokerage backend (Alpaca Broker API), hedging
+directional exposure while capturing the spread differential.
 
 The focus is on getting a functional system live quickly. There are known risks
 that will be addressed in future iterations as total value locked (TVL) grows
@@ -37,10 +37,10 @@ and the system proves market fit.
 
 #### Onchain Infrastructure
 
-- Raindex orderbook with deployed Orders from specific owner using Pyth oracle
-  feeds
+- Raindex orderbook with deployed Orders from a specific owner using the
+  liquidity service's pricing mechanism
   - Multiple orders continuously offer to buy/sell different tokenized equities
-    at Pyth price ± spread
+    at reference price ± spread
 - Order vaults holding stablecoins and tokenized equities
 
 #### Offchain Infrastructure
@@ -57,7 +57,7 @@ and the system proves market fit.
 
 #### Normal Operation Cycle
 
-1. Orders continuously offer to buy/sell tokenized equities at Pyth price ±
+1. Orders continuously offer to buy/sell tokenized equities at reference price ±
    spread
 2. Bot monitors Raindex for clears involving any orders from the arbitrageur's
    owner address
@@ -742,25 +742,14 @@ migration files in `migrations/`.
 - Maintain complete audit trail in the immutable event store
 - Handle concurrent trade processing safely with per-symbol locking
 
-#### Pyth Price Extraction
+#### Legacy Trade Price Enrichment
 
-- Records the Pyth oracle reference price for a trade via a historic `eth_call`
-  to `getPriceUnsafe(feed_id)` on the Base Pyth contract, pinned at the trade's
-  block. The service makes no `debug_*`/trace RPC calls.
-- The feed ID per equity is configured (optional `pyth_feed_id` under
-  `[assets.equities.<SYMBOL>]`). A symbol with no configured feed is recorded
-  without enrichment (logged at `debug`); hedging is unaffected.
-- Retrieves price value, confidence interval, exponent, and publish timestamp;
-  prices are stored in the `onchain_trade_view` alongside trade records
-- NULL price values indicate enrichment was skipped (no configured feed, missing
-  block number, RPC error, or invalid publish timestamp)
-- Because `getPriceUnsafe` reads the feed's stored state as of the trade block,
-  the recorded price is an end-of-block reference: it matches what the order
-  observed unless a Pyth update for that feed landed in the same block after the
-  trade. This is acceptable for analytics and never gates hedging.
-- The feed an order reads can change (oracle migrations); `pyth_feed_id` holds
-  the current feed per symbol and is refreshed if the order migrates.
-- Trade processing continues normally even if price enrichment is skipped
+- The bot does not read an external oracle while accounting for equity fills and
+  does not append new `OnChainTradeEvent::Enriched` events. Hedging depends only
+  on the fill itself.
+- Historical event streams can contain `OnChainTradeEvent::Enriched` events with
+  a `pyth_price`. That immutable legacy shape remains deserializable,
+  replayable, and displayable, but it is not produced by the current runtime.
 
 #### Bot-Paid Gas Cost Recording
 
@@ -779,13 +768,12 @@ migration files in `migrations/`.
   fee is not read from the receipt and is not included in the recorded cost (see
   "Known gaps" below)
 - A dedicated worker processes the job: it refetches the confirmed receipt,
-  verifies the bot wallet paid for it, reads the ETH/USD price from the Pyth
-  oracle on Base pinned to a block, and records one immutable cost fact (see
-  Pyth Price Extraction above for the block-pinning rationale; ETH/USD valuation
-  always reads the Base feed, pinned at the receipt's own block for Base
-  transactions and at the latest Base block for Ethereum transactions -- the
-  Ethereum-transaction pin is therefore not reproducible across two recording
-  attempts, see ADR 0017)
+  verifies the bot wallet paid for it, reads the ETH/USD price from Chainlink's
+  standard proxy on Base pinned to a block, and records one immutable cost fact
+  (ETH/USD valuation always reads the Base feed, pinned at the receipt's own
+  block for Base transactions and at the latest Base block for Ethereum
+  transactions -- the Ethereum-transaction pin is therefore not reproducible
+  across two recording attempts, see ADR 0020)
 - Recording is best-effort and asynchronous: a failure recording one receipt's
   cost never blocks or slows trading. The job retries with backoff. A repeated
   `Record` for the same chain and transaction hash is idempotent whenever the
@@ -1423,7 +1411,6 @@ The system provides two top-level capabilities:
 │  st0x-execution      st0x-tokenization  st0x-bridge    st0x-raindex     │
 │  ├─ Executor trait   ├─ Tokenizer trait ├─ Bridge trait├─ Raindex trait │
 │  ├─ Alpaca wallet    │                  │              │                │
-│  ├─ Pyth feeds       │                  │              │                │
 │  │                   │                  │              │                │
 │  │ features:         │ features:        │ features:    │ features:      │
 │  │ ├─ alpaca-broker  │ └─ alpaca        │ └─ cctp      │ └─ rain        │
@@ -1494,7 +1481,7 @@ The system provides two top-level capabilities:
 
 | Crate               | Purpose                                                                        | Feature Flags                     |
 | ------------------- | ------------------------------------------------------------------------------ | --------------------------------- |
-| `st0x-execution`    | Brokerage API integration for trade execution; Alpaca wallet ops; Pyth feeds   | `alpaca-broker`, `mock`           |
+| `st0x-execution`    | Brokerage API integration for trade execution and Alpaca wallet operations     | `alpaca-broker`, `mock`           |
 | `st0x-tokenization` | Tokenization API for minting/redeeming equity tokens                           | `alpaca`                          |
 | `st0x-bridge`       | Cross-chain asset transfers                                                    | `cctp`                            |
 | `st0x-raindex`      | Rain orderbook vault deposit/withdraw operations                               | `rain`                            |
@@ -1583,16 +1570,15 @@ implementation. Solutions will be developed in later iterations.
   - Bot downtime while onchain order remains active
   - Bot detects onchain trade but fails to execute offchain trade
   - Broker API failures or rate limiting during critical periods
-- **After-Hours Trading Gap**: Pyth oracle may continue operating when
-  traditional markets are closed, allowing onchain trades while broker markets
-  are unavailable. Creates guaranteed daily exposure windows.
+- **After-Hours Trading Gap**: Onchain orders may remain executable when
+  traditional markets are closed and broker hedging is unavailable. This creates
+  recurring exposure windows.
 
 ### Onchain Risks
 
-- **Stale Pyth Oracle Data**: If the oracle becomes stale, the order won't trade
-  onchain, resulting in missed arbitrage opportunities. However, this is
-  preferable to the alternative scenario where trades execute onchain but the
-  bot cannot make offsetting offchain trades.
+- **Stale Order Pricing Data**: If an order's pricing source becomes stale, the
+  order may stop trading onchain, resulting in missed arbitrage opportunities.
+  This is preferable to executing trades the bot cannot hedge correctly.
 - **Solver fails:** if the solver fails, again onchain trades won't happen but
   as above this is simply opportunity cost.
 
@@ -1844,8 +1830,10 @@ struct OnChainTrade {
     enrichment: Option<Enrichment>,
 }
 
+// Legacy persisted state only. The runtime no longer emits this data.
 struct Enrichment {
     gas_used: u64,
+    effective_gas_price: u128,
     pyth_price: PythPrice,
     enriched_at: DateTime<Utc>,
 }
@@ -1863,10 +1851,8 @@ enum OnChainTradeCommand {
         block_number: u64,
         block_timestamp: DateTime<Utc>,
     },
-    Enrich {
-        gas_used: u64,
-        pyth_price: PythPrice,
-    },
+    AttributeSource { source: OnChainTradeSource },
+    Acknowledge,
 }
 ```
 
@@ -1883,8 +1869,10 @@ enum OnChainTradeEvent {
         block_timestamp: DateTime<Utc>,
         filled_at: DateTime<Utc>,
     },
+    // Legacy event retained for deserialization and replay only.
     Enriched {
         gas_used: u64,
+        effective_gas_price: u128,
         pyth_price: PythPrice,
         enriched_at: DateTime<Utc>,
     },
@@ -1893,8 +1881,8 @@ enum OnChainTradeEvent {
 
 **Business Rules** (enforced in `handle()`):
 
-- Can only enrich once
-- Cannot enrich before fill is witnessed
+- Current commands never append `Enriched`; historical events remain replayable
+- A fill can be acknowledged only after it is witnessed
 
 #### Position Aggregate
 
@@ -4580,12 +4568,6 @@ sequenceDiagram
     OM->>P: PositionCommand::CompleteOffChainOrder
     P-->>OM: PositionEvent::OffChainOrderFilled
     OM->>Views: Update
-
-    Note over App,Views: Metadata enrichment (async)
-    App->>App: Extract Pyth Price
-    App->>OT: OnChainTradeCommand::Enrich
-    OT-->>App: OnChainTradeEvent::Enriched
-    App->>Views: Update projections
 ```
 
 #### Orchestration Job Taxonomy
@@ -4598,7 +4580,6 @@ All work managed by the Conductor falls into one of these categories:
 | ------------------------ | ------------------------------------------------------------------------- |
 | `AccountForDexTrade`     | Convert raindex event, discover vaults, acknowledge fill, place hedge     |
 | `DiscoverVaultsForTrade` | Extract and register vault info from trade event (no ordering constraint) |
-| `EnrichTrade`            | Add pyth pricing and gas metadata to OnChainTrade aggregate               |
 | Backfill                 | Fetch historical events, push as `AccountForDexTrade` jobs                |
 | Seed vault registry      | Populate known vaults from config at startup                              |
 | Rebalancing operation    | Execute a cross-venue asset transfer (mint/redeem/bridge)                 |
@@ -5050,8 +5031,8 @@ multiple broker-specific contexts.
    transport failures are retried and degrade only dashboard USD values, not
    hedging or rebalancing.
 
-3. **Spreads**: Last realized spreads per asset (buy/sell prices, Pyth
-   reference, spread bps) and per-symbol price charts over time.
+3. **Spreads**: Last realized spreads per asset (buy/sell prices and spread bps)
+   and per-symbol price charts over time.
 
 4. **Trade History**: Recent trades filterable by venue (onchain/offchain/both).
    Onchain entries are completed fills and carry their execution source:

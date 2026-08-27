@@ -33,17 +33,16 @@ ingestion_cutoff = "safe"
 [rest_api]
 url = "http://localhost:8099"
 
-# ETH/USD valuation source for bot-gas cost recording (ADR 0017). Only
-# required once [rebalancing] is enabled. `pyth_contract` here is the real
+# ETH/USD valuation source for bot-gas cost recording (ADR 0020). Only
+# required once [rebalancing] is enabled. `chainlink_feed` here is the real
 # Base mainnet address -- a PLACEHOLDER with no deployed code on the local
 # anvil chain the e2e harness runs against, so it is NOT usable as-is for a
 # server started from this file with rebalancing on. Rebalancing e2e
 # scenarios instead build their ctx programmatically and override this with
-# the harness's deployed `MockPyth` address (see
-# `tests/e2e/rebalancing/assertions.rs`, `mock_bot_gas_valuation`). This
-# section only exists so `[bot_gas_valuation]` is present and TOML-valid for
-# tests that merely parse this file; do not rely on it to run rebalancing
-# against a live server.
+# the harness's deployed Chainlink stub address (see `build_rebalancing_ctx`
+# and `build_usdc_rebalancing_ctx` in
+# `tests/e2e/rebalancing/assertions.rs`). This section only exists so
+# `[bot_gas_valuation]` is present and TOML-valid for tests that merely parse
+# this file; do not rely on it to run rebalancing against a live server.
 [bot_gas_valuation]
-pyth_contract = "0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a"
-eth_usd_feed_id = "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"
+chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"

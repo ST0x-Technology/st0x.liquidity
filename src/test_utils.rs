@@ -134,7 +134,6 @@ pub(crate) fn rebalancing_enabled_equities(symbols: &[&str]) -> EquitiesConfig {
                     EquityAssetConfig {
                         tokenized_equity: Address::ZERO,
                         tokenized_equity_derivative: Address::ZERO,
-                        pyth_feed_id: None,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Disabled,
                         rebalancing: OperationMode::Enabled,
@@ -445,9 +444,6 @@ impl OnchainTradeBuilder {
                 price: Usdc::new(Float::parse("150".to_string()).unwrap()).unwrap(),
                 block_number: Some(1),
                 block_timestamp: Some(Utc::now()),
-                gas_used: None,
-                effective_gas_price: None,
-                pyth_price: None,
             },
         }
     }
@@ -493,19 +489,6 @@ impl OnchainTradeBuilder {
     #[must_use]
     pub(crate) fn with_block_timestamp(mut self, block_timestamp: Option<DateTime<Utc>>) -> Self {
         self.trade.block_timestamp = block_timestamp;
-        self
-    }
-
-    #[must_use]
-    pub(crate) fn with_enrichment(
-        mut self,
-        gas_used: u64,
-        effective_gas_price: u128,
-        pyth_price: crate::onchain_trade::PythPrice,
-    ) -> Self {
-        self.trade.gas_used = Some(gas_used);
-        self.trade.effective_gas_price = Some(effective_gas_price);
-        self.trade.pyth_price = Some(pyth_price);
         self
     }
 

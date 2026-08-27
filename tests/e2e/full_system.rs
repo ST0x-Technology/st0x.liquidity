@@ -66,7 +66,7 @@ use crate::poll::{
     connect_db, count_events, count_events_of_type, free_port_pair, poll_for_broker_fills,
     poll_for_events, poll_for_events_with_timeout, poll_for_ready, spawn_bot_with_event_channel,
 };
-use crate::rebalancing::assertions::{TestWallet, mock_bot_gas_valuation};
+use crate::rebalancing::assertions::TestWallet;
 use crate::test_infra::TestInfra;
 
 /// Builds a `Ctx` with ALL features enabled: hedging, equity rebalancing,
@@ -107,7 +107,6 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
                 EquityAssetConfig {
                     tokenized_equity: *unwrapped,
                     tokenized_equity_derivative: *wrapped,
-                    pyth_feed_id: None,
                     vault_ids: equity_vault_ids.get(symbol).copied().into_iter().collect(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Enabled,
@@ -176,7 +175,9 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
         )
         .issuance(st0x_config::test_issuance_status_ctx(issuance_base_url))
         .redemption_wallet(REDEMPTION_WALLET)
-        .bot_gas_valuation(mock_bot_gas_valuation(chain.mock_pyth))
+        .bot_gas_valuation(st0x_hedge::BotGasValuationConfig {
+            chainlink_feed: chain.mock_chainlink_feed,
+        })
         .call()
         .map_err(Into::into)
 }
@@ -545,8 +546,7 @@ address = "{owner}"
 redemption_wallet = "{redemption_wallet}"
 
 [bot_gas_valuation]
-pyth_contract = "{mock_pyth:#x}"
-eth_usd_feed_id = "0xabababababababababababababababababababababababababababababababab"
+chainlink_feed = "{mock_chainlink_feed:#x}"
 
 [rebalancing]
 transfer_timeout_secs = 1800
@@ -584,7 +584,7 @@ rebalancing = "enabled"
         redemption_wallet = REDEMPTION_WALLET,
         aapl_vault_id = equity_vault_ids["AAPL"],
         tsla_vault_id = equity_vault_ids["TSLA"],
-        mock_pyth = infra.base_chain.mock_pyth,
+        mock_chainlink_feed = infra.base_chain.mock_chainlink_feed,
     );
 
     let secrets = format!(
