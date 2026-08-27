@@ -20,6 +20,22 @@ pub struct Cli {
 pub enum Command {
     /// Read-only queries against the liquidity bot.
     Read(ReadArgs),
+    /// State-changing capital operations.
+    #[command(subcommand)]
+    Capital(Capital),
+}
+
+#[derive(Subcommand)]
+pub enum Capital {
+    /// Resume interrupted mint and redemption transfers.
+    Resume,
+    /// Re-check a stuck transfer by kind and aggregate id.
+    Recheck {
+        /// Transfer kind path segment (for example mint or redemption).
+        kind: String,
+        /// Aggregate id path segment.
+        id: String,
+    },
 }
 
 #[derive(Args)]

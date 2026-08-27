@@ -1,3 +1,4 @@
+mod auth;
 mod cli;
 mod error;
 mod output;
@@ -8,7 +9,8 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use crate::cli::{Cli, Command};
+use crate::auth::Adc;
+use crate::cli::{Capital, Cli, Command};
 use crate::error::Error;
 use crate::transport::Client;
 
@@ -45,11 +47,23 @@ impl From<Error> for RunError {
 }
 
 async fn run(cli: Cli) -> Result<(), RunError> {
-    let base_url = target::resolve(cli.env)?;
-    let client = Client::new(base_url)?;
+    let target = target::resolve(cli.env)?;
+    let auth = Adc::new(&target.audience)?;
+    let client = Client::new(target.base_url, auth)?;
     match cli.command {
         Command::Read(args) => {
             let value = client.get(args.resource.path(), &args.params).await?;
+            output::print(&value)?;
+        }
+        Command::Capital(command) => {
+            let value = match command {
+                Capital::Resume => client.post("/transfers/resume").await?,
+                Capital::Recheck { kind, id } => {
+                    client
+                        .post(&format!("/transfers/recheck/{kind}/{id}"))
+                        .await?
+                }
+            };
             output::print(&value)?;
         }
     }

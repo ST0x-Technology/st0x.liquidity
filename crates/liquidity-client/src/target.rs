@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use url::Url;
 
-/// Deployment the client talks to. Selects the IAP-fronted API base URL.
+/// Deployment the client talks to. Selects the IAP-fronted API base URL and
+/// the ID token audience.
 #[derive(Clone, Copy, clap::ValueEnum)]
 pub enum Env {
     Staging,
@@ -17,14 +18,29 @@ impl Env {
     }
 }
 
-/// Reads the base URL for `env` from its non-secret environment variable.
-/// The value is the IAP-fronted HTTPS URL Google authenticates in front of;
-/// it carries no credentials.
-pub fn resolve(env: Env) -> Result<Url> {
+/// Non-secret connection settings for one environment. The base URL is the
+/// IAP-fronted HTTPS endpoint; the audience is the IAP OAuth client ID the ID
+/// token is minted for. Neither is a credential.
+pub struct Target {
+    pub base_url: Url,
+    pub audience: String,
+}
+
+fn required(variable: &str, hint: &str) -> Result<String> {
+    std::env::var(variable).with_context(|| format!("set {variable} {hint}"))
+}
+
+pub fn resolve(env: Env) -> Result<Target> {
     let prefix = env.prefix();
-    let variable = format!("{prefix}_URL");
-    let raw = std::env::var(&variable).with_context(|| {
-        format!("set {variable} to the IAP-fronted liquidity API base URL for this environment")
-    })?;
-    Url::parse(&raw).with_context(|| format!("{variable} is not a valid URL: {raw}"))
+    let raw_url = required(
+        &format!("{prefix}_URL"),
+        "to the IAP-fronted liquidity API base URL for this environment",
+    )?;
+    let base_url = Url::parse(&raw_url)
+        .with_context(|| format!("{prefix}_URL is not a valid URL: {raw_url}"))?;
+    let audience = required(
+        &format!("{prefix}_AUDIENCE"),
+        "to the IAP OAuth client ID (the ID token audience) for this environment",
+    )?;
+    Ok(Target { base_url, audience })
 }

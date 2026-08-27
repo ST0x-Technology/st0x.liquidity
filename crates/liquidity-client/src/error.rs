@@ -12,12 +12,13 @@ pub enum Error {
     Http(StatusCode, String),
     Decode(reqwest::Error),
     Encode(serde_json::Error),
+    Auth(String),
 }
 
 impl Error {
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Unauthorized(_) | Self::Forbidden(_) => 77,
+            Self::Unauthorized(_) | Self::Forbidden(_) | Self::Auth(_) => 77,
             _ => 1,
         }
     }
@@ -55,6 +56,10 @@ impl fmt::Display for Error {
             Self::Encode(source) => {
                 write!(f, "the response could not be re-encoded as JSON: {source}")
             }
+            Self::Auth(reason) => write!(
+                f,
+                "could not obtain a T0 Google identity: {reason}\nEnsure Application Default Credentials are configured (a service account, workload identity, or impersonation) that can mint an ID token for the configured audience.",
+            ),
         }
     }
 }
