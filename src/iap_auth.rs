@@ -357,7 +357,6 @@ mod tests {
     use httpmock::prelude::*;
     use jsonwebtoken::{EncodingKey, Header, encode};
     use p256::ecdsa::SigningKey;
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
     use p256::pkcs8::EncodePrivateKey;
     use serde::Serialize;
     use tower::ServiceExt as _;
