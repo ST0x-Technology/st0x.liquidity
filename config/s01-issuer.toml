@@ -86,6 +86,7 @@ tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"
 transfer_timeout_secs = 1800
 transfer_attempt_timeout_secs = 3600
 attestation_retry_deadline_secs = 86400
+settlement_retry_deadline_secs = 86400
 max_burn_revert_redrives = 5
 freeze_check = "disabled"
 
