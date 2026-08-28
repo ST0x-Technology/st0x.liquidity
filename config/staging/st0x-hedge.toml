@@ -254,15 +254,19 @@ url = "https://api.st0x.io"
 chat_id = -1
 # Forum topic alerts post into (the "DEX Liquidity" topic).
 message_thread_id = 50
-# Per-chain native-ETH balances below which low-gas alerts fire (decimal ETH).
-# Ethereum's 0.05 ETH value is intentionally L1-calibrated; see SPEC.md.
-base_low_balance_threshold = "0.05"
-ethereum_low_balance_threshold = "0.05"
 # Seconds between native-balance polls.
 poll_interval = 300
 # Minimum seconds between repeated alerts while the balance stays below threshold.
 # 43200 = 12 hours.
 realert_interval = 43200
+
+# Native-gas balance below which low-gas alerts fire, per chain (decimal ETH).
+# Required for every chain the gas monitor runs on: one figure cannot be right
+# for both an expensive chain and a cheap one. Ethereum's value is
+# intentionally L1-calibrated; see SPEC.md.
+[alerts.low_balance_thresholds]
+base = "0.05"
+ethereum = "0.05"
 
 # USDC vault and rebalancing settings.
 [chains.base.trading.assets.cash]
