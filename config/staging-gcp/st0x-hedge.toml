@@ -19,17 +19,17 @@ server_port = 8001
 # HTTP port for the apalis-board job queue UI.
 board_port = 8002
 
-# IAP audiences for the role-gated ops API. Uncomment once the load balancer
-# backends exist, filling both values from the `ops_api_audiences` output of
-# terraform/staging-liquidity. While this section is absent the role-gated
-# routes are not mounted at all, which is what a deployment with no load
-# balancer in front of it should do.
+# IAP audiences for the role-gated ops API, from the `ops_api_audiences`
+# output of terraform/staging-liquidity (applied 2026-08-27, PR #359). The
+# bot pins the audience per path prefix, so a token IAP minted for the read
+# backend is refused on the write path even though its signature is valid.
 #
 # Not secrets: an audience names an IAM-gated backend and is useless without
-# an identity Google will sign for.
-# [ops_api]
-# read_audience = "/projects/<number>/global/backendServices/<read backend id>"
-# write_audience = "/projects/<number>/global/backendServices/<write backend id>"
+# an identity Google will sign for. Removing this section unmounts the
+# role-gated routes entirely.
+[ops_api]
+read_audience = "/projects/819265953297/global/backendServices/6620592880358364228"
+write_audience = "/projects/819265953297/global/backendServices/6816788502563099716"
 # Minimum log level: trace, debug, info, warn, error.
 log_level = "trace"
 # Directory for rotated log files (stdout if omitted).
