@@ -458,7 +458,7 @@ pub(crate) type TransferUsdcToHedgingJobQueue = JobQueue<TransferUsdcToHedging>;
 pub(crate) type TransferUsdcToMarketMakingJobQueue = JobQueue<TransferUsdcToMarketMaking>;
 
 /// Trait-erased entry point for the Base->Alpaca apalis job. Erasing the
-/// `Chain` generic here lets the conductor build a single concrete `Ctx`
+/// `Signer` generic here lets the conductor build a single concrete `Ctx`
 /// regardless of which wallet backend is wired in.
 #[async_trait]
 pub(crate) trait ResumeBaseToAlpaca: Send + Sync + 'static {
@@ -470,9 +470,9 @@ pub(crate) trait ResumeBaseToAlpaca: Send + Sync + 'static {
 }
 
 #[async_trait]
-impl<Chain> ResumeBaseToAlpaca for CrossVenueCashTransfer<Chain>
+impl<Signer> ResumeBaseToAlpaca for CrossVenueCashTransfer<Signer>
 where
-    Chain: Wallet + Send + Sync + 'static,
+    Signer: Wallet + Send + Sync + 'static,
 {
     async fn resume_base_to_alpaca(
         &self,
@@ -495,9 +495,9 @@ pub(crate) trait ResumeAlpacaToBase: Send + Sync + 'static {
 }
 
 #[async_trait]
-impl<Chain> ResumeAlpacaToBase for CrossVenueCashTransfer<Chain>
+impl<Signer> ResumeAlpacaToBase for CrossVenueCashTransfer<Signer>
 where
-    Chain: Wallet + Send + Sync + 'static,
+    Signer: Wallet + Send + Sync + 'static,
 {
     async fn resume_alpaca_to_base(
         &self,

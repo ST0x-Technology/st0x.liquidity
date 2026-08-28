@@ -626,13 +626,14 @@ mod tests {
     use uuid::Uuid;
 
     use st0x_event_sorcery::EventSourced;
+    use st0x_evm::Chain;
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_raindex::RaindexVaultId;
     use st0x_tokenization::issuer_request_id;
     use st0x_tokenization::mock::MockTokenizer;
     use st0x_wrapper::MockWrapper;
 
-    use crate::bot_gas::{BotGasChain, pending_bot_gas_jobs};
+    use crate::bot_gas::pending_bot_gas_jobs;
     use crate::equity_redemption::redemption_aggregate_id;
     use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::onchain::mock::{DepositBehavior, MockRaindex};
@@ -805,7 +806,7 @@ mod tests {
         let jobs = pending_bot_gas_jobs(&apalis_pool).await;
         assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
         assert_eq!(jobs[0].category, BotGasOperationCategory::VaultDeposit);
-        assert_eq!(jobs[0].chain, BotGasChain::Base);
+        assert_eq!(jobs[0].chain, Chain::Base);
         assert_eq!(jobs[0].tx_hash, FAKE_TX_HASH);
         assert_eq!(jobs[0].symbol, Some(aapl()));
     }

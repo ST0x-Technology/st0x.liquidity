@@ -16,7 +16,7 @@ use st0x_bridge::cctp::{AttestationResponse, CctpBridge, CctpError};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
 use st0x_config::ALPACA_MINIMUM_WITHDRAWAL;
 use st0x_event_sorcery::Store;
-use st0x_evm::{USDC_BASE, Wallet};
+use st0x_evm::{Chain, USDC_BASE, Wallet};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
     AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, AlpacaWalletService, ClientOrderId,
@@ -27,9 +27,7 @@ use st0x_finance::{Usd, Usdc};
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
 
 use super::UsdcTransferError;
-use crate::bot_gas::{
-    BotGasChain, BotGasOperationCategory, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCost,
-};
+use crate::bot_gas::{BotGasOperationCategory, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCost};
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::{
     ConversionAmounts, RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand,
@@ -191,13 +189,13 @@ struct AwaitingAttestationTimestamps {
 ///
 /// # Type Parameters
 ///
-/// * `Chain` - Wallet type used for both Ethereum and Base chains
-/// * `B` - Bridge implementation; defaults to [`CctpBridge<Chain, Chain>`]
-pub(crate) struct CrossVenueCashTransfer<Chain: Wallet, B = CctpBridge<Chain, Chain>> {
+/// * `Signer` - Wallet type used for both Ethereum and Base chains
+/// * `B` - Bridge implementation; defaults to [`CctpBridge<Signer, Signer>`]
+pub(crate) struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>> {
     alpaca_broker: InstrumentedAlpacaBroker,
     alpaca_wallet: Arc<AlpacaWalletService>,
     cctp_bridge: Arc<B>,
-    raindex: Arc<RaindexService<Chain>>,
+    raindex: Arc<RaindexService<Signer>>,
     cqrs: Arc<Store<UsdcRebalance>>,
     market_maker_wallet: Address,
     vault_id: RaindexVaultId,
@@ -258,15 +256,15 @@ impl std::fmt::Display for MintScanCallSite {
 }
 
 impl<
-    Chain: Wallet,
+    Signer: Wallet,
     B: Bridge<Error = CctpError, Attestation = AttestationResponse> + UsdcBridgeHelper,
-> CrossVenueCashTransfer<Chain, B>
+> CrossVenueCashTransfer<Signer, B>
 {
     pub(crate) fn new(
         alpaca_broker: InstrumentedAlpacaBroker,
         alpaca_wallet: Arc<AlpacaWalletService>,
         cctp_bridge: Arc<B>,
-        raindex: Arc<RaindexService<Chain>>,
+        raindex: Arc<RaindexService<Signer>>,
         cqrs: Arc<Store<UsdcRebalance>>,
         market_maker_wallet: Address,
         vault_id: RaindexVaultId,
@@ -310,7 +308,7 @@ impl<
     /// itself once past that state (see that resume arm's comment).
     async fn enqueue_bot_gas_cost(
         &self,
-        chain: BotGasChain,
+        chain: Chain,
         tx_hash: TxHash,
         category: BotGasOperationCategory,
     ) -> Result<(), UsdcTransferError> {
@@ -1125,7 +1123,7 @@ impl<
                         // `confirm_deposit` advances the aggregate to its terminal
                         // state.
                         self.enqueue_bot_gas_cost(
-                            BotGasChain::Base,
+                            Chain::Base,
                             deposit_tx,
                             BotGasOperationCategory::VaultDeposit,
                         )
@@ -2217,8 +2215,8 @@ impl<
         // Enqueue BEFORE `ConfirmBridging` (see `enqueue_bot_gas_cost`'s doc
         // for why the ordering matters here).
         let mint_chain = match direction {
-            BridgeDirection::EthereumToBase => BotGasChain::Base,
-            BridgeDirection::BaseToEthereum => BotGasChain::Ethereum,
+            BridgeDirection::EthereumToBase => Chain::Base,
+            BridgeDirection::BaseToEthereum => Chain::Ethereum,
         };
         self.enqueue_bot_gas_cost(
             mint_chain,
@@ -2296,7 +2294,7 @@ impl<
         self.raindex.confirm_tx(deposit_tx).await?;
 
         self.enqueue_bot_gas_cost(
-            BotGasChain::Base,
+            Chain::Base,
             deposit_tx,
             BotGasOperationCategory::VaultDeposit,
         )
@@ -3168,7 +3166,7 @@ impl<
             .await
             .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
         self.enqueue_bot_gas_cost(
-            BotGasChain::Ethereum,
+            Chain::Ethereum,
             send_tx,
             BotGasOperationCategory::WalletTransfer,
         )
@@ -3220,7 +3218,7 @@ impl<
         {
             info!(target: "rebalance", %id, %existing_tx, %deposit_address, "Adopting already-submitted USDC deposit transfer to Alpaca on resume");
             self.enqueue_bot_gas_cost(
-                BotGasChain::Ethereum,
+                Chain::Ethereum,
                 existing_tx,
                 BotGasOperationCategory::WalletTransfer,
             )
@@ -3234,7 +3232,7 @@ impl<
             .await
             .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
         self.enqueue_bot_gas_cost(
-            BotGasChain::Ethereum,
+            Chain::Ethereum,
             send_tx,
             BotGasOperationCategory::WalletTransfer,
         )
@@ -3348,7 +3346,7 @@ impl<
         // succeeds) proceeds to genuinely fail the transfer for
         // reconciliation below.
         self.enqueue_bot_gas_cost(
-            BotGasChain::Base,
+            Chain::Base,
             existing_tx,
             BotGasOperationCategory::VaultWithdraw,
         )
@@ -3392,7 +3390,7 @@ impl<
         // Enqueue BEFORE `Initiate`/`ConfirmWithdrawal` (see
         // `enqueue_bot_gas_cost`'s doc for why the ordering matters here).
         self.enqueue_bot_gas_cost(
-            BotGasChain::Base,
+            Chain::Base,
             withdraw_tx,
             BotGasOperationCategory::VaultWithdraw,
         )
@@ -3900,8 +3898,8 @@ impl<
         // Enqueue BEFORE `InitiateBridging` (see `enqueue_bot_gas_cost`'s doc
         // for why the ordering matters here).
         let burn_chain = match direction {
-            BridgeDirection::BaseToEthereum => BotGasChain::Base,
-            BridgeDirection::EthereumToBase => BotGasChain::Ethereum,
+            BridgeDirection::BaseToEthereum => Chain::Base,
+            BridgeDirection::EthereumToBase => Chain::Ethereum,
         };
         self.enqueue_bot_gas_cost(
             burn_chain,
@@ -5213,9 +5211,9 @@ mod tests {
         RawPrivateKeyWallet::new(private_key, base_provider, 1).unwrap()
     }
 
-    fn create_test_onchain_services<Chain: Wallet + Clone>(
-        wallet: Chain,
-    ) -> (CctpBridge<Chain, Chain>, RaindexService<Chain>) {
+    fn create_test_onchain_services<Signer: Wallet + Clone>(
+        wallet: Signer,
+    ) -> (CctpBridge<Signer, Signer>, RaindexService<Signer>) {
         let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
             usdc_ethereum: USDC_ADDRESS,
             usdc_base: USDC_ADDRESS,
@@ -5249,10 +5247,10 @@ mod tests {
     /// polling resolves immediately instead of retrying the real Circle endpoint
     /// for ~5 minutes. Test-support only.
     #[cfg(feature = "test-support")]
-    fn create_test_onchain_services_with_circle_api<Chain: Wallet + Clone>(
-        wallet: Chain,
+    fn create_test_onchain_services_with_circle_api<Signer: Wallet + Clone>(
+        wallet: Signer,
         circle_api_base: String,
-    ) -> (CctpBridge<Chain, Chain>, RaindexService<Chain>) {
+    ) -> (CctpBridge<Signer, Signer>, RaindexService<Signer>) {
         let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
             usdc_ethereum: USDC_ADDRESS,
             usdc_base: USDC_ADDRESS,
@@ -13935,7 +13933,7 @@ mod tests {
         );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
 
-        // A real wallet is required for the Chain type parameter even though
+        // A real wallet is required for the Signer type parameter even though
         // burn_recording_pending never calls into RaindexService.
         let (_anvil, endpoint, private_key) = setup_anvil();
         let wallet = create_test_wallet(&endpoint, &private_key);
@@ -14464,18 +14462,18 @@ mod tests {
     }
 
     /// Builds a `CrossVenueCashTransfer` wired to a real (anvil-backed)
-    /// `RaindexService` -- required for the `Chain` type parameter even
+    /// `RaindexService` -- required for the `Signer` type parameter even
     /// though none of these bot-gas convergence tests call into it -- and an
     /// `Enabled` bot-gas enqueuer backed by a fresh apalis pool. Callers supply
     /// their own `MockBridge` so only the test that actually sends USDC on
     /// Ethereum opts into a canned response (see `MockBridge::with_send_usdc_tx`);
     /// every other caller keeps the default `unimplemented!()` guard.
-    async fn manager_with_bot_gas_queue<Chain: Wallet + Clone>(
+    async fn manager_with_bot_gas_queue<Signer: Wallet + Clone>(
         cqrs: Arc<Store<UsdcRebalance>>,
-        wallet: Chain,
+        wallet: Signer,
         bridge: MockBridge,
     ) -> (
-        CrossVenueCashTransfer<Chain, MockBridge>,
+        CrossVenueCashTransfer<Signer, MockBridge>,
         apalis_sqlite::SqlitePool,
         MockServer,
     ) {
@@ -14549,7 +14547,7 @@ mod tests {
         assert_eq!(jobs[0].category, BotGasOperationCategory::CctpBurn);
         assert_eq!(
             jobs[0].chain,
-            BotGasChain::Ethereum,
+            Chain::Ethereum,
             "EthereumToBase burns on Ethereum (the source chain)"
         );
         assert_eq!(jobs[0].tx_hash, burn_tx);
@@ -14593,7 +14591,7 @@ mod tests {
         assert_eq!(jobs[0].category, BotGasOperationCategory::CctpMint);
         assert_eq!(
             jobs[0].chain,
-            BotGasChain::Base,
+            Chain::Base,
             "EthereumToBase mints on Base (the destination chain)"
         );
         assert_eq!(jobs[0].tx_hash, mint_tx);
@@ -14731,7 +14729,7 @@ mod tests {
         let jobs = pending_bot_gas_jobs(&apalis_pool).await;
         assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
         assert_eq!(jobs[0].category, BotGasOperationCategory::VaultWithdraw);
-        assert_eq!(jobs[0].chain, BotGasChain::Base);
+        assert_eq!(jobs[0].chain, Chain::Base);
         assert_eq!(jobs[0].tx_hash, withdraw_tx);
         assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
     }
@@ -14845,7 +14843,7 @@ mod tests {
             "the adopted withdrawal's gas cost must still be recorded"
         );
         assert_eq!(jobs[0].category, BotGasOperationCategory::VaultWithdraw);
-        assert_eq!(jobs[0].chain, BotGasChain::Base);
+        assert_eq!(jobs[0].chain, Chain::Base);
         assert_eq!(jobs[0].tx_hash, existing_tx);
 
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
@@ -14954,7 +14952,7 @@ mod tests {
         let jobs = pending_bot_gas_jobs(&apalis_pool).await;
         assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
         assert_eq!(jobs[0].category, BotGasOperationCategory::WalletTransfer);
-        assert_eq!(jobs[0].chain, BotGasChain::Ethereum);
+        assert_eq!(jobs[0].chain, Chain::Ethereum);
         assert_eq!(jobs[0].tx_hash, send_tx);
         assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
     }
@@ -14993,7 +14991,7 @@ mod tests {
         let jobs = pending_bot_gas_jobs(&apalis_pool).await;
         assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
         assert_eq!(jobs[0].category, BotGasOperationCategory::VaultDeposit);
-        assert_eq!(jobs[0].chain, BotGasChain::Base);
+        assert_eq!(jobs[0].chain, Chain::Base);
         assert_eq!(jobs[0].tx_hash, deposit_tx);
         assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
     }

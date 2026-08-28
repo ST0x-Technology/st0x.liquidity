@@ -20,10 +20,11 @@ use chrono::{DateTime, TimeDelta, Utc};
 use rain_math_float::Float;
 use tracing::warn;
 
+use st0x_evm::Chain;
 use st0x_finance::Usd;
 use st0x_float_macro::float;
 
-use super::{BotGasChain, EthUsdPrice};
+use super::EthUsdPrice;
 
 sol! {
     #[sol(rpc)]
@@ -69,6 +70,11 @@ pub(crate) enum EthUsdValuationError {
     InvalidUpdatedAt(U256),
     #[error("ETH/USD Chainlink decimals {decimals} exceeds supported maximum {MAX_DECIMALS}")]
     DecimalsOutOfRange { decimals: u8 },
+    /// Pricing gas in ETH is only meaningful where the native token IS ETH.
+    /// Valuing another chain's gas against the ETH/USD feed would silently
+    /// misprice it, so the read is refused instead.
+    #[error("{chain} pays gas in a token that is not ETH, so the ETH/USD feed cannot value it")]
+    NonEthGasToken { chain: Chain },
 }
 
 /// Reads the ETH/USD price used to value a bot-paid gas receipt.
@@ -78,7 +84,7 @@ pub(crate) enum EthUsdValuationError {
 pub(crate) async fn read_eth_usd_price<BaseProvider>(
     base_provider: &BaseProvider,
     chainlink_feed: Address,
-    chain: BotGasChain,
+    chain: Chain,
     receipt_block_number: u64,
     receipt_block_hash: B256,
     occurred_at: DateTime<Utc>,
@@ -86,13 +92,13 @@ pub(crate) async fn read_eth_usd_price<BaseProvider>(
 where
     BaseProvider: Provider,
 {
-    let block_number = match chain {
-        BotGasChain::Base => receipt_block_number,
-        BotGasChain::Ethereum => base_provider.get_block_number().await?,
-    };
-    let block_id = match chain {
-        BotGasChain::Base => BlockId::hash(receipt_block_hash),
-        BotGasChain::Ethereum => BlockId::number(block_number),
+    let (block_number, block_id) = match chain {
+        Chain::Base => (receipt_block_number, BlockId::hash(receipt_block_hash)),
+        Chain::Ethereum => {
+            let latest = base_provider.get_block_number().await?;
+            (latest, BlockId::number(latest))
+        }
+        Chain::HyperEvm => return Err(EthUsdValuationError::NonEthGasToken { chain }),
     };
 
     let feed = AggregatorV3Interface::new(chainlink_feed, base_provider);
@@ -192,6 +198,35 @@ mod tests {
         )
     }
 
+    /// HyperEVM pays gas in HYPE. Reading the ETH/USD feed for it would
+    /// return a number that looks valid and prices the gas wrongly, so the
+    /// read is refused before any RPC call is made.
+    #[tokio::test]
+    async fn non_eth_gas_token_chain_is_refused_without_an_rpc_call() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+
+        let error = read_eth_usd_price(
+            &provider,
+            CHAINLINK_FEED,
+            Chain::HyperEvm,
+            123,
+            RECEIPT_BLOCK_HASH,
+            occurred_at(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                EthUsdValuationError::NonEthGasToken {
+                    chain: Chain::HyperEvm
+                }
+            ),
+            "expected NonEthGasToken, got: {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn base_receipt_records_scaled_chainlink_price_at_receipt_block() {
         let asserter = Asserter::new();
@@ -205,7 +240,7 @@ mod tests {
         let result = read_eth_usd_price(
             &provider,
             CHAINLINK_FEED,
-            BotGasChain::Base,
+            Chain::Base,
             123,
             RECEIPT_BLOCK_HASH,
             occurred_at(),
@@ -250,7 +285,7 @@ mod tests {
         let result = read_eth_usd_price(
             &provider,
             CHAINLINK_FEED,
-            BotGasChain::Base,
+            Chain::Base,
             50_220_982,
             RECEIPT_BLOCK_HASH,
             observed_at,
@@ -311,7 +346,7 @@ mod tests {
         read_eth_usd_price(
             &provider,
             CHAINLINK_FEED,
-            BotGasChain::Base,
+            Chain::Base,
             123,
             RECEIPT_BLOCK_HASH,
             occurred_at(),
@@ -337,7 +372,7 @@ mod tests {
         let result = read_eth_usd_price(
             &provider,
             CHAINLINK_FEED,
-            BotGasChain::Ethereum,
+            Chain::Ethereum,
             111,
             RECEIPT_BLOCK_HASH,
             occurred_at(),
@@ -363,7 +398,7 @@ mod tests {
         read_eth_usd_price(
             &provider,
             CHAINLINK_FEED,
-            BotGasChain::Base,
+            Chain::Base,
             123,
             RECEIPT_BLOCK_HASH,
             occurred_at(),
@@ -389,7 +424,7 @@ mod tests {
         let result = read_eth_usd_price(
             &provider,
             CHAINLINK_FEED,
-            BotGasChain::Base,
+            Chain::Base,
             123,
             RECEIPT_BLOCK_HASH,
             occurred_at(),
@@ -412,7 +447,7 @@ mod tests {
             let error = read_eth_usd_price(
                 &provider,
                 CHAINLINK_FEED,
-                BotGasChain::Base,
+                Chain::Base,
                 123,
                 RECEIPT_BLOCK_HASH,
                 occurred_at(),
@@ -447,7 +482,7 @@ mod tests {
         let error = read_eth_usd_price(
             &provider,
             CHAINLINK_FEED,
-            BotGasChain::Base,
+            Chain::Base,
             123,
             RECEIPT_BLOCK_HASH,
             occurred_at(),
@@ -482,7 +517,7 @@ mod tests {
         let error = read_eth_usd_price(
             &provider,
             CHAINLINK_FEED,
-            BotGasChain::Base,
+            Chain::Base,
             123,
             RECEIPT_BLOCK_HASH,
             occurred_at(),
@@ -505,7 +540,7 @@ mod tests {
         let error = read_eth_usd_price(
             &provider,
             CHAINLINK_FEED,
-            BotGasChain::Base,
+            Chain::Base,
             123,
             RECEIPT_BLOCK_HASH,
             occurred_at(),
@@ -528,7 +563,7 @@ mod tests {
         let error = read_eth_usd_price(
             &provider,
             CHAINLINK_FEED,
-            BotGasChain::Base,
+            Chain::Base,
             123,
             RECEIPT_BLOCK_HASH,
             occurred_at(),

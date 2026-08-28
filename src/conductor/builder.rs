@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 
 use st0x_config::{AlertsCtx, Ctx, ExecutionThreshold, OnchainWalletCtx};
 use st0x_event_sorcery::{Projection, Store};
-use st0x_evm::{Evm, ReadOnlyEvm, Wallet};
+use st0x_evm::{Chain, Evm, ReadOnlyEvm, Wallet};
 use st0x_execution::{Executor, Symbol};
 use st0x_finance::{HasZero, Positive, Usd};
 use st0x_raindex::RaindexService;
@@ -35,7 +35,6 @@ use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
 use super::{Conductor, SupervisorStartupTokens};
 use crate::alerts::Notifier;
-use crate::bot_gas::BotGasChain;
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::{
@@ -1095,7 +1094,7 @@ where
             balance_reader: Arc::new(ProviderBalanceReader::new(base_provider)),
             notifier: notifier.clone(),
             wallet: base_wallet,
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             threshold_wei: alerts.base_low_balance_threshold_wei,
             poll_interval: alerts.poll_interval,
             realert_interval: alerts.realert_interval,
@@ -1104,7 +1103,7 @@ where
             balance_reader: Arc::new(ProviderBalanceReader::new(ethereum_provider)),
             notifier,
             wallet: ethereum_wallet,
-            chain: BotGasChain::Ethereum,
+            chain: Chain::Ethereum,
             threshold_wei: alerts.ethereum_low_balance_threshold_wei,
             poll_interval: alerts.poll_interval,
             realert_interval: alerts.realert_interval,
@@ -1477,7 +1476,7 @@ mod tests {
         );
 
         assert_eq!(base.wallet, base_wallet);
-        assert_eq!(base.chain, BotGasChain::Base);
+        assert_eq!(base.chain, Chain::Base);
         assert_eq!(base.threshold_wei, U256::from(100_u64));
         assert_eq!(
             base.balance_reader
@@ -1489,7 +1488,7 @@ mod tests {
         );
 
         assert_eq!(ethereum.wallet, ethereum_wallet);
-        assert_eq!(ethereum.chain, BotGasChain::Ethereum);
+        assert_eq!(ethereum.chain, Chain::Ethereum);
         assert_eq!(ethereum.threshold_wei, U256::from(200_u64));
         assert_eq!(
             ethereum

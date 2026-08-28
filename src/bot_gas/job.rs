@@ -19,13 +19,11 @@ use std::sync::Arc;
 use tracing::{error, warn};
 
 use st0x_event_sorcery::SendError;
-use st0x_evm::Wallet;
+use st0x_evm::{Chain, Wallet};
 use st0x_finance::Symbol;
 
 use super::valuation::{EthUsdValuationError, read_eth_usd_price};
-use super::{
-    BotGasChain, BotGasCostError, BotGasCostLedger, BotGasOperationCategory, BotGasReceiptCost,
-};
+use super::{BotGasCostError, BotGasCostLedger, BotGasOperationCategory, BotGasReceiptCost};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 
 /// Persistent job queue for [`RecordBotGasReceiptCost`].
@@ -163,7 +161,7 @@ pub(super) mod test_support {
 /// the bounded redrive counter described on [`MAX_REDRIVE_ATTEMPTS`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RecordBotGasReceiptCost {
-    pub(crate) chain: BotGasChain,
+    pub(crate) chain: Chain,
     pub(crate) tx_hash: TxHash,
     pub(crate) category: BotGasOperationCategory,
     pub(crate) symbol: Option<Symbol>,
@@ -179,7 +177,7 @@ impl RecordBotGasReceiptCost {
     /// Builds a fresh (zero redrive attempts) job for a Base-chain tx.
     /// Every current production enqueue site is Base-only (vault
     /// deposit/withdraw, wrap/unwrap, USDC wallet transfer); the CCTP burn/
-    /// mint's `BotGasChain::Ethereum` job is constructed inline where it
+    /// mint's `Chain::Ethereum` job is constructed inline where it
     /// arises since it is the one exception.
     pub(crate) fn for_base_tx(
         tx_hash: TxHash,
@@ -187,7 +185,7 @@ impl RecordBotGasReceiptCost {
         symbol: Symbol,
     ) -> Self {
         Self {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash,
             category,
             symbol: Some(symbol),
@@ -244,7 +242,7 @@ pub(crate) enum RecordBotGasReceiptCostError {
     #[error(transparent)]
     Rpc(#[from] RpcError<TransportErrorKind>),
     #[error("invalid block timestamp {timestamp} on {chain:?}")]
-    InvalidBlockTimestamp { chain: BotGasChain, timestamp: u64 },
+    InvalidBlockTimestamp { chain: Chain, timestamp: u64 },
     #[error(transparent)]
     Valuation(#[from] EthUsdValuationError),
     #[error(transparent)]
@@ -258,10 +256,15 @@ pub(crate) enum RecordBotGasReceiptCostError {
          dead-lettering this gas cost fact"
     )]
     RedriveLimitReached {
-        chain: BotGasChain,
+        chain: Chain,
         tx_hash: TxHash,
         attempts: u32,
     },
+    /// The job names a chain this context holds no wallet for. Recording the
+    /// cost would need a payer address to check the receipt against, so the
+    /// attempt fails rather than attributing the gas to the wrong wallet.
+    #[error("no bot wallet is wired for {chain}, so its receipt gas cannot be recorded")]
+    UnwiredChain { chain: Chain },
 }
 
 impl From<SendError<BotGasReceiptCost>> for RecordBotGasReceiptCostError {
@@ -286,11 +289,14 @@ impl Job<RecordBotGasReceiptCostCtx> for RecordBotGasReceiptCost {
 
     async fn perform(&self, ctx: &RecordBotGasReceiptCostCtx) -> Result<Self::Output, Self::Error> {
         let (provider, bot_wallet) = match self.chain {
-            BotGasChain::Base => (ctx.base_wallet.provider(), ctx.base_wallet.address()),
-            BotGasChain::Ethereum => (
+            Chain::Base => (ctx.base_wallet.provider(), ctx.base_wallet.address()),
+            Chain::Ethereum => (
                 ctx.ethereum_wallet.provider(),
                 ctx.ethereum_wallet.address(),
             ),
+            Chain::HyperEvm => {
+                return Err(RecordBotGasReceiptCostError::UnwiredChain { chain: self.chain });
+            }
         };
 
         // A confirmed tx should have a receipt; a missing one here, or an RPC
@@ -502,12 +508,13 @@ fn is_transient_rpc_error(error: &EthUsdValuationError) -> bool {
         | EthUsdValuationError::Decimal { .. }
         | EthUsdValuationError::Arithmetic(_)
         | EthUsdValuationError::InvalidUpdatedAt(_)
-        | EthUsdValuationError::DecimalsOutOfRange { .. } => false,
+        | EthUsdValuationError::DecimalsOutOfRange { .. }
+        | EthUsdValuationError::NonEthGasToken { .. } => false,
     }
 }
 
 fn block_timestamp(
-    chain: BotGasChain,
+    chain: Chain,
     timestamp_secs: u64,
 ) -> Result<DateTime<chrono::Utc>, RecordBotGasReceiptCostError> {
     let secs = i64::try_from(timestamp_secs).map_err(|_| {
@@ -758,7 +765,7 @@ mod tests {
         let ctx = ctx_with_asserter_and_queue(&asserter, ledger, job_queue);
 
         let error = RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::VaultDeposit,
             symbol: None,
@@ -779,6 +786,37 @@ mod tests {
         (error, pending)
     }
 
+    /// The context carries a Base and an Ethereum wallet only. A job naming a
+    /// third chain has no payer address to check the receipt against, so it
+    /// must fail rather than fall back to one of the wallets it does hold --
+    /// which would attribute the gas to the wrong wallet.
+    #[tokio::test]
+    async fn a_chain_with_no_wired_wallet_is_refused() {
+        let asserter = Asserter::new();
+        let (ledger, _store) = ledger_and_store().await;
+        let ctx = ctx_with_asserter(&asserter, ledger).await;
+
+        let job = RecordBotGasReceiptCost {
+            chain: Chain::HyperEvm,
+            tx_hash: TxHash::repeat_byte(0x11),
+            category: BotGasOperationCategory::VaultDeposit,
+            symbol: None,
+            redrive_attempts: 0,
+        };
+
+        let error = job.perform(&ctx).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RecordBotGasReceiptCostError::UnwiredChain {
+                    chain: Chain::HyperEvm
+                }
+            ),
+            "expected UnwiredChain, got: {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn happy_path_records_cost_for_base_receipt() {
         let occurred_at = Utc.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap();
@@ -788,7 +826,7 @@ mod tests {
         let ctx = ctx_with_asserter(&asserter, ledger).await;
 
         let job = RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::VaultDeposit,
             symbol: None,
@@ -798,7 +836,7 @@ mod tests {
         job.perform(&ctx).await.unwrap();
 
         let id = super::super::BotGasReceiptCostId {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
         };
         let recorded = store
@@ -829,7 +867,7 @@ mod tests {
         let ctx = ctx_with_asserter(&asserter, ledger).await;
 
         let job = RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::VaultDeposit,
             symbol: None,
@@ -860,7 +898,7 @@ mod tests {
         let ctx = ctx_with_asserter(&asserter, ledger).await;
 
         let job = RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::CctpMint,
             symbol: None,
@@ -872,7 +910,7 @@ mod tests {
             .expect("a relayer-paid CCTP mint must be skipped, not fail the job");
 
         let id = super::super::BotGasReceiptCostId {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
         };
         let recorded = store.load(&id).await.unwrap();
@@ -893,7 +931,7 @@ mod tests {
         let ctx = ctx_with_asserter(&asserter, ledger).await;
 
         let job = RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::VaultDeposit,
             symbol: None,
@@ -905,7 +943,7 @@ mod tests {
             .expect("a reverted receipt must be skipped, not fail the job");
 
         let id = super::super::BotGasReceiptCostId {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
         };
         let recorded = store.load(&id).await.unwrap();
@@ -925,7 +963,7 @@ mod tests {
         queue_happy_path_responses(&first_asserter, occurred_at);
         let first_ctx = ctx_with_asserter(&first_asserter, ledger.clone()).await;
         let job = RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::VaultDeposit,
             symbol: None,
@@ -978,7 +1016,7 @@ mod tests {
         let occurred_at = Utc.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap();
         let (ledger, store, pool) = ledger_store_and_pool().await;
         let job = RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::VaultDeposit,
             symbol: None,
@@ -1002,7 +1040,7 @@ mod tests {
         }
 
         let id = super::super::BotGasReceiptCostId {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
         };
         let recorded = store
@@ -1043,7 +1081,7 @@ mod tests {
         let ctx = ctx_with_asserter_and_queue(&asserter, ledger, job_queue);
 
         let job = RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::VaultDeposit,
             symbol: None,
@@ -1078,7 +1116,7 @@ mod tests {
         let ctx = ctx_with_asserter_and_queue(&asserter, ledger, job_queue);
 
         let job = RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::VaultDeposit,
             symbol: None,
@@ -1129,7 +1167,7 @@ mod tests {
         let ctx = ctx_with_asserter_and_queue(&asserter, ledger, job_queue);
 
         let job = RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::VaultDeposit,
             symbol: None,
@@ -1171,7 +1209,7 @@ mod tests {
         let ctx = ctx_with_asserter_and_queue(&asserter, ledger, job_queue);
 
         let job = RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::VaultDeposit,
             symbol: None,
@@ -1209,7 +1247,7 @@ mod tests {
         let ctx = ctx_with_asserter_and_queue(&asserter, ledger, job_queue);
 
         let job = RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::VaultDeposit,
             symbol: None,
@@ -1249,7 +1287,7 @@ mod tests {
         let ctx = ctx_with_asserter_and_queue(&asserter, ledger, job_queue);
 
         let job = RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::VaultDeposit,
             symbol: None,
@@ -1349,7 +1387,7 @@ mod tests {
         let ctx = ctx_with_asserter_and_queue(&asserter, ledger, job_queue);
 
         let job = RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::VaultDeposit,
             symbol: None,
@@ -1381,7 +1419,7 @@ mod tests {
         let ctx = ctx_with_asserter_and_queue(&asserter, ledger, job_queue);
 
         let job = RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::VaultDeposit,
             symbol: None,
@@ -1437,7 +1475,7 @@ mod tests {
         // match for the store lookup key below to line up with what
         // `from_receipt` actually persists.
         let job = RecordBotGasReceiptCost {
-            chain: BotGasChain::Ethereum,
+            chain: Chain::Ethereum,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::WalletTransfer,
             symbol: None,
@@ -1447,7 +1485,7 @@ mod tests {
         job.perform(&ctx).await.unwrap();
 
         let id = super::super::BotGasReceiptCostId {
-            chain: BotGasChain::Ethereum,
+            chain: Chain::Ethereum,
             tx_hash: TxHash::repeat_byte(0x11),
         };
         let recorded = store
@@ -1482,7 +1520,7 @@ mod tests {
         queue_happy_path_responses(&asserter, occurred_at);
         let ctx = ctx_with_asserter(&asserter, ledger).await;
         let job = RecordBotGasReceiptCost {
-            chain: BotGasChain::Base,
+            chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
             category: BotGasOperationCategory::VaultDeposit,
             symbol: Some(Symbol::new("AAPL").unwrap()),

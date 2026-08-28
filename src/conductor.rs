@@ -1723,10 +1723,10 @@ struct PositionAndRebalancing {
 
 /// Builds the wrapper service from the single wallet/config source shared by
 /// startup approvals, portfolio snapshots, and rebalancing.
-fn build_wrapper<Chain: Wallet + Clone>(
-    base_wallet: Chain,
+fn build_wrapper<Signer: Wallet + Clone>(
+    base_wallet: Signer,
     ctx: &Ctx,
-) -> Arc<WrapperService<Chain>> {
+) -> Arc<WrapperService<Signer>> {
     Arc::new(WrapperService::new(
         base_wallet,
         to_wrapped_equities(&ctx.assets.equities.symbols),
@@ -1940,13 +1940,13 @@ struct MintAuthorizationInfra {
 /// authorization, unlike resume jobs, which startup re-derives). A failed
 /// sweep fails startup -- an unrepaired orphan would read as a live
 /// delivery and suppress resume.
-async fn build_mint_authorization_infra<Chain>(
+async fn build_mint_authorization_infra<Signer>(
     ctx: &Ctx,
     apalis_pool: &apalis_sqlite::SqlitePool,
-    base_wallet: &Chain,
+    base_wallet: &Signer,
 ) -> anyhow::Result<MintAuthorizationInfra>
 where
-    Chain: Wallet + Clone + Send + Sync + 'static,
+    Signer: Wallet + Clone + Send + Sync + 'static,
 {
     let issuance_client = Arc::new(IssuanceClient::new(
         ctx.issuance.base_url.clone(),
@@ -2054,11 +2054,11 @@ async fn wire_freeze_guard(
 
 /// Builds the rebalancing [`RaindexService`]: writes settle through the shared
 /// inventory, `market_maker_wallet` signs and appears as the operator.
-fn build_rebalancing_raindex_service<Chain: Wallet + Clone>(
-    base_wallet: &Chain,
+fn build_rebalancing_raindex_service<Signer: Wallet + Clone>(
+    base_wallet: &Signer,
     ctx: &Ctx,
     market_maker_wallet: Address,
-) -> Arc<RaindexService<Chain>> {
+) -> Arc<RaindexService<Signer>> {
     Arc::new(RaindexService::new(
         base_wallet.clone(),
         crate::onchain::raindex_contracts(&ctx.evm),
@@ -2076,8 +2076,8 @@ fn build_rebalancing_raindex_service<Chain: Wallet + Clone>(
 /// play (integration tests and any not-yet-migrated setup), so there is no
 /// `OPERATOR_ROLE` to check and the orderbook allowance is the live one, not a
 /// stale artifact to revoke.
-async fn preflight_inventory_access<Chain: Wallet + Clone>(
-    raindex_service: &RaindexService<Chain>,
+async fn preflight_inventory_access<Signer: Wallet + Clone>(
+    raindex_service: &RaindexService<Signer>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     let InventoryMode::Managed { inventory } = ctx.evm.inventory else {
@@ -2108,8 +2108,8 @@ async fn preflight_inventory_access<Chain: Wallet + Clone>(
 /// orderbook directly. Deposits now approve the inventory instead, so a
 /// leftover orderbook allowance is dead capital-exposure surface. Idempotent
 /// (a no-op once zero) and non-fatal -- a failure here must not block startup.
-async fn revoke_stale_orderbook_allowances<Chain: Wallet + Clone>(
-    raindex_service: &RaindexService<Chain>,
+async fn revoke_stale_orderbook_allowances<Signer: Wallet + Clone>(
+    raindex_service: &RaindexService<Signer>,
     ctx: &Ctx,
 ) {
     let revoke_tokens = std::iter::once(st0x_evm::USDC_BASE).chain(
@@ -2202,14 +2202,14 @@ async fn build_query_frameworks(
 /// services `RebalancerServices` needs. The telemetry wrap happens here (not
 /// at a lower layer) so rebalancer Alpaca calls emit broker dependency
 /// samples, mirroring the hedge executor's own wrapping.
-async fn build_rebalancer_services<Chain: Wallet + Clone>(
+async fn build_rebalancer_services<Signer: Wallet + Clone>(
     alpaca_auth: &AlpacaBrokerApiCtx,
-    wallets: ChainWallets<Chain>,
-    raindex_service: Arc<RaindexService<Chain>>,
+    wallets: ChainWallets<Signer>,
+    raindex_service: Arc<RaindexService<Signer>>,
     rebalancing_ctx: &RebalancingCtx,
     required_confirmations: u64,
     telemetry: TelemetrySender,
-) -> anyhow::Result<RebalancerServices<Chain>> {
+) -> anyhow::Result<RebalancerServices<Signer>> {
     let alpaca_wallet = Arc::new(AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
         alpaca_auth.account_id,
@@ -2240,10 +2240,10 @@ async fn build_rebalancer_services<Chain: Wallet + Clone>(
     .map_err(Into::into)
 }
 
-fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
+fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     redemption_wallet: Address,
-    wallets: ChainWallets<Chain>,
+    wallets: ChainWallets<Signer>,
     deps: RebalancingDeps,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = anyhow::Result<RebalancingInfrastructure>> + Send>,
@@ -2538,11 +2538,11 @@ async fn catch_up_stage_timing_projections(
 /// dependencies; the unwrapped store additionally needs the base `wallet`
 /// address to settle unwraps. Kept together because they are the recovery
 /// counterpart built from the same `recovery_transfer`.
-async fn build_equity_recovery_stores<Chain: Wallet + Clone>(
+async fn build_equity_recovery_stores<Signer: Wallet + Clone>(
     pool: &SqlitePool,
-    raindex: Arc<RaindexService<Chain>>,
+    raindex: Arc<RaindexService<Signer>>,
     vault_lookup: Arc<dyn VaultLookup>,
-    wrapper: Arc<WrapperService<Chain>>,
+    wrapper: Arc<WrapperService<Signer>>,
     transfer: Arc<CrossVenueEquityTransfer>,
     wallet: Address,
     bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
@@ -4596,7 +4596,7 @@ mod tests {
     }
 
     /// A wallet-backed `RaindexService` whose provider is an [`Asserter`] mock, so
-    /// `preflight_inventory_access` (which needs `Chain: Wallet`) can run without
+    /// `preflight_inventory_access` (which needs `Signer: Wallet`) can run without
     /// a live chain. Any eth_call it makes pops a response from `asserter`; an
     /// empty asserter therefore proves the code made no call.
     fn mock_wallet_raindex_service(

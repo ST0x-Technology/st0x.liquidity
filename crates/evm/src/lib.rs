@@ -42,6 +42,9 @@ pub use nonce::ResettableNonceManager;
 mod bindings;
 pub use bindings::IERC20;
 
+mod chain;
+pub use chain::{Chain, ParseChainError};
+
 mod tokens;
 pub use tokens::{USDC_BASE, USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
 
