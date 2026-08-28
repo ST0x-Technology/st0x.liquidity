@@ -20,10 +20,11 @@ Related work:
 
 ## What Changes
 
-The cutover changes three values under `[raindex]` in the deployment config:
+The cutover changes three values under `[chains.<name>.trading]` in the
+deployment config:
 
 ```toml
-[raindex]
+[chains.base.trading]
 inventory_mode = "managed"
 inventory = "<INVENTORY_ADDRESS>"
 vault_owner = "<INVENTORY_ADDRESS>"

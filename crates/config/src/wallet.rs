@@ -13,9 +13,8 @@ use std::sync::Arc;
 use tracing::info;
 use url::Url;
 
-use st0x_evm::{Wallet, WalletCtx as EvmWalletCtx, WalletKind};
+use st0x_evm::{Chain, Wallet, WalletCtx as EvmWalletCtx, WalletKind};
 
-const REQUIRED_CONFIRMATIONS: u64 = 3;
 const RPC_MAX_RETRIES: u32 = 10;
 const RPC_INITIAL_BACKOFF_MS: u64 = 1000;
 const RPC_COMPUTE_UNITS_PER_SECOND: u64 = 100;
@@ -50,10 +49,10 @@ pub enum WalletCtxError {
     #[error("failed to build the wallet RPC HTTP client: {0}")]
     HttpClient(#[from] reqwest::Error),
     #[error(
-        "{field} must use https; http is allowed only for loopback hosts \
-         (local test nodes)"
+        "[chains.{chain}] rpc_url must use https; http is allowed only for loopback \
+         hosts (local test nodes)"
     )]
-    InsecureRpcUrl { field: &'static str },
+    InsecureRpcUrl { chain: Chain },
     #[error(transparent)]
     Evm(#[from] st0x_evm::EvmError),
 }
@@ -63,10 +62,7 @@ pub enum WalletCtxError {
 /// (Anvil) keep working while any routable endpoint must be HTTPS. Enforced
 /// both at config load and in [`OnchainWalletCtx::new`], so no caller of the
 /// public constructor can bypass it.
-pub(crate) fn require_secure_wallet_rpc_url(
-    url: &Url,
-    field: &'static str,
-) -> Result<(), WalletCtxError> {
+pub(crate) fn require_secure_wallet_rpc_url(url: &Url, chain: Chain) -> Result<(), WalletCtxError> {
     if url.scheme() == "https" {
         return Ok(());
     }
@@ -81,7 +77,7 @@ pub(crate) fn require_secure_wallet_rpc_url(
     if is_loopback && url.scheme() == "http" {
         Ok(())
     } else {
-        Err(WalletCtxError::InsecureRpcUrl { field })
+        Err(WalletCtxError::InsecureRpcUrl { chain })
     }
 }
 
@@ -96,11 +92,34 @@ pub struct OnchainWalletCtx {
     hyperevm: Arc<dyn Wallet<Provider = RootProvider>>,
 }
 
+/// What one chain's signer is built from: its endpoint and the confirmation
+/// depth its submitted transactions wait for. The depth comes from that
+/// chain's `[chains.<name>]` entry -- a load-balanced RPC fleet can route a
+/// later request to a node that has not seen the tx, so every submission
+/// waits out its own chain's reorg behaviour, not a global constant.
+pub struct SigningChain {
+    pub rpc_url: Url,
+    pub required_confirmations: u64,
+}
+
+/// Per-chain signer parameters for every chain the wallet is built for.
+///
+/// Named fields rather than a map so "a signer exists for every signing chain"
+/// holds by construction, and the accessors below can hand out a wallet
+/// without an `Option` the caller cannot act on. `validate_wallet_inputs`
+/// produces this from the chain registry, failing when an entry is absent.
+pub struct SigningChains {
+    pub base: SigningChain,
+    pub ethereum: SigningChain,
+    pub hyperevm: SigningChain,
+}
+
 impl OnchainWalletCtx {
-    /// Build wallets for all chains from raw TOML config/secrets and RPC URLs.
+    /// Build one signing wallet per chain from raw TOML config/secrets and the
+    /// registry's RPC endpoints.
     ///
     /// Without wallet features, `WalletKind` is uninhabited so
-    /// deserialization always fails at the `?` — making later clones
+    /// deserialization always fails at the `?` -- making later clones
     /// appear redundant to clippy.
     #[cfg_attr(
         not(any(feature = "wallet-turnkey", feature = "wallet-private-key")),
@@ -109,13 +128,17 @@ impl OnchainWalletCtx {
     pub async fn new(
         wallet_config: toml::Value,
         wallet_secrets: toml::Value,
-        base_rpc_url: Url,
-        ethereum_rpc_url: Url,
-        hyperevm_rpc_url: Url,
+        chains: SigningChains,
     ) -> Result<Self, WalletCtxError> {
-        require_secure_wallet_rpc_url(&base_rpc_url, "base_rpc_url")?;
-        require_secure_wallet_rpc_url(&ethereum_rpc_url, "ethereum_rpc_url")?;
-        require_secure_wallet_rpc_url(&hyperevm_rpc_url, "hyperevm_rpc_url")?;
+        let SigningChains {
+            base,
+            ethereum,
+            hyperevm,
+        } = chains;
+
+        require_secure_wallet_rpc_url(&base.rpc_url, Chain::Base)?;
+        require_secure_wallet_rpc_url(&ethereum.rpc_url, Chain::Ethereum)?;
+        require_secure_wallet_rpc_url(&hyperevm.rpc_url, Chain::HyperEvm)?;
 
         let WalletKindTag { kind } = WalletKindTag::deserialize(wallet_config.clone())?;
 
@@ -124,15 +147,23 @@ impl OnchainWalletCtx {
                 &kind,
                 wallet_config.clone(),
                 wallet_secrets.clone(),
-                base_rpc_url,
+                base.rpc_url,
+                base.required_confirmations,
             ),
             build_wallet(
                 &kind,
                 wallet_config.clone(),
                 wallet_secrets.clone(),
-                ethereum_rpc_url,
+                ethereum.rpc_url,
+                ethereum.required_confirmations,
             ),
-            build_wallet(&kind, wallet_config, wallet_secrets, hyperevm_rpc_url,),
+            build_wallet(
+                &kind,
+                wallet_config,
+                wallet_secrets,
+                hyperevm.rpc_url,
+                hyperevm.required_confirmations,
+            ),
         )?;
 
         info!(
@@ -197,6 +228,7 @@ pub async fn build_wallet(
     wallet_config: toml::Value,
     wallet_secrets: toml::Value,
     rpc_url: Url,
+    required_confirmations: u64,
 ) -> Result<Arc<dyn Wallet<Provider = RootProvider>>, WalletCtxError> {
     let provider = RootProvider::new(http_client_with_retry(rpc_url)?);
 
@@ -205,7 +237,7 @@ pub async fn build_wallet(
             settings: TomlValue(wallet_config),
             credentials: TomlValue(wallet_secrets),
             provider,
-            required_confirmations: REQUIRED_CONFIRMATIONS,
+            required_confirmations,
         })
         .await?)
 }

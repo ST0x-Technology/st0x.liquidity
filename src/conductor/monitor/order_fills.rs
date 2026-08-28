@@ -79,7 +79,7 @@ use task_supervisor::{SupervisedTask, TaskResult};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
-use st0x_config::{EvmCtx, IngestionCutoff};
+use st0x_config::{IngestionCutoff, TradingChain};
 
 use crate::conductor::job::QueuePushError;
 use crate::onchain::OnChainError;
@@ -100,7 +100,7 @@ use crate::telemetry::{
 /// checkpoint -- so a hiccup never halts ingestion.
 #[derive(Clone)]
 pub(crate) struct OrderFillMonitor<P> {
-    evm_ctx: EvmCtx,
+    evm_ctx: TradingChain,
     backfill_queue: BackfillJobQueue,
     pool: SqlitePool,
     provider: P,
@@ -109,7 +109,7 @@ pub(crate) struct OrderFillMonitor<P> {
 
 impl<P> OrderFillMonitor<P> {
     pub(crate) fn new(
-        evm_ctx: EvmCtx,
+        evm_ctx: TradingChain,
         backfill_queue: BackfillJobQueue,
         pool: SqlitePool,
         provider: P,
@@ -600,7 +600,8 @@ mod tests {
     use serde_json::Value;
     use sqlx::{ConnectOptions, SqlitePool};
 
-    use st0x_config::InventoryMode;
+    use st0x_config::{InventoryAdapters, InventoryMode};
+    use st0x_evm::Chain;
 
     use super::*;
     use crate::test_utils::setup_test_pools;
@@ -663,7 +664,7 @@ mod tests {
         OrderFillMonitor<P>,
         SqlitePool,
         apalis_sqlite::SqlitePool,
-        EvmCtx,
+        TradingChain,
     ) {
         setup_with_deployment_block(provider, 1).await
     }
@@ -675,7 +676,7 @@ mod tests {
         OrderFillMonitor<P>,
         SqlitePool,
         apalis_sqlite::SqlitePool,
-        EvmCtx,
+        TradingChain,
     ) {
         setup_with_deployment_block_and_cutoff(provider, deployment_block, IngestionCutoff::Safe)
             .await
@@ -689,12 +690,14 @@ mod tests {
         OrderFillMonitor<P>,
         SqlitePool,
         apalis_sqlite::SqlitePool,
-        EvmCtx,
+        TradingChain,
     ) {
         let (pool, apalis_pool) = setup_test_pools().await;
         let backfill_queue = BackfillJobQueue::new(&apalis_pool);
 
-        let evm_ctx = EvmCtx {
+        let evm_ctx = TradingChain {
+            chain: Chain::Base,
+            inventory_adapters: InventoryAdapters::default(),
             rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             inventory: InventoryMode::Managed {
@@ -1273,7 +1276,9 @@ mod tests {
         let (pool, apalis_pool, db_path, _dir) =
             crate::test_utils::setup_file_backed_test_db(Duration::from_millis(250)).await;
         let backfill_queue = BackfillJobQueue::new(&apalis_pool);
-        let evm_ctx = EvmCtx {
+        let evm_ctx = TradingChain {
+            chain: Chain::Base,
+            inventory_adapters: InventoryAdapters::default(),
             rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             inventory: InventoryMode::Managed {

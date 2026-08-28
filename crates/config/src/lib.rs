@@ -6,7 +6,7 @@
 
 mod alerts;
 mod bot_gas_valuation;
-mod evm;
+mod chain;
 mod imbalance_threshold;
 mod loader;
 mod orchestrator;
@@ -19,9 +19,10 @@ mod wallet;
 
 pub use alerts::{AlertsAssemblyError, AlertsConfig, AlertsCtx, AlertsSecrets};
 pub use bot_gas_valuation::BotGasValuationConfig;
-pub use evm::{
-    EvmConfig, EvmConfigError, EvmCtx, EvmSecrets, IngestionCutoff, InventoryAdapter,
-    InventoryAdapterVenue, InventoryAdapters, InventoryMode, InventoryModeTag,
+pub use chain::{
+    ChainConfig, ChainConfigError, ChainCtx, ChainRegistry, ChainRegistryError, ChainSecrets,
+    IngestionCutoff, InventoryAdapter, InventoryAdapterVenue, InventoryAdapters, InventoryMode,
+    InventoryModeTag, TradingChain, TradingConfig,
 };
 pub use imbalance_threshold::{ImbalanceThreshold, InvalidImbalanceThreshold};
 pub use loader::*;
@@ -37,4 +38,4 @@ pub use telemetry::{
     mk_env_filter, setup_tracing,
 };
 pub use threshold::{ExecutionThreshold, InvalidThresholdError};
-pub use wallet::{OnchainWalletCtx, WalletCtxError, build_wallet};
+pub use wallet::{OnchainWalletCtx, SigningChains, WalletCtxError, build_wallet};

@@ -141,11 +141,13 @@ mod tests {
     use alloy::primitives::{Address, address};
     use url::Url;
 
+    use st0x_config::ChainRegistry;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
-        AssetsConfig, BrokerCtx, EquitiesConfig, EvmCtx, ExecutionThreshold, IngestionCutoff,
-        InventoryAdapters, InventoryMode, LogFormat, LogLevel, TradingMode,
+        AssetsConfig, BrokerCtx, EquitiesConfig, ExecutionThreshold, IngestionCutoff,
+        InventoryAdapters, InventoryMode, LogFormat, LogLevel, TradingChain, TradingMode,
     };
+    use st0x_evm::Chain;
 
     use super::*;
     use crate::test_utils::positive_shares;
@@ -200,7 +202,9 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            evm: EvmCtx {
+            chains: ChainRegistry::single_trading_chain(TradingChain {
+                chain: Chain::Base,
+                inventory_adapters: InventoryAdapters::default(),
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 inventory: InventoryMode::Managed {
@@ -210,8 +214,7 @@ mod tests {
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
-            },
-            inventory_adapters: InventoryAdapters::default(),
+            }),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,

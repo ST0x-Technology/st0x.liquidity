@@ -1,13 +1,13 @@
 //! CCTP bridge and recovery CLI commands.
 
-use alloy::primitives::{B256, U256};
+use alloy::primitives::{Address, B256, U256};
 use rain_math_float::Float;
 use std::io::Write;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection};
-use st0x_config::Ctx;
-use st0x_evm::{Evm, IERC20, IntoErrorRegistry, USDC_BASE, USDC_ETHEREUM, Wallet};
+use st0x_config::{ChainRegistry, Ctx};
+use st0x_evm::{Chain, Evm, IERC20, IntoErrorRegistry, USDC_BASE, USDC_ETHEREUM, Wallet};
 use st0x_finance::Usdc;
 use st0x_float_serde::format_float_with_fallback;
 
@@ -185,20 +185,16 @@ pub(super) async fn reset_allowance_command<Registry: IntoErrorRegistry, Writer:
 ) -> anyhow::Result<()> {
     let wallet_ctx = ctx.wallet()?;
 
-    let (usdc_address, spender, chain_name, caller) = match chain {
+    let (usdc_address, requested, chain_name, caller) = match chain {
         CctpChain::Ethereum => (
             USDC_ETHEREUM,
-            ctx.evm.orderbook,
+            Chain::Ethereum,
             "Ethereum",
             wallet_ctx.ethereum_wallet(),
         ),
-        CctpChain::Base => (
-            USDC_BASE,
-            ctx.evm.orderbook,
-            "Base",
-            wallet_ctx.base_wallet(),
-        ),
+        CctpChain::Base => (USDC_BASE, Chain::Base, "Base", wallet_ctx.base_wallet()),
     };
+    let spender = orderbook_spender(&ctx.chains, requested)?;
 
     let owner = caller.address();
 
@@ -238,18 +234,40 @@ pub(super) async fn reset_allowance_command<Registry: IntoErrorRegistry, Writer:
     Ok(())
 }
 
+/// The orderbook address whose USDC allowance the reset targets.
+///
+/// The orderbook only exists on the trading chain, so a reset requested for
+/// any other chain must refuse: reusing the trading chain's address there
+/// would zero an allowance nothing holds while the real spender on the
+/// requested chain stays approved.
+fn orderbook_spender(registry: &ChainRegistry, requested: Chain) -> anyhow::Result<Address> {
+    let trading = registry.sole_trading();
+    if trading.chain != requested {
+        anyhow::bail!(
+            "reset-allowance targets the orderbook, which only exists on the trading chain \
+             ({trading_chain}); requested {requested}",
+            trading_chain = trading.chain,
+        );
+    }
+
+    Ok(trading.orderbook)
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address};
     use url::Url;
 
     use rain_math_float::Float;
+
+    use st0x_config::ChainRegistry;
     use st0x_config::ExecutionThreshold;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
         AssetsConfig, BrokerCtx, CtxError, EquitiesConfig, LogFormat, LogLevel, TradingMode,
     };
-    use st0x_config::{EvmCtx, IngestionCutoff, InventoryAdapters, InventoryMode};
+    use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
+    use st0x_evm::Chain;
     use st0x_evm::OpenChainErrorRegistry;
     use st0x_finance::Usdc;
 
@@ -264,7 +282,9 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            evm: EvmCtx {
+            chains: ChainRegistry::single_trading_chain(TradingChain {
+                chain: Chain::Base,
+                inventory_adapters: InventoryAdapters::default(),
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 inventory: InventoryMode::Managed {
@@ -274,8 +294,7 @@ mod tests {
                 deployment_block: 1,
                 required_confirmations: 0,
                 ingestion_cutoff: IngestionCutoff::Safe,
-            },
-            inventory_adapters: InventoryAdapters::default(),
+            }),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
@@ -350,6 +369,34 @@ mod tests {
                 Some(CtxError::WalletNotConfigured)
             ),
             "Expected CtxError::WalletNotConfigured, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn reset_allowance_resolves_the_trading_chain_orderbook() {
+        let ctx = create_ctx_without_rebalancing();
+
+        let spender = orderbook_spender(&ctx.chains, Chain::Base).unwrap();
+
+        assert_eq!(
+            spender,
+            address!("0x1234567890123456789012345678901234567890")
+        );
+    }
+
+    #[test]
+    fn reset_allowance_refuses_a_chain_that_is_not_the_trading_chain() {
+        // The Base orderbook address means nothing on Ethereum: an approve(0)
+        // there would report success while the real Ethereum spender stayed
+        // approved.
+        let ctx = create_ctx_without_rebalancing();
+
+        let error = orderbook_spender(&ctx.chains, Chain::Ethereum).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "reset-allowance targets the orderbook, which only exists on the trading chain \
+             (base); requested ethereum"
         );
     }
 

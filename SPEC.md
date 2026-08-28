@@ -105,7 +105,7 @@ Automated rebalancing is Alpaca Broker API based.
 
 Rebalancing deposits and withdrawals do not necessarily settle on the Rain
 OrderBook directly. The system supports two settlement modes, selected
-explicitly per deployment via `inventory_mode` under `[raindex]`:
+explicitly per deployment via `inventory_mode` under `[chains.<name>.trading]`:
 
 - **Legacy** (`inventory_mode = "legacy"`): the bot's own EOA owns the Raindex
   vaults and `deposit4`/`withdraw4` settle against the OrderBook itself. No
@@ -120,12 +120,12 @@ explicitly per deployment via `inventory_mode` under `[raindex]`:
   clear error rather than reverting on the first rebalance; it also revokes any
   stale pre-migration allowance the bot granted the OrderBook directly.
 
-Each deployment explicitly configures its inventory adapters under `[raindex]`
-as venue/operator pairs. These public onchain addresses are deployment settings,
-not secrets or environment variables. The same venue may list more than one
-operator during a rotation, but one operator cannot name multiple venues. Legacy
-mode forbids adapter entries because it has no shared inventory through which
-they could settle.
+Each deployment explicitly configures its inventory adapters under
+`[chains.<name>.trading]` as venue/operator pairs. These public onchain
+addresses are deployment settings, not secrets or environment variables. The
+same venue may list more than one operator during a rotation, but one operator
+cannot name multiple venues. Legacy mode forbids adapter entries because it has
+no shared inventory through which they could settle.
 
 Distinct from the settlement target is `vault_owner`: the on-chain owner every
 `vaultBalance2` read, vault-registry entry, and ClearV3/TakeOrderV3 order-owner

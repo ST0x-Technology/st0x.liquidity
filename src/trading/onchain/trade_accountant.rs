@@ -120,7 +120,7 @@ where
         let trade_result = match &trade_event.event {
             ClearV3(clear_event) => {
                 OnchainTrade::try_from_clear_v3(
-                    &ctx.ctx.evm,
+                    ctx.ctx.chains.sole_trading(),
                     &ctx.cache,
                     &ctx.evm,
                     *clear_event.clone(),
@@ -150,7 +150,7 @@ where
                     &ctx.cache,
                     &ctx.evm,
                     &ctx.ctx.assets,
-                    &ctx.ctx.inventory_adapters,
+                    &ctx.ctx.chains.sole_trading().inventory_adapters,
                     inv.as_ref(),
                     reconstructed_log,
                     None,
@@ -847,7 +847,7 @@ mod tests {
         let job_queue = DexTradeAccountingJobQueue::new(apalis_pool);
 
         AccountantCtx {
-            contracts: crate::onchain::raindex_contracts(&ctx.evm),
+            contracts: crate::onchain::raindex_contracts(ctx.chains.sole_trading()),
             ctx,
             cache,
             evm: st0x_evm::ReadOnlyEvm::new(provider),

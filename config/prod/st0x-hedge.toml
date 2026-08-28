@@ -41,7 +41,12 @@ close_flatten_cross_max_bps = 400
 beneficiary_entity_name = "T0 TRADE (BVI) LTD"
 
 # On-chain orderbook settings.
-[raindex]
+[chains.base]
+# Block confirmations required before a submitted transaction is treated as
+# settled. Does not govern fill ingestion (controlled by ingestion_cutoff).
+required_confirmations = 3
+
+[chains.base.trading]
 # Rain Orderbook contract on Base.
 orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 # Rebalancing settlement mode: "legacy" (settle directly against the orderbook
@@ -67,14 +72,21 @@ vault_owner = "0x10e4db39275C3b128C01bA1194D45D19aE1520d9"
 # Backfill floor. No inventory-owned event can predate its deployment block; an
 # existing later checkpoint still resumes at checkpoint + 1.
 deployment_block = 49746968
-# Block confirmations required before a submitted transaction is treated as
-# settled. Does not govern fill ingestion (controlled by ingestion_cutoff).
-required_confirmations = 3
 # Use the OP-Stack safe block as the fill-ingestion cutoff. This cuts hedging
 # lag from ~20 min (finalized) to ~seconds. See example.config.toml for tradeoffs.
 ingestion_cutoff = "safe"
 
-# Wallet configuration (Turnkey secure enclave signing).
+# Ethereum is a cash-corridor endpoint only: the bot holds USDC and signs
+# there, but runs no orderbook and ingests no fills, so it has no [trading]
+# table. Confirmations are deeper than Base's because an L1 reorg is a
+# different risk from an OP-Stack sequencer batch.
+[chains.ethereum]
+required_confirmations = 12
+
+# HyperEVM, same shape as Ethereum.
+[chains.hyperevm]
+required_confirmations = 1
+
 [wallet]
 kind = "turnkey"
 # On-chain address controlled by the Turnkey key.
