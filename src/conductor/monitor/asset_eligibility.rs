@@ -6,6 +6,13 @@
 //! mid-session start, per the spec's window rule) and then daily at the
 //! 19:55 ET slot five minutes before the overnight session opens.
 //!
+//! Daily on purpose, a superset of the spec's sync days (Sunday through
+//! Thursday plus holiday eves): a Friday or Saturday sync refreshes a
+//! store nothing reads, which costs a few requests but spares the
+//! scheduler a trading-calendar dependency. The session-scoped staleness
+//! check in `validate_overnight_eligibility` is what actually gates
+//! placements.
+//!
 //! A failed sync alerts through the [`Notifier`] path instead of
 //! silently serving stale eligibility: the session-scoped staleness
 //! check in `validate_overnight_eligibility` already fails closed, so
@@ -19,14 +26,15 @@ use task_supervisor::{SupervisedTask, TaskResult};
 use tracing::{error, info};
 
 use st0x_execution::{
-    AlpacaBrokerApi, EligibilitySnapshots, Symbol, next_eligibility_sync_at, sync_eligibility,
+    AlpacaBrokerApi, AlpacaBrokerApiCtx, EligibilitySnapshots, Symbol, TryIntoExecutor,
+    next_eligibility_sync_at, sync_eligibility,
 };
 
 use crate::alerts::Notifier;
 
 #[derive(Clone)]
 pub(crate) struct AssetEligibilityMonitor {
-    pub(crate) broker: Arc<AlpacaBrokerApi>,
+    pub(crate) broker_ctx: AlpacaBrokerApiCtx,
     pub(crate) symbols: Vec<Symbol>,
     pub(crate) store: EligibilitySnapshots,
     pub(crate) notifier: Arc<dyn Notifier>,
@@ -34,6 +42,12 @@ pub(crate) struct AssetEligibilityMonitor {
 
 impl SupervisedTask for AssetEligibilityMonitor {
     async fn run(&mut self) -> TaskResult {
+        // Built here rather than injected: construction verifies the
+        // account over HTTP, so a failure lands in the supervisor's
+        // restart-with-backoff path instead of aborting conductor
+        // startup.
+        let broker = self.broker_ctx.clone().try_into_executor().await?;
+
         info!(
             symbols = self.symbols.len(),
             "Asset eligibility monitor started"
@@ -41,7 +55,7 @@ impl SupervisedTask for AssetEligibilityMonitor {
 
         // Startup sync: a bot starting mid-session gets an in-window
         // snapshot immediately instead of deferring until 19:55.
-        self.sync_and_alert().await;
+        self.sync_and_alert(&broker).await;
 
         loop {
             let now = Utc::now();
@@ -52,14 +66,14 @@ impl SupervisedTask for AssetEligibilityMonitor {
             info!(%next, "Next asset eligibility sync scheduled");
             tokio::time::sleep(wait).await;
 
-            self.sync_and_alert().await;
+            self.sync_and_alert(&broker).await;
         }
     }
 }
 
 impl AssetEligibilityMonitor {
-    async fn sync_and_alert(&self) {
-        match sync_eligibility(&self.broker, &self.symbols, &self.store).await {
+    async fn sync_and_alert(&self, broker: &AlpacaBrokerApi) {
+        match sync_eligibility(broker, &self.symbols, &self.store).await {
             Ok(()) => info!(
                 symbols = self.symbols.len(),
                 "Asset eligibility sync completed"
@@ -125,8 +139,8 @@ mod tests {
         });
     }
 
-    async fn mock_broker(server: &MockServer) -> Arc<AlpacaBrokerApi> {
-        let ctx = AlpacaBrokerApiCtx {
+    fn mock_broker_ctx(server: &MockServer) -> AlpacaBrokerApiCtx {
+        AlpacaBrokerApiCtx {
             auth: st0x_execution::AlpacaBrokerAuth::Basic {
                 api_key: "test_key".to_string(),
                 api_secret: "test_secret".to_string(),
@@ -136,22 +150,28 @@ mod tests {
             asset_cache_ttl: Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
             counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-        };
-        Arc::new(ctx.try_into_executor().await.unwrap())
+        }
     }
 
-    fn monitor(
-        broker: Arc<AlpacaBrokerApi>,
+    async fn monitor_and_broker(
+        server: &MockServer,
         notifier: Arc<RecordingNotifier>,
-    ) -> (AssetEligibilityMonitor, EligibilitySnapshots) {
+    ) -> (
+        AssetEligibilityMonitor,
+        AlpacaBrokerApi,
+        EligibilitySnapshots,
+    ) {
+        let broker_ctx = mock_broker_ctx(server);
+        let broker = broker_ctx.clone().try_into_executor().await.unwrap();
         let store = EligibilitySnapshots::default();
         (
             AssetEligibilityMonitor {
-                broker,
+                broker_ctx,
                 symbols: vec![Symbol::new("AAPL").unwrap()],
                 store: store.clone(),
                 notifier,
             },
+            broker,
             store,
         )
     }
@@ -173,9 +193,9 @@ mod tests {
                 }));
         });
         let notifier = Arc::new(RecordingNotifier::default());
-        let (task, store) = monitor(mock_broker(&server).await, notifier.clone());
+        let (task, broker, store) = monitor_and_broker(&server, notifier.clone()).await;
 
-        task.sync_and_alert().await;
+        task.sync_and_alert(&broker).await;
 
         assert_eq!(
             store
@@ -197,9 +217,9 @@ mod tests {
             then.status(500).body("broker exploded");
         });
         let notifier = Arc::new(RecordingNotifier::default());
-        let (task, store) = monitor(mock_broker(&server).await, notifier.clone());
+        let (task, broker, store) = monitor_and_broker(&server, notifier.clone()).await;
 
-        task.sync_and_alert().await;
+        task.sync_and_alert(&broker).await;
 
         assert_eq!(store.get(&Symbol::new("AAPL").unwrap()), None);
         assert_eq!(
