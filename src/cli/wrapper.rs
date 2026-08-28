@@ -145,7 +145,7 @@ pub(super) async fn donate_equity_command<Writer: Write>(
     let owner = base_wallet.address();
     let wrapper = WrapperService::new(
         base_wallet,
-        to_wrapped_equities(&ctx.assets.equities.symbols),
+        to_wrapped_equities(&ctx.chains.sole_trading().assets.equities.symbols),
     );
 
     donate_equity_with_wrapper(stdout, &wrapper, owner, symbol, quantity).await
@@ -198,7 +198,7 @@ struct WrapContext {
 
 /// Resolves the wallet and the symbol to address map for a wrap or unwrap.
 ///
-/// Base resolves from `[assets.equities]` exactly as before. Non Base
+/// Base resolves from `[chains.<name>.trading.assets.equities]` exactly as before. Non Base
 /// networks have no config source, so the registry token list is required
 /// and a stray one on Base is rejected instead of silently ignored. The
 /// resolved map must contain the requested symbol so a typo fails here with
@@ -214,10 +214,12 @@ fn wrap_context(
         super::rebalancing::tokenization_network_context(wallet_ctx, network);
 
     let equities = match (network, registry) {
-        (TokenizationNetwork::Base, None) => to_wrapped_equities(&ctx.assets.equities.symbols),
+        (TokenizationNetwork::Base, None) => {
+            to_wrapped_equities(&ctx.chains.sole_trading().assets.equities.symbols)
+        }
         (TokenizationNetwork::Base, Some(_)) => anyhow::bail!(
             "--registry only applies to non Base networks: Base resolves \
-             from [assets.equities]"
+             from [chains.<name>.trading.assets.equities]"
         ),
         (TokenizationNetwork::Ethereum | TokenizationNetwork::HyperEvm, Some(path)) => {
             load_wrapped_equities(path, network.chain_id())?
@@ -248,10 +250,9 @@ mod tests {
 
     use st0x_config::ChainRegistry;
     use st0x_config::ExecutionThreshold;
+    use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
-    use st0x_config::{
-        AssetsConfig, BrokerCtx, Ctx, EquitiesConfig, LogFormat, LogLevel, TradingMode,
-    };
+    use st0x_config::{BrokerCtx, ChainAssets, Ctx, LogFormat, LogLevel, TradingMode};
     use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
     use st0x_evm::Chain;
     use st0x_execution::Symbol;
@@ -274,6 +275,8 @@ mod tests {
             server_port: 8080,
             board_port: 8081,
             chains: ChainRegistry::single_trading_chain(TradingChain {
+                redemption_wallet: None,
+                assets: ChainAssets::default(),
                 chain: Chain::Base,
                 inventory_adapters: InventoryAdapters::default(),
                 rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -306,10 +309,7 @@ mod tests {
             wallet: None,
             wallet_meta: None,
             execution_threshold: ExecutionThreshold::whole_share(),
-            assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            assets: HedgingAssets::default(),
             travel_rule: None,
             rest_api: None,
             issuance: create_test_issuance_ctx(),

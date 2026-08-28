@@ -21,7 +21,7 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use rain_math_float::Float;
-use st0x_config::{AssetsConfig, OperationMode};
+use st0x_config::{ChainAssets, OperationMode};
 use st0x_event_sorcery::{
     AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, Store, deps,
 };
@@ -157,7 +157,10 @@ pub(crate) struct RebalancingServiceConfig {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: Option<ImbalanceThreshold>,
     pub(crate) transfer_timeout: Duration,
-    pub(crate) assets: AssetsConfig,
+    pub(crate) assets: ChainAssets,
+    /// The broker-side cash reserve, which sits at the broker rather than on
+    /// any chain, so it does not travel with the chain's cash vaults.
+    pub(crate) cash_reserved: Option<Positive<Usd>>,
 }
 
 impl RebalancingServiceConfig {
@@ -3042,7 +3045,7 @@ impl RebalancingService {
         let usdc_limit = cash
             .and_then(|cash| cash.operational_limit)
             .map(Positive::inner);
-        let reserved = cash.and_then(|cash| cash.reserved).map(Positive::inner);
+        let reserved = self.config.cash_reserved.map(Positive::inner);
 
         Some((*threshold, usdc_limit, reserved))
     }
@@ -5443,15 +5446,8 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use rain_math_float::Float;
     use sqlx::SqlitePool;
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-    use tokio::sync::broadcast;
-    use uuid::Uuid;
-
     use st0x_config::{
-        CashAssetConfig, EquitiesConfig, EquityAssetConfig, ExecutionThreshold, OperationMode,
+        ChainCashAsset, ChainEquities, ChainEquityAsset, ExecutionThreshold, OperationMode,
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{
@@ -5466,6 +5462,12 @@ mod tests {
     use st0x_tokenization::mock::MockTokenizer;
     use st0x_tokenization::{issuer_request_id, tokenization_request_id};
     use st0x_wrapper::MockWrapper;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use tokio::sync::broadcast;
+    use uuid::Uuid;
 
     use super::*;
     use crate::alerts::{CapturingNotifier, NoopNotifier};
@@ -5547,6 +5549,7 @@ mod tests {
 
     fn test_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {
+            cash_reserved: None,
             equity: ImbalanceThreshold {
                 target: float!(0.5),
                 deviation: float!(0.2),
@@ -5556,13 +5559,12 @@ mod tests {
                 deviation: float!(0.2),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
-            assets: AssetsConfig {
+            assets: ChainAssets {
                 equities: rebalancing_enabled_equities(&["AAPL", "TSLA", "GOOG", "RKLB"]),
-                cash: Some(CashAssetConfig {
+                cash: Some(ChainCashAsset {
                     vault_ids: Vec::new(),
                     rebalancing: OperationMode::Enabled,
                     operational_limit: None,
-                    reserved: None,
                 }),
             },
         }
@@ -5570,6 +5572,7 @@ mod tests {
 
     fn test_config_with_timeout(timeout: Duration) -> RebalancingServiceConfig {
         RebalancingServiceConfig {
+            cash_reserved: None,
             transfer_timeout: timeout,
             ..test_config()
         }
@@ -5614,14 +5617,13 @@ mod tests {
         let mut config = test_config();
         config.assets.equities.symbols.insert(
             symbol.clone(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: Address::random(),
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Enabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -5671,14 +5673,13 @@ mod tests {
         let mut config = test_config();
         config.assets.equities.symbols.insert(
             symbol.clone(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: Address::random(),
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Enabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -5728,14 +5729,13 @@ mod tests {
         let mut config = test_config();
         config.assets.equities.symbols.insert(
             symbol.clone(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: Address::random(),
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -5836,19 +5836,19 @@ mod tests {
     /// Builds a `RebalancingService` with `wrapped_equity_recovery = Enabled` for `symbol`.
     async fn make_trigger_with_recovery_enabled(symbol: &Symbol) -> Arc<RebalancingService> {
         let config = RebalancingServiceConfig {
-            assets: AssetsConfig {
-                equities: EquitiesConfig {
+            cash_reserved: None,
+            assets: ChainAssets {
+                equities: ChainEquities {
                     operational_limit: None,
                     symbols: HashMap::from([(
                         symbol.clone(),
-                        EquityAssetConfig {
+                        ChainEquityAsset {
                             tokenized_equity: Address::ZERO,
                             tokenized_equity_derivative: Address::ZERO,
                             vault_ids: Vec::new(),
                             trading: OperationMode::Disabled,
                             rebalancing: OperationMode::Enabled,
                             wrapped_equity_recovery: OperationMode::Enabled,
-                            extended_hours_counter_trading: OperationMode::Disabled,
                             operational_limit: None,
                         },
                     )]),
@@ -7497,13 +7497,11 @@ mod tests {
 
         let trigger = RebalancingService::new(
             RebalancingServiceConfig {
+                cash_reserved: None,
                 equity: test_config().equity,
                 usdc: None,
                 transfer_timeout: test_config().transfer_timeout,
-                assets: AssetsConfig {
-                    equities: EquitiesConfig::default(),
-                    cash: None,
-                },
+                assets: ChainAssets::default(),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
@@ -7537,7 +7535,7 @@ mod tests {
     /// whitelist itself.
     async fn make_imbalanced_trigger_with_equities(
         symbol: &Symbol,
-        equities: EquitiesConfig,
+        equities: ChainEquities,
     ) -> Arc<RebalancingService> {
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
@@ -7555,7 +7553,8 @@ mod tests {
             .unwrap();
 
         let config = RebalancingServiceConfig {
-            assets: AssetsConfig {
+            cash_reserved: None,
+            assets: ChainAssets {
                 equities,
                 cash: None,
             },
@@ -7603,7 +7602,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
 
         let trigger =
-            make_imbalanced_trigger_with_equities(&symbol, EquitiesConfig::default()).await;
+            make_imbalanced_trigger_with_equities(&symbol, ChainEquities::default()).await;
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
@@ -19471,16 +19470,14 @@ mod tests {
         let schedulers = RebalancingSchedulers::new(&apalis_pool);
         let trigger = RebalancingService::new(
             RebalancingServiceConfig {
+                cash_reserved: None,
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 },
                 usdc: None,
                 transfer_timeout: Duration::from_secs(30 * 60),
-                assets: AssetsConfig {
-                    equities: EquitiesConfig::default(),
-                    cash: None,
-                },
+                assets: ChainAssets::default(),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {

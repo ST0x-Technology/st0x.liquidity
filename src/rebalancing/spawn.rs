@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
-use st0x_config::{EquityAssetConfig, OnchainWalletCtx};
+use st0x_config::{ChainEquityAsset, OnchainWalletCtx};
 use st0x_event_sorcery::Store;
 use st0x_evm::{USDC_BASE, USDC_ETHEREUM, Wallet};
 use st0x_execution::{AlpacaWalletService, EmptySymbolError, Symbol};
@@ -33,7 +33,7 @@ pub(crate) enum SpawnRebalancerError {
 /// Adapts the config-layer equity asset map to the narrow per-symbol token pairs
 /// [`WrapperService`] needs, keeping `st0x-wrapper` independent of `st0x-config`.
 pub(crate) fn to_wrapped_equities(
-    equities: &HashMap<Symbol, EquityAssetConfig>,
+    equities: &HashMap<Symbol, ChainEquityAsset>,
 ) -> HashMap<Symbol, WrappedEquity> {
     equities
         .iter()
@@ -197,7 +197,7 @@ mod tests {
     use std::collections::HashMap;
     use uuid::Uuid;
 
-    use st0x_config::{AssetsConfig, EquitiesConfig, OperationMode, RebalancingCtx};
+    use st0x_config::{ChainAssets, OperationMode, RebalancingCtx};
     use st0x_event_sorcery::test_store;
     use st0x_evm::Evm;
     use st0x_evm::local::RawPrivateKeyWallet;
@@ -227,14 +227,13 @@ mod tests {
         let mut config = HashMap::new();
         config.insert(
             symbol.clone(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: underlying,
                 tokenized_equity_derivative: derivative,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -344,13 +343,11 @@ mod tests {
         let ctx = make_ctx();
 
         let trigger_config = RebalancingServiceConfig {
+            cash_reserved: None,
             equity: ctx.equity,
             usdc: ctx.usdc,
             transfer_timeout: ctx.transfer_timeout,
-            assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            assets: ChainAssets::default(),
         };
 
         assert!(trigger_config.equity.target.eq(float!(0.5)).unwrap());
@@ -362,13 +359,11 @@ mod tests {
         let ctx = make_ctx();
 
         let trigger_config = RebalancingServiceConfig {
+            cash_reserved: None,
             equity: ctx.equity,
             usdc: ctx.usdc,
             transfer_timeout: ctx.transfer_timeout,
-            assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            assets: ChainAssets::default(),
         };
 
         let usdc_threshold = trigger_config.usdc.expect("USDC threshold should be Some");

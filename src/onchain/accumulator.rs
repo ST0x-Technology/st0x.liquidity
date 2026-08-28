@@ -2,7 +2,7 @@ use tracing::debug;
 #[cfg(test)]
 use tracing::info;
 
-use st0x_config::AssetsConfig;
+use st0x_config::{ChainAssets, HedgingAssets};
 use st0x_event_sorcery::Projection;
 use st0x_execution::{
     Direction, Executor, FractionalShares, MarketSession, Positive, SupportedExecutor, Symbol,
@@ -32,7 +32,8 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     position_projection: &Projection<Position>,
     symbol: &Symbol,
     executor_type: SupportedExecutor,
-    assets: &AssetsConfig,
+    assets: &ChainAssets,
+    hedging: &HedgingAssets,
     asset_enabled: bool,
 ) -> Result<Option<ExecutionCtx>, OnChainError> {
     if !check_asset_enabled(asset_enabled, symbol) {
@@ -57,7 +58,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     };
 
     let Some(market_session) =
-        check_market_session(executor, symbol, assets.is_extended_hours_enabled(symbol)).await?
+        check_market_session(executor, symbol, hedging.is_extended_hours_enabled(symbol)).await?
     else {
         return Ok(None);
     };
@@ -126,7 +127,7 @@ pub(crate) async fn check_all_positions<E: Executor>(
     executor: &E,
     position_projection: &Projection<Position>,
     executor_type: SupportedExecutor,
-    assets: &AssetsConfig,
+    assets: &ChainAssets,
     is_trading_enabled: impl Fn(&Symbol) -> bool,
 ) -> Result<Vec<ExecutionCtx>, OnChainError> {
     let all_positions = position_projection.load_all().await?;
@@ -192,17 +193,19 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use st0x_config::{
+        ChainAssets, ChainEquities, ChainEquityAsset, EquityHedgePolicy, ExecutionThreshold,
+        HedgedEquities, HedgingAssets, OperationMode,
+    };
     use st0x_event_sorcery::{Projection, Store, StoreBuilder};
     use st0x_execution::{
         Direction, FractionalShares, MockExecutor, Positive, SupportedExecutor, Symbol,
     };
+    use st0x_float_macro::float;
 
     use super::*;
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::test_utils::setup_test_db;
-    use st0x_config::ExecutionThreshold;
-    use st0x_config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
-    use st0x_float_macro::float;
 
     async fn create_test_position_infra(
         pool: &SqlitePool,
@@ -240,27 +243,40 @@ mod tests {
             .unwrap();
     }
 
-    fn assets_with_extended_hours(symbol: &Symbol, enabled: bool) -> AssetsConfig {
-        let extended_hours_counter_trading = if enabled {
-            OperationMode::Enabled
-        } else {
-            OperationMode::Disabled
-        };
-
-        AssetsConfig {
-            equities: EquitiesConfig {
+    fn listed(symbol: &Symbol) -> ChainAssets {
+        ChainAssets {
+            equities: ChainEquities {
                 operational_limit: None,
                 symbols: HashMap::from([(
                     symbol.clone(),
-                    EquityAssetConfig {
+                    ChainEquityAsset {
                         tokenized_equity: Address::ZERO,
                         tokenized_equity_derivative: Address::ZERO,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Enabled,
                         rebalancing: OperationMode::Disabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
-                        extended_hours_counter_trading,
                         operational_limit: None,
+                    },
+                )]),
+            },
+            cash: None,
+        }
+    }
+
+    fn hedged_with_extended_hours(symbol: &Symbol, enabled: bool) -> HedgingAssets {
+        let extended_hours_counter_trading = if enabled {
+            OperationMode::Enabled
+        } else {
+            OperationMode::Disabled
+        };
+
+        HedgingAssets {
+            equities: HedgedEquities {
+                symbols: HashMap::from([(
+                    symbol.clone(),
+                    EquityHedgePolicy {
+                        extended_hours_counter_trading,
                     },
                 )]),
             },
@@ -279,10 +295,8 @@ mod tests {
             &query,
             &Symbol::new("AAPL").unwrap(),
             SupportedExecutor::DryRun,
-            &AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            &ChainAssets::default(),
+            &HedgingAssets::default(),
             true,
         )
         .await
@@ -311,10 +325,8 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            &ChainAssets::default(),
+            &HedgingAssets::default(),
             true,
         )
         .await
@@ -343,10 +355,8 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            &ChainAssets::default(),
+            &HedgingAssets::default(),
             true,
         )
         .await
@@ -397,10 +407,7 @@ mod tests {
             &executor,
             &query,
             SupportedExecutor::DryRun,
-            &AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            &ChainAssets::default(),
             |_| true,
         )
         .await
@@ -441,10 +448,8 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            &ChainAssets::default(),
+            &HedgingAssets::default(),
             true,
         )
         .await
@@ -477,7 +482,8 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &assets_with_extended_hours(&symbol, false),
+            &listed(&symbol),
+            &hedged_with_extended_hours(&symbol, false),
             true,
         )
         .await
@@ -510,7 +516,8 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &assets_with_extended_hours(&symbol, true),
+            &listed(&symbol),
+            &hedged_with_extended_hours(&symbol, true),
             true,
         )
         .await
@@ -543,10 +550,8 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            &ChainAssets::default(),
+            &HedgingAssets::default(),
             true,
         )
         .await
@@ -583,10 +588,8 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            &ChainAssets::default(),
+            &HedgingAssets::default(),
             true,
         )
         .await
@@ -619,10 +622,8 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            &ChainAssets::default(),
+            &HedgingAssets::default(),
             true,
         )
         .await
@@ -640,10 +641,8 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            &ChainAssets::default(),
+            &HedgingAssets::default(),
             true,
         )
         .await
@@ -673,19 +672,18 @@ mod tests {
         )
         .await;
 
-        let assets = AssetsConfig {
-            equities: EquitiesConfig {
+        let assets = ChainAssets {
+            equities: ChainEquities {
                 operational_limit: None,
                 symbols: HashMap::from([(
                     symbol.clone(),
-                    EquityAssetConfig {
+                    ChainEquityAsset {
                         tokenized_equity: Address::ZERO,
                         tokenized_equity_derivative: Address::ZERO,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Enabled,
                         rebalancing: OperationMode::Disabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
-                        extended_hours_counter_trading: OperationMode::Disabled,
                         operational_limit: Some(
                             Positive::new(FractionalShares::new(float!(3.0))).unwrap(),
                         ),
@@ -701,6 +699,7 @@ mod tests {
             &symbol,
             SupportedExecutor::DryRun,
             &assets,
+            &HedgingAssets::default(),
             true,
         )
         .await
@@ -735,10 +734,8 @@ mod tests {
             &query,
             &symbol,
             SupportedExecutor::DryRun,
-            &AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            &ChainAssets::default(),
+            &HedgingAssets::default(),
             false,
         )
         .await
@@ -780,10 +777,7 @@ mod tests {
             &executor,
             &query,
             SupportedExecutor::DryRun,
-            &AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
+            &ChainAssets::default(),
             |symbol| symbol != &aapl,
         )
         .await

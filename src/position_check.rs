@@ -357,7 +357,13 @@ where
 
         let eligible: Vec<Symbol> = all_positions
             .iter()
-            .filter(|(symbol, _)| self.ctx.assets.is_trading_enabled(symbol))
+            .filter(|(symbol, _)| {
+                self.ctx
+                    .chains
+                    .sole_trading()
+                    .assets
+                    .is_trading_enabled(symbol)
+            })
             .filter(|(symbol, _)| {
                 if active_transfers.contains(symbol) {
                     debug!(%symbol, "Skipping hedge: equity transfer in progress");
@@ -387,6 +393,7 @@ where
             &self.position_projection,
             symbol,
             self.executor.to_supported_executor(),
+            &self.ctx.chains.sole_trading().assets,
             &self.ctx.assets,
             true,
         )
@@ -1274,8 +1281,8 @@ mod tests {
     use tokio::sync::Barrier;
 
     use st0x_config::{
-        AssetsConfig, EquitiesConfig, EquityAssetConfig, ExecutionThreshold, OperationMode,
-        create_test_ctx_with_order_owner,
+        ChainEquityAsset, EquityHedgePolicy, ExecutionThreshold, HedgedEquities, HedgingAssets,
+        OperationMode, create_test_ctx_with_order_owner,
     };
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::{
@@ -1605,32 +1612,47 @@ mod tests {
         for symbol in symbols {
             equity_symbols.insert(
                 Symbol::new(*symbol).unwrap(),
-                EquityAssetConfig {
+                ChainEquityAsset {
                     tokenized_equity: Address::ZERO,
                     tokenized_equity_derivative: Address::ZERO,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
-                    extended_hours_counter_trading: extended_hours,
                     operational_limit: None,
                 },
             );
         }
 
-        Ctx {
-            assets: AssetsConfig {
-                equities: EquitiesConfig {
-                    operational_limit: None,
-                    symbols: equity_symbols,
-                },
-                cash: None,
+        let hedging = HedgingAssets {
+            equities: HedgedEquities {
+                symbols: equity_symbols
+                    .keys()
+                    .map(|symbol| {
+                        (
+                            symbol.clone(),
+                            EquityHedgePolicy {
+                                extended_hours_counter_trading: extended_hours,
+                            },
+                        )
+                    })
+                    .collect(),
             },
+            cash: None,
+        };
+
+        let mut ctx = Ctx {
+            assets: hedging,
             execution_threshold: ExecutionThreshold::whole_share(),
             ..create_test_ctx_with_order_owner(address!(
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ))
-        }
+        };
+
+        // The listing lives on the trading chain; the hedging table above only
+        // says how those symbols hedge, not that they trade anywhere.
+        ctx.chains.sole_trading_mut().assets.equities.symbols = equity_symbols;
+        ctx
     }
 
     /// A broker outage must not kill the periodic position scan: the

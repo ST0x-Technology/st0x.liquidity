@@ -176,7 +176,7 @@ pub(crate) enum PortfolioSnapshotJobError {
     MarkEvaluation(#[from] rain_math_float::FloatError),
     #[error(
         "failed to total the balance of a portfolio row for a symbol absent from \
-         [assets.equities]: {0}"
+         [chains.<name>.trading.assets.equities]: {0}"
     )]
     UnconfiguredRowTotal(#[source] rain_math_float::FloatError),
     #[error("failed to load an already-captured portfolio snapshot: {0}")]
@@ -923,7 +923,7 @@ fn capped_retry_backoff(boundary: Option<DateTime<Utc>>, now: DateTime<Utc>) -> 
         })
 }
 
-/// Drops the EMPTY rows of a symbol absent from `[assets.equities]`; USDC and
+/// Drops the EMPTY rows of a symbol absent from `[chains.<name>.trading.assets.equities]`; USDC and
 /// held rows pass through.
 ///
 /// Empty rows change no number -- `evaluate_day` (`read.rs`) skips zero
@@ -966,14 +966,14 @@ fn drop_empty_unconfigured_equity_rows(
         warn!(
             dropped_symbols = ?dropped_empty,
             "Dropping empty portfolio snapshot rows for registry symbols absent from \
-             [assets.equities]; they hold nothing, so no balance is excluded"
+             [chains.<name>.trading.assets.equities]; they hold nothing, so no balance is excluded"
         );
     }
 
     if !held.is_empty() {
         warn!(
             held_symbols = ?held,
-            "Registry symbols absent from [assets.equities] still hold a balance; they \
+            "Registry symbols absent from [chains.<name>.trading.assets.equities] still hold a balance; they \
              cannot be priced, so today's capital is not computable and the day will be \
              excluded. Reconcile these holdings to restore the capital series"
         );
@@ -2893,7 +2893,7 @@ mod tests {
         );
     }
 
-    /// A vault-registry symbol with no `[assets.equities]` entry (an asset
+    /// A vault-registry symbol with no `[chains.<name>.trading.assets.equities]` entry (an asset
     /// deliberately removed from config), drained to zero, must not fail the
     /// day's capture: its empty rows are dropped with a warning and every
     /// configured row still persists.

@@ -28,6 +28,9 @@ inventory_divergence_threshold = 10
 ws_url = "ws://st0x-pricing:8080/ws"
 
 # On-chain orderbook settings (same Rain Orderbook on Base as the bot).
+[assets.equities.SGOV]
+extended_hours_counter_trading = "disabled"
+
 [chains.base]
 required_confirmations = 3
 
@@ -42,6 +45,10 @@ inventory_adapters = []
 vault_owner = "0x975789F46b5De4624d6a4c3B3679901edF1a5bdA"
 deployment_block = 43259507
 ingestion_cutoff = "safe"
+# Alpaca's issuer wallet on this chain -- ERC-20 transfers for redemption go
+# here. Per chain: a redemption delivers tokens that exist on one chain, so
+# sending them to another chain's issuer address would burn them.
+redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
 
 # Ethereum is a cash-corridor endpoint only: the bot holds USDC and signs
 # there, but runs no orderbook and ingests no fills, so it has no [trading]
@@ -72,17 +79,10 @@ close_flatten_cross_max_bps = 400
 [broker.travel_rule]
 beneficiary_entity_name = "T0 TRADE (BVI) LTD"
 
-[tokenization]
-redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
-
-# Equity assets eligible for a dividend bump. SGOV is the yield-bearing wrapper
-# whose NAV bump this MVP targets. Add a block per symbol as they pay dividends
-# (tokenized_equity / tokenized_equity_derivative from config/prod/st0x-hedge.toml).
-[assets.equities.SGOV]
+[chains.base.trading.assets.equities.SGOV]
 trading = "enabled"
 rebalancing = "disabled"
 wrapped_equity_recovery = "disabled"
-extended_hours_counter_trading = "disabled"
 vault_id = "0xfab"
 tokenized_equity = "0xc941C1506B7555Ba8C506Fb6c9b9CC259902d612"
 tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"

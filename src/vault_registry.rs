@@ -569,8 +569,14 @@ impl SeedVaultRegistryCtx {
         vault_registry: Arc<Store<VaultRegistry>>,
         ctx: &Ctx,
     ) -> Result<Self, Box<CtxError>> {
-        for (symbol, equity_config) in &ctx.assets.equities.symbols {
-            if equity_config.vault_ids.is_empty() && ctx.assets.is_rebalancing_enabled(symbol) {
+        for (symbol, equity_config) in &ctx.chains.sole_trading().assets.equities.symbols {
+            if equity_config.vault_ids.is_empty()
+                && ctx
+                    .chains
+                    .sole_trading()
+                    .assets
+                    .is_rebalancing_enabled(symbol)
+            {
                 return Err(Box::new(CtxError::MissingEquityVaultId {
                     symbol: symbol.clone(),
                 }));
@@ -583,6 +589,8 @@ impl SeedVaultRegistryCtx {
         };
 
         let equity_seeds = ctx
+            .chains
+            .sole_trading()
             .assets
             .equities
             .symbols
@@ -600,6 +608,8 @@ impl SeedVaultRegistryCtx {
             .collect();
 
         let equity_primary_seeds = ctx
+            .chains
+            .sole_trading()
             .assets
             .equities
             .symbols
@@ -618,6 +628,8 @@ impl SeedVaultRegistryCtx {
             .collect();
 
         let usdc_vault_ids = ctx
+            .chains
+            .sole_trading()
             .assets
             .cash
             .as_ref()
@@ -625,6 +637,8 @@ impl SeedVaultRegistryCtx {
             .unwrap_or_default();
 
         let usdc_primary_vault_id = ctx
+            .chains
+            .sole_trading()
             .assets
             .cash
             .as_ref()
@@ -739,9 +753,15 @@ mod tests {
     use apalis_core::worker::event::Event;
     use apalis_core::worker::ext::event_listener::EventListenerExt;
     use async_trait::async_trait;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    use st0x_config::{
+        ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode,
+        create_test_ctx_with_order_owner,
+    };
 
     use st0x_event_sorcery::{EntityList, Reactor, StoreBuilder, TestHarness, deps, replay};
 
@@ -1502,42 +1522,33 @@ mod tests {
     /// the top of this module so [`SeedVaultRegistryCtx::from_config`]
     /// can exercise the production construction path.
     fn ctx_with_seeded_assets() -> Ctx {
-        use st0x_config::{
-            AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, OperationMode,
-            create_test_ctx_with_order_owner,
-        };
-        use std::collections::HashMap;
-
         let mut symbols = HashMap::new();
         symbols.insert(
             test_symbol(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: TEST_TOKEN,
                 vault_ids: vec![TEST_VAULT_ID],
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
 
-        Ctx {
-            assets: AssetsConfig {
-                equities: EquitiesConfig {
-                    operational_limit: None,
-                    symbols,
-                },
-                cash: Some(CashAssetConfig {
-                    vault_ids: vec![test_usdc_vault_id()],
-                    rebalancing: OperationMode::Disabled,
-                    operational_limit: None,
-                    reserved: None,
-                }),
+        let mut ctx = create_test_ctx_with_order_owner(TEST_OWNER);
+        ctx.chains.sole_trading_mut().assets = ChainAssets {
+            equities: ChainEquities {
+                operational_limit: None,
+                symbols,
             },
-            ..create_test_ctx_with_order_owner(TEST_OWNER)
-        }
+            cash: Some(ChainCashAsset {
+                vault_ids: vec![test_usdc_vault_id()],
+                rebalancing: OperationMode::Disabled,
+                operational_limit: None,
+            }),
+        };
+        ctx
     }
 
     async fn seed_ctx_from(pool: sqlx::SqlitePool, ctx: &Ctx) -> Arc<SeedVaultRegistryCtx> {
@@ -1559,10 +1570,6 @@ mod tests {
 
     #[tokio::test]
     async fn from_config_rejects_missing_vault_id() {
-        use st0x_config::{
-            AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode,
-            create_test_ctx_with_order_owner,
-        };
         use std::collections::HashMap;
 
         // Two equities with rebalancing enabled: one has a vault_id, one
@@ -1571,40 +1578,36 @@ mod tests {
         let mut symbols = HashMap::new();
         symbols.insert(
             Symbol::new("AAPL").unwrap(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: vec![TEST_VAULT_ID],
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
         symbols.insert(
             Symbol::new("TSLA").unwrap(),
-            EquityAssetConfig {
+            ChainEquityAsset {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
 
-        let ctx = Ctx {
-            assets: AssetsConfig {
-                equities: EquitiesConfig {
-                    operational_limit: None,
-                    symbols,
-                },
-                cash: None,
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains.sole_trading_mut().assets = ChainAssets {
+            equities: ChainEquities {
+                operational_limit: None,
+                symbols,
             },
-            ..create_test_ctx_with_order_owner(Address::ZERO)
+            cash: None,
         };
 
         let pool = setup_test_db().await;
@@ -1656,6 +1659,8 @@ mod tests {
             b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
         let mut updated_ctx = ctx_with_seeded_assets();
         updated_ctx
+            .chains
+            .sole_trading_mut()
             .assets
             .equities
             .symbols
@@ -1691,7 +1696,14 @@ mod tests {
         let new_vault_id =
             b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
         let mut updated_ctx = ctx_with_seeded_assets();
-        updated_ctx.assets.cash.as_mut().unwrap().vault_ids = vec![new_vault_id];
+        updated_ctx
+            .chains
+            .sole_trading_mut()
+            .assets
+            .cash
+            .as_mut()
+            .unwrap()
+            .vault_ids = vec![new_vault_id];
 
         let updated_seed_ctx = seed_ctx_from(pool, &updated_ctx).await;
         SeedVaultRegistry.perform(&updated_seed_ctx).await.unwrap();

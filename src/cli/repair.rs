@@ -58,7 +58,7 @@ pub(super) async fn set_portfolio_snapshot_mark_command<W: Write>(
     }
 
     // `EquityMarkSet` prices EVERY row of the symbol (the projection's UPDATE
-    // has no location filter). A symbol with no `[assets.equities]` entry has
+    // has no location filter). A symbol with no `[chains.<name>.trading.assets.equities]` entry has
     // no wrapper entry either, so the capture leaves its MarketMaking and
     // BaseWalletWrapped rows in vault-share units -- applying an underlying
     // share price to those misvalues the day, which is exactly what the
@@ -77,7 +77,7 @@ pub(super) async fn set_portfolio_snapshot_mark_command<W: Write>(
 
         if unconverted > 0 {
             bail!(
-                "{symbol} has no [assets.equities] entry, so its {unconverted}                  wrapped-location row(s) on {day} hold vault shares, not underlying shares.                  A mark would price them as underlying and misstate the day's capital.                  Reconcile the holding instead, or restore the config entry so the capture                  can resolve a vault ratio."
+                "{symbol} has no [chains.<name>.trading.assets.equities] entry, so its {unconverted}                  wrapped-location row(s) on {day} hold vault shares, not underlying shares.                  A mark would price them as underlying and misstate the day's capital.                  Reconcile the holding instead, or restore the config entry so the capture                  can resolve a vault ratio."
             );
         }
     }
@@ -594,7 +594,8 @@ mod tests {
     fn ctx_with_equities(symbols: &[&str]) -> Ctx {
         let mut ctx =
             st0x_config::create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
-        ctx.assets.equities = crate::test_utils::rebalancing_enabled_equities(symbols);
+        ctx.chains.sole_trading_mut().assets.equities =
+            crate::test_utils::rebalancing_enabled_equities(symbols);
         ctx
     }
 

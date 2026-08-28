@@ -22,7 +22,7 @@ use std::future::Future;
 use alloy::primitives::{Address, TxHash, U256};
 use futures_util::{StreamExt, TryStreamExt, stream};
 
-use st0x_config::AssetsConfig;
+use st0x_config::ChainAssets;
 use st0x_evm::{IERC20, OpenChainErrorRegistry, Wallet};
 use st0x_execution::Symbol;
 
@@ -133,7 +133,7 @@ pub(crate) enum StartupApprovalError {
 /// with trading or rebalancing enabled, the two wrap/deposit grants, plus the
 /// single USDC grant.
 pub(crate) fn build_approval_targets(
-    assets: &AssetsConfig,
+    assets: &ChainAssets,
     orderbook: Address,
     usdc: Address,
 ) -> Vec<ApprovalTarget> {
@@ -360,7 +360,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use st0x_config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
+    use st0x_config::{ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
     use st0x_evm::Evm;
     use st0x_evm::local::RawPrivateKeyWallet;
 
@@ -490,24 +490,23 @@ mod tests {
         derivative: Address,
         trading: OperationMode,
         rebalancing: OperationMode,
-    ) -> EquityAssetConfig {
-        EquityAssetConfig {
+    ) -> ChainEquityAsset {
+        ChainEquityAsset {
             tokenized_equity: underlying,
             tokenized_equity_derivative: derivative,
             vault_ids: Vec::new(),
             trading,
             rebalancing,
             wrapped_equity_recovery: OperationMode::Disabled,
-            extended_hours_counter_trading: OperationMode::Disabled,
             operational_limit: None,
         }
     }
 
     fn assets_with(
-        equities: impl IntoIterator<Item = (&'static str, EquityAssetConfig)>,
-    ) -> AssetsConfig {
-        AssetsConfig {
-            equities: EquitiesConfig {
+        equities: impl IntoIterator<Item = (&'static str, ChainEquityAsset)>,
+    ) -> ChainAssets {
+        ChainAssets {
+            equities: ChainEquities {
                 operational_limit: None,
                 symbols: equities
                     .into_iter()

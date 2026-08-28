@@ -133,18 +133,26 @@ trading and hedging it.
 **Staging:** `config/staging/st0x-hedge.toml` **Production:**
 `config/prod/st0x-hedge.toml`
 
-Add a new section under `[assets.equities]`:
+Add two sections. The first says where the asset is listed on-chain, so it goes
+under the chain that lists it. The second says how the bot hedges it, which is
+independent of any chain -- there is one broker account and one position per
+symbol.
 
 ```toml
-[assets.equities.SGOV]
+[chains.base.trading.assets.equities.SGOV]
 trading = "disabled"                          # "enabled" or "disabled"
 rebalancing = "disabled"                      # "enabled" or "disabled"
 wrapped_equity_recovery = "disabled"          # "enabled" or "disabled"
-extended_hours_counter_trading = "disabled"   # "enabled" or "disabled"
 vault_id = "0xfab"                            # Raindex vault ID (can omit for auto-discovery)
 tokenized_equity = "0xc941C1506B7555Ba8C506Fb6c9b9CC259902d612"
 tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"
+
+[assets.equities.SGOV]
+extended_hours_counter_trading = "disabled"   # "enabled" or "disabled"
 ```
+
+Both are required: a symbol listed on a chain with no hedging policy, or a
+hedging policy for a symbol listed on no chain, fails startup.
 
 **Fields:**
 

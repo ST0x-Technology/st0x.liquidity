@@ -247,6 +247,7 @@ mod tests {
     use serde_json::json;
     use url::Url;
 
+    use st0x_config::ChainAssets;
     use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode};
     use st0x_evm::Chain;
     use st0x_evm::ReadOnlyEvm;
@@ -265,6 +266,8 @@ mod tests {
 
     fn create_test_ctx() -> TradingChain {
         TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),

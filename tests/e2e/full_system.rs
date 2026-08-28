@@ -36,6 +36,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info};
 
 use st0x_config::{BrokerCtx, Ctx, configure_sqlite_pool};
+use st0x_config::{CashHedgePolicy, EquityHedgePolicy, HedgedEquities, HedgingAssets};
 use st0x_dto::Statement;
 use st0x_event_sorcery::Projection;
 use st0x_evm::Wallet;
@@ -52,7 +53,7 @@ use st0x_hedge::mock_api::{
     REDEMPTION_WALLET, RedemptionOutcome, TokenizationRequestType, TokenizationStatus,
 };
 use st0x_hedge::{
-    AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, ImbalanceThreshold,
+    ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, ImbalanceThreshold,
     OperationMode, Position, RebalancingCtx, TradingMode, UsdcRebalancing,
     seed_simulated_equity_redemption_history, seed_simulated_hedge_latency_history,
     seed_simulated_mint_history, seed_simulated_usdc_rebalance_history,
@@ -101,19 +102,18 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
     };
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth);
 
-    let equities: HashMap<Symbol, EquityAssetConfig> = equity_tokens
+    let equities: HashMap<Symbol, ChainEquityAsset> = equity_tokens
         .iter()
         .map(|(symbol, wrapped, unwrapped)| {
             Ok((
                 Symbol::new(symbol)?,
-                EquityAssetConfig {
+                ChainEquityAsset {
                     tokenized_equity: *unwrapped,
                     tokenized_equity_derivative: *wrapped,
                     vault_ids: equity_vault_ids.get(symbol).copied().into_iter().collect(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Enabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
-                    extended_hours_counter_trading: OperationMode::Disabled,
                     operational_limit: None,
                 },
             ))
@@ -157,17 +157,32 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
         .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
         .order_owner(chain.owner)
         .wallet(wallet_ctx)
-        .assets(AssetsConfig {
-            equities: EquitiesConfig {
+        .assets(ChainAssets {
+            equities: ChainEquities {
                 symbols: equities,
                 operational_limit: None,
             },
-            cash: Some(CashAssetConfig {
+            cash: Some(ChainCashAsset {
                 vault_ids: vec![cash_vault_id],
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
-                reserved: cash_reserved,
             }),
+        })
+        .hedging(HedgingAssets {
+            equities: HedgedEquities {
+                symbols: equity_tokens
+                    .iter()
+                    .map(|(symbol, _, _)| {
+                        (
+                            Symbol::new(symbol).unwrap(),
+                            EquityHedgePolicy {
+                                extended_hours_counter_trading: OperationMode::Disabled,
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+            cash: cash_reserved.map(|reserved| CashHedgePolicy { reserved }),
         })
         .inventory_poll_interval(15)
         .server_port(server_port)
@@ -532,6 +547,12 @@ counter_trade_slippage_bps = 100
 [broker.travel_rule]
 beneficiary_entity_name = "Simulate Failures"
 
+[assets.equities.AAPL]
+extended_hours_counter_trading = "disabled"
+
+[assets.equities.TSLA]
+extended_hours_counter_trading = "disabled"
+
 [chains.base]
 required_confirmations = 0
 
@@ -542,6 +563,7 @@ inventory_adapters = []
 vault_owner = "{owner}"
 deployment_block = {current_block}
 ingestion_cutoff = "safe"
+redemption_wallet = "{redemption_wallet}"
 
 [chains.ethereum]
 required_confirmations = 1
@@ -552,9 +574,6 @@ required_confirmations = 1
 [wallet]
 kind = "private-key"
 address = "{owner}"
-
-[tokenization]
-redemption_wallet = "{redemption_wallet}"
 
 [bot_gas_valuation]
 chainlink_feed = "{mock_chainlink_feed:#x}"
@@ -567,25 +586,23 @@ max_burn_revert_redrives = 5
 equity = {{ target = 0.5, deviation = 0.1 }}
 usdc = {{ mode = "enabled", target = 0.5, deviation = 0.1 }}
 
-[assets.equities.AAPL]
+[chains.base.trading.assets.equities.AAPL]
 tokenized_equity = "{aapl_unwrapped}"
 tokenized_equity_derivative = "{aapl_wrapped}"
 vault_ids = ["{aapl_vault_id:#x}"]
 trading = "enabled"
 rebalancing = "enabled"
 wrapped_equity_recovery = "disabled"
-extended_hours_counter_trading = "disabled"
 
-[assets.equities.TSLA]
+[chains.base.trading.assets.equities.TSLA]
 tokenized_equity = "{tsla_unwrapped}"
 tokenized_equity_derivative = "{tsla_wrapped}"
 vault_ids = ["{tsla_vault_id:#x}"]
 trading = "enabled"
 rebalancing = "enabled"
 wrapped_equity_recovery = "disabled"
-extended_hours_counter_trading = "disabled"
 
-[assets.cash]
+[chains.base.trading.assets.cash]
 vault_ids = ["{usdc_vault_id:#x}"]
 rebalancing = "enabled"
 "#,

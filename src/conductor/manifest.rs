@@ -172,6 +172,7 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::broadcast;
 
+    use st0x_config::{ChainAssets, ExecutionThreshold};
     use st0x_dto::Statement;
     use st0x_event_sorcery::test_store;
     use st0x_execution::{Direction, FractionalShares, Symbol};
@@ -196,10 +197,10 @@ mod tests {
     use crate::test_utils::{rebalancing_enabled_equities, setup_test_pools};
     use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::{VaultRegistryCommand, VaultRegistryId};
-    use st0x_config::{AssetsConfig, ExecutionThreshold};
 
     fn test_trigger_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {
+            cash_reserved: None,
             equity: ImbalanceThreshold {
                 target: float!(0.5),
                 deviation: float!(0.2),
@@ -209,7 +210,7 @@ mod tests {
                 deviation: float!(0.15),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
-            assets: AssetsConfig {
+            assets: ChainAssets {
                 equities: rebalancing_enabled_equities(&["AAPL"]),
                 cash: None,
             },

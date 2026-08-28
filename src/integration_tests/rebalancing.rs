@@ -21,8 +21,7 @@ use uuid::Uuid;
 
 use rain_math_float::Float;
 use st0x_config::{
-    AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, ExecutionThreshold,
-    OperationMode,
+    ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, ExecutionThreshold, OperationMode,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{Store, StoreBuilder, test_store};
@@ -200,6 +199,7 @@ async fn discover_deterministic_tx_hash(
 
 fn test_trigger_config() -> RebalancingServiceConfig {
     RebalancingServiceConfig {
+        cash_reserved: None,
         equity: ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
@@ -209,28 +209,26 @@ fn test_trigger_config() -> RebalancingServiceConfig {
             deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
-        assets: AssetsConfig {
-            equities: EquitiesConfig {
+        assets: ChainAssets {
+            equities: ChainEquities {
                 operational_limit: None,
                 symbols: HashMap::from([(
                     Symbol::new("AAPL").unwrap(),
-                    EquityAssetConfig {
+                    ChainEquityAsset {
                         tokenized_equity: Address::ZERO,
                         tokenized_equity_derivative: Address::ZERO,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Disabled,
                         rebalancing: OperationMode::Enabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
-                        extended_hours_counter_trading: OperationMode::Disabled,
                         operational_limit: None,
                     },
                 )]),
             },
-            cash: Some(CashAssetConfig {
+            cash: Some(ChainCashAsset {
                 vault_ids: Vec::new(),
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
-                reserved: None,
             }),
         },
     }
@@ -697,7 +695,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
         transfer: equity_transfer,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
         mint_store,
-        equities_config: EquitiesConfig::default(),
+        equities_config: ChainEquities::default(),
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     Job::perform(&job, &ctx).await.unwrap();
@@ -1296,9 +1294,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     // imbalance check exercises the (reserved=Some, gross=Some) path
     // end-to-end, matching what the polling side will write.
     let mut trigger_config = test_trigger_config();
-    if let Some(cash) = trigger_config.assets.cash.as_mut() {
-        cash.reserved = Some(Positive::new(Usd::new(float!(300))).unwrap());
-    }
+    trigger_config.cash_reserved = Some(Positive::new(Usd::new(float!(300))).unwrap());
     let service = Arc::new(RebalancingService::new(
         trigger_config,
         Arc::clone(&vault_registry),
@@ -1504,9 +1500,7 @@ async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve()
     }
 
     let mut config = test_trigger_config();
-    if let Some(cash) = config.assets.cash.as_mut() {
-        cash.reserved = Some(Positive::new(Usd::new(float!(100))).unwrap());
-    }
+    config.cash_reserved = Some(Positive::new(Usd::new(float!(100))).unwrap());
 
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
@@ -1559,6 +1553,7 @@ async fn usdc_none_disables_usdc_rebalancing() {
 
     let trigger = RebalancingService::new(
         RebalancingServiceConfig {
+            cash_reserved: None,
             usdc: None,
             ..test_trigger_config()
         },
@@ -1669,7 +1664,7 @@ async fn mint_api_failure_produces_rejected_event() {
         transfer: equity_transfer,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
         mint_store,
-        equities_config: EquitiesConfig::default(),
+        equities_config: ChainEquities::default(),
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -1764,17 +1759,17 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         event_sender,
     ));
 
-    let assets = AssetsConfig {
-        equities: EquitiesConfig::default(),
-        cash: Some(CashAssetConfig {
+    let assets = ChainAssets {
+        equities: ChainEquities::default(),
+        cash: Some(ChainCashAsset {
             vault_ids: Vec::new(),
             rebalancing: OperationMode::Enabled,
             operational_limit: Some(Positive::new(Usdc::new(float!(100))).unwrap()),
-            reserved: None,
         }),
     };
 
     let config = RebalancingServiceConfig {
+        cash_reserved: None,
         equity: ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
@@ -1895,16 +1890,16 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         event_sender,
     ));
 
-    let assets = AssetsConfig {
-        equities: EquitiesConfig::default(),
-        cash: Some(CashAssetConfig {
+    let assets = ChainAssets {
+        equities: ChainEquities::default(),
+        cash: Some(ChainCashAsset {
             vault_ids: Vec::new(),
             rebalancing: OperationMode::Enabled,
             operational_limit: Some(Positive::new(Usdc::new(float!(100))).unwrap()),
-            reserved: None,
         }),
     };
     let config = RebalancingServiceConfig {
+        cash_reserved: None,
         equity: ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
@@ -1998,6 +1993,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
         .await;
 
         let wide_config = RebalancingServiceConfig {
+            cash_reserved: None,
             equity: ImbalanceThreshold {
                 target: float!(0.5),
                 deviation: float!(0.4),
@@ -2007,13 +2003,12 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 deviation: float!(0.4),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
-            assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: Some(CashAssetConfig {
+            assets: ChainAssets {
+                equities: ChainEquities::default(),
+                cash: Some(ChainCashAsset {
                     vault_ids: Vec::new(),
                     rebalancing: OperationMode::Enabled,
                     operational_limit: None,
-                    reserved: None,
                 }),
             },
         };
@@ -2059,6 +2054,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
         .await;
 
         let tight_config = RebalancingServiceConfig {
+            cash_reserved: None,
             equity: ImbalanceThreshold {
                 target: float!(0.5),
                 deviation: float!(0.1),
@@ -2068,13 +2064,12 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 deviation: float!(0.1),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
-            assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: Some(CashAssetConfig {
+            assets: ChainAssets {
+                equities: ChainEquities::default(),
+                cash: Some(ChainCashAsset {
                     vault_ids: Vec::new(),
                     rebalancing: OperationMode::Enabled,
                     operational_limit: None,
-                    reserved: None,
                 }),
             },
         };
@@ -2260,7 +2255,7 @@ async fn mint_accepted_sets_offchain_inflight() {
                 transfer: equity_transfer,
                 equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
                 mint_store,
-                equities_config: EquitiesConfig::default(),
+                equities_config: ChainEquities::default(),
                 job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
             };
             let _ = Job::perform(&job, &ctx).await;
@@ -2474,7 +2469,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
         transfer: Arc::clone(&equity_transfer) as _,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
         mint_store,
-        equities_config: EquitiesConfig::default(),
+        equities_config: ChainEquities::default(),
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     Job::perform(&job, &ctx).await.unwrap();

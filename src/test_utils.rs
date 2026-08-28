@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
-use st0x_config::{EquitiesConfig, EquityAssetConfig, OperationMode};
+use st0x_config::{ChainEquities, ChainEquityAsset, OperationMode};
 use st0x_event_sorcery::{DomainEvent, EventSourced};
 use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
 
@@ -123,22 +123,21 @@ pub(crate) fn spawn_anvil_pair(
 /// rebalancing. The trigger only dispatches transfers for symbols configured
 /// with `rebalancing = "enabled"`, so trigger tests must whitelist the
 /// symbols they exercise.
-pub(crate) fn rebalancing_enabled_equities(symbols: &[&str]) -> EquitiesConfig {
-    EquitiesConfig {
+pub(crate) fn rebalancing_enabled_equities(symbols: &[&str]) -> ChainEquities {
+    ChainEquities {
         operational_limit: None,
         symbols: symbols
             .iter()
             .map(|symbol| {
                 (
                     Symbol::new(*symbol).unwrap(),
-                    EquityAssetConfig {
+                    ChainEquityAsset {
                         tokenized_equity: Address::ZERO,
                         tokenized_equity_derivative: Address::ZERO,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Disabled,
                         rebalancing: OperationMode::Enabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
-                        extended_hours_counter_trading: OperationMode::Disabled,
                         operational_limit: None,
                     },
                 )

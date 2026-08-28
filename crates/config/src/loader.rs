@@ -6,10 +6,10 @@
 
 use alloy::primitives::{Address, B256};
 use clap::Parser;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -22,7 +22,7 @@ use st0x_execution::{
     DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, FractionalShares, Positive, SupportedExecutor,
     Symbol, TimeInForce,
 };
-use st0x_finance::{Usd, Usdc};
+use st0x_finance::Usdc;
 use st0x_float_macro::float;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -32,10 +32,10 @@ use crate::chain::TradingChain;
 use crate::pricing::PricingSecrets;
 use crate::wallet::{SigningChain, SigningChains};
 use crate::{
-    AlertsConfig, AlertsCtx, AlertsSecrets, BotGasValuationConfig, ChainConfig, ChainRegistry,
-    ChainSecrets, ExecutionThreshold, InvalidThresholdError, OrchestratorConfig, PricingConfig,
-    PricingCtx, PricingCtxError, RebalancingConfig, RebalancingCtx, RebalancingCtxError,
-    TelemetryConfig, TelemetryCtx,
+    AlertsConfig, AlertsCtx, AlertsSecrets, BotGasValuationConfig, ChainConfig, ChainEquityAsset,
+    ChainRegistry, ChainSecrets, ExecutionThreshold, HedgingAssets, InvalidThresholdError,
+    OperationMode, OrchestratorConfig, PricingConfig, PricingCtx, PricingCtxError,
+    RebalancingConfig, RebalancingCtx, RebalancingCtxError, TelemetryConfig, TelemetryCtx,
 };
 
 /// Alpaca minimum execution threshold: $2.
@@ -74,74 +74,6 @@ pub struct Env {
     pub secrets: PathBuf,
 }
 
-/// Whether a per-asset operation (trading or rebalancing) is active.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OperationMode {
-    Enabled,
-    Disabled,
-}
-
-/// Per-equity asset configuration.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EquityAssetConfig {
-    pub tokenized_equity: Address,
-    pub tokenized_equity_derivative: Address,
-    #[serde(
-        default,
-        alias = "vault_id",
-        deserialize_with = "deserialize_vault_ids"
-    )]
-    pub vault_ids: Vec<B256>,
-    pub trading: OperationMode,
-    pub rebalancing: OperationMode,
-    pub wrapped_equity_recovery: OperationMode,
-    /// When enabled, counter-trades for this equity may be placed during
-    /// extended (pre-/after-market) sessions as limit orders, instead of
-    /// waiting for the regular open. Must be explicitly configured.
-    pub extended_hours_counter_trading: OperationMode,
-    pub operational_limit: Option<Positive<FractionalShares>>,
-}
-
-/// Cash asset (USDC) configuration.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CashAssetConfig {
-    #[serde(
-        default,
-        alias = "vault_id",
-        deserialize_with = "deserialize_vault_ids"
-    )]
-    pub vault_ids: Vec<B256>,
-    pub rebalancing: OperationMode,
-    pub operational_limit: Option<Positive<Usdc>>,
-    /// USD amount subtracted from offchain cash to compute available balance.
-    /// Prevents the system from rebalancing funds that should remain untouched.
-    pub reserved: Option<Positive<Usd>>,
-}
-
-/// Equity assets configuration with an optional global operational limit.
-///
-/// Uses `#[serde(flatten)]` so that per-symbol tables live alongside the
-/// `operational_limit` key under `[assets.equities]` in the TOML.
-/// `deny_unknown_fields` is intentionally absent because it is
-/// incompatible with `flatten`.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct EquitiesConfig {
-    pub operational_limit: Option<Positive<FractionalShares>>,
-    #[serde(flatten)]
-    pub symbols: HashMap<Symbol, EquityAssetConfig>,
-}
-
-/// Top-level assets configuration containing equities and cash.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AssetsConfig {
-    pub equities: EquitiesConfig,
-    pub cash: Option<CashAssetConfig>,
-}
-
 /// Validated, network-free inputs required by the deploy-time Turnkey approval
 /// policy coverage check.
 #[cfg(feature = "wallet-turnkey")]
@@ -152,56 +84,7 @@ pub struct TurnkeyApprovalPolicyInputs {
     pub api_private_key: Option<st0x_evm::turnkey::TurnkeyApiPrivateKey>,
     pub wallet_address: Address,
     pub orderbook: Address,
-    pub assets: AssetsConfig,
-}
-
-/// Parses a hex string (possibly short, e.g. `"0xfab"`) into a
-/// left-padded `B256`.
-fn parse_padded_b256(hex_str: &str) -> Result<B256, String> {
-    let stripped = hex_str
-        .strip_prefix("0x")
-        .or_else(|| hex_str.strip_prefix("0X"))
-        .unwrap_or(hex_str);
-
-    if stripped.len() > 64 {
-        return Err(format!("hex string too long for B256: {stripped}"));
-    }
-
-    if stripped.is_empty() {
-        return Err("empty hex string for B256".to_string());
-    }
-
-    let padded = format!("{stripped:0>64}");
-    padded.parse::<B256>().map_err(|err| err.to_string())
-}
-
-/// Deserializes vault IDs from either a single hex string or an array of hex
-/// strings. Each value is left-padded to a full `B256`.
-///
-/// Accepts both `vault_id = "0xfab"` (single) and
-/// `vault_ids = ["0xfab", "0xfab2"]` (multiple) in TOML.
-fn deserialize_vault_ids<'de, D>(deserializer: D) -> Result<Vec<B256>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum OneOrMany {
-        One(String),
-        Many(Vec<String>),
-    }
-
-    let raw = OneOrMany::deserialize(deserializer)?;
-
-    let hex_strings = match raw {
-        OneOrMany::One(single) => vec![single],
-        OneOrMany::Many(many) => many,
-    };
-
-    hex_strings
-        .into_iter()
-        .map(|hex_str| parse_padded_b256(&hex_str).map_err(serde::de::Error::custom))
-        .collect()
+    pub assets: crate::ChainAssets,
 }
 
 /// Non-secret settings deserialized from the plaintext config TOML.
@@ -229,10 +112,10 @@ struct Config {
     alerts: Option<AlertsConfig>,
     pricing: Option<PricingConfig>,
     rebalancing: Option<RebalancingConfig>,
-    tokenization: Option<TokenizationConfig>,
     wallet: Option<toml::Value>,
     broker: Option<BrokerConfig>,
-    assets: AssetsConfig,
+    #[serde(default)]
+    assets: HedgingAssets,
     rest_api: Option<RestApiUrlConfig>,
     /// ETH/USD valuation source for bot-gas cost recording. See
     /// [`Ctx::bot_gas_valuation`] for when this is required.
@@ -391,18 +274,6 @@ impl RestApiCtx {
         Self::new(url, None, None)
             .expect("reqwest client with default TLS should never fail to build")
     }
-}
-
-/// Tokenization settings for Alpaca equity mint/redeem operations.
-///
-/// Required when `[rebalancing]` is configured. Also usable in standalone
-/// mode for CLI commands that send tokens (`alpaca-redeem`, `transfer-equity`).
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TokenizationConfig {
-    /// Alpaca's issuer wallet — ERC-20 token transfers for redemption
-    /// are sent to this address.
-    redemption_wallet: Address,
 }
 
 /// Non-secret broker settings from the plaintext config TOML.
@@ -655,12 +526,14 @@ pub struct Ctx {
     /// Non-secret wallet metadata for the dashboard config dialog.
     pub wallet_meta: Option<WalletMeta>,
     pub execution_threshold: ExecutionThreshold,
-    pub assets: AssetsConfig,
+    /// What the bot hedges and how. Where each symbol is listed on-chain
+    /// lives on the chain registry, not here.
+    pub assets: HedgingAssets,
     pub travel_rule: Option<TravelRuleConfig>,
     pub rest_api: Option<RestApiCtx>,
     pub issuance: IssuanceStatusCtx,
-    /// Alpaca redemption wallet from `[tokenization]`.
-    /// `Some` when the config includes a `[tokenization]` section.
+    /// Alpaca redemption wallet from `[chains.<name>.trading].redemption_wallet`.
+    /// `Some` when the config includes a `[chains.<name>.trading].redemption_wallet` section.
     pub redemption_wallet: Option<Address>,
     /// ETH/USD valuation source for bot-gas cost recording (ADR 0020).
     /// Bot-gas cost recording only runs on rebalancing paths (vault
@@ -968,7 +841,7 @@ struct ValidatedParts {
     pricing: Option<PricingCtx>,
     execution_threshold: ExecutionThreshold,
     trading_mode: TradingMode,
-    assets: AssetsConfig,
+    assets: HedgingAssets,
     travel_rule: Option<TravelRuleConfig>,
     rest_api: Option<RestApiCtx>,
     issuance: IssuanceStatusCtx,
@@ -1073,14 +946,57 @@ fn validate_wallet_inputs(
     }
 }
 
-/// Rejects extended-hours trading that its prerequisite can never reach.
-fn validate_extended_hours_counter_trading(assets: &AssetsConfig) -> Result<(), CtxError> {
-    // The hedge path gates on `trading` before it consults the extended-hours
-    // session, so enabling extended-hours counter-trading while disabling
-    // counter-trading creates a dead configuration that can never execute.
-    for (symbol, equity) in &assets.equities.symbols {
-        if equity.extended_hours_counter_trading == OperationMode::Enabled
-            && equity.trading == OperationMode::Disabled
+/// Rejects an asset table that contradicts the chain tables it depends on.
+///
+/// The two halves have to agree: `[chains.<name>.trading.assets.equities]` says what the bot hedges,
+/// and each `[chains.<name>.trading.assets.equities]` says where those symbols
+/// are listed. A symbol in one and not the other is a misconfiguration in both
+/// directions -- a listing nothing will hedge, or a hedge for something that
+/// trades nowhere -- so neither is silently tolerated.
+fn validate_asset_tables(
+    hedging: &HedgingAssets,
+    chains: &BTreeMap<Chain, ChainConfig>,
+) -> Result<(), CtxError> {
+    let listings = |symbol: &Symbol| -> Vec<&ChainEquityAsset> {
+        chains
+            .values()
+            .filter_map(|config| config.trading.as_ref())
+            .filter_map(|trading| trading.assets.equities.symbols.get(symbol))
+            .collect()
+    };
+
+    for (chain, config) in chains {
+        let Some(trading) = &config.trading else {
+            continue;
+        };
+
+        for symbol in trading.assets.equities.symbols.keys() {
+            if !hedging.equities.symbols.contains_key(symbol) {
+                return Err(CtxError::ListedSymbolIsNotHedged {
+                    chain: *chain,
+                    symbol: symbol.clone(),
+                });
+            }
+        }
+    }
+
+    for (symbol, policy) in &hedging.equities.symbols {
+        let listed = listings(symbol);
+
+        if listed.is_empty() {
+            return Err(CtxError::HedgedSymbolIsNotListed {
+                symbol: symbol.clone(),
+            });
+        }
+
+        // The hedge path gates on `trading` before it consults the
+        // extended-hours session, so enabling extended-hours counter-trading
+        // for a symbol that trades nowhere creates a dead configuration that
+        // can never execute.
+        if policy.extended_hours_counter_trading == OperationMode::Enabled
+            && listed
+                .iter()
+                .all(|asset| asset.trading == OperationMode::Disabled)
         {
             return Err(CtxError::ExtendedHoursWithoutCounterTrading {
                 symbol: symbol.clone(),
@@ -1155,7 +1071,7 @@ fn parse_and_validate(
         });
     }
 
-    validate_extended_hours_counter_trading(&config.assets)?;
+    validate_asset_tables(&config.assets, &config.chains)?;
     let polling_intervals = validated_polling_intervals(&config)?;
 
     let broker = BrokerCtx::from_parts(secrets.broker, config.broker.as_ref())?;
@@ -1185,13 +1101,19 @@ fn parse_and_validate(
 
             let minimum = *crate::ALPACA_TO_BASE_MINIMUM_TRANSFER;
 
-            if let Some(cash) = &config.assets.cash
-                && cash.rebalancing == OperationMode::Enabled
-                && let Some(cash_limit) = &cash.operational_limit
-            {
-                let below_minimum = cash_limit.inner().lt(&minimum)?;
+            for chain_config in config.chains.values() {
+                let Some(cash) = chain_config
+                    .trading
+                    .as_ref()
+                    .and_then(|trading| trading.assets.cash.as_ref())
+                else {
+                    continue;
+                };
 
-                if below_minimum {
+                if cash.rebalancing == OperationMode::Enabled
+                    && let Some(cash_limit) = &cash.operational_limit
+                    && cash_limit.inner().lt(&minimum)?
+                {
                     return Err(CtxError::CashOperationalLimitBelowMinimumTransfer {
                         configured: cash_limit.inner(),
                         minimum,
@@ -1204,7 +1126,7 @@ fn parse_and_validate(
         None => TradingMode::Standalone,
     };
 
-    let redemption_wallet = config.tokenization.map(|t| t.redemption_wallet);
+    let redemption_wallet = chains.sole_trading().redemption_wallet;
 
     if matches!(trading_mode, TradingMode::Rebalancing(_)) && redemption_wallet.is_none() {
         return Err(CtxError::MissingTokenization);
@@ -1332,7 +1254,7 @@ struct ExtendedHoursBrokerWindows {
 fn extended_hours_broker_windows(
     broker: &BrokerCtx,
     broker_config: Option<&BrokerConfig>,
-    assets: &AssetsConfig,
+    assets: &HedgingAssets,
 ) -> Result<ExtendedHoursBrokerWindows, CtxError> {
     let requires_configured_windows = match broker {
         BrokerCtx::AlpacaBrokerApi(_) => true,
@@ -1512,7 +1434,7 @@ impl Ctx {
             api_private_key,
             wallet_address,
             orderbook: parts.chains.sole_trading().orderbook,
-            assets: parts.assets,
+            assets: parts.chains.sole_trading().assets.clone(),
         }))
     }
 
@@ -1531,7 +1453,7 @@ impl Ctx {
         self.wallet.as_ref().ok_or(CtxError::WalletNotConfigured)
     }
 
-    /// Returns the redemption wallet from the `[tokenization]` config section.
+    /// Returns the redemption wallet from the `[chains.<name>.trading].redemption_wallet` config section.
     pub fn redemption_wallet(&self) -> Result<Address, CtxError> {
         self.redemption_wallet.ok_or(CtxError::MissingTokenization)
     }
@@ -1568,80 +1490,11 @@ impl Ctx {
     }
 }
 
-/// Per-symbol equity config guards. All six live on `AssetsConfig` (the owner
-/// of the `[assets.equities]` map) so callers use one convention --
+/// Per-symbol equity config guards. All six live on `ChainAssets` (the owner
+/// of the `[chains.<name>.trading.assets.equities]` map) so callers use one convention --
 /// `assets.X(symbol)` or `ctx.assets.X(symbol)` -- rather than mixing
 /// `ctx.X(symbol)` with `ctx.assets.X(symbol)`. Code that holds only an
-/// `&AssetsConfig` (e.g. the accumulator) can reach every guard without a `Ctx`.
-impl AssetsConfig {
-    /// Returns whether trading is enabled for the given equity.
-    ///
-    /// Fail-closed: assets not present in the config are treated as
-    /// trading-disabled.
-    pub fn is_trading_enabled(&self, symbol: &Symbol) -> bool {
-        self.equities
-            .symbols
-            .get(symbol)
-            .is_some_and(|config| config.trading == OperationMode::Enabled)
-    }
-
-    /// Returns whether rebalancing is enabled for the given equity.
-    ///
-    /// Assets not present in the config are treated as rebalancing-disabled
-    /// by default.
-    pub fn is_rebalancing_enabled(&self, symbol: &Symbol) -> bool {
-        self.equities
-            .symbols
-            .get(symbol)
-            .is_some_and(|config| config.rebalancing == OperationMode::Enabled)
-    }
-
-    /// Returns whether wrapped/unwrapped wallet equity recovery is enabled
-    /// for the given equity.
-    ///
-    /// Independent of `rebalancing`: a symbol may opt into recovery while
-    /// keeping automatic rebalancing disabled. Assets not present in the
-    /// config are treated as recovery-disabled by default.
-    pub fn is_wrapped_equity_recovery_enabled(&self, symbol: &Symbol) -> bool {
-        self.equities
-            .symbols
-            .get(symbol)
-            .is_some_and(|config| config.wrapped_equity_recovery == OperationMode::Enabled)
-    }
-
-    /// Returns the configured tokenized-equity (minted onchain token) address
-    /// for `symbol`, or `None` when the symbol is absent from
-    /// `[assets.equities]`. Lets operator commands resolve the token from the
-    /// ticker instead of taking an error-prone address argument.
-    pub fn tokenized_equity(&self, symbol: &Symbol) -> Option<Address> {
-        self.equities
-            .symbols
-            .get(symbol)
-            .map(|config| config.tokenized_equity)
-    }
-
-    /// Returns whether extended-hours counter-trading is enabled for the
-    /// given equity.
-    ///
-    /// Fail-closed: assets not present in the config are treated as
-    /// disabled.
-    pub fn is_extended_hours_enabled(&self, symbol: &Symbol) -> bool {
-        self.equities
-            .symbols
-            .get(symbol)
-            .is_some_and(|config| config.extended_hours_counter_trading == OperationMode::Enabled)
-    }
-
-    /// Returns whether any configured equity enables extended-hours
-    /// counter-trading.
-    pub fn any_extended_hours_enabled(&self) -> bool {
-        self.equities
-            .symbols
-            .values()
-            .any(|config| config.extended_hours_counter_trading == OperationMode::Enabled)
-    }
-}
-
+/// `&ChainAssets` (e.g. the accumulator) can reach every guard without a `Ctx`.
 #[cfg(any(test, feature = "test-support"))]
 use crate::{IngestionCutoff, InventoryMode};
 
@@ -1674,7 +1527,13 @@ impl Ctx {
         #[builder(default = InventoryMode::Legacy)]
         inventory_mode: InventoryMode,
         #[builder(default = InventoryAdapters::default())] inventory_adapters: InventoryAdapters,
-        assets: AssetsConfig,
+        /// What the trading chain lists.
+        assets: crate::ChainAssets,
+        /// How those symbols hedge. Omitted by most fixtures, which care about
+        /// the chain listing; when absent every listed symbol gets an
+        /// extended-hours-disabled policy, matching what the config validator
+        /// requires of a real file.
+        hedging: Option<HedgingAssets>,
         #[builder(default = 2)] inventory_poll_interval: u64,
         #[builder(default = const { NonZeroU32::new(10).unwrap() })]
         inventory_divergence_threshold: NonZeroU32,
@@ -1718,6 +1577,25 @@ impl Ctx {
             InventoryMode::Managed { inventory } => inventory,
         };
 
+        let hedging = hedging.unwrap_or_else(|| HedgingAssets {
+            equities: crate::HedgedEquities {
+                symbols: assets
+                    .equities
+                    .symbols
+                    .keys()
+                    .map(|symbol| {
+                        (
+                            symbol.clone(),
+                            crate::EquityHedgePolicy {
+                                extended_hours_counter_trading: OperationMode::Disabled,
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+            cash: None,
+        });
+
         Ok(Self {
             database_url,
             log_level: LogLevel::Debug,
@@ -1736,6 +1614,8 @@ impl Ctx {
                 vault_owner,
                 deployment_block,
                 ingestion_cutoff: IngestionCutoff::Safe,
+                redemption_wallet,
+                assets,
             }),
             order_polling_interval: 1,
             order_polling_max_jitter: 0,
@@ -1757,7 +1637,7 @@ impl Ctx {
             wallet,
             wallet_meta: None,
             execution_threshold,
-            assets,
+            assets: hedging,
             travel_rule,
             rest_api,
             issuance,
@@ -1887,8 +1767,8 @@ pub enum CtxError {
     #[error("operation requires rebalancing mode")]
     NotRebalancing,
     #[error(
-        "operation requires [tokenization] config section \
-         with redemption_wallet"
+        "operation requires the trading chain's redemption_wallet \
+         ([chains.<name>.trading].redemption_wallet)"
     )]
     MissingTokenization,
     #[error(
@@ -1911,25 +1791,35 @@ pub enum CtxError {
     #[error("[wallet] config present but [wallet] secrets missing")]
     WalletSecretsMissing,
     #[error(
-        "assets.cash operational_limit {configured} is below the smallest \
-         Alpaca-to-Base transfer that can complete, {minimum}"
+        "[chains.<name>.trading.assets.cash] operational_limit {configured} is below the \
+         smallest Alpaca-to-Base transfer that can complete, {minimum}"
     )]
     CashOperationalLimitBelowMinimumTransfer { configured: Usdc, minimum: Usdc },
     #[error(
-        "assets.cash.vault_ids is required for rebalancing \
+        "vault_ids in [chains.<name>.trading.assets.cash] is required for rebalancing \
          but not configured"
     )]
     MissingCashVaultId,
     #[error(
-        "assets.equities.{symbol}.vault_ids is required when \
+        "vault_ids in [chains.<name>.trading.assets.equities.{symbol}] is required when \
          rebalancing is enabled but not configured"
     )]
     MissingEquityVaultId { symbol: Symbol },
     #[error(
-        "assets.equities.{symbol}: extended_hours_counter_trading cannot be \
-         enabled when trading is disabled -- extended-hours counter-trades only \
-         run while counter-trading is enabled, so this combination can never \
-         execute"
+        "[chains.{chain}.trading.assets.equities.{symbol}] is listed on chain but absent \
+         from [chains.<name>.trading.assets.equities], so nothing would hedge its fills"
+    )]
+    ListedSymbolIsNotHedged { chain: Chain, symbol: Symbol },
+    #[error(
+        "[assets.equities.{symbol}] is hedged but listed under no chain's \
+         [chains.base.assets.equities], so it can never trade"
+    )]
+    HedgedSymbolIsNotListed { symbol: Symbol },
+    #[error(
+        "[assets.equities.{symbol}] enables extended_hours_counter_trading, but every \
+         [chains.<name>.trading.assets.equities.{symbol}] listing has trading disabled \
+         -- extended-hours counter-trades only run while counter-trading is enabled, \
+         so this combination can never execute"
     )]
     ExtendedHoursWithoutCounterTrading { symbol: Symbol },
     #[error("{field} must be non-zero")]
@@ -1995,6 +1885,8 @@ impl CtxError {
                 "cash operational limit below minimum transfer"
             }
             Self::MissingCashVaultId => "missing cash vault_ids",
+            Self::ListedSymbolIsNotHedged { .. } => "listed symbol has no hedging policy",
+            Self::HedgedSymbolIsNotListed { .. } => "hedged symbol is listed on no chain",
             Self::MissingEquityVaultId { .. } => "missing equity vault_ids",
             Self::ExtendedHoursWithoutCounterTrading { .. } => {
                 "extended hours enabled without counter-trading"
@@ -2118,6 +2010,8 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
             vault_owner: order_owner,
             deployment_block: 1,
             ingestion_cutoff: IngestionCutoff::Safe,
+            redemption_wallet: None,
+            assets: crate::ChainAssets::default(),
         }),
         order_polling_interval: 15,
         order_polling_max_jitter: 5,
@@ -2139,10 +2033,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         wallet: None,
         wallet_meta: None,
         execution_threshold: ExecutionThreshold::whole_share(),
-        assets: AssetsConfig {
-            equities: EquitiesConfig::default(),
-            cash: None,
-        },
+        assets: HedgingAssets::default(),
         travel_rule: None,
         rest_api: None,
         issuance: create_test_issuance_ctx(),
@@ -2187,7 +2078,7 @@ mod tests {
             .broker(BrokerCtx::DryRun)
             .trading_mode(TradingMode::Standalone)
             .order_owner(order_owner)
-            .assets(AssetsConfig::default())
+            .assets(crate::ChainAssets::default())
             .call()
             .unwrap();
 
@@ -2208,7 +2099,7 @@ mod tests {
             .broker(BrokerCtx::DryRun)
             .trading_mode(TradingMode::Standalone)
             .order_owner(order_owner)
-            .assets(AssetsConfig::default())
+            .assets(crate::ChainAssets::default())
             .inventory_mode(InventoryMode::Managed { inventory })
             .call()
             .unwrap();
@@ -2258,7 +2149,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -2287,6 +2178,61 @@ mod tests {
         file
     }
 
+    /// Pyth enrichment was removed (#1265): a config still carrying a feed id
+    /// must fail loudly rather than silently ignoring the stale key.
+    #[tokio::test]
+    async fn equity_pyth_feed_id_is_rejected_as_unknown_configuration() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+
+            [chains.base]
+            required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            ingestion_cutoff = "safe"
+
+            [chains.base.trading.assets.equities.AAPL]
+            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            pyth_feed_id = "0xfee33f2a978bf32dd6b662b65ba8083c6773b494f8401194ec1870c640860245"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+
+            [chains.ethereum]
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            required_confirmations = 1
+
+            [assets.equities.AAPL]
+            extended_hours_counter_trading = "disabled"
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let source = std::error::Error::source(&error)
+            .map(ToString::to_string)
+            .unwrap_or_default();
+
+        assert!(
+            source.contains("pyth_feed_id"),
+            "a stale pyth_feed_id key must be rejected by name, got: {source}"
+        );
+    }
+
     fn alerts_config_toml(base_threshold: &str, ethereum_threshold: &str) -> NamedTempFile {
         toml_file(&format!(
             r#"
@@ -2296,7 +2242,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -2348,7 +2294,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -2427,7 +2373,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -2522,12 +2468,14 @@ mod tests {
             inventory_divergence_threshold = 10
 
             [assets.equities.AAPL]
+            extended_hours_counter_trading = "disabled"
+
+            [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
             tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "disabled"
 
             {pricing}
 
@@ -2662,7 +2610,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -2712,7 +2660,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -2770,7 +2718,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -2825,7 +2773,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -2880,7 +2828,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -3057,7 +3005,7 @@ mod tests {
             board_port = 8081
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -3106,7 +3054,7 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -3155,7 +3103,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 0
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -3203,7 +3151,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -3252,7 +3200,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -3292,8 +3240,12 @@ mod tests {
         );
     }
 
+    /// The flag is still required per equity, but it is no longer a field on
+    /// the chain listing, so a missing one is caught by the cross-table check
+    /// rather than by serde: a symbol listed on a chain with no hedging policy
+    /// has nothing to hedge its fills.
     #[tokio::test]
-    async fn extended_hours_counter_trading_is_required_per_equity() {
+    async fn a_listed_equity_without_a_hedging_policy_is_rejected() {
         let config = toml_file(
             r#"
             database_url = ":memory:"
@@ -3302,7 +3254,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities.AAPL]
+            [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             trading = "enabled"
@@ -3335,15 +3287,14 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(error, CtxError::ConfigToml { .. }),
-            "expected config parse failure for missing extended-hours flag, got: {error:#}"
-        );
-
-        let source = std::error::Error::source(&error).unwrap();
-        let source_display = source.to_string();
-        assert!(
-            source_display.contains("extended_hours_counter_trading"),
-            "expected parse error to mention extended-hours flag, got: {source_display}"
+            matches!(
+                error,
+                CtxError::ListedSymbolIsNotHedged {
+                    chain: Chain::Base,
+                    ref symbol,
+                } if *symbol == Symbol::new("AAPL").unwrap()
+            ),
+            "a listed symbol with no [chains.<name>.trading.assets.equities] entry must be refused, got: {error:#}"
         );
     }
 
@@ -3357,7 +3308,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 0
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -3409,7 +3360,7 @@ mod tests {
             inventory_divergence_threshold = 10
             order_fill_poll_interval = 0
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -3460,7 +3411,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -3534,9 +3485,9 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
-            [assets.cash]
+            [chains.base.trading.assets.cash]
             rebalancing = "enabled"
             operational_limit = 52
 
@@ -3551,6 +3502,7 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
             required_confirmations = 12
@@ -3564,10 +3516,6 @@ mod tests {
             extended_hours_reprice_timeout_secs = 300
             close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
-
-            [tokenization]
-            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-
             [rebalancing]
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
@@ -3624,7 +3572,7 @@ mod tests {
             position_check_interval = 120
             inventory_poll_interval = 90
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -3798,7 +3746,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -3811,16 +3759,13 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
             required_confirmations = 12
 
             [chains.hyperevm]
             required_confirmations = 1
-
-            [tokenization]
-            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-
             [rebalancing]
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
@@ -3904,7 +3849,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -3974,7 +3919,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -3987,6 +3932,7 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
             required_confirmations = 12
@@ -4000,10 +3946,6 @@ mod tests {
             extended_hours_reprice_timeout_secs = 300
             close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
-
-            [tokenization]
-            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-
             [rebalancing]
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
@@ -4059,7 +4001,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -4072,6 +4014,7 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
             required_confirmations = 12
@@ -4088,10 +4031,6 @@ mod tests {
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"
-
-            [tokenization]
-            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-
             [rebalancing]
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
@@ -4139,7 +4078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalancing_without_tokenization_config_fails() {
+    async fn rebalancing_without_a_redemption_wallet_fails() {
         let config = toml_file(
             r#"
             database_url = ":memory:"
@@ -4148,7 +4087,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -4244,7 +4183,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -4257,6 +4196,7 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
             required_confirmations = 12
@@ -4277,10 +4217,6 @@ mod tests {
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"
-
-            [tokenization]
-            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-
             {bot_gas_valuation_section}
 
             [rebalancing]
@@ -4479,7 +4415,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -4549,7 +4485,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -4629,9 +4565,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
-            target_ratio = 0.5
-            ratio_deviation = 0.2
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -4705,7 +4639,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -4777,7 +4711,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -4963,7 +4897,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -5168,7 +5102,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -5240,7 +5174,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -5316,7 +5250,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -5389,7 +5323,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -5465,7 +5399,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -5941,7 +5875,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -5954,16 +5888,13 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
             required_confirmations = 12
 
             [chains.hyperevm]
             required_confirmations = 1
-
-            [tokenization]
-            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-
             [rebalancing]
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
@@ -6013,11 +5944,12 @@ mod tests {
         let config_str = include_str!("../../../config/prod/st0x-hedge.toml");
         let config: Config = toml::from_str(config_str).unwrap();
 
-        let global_limit = config
-            .assets
-            .equities
-            .operational_limit
-            .map(Positive::inner);
+        let base = config
+            .chains
+            .get(&Chain::Base)
+            .and_then(|chain| chain.trading.as_ref())
+            .expect("prod config must describe Base as a trading chain");
+        let global_limit = base.assets.equities.operational_limit.map(Positive::inner);
 
         let broker = config.broker.expect(
             "prod config must include [broker.travel_rule] — \
@@ -6045,7 +5977,7 @@ mod tests {
             .validated()
             .unwrap();
 
-        for (symbol, equity) in &config.assets.equities.symbols {
+        for (symbol, equity) in &base.assets.equities.symbols {
             if equity.rebalancing == OperationMode::Enabled
                 && let Some(limit) = &equity.operational_limit
                 && let Some(global) = global_limit
@@ -6154,6 +6086,10 @@ mod tests {
         // The NAV bump tokenizes + donates the wrapped equity, so the bumped
         // symbol must carry both token addresses the wrap/donate path resolves.
         let sgov = config
+            .chains
+            .get(&Chain::Base)
+            .and_then(|chain| chain.trading.as_ref())
+            .expect("s01-issuer config must describe Base as a trading chain")
             .assets
             .equities
             .symbols
@@ -6186,52 +6122,6 @@ mod tests {
     fn e2e_config_toml_is_valid() {
         let config_str = include_str!("../../../e2e/config.toml");
         let _: Config = toml::from_str(config_str).unwrap();
-    }
-
-    #[test]
-    fn equity_pyth_feed_id_is_rejected_as_unknown_configuration() {
-        let toml_str = r#"
-            database_url = ":memory:"
-            server_port = 8080
-            board_port = 8081
-            apalis_finished_job_cleanup_interval_secs = 3600
-            inventory_divergence_threshold = 10
-
-            [chains.base]
-            required_confirmations = 3
-
-            [chains.base.trading]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            inventory_mode = "managed"
-            inventory_adapters = []
-            inventory = "0x2222222222222222222222222222222222222222"
-            vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
-            ingestion_cutoff = "safe"
-
-            [chains.ethereum]
-            required_confirmations = 12
-
-            [chains.hyperevm]
-            required_confirmations = 1
-
-            [assets.equities.AAPL]
-            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            pyth_feed_id = "0xfee33f2a978bf32dd6b662b65ba8083c6773b494f8401194ec1870c640860245"
-            trading = "enabled"
-            rebalancing = "disabled"
-            wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "disabled"
-        "#;
-
-        let error = toml::from_str::<Config>(toml_str)
-            .err()
-            .expect("removed equity setting must be rejected");
-        assert!(
-            error.to_string().contains("unknown field `pyth_feed_id`"),
-            "expected removed Pyth setting to fail explicitly, got: {error}"
-        );
     }
 
     #[test]
@@ -6490,7 +6380,7 @@ mod tests {
             [assets]
             bogus_field = "should fail"
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -6534,12 +6424,14 @@ mod tests {
             inventory_divergence_threshold = 10
 
             [assets.equities.AAPL]
+            extended_hours_counter_trading = "disabled"
+
+            [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "disabled"
             bogus_field = "should fail"
 
             [chains.base]
@@ -6583,7 +6475,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.cash]
+            [chains.base.trading.assets.cash]
             rebalancing = "disabled"
             bogus_field = "should fail"
 
@@ -6764,820 +6656,6 @@ mod tests {
             matches!(err, CtxError::SecretsToml { .. }),
             "Expected secrets parse error for unknown broker field, got {err:?}"
         );
-    }
-
-    #[test]
-    fn assets_config_parses_equities_and_cash() {
-        let toml_str = r#"
-            [equities.RKLB]
-            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
-            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
-            vault_id = "0xfab"
-            trading = "disabled"
-            rebalancing = "enabled"
-            wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "disabled"
-            operational_limit = 5
-
-            [equities.SPYM]
-            tokenized_equity = "0x8fdf41116f755771bfe0747d5f8c3711d5debfbb"
-            tokenized_equity_derivative = "0x31c2c14134e6e3b7ef9478297f199331133fc2d8"
-            trading = "disabled"
-            rebalancing = "disabled"
-            wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "disabled"
-
-            [cash]
-            vault_id = "0x0000000000000000000000000000000000000000000000000000000000000fab"
-            rebalancing = "disabled"
-            operational_limit = 100
-        "#;
-
-        let config: AssetsConfig = toml::from_str(toml_str).unwrap();
-
-        assert_eq!(config.equities.symbols.len(), 2);
-
-        let rklb = &config.equities.symbols[&Symbol::new("RKLB").unwrap()];
-        assert_eq!(
-            rklb.tokenized_equity,
-            "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
-                .parse::<Address>()
-                .unwrap()
-        );
-        assert_eq!(rklb.trading, OperationMode::Disabled);
-        assert_eq!(rklb.rebalancing, OperationMode::Enabled);
-        assert_eq!(rklb.vault_ids.len(), 1);
-        assert!(rklb.operational_limit.is_some());
-
-        let cash = config.cash.unwrap();
-        assert_eq!(cash.rebalancing, OperationMode::Disabled);
-        assert_eq!(cash.vault_ids.len(), 1);
-    }
-
-    #[test]
-    fn extended_hours_counter_trading_parses_enabled_and_disabled_from_toml() {
-        let toml_str = r#"
-            [equities.AAPL]
-            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
-            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
-            trading = "enabled"
-            rebalancing = "disabled"
-            wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "enabled"
-
-            [equities.TSLA]
-            tokenized_equity = "0x8fdf41116f755771bfe0747d5f8c3711d5debfbb"
-            tokenized_equity_derivative = "0x31c2c14134e6e3b7ef9478297f199331133fc2d8"
-            trading = "disabled"
-            rebalancing = "disabled"
-            wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "disabled"
-        "#;
-        let config: AssetsConfig = toml::from_str(toml_str).unwrap();
-        let aapl = Symbol::new("AAPL").unwrap();
-        let tsla = Symbol::new("TSLA").unwrap();
-        assert!(config.is_extended_hours_enabled(&aapl));
-        assert!(!config.is_extended_hours_enabled(&tsla));
-    }
-
-    #[test]
-    fn short_vault_id_left_pads_to_b256() {
-        let toml_str = r#"
-            [equities.RKLB]
-            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
-            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
-            vault_id = "0xfab"
-            trading = "disabled"
-            rebalancing = "enabled"
-            wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "disabled"
-        "#;
-
-        let config: AssetsConfig = toml::from_str(toml_str).unwrap();
-        let rklb = &config.equities.symbols[&Symbol::new("RKLB").unwrap()];
-        let expected: B256 = "0000000000000000000000000000000000000000000000000000000000000fab"
-            .parse()
-            .unwrap();
-        assert_eq!(rklb.vault_ids[0], expected);
-    }
-
-    #[test]
-    fn vault_ids_array_parses_multiple_values() {
-        let toml_str = r#"
-            [equities.RKLB]
-            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
-            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
-            vault_ids = ["0xfab", "0xfab2"]
-            trading = "disabled"
-            rebalancing = "enabled"
-            wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "disabled"
-        "#;
-
-        let config: AssetsConfig = toml::from_str(toml_str).unwrap();
-        let rklb = &config.equities.symbols[&Symbol::new("RKLB").unwrap()];
-        assert_eq!(rklb.vault_ids.len(), 2);
-
-        let expected_1: B256 = "0000000000000000000000000000000000000000000000000000000000000fab"
-            .parse()
-            .unwrap();
-        let expected_2: B256 = "000000000000000000000000000000000000000000000000000000000000fab2"
-            .parse()
-            .unwrap();
-        assert_eq!(rklb.vault_ids[0], expected_1);
-        assert_eq!(rklb.vault_ids[1], expected_2);
-    }
-
-    #[test]
-    fn equity_missing_trading_field_rejects() {
-        let toml_str = r#"
-            [equities.AAPL]
-            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            rebalancing = "disabled"
-            wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "disabled"
-        "#;
-
-        let result = toml::from_str::<AssetsConfig>(toml_str);
-        assert!(
-            result.is_err(),
-            "Expected error for missing trading field, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn equity_missing_rebalancing_field_rejects() {
-        let toml_str = r#"
-            [equities.AAPL]
-            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            trading = "enabled"
-            wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "disabled"
-        "#;
-
-        let result = toml::from_str::<AssetsConfig>(toml_str);
-        assert!(
-            result.is_err(),
-            "Expected error for missing rebalancing field, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn equity_missing_wrapped_equity_recovery_field_rejects() {
-        let toml_str = r#"
-            [equities.AAPL]
-            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            trading = "enabled"
-            rebalancing = "disabled"
-            extended_hours_counter_trading = "disabled"
-        "#;
-
-        let result = toml::from_str::<AssetsConfig>(toml_str);
-        assert!(
-            result.is_err(),
-            "Expected error for missing wrapped_equity_recovery field, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn per_asset_operational_limits_parsed_independently() {
-        let toml_str = r#"
-            [equities.AAPL]
-            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            trading = "enabled"
-            rebalancing = "disabled"
-            wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "disabled"
-            operational_limit = 10
-
-            [equities.TSLA]
-            tokenized_equity = "0xcccccccccccccccccccccccccccccccccccccccc"
-            tokenized_equity_derivative = "0xdddddddddddddddddddddddddddddddddddddddd"
-            trading = "enabled"
-            rebalancing = "disabled"
-            wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "disabled"
-        "#;
-
-        let config: AssetsConfig = toml::from_str(toml_str).unwrap();
-        let aapl = &config.equities.symbols[&Symbol::new("AAPL").unwrap()];
-        let tsla = &config.equities.symbols[&Symbol::new("TSLA").unwrap()];
-        assert!(
-            aapl.operational_limit.is_some(),
-            "AAPL should have an operational limit"
-        );
-        assert!(
-            tsla.operational_limit.is_none(),
-            "TSLA should not have an operational limit"
-        );
-    }
-
-    #[test]
-    fn is_trading_enabled_returns_configured_value() {
-        let mut symbols = HashMap::new();
-        symbols.insert(
-            Symbol::new("RKLB").unwrap(),
-            EquityAssetConfig {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: Vec::new(),
-                trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
-                operational_limit: None,
-            },
-        );
-
-        let ctx = Ctx {
-            assets: AssetsConfig {
-                equities: EquitiesConfig {
-                    operational_limit: None,
-                    symbols,
-                },
-                cash: None,
-            },
-            ..create_test_ctx_with_order_owner(address!(
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ))
-        };
-
-        assert!(
-            !ctx.assets.is_trading_enabled(&Symbol::new("RKLB").unwrap()),
-            "RKLB trading should be disabled"
-        );
-    }
-
-    #[test]
-    fn is_trading_disabled_for_unknown_assets() {
-        let ctx = create_test_ctx_with_order_owner(address!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-
-        assert!(
-            !ctx.assets
-                .is_trading_enabled(&Symbol::new("UNKNOWN").unwrap()),
-            "Unknown assets should default to trading disabled (fail-closed)"
-        );
-    }
-
-    #[test]
-    fn is_extended_hours_enabled_returns_configured_value() {
-        let mut symbols = HashMap::new();
-        symbols.insert(
-            Symbol::new("AAPL").unwrap(),
-            EquityAssetConfig {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: Vec::new(),
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Enabled,
-                operational_limit: None,
-            },
-        );
-        symbols.insert(
-            Symbol::new("TSLA").unwrap(),
-            EquityAssetConfig {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: Vec::new(),
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
-                operational_limit: None,
-            },
-        );
-
-        let assets = AssetsConfig {
-            equities: EquitiesConfig {
-                operational_limit: None,
-                symbols,
-            },
-            cash: None,
-        };
-
-        assert!(
-            assets.is_extended_hours_enabled(&Symbol::new("AAPL").unwrap()),
-            "AAPL extended-hours counter-trading should be enabled"
-        );
-        assert!(
-            !assets.is_extended_hours_enabled(&Symbol::new("TSLA").unwrap()),
-            "TSLA extended-hours counter-trading should be disabled"
-        );
-        assert!(
-            !assets.is_extended_hours_enabled(&Symbol::new("UNKNOWN").unwrap()),
-            "Unknown assets should default to disabled (fail-closed)"
-        );
-        assert!(
-            assets.any_extended_hours_enabled(),
-            "At least one equity enables extended-hours counter-trading"
-        );
-        assert!(
-            !AssetsConfig::default().any_extended_hours_enabled(),
-            "No configured equities means no extended-hours counter-trading"
-        );
-    }
-
-    #[test]
-    fn is_rebalancing_enabled_returns_configured_value() {
-        let mut symbols = HashMap::new();
-        symbols.insert(
-            Symbol::new("RKLB").unwrap(),
-            EquityAssetConfig {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: Vec::new(),
-                trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
-                operational_limit: None,
-            },
-        );
-
-        let ctx = Ctx {
-            assets: AssetsConfig {
-                equities: EquitiesConfig {
-                    operational_limit: None,
-                    symbols,
-                },
-                cash: None,
-            },
-            ..create_test_ctx_with_order_owner(address!(
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ))
-        };
-
-        assert!(
-            ctx.assets
-                .is_rebalancing_enabled(&Symbol::new("RKLB").unwrap()),
-            "RKLB rebalancing should be enabled"
-        );
-    }
-
-    #[test]
-    fn is_rebalancing_enabled_defaults_to_false_for_unknown() {
-        let ctx = create_test_ctx_with_order_owner(address!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-
-        assert!(
-            !ctx.assets
-                .is_rebalancing_enabled(&Symbol::new("UNKNOWN").unwrap()),
-            "Unknown assets should default to rebalancing disabled"
-        );
-    }
-
-    #[test]
-    fn is_wrapped_equity_recovery_enabled_is_independent_of_rebalancing() {
-        let mut symbols = HashMap::new();
-        symbols.insert(
-            Symbol::new("AAPL").unwrap(),
-            EquityAssetConfig {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: Vec::new(),
-                trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Enabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
-                operational_limit: None,
-            },
-        );
-
-        let ctx = Ctx {
-            assets: AssetsConfig {
-                equities: EquitiesConfig {
-                    operational_limit: None,
-                    symbols,
-                },
-                cash: None,
-            },
-            ..create_test_ctx_with_order_owner(address!(
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ))
-        };
-
-        let aapl = Symbol::new("AAPL").unwrap();
-        assert!(
-            ctx.assets.is_wrapped_equity_recovery_enabled(&aapl),
-            "Recovery should follow wrapped_equity_recovery config"
-        );
-        assert!(
-            !ctx.assets.is_rebalancing_enabled(&aapl),
-            "Recovery-enabled symbol must not imply rebalancing is enabled"
-        );
-        assert!(
-            !ctx.assets
-                .is_wrapped_equity_recovery_enabled(&Symbol::new("UNKNOWN").unwrap()),
-            "Unknown assets should default to recovery disabled"
-        );
-    }
-
-    #[test]
-    fn base_symbol_config_keys_fix_lookup_bug() {
-        // Config keys use base symbols (SPYM not tSPYM).
-        // is_trading_enabled uses Symbol directly, which matches
-        // base symbol keys. This verifies the bug fix.
-        let mut symbols = HashMap::new();
-        symbols.insert(
-            Symbol::new("SPYM").unwrap(),
-            EquityAssetConfig {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: Vec::new(),
-                trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                extended_hours_counter_trading: OperationMode::Disabled,
-                operational_limit: None,
-            },
-        );
-
-        let ctx = Ctx {
-            assets: AssetsConfig {
-                equities: EquitiesConfig {
-                    operational_limit: None,
-                    symbols,
-                },
-                cash: None,
-            },
-            ..create_test_ctx_with_order_owner(address!(
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ))
-        };
-
-        // The lookup uses base symbol "SPYM" which matches the config key
-        assert!(
-            !ctx.assets.is_trading_enabled(&Symbol::new("SPYM").unwrap()),
-            "SPYM trading should be disabled per config"
-        );
-    }
-
-    mod proptests {
-        use proptest::prelude::*;
-
-        use super::*;
-
-        /// Generates a valid hex digit string of length 1..=64.
-        fn arb_hex_digits() -> impl Strategy<Value = String> {
-            prop::collection::vec(
-                prop::sample::select(vec![
-                    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
-                ]),
-                1..=64,
-            )
-            .prop_map(|chars| chars.into_iter().collect::<String>())
-        }
-
-        proptest! {
-            /// Arbitrary short hex strings left-pad to correct B256.
-            ///
-            /// The padded result should equal the hex digits
-            /// zero-filled on the left to 64 chars.
-            #[test]
-            fn padded_b256_roundtrip(hex_digits in arb_hex_digits()) {
-                let hex_str = format!("0x{hex_digits}");
-                let parsed = parse_padded_b256(&hex_str).unwrap();
-
-                let expected_hex = format!("{hex_digits:0>64}");
-                let expected: B256 = expected_hex.parse().unwrap();
-                prop_assert_eq!(parsed, expected);
-            }
-
-            /// Invalid hex characters must produce a parse error.
-            #[test]
-            fn padded_b256_rejects_invalid_hex(
-                bad_char in "[g-zG-Z!@#$%^&*]",
-                prefix in arb_hex_digits(),
-            ) {
-                let hex_str = format!("0x{prefix}{bad_char}");
-                let result = parse_padded_b256(&hex_str);
-                prop_assert!(
-                    result.is_err(),
-                    "Expected error for invalid hex '{hex_str}', got {result:?}",
-                );
-            }
-
-            /// OperationMode serializes and deserializes as lowercase strings.
-            #[test]
-            fn operation_mode_serde_roundtrip(enabled in any::<bool>()) {
-                #[derive(Debug, PartialEq, Serialize, Deserialize)]
-                struct Wrapper {
-                    mode: OperationMode,
-                }
-
-                let wrapper = Wrapper {
-                    mode: if enabled {
-                        OperationMode::Enabled
-                    } else {
-                        OperationMode::Disabled
-                    },
-                };
-
-                let serialized = toml::to_string(&wrapper).unwrap();
-                let deserialized: Wrapper = toml::from_str(&serialized).unwrap();
-                prop_assert_eq!(wrapper, deserialized);
-            }
-
-            /// OperationMode rejects strings that are not "enabled" or
-            /// "disabled".
-            #[test]
-            fn operation_mode_rejects_invalid_strings(
-                invalid in "[a-z]{3,10}"
-                    .prop_filter("must not be a valid mode", |value| {
-                        value != "enabled" && value != "disabled"
-                    })
-            ) {
-                #[derive(Debug, Deserialize)]
-                struct Wrapper {
-                    #[allow(dead_code)]
-                    mode: OperationMode,
-                }
-
-                let toml_str = format!(r#"mode = "{invalid}""#);
-
-                let result = toml::from_str::<Wrapper>(&toml_str);
-                prop_assert!(
-                    result.is_err(),
-                    "Expected error for invalid mode '{invalid}', got {result:?}"
-                );
-            }
-
-            /// EquityAssetConfig parses when all required fields are present.
-            #[test]
-            fn equity_asset_config_parses_with_addresses(
-                share_byte in any::<u8>(),
-                derivative_byte in any::<u8>(),
-                trading_enabled in any::<bool>(),
-                rebalancing_enabled in any::<bool>(),
-            ) {
-                let trading = if trading_enabled { "enabled" } else { "disabled" };
-                let rebalancing = if rebalancing_enabled { "enabled" } else { "disabled" };
-                let toml_str = format!(
-                    r#"
-                    tokenized_equity = "0x{share_byte:02x}{:0>38}"
-                    tokenized_equity_derivative = "0x{derivative_byte:02x}{:0>38}"
-                    trading = "{trading}"
-                    rebalancing = "{rebalancing}"
-                    wrapped_equity_recovery = "disabled"
-                    extended_hours_counter_trading = "disabled"
-                    "#,
-                    "", "",
-                );
-
-                let result = toml::from_str::<EquityAssetConfig>(&toml_str);
-                prop_assert!(
-                    result.is_ok(),
-                    "Expected successful parse, got {result:?}"
-                );
-
-                let config = result.unwrap();
-                let expected_trading = if trading_enabled {
-                    OperationMode::Enabled
-                } else {
-                    OperationMode::Disabled
-                };
-                let expected_rebalancing = if rebalancing_enabled {
-                    OperationMode::Enabled
-                } else {
-                    OperationMode::Disabled
-                };
-                prop_assert_eq!(config.trading, expected_trading);
-                prop_assert_eq!(config.rebalancing, expected_rebalancing);
-            }
-        }
-
-        #[test]
-        fn cash_asset_config_parses_without_token_addresses() {
-            let toml_str = r#"
-                vault_id = "0xfab"
-                rebalancing = "disabled"
-                operational_limit = 100
-            "#;
-
-            let config: CashAssetConfig = toml::from_str(toml_str).unwrap();
-            assert_eq!(config.rebalancing, OperationMode::Disabled);
-            assert_eq!(config.vault_ids.len(), 1);
-        }
-
-        #[test]
-        fn cash_reserved_parses_positive_usd() {
-            let toml_str = r#"
-                rebalancing = "enabled"
-                reserved = 5000.00
-            "#;
-
-            let config: CashAssetConfig = toml::from_str(toml_str).unwrap();
-            let reserved = config.reserved.unwrap();
-            assert!(
-                reserved.inner().eq(&Usd::new(float!(5000))).unwrap(),
-                "Expected $5000 reserved, got {reserved}"
-            );
-        }
-
-        #[test]
-        fn cash_reserved_absent_is_none() {
-            let toml_str = r#"
-                rebalancing = "enabled"
-            "#;
-
-            let config: CashAssetConfig = toml::from_str(toml_str).unwrap();
-            assert!(config.reserved.is_none());
-        }
-
-        #[test]
-        fn cash_reserved_rejects_zero() {
-            let toml_str = r#"
-                rebalancing = "enabled"
-                reserved = 0
-            "#;
-
-            let result = toml::from_str::<CashAssetConfig>(toml_str);
-            assert!(
-                result.is_err(),
-                "Expected error for zero reserved, got {result:?}"
-            );
-        }
-
-        #[test]
-        fn cash_reserved_rejects_negative() {
-            let toml_str = r#"
-                rebalancing = "enabled"
-                reserved = -100
-            "#;
-
-            let result = toml::from_str::<CashAssetConfig>(toml_str);
-            assert!(
-                result.is_err(),
-                "Expected error for negative reserved, got {result:?}"
-            );
-        }
-
-        #[test]
-        fn equity_asset_config_rejects_missing_tokenized_equity() {
-            let toml_str = r#"
-                tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            "#;
-
-            let result = toml::from_str::<EquityAssetConfig>(toml_str);
-            assert!(
-                result.is_err(),
-                "Expected error for missing tokenized_equity, got {result:?}"
-            );
-        }
-
-        #[test]
-        fn equity_asset_config_rejects_missing_tokenized_equity_derivative() {
-            let toml_str = r#"
-                tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            "#;
-
-            let result = toml::from_str::<EquityAssetConfig>(toml_str);
-            assert!(
-                result.is_err(),
-                "Expected error for missing tokenized_equity_derivative, got {result:?}"
-            );
-        }
-
-        #[test]
-        fn padded_b256_rejects_empty_hex() {
-            let result = parse_padded_b256("0x");
-            assert!(
-                result.is_err(),
-                "Expected error for empty hex string, got {result:?}"
-            );
-        }
-
-        #[test]
-        fn padded_b256_rejects_too_long_hex() {
-            let long_hex = "a".repeat(65);
-            let hex_str = format!("0x{long_hex}");
-            let result = parse_padded_b256(&hex_str);
-            assert!(
-                result.is_err(),
-                "Expected error for too-long hex string, got {result:?}"
-            );
-        }
-
-        #[test]
-        fn operation_mode_enabled_from_string() {
-            #[derive(Debug, Deserialize)]
-            struct Wrapper {
-                mode: OperationMode,
-            }
-
-            let wrapper: Wrapper = toml::from_str(r#"mode = "enabled""#).unwrap();
-            assert_eq!(wrapper.mode, OperationMode::Enabled);
-        }
-
-        #[test]
-        fn operation_mode_disabled_from_string() {
-            #[derive(Debug, Deserialize)]
-            struct Wrapper {
-                mode: OperationMode,
-            }
-
-            let wrapper: Wrapper = toml::from_str(r#"mode = "disabled""#).unwrap();
-            assert_eq!(wrapper.mode, OperationMode::Disabled);
-        }
-    }
-
-    #[test]
-    fn kms_broker_secrets_parse_without_stored_credentials() {
-        // The keyless [broker] variant carries no api_key/api_secret:
-        // a client id plus the Cloud KMS key-version that signs the
-        // RFC 7523 client assertions.
-        let secrets: Secrets = toml::from_str(
-            r#"
-            [chains.base]
-            rpc_url = "http://localhost:8545"
-
-            [chains.ethereum]
-            rpc_url = "http://localhost:8545"
-
-            [chains.hyperevm]
-            rpc_url = "http://localhost:8545"
-
-            [broker]
-            type = "alpaca-broker-api-kms"
-            client_id = "CKTEST"
-            kms_key_version = "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1"
-            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
-            mode = "production"
-            "#,
-        )
-        .unwrap();
-
-        match secrets.broker {
-            BrokerSecrets::AlpacaBrokerApiKms {
-                ref client_id,
-                ref kms_key_version,
-                ..
-            } => {
-                assert_eq!(client_id, "CKTEST");
-                assert!(kms_key_version.ends_with("cryptoKeyVersions/1"));
-            }
-            ref other => panic!("expected keyless broker secrets, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn kms_broker_mapping_requires_production_and_assembles_kms_auth() {
-        let broker_config: BrokerConfig = toml::from_str(
-            r#"
-            counter_trade_slippage_bps = 100
-            close_flatten_cross_max_bps = 400
-            extended_hours_reprice_timeout_secs = 300
-            close_flatten_reprice_timeout_secs = 60
-            extended_hours_close_flatten_window_secs = 900
-
-            [travel_rule]
-            beneficiary_entity_name = "Test Corp"
-            "#,
-        )
-        .unwrap();
-        let kms_secrets = |mode: AlpacaBrokerApiMode| BrokerSecrets::AlpacaBrokerApiKms {
-            client_id: "CKTEST".to_string(),
-            kms_key_version: "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1"
-                .to_string(),
-            account_id: "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef".parse().unwrap(),
-            mode: Some(mode),
-        };
-
-        // The keyless mint targets live authx; pairing it with sandbox
-        // must fail at assembly, not silently mint production tokens.
-        let rejected = BrokerCtx::from_parts(
-            kms_secrets(AlpacaBrokerApiMode::Sandbox),
-            Some(&broker_config),
-        );
-        assert!(matches!(
-            rejected,
-            Err(CtxError::KmsBrokerRequiresProductionMode)
-        ));
-
-        // Production mode assembles a KmsJwt broker context: this pins
-        // the from_parts mapping, not just the TOML shape.
-        let ctx = BrokerCtx::from_parts(
-            kms_secrets(AlpacaBrokerApiMode::Production),
-            Some(&broker_config),
-        )
-        .unwrap();
-        assert!(matches!(
-            &ctx,
-            BrokerCtx::AlpacaBrokerApi(broker_ctx)
-                if matches!(
-                    &broker_ctx.auth,
-                    AlpacaBrokerAuth::KmsJwt { client_id, .. } if client_id == "CKTEST"
-                )
-        ));
     }
 
     #[test]
@@ -7768,12 +6846,14 @@ mod tests {
             inventory_divergence_threshold = 10
 
             [assets.equities.AAPL]
+            extended_hours_counter_trading = "disabled"
+
+            [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0x4444444444444444444444444444444444444444"
             tokenized_equity_derivative = "0x5555555555555555555555555555555555555555"
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "disabled"
 
             [pricing]
             ws_url = "wss://pricing.test/ws"
@@ -7880,12 +6960,14 @@ mod tests {
             inventory_divergence_threshold = 10
 
             [assets.equities.AAPL]
+            extended_hours_counter_trading = "enabled"
+
+            [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
             tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
             trading = "disabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "enabled"
 
             [pricing]
             ws_url = "wss://pricing.test/ws"
@@ -7936,12 +7018,14 @@ mod tests {
             inventory_divergence_threshold = 10
 
             [assets.equities.AAPL]
+            extended_hours_counter_trading = "enabled"
+
+            [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
             tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "enabled"
 
             [pricing]
             ws_url = "wss://pricing.test/ws"
@@ -7990,12 +7074,14 @@ mod tests {
             inventory_divergence_threshold = 10
 
             [assets.equities.AAPL]
+            extended_hours_counter_trading = "enabled"
+
+            [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
             tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "enabled"
 
             [pricing]
             ws_url = "wss://pricing.test/ws"
@@ -8044,12 +7130,14 @@ mod tests {
             inventory_divergence_threshold = 10
 
             [assets.equities.AAPL]
+            extended_hours_counter_trading = "enabled"
+
+            [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
             tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "enabled"
 
             [pricing]
             ws_url = "wss://pricing.test/ws"
@@ -8117,12 +7205,14 @@ mod tests {
             inventory_divergence_threshold = 10
 
             [assets.equities.AAPL]
+            extended_hours_counter_trading = "enabled"
+
+            [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
             tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "enabled"
 
             [pricing]
             ws_url = "wss://pricing.test/ws"
@@ -8218,12 +7308,14 @@ mod tests {
             inventory_divergence_threshold = 10
 
             [assets.equities.AAPL]
+            extended_hours_counter_trading = "enabled"
+
+            [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
             tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
-            extended_hours_counter_trading = "enabled"
 
             [pricing]
             ws_url = "wss://pricing.test/ws"
@@ -8341,7 +7433,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -8396,7 +7488,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -8469,7 +7561,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -8569,7 +7661,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3
@@ -8623,7 +7715,7 @@ mod tests {
             inventory_divergence_threshold = 10
             position_check_interval = 0
 
-            [assets.equities]
+            [chains.base.trading.assets.equities]
 
             [chains.base]
             required_confirmations = 3

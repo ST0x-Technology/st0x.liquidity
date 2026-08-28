@@ -50,6 +50,9 @@ close_flatten_cross_max_bps = 400
 
 [broker.travel_rule]
 beneficiary_entity_name = "Acme Corp"
+[assets.equities.EXAMPLE]
+extended_hours_counter_trading = "disabled"
+
 
 [chains.base]
 # Block-confirmation depth required before a transaction this bot submits is
@@ -106,6 +109,14 @@ deployment_block = 1
 # "finalized" -- L1-finalized block (Casper FFG). Full reorg protection but
 #                ~20 min hedging lag on Base.
 ingestion_cutoff = "safe"
+# Alpaca's issuer wallet on this chain -- ERC-20 transfers for redemption go
+# here. Per chain: a redemption delivers tokens that exist on one chain, so
+# sending them to another chain's issuer address would burn them.
+#
+# Required when [rebalancing] is configured (equity redemptions), and by the
+# alpaca-redeem and transfer-equity CLI commands (overridable there with
+# --redemption-wallet).
+redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 # Ethereum is a cash-corridor endpoint only: the bot holds USDC and signs
 # there, but runs no orderbook and ingests no fills, so it has no [trading]
@@ -136,18 +147,6 @@ address = "0xfcad0b19bb29d4674531d6f115237e16afce377c"
 #     the secrets file needs no [wallet] section at all.
 # kms_api_key = "projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>/cryptoKeyVersions/1"
 
-# Alpaca tokenization settings. Required when [rebalancing] is configured
-# (used for equity redemptions). Also needed for CLI commands: alpaca-redeem
-# and transfer-equity (overridable via --redemption-wallet flag).
-# Not needed for alpaca-tokenize or alpaca-tokenization-requests.
-[tokenization]
-# Alpaca's issuer wallet — ERC-20 transfers for redemption go here.
-redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-
-# ETH/USD valuation source for bot-gas cost recording (ADR 0020). Required
-# whenever [rebalancing] is configured -- bot-gas cost recording only runs on
-# rebalancing paths (vault deposit/withdraw, wrap/unwrap, CCTP burn/mint, USDC
-# transfer). The Chainlink Base proxy address is public, not a secret.
 [bot_gas_valuation]
 chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 
@@ -195,7 +194,7 @@ freeze_check = "enabled"
 equity = { target = 0.5, deviation = 0.2 }
 usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
 
-[assets.equities.EXAMPLE]
+[chains.base.trading.assets.equities.EXAMPLE]
 tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 trading = "enabled"
@@ -210,12 +209,11 @@ wrapped_equity_recovery = "disabled"
 # so the limit price is derived from the latest trade plus
 # `[broker].counter_trade_slippage_bps`. Leave disabled to restrict hedging
 # to regular-hours market orders.
-extended_hours_counter_trading = "disabled"
 # Single vault: vault_ids = "0xab12"
 # Multiple vaults: vault_ids = ["0xab12", "0xcd34"]
 # operational_limit = 100.0
 
-[assets.cash]
+[chains.base.trading.assets.cash]
 rebalancing = "enabled"
 # Single vault: vault_ids = "0xcd34"
 # Multiple vaults: vault_ids = ["0xcd34", "0xef56"]

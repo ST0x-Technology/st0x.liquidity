@@ -13,13 +13,15 @@ environment = "e2e"
 traces_endpoint = "http://localhost:10428"
 logs_endpoint = "http://localhost:9428"
 
-[assets.equities.EXAMPLE]
+[chains.base.trading.assets.equities.EXAMPLE]
 trading = "enabled"
 rebalancing = "disabled"
 wrapped_equity_recovery = "disabled"
-extended_hours_counter_trading = "disabled"
 tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[assets.equities.EXAMPLE]
+extended_hours_counter_trading = "disabled"
+
 
 [chains.base]
 required_confirmations = 0

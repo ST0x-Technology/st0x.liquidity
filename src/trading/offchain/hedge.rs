@@ -16,7 +16,7 @@ use st0x_float_macro::float;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use st0x_config::{AssetsConfig, ExecutionThreshold};
+use st0x_config::{ExecutionThreshold, HedgingAssets};
 use st0x_event_sorcery::{AggregateError, LifecycleError, Store};
 use st0x_execution::{
     Backpressure, ClientOrderId, CounterTradePreflight, CounterTradeSkipReason, Direction,
@@ -125,7 +125,7 @@ pub(crate) struct HedgeCtx {
     /// order during an Extended session. A disabled symbol skips (the
     /// regular-open cancel-and-replace sweep is keyed off the same per-symbol
     /// flag, so an extended order for a disabled symbol would be orphaned).
-    pub(crate) assets: AssetsConfig,
+    pub(crate) assets: HedgingAssets,
     /// Validated once at construction (`conductor/builder.rs`) instead of
     /// re-parsed from a raw `u64` on every hedge job -- the window is fixed
     /// for the process lifetime, so re-validating it per job just threads an
@@ -1561,12 +1561,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
 
-    use alloy::primitives::{Address, TxHash};
+    use alloy::primitives::TxHash;
     use proptest::prelude::*;
     use tokio::sync::Notify;
     use uuid::Uuid;
 
-    use st0x_config::{EquitiesConfig, EquityAssetConfig, ExecutionThreshold, OperationMode};
+    use st0x_config::{EquityHedgePolicy, ExecutionThreshold, HedgedEquities, OperationMode};
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::{
         ClientOrderId, Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor,
@@ -1583,30 +1583,22 @@ mod tests {
     use crate::position::{AnchorDisposition, Position, PositionCommand, TradeId};
     use crate::test_utils::TEST_POLL_INTERVAL;
 
-    /// Builds an [`AssetsConfig`] with a single equity whose extended-hours
+    /// Builds an [`HedgingAssets`] with a single equity whose extended-hours
     /// counter-trading flag is set as given. Used to drive the per-symbol
     /// extended-hours gate in `PlaceHedge::perform`.
-    fn extended_hours_assets(symbol: &str, enabled: bool) -> AssetsConfig {
+    fn extended_hours_assets(symbol: &str, enabled: bool) -> HedgingAssets {
         let extended_hours_counter_trading = if enabled {
             OperationMode::Enabled
         } else {
             OperationMode::Disabled
         };
 
-        AssetsConfig {
-            equities: EquitiesConfig {
-                operational_limit: None,
+        HedgingAssets {
+            equities: HedgedEquities {
                 symbols: std::iter::once((
                     Symbol::new(symbol).unwrap(),
-                    EquityAssetConfig {
-                        tokenized_equity: Address::ZERO,
-                        tokenized_equity_derivative: Address::ZERO,
-                        vault_ids: Vec::new(),
-                        trading: OperationMode::Disabled,
-                        rebalancing: OperationMode::Disabled,
-                        wrapped_equity_recovery: OperationMode::Disabled,
+                    EquityHedgePolicy {
                         extended_hours_counter_trading,
-                        operational_limit: None,
                     },
                 ))
                 .collect(),
@@ -6239,7 +6231,7 @@ mod tests {
     /// chosen session and per-symbol extended-hours eligibility.
     async fn create_hedge_ctx_with(
         placer: Arc<dyn OrderPlacer>,
-        assets: AssetsConfig,
+        assets: HedgingAssets,
     ) -> TestInfra {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 

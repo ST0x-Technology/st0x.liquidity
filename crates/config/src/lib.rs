@@ -5,6 +5,7 @@
 //! shared-metadata, and domain crates must remain config-agnostic.
 
 mod alerts;
+mod assets;
 mod bot_gas_valuation;
 mod chain;
 mod imbalance_threshold;
@@ -18,6 +19,10 @@ mod threshold;
 mod wallet;
 
 pub use alerts::{AlertsAssemblyError, AlertsConfig, AlertsCtx, AlertsSecrets};
+pub use assets::{
+    CashHedgePolicy, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset,
+    EquityHedgePolicy, HedgedEquities, HedgingAssets, OperationMode,
+};
 pub use bot_gas_valuation::BotGasValuationConfig;
 pub use chain::{
     ChainConfig, ChainConfigError, ChainCtx, ChainRegistry, ChainRegistryError, ChainSecrets,

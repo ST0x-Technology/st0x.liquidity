@@ -600,6 +600,7 @@ mod tests {
     use serde_json::Value;
     use sqlx::{ConnectOptions, SqlitePool};
 
+    use st0x_config::ChainAssets;
     use st0x_config::{InventoryAdapters, InventoryMode};
     use st0x_evm::Chain;
 
@@ -696,6 +697,8 @@ mod tests {
         let backfill_queue = BackfillJobQueue::new(&apalis_pool);
 
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
@@ -1277,6 +1280,8 @@ mod tests {
             crate::test_utils::setup_file_backed_test_db(Duration::from_millis(250)).await;
         let backfill_queue = BackfillJobQueue::new(&apalis_pool);
         let evm_ctx = TradingChain {
+            redemption_wallet: None,
+            assets: ChainAssets::default(),
             chain: Chain::Base,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
