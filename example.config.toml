@@ -66,6 +66,12 @@ close_flatten_cross_max_bps = 400
 
 [broker.travel_rule]
 beneficiary_entity_name = "Acme Corp"
+# Symbols intentionally removed from this table while registry or snapshot
+# state still references them. Live workflows still block deployment. See
+# "Retired Symbol" in docs/domain.md.
+[assets.equities]
+retired_symbols = []
+
 [assets.equities.EXAMPLE]
 extended_hours_counter_trading = "disabled"
 

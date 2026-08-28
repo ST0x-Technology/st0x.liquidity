@@ -9,7 +9,7 @@ use clap::Parser;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -118,6 +118,73 @@ impl std::fmt::Display for StartupNotice {
         };
         write!(formatter, "{level}: {message}", message = self.message)
     }
+}
+
+/// Candidate-config symbol sets consumed by the deploy-time database verifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentSymbolPolicy {
+    configured: BTreeSet<Symbol>,
+    retired: BTreeSet<Symbol>,
+}
+
+impl DeploymentSymbolPolicy {
+    pub fn new(
+        configured: impl IntoIterator<Item = Symbol>,
+        retired: impl IntoIterator<Item = Symbol>,
+    ) -> Result<Self, CtxError> {
+        let configured = configured.into_iter().collect::<BTreeSet<_>>();
+        let mut retired_symbols = BTreeSet::new();
+
+        for symbol in retired {
+            if !retired_symbols.insert(symbol.clone()) {
+                return Err(CtxError::DuplicateRetiredSymbol { symbol });
+            }
+            if configured.contains(&symbol) {
+                return Err(CtxError::ConfiguredSymbolMarkedRetired { symbol });
+            }
+        }
+
+        Ok(Self {
+            configured,
+            retired: retired_symbols,
+        })
+    }
+
+    pub fn configured(&self) -> &BTreeSet<Symbol> {
+        &self.configured
+    }
+
+    pub fn retired(&self) -> &BTreeSet<Symbol> {
+        &self.retired
+    }
+}
+
+#[derive(Deserialize)]
+struct DeploymentConfig {
+    assets: HedgingAssets,
+}
+
+/// Reads only the public asset section needed by the deploy-time symbol gate.
+///
+/// The full config/secrets validation remains the responsibility of
+/// `validate-config`; this loader performs no network or secret access.
+pub fn load_deployment_symbol_policy(
+    config_path: &Path,
+) -> Result<DeploymentSymbolPolicy, CtxError> {
+    let config_str = std::fs::read_to_string(config_path).map_err(|source| CtxError::ConfigIo {
+        path: config_path.to_path_buf(),
+        source,
+    })?;
+    let config: DeploymentConfig =
+        toml::from_str(&config_str).map_err(|source| CtxError::ConfigToml {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
+
+    DeploymentSymbolPolicy::new(
+        config.assets.equities.symbols.into_keys(),
+        config.assets.equities.retired_symbols,
+    )
 }
 
 /// Validated, network-free inputs required by the deploy-time Turnkey approval
@@ -1385,6 +1452,11 @@ fn validate_asset_tables(
     hedging: &HedgingAssets,
     chains: &BTreeMap<Chain, ChainConfig>,
 ) -> Result<(), CtxError> {
+    DeploymentSymbolPolicy::new(
+        hedging.equities.symbols.keys().cloned(),
+        hedging.equities.retired_symbols.clone(),
+    )?;
+
     let listings = |symbol: &Symbol| -> Vec<&ChainEquityAsset> {
         chains
             .values()
@@ -2067,6 +2139,7 @@ impl Ctx {
 
         let hedging = hedging.unwrap_or_else(|| HedgingAssets {
             equities: crate::HedgedEquities {
+                retired_symbols: Vec::new(),
                 symbols: assets
                     .equities
                     .symbols
@@ -2213,6 +2286,13 @@ pub enum CtxError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    #[error("duplicate symbol {symbol} in [assets.equities].retired_symbols")]
+    DuplicateRetiredSymbol { symbol: Symbol },
+    #[error(
+        "symbol {symbol} cannot be both configured under [assets.equities] and \
+         listed in retired_symbols"
+    )]
+    ConfiguredSymbolMarkedRetired { symbol: Symbol },
     #[error("failed to parse secrets {path}")]
     SecretsToml {
         path: PathBuf,
@@ -2377,6 +2457,8 @@ impl CtxError {
             Self::ConfigIo { .. } => "failed to read config file",
             Self::SecretsIo { .. } => "failed to read secrets file",
             Self::ConfigToml { .. } => "failed to parse config",
+            Self::DuplicateRetiredSymbol { .. } => "duplicate retired symbol",
+            Self::ConfiguredSymbolMarkedRetired { .. } => "configured symbol marked retired",
             Self::SecretsToml { .. } => "failed to parse secrets",
             Self::InvalidThreshold(_) => "invalid execution threshold",
             Self::MissingCounterTradeSlippageBps => "missing counter trade slippage bps",
@@ -2844,6 +2926,9 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [assets.equities]
+            retired_symbols = []
+
             [assets.equities.AAPL]
             extended_hours_counter_trading = "disabled"
         "#,
@@ -3108,6 +3193,9 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
+
+            [assets.equities]
+            retired_symbols = []
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "disabled"
@@ -3788,6 +3876,7 @@ mod tests {
             inventory_divergence_threshold = 10
 
             [assets.equities]
+            retired_symbols = []
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
@@ -3831,6 +3920,7 @@ mod tests {
             hedge_order_gate_reconciliation_timeout_secs = 0
 
             [assets.equities]
+            retired_symbols = []
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
@@ -4437,6 +4527,7 @@ mod tests {
             log_query_url_template = "https://logs.example/query?id=missing"
 
             [assets.equities]
+            retired_symbols = []
 
             [chains.base]
             lifecycle = "active"
@@ -4489,6 +4580,7 @@ mod tests {
             log_query_url_template = "not a url {id}"
 
             [assets.equities]
+            retired_symbols = []
 
             [chains.base]
             lifecycle = "active"
@@ -7424,6 +7516,88 @@ mod tests {
         let _: Secrets = toml::from_str(secrets_str).unwrap();
     }
 
+    #[test]
+    fn duplicate_retired_symbols_are_rejected() {
+        let error = DeploymentSymbolPolicy::new(
+            [],
+            [Symbol::new("QSEP").unwrap(), Symbol::new("QSEP").unwrap()],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CtxError::DuplicateRetiredSymbol { .. }));
+    }
+
+    #[test]
+    fn configured_symbol_cannot_also_be_retired() {
+        let qsep = Symbol::new("QSEP").unwrap();
+        let error = DeploymentSymbolPolicy::new([qsep.clone()], [qsep]).unwrap_err();
+
+        assert!(matches!(
+            error,
+            CtxError::ConfiguredSymbolMarkedRetired { .. }
+        ));
+    }
+
+    #[test]
+    fn deployment_symbol_policy_reads_only_plaintext_asset_config() {
+        let config = toml_file(
+            r#"
+                unrelated_top_level_key = "ignored by the narrow deploy loader"
+
+                [assets.equities]
+                retired_symbols = ["QSEP"]
+
+                [assets.equities.AAPL]
+                extended_hours_counter_trading = "disabled"
+            "#,
+        );
+
+        let policy = load_deployment_symbol_policy(config.path()).unwrap();
+
+        assert_eq!(
+            policy.configured(),
+            &BTreeSet::from([Symbol::new("AAPL").unwrap()])
+        );
+        assert_eq!(
+            policy.retired(),
+            &BTreeSet::from([Symbol::new("QSEP").unwrap()])
+        );
+    }
+
+    #[test]
+    fn deployment_symbol_policy_loader_rejects_duplicate_retired_symbols() {
+        let config = toml_file(
+            r#"
+                [assets.equities]
+                retired_symbols = ["QSEP", "QSEP"]
+            "#,
+        );
+
+        let error = load_deployment_symbol_policy(config.path()).unwrap_err();
+
+        assert!(matches!(error, CtxError::DuplicateRetiredSymbol { .. }));
+    }
+
+    #[test]
+    fn deployment_symbol_policy_loader_rejects_configured_retired_symbol() {
+        let config = toml_file(
+            r#"
+                [assets.equities]
+                retired_symbols = ["QSEP"]
+
+                [assets.equities.QSEP]
+                extended_hours_counter_trading = "disabled"
+            "#,
+        );
+
+        let error = load_deployment_symbol_policy(config.path()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            CtxError::ConfiguredSymbolMarkedRetired { .. }
+        ));
+    }
+
     /// Every `.toml` config checked into the repo: `config/*/`, plus the
     /// `example.config.toml` and `e2e/config.toml` templates.
     fn repo_config_paths() -> Vec<PathBuf> {
@@ -7725,6 +7899,9 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
+
+            [assets.equities]
+            retired_symbols = []
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "disabled"
@@ -8160,6 +8337,9 @@ mod tests {
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
+            [assets.equities]
+            retired_symbols = []
+
             [assets.equities.AAPL]
             extended_hours_counter_trading = "disabled"
 
@@ -8278,6 +8458,9 @@ mod tests {
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
+            [assets.equities]
+            retired_symbols = []
+
             [assets.equities.AAPL]
             extended_hours_counter_trading = "enabled"
 
@@ -8340,6 +8523,9 @@ mod tests {
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
+            [assets.equities]
+            retired_symbols = []
+
             [assets.equities.AAPL]
             extended_hours_counter_trading = "enabled"
 
@@ -8400,6 +8586,9 @@ mod tests {
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
 
+            [assets.equities]
+            retired_symbols = []
+
             [assets.equities.AAPL]
             extended_hours_counter_trading = "enabled"
 
@@ -8459,6 +8648,9 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
+
+            [assets.equities]
+            retired_symbols = []
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "enabled"
@@ -8538,6 +8730,9 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
+
+            [assets.equities]
+            retired_symbols = []
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "enabled"
@@ -8645,6 +8840,9 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
+
+            [assets.equities]
+            retired_symbols = []
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "enabled"

@@ -49,6 +49,9 @@ beneficiary_entity_name = "T0 TRADE (BVI) LTD"
 
 # Per-equity hedging policy (broker-side). Chain asset facts live under
 # [chains.base.trading.assets].
+[assets.equities]
+retired_symbols = []
+
 [assets.equities.RKLB]
 extended_hours_counter_trading = "enabled"
 

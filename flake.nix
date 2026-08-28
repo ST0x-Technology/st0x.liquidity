@@ -553,7 +553,7 @@
                   text = ''
                     local_snapshot="$(${infraPkgs.packages.${env + "DbSnapshot"}}/bin/${env}-db-snapshot "$@")"
                     echo "Verifying migrations against $local_snapshot..." >&2
-                    exec verify-migrations --db "$local_snapshot"
+                    exec verify-migrations --db "$local_snapshot" --config ${./config/${env}/st0x-hedge.toml}
                   '';
                 };
               }) envNames

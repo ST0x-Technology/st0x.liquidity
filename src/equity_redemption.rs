@@ -1030,6 +1030,23 @@ pub(crate) enum EquityRedemption {
 }
 
 impl EquityRedemption {
+    pub(crate) fn symbol(&self) -> &Symbol {
+        match self {
+            Self::VaultWithdrawPending { symbol, .. }
+            | Self::VaultWithdrawSubmitted { symbol, .. }
+            | Self::WithdrawnFromRaindex { symbol, .. }
+            | Self::UnwrapPending { symbol, .. }
+            | Self::UnwrapSubmitted { symbol, .. }
+            | Self::TokensUnwrapped { symbol, .. }
+            | Self::SendPending { symbol, .. }
+            | Self::TokensSent { symbol, .. }
+            | Self::Pending { symbol, .. }
+            | Self::Completed { symbol, .. }
+            | Self::Failed { symbol, .. }
+            | Self::Reconciled { symbol, .. } => symbol,
+        }
+    }
+
     /// Returns the requested quantity carried by the aggregate in every
     /// state. Wrapped-equity recovery compares this against the wallet
     /// snapshot so an audit mismatch surfaces before dispatch.

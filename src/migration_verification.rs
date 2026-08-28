@@ -10,6 +10,7 @@
 //! `src/bin/verify-migrations.rs` for the CLI entry point used both as a
 //! pre-deploy gate and for manual testing while developing a migration.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
@@ -18,13 +19,16 @@ use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 use thiserror::Error;
 
+use st0x_config::DeploymentSymbolPolicy;
 use st0x_event_sorcery::{EventSourced, load_all_ids, load_entity};
+use st0x_execution::Symbol;
 
 use crate::bot_gas::BotGasReceiptCost;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::snapshot::InventorySnapshot;
 use crate::offchain::order::OffchainOrder;
 use crate::onchain_trade::OnChainTrade;
+use crate::portfolio_snapshot::PortfolioSnapshot;
 use crate::position::Position;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecovery;
@@ -58,6 +62,7 @@ impl AggregateReplayReport {
 #[derive(Debug)]
 pub struct VerificationReport {
     pub replay_reports: Vec<AggregateReplayReport>,
+    symbol_compatibility: SymbolCompatibilityReport,
 }
 
 impl VerificationReport {
@@ -65,6 +70,7 @@ impl VerificationReport {
         self.replay_reports
             .iter()
             .any(AggregateReplayReport::has_failures)
+            || self.symbol_compatibility.has_failures()
     }
 }
 
@@ -87,6 +93,160 @@ impl fmt::Display for VerificationReport {
                     failure.aggregate_id, failure.error
                 )?;
             }
+        }
+        write!(formatter, "{}", self.symbol_compatibility)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SymbolReferenceSource {
+    Position,
+    UnacknowledgedOnChainTrade,
+    OpenOffchainOrder,
+    VaultRegistry,
+    InventorySnapshot,
+    OpenMint,
+    OpenRedemption,
+    WrappedEquityRecovery,
+    UnwrappedEquityRecovery,
+    PortfolioSnapshot,
+}
+
+impl SymbolReferenceSource {
+    fn allows_retirement(self) -> bool {
+        matches!(
+            self,
+            Self::VaultRegistry | Self::InventorySnapshot | Self::PortfolioSnapshot
+        )
+    }
+}
+
+impl fmt::Display for SymbolReferenceSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Position => "position",
+            Self::UnacknowledgedOnChainTrade => "unacknowledged onchain trade",
+            Self::OpenOffchainOrder => "open offchain order",
+            Self::VaultRegistry => "vault registry",
+            Self::InventorySnapshot => "inventory snapshot",
+            Self::OpenMint => "open mint",
+            Self::OpenRedemption => "open redemption",
+            Self::WrappedEquityRecovery => "wrapped-equity recovery",
+            Self::UnwrappedEquityRecovery => "unwrapped-equity recovery",
+            Self::PortfolioSnapshot => "portfolio snapshot",
+        };
+        formatter.write_str(label)
+    }
+}
+
+type SymbolReferences = BTreeMap<Symbol, BTreeSet<SymbolReferenceSource>>;
+
+#[derive(Debug)]
+struct SymbolCompatibilityReport {
+    missing: SymbolReferences,
+    blocked_retired: SymbolReferences,
+    allowed_retired: SymbolReferences,
+    stale_retired: BTreeSet<Symbol>,
+}
+
+impl SymbolCompatibilityReport {
+    fn new(policy: &DeploymentSymbolPolicy, references: &SymbolReferences) -> Self {
+        let missing = references
+            .iter()
+            .filter(|(symbol, _)| !policy.configured().contains(*symbol))
+            .filter(|(symbol, _)| !policy.retired().contains(*symbol))
+            .map(|(symbol, sources)| (symbol.clone(), sources.clone()))
+            .collect();
+        let blocked_retired = references
+            .iter()
+            .filter(|(symbol, _)| policy.retired().contains(*symbol))
+            .filter(|(_, sources)| sources.iter().any(|source| !source.allows_retirement()))
+            .map(|(symbol, sources)| (symbol.clone(), sources.clone()))
+            .collect();
+        let allowed_retired = references
+            .iter()
+            .filter(|(symbol, _)| policy.retired().contains(*symbol))
+            .filter(|(_, sources)| sources.iter().all(|source| source.allows_retirement()))
+            .map(|(symbol, sources)| (symbol.clone(), sources.clone()))
+            .collect();
+        let stale_retired = policy
+            .retired()
+            .iter()
+            .filter(|symbol| !references.contains_key(*symbol))
+            .cloned()
+            .collect();
+
+        Self {
+            missing,
+            blocked_retired,
+            allowed_retired,
+            stale_retired,
+        }
+    }
+
+    fn has_failures(&self) -> bool {
+        !self.missing.is_empty()
+            || !self.blocked_retired.is_empty()
+            || !self.stale_retired.is_empty()
+    }
+}
+
+impl fmt::Display for SymbolCompatibilityReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(formatter, "Permanent-state/config symbol check:")?;
+
+        if self.missing.is_empty()
+            && self.blocked_retired.is_empty()
+            && self.allowed_retired.is_empty()
+            && self.stale_retired.is_empty()
+        {
+            writeln!(formatter, "  Compatible.")?;
+            return Ok(());
+        }
+
+        for (symbol, sources) in &self.missing {
+            writeln!(
+                formatter,
+                "  - {symbol}: absent from [assets.equities] but referenced by {}",
+                DisplaySources(sources)
+            )?;
+        }
+        for (symbol, sources) in &self.blocked_retired {
+            writeln!(
+                formatter,
+                "  - {symbol}: listed in retired_symbols but still required by active durable \
+                 state; referenced by {}",
+                DisplaySources(sources)
+            )?;
+        }
+        for (symbol, sources) in &self.allowed_retired {
+            writeln!(
+                formatter,
+                "  - {symbol}: intentionally retired; referenced by {}",
+                DisplaySources(sources)
+            )?;
+        }
+        for symbol in &self.stale_retired {
+            writeln!(
+                formatter,
+                "  - {symbol}: listed in retired_symbols but has no durable reference"
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+struct DisplaySources<'sources>(&'sources BTreeSet<SymbolReferenceSource>);
+
+impl fmt::Display for DisplaySources<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, source) in self.0.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            write!(formatter, "{source}")?;
         }
         Ok(())
     }
@@ -120,6 +280,7 @@ pub enum VerificationError {
 /// or a downloaded snapshot.
 pub async fn verify_migrations(
     source_db_path: &Path,
+    symbol_policy: &DeploymentSymbolPolicy,
 ) -> Result<VerificationReport, VerificationError> {
     let source_options = SqliteConnectOptions::new()
         .filename(source_db_path)
@@ -153,23 +314,30 @@ pub async fn verify_migrations(
 
     clear_snapshots(&scratch_pool).await?;
 
-    let replay_reports = run_replay_checks(&scratch_pool).await;
+    let (replay_reports, symbol_references) =
+        run_replay_checks_with_references(&scratch_pool).await;
+    let symbol_compatibility = SymbolCompatibilityReport::new(symbol_policy, &symbol_references);
 
     scratch_pool.close().await;
 
-    Ok(VerificationReport { replay_reports })
+    Ok(VerificationReport {
+        replay_reports,
+        symbol_compatibility,
+    })
 }
 
 /// Historical snapshots reflect the aggregate shape at the time they were
 /// taken. If no events have appended since, `load_entity` returns the
 /// cached snapshot directly and never touches the underlying events --
 /// masking exactly the "old event no longer deserializes under current
-/// code" bug this check exists to catch. Clearing snapshots forces every
-/// aggregate to replay from its full raw event history, the same as what
+/// code" bug this check exists to catch. Clearing snapshots forces retained
+/// streams to replay from their full raw event history, the same as what
 /// happens in production when a `SCHEMA_VERSION` bump clears stale
-/// snapshots on deploy.
+/// snapshots on deploy. `InventorySnapshot` is excluded because compaction
+/// may leave its snapshot as the only durable current state.
 async fn clear_snapshots(pool: &SqlitePool) -> Result<(), VerificationError> {
-    sqlx::query("DELETE FROM snapshots")
+    sqlx::query("DELETE FROM snapshots WHERE aggregate_type <> ?1")
+        .bind(InventorySnapshot::AGGREGATE_TYPE)
         .execute(pool)
         .await
         .map_err(VerificationError::ClearSnapshots)?;
@@ -177,25 +345,45 @@ async fn clear_snapshots(pool: &SqlitePool) -> Result<(), VerificationError> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn run_replay_checks(pool: &SqlitePool) -> Vec<AggregateReplayReport> {
-    vec![
-        check_replay::<Position>(pool).await,
-        check_replay::<OnChainTrade>(pool).await,
-        check_replay::<OffchainOrder>(pool).await,
-        check_replay::<VaultRegistry>(pool).await,
-        check_replay::<InventorySnapshot>(pool).await,
-        check_replay::<UsdcRebalance>(pool).await,
-        check_replay::<TokenizedEquityMint>(pool).await,
-        check_replay::<EquityRedemption>(pool).await,
-        check_replay::<WrappedEquityRecovery>(pool).await,
-        check_replay::<UnwrappedEquityRecovery>(pool).await,
-        check_replay::<BotGasReceiptCost>(pool).await,
-    ]
+    run_replay_checks_with_references(pool).await.0
 }
 
-async fn check_replay<Entity>(pool: &SqlitePool) -> AggregateReplayReport
+async fn run_replay_checks_with_references(
+    pool: &SqlitePool,
+) -> (Vec<AggregateReplayReport>, SymbolReferences) {
+    let mut reports = Vec::new();
+    let mut references = SymbolReferences::new();
+
+    macro_rules! check {
+        ($entity:ty) => {{
+            reports.push(check_replay::<$entity>(pool, &mut references).await);
+        }};
+    }
+
+    check!(Position);
+    check!(OnChainTrade);
+    check!(OffchainOrder);
+    check!(VaultRegistry);
+    check!(InventorySnapshot);
+    check!(PortfolioSnapshot);
+    check!(UsdcRebalance);
+    check!(TokenizedEquityMint);
+    check!(EquityRedemption);
+    check!(WrappedEquityRecovery);
+    check!(UnwrappedEquityRecovery);
+    check!(BotGasReceiptCost);
+
+    (reports, references)
+}
+
+async fn check_replay<Entity>(
+    pool: &SqlitePool,
+    references: &mut SymbolReferences,
+) -> AggregateReplayReport
 where
-    Entity: EventSourced,
+    Entity: DurableSymbolReferences + EventSourced,
     <Entity::Id as FromStr>::Err: fmt::Debug,
 {
     let ids = match load_all_ids::<Entity>(pool).await {
@@ -215,7 +403,7 @@ where
     let mut failures = Vec::new();
     for id in &ids {
         match load_entity::<Entity>(pool, id).await {
-            Ok(Some(_)) => {}
+            Ok(Some(entity)) => entity.add_durable_symbol_references(references),
             Ok(None) => failures.push(ReplayFailure {
                 aggregate_id: id.to_string(),
                 error: "replayed to empty state".to_string(),
@@ -234,20 +422,178 @@ where
     }
 }
 
+fn add_reference(
+    references: &mut SymbolReferences,
+    symbol: &Symbol,
+    source: SymbolReferenceSource,
+) {
+    references.entry(symbol.clone()).or_default().insert(source);
+}
+
+trait DurableSymbolReferences {
+    fn add_durable_symbol_references(&self, references: &mut SymbolReferences);
+}
+
+impl DurableSymbolReferences for Position {
+    fn add_durable_symbol_references(&self, references: &mut SymbolReferences) {
+        add_reference(references, &self.symbol, SymbolReferenceSource::Position);
+    }
+}
+
+impl DurableSymbolReferences for OnChainTrade {
+    fn add_durable_symbol_references(&self, references: &mut SymbolReferences) {
+        if self.acknowledged_at.is_none() {
+            add_reference(
+                references,
+                &self.symbol,
+                SymbolReferenceSource::UnacknowledgedOnChainTrade,
+            );
+        }
+    }
+}
+
+impl DurableSymbolReferences for OffchainOrder {
+    fn add_durable_symbol_references(&self, references: &mut SymbolReferences) {
+        match self {
+            Self::Pending { .. }
+            | Self::Submitted { .. }
+            | Self::PartiallyFilled { .. }
+            | Self::Cancelling { .. } => add_reference(
+                references,
+                self.symbol(),
+                SymbolReferenceSource::OpenOffchainOrder,
+            ),
+            Self::Filled { .. } | Self::Failed { .. } | Self::Cancelled { .. } => {}
+        }
+    }
+}
+
+impl DurableSymbolReferences for VaultRegistry {
+    fn add_durable_symbol_references(&self, references: &mut SymbolReferences) {
+        for vault in self
+            .equity_vaults
+            .values()
+            .flat_map(|vaults| vaults.values())
+        {
+            add_reference(
+                references,
+                &vault.symbol,
+                SymbolReferenceSource::VaultRegistry,
+            );
+        }
+    }
+}
+
+impl DurableSymbolReferences for InventorySnapshot {
+    fn add_durable_symbol_references(&self, references: &mut SymbolReferences) {
+        let symbols = self
+            .onchain_equity
+            .keys()
+            .chain(self.offchain_equity.keys())
+            .chain(self.base_wallet_unwrapped_equity.keys())
+            .chain(self.base_wallet_wrapped_equity.keys())
+            .chain(self.inflight_mints.keys())
+            .chain(self.inflight_redemptions.keys());
+        for symbol in symbols {
+            add_reference(references, symbol, SymbolReferenceSource::InventorySnapshot);
+        }
+    }
+}
+
+impl DurableSymbolReferences for PortfolioSnapshot {
+    fn add_durable_symbol_references(&self, references: &mut SymbolReferences) {
+        for symbol in self.captured_equity_symbols() {
+            add_reference(references, symbol, SymbolReferenceSource::PortfolioSnapshot);
+        }
+    }
+}
+
+impl DurableSymbolReferences for UsdcRebalance {
+    fn add_durable_symbol_references(&self, _references: &mut SymbolReferences) {}
+}
+
+impl DurableSymbolReferences for TokenizedEquityMint {
+    fn add_durable_symbol_references(&self, references: &mut SymbolReferences) {
+        if self.is_terminal() {
+            return;
+        }
+        add_reference(references, self.symbol(), SymbolReferenceSource::OpenMint);
+    }
+}
+
+impl DurableSymbolReferences for EquityRedemption {
+    fn add_durable_symbol_references(&self, references: &mut SymbolReferences) {
+        if self.is_terminal() {
+            return;
+        }
+        add_reference(
+            references,
+            self.symbol(),
+            SymbolReferenceSource::OpenRedemption,
+        );
+    }
+}
+
+impl DurableSymbolReferences for WrappedEquityRecovery {
+    fn add_durable_symbol_references(&self, references: &mut SymbolReferences) {
+        if self.is_terminal() {
+            return;
+        }
+        add_reference(
+            references,
+            self.symbol(),
+            SymbolReferenceSource::WrappedEquityRecovery,
+        );
+    }
+}
+
+impl DurableSymbolReferences for UnwrappedEquityRecovery {
+    fn add_durable_symbol_references(&self, references: &mut SymbolReferences) {
+        if self.is_terminal() {
+            return;
+        }
+        add_reference(
+            references,
+            self.symbol(),
+            SymbolReferenceSource::UnwrappedEquityRecovery,
+        );
+    }
+}
+
+impl DurableSymbolReferences for BotGasReceiptCost {
+    fn add_durable_symbol_references(&self, _references: &mut SymbolReferences) {}
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use alloy::primitives::{Address, TxHash};
     use chrono::Utc;
     use serde_json::json;
+    use tempfile::TempDir;
     use uuid::Uuid;
 
-    use st0x_config::ExecutionThreshold;
-    use st0x_execution::{ClientOrderId, FractionalShares, Positive, Symbol};
+    use st0x_config::{DeploymentSymbolPolicy, ExecutionThreshold};
+    use st0x_dto::Direction;
+    use st0x_event_sorcery::StoreBuilder;
+    use st0x_execution::{
+        ClientOrderId, FractionalShares, MarketSession, Positive, SupportedExecutor, Symbol,
+    };
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::position::PositionEvent;
+    use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
+    use crate::inventory::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
+    use crate::onchain_trade::OnChainTradeSource;
+    use crate::portfolio_snapshot::{
+        PortfolioBalanceRowWithMark, PortfolioSnapshotCommand, PortfolioSnapshotId,
+    };
+    use crate::position::{PositionCommand, TradeId};
     use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent};
+    use crate::vault_registry::{VaultRegistryCommand, VaultRegistryId};
 
     const A_USDC_REBALANCE_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -259,6 +605,21 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         pool
+    }
+
+    async fn source_database() -> (TempDir, PathBuf, SqlitePool) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.db");
+        let pool = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        (directory, path, pool)
     }
 
     async fn insert_event(
@@ -299,26 +660,121 @@ mod tests {
         .unwrap();
     }
 
+    async fn insert_inventory_snapshot_only(pool: &SqlitePool, symbol: &str) {
+        let store = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let id = InventorySnapshotId {
+            orderbook: Address::repeat_byte(0x11),
+            owner: Address::repeat_byte(0x22),
+        };
+
+        store
+            .send(
+                &id,
+                InventorySnapshotCommand::OnchainEquity {
+                    balances: BTreeMap::from([(
+                        Symbol::new(symbol).unwrap(),
+                        FractionalShares::new(float!(1)),
+                    )]),
+                    fetched_at: Utc::now(),
+                    block_number: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
     fn one_share_threshold() -> ExecutionThreshold {
         ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(1))).unwrap())
     }
 
     async fn insert_position_initialized(pool: &SqlitePool, symbol: &str) {
-        let event = PositionEvent::Initialized {
-            symbol: Symbol::new(symbol).unwrap(),
-            threshold: one_share_threshold(),
-            initialized_at: Utc::now(),
+        let (store, _) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let symbol = Symbol::new(symbol).unwrap();
+
+        store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: one_share_threshold(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::repeat_byte(0x33),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(1),
+                    block_timestamp: Utc::now(),
+                    block_number: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn insert_vault_registry_seed(pool: &SqlitePool, symbol: &str) {
+        let (store, _) = StoreBuilder::<VaultRegistry>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let id = VaultRegistryId {
+            orderbook: Address::repeat_byte(0x11),
+            owner: Address::repeat_byte(0x22),
         };
-        insert_event(
-            pool,
-            "Position",
-            symbol,
-            1,
-            "PositionEvent::Initialized",
-            "1.0",
-            serde_json::to_value(&event).unwrap(),
+        store
+            .send(
+                &id,
+                VaultRegistryCommand::SeedEquityVaultFromConfig {
+                    token: Address::repeat_byte(0x33),
+                    vault_id: alloy::primitives::B256::repeat_byte(0x44),
+                    symbol: Symbol::new(symbol).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn insert_portfolio_snapshot_captured(pool: &SqlitePool, symbol: &str) {
+        let store = StoreBuilder::<PortfolioSnapshot>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let captured_at = Utc::now();
+        store
+            .send(
+                &PortfolioSnapshotId(chrono::NaiveDate::from_ymd_opt(2026, 8, 20).unwrap()),
+                PortfolioSnapshotCommand::Capture {
+                    captured_at,
+                    rows: vec![PortfolioBalanceRowWithMark {
+                        row: PortfolioBalanceRow {
+                            location: PortfolioLocation::MarketMaking,
+                            asset: PortfolioAsset::Equity(Symbol::new(symbol).unwrap()),
+                            available: float!(0),
+                            inflight: float!(0),
+                        },
+                        usd_mark: None,
+                        mark_captured_at: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    fn symbol_policy(configured: &[&str], retired: &[&str]) -> DeploymentSymbolPolicy {
+        DeploymentSymbolPolicy::new(
+            configured
+                .iter()
+                .map(|symbol| Symbol::new(*symbol).unwrap()),
+            retired.iter().map(|symbol| Symbol::new(*symbol).unwrap()),
         )
-        .await;
+        .unwrap()
     }
 
     fn find_report<'reports>(
@@ -329,6 +785,173 @@ mod tests {
             .iter()
             .find(|report| report.aggregate_type == aggregate_type)
             .unwrap()
+    }
+
+    fn references_for(entity: &impl DurableSymbolReferences) -> SymbolReferences {
+        let mut references = SymbolReferences::new();
+        entity.add_durable_symbol_references(&mut references);
+        references
+    }
+
+    fn contains_source(
+        references: &SymbolReferences,
+        symbol: &Symbol,
+        source: SymbolReferenceSource,
+    ) -> bool {
+        references
+            .get(symbol)
+            .is_some_and(|sources| sources.contains(&source))
+    }
+
+    #[test]
+    fn unfinished_state_classifiers_exclude_terminal_state() {
+        let symbol = Symbol::new("QSEP").unwrap();
+        let now = Utc::now();
+        let shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
+
+        let unacknowledged_trade = OnChainTrade {
+            source: OnChainTradeSource::Raindex,
+            symbol: symbol.clone(),
+            amount: float!(1),
+            direction: Direction::Buy,
+            price_usdc: float!(1),
+            block_number: Some(1),
+            block_timestamp: now,
+            filled_at: now,
+            enrichment: None,
+            acknowledged_at: None,
+        };
+        assert!(contains_source(
+            &references_for(&unacknowledged_trade),
+            &symbol,
+            SymbolReferenceSource::UnacknowledgedOnChainTrade,
+        ));
+        assert!(
+            references_for(&OnChainTrade {
+                acknowledged_at: Some(now),
+                ..unacknowledged_trade
+            })
+            .is_empty()
+        );
+
+        let open_order = OffchainOrder::Pending {
+            symbol: symbol.clone(),
+            shares,
+            direction: Direction::Buy,
+            executor: SupportedExecutor::AlpacaBrokerApi,
+            placed_at: now,
+            market_session: MarketSession::Regular,
+            close_flatten: false,
+        };
+        assert!(contains_source(
+            &references_for(&open_order),
+            &symbol,
+            SymbolReferenceSource::OpenOffchainOrder,
+        ));
+        assert!(
+            references_for(&OffchainOrder::Failed {
+                symbol: symbol.clone(),
+                shares,
+                requested_shares: None,
+                direction: Direction::Buy,
+                executor: SupportedExecutor::AlpacaBrokerApi,
+                retained_fill: None,
+                filled_shares: None,
+                executor_order_id: None,
+                error: "rejected".to_string(),
+                placed_at: now,
+                failed_at: now,
+            })
+            .is_empty()
+        );
+
+        let open_mint = TokenizedEquityMint::MintRequested {
+            symbol: symbol.clone(),
+            quantity: float!(1),
+            wallet: Address::ZERO,
+            requested_at: now,
+        };
+        assert!(contains_source(
+            &references_for(&open_mint),
+            &symbol,
+            SymbolReferenceSource::OpenMint,
+        ));
+        assert!(
+            references_for(&TokenizedEquityMint::Failed {
+                symbol: symbol.clone(),
+                quantity: float!(1),
+                reason: "failed".to_string(),
+                requested_at: now,
+                failed_at: now,
+            })
+            .is_empty()
+        );
+
+        let open_redemption = EquityRedemption::VaultWithdrawPending {
+            symbol: symbol.clone(),
+            quantity: float!(1),
+            token: Address::ZERO,
+            wrapped_amount: alloy::primitives::U256::ZERO,
+            pending_at: now,
+        };
+        assert!(contains_source(
+            &references_for(&open_redemption),
+            &symbol,
+            SymbolReferenceSource::OpenRedemption,
+        ));
+        assert!(
+            references_for(&EquityRedemption::Failed {
+                symbol: symbol.clone(),
+                quantity: float!(1),
+                raindex_withdraw_tx: None,
+                redemption_tx: None,
+                tokenization_request_id: None,
+                reason: None,
+                started_at: now,
+                failed_at: now,
+            })
+            .is_empty()
+        );
+
+        let wrapped_recovery = WrappedEquityRecovery::Detected {
+            symbol: symbol.clone(),
+            shares: FractionalShares::new(float!(1)),
+            detected_at: now,
+        };
+        assert!(contains_source(
+            &references_for(&wrapped_recovery),
+            &symbol,
+            SymbolReferenceSource::WrappedEquityRecovery,
+        ));
+        assert!(
+            references_for(&WrappedEquityRecovery::Failed {
+                symbol: symbol.clone(),
+                shares: FractionalShares::new(float!(1)),
+                reason: "failed".to_string(),
+                failed_at: now,
+            })
+            .is_empty()
+        );
+
+        let unwrapped_recovery = UnwrappedEquityRecovery::Detected {
+            symbol: symbol.clone(),
+            shares: FractionalShares::new(float!(1)),
+            detected_at: now,
+        };
+        assert!(contains_source(
+            &references_for(&unwrapped_recovery),
+            &symbol,
+            SymbolReferenceSource::UnwrappedEquityRecovery,
+        ));
+        assert!(
+            references_for(&UnwrappedEquityRecovery::Failed {
+                symbol,
+                shares: FractionalShares::new(float!(1)),
+                reason: "failed".to_string(),
+                failed_at: now,
+            })
+            .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -441,7 +1064,7 @@ mod tests {
 
         let reports = run_replay_checks(&pool).await;
 
-        assert_eq!(reports.len(), 11);
+        assert_eq!(reports.len(), 12);
         for report in &reports {
             assert_eq!(report.total, 0, "{}", report.aggregate_type);
             assert!(report.failures.is_empty(), "{}", report.aggregate_type);
@@ -469,39 +1092,142 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_migrations_never_mutates_the_source_and_covers_every_aggregate_type() {
-        let source_dir = tempfile::tempdir().unwrap();
-        let source_path = source_dir.path().join("source.db");
+    async fn clear_snapshots_preserves_compacted_inventory_state() {
+        let pool = migrated_pool().await;
+        insert_inventory_snapshot_only(&pool, "QSEP").await;
 
-        let setup_pool = SqlitePool::connect_with(
-            SqliteConnectOptions::new()
-                .filename(&source_path)
-                .create_if_missing(true),
+        clear_snapshots(&pool).await.unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM snapshots WHERE aggregate_type = 'InventorySnapshot'",
         )
+        .fetch_one(&pool)
         .await
         .unwrap();
-        sqlx::migrate!().run(&setup_pool).await.unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn verify_migrations_never_mutates_the_source_and_covers_every_aggregate_type() {
+        let (_source_dir, source_path, setup_pool) = source_database().await;
         insert_position_initialized(&setup_pool, "AAPL").await;
         setup_pool.close().await;
 
         let bytes_before = std::fs::read(&source_path).unwrap();
 
-        let report = verify_migrations(&source_path).await.unwrap();
+        let report = verify_migrations(&source_path, &symbol_policy(&["AAPL"], &[]))
+            .await
+            .unwrap();
 
         let bytes_after = std::fs::read(&source_path).unwrap();
         assert_eq!(bytes_before, bytes_after, "source database was mutated");
 
         assert!(!report.has_failures());
-        assert_eq!(report.replay_reports.len(), 11);
+        assert_eq!(report.replay_reports.len(), 12);
         assert_eq!(find_report(&report.replay_reports, "Position").total, 1);
     }
 
     #[tokio::test]
     async fn verify_migrations_fails_clearly_on_a_missing_source() {
-        let error = verify_migrations(Path::new("/nonexistent/path/does-not-exist.db"))
-            .await
-            .unwrap_err();
+        let error = verify_migrations(
+            Path::new("/nonexistent/path/does-not-exist.db"),
+            &symbol_policy(&[], &[]),
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(error, VerificationError::OpenSource { .. }));
+    }
+
+    #[tokio::test]
+    async fn qsep_registry_reference_blocks_config_removal_and_names_the_source() {
+        let (_source_dir, source_path, pool) = source_database().await;
+        insert_vault_registry_seed(&pool, "QSEP").await;
+        pool.close().await;
+
+        let report = verify_migrations(&source_path, &symbol_policy(&["AAPL"], &[]))
+            .await
+            .unwrap();
+
+        assert!(report.has_failures());
+        let rendered = report.to_string();
+        assert!(rendered.contains("QSEP"), "{rendered}");
+        assert!(rendered.contains("vault registry"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn explicit_qsep_retirement_allows_the_known_reference() {
+        let (_source_dir, source_path, pool) = source_database().await;
+        insert_vault_registry_seed(&pool, "QSEP").await;
+        pool.close().await;
+
+        let report = verify_migrations(&source_path, &symbol_policy(&["AAPL"], &["QSEP"]))
+            .await
+            .unwrap();
+
+        assert!(!report.has_failures(), "{report}");
+    }
+
+    #[tokio::test]
+    async fn retired_symbol_with_open_position_reference_blocks_config_removal() {
+        let (_source_dir, source_path, pool) = source_database().await;
+        insert_position_initialized(&pool, "QSEP").await;
+        insert_vault_registry_seed(&pool, "QSEP").await;
+        pool.close().await;
+
+        let report = verify_migrations(&source_path, &symbol_policy(&["AAPL"], &["QSEP"]))
+            .await
+            .unwrap();
+
+        assert!(report.has_failures());
+        let rendered = report.to_string();
+        assert!(rendered.contains("QSEP"), "{rendered}");
+        assert!(rendered.contains("position"), "{rendered}");
+        assert!(rendered.contains("vault registry"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_only_inventory_reference_blocks_symbol_removal() {
+        let (_source_dir, source_path, pool) = source_database().await;
+        insert_inventory_snapshot_only(&pool, "QSEP").await;
+        pool.close().await;
+
+        let report = verify_migrations(&source_path, &symbol_policy(&["AAPL"], &[]))
+            .await
+            .unwrap();
+
+        assert!(report.has_failures());
+        let rendered = report.to_string();
+        assert!(rendered.contains("QSEP"), "{rendered}");
+        assert!(rendered.contains("inventory snapshot"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn retained_portfolio_snapshot_event_row_blocks_symbol_removal() {
+        let (_source_dir, source_path, pool) = source_database().await;
+        insert_portfolio_snapshot_captured(&pool, "QSEP").await;
+        pool.close().await;
+
+        let report = verify_migrations(&source_path, &symbol_policy(&["AAPL"], &[]))
+            .await
+            .unwrap();
+
+        assert!(report.has_failures());
+        let rendered = report.to_string();
+        assert!(rendered.contains("QSEP"), "{rendered}");
+        assert!(rendered.contains("portfolio snapshot"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn stale_retirement_without_durable_reference_is_rejected() {
+        let (_source_dir, source_path, pool) = source_database().await;
+        pool.close().await;
+
+        let report = verify_migrations(&source_path, &symbol_policy(&[], &["QSEP"]))
+            .await
+            .unwrap();
+
+        assert!(report.has_failures());
+        assert!(report.to_string().contains("no durable reference"));
     }
 }

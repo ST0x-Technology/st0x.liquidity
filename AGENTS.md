@@ -297,7 +297,8 @@ at (runs against its own internal `VACUUM INTO` copy) and replays every
 persisted aggregate under current code, catching legacy event shapes a migration
 needs to repair. The same binary gates staging/prod deploys in `deploy.nix`
 before the real restart. To point it at an already-downloaded snapshot instead
-of pulling a fresh one, run `cargo run --bin verify-migrations -- --db <path>`
+of pulling a fresh one, run
+`cargo run --bin verify-migrations -- --db <path> --config <config-path>`
 directly.
 
 ### Dependency Management

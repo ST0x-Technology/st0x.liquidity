@@ -7339,6 +7339,7 @@ mod tests {
     fn hedging_for(assets: &ChainAssets, extended_hours: OperationMode) -> HedgingAssets {
         HedgingAssets {
             equities: st0x_config::HedgedEquities {
+                retired_symbols: Vec::new(),
                 symbols: assets
                     .equities
                     .symbols
@@ -8938,6 +8939,7 @@ mod tests {
         let cqrs = TradeProcessingCqrs {
             hedging: HedgingAssets {
                 equities: st0x_config::HedgedEquities {
+                    retired_symbols: Vec::new(),
                     symbols: HashMap::from([(
                         Symbol::new("AAPL").unwrap(),
                         st0x_config::EquityHedgePolicy {

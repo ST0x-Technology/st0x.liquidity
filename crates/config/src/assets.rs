@@ -226,6 +226,10 @@ pub struct CashHedgePolicy {
 /// The per-symbol hedging policy for each hedged equity.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HedgedEquities {
+    /// Symbols deliberately removed from runtime configuration while
+    /// retirement-compatible durable state still references them. Consumed
+    /// only by the deploy-time verifier.
+    pub retired_symbols: Vec<Symbol>,
     #[serde(flatten)]
     pub symbols: HashMap<Symbol, EquityHedgePolicy>,
 }
@@ -234,7 +238,6 @@ pub struct HedgedEquities {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HedgingAssets {
-    #[serde(default)]
     pub equities: HedgedEquities,
     pub cash: Option<CashHedgePolicy>,
 }
@@ -317,6 +320,9 @@ mod tests {
     #[test]
     fn extended_hours_counter_trading_parses_enabled_and_disabled_from_toml() {
         let toml_str = r#"
+            [equities]
+            retired_symbols = []
+
             [equities.AAPL]
             extended_hours_counter_trading = "enabled"
 
@@ -328,6 +334,39 @@ mod tests {
 
         assert!(hedging.is_extended_hours_enabled(&Symbol::new("AAPL").unwrap()));
         assert!(!hedging.is_extended_hours_enabled(&Symbol::new("TSLA").unwrap()));
+    }
+
+    #[test]
+    fn retired_symbols_policy_is_required_when_equities_are_configured() {
+        let error = toml::from_str::<HedgingAssets>(
+            r#"
+                [equities.AAPL]
+                extended_hours_counter_trading = "disabled"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing field `retired_symbols`")
+        );
+    }
+
+    #[test]
+    fn retired_symbols_policy_parses_non_empty_list() {
+        let hedging = toml::from_str::<HedgingAssets>(
+            r#"
+                [equities]
+                retired_symbols = ["QSEP"]
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            hedging.equities.retired_symbols,
+            vec![Symbol::new("QSEP").unwrap()]
+        );
     }
 
     #[test]
@@ -519,7 +558,10 @@ mod tests {
         );
 
         let hedging = HedgingAssets {
-            equities: HedgedEquities { symbols },
+            equities: HedgedEquities {
+                retired_symbols: Vec::new(),
+                symbols,
+            },
             cash: None,
         };
 

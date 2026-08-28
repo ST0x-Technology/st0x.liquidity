@@ -1034,6 +1034,29 @@ permanent events, config entries are not), and such a symbol has no wrapper
 entry to resolve a vault ratio with. It never fails the capture, and what
 happens to its rows depends on whether it still holds anything.
 
+Deployments prevent this mismatch by comparing the candidate `[assets.equities]`
+configuration with symbol references reconstructed from durable state. The
+pre-start `verify-migrations` gate checks vault-registry and current inventory
+state, Position aggregates, unfinished trade/order/equity transfer/recovery
+aggregates, and captured portfolio rows reconstructed from retained snapshot
+events. A referenced symbol absent from the candidate asset map fails the deploy
+unless it is listed in `retired_symbols` and every remaining reference is a
+retirement-compatible registry or snapshot record. An unfinished Position,
+trade, order, mint, redemption, or recovery reference still fails the deploy
+when the symbol is listed as retired. Every failure reports all reference
+sources before the service restarts.
+
+An intentional asset retirement is recorded in the plaintext
+`[assets.equities].retired_symbols` list. A retired symbol remains unconfigured
+at runtime; the list only acknowledges retirement-compatible durable registry
+and snapshot residue at the deploy gate. It cannot bypass references that still
+need runtime symbol configuration. The list is required in deployable configs
+even when empty. Configured and retired symbols must be disjoint, duplicate
+retirement entries are invalid, and a retirement entry with no matching durable
+reference is rejected so stale exceptions cannot silently weaken later deploys.
+The check uses the verifier's disposable database copy and never mutates the
+live database.
+
 Rows drained to zero are dropped with a warning. They contribute nothing -- zero
 balances are skipped when the day is evaluated -- so dropping them changes no
 number, and a fully reconciled retired asset stops affecting the series

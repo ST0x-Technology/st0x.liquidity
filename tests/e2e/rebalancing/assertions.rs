@@ -67,6 +67,7 @@ fn hedging_with_reserve(
 ) -> HedgingAssets {
     HedgingAssets {
         equities: HedgedEquities {
+            retired_symbols: Vec::new(),
             symbols: equities
                 .keys()
                 .map(|symbol| {

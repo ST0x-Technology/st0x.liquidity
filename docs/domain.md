@@ -139,6 +139,16 @@ and `wtAAPL` both resolve to `AAPL`). `WrappedTokenizedShares` is the only
 `TokenizedSymbol<WrappedTokenizedShares>` (`wt` prefix), while Alpaca
 tokenization operates on the base `Symbol` directly.
 
+### Retired Symbol
+
+A base equity symbol deliberately removed from `[assets.equities]` while durable
+state still references it. It is listed under
+`[assets.equities].retired_symbols` so the deploy verifier can distinguish an
+intentional retirement from an accidental config deletion. Retirement does not
+restore runtime configuration or make the symbol operational; it is a narrow,
+auditable exception for registry and snapshot residue. It never permits an
+unfinished workflow that still needs runtime symbol configuration.
+
 ### Hedge
 
 The core mechanism for capturing arbitrage while minimizing directional risk.

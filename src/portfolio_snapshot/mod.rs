@@ -287,13 +287,18 @@ pub(crate) struct PortfolioSnapshot {
 }
 
 impl PortfolioSnapshot {
-    pub(crate) fn captured_equity_row_count(&self, symbol: &Symbol) -> usize {
+    pub(crate) fn captured_equity_symbols(&self) -> impl Iterator<Item = &Symbol> {
         self.captured_rows
             .iter()
-            .filter(|row| match &row.row.asset {
-                crate::inventory::PortfolioAsset::Equity(captured) => captured == symbol,
-                crate::inventory::PortfolioAsset::Usdc => false,
+            .filter_map(|row| match &row.row.asset {
+                crate::inventory::PortfolioAsset::Equity(symbol) => Some(symbol),
+                crate::inventory::PortfolioAsset::Usdc => None,
             })
+    }
+
+    pub(crate) fn captured_equity_row_count(&self, symbol: &Symbol) -> usize {
+        self.captured_equity_symbols()
+            .filter(|captured| *captured == symbol)
             .count()
     }
 
