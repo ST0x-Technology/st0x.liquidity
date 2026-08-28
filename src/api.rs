@@ -20,8 +20,8 @@ use st0x_config::BrokerCtx;
 use st0x_dto::{
     EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, TradingVenue,
 };
-use st0x_execution::Symbol;
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
+use st0x_execution::{OvernightOrderShape, Symbol, validate_overnight_eligibility};
 use st0x_finance::FractionalShares;
 use st0x_tokenization::IssuerRequestId;
 
@@ -145,6 +145,69 @@ struct TradeResponse {
     entries: Vec<serde_json::Value>,
     total: usize,
     has_more: bool,
+}
+
+/// One configured symbol's overnight-eligibility state: the bot's last
+/// synced attribute snapshot plus the fail-closed verdicts an overnight
+/// placement would get right now. `synced_at` and the attributes are
+/// `null` until the sync has recorded the symbol.
+///
+/// Server-local rather than an `st0x-dto` binding: no dashboard code
+/// consumes this yet, so there is no TypeScript surface to generate.
+#[derive(Debug, Serialize)]
+struct OvernightEligibilityEntry {
+    symbol: String,
+    synced_at: Option<DateTime<Utc>>,
+    overnight_tradable: Option<bool>,
+    overnight_halted: Option<bool>,
+    fractionable: Option<bool>,
+    fractional_eh_enabled: Option<bool>,
+    whole_share_verdict: String,
+    fractional_verdict: String,
+}
+
+/// Reports the overnight eligibility snapshot for every configured
+/// equity symbol, verdicts evaluated at request time so staleness tracks
+/// the moving session window.
+async fn overnight_eligibility(
+    State(state): State<AppState>,
+) -> Json<Vec<OvernightEligibilityEntry>> {
+    let now = Utc::now();
+    let mut symbols: Vec<Symbol> = crate::conductor::configured_equity_symbols(&state.ctx)
+        .into_iter()
+        .collect();
+    symbols.sort_by_key(ToString::to_string);
+
+    let entries = symbols
+        .into_iter()
+        .map(|symbol| {
+            let snapshot = state.overnight_eligibility.get(&symbol);
+            let verdict = |shape| match validate_overnight_eligibility(
+                &symbol,
+                snapshot.as_ref(),
+                shape,
+                now,
+            ) {
+                Ok(()) => "eligible".to_string(),
+                Err(error) => error.to_string(),
+            };
+
+            OvernightEligibilityEntry {
+                whole_share_verdict: verdict(OvernightOrderShape::WholeShares),
+                fractional_verdict: verdict(OvernightOrderShape::Fractional),
+                symbol: symbol.to_string(),
+                synced_at: snapshot.map(|snapshot| snapshot.synced_at),
+                overnight_tradable: snapshot
+                    .and_then(|snapshot| snapshot.details.overnight_tradable),
+                overnight_halted: snapshot.and_then(|snapshot| snapshot.details.overnight_halted),
+                fractionable: snapshot.and_then(|snapshot| snapshot.details.fractionable),
+                fractional_eh_enabled: snapshot
+                    .and_then(|snapshot| snapshot.details.fractional_eh_enabled),
+            }
+        })
+        .collect();
+
+    Json(entries)
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -1682,6 +1745,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/pnl", get(pnl))
         .route("/logs", get(logs))
         .route("/orders/pending", get(pending_orders))
+        .route("/overnight/eligibility", get(overnight_eligibility))
         .route("/trades", get(trades))
         .route("/trades/{venue}/{aggregate_id}/events", get(trade_events))
         .route("/transfers", get(transfers_endpoint))
@@ -1711,14 +1775,16 @@ mod tests {
     use uuid::uuid;
 
     use st0x_config::{
-        BrokerCtx, Ctx, ExecutionThreshold, RestApiCtx, create_test_ctx_with_order_owner,
+        BrokerCtx, Ctx, EquityAssetConfig, ExecutionThreshold, OperationMode, RestApiCtx,
+        create_test_ctx_with_order_owner,
     };
     use st0x_dto::TradeOutcome;
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
+    use st0x_execution::alpaca_broker_api::AssetStatus;
     use st0x_execution::{
-        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
-        DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutorOrderId, Positive,
-        SupportedExecutor, Symbol, TimeInForce,
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AssetDetails,
+        DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, EligibilitySnapshot, ExecutorOrderId,
+        Positive, SupportedExecutor, Symbol, TimeInForce,
     };
     use st0x_finance::Usd;
     use st0x_float_macro::float;
@@ -1765,7 +1831,133 @@ mod tests {
             resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
             pnl_report_admission: crate::dashboard::pnl::pnl_report_admission(),
             metrics_handle: crate::metrics::setup().expect("metrics setup"),
+            overnight_eligibility: st0x_execution::EligibilitySnapshots::default(),
         }
+    }
+
+    /// A ctx with one trading-enabled equity so the eligibility endpoint
+    /// has a configured symbol to report.
+    fn overnight_test_ctx() -> Ctx {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.assets.equities.symbols.insert(
+            Symbol::new("RKLB").unwrap(),
+            EquityAssetConfig {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+        ctx
+    }
+
+    async fn get_overnight_eligibility(state: AppState) -> serde_json::Value {
+        let response = build_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/overnight/eligibility")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_str(&body_to_string(response).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn overnight_eligibility_reports_unsynced_symbols_fail_closed() {
+        let state = empty_app_state(overnight_test_ctx()).await;
+
+        let body = get_overnight_eligibility(state).await;
+
+        assert_eq!(
+            body,
+            serde_json::json!([{
+                "symbol": "RKLB",
+                "synced_at": null,
+                "overnight_tradable": null,
+                "overnight_halted": null,
+                "fractionable": null,
+                "fractional_eh_enabled": null,
+                "whole_share_verdict":
+                    "no eligibility snapshot for RKLB: the asset sync has not run",
+                "fractional_verdict":
+                    "no eligibility snapshot for RKLB: the asset sync has not run",
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_eligibility_reports_a_fresh_snapshot_as_eligible() {
+        let state = empty_app_state(overnight_test_ctx()).await;
+        let synced_at = Utc::now();
+        state.overnight_eligibility.record(
+            Symbol::new("RKLB").unwrap(),
+            EligibilitySnapshot {
+                synced_at,
+                details: AssetDetails {
+                    status: AssetStatus::Active,
+                    tradable: true,
+                    fractionable: Some(true),
+                    fractional_eh_enabled: Some(true),
+                    overnight_tradable: Some(true),
+                    overnight_halted: Some(false),
+                },
+            },
+        );
+
+        let body = get_overnight_eligibility(state).await;
+
+        assert_eq!(
+            body,
+            serde_json::json!([{
+                "symbol": "RKLB",
+                "synced_at": synced_at,
+                "overnight_tradable": true,
+                "overnight_halted": false,
+                "fractionable": true,
+                "fractional_eh_enabled": true,
+                "whole_share_verdict": "eligible",
+                "fractional_verdict": "eligible",
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_eligibility_reports_a_pre_window_snapshot_as_stale() {
+        let state = empty_app_state(overnight_test_ctx()).await;
+        // Three days old: unambiguously before any session's 19:45 ET
+        // sync window regardless of when the test runs.
+        let synced_at = Utc::now() - chrono::Duration::days(3);
+        state.overnight_eligibility.record(
+            Symbol::new("RKLB").unwrap(),
+            EligibilitySnapshot {
+                synced_at,
+                details: AssetDetails {
+                    status: AssetStatus::Active,
+                    tradable: true,
+                    fractionable: Some(true),
+                    fractional_eh_enabled: Some(true),
+                    overnight_tradable: Some(true),
+                    overnight_halted: Some(false),
+                },
+            },
+        );
+
+        let body = get_overnight_eligibility(state).await;
+
+        let stale_verdict = format!(
+            "eligibility snapshot for RKLB is stale (synced at {synced_at}); \
+             refusing to place from outdated attributes"
+        );
+        assert_eq!(body[0]["whole_share_verdict"], stale_verdict.as_str());
+        assert_eq!(body[0]["fractional_verdict"], stale_verdict.as_str());
+        assert_eq!(body[0]["synced_at"], serde_json::json!(synced_at));
     }
 
     #[tokio::test]

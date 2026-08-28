@@ -171,6 +171,9 @@ pub(crate) struct AppState {
     pub(crate) pnl_report_admission: dashboard::pnl::PnlReportAdmission,
     pub(crate) pnl_ledger: Arc<dashboard::pnl::PnlLedger>,
     pub(crate) metrics_handle: PrometheusHandle,
+    /// The overnight eligibility store the conductor's sync task writes;
+    /// `/overnight/eligibility` reports it per configured symbol.
+    pub(crate) overnight_eligibility: st0x_execution::EligibilitySnapshots,
 }
 
 #[tracing::instrument(skip_all, target = "startup", level = tracing::Level::INFO)]
@@ -280,6 +283,10 @@ async fn run_bot_session_inner(
     // ingestion mutex instead of racing as separate ingesters.
     let pnl_ledger = Arc::new(dashboard::pnl::PnlLedger::new(pools.cqrs.clone()));
 
+    // One shared store: the conductor's eligibility sync writes it, the
+    // server's /overnight/eligibility endpoint reads it.
+    let overnight_eligibility = st0x_execution::EligibilitySnapshots::default();
+
     let state = AppState {
         ctx: ctx.clone(),
         pool: pools.cqrs.clone(),
@@ -292,6 +299,7 @@ async fn run_bot_session_inner(
         pnl_report_admission: dashboard::pnl::pnl_report_admission(),
         pnl_ledger: pnl_ledger.clone(),
         metrics_handle,
+        overnight_eligibility: overnight_eligibility.clone(),
     };
     let startup_barrier = startup::StartupBarrier::new();
     let equity_price_task = equity_price_monitor.map(|task| startup::StartupTask {
@@ -320,6 +328,7 @@ async fn run_bot_session_inner(
             inventory,
             recovery_cell,
             pnl_ledger,
+            overnight_eligibility,
         },
         shutdown_token.clone(),
         ConductorStartupTokens {
@@ -1200,6 +1209,7 @@ mod tests {
                 inventory: create_test_inventory(),
                 recovery_cell: Arc::new(tokio::sync::OnceCell::new()),
                 pnl_ledger: Arc::new(dashboard::pnl::PnlLedger::new(pool)),
+                overnight_eligibility: st0x_execution::EligibilitySnapshots::default(),
             },
             tokio_util::sync::CancellationToken::new(),
             create_test_startup_tokens(),
@@ -1234,6 +1244,7 @@ mod tests {
                 inventory: create_test_inventory(),
                 recovery_cell: Arc::new(tokio::sync::OnceCell::new()),
                 pnl_ledger: Arc::new(dashboard::pnl::PnlLedger::new(pool)),
+                overnight_eligibility: st0x_execution::EligibilitySnapshots::default(),
             },
             tokio_util::sync::CancellationToken::new(),
             create_test_startup_tokens(),

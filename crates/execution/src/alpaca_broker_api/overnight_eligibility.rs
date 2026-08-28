@@ -59,7 +59,10 @@ impl EligibilitySnapshots {
             .copied()
     }
 
-    fn record(&self, symbol: Symbol, snapshot: EligibilitySnapshot) {
+    /// Records a snapshot. Production writes go through
+    /// [`sync_eligibility`]; public so consuming crates' tests can seed
+    /// the store directly.
+    pub fn record(&self, symbol: Symbol, snapshot: EligibilitySnapshot) {
         self.inner
             .write()
             .unwrap_or_else(PoisonError::into_inner)
