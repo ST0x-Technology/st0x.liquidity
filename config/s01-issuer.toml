@@ -32,6 +32,9 @@ ws_url = "ws://st0x-pricing:8080/ws"
 extended_hours_counter_trading = "disabled"
 
 [chains.base]
+# Trades, hedges and rebalances: everything is on, subject to the
+# per-asset flags below.
+lifecycle = "active"
 required_confirmations = 3
 
 [chains.base.trading]
@@ -55,10 +58,16 @@ redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
 # table. Confirmations are deeper than Base's because an L1 reorg is a
 # different risk from an OP-Stack sequencer batch.
 [chains.ethereum]
+# Holds and moves USDC for the corridor; it runs no orderbook, so it has
+# no [trading] table.
+lifecycle = "active"
 required_confirmations = 12
 
 # HyperEVM, same shape as Ethereum.
 [chains.hyperevm]
+# A signer exists and nothing moves yet. Raising this to "active" fails
+# startup: no CCTP domain and no HYPE price source are wired.
+lifecycle = "observe-only"
 required_confirmations = 1
 
 [wallet]

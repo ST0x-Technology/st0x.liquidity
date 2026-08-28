@@ -157,6 +157,9 @@ extended_hours_counter_trading = "enabled"
 extended_hours_counter_trading = "enabled"
 
 [chains.base]
+# Trades, hedges and rebalances: everything is on, subject to the
+# per-asset flags below.
+lifecycle = "active"
 # Block confirmations required before a submitted transaction is treated as
 # settled. Does not govern fill ingestion (controlled by ingestion_cutoff).
 required_confirmations = 3
@@ -195,10 +198,16 @@ redemption_wallet = "0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE"
 # table. Confirmations are deeper than Base's because an L1 reorg is a
 # different risk from an OP-Stack sequencer batch.
 [chains.ethereum]
+# Holds and moves USDC for the corridor; it runs no orderbook, so it has
+# no [trading] table.
+lifecycle = "active"
 required_confirmations = 12
 
 # HyperEVM, same shape as Ethereum.
 [chains.hyperevm]
+# A signer exists and nothing moves yet. Raising this to "active" fails
+# startup: no CCTP domain and no HYPE price source are wired.
+lifecycle = "observe-only"
 required_confirmations = 1
 
 [wallet]

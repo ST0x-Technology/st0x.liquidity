@@ -8,6 +8,7 @@ mod alerts;
 mod assets;
 mod bot_gas_valuation;
 mod chain;
+mod enablement;
 mod imbalance_threshold;
 mod loader;
 mod orchestrator;
@@ -30,6 +31,10 @@ pub use chain::{
     ChainConfig, ChainConfigError, ChainCtx, ChainRegistry, ChainRegistryError, ChainSecrets,
     IngestionCutoff, InventoryAdapter, InventoryAdapterVenue, InventoryAdapters, InventoryMode,
     InventoryModeTag, TradingChain, TradingConfig,
+};
+pub use enablement::{
+    ChainCapability, ChainEnablementError, ChainLifecycle, MissingCapabilities,
+    provided_capabilities, required_capabilities,
 };
 pub use imbalance_threshold::{ImbalanceThreshold, InvalidImbalanceThreshold};
 pub use loader::*;

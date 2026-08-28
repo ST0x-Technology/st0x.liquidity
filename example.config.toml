@@ -55,6 +55,23 @@ extended_hours_counter_trading = "disabled"
 
 
 [chains.base]
+# How far along this chain is in its bring-up. Required; there is no default,
+# because a chain silently reading as "active" would move funds the moment it
+# was described.
+#
+#   disabled     -- not constructed at all: no RPC, no watcher, no signer.
+#   observe-only -- the bot reads this chain; it places no orders and moves no
+#                   funds. Refused on a chain whose assets have
+#                   trading = "enabled", since those fills would be recorded
+#                   and never hedged.
+#   prefunded    -- the bot holds and moves funds here, but tops them up by
+#                   hand; no rebalancing.
+#   active       -- rebalancing runs too, subject to the per-asset flags.
+#
+# Startup refuses a state this build cannot serve, naming what is missing:
+# a chain with no fill watcher cannot trade, and one whose gas token is not
+# ETH cannot be "active" until a price source for it exists.
+lifecycle = "active"
 # Block-confirmation depth required before a transaction this bot submits is
 # treated as settled (the primary gate for USDC rebalancing withdrawals). This
 # does NOT govern order-fill ingestion: the fill monitor caps the backfill range
@@ -123,10 +140,16 @@ redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 # table. Confirmations are deeper than Base's because an L1 reorg is a
 # different risk from an OP-Stack sequencer batch.
 [chains.ethereum]
+# Holds and moves USDC for the corridor; it runs no orderbook, so it has
+# no [trading] table.
+lifecycle = "active"
 required_confirmations = 12
 
 # HyperEVM, same shape as Ethereum.
 [chains.hyperevm]
+# A signer exists and nothing moves yet. Raising this to "active" fails
+# startup: no CCTP domain and no HYPE price source are wired.
+lifecycle = "observe-only"
 required_confirmations = 1
 
 [wallet]
