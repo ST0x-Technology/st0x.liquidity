@@ -272,6 +272,17 @@ pub enum AlpacaBrokerApiError {
         retry_after: Option<Duration>,
     },
 
+    /// Alpaca definitively rejected a USD-notional USDC conversion at order
+    /// placement because the available USD balance was insufficient. The
+    /// placement boundary wraps the original API error so callers can resize
+    /// this one safe-to-retry case without treating the same code from a later
+    /// order read as proof that no order exists.
+    #[error("USD-to-USDC conversion placement rejected for insufficient USD balance: {source}")]
+    UsdConversionInsufficientBalance {
+        #[source]
+        source: Box<Self>,
+    },
+
     #[error("Invalid order ID: {0}")]
     InvalidOrderId(#[from] uuid::Error),
 
@@ -490,6 +501,7 @@ impl AlpacaBrokerApiError {
             }),
 
             Self::ApiError { .. }
+            | Self::UsdConversionInsufficientBalance { .. }
             | Self::HttpClient(_)
             | Self::KmsJwt(_)
             | Self::JsonParse(_)
@@ -568,6 +580,7 @@ impl AlpacaBrokerApiError {
             // values in hand -- so the same inputs fail the same way.
             Self::JsonParse(_)
             | Self::AlpacaAmount(_)
+            | Self::UsdConversionInsufficientBalance { .. }
             | Self::InvalidHeader(_)
             | Self::InvalidOrderId(_)
             | Self::IncompleteOrder { .. }
@@ -663,6 +676,21 @@ mod tests {
         let error = AlpacaBrokerApiError::MissingPositionQuantity;
 
         assert_eq!(error.backpressure(), None);
+    }
+
+    #[test]
+    fn insufficient_usd_conversion_balance_is_permanent_without_backpressure() {
+        let error = AlpacaBrokerApiError::UsdConversionInsufficientBalance {
+            source: Box::new(AlpacaBrokerApiError::ApiError {
+                status: reqwest::StatusCode::FORBIDDEN,
+                alpaca_code: Some(40_310_000),
+                message: "insufficient balance for USD".to_string(),
+                retry_after: None,
+            }),
+        };
+
+        assert_eq!(error.backpressure(), None);
+        assert_eq!(error.permanence(), Permanence::Permanent);
     }
 
     fn api_error(status: reqwest::StatusCode) -> AlpacaBrokerApiError {

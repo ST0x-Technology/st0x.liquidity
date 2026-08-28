@@ -19,7 +19,7 @@ use st0x_evm::{
 };
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletService, Executor,
-    FractionalShares, Network, Symbol, TimeInForce,
+    FractionalShares, Network, Positive, Symbol, TimeInForce,
 };
 use st0x_finance::Usdc;
 use st0x_issuance_client::IssuanceClient;
@@ -607,6 +607,12 @@ async fn run_usdc_transfer<Writer: Write>(
         &UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             required_confirmations: ctx.chains.sole_trading().required_confirmations,
+            reserved_cash: ctx
+                .assets
+                .cash
+                .as_ref()
+                .map(|cash| cash.reserved)
+                .map(Positive::inner),
             #[cfg(feature = "test-support")]
             circle_api_base: rebalancing_ctx.circle_api_base.clone(),
             #[cfg(feature = "test-support")]

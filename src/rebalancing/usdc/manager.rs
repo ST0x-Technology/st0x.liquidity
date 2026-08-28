@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use st0x_bridge::cctp::{AttestationResponse, CctpBridge, CctpError};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
-use st0x_config::ALPACA_MINIMUM_WITHDRAWAL;
+use st0x_config::{ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER};
 use st0x_event_sorcery::Store;
 use st0x_evm::{Chain, USDC_BASE, Wallet};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
@@ -24,10 +24,12 @@ use st0x_execution::{
     TokenSymbol, Transfer, TransferStatus,
 };
 use st0x_finance::{Usd, Usdc};
+use st0x_float_macro::float;
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
 
 use super::UsdcTransferError;
 use crate::bot_gas::{BotGasOperationCategory, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCost};
+use crate::inventory::view::alpaca_to_base_usdc_capacity;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::{
     ConversionAmounts, RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand,
@@ -44,6 +46,16 @@ const BURN_RECORD_ATTEMPTS: u32 = 3;
 /// number (100ms, 200ms). A SQLite write-lock clears fast, so a short linear
 /// backoff is enough.
 const BURN_RECORD_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Alpaca accepts USD conversion notionals only to whole-cent precision.
+const USD_CONVERSION_NOTIONAL_DECIMAL_PLACES: u8 = 2;
+
+/// A definitive Alpaca `40310000` placement rejection creates no order, so it
+/// is safe to retry this many times inside one durable conversion attempt. The
+/// 2026-08-25 incident missed the balance eleven times and succeeded on the
+/// twelfth; keeping the bound here beside the resize rule makes that operational
+/// contract explicit.
+const USD_CONVERSION_PLACEMENT_ATTEMPTS: u32 = 12;
 
 /// Upper bound on the whole `submit_burn` call -- the allowance check, fee query,
 /// AND the `depositForBurn` broadcast. These normally return in seconds; the
@@ -70,6 +82,7 @@ const BURN_BROADCAST_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) struct UsdcSettlementParams {
     pub(crate) attestation_retry_deadline: Duration,
     pub(crate) required_confirmations: u64,
+    pub(crate) reserved_cash: Option<Usd>,
     /// Circle attestation/fee API base URL (test-only override; production
     /// builds use the [`st0x_bridge::cctp::CIRCLE_API_BASE`] constant).
     #[cfg(feature = "test-support")]
@@ -185,6 +198,39 @@ struct AwaitingAttestationTimestamps {
     initiated_at: DateTime<Utc>,
 }
 
+/// Produces the next strictly smaller whole-cent USD conversion notional from
+/// the previous attempt and the freshly observed broker capacity.
+fn resize_usd_conversion_notional(
+    id: &UsdcRebalanceId,
+    previous: Positive<Usd>,
+    capacity: Usdc,
+) -> Result<Positive<Usd>, UsdcTransferError> {
+    let stepped = (previous.inner() - Usd::new(float!(0.01)))?;
+    let fresh_capacity = Usd::new(capacity.inner());
+    let resized = if fresh_capacity.lt(&stepped)? {
+        fresh_capacity
+    } else {
+        stepped
+    };
+    let (resized_fixed, _) = resized
+        .inner()
+        .to_fixed_decimal_lossy(USD_CONVERSION_NOTIONAL_DECIMAL_PLACES)?;
+    let resized = Usd::new(Float::from_fixed_decimal(
+        resized_fixed,
+        USD_CONVERSION_NOTIONAL_DECIMAL_PLACES,
+    )?);
+    let minimum = Usd::new(ALPACA_TO_BASE_MINIMUM_TRANSFER.inner());
+    if resized.lt(&minimum)? {
+        return Err(UsdcTransferError::ResizedConversionBelowMinimum {
+            id: id.clone(),
+            available: resized,
+            minimum,
+        });
+    }
+
+    Ok(Positive::new(resized)?)
+}
+
 /// Orchestrates USDC rebalancing between Alpaca (Ethereum) and Rain (Base).
 ///
 /// # Type Parameters
@@ -201,6 +247,7 @@ pub(crate) struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, 
     vault_id: RaindexVaultId,
     attestation_retry_deadline: Duration,
     required_confirmations: u64,
+    reserved_cash: Option<Usd>,
     /// Enqueues bot-gas cost recording after CCTP burn/mint confirmations and
     /// the USDC-to-Alpaca wallet transfer succeed (ADR 0017).
     /// Defaults to `Disabled`; production wiring opts in via
@@ -280,6 +327,7 @@ impl<
             vault_id,
             attestation_retry_deadline: settlement.attestation_retry_deadline,
             required_confirmations: settlement.required_confirmations,
+            reserved_cash: settlement.reserved_cash,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         }
     }
@@ -586,28 +634,42 @@ impl<
         Ok(response)
     }
 
+    async fn fail_conversion(
+        &self,
+        id: &UsdcRebalanceId,
+        reason: String,
+    ) -> Result<(), UsdcTransferError> {
+        self.cqrs
+            .send(id, UsdcRebalanceCommand::FailConversion { reason })
+            .await?;
+        Ok(())
+    }
+
+    /// Re-reads settled cash after a definitive insufficient-balance
+    /// rejection and produces a strictly smaller, reserve-aware whole-cent
+    /// placement. The one-cent decrement guarantees progress when the fresh
+    /// read has not moved; taking the minimum prevents a later read from ever
+    /// increasing this aggregate's original intent.
+    async fn resized_usd_conversion_notional(
+        &self,
+        id: &UsdcRebalanceId,
+        previous: Positive<Usd>,
+    ) -> Result<Positive<Usd>, UsdcTransferError> {
+        let withdrawable_cash_cents = self.alpaca_broker.withdrawable_cash_cents().await?;
+        let capacity =
+            alpaca_to_base_usdc_capacity(withdrawable_cash_cents, self.reserved_cash)?
+                .ok_or_else(|| UsdcTransferError::WithdrawableCashUnavailable { id: id.clone() })?;
+
+        resize_usd_conversion_notional(id, previous, capacity)
+    }
+
     /// Converts USD buying power to USDC in the crypto wallet.
     ///
-    /// Used at the start of AlpacaToBase flow, before withdrawal.
-    /// Places a buy order on USDC/USD and polls until filled.
-    ///
-    /// `amount` is the USD to spend, not the USDC to receive: the buy names
-    /// dollars so it can be sized at all the cash available. The USDC bought
-    /// is always less -- Alpaca's collar takes ~2% of it, and slippage the
-    /// rest -- so the returned filled amount is what downstream steps use.
-    ///
-    /// # Event Sourcing Flow
-    ///
-    /// 1. Record intent via `InitiateConversion` (aggregate enters
-    ///    `Converting` state)
-    /// 2. Place Alpaca order
-    /// 3. If order fails: emit `FailConversion` (aggregate enters
-    ///    `ConversionFailed` state)
-    /// 4. If order succeeds: emit `ConfirmConversion` (aggregate enters
-    ///    `ConversionComplete` state)
-    ///
-    /// The `order_id` in `InitiateConversion` is a correlation UUID
-    /// generated upfront, not the actual Alpaca order ID.
+    /// Used at the start of AlpacaToBase flow, before withdrawal. Placement
+    /// retries only definitive insufficient-USD rejections and reuses the
+    /// correlation ID across every resized request. A successful fill records
+    /// the actual USDC received for downstream withdrawal sizing; exhausting
+    /// the bound records one terminal conversion failure.
     #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
     pub(crate) async fn execute_usd_to_usdc_conversion(
         &self,
@@ -623,8 +685,7 @@ impl<
         // named here so the order cannot be read as a USDC quantity. Built
         // before the intent is recorded so a non-positive amount fails with
         // no aggregate event and no broker order to reconcile.
-        let conversion_order =
-            ConversionOrder::BuyWithUsd(Positive::new(Usd::new(amount.inner()))?);
+        let mut notional = Positive::new(Usd::new(amount.inner()))?;
 
         // Record intent BEFORE placing order so we can track failures
         self.cqrs
@@ -638,60 +699,106 @@ impl<
             )
             .await?;
 
-        let order = match self
-            .alpaca_broker
-            .convert_usdc_usd(conversion_order, &correlation_id)
-            .await
-        {
-            Ok(order) => order,
-            // The order's fate is unknown: it may still be live at the broker
-            // and still fill. Recording a failure would release the in-flight
-            // guard and let the trigger arm a second conversion for the same
-            // imbalance while real money can still move, so the aggregate is
-            // left at `Converting` for operator reconciliation instead.
-            Err(
-                error @ (AlpacaBrokerApiError::ConversionCancelNotSettled { .. }
-                | AlpacaBrokerApiError::ConversionOrderNotFound { .. }),
-            ) => {
-                error!(target: "rebalance", %error, "USD to USDC conversion outcome unresolved");
-                return Err(UsdcTransferError::ConversionOutcomeUnresolved {
-                    id: id.clone(),
-                    source: Box::new(error),
-                });
-            }
-            Err(error) => {
-                // Conversion placement fails fast on ANY error (RAI-1494:
-                // deliberately NOT rescheduled, unlike the deposit/withdrawal
-                // polls) -- retrying a placement risks submitting the order
-                // twice against real money. A classified 429 must not reach
-                // the job's backpressure classifier though:
-                // `find_backpressure` walks the `.source()` chain, so
-                // returning `AlpacaBrokerApi` here would let it downcast into
-                // the underlying 429 and mistakenly reschedule an
-                // already-terminalized aggregate. Return the
-                // non-classifiable `ConversionPlacementFailed` only for that
-                // case; every other placement failure (e.g. a terminally
-                // rejected/canceled/expired order) keeps surfacing the
-                // original `AlpacaBrokerApi` variant so its specific reason
-                // is preserved for callers/tests that match on it.
-                warn!(target: "rebalance", "USD to USDC conversion failed: {error}");
-                self.cqrs
-                    .send(
-                        id,
-                        UsdcRebalanceCommand::FailConversion {
-                            reason: error.to_string(),
-                        },
-                    )
-                    .await?;
-                if error.backpressure().is_some() {
-                    return Err(UsdcTransferError::ConversionPlacementFailed { id: id.clone() });
+        let mut attempt = 0;
+        let order = loop {
+            attempt += 1;
+            match self
+                .alpaca_broker
+                .convert_usdc_usd(ConversionOrder::BuyWithUsd(notional), &correlation_id)
+                .await
+            {
+                Ok(order) => break order,
+                Err(error @ AlpacaBrokerApiError::UsdConversionInsufficientBalance { .. }) => {
+                    if attempt >= USD_CONVERSION_PLACEMENT_ATTEMPTS {
+                        warn!(
+                            target: "rebalance",
+                            %id,
+                            attempt,
+                            max_attempts = USD_CONVERSION_PLACEMENT_ATTEMPTS,
+                            %error,
+                            "USD to USDC conversion failed after exhausting insufficient-balance placement attempts"
+                        );
+                        self.fail_conversion(id, error.to_string()).await?;
+                        return Err(UsdcTransferError::AlpacaBrokerApi(error));
+                    }
+
+                    let resized = match self.resized_usd_conversion_notional(id, notional).await {
+                        Ok(resized) => resized,
+                        Err(resize_error) => {
+                            warn!(
+                                target: "rebalance",
+                                %id,
+                                attempt,
+                                error = %resize_error,
+                                "USD to USDC conversion retry could not be resized"
+                            );
+                            self.fail_conversion(id, resize_error.to_string()).await?;
+                            return match &resize_error {
+                                UsdcTransferError::AlpacaBrokerApi(error)
+                                    if error.backpressure().is_some() =>
+                                {
+                                    Err(UsdcTransferError::ConversionPlacementFailed {
+                                        id: id.clone(),
+                                    })
+                                }
+                                _ => Err(resize_error),
+                            };
+                        }
+                    };
+                    warn!(
+                        target: "rebalance",
+                        %id,
+                        attempt,
+                        previous = %notional,
+                        next = %resized,
+                        "Alpaca rejected USD-to-USDC placement for insufficient balance; retrying with fresh capacity"
+                    );
+                    notional = resized;
                 }
-                return Err(UsdcTransferError::AlpacaBrokerApi(error));
+                // The order's fate is unknown: it may still be live at the broker
+                // and still fill. Recording a failure would release the in-flight
+                // guard and let the trigger arm a second conversion for the same
+                // imbalance while real money can still move, so the aggregate is
+                // left at `Converting` for operator reconciliation instead.
+                Err(
+                    error @ (AlpacaBrokerApiError::ConversionCancelNotSettled { .. }
+                    | AlpacaBrokerApiError::ConversionOrderNotFound { .. }),
+                ) => {
+                    error!(target: "rebalance", %error, "USD to USDC conversion outcome unresolved");
+                    return Err(UsdcTransferError::ConversionOutcomeUnresolved {
+                        id: id.clone(),
+                        source: Box::new(error),
+                    });
+                }
+                Err(error) => {
+                    // Conversion placement fails fast on ANY error (RAI-1494:
+                    // deliberately NOT rescheduled, unlike the deposit/withdrawal
+                    // polls) -- retrying a placement risks submitting the order
+                    // twice against real money. A classified 429 must not reach
+                    // the job's backpressure classifier though:
+                    // `find_backpressure` walks the `.source()` chain, so
+                    // returning `AlpacaBrokerApi` here would let it downcast into
+                    // the underlying 429 and mistakenly reschedule an
+                    // already-terminalized aggregate. Return the
+                    // non-classifiable `ConversionPlacementFailed` only for that
+                    // case; every other placement failure (e.g. a terminally
+                    // rejected/canceled/expired order) keeps surfacing the
+                    // original `AlpacaBrokerApi` variant so its specific reason
+                    // is preserved for callers/tests that match on it.
+                    warn!(target: "rebalance", "USD to USDC conversion failed: {error}");
+                    self.fail_conversion(id, error.to_string()).await?;
+                    if error.backpressure().is_some() {
+                        return Err(UsdcTransferError::ConversionPlacementFailed {
+                            id: id.clone(),
+                        });
+                    }
+                    return Err(UsdcTransferError::AlpacaBrokerApi(error));
+                }
             }
         };
 
         let conversion = self
-            .record_conversion_or_fail(id, &correlation_id, &order, conversion_order.direction())
+            .record_conversion_or_fail(id, &correlation_id, &order, ConversionDirection::UsdToUsdc)
             .await?;
         let received_amount = conversion.received_amount;
 
@@ -4312,12 +4419,13 @@ mod tests {
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolEvent;
     use httpmock::prelude::*;
+    use proptest::prelude::*;
     use reqwest::StatusCode;
     use serde_json::json;
     use sqlx::SqlitePool;
     use std::str::FromStr;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use uuid::{Uuid, uuid};
 
     use st0x_execution::alpaca_broker_api::CryptoOrderFailureReason;
@@ -4867,6 +4975,7 @@ mod tests {
         UsdcSettlementParams {
             attestation_retry_deadline: TEST_ATTESTATION_RETRY_DEADLINE,
             required_confirmations: 3,
+            reserved_cash: None,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             #[cfg(feature = "test-support")]
@@ -5168,6 +5277,24 @@ mod tests {
                 .json_body(json!({
                     "id": "904837e3-3b76-47ec-b432-046db621571b",
                     "status": "ACTIVE"
+                }));
+        })
+    }
+
+    fn create_withdrawable_cash_mock<'a>(
+        server: &'a MockServer,
+        cash: &'static str,
+    ) -> httpmock::Mock<'a> {
+        server.mock(move |when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE",
+                    "cash": cash,
+                    "cash_withdrawable": cash
                 }));
         })
     }
@@ -5939,6 +6066,392 @@ mod tests {
             .unwrap();
 
         order_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn insufficient_usd_placement_reloads_cash_and_completes_resized_conversion() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let withdrawable_cash = create_withdrawable_cash_mock(&server, "69.36");
+
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let cqrs = create_test_store_instance().await;
+        let mut settlement = test_settlement_params();
+        settlement.reserved_cash = Some(Usd::new(float!(0.10)));
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            Arc::clone(&cqrs),
+            address!("0x1111111111111111111111111111111111111111"),
+            TEST_VAULT_ID,
+            &settlement,
+        );
+
+        let rejected = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body_includes(r#"{"side":"buy","notional":"69.38"}"#);
+            then.status(403)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "code": 40_310_000,
+                    "message": "insufficient balance for USD (requested: 69.38, available: 69.36)"
+                }));
+        });
+        let resized =
+            create_conversion_order_mock(&server, ConversionDirection::UsdToUsdc, "69.26");
+        let _get_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "69.26",
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let received = manager
+            .execute_usd_to_usdc_conversion(&id, usdc("69.38"))
+            .await
+            .unwrap();
+
+        assert_eq!(received, usdc("69.26"));
+        rejected.assert_calls(1);
+        resized.assert_calls(1);
+        // One account read initializes the broker; the second is the required
+        // fresh capacity read after the rejected placement.
+        withdrawable_cash.assert_calls(2);
+        assert!(matches!(
+            cqrs.load(&id).await.unwrap(),
+            Some(UsdcRebalance::ConversionComplete { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn resized_notional_floors_the_previous_amount_to_whole_cents() {
+        let server = MockServer::start();
+        let withdrawable_cash = create_withdrawable_cash_mock(&server, "100");
+        let (manager, _cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let resized = manager
+            .resized_usd_conversion_notional(
+                &UsdcRebalanceId(Uuid::new_v4()),
+                Positive::new(Usd::new(float!(69.389999))).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resized.inner(), Usd::new(float!(69.37)));
+        withdrawable_cash.assert_calls(2);
+    }
+
+    proptest! {
+        /// Every successful resize is the whole-cent floor of the smaller of
+        /// fresh capacity and the previous notional minus one cent. Results
+        /// below the configured transfer minimum fail with that exact amount.
+        #[test]
+        fn resized_notional_preserves_financial_invariants(
+            previous_micros in 10_000u64..=2_000_000_000u64,
+            capacity_cents in 0u64..=200_000u64,
+        ) {
+            let id = UsdcRebalanceId(Uuid::nil());
+            let previous = Positive::new(Usd::new(
+                Float::from_fixed_decimal(U256::from(previous_micros), 6).unwrap(),
+            ))
+            .unwrap();
+            let capacity = Usdc::new(
+                Float::from_fixed_decimal(U256::from(capacity_cents), 2).unwrap(),
+            );
+            let expected_cents = (previous_micros - 10_000)
+                .min(capacity_cents * 10_000)
+                / 10_000;
+            let (minimum_cents, _) = ALPACA_TO_BASE_MINIMUM_TRANSFER
+                .inner()
+                .to_fixed_decimal_lossy(2)
+                .unwrap();
+
+            match resize_usd_conversion_notional(&id, previous, capacity) {
+                Ok(resized) => {
+                    let resized = resized.inner();
+                    let (actual_cents, _) = resized.inner().to_fixed_decimal_lossy(2).unwrap();
+
+                    prop_assert_eq!(actual_cents, U256::from(expected_cents));
+                    prop_assert!(actual_cents >= minimum_cents);
+                    prop_assert!(actual_cents <= U256::from(capacity_cents));
+                    prop_assert!(expected_cents * 10_000 < previous_micros);
+                    prop_assert_eq!(
+                        resized,
+                        Usd::new(Float::from_fixed_decimal(actual_cents, 2).unwrap())
+                    );
+                }
+                Err(UsdcTransferError::ResizedConversionBelowMinimum {
+                    id: errored_id,
+                    available,
+                    minimum,
+                }) => {
+                    let (available_cents, _) =
+                        available.inner().to_fixed_decimal_lossy(2).unwrap();
+
+                    prop_assert_eq!(errored_id, id);
+                    prop_assert_eq!(available_cents, U256::from(expected_cents));
+                    prop_assert!(available_cents < minimum_cents);
+                    prop_assert_eq!(
+                        minimum,
+                        Usd::new(ALPACA_TO_BASE_MINIMUM_TRANSFER.inner())
+                    );
+                }
+                Err(error) => prop_assert!(false, "unexpected resize error: {error:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn eleven_balance_races_complete_on_the_twelfth_placement() {
+        let server = MockServer::start();
+        let withdrawable_cash = create_withdrawable_cash_mock(&server, "100");
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&requests);
+        let placement_attempt = Arc::new(AtomicUsize::new(0));
+        let responder_attempt = Arc::clone(&placement_attempt);
+        let placements = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.respond_with(move |request: &HttpMockRequest| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(request.body().as_ref()).unwrap();
+                captured_requests.lock().unwrap().push((
+                    body["client_order_id"].as_str().unwrap().to_owned(),
+                    body["notional"].as_str().unwrap().to_owned(),
+                ));
+                let attempt = responder_attempt.fetch_add(1, Ordering::SeqCst) + 1;
+                let (status, body) = if attempt < USD_CONVERSION_PLACEMENT_ATTEMPTS as usize {
+                    (
+                        403,
+                        json!({
+                            "code": 40_310_000,
+                            "message": "insufficient balance for USD"
+                        }),
+                    )
+                } else {
+                    (
+                        200,
+                        json!({
+                            "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                            "symbol": "USDCUSD",
+                            "qty": null,
+                            "notional": "69.27",
+                            "status": "filled",
+                            "filled_avg_price": "1.0001",
+                            "filled_qty": "69.27",
+                            "created_at": "2024-01-15T10:30:00Z"
+                        }),
+                    )
+                };
+
+                HttpMockResponse::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(serde_json::to_string(&body).unwrap())
+                    .build()
+            });
+        });
+        let _get_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "69.27",
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let received = manager
+            .execute_usd_to_usdc_conversion(&id, usdc("69.38"))
+            .await
+            .unwrap();
+
+        assert_eq!(received, usdc("69.27"));
+        placements.assert_calls(USD_CONVERSION_PLACEMENT_ATTEMPTS as usize);
+        // Broker initialization plus one fresh read after each of the eleven
+        // definitive rejections.
+        withdrawable_cash.assert_calls(USD_CONVERSION_PLACEMENT_ATTEMPTS as usize);
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), USD_CONVERSION_PLACEMENT_ATTEMPTS as usize);
+            assert!(
+                requests
+                    .iter()
+                    .all(|(client_order_id, _)| client_order_id == &requests[0].0),
+                "every resized placement must reuse the aggregate correlation ID"
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|(_, notional)| notional.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "69.38", "69.37", "69.36", "69.35", "69.34", "69.33", "69.32", "69.31", "69.3",
+                    "69.29", "69.28", "69.27"
+                ]
+            );
+            drop(requests);
+        }
+        assert!(matches!(
+            cqrs.load(&id).await.unwrap(),
+            Some(UsdcRebalance::ConversionComplete { .. })
+        ));
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn persistent_insufficient_balance_fails_once_after_twelve_placements() {
+        let server = MockServer::start();
+        let withdrawable_cash = create_withdrawable_cash_mock(&server, "100");
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+        let rejected = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(403)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "code": 40_310_000,
+                    "message": "insufficient balance for USD"
+                }));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let error = manager
+            .execute_usd_to_usdc_conversion(&id, usdc("69.38"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            UsdcTransferError::AlpacaBrokerApi(
+                AlpacaBrokerApiError::UsdConversionInsufficientBalance { .. }
+            )
+        ));
+        rejected.assert_calls(USD_CONVERSION_PLACEMENT_ATTEMPTS as usize);
+        withdrawable_cash.assert_calls(USD_CONVERSION_PLACEMENT_ATTEMPTS as usize);
+        assert!(matches!(
+            cqrs.load(&id).await.unwrap(),
+            Some(UsdcRebalance::ConversionFailed { .. })
+        ));
+        assert!(logs_contain(
+            "USD to USDC conversion failed after exhausting insufficient-balance placement attempts"
+        ));
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn resized_notional_below_transfer_minimum_fails_without_another_placement() {
+        let server = MockServer::start();
+        let withdrawable_cash = create_withdrawable_cash_mock(&server, "52.99");
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+        let rejected = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(403)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "code": 40_310_000,
+                    "message": "insufficient balance for USD"
+                }));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let error = manager
+            .execute_usd_to_usdc_conversion(&id, usdc("69.38"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            UsdcTransferError::ResizedConversionBelowMinimum {
+                available,
+                minimum,
+                ..
+            } if available == Usd::new(float!(52.99))
+                && minimum == Usd::new(float!(53))
+        ));
+        rejected.assert_calls(1);
+        withdrawable_cash.assert_calls(2);
+        assert!(matches!(
+            cqrs.load(&id).await.unwrap(),
+            Some(UsdcRebalance::ConversionFailed { .. })
+        ));
+        assert!(logs_contain(
+            "USD to USDC conversion retry could not be resized"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cash_refresh_rate_limit_terminalizes_without_backpressure() {
+        let server = MockServer::start();
+        let account_attempt = Arc::new(AtomicUsize::new(0));
+        let responder_attempt = Arc::clone(&account_attempt);
+        let account = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.respond_with(move |_request: &HttpMockRequest| {
+                let attempt = responder_attempt.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = if attempt == 0 {
+                    (
+                        200,
+                        json!({
+                            "id": "904837e3-3b76-47ec-b432-046db621571b",
+                            "status": "ACTIVE",
+                            "cash": "69.38",
+                            "cash_withdrawable": "69.38"
+                        }),
+                    )
+                } else {
+                    (429, json!({"message": "rate limited"}))
+                };
+
+                HttpMockResponse::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .header("Retry-After", "5")
+                    .body(serde_json::to_string(&body).unwrap())
+                    .build()
+            });
+        });
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+        let rejected = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(403)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "code": 40_310_000,
+                    "message": "insufficient balance for USD"
+                }));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let error = manager
+            .execute_usd_to_usdc_conversion(&id, usdc("69.38"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            UsdcTransferError::ConversionPlacementFailed { id: errored } if *errored == id
+        ));
+        assert_eq!(crate::conductor::job::find_backpressure(&error), None);
+        rejected.assert_calls(1);
+        account.assert_calls(2);
+        assert!(matches!(
+            cqrs.load(&id).await.unwrap(),
+            Some(UsdcRebalance::ConversionFailed { .. })
+        ));
     }
 
     /// The fresh-fill path proven end to end: a 9-decimal Alpaca fill is

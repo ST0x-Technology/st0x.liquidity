@@ -23,7 +23,9 @@ use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use sqlx_apalis::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
 use std::collections::HashMap;
+use std::future::Future;
 use std::num::TryFromIntError;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use task_supervisor::{SupervisorHandle, SupervisorHandleError};
@@ -2297,6 +2299,7 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
     raindex_service: Arc<RaindexService<Signer>>,
     rebalancing_ctx: &RebalancingCtx,
     required_confirmations: u64,
+    reserved_cash: Option<Usd>,
     telemetry: TelemetrySender,
 ) -> anyhow::Result<RebalancerServices<Signer>> {
     let alpaca_wallet = Arc::new(AlpacaWalletService::new(
@@ -2318,6 +2321,7 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
         UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             required_confirmations,
+            reserved_cash,
             #[cfg(feature = "test-support")]
             circle_api_base: rebalancing_ctx.circle_api_base.clone(),
             #[cfg(feature = "test-support")]
@@ -2329,14 +2333,27 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
     .map_err(Into::into)
 }
 
+fn build_rebalancing_vault_lookup(
+    ctx: &Ctx,
+    projection: Arc<Projection<VaultRegistry>>,
+) -> (VaultRegistryId, Arc<dyn VaultLookup>) {
+    // The (orderbook, vault-owner) pair keys both the vault-registry lookup
+    // and the rebalancing service's registry reads.
+    let registry_id = VaultRegistryId {
+        orderbook: ctx.chains.sole_trading().orderbook,
+        owner: ctx.vault_owner(),
+    };
+    let lookup = Arc::new(VaultRegistryLookup::new(projection, registry_id.clone()));
+
+    (registry_id, lookup)
+}
+
 fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     redemption_wallet: Address,
     wallets: ChainWallets<Signer>,
     deps: RebalancingDeps,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = anyhow::Result<RebalancingInfrastructure>> + Send>,
-> {
+) -> Pin<Box<dyn Future<Output = anyhow::Result<RebalancingInfrastructure>> + Send>> {
     let rebalancing_ctx = Arc::new(rebalancing_ctx);
 
     Box::pin(async move {
@@ -2365,17 +2382,8 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             BotGasReceiptCostEnqueuer::Disabled
         };
 
-        // The (orderbook, vault-owner) pair keys both the vault-registry lookup
-        // and the rebalancing service's registry reads.
-        let vault_registry_id = VaultRegistryId {
-            orderbook: deps.ctx.chains.sole_trading().orderbook,
-            owner: deps.ctx.vault_owner(),
-        };
-
-        let vault_lookup: Arc<dyn VaultLookup> = Arc::new(VaultRegistryLookup::new(
-            deps.vault_registry_projection,
-            vault_registry_id.clone(),
-        ));
+        let (vault_registry_id, vault_lookup) =
+            build_rebalancing_vault_lookup(&deps.ctx, deps.vault_registry_projection);
 
         let raindex_service =
             build_rebalancing_raindex_service(base_wallet, &deps.ctx, market_maker_wallet);
@@ -2500,12 +2508,14 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             .recover_usdc_guard(&deps.pool, &built.usdc)
             .await?;
 
+        let cash = deps.ctx.assets.cash.as_ref();
         let services = build_rebalancer_services(
             alpaca_auth,
             wallets,
             raindex_service,
             &rebalancing_ctx,
             deps.ctx.chains.sole_trading().required_confirmations,
+            cash.map(|cash| cash.reserved).map(Positive::inner),
             deps.telemetry.clone(),
         )
         .await?;
