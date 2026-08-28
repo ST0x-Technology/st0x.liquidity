@@ -68,7 +68,6 @@ use crate::bot_gas::{
 };
 use crate::conductor::exit::{ConductorExit, ConductorExitError, MonitorTaskError};
 use crate::conductor::job::{BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureStreak};
-use crate::conductor::monitor::asset_eligibility::AssetEligibilityMonitor;
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
 use crate::dashboard::pnl::{LedgerHead, PnlLedger, PnlLedgerReactor};
 use crate::dashboard::{Broadcaster, DashboardTradeDelivery};
@@ -865,6 +864,9 @@ pub(crate) struct ServerHandles {
     pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) recovery_cell: Arc<tokio::sync::OnceCell<crate::api::RecoveryHandle>>,
     pub(crate) pnl_ledger: Arc<PnlLedger>,
+    /// The overnight eligibility store: the conductor's sync task writes
+    /// it, the server's `/overnight/eligibility` endpoint reads it.
+    pub(crate) overnight_eligibility: EligibilitySnapshots,
 }
 
 impl Conductor {
@@ -880,6 +882,7 @@ impl Conductor {
             inventory,
             recovery_cell,
             pnl_ledger,
+            overnight_eligibility,
         }: ServerHandles,
         shutdown_token: CancellationToken,
         startup_tokens: ConductorStartupTokens,
@@ -1035,7 +1038,7 @@ impl Conductor {
         );
 
         let conductor_ctx = builder::ConductorCtx {
-            asset_eligibility_monitor: Some(build_asset_eligibility_monitor(&ctx, &notifier)),
+            overnight_eligibility,
             ctx: ctx.clone(),
             watch_providers,
             poll_freshness,
@@ -2709,30 +2712,6 @@ async fn build_query_frameworks(
     );
 
     manifest.build(pool.clone(), equity_transfer_services).await
-}
-
-/// Builds the overnight asset-eligibility monitor for an Alpaca broker.
-///
-/// Alpaca-specific on purpose: overnight eligibility is an Alpaca
-/// surface, so the monitor gets the concrete broker ctx instead of
-/// widening the generic `Executor` bound. The ctx rather than a built
-/// client: constructing one verifies the account over HTTP, and that
-/// failure belongs on the monitor's alert path, not on the startup path
-/// where it would abort `Conductor::start`.
-fn build_asset_eligibility_monitor(
-    ctx: &Ctx,
-    notifier: &Arc<dyn Notifier>,
-) -> AssetEligibilityMonitor {
-    let BrokerCtx::AlpacaBrokerApi(alpaca_ctx) = &ctx.broker;
-
-    AssetEligibilityMonitor {
-        broker_ctx: alpaca_ctx.clone(),
-        symbols: builder::configured_equity_symbols(ctx)
-            .into_iter()
-            .collect(),
-        store: EligibilitySnapshots::default(),
-        notifier: notifier.clone(),
-    }
 }
 
 /// Builds the Alpaca wallet client, instrumented broker, and CCTP/raindex

@@ -157,6 +157,7 @@ in
             "/trades" = apiProxy "/trades";
             "/transfers" = apiProxy "/transfers";
             "/performance" = apiProxy "/performance";
+            "/overnight" = apiProxy "/overnight";
           };
       };
     };

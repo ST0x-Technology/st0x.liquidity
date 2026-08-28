@@ -6,6 +6,13 @@
 //! mid-session start, per the spec's window rule) and then daily at the
 //! 19:55 ET slot five minutes before the overnight session opens.
 //!
+//! Daily on purpose, a superset of the spec's sync days (Sunday through
+//! Thursday plus holiday eves): a Friday or Saturday sync refreshes a
+//! store nothing reads, which costs a few requests but spares the
+//! scheduler a trading-calendar dependency. The session-scoped staleness
+//! check in `validate_overnight_eligibility` is what actually gates
+//! placements.
+//!
 //! A failed sync alerts through the [`Notifier`] path instead of
 //! silently serving stale eligibility: the session-scoped staleness
 //! check in `validate_overnight_eligibility` already fails closed, so
@@ -19,7 +26,7 @@ use task_supervisor::{SupervisedTask, TaskResult};
 use tracing::{error, info};
 
 use st0x_execution::{
-    AlpacaBrokerApi, AlpacaBrokerApiCtx, EligibilitySnapshots, Executor, Symbol,
+    AlpacaBrokerApi, AlpacaBrokerApiCtx, EligibilitySnapshots, Symbol, TryIntoExecutor,
     next_eligibility_sync_at, sync_eligibility,
 };
 
@@ -27,9 +34,6 @@ use crate::alerts::Notifier;
 
 #[derive(Clone)]
 pub(crate) struct AssetEligibilityMonitor {
-    /// The broker is built per sync rather than once at construction:
-    /// `try_from_ctx` verifies the account over HTTP, and a blip on that
-    /// call must alert through this task instead of aborting startup.
     pub(crate) broker_ctx: AlpacaBrokerApiCtx,
     pub(crate) symbols: Vec<Symbol>,
     pub(crate) store: EligibilitySnapshots,
@@ -38,6 +42,12 @@ pub(crate) struct AssetEligibilityMonitor {
 
 impl SupervisedTask for AssetEligibilityMonitor {
     async fn run(&mut self) -> TaskResult {
+        // Built here rather than injected: construction verifies the
+        // account over HTTP, so a failure lands in the supervisor's
+        // restart-with-backoff path instead of aborting conductor
+        // startup.
+        let broker = self.broker_ctx.clone().try_into_executor().await?;
+
         info!(
             symbols = self.symbols.len(),
             "Asset eligibility monitor started"
@@ -54,7 +64,7 @@ impl SupervisedTask for AssetEligibilityMonitor {
 
         // Startup sync: a bot starting mid-session gets an in-window
         // snapshot immediately instead of deferring until 19:55.
-        self.sync_and_alert().await;
+        self.sync_and_alert(&broker).await;
 
         loop {
             // Zero whenever the startup or previous sync ran past the slot,
@@ -63,31 +73,15 @@ impl SupervisedTask for AssetEligibilityMonitor {
             info!(%next, "Next asset eligibility sync scheduled");
             tokio::time::sleep(wait).await;
 
-            self.sync_and_alert().await;
+            self.sync_and_alert(&broker).await;
             next = next_eligibility_sync_at(Utc::now());
         }
     }
 }
 
 impl AssetEligibilityMonitor {
-    async fn sync_and_alert(&self) {
-        let broker = match AlpacaBrokerApi::try_from_ctx(self.broker_ctx.clone()).await {
-            Ok(broker) => broker,
-            Err(error) => {
-                error!(
-                    ?error,
-                    "Asset eligibility sync could not reach the broker; overnight \
-                     placements fail closed until the next successful sync"
-                );
-                self.alert(format!(
-                    "Overnight asset-eligibility sync could not reach the broker: {error}"
-                ))
-                .await;
-                return;
-            }
-        };
-
-        match sync_eligibility(&broker, &self.symbols, &self.store).await {
+    async fn sync_and_alert(&self, broker: &AlpacaBrokerApi) {
+        match sync_eligibility(broker, &self.symbols, &self.store).await {
             Ok(()) => info!(
                 symbols = self.symbols.len(),
                 "Asset eligibility sync completed"
@@ -182,10 +176,16 @@ mod tests {
         }
     }
 
-    fn monitor(
-        broker_ctx: AlpacaBrokerApiCtx,
+    async fn monitor_and_broker(
+        server: &MockServer,
         notifier: Arc<RecordingNotifier>,
-    ) -> (AssetEligibilityMonitor, EligibilitySnapshots) {
+    ) -> (
+        AssetEligibilityMonitor,
+        AlpacaBrokerApi,
+        EligibilitySnapshots,
+    ) {
+        let broker_ctx = mock_broker_ctx(server);
+        let broker = broker_ctx.clone().try_into_executor().await.unwrap();
         let store = EligibilitySnapshots::default();
         (
             AssetEligibilityMonitor {
@@ -194,8 +194,37 @@ mod tests {
                 store: store.clone(),
                 notifier,
             },
+            broker,
             store,
         )
+    }
+
+    /// Construction verifies the account over HTTP. A rejection must leave
+    /// `run` -- and so reach the supervisor's restart path -- instead of
+    /// being swallowed into a task that then syncs nothing forever.
+    #[tokio::test]
+    async fn run_surfaces_a_broker_verification_failure() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(401).body("unauthorized");
+        });
+        let notifier = Arc::new(RecordingNotifier::default());
+        let mut task = AssetEligibilityMonitor {
+            broker_ctx: mock_broker_ctx(&server),
+            symbols: vec![Symbol::new("AAPL").unwrap()],
+            store: EligibilitySnapshots::default(),
+            notifier: notifier.clone(),
+        };
+
+        let error = task.run().await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("401"),
+            "expected the broker verification status in the error, got: {error}"
+        );
+        assert_eq!(*notifier.messages.lock().unwrap(), Vec::<String>::new());
     }
 
     #[tokio::test]
@@ -215,9 +244,9 @@ mod tests {
                 }));
         });
         let notifier = Arc::new(RecordingNotifier::default());
-        let (task, store) = monitor(mock_broker_ctx(&server), notifier.clone());
+        let (task, broker, store) = monitor_and_broker(&server, notifier.clone()).await;
 
-        task.sync_and_alert().await;
+        task.sync_and_alert(&broker).await;
 
         assert_eq!(
             store
@@ -239,9 +268,9 @@ mod tests {
             then.status(500).body("broker exploded");
         });
         let notifier = Arc::new(RecordingNotifier::default());
-        let (task, store) = monitor(mock_broker_ctx(&server), notifier.clone());
+        let (task, broker, store) = monitor_and_broker(&server, notifier.clone()).await;
 
-        task.sync_and_alert().await;
+        task.sync_and_alert(&broker).await;
 
         assert_eq!(store.get(&Symbol::new("AAPL").unwrap()), None);
         // The alert names the symbol: a count alone leaves the operator

@@ -749,6 +749,7 @@ mod tests {
             pnl_report_admission: pnl::pnl_report_admission(),
             metrics_handle: crate::metrics::setup().expect("metrics setup"),
             health: crate::startup::HealthGate::default(),
+            overnight_eligibility: st0x_execution::EligibilitySnapshots::default(),
         }
     }
 
