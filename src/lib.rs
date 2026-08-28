@@ -333,6 +333,7 @@ async fn run_bot_session_inner(
                 executor_maintenance: startup_barrier.token(),
                 base_gas_monitor: startup_barrier.token(),
                 ethereum_gas_monitor: startup_barrier.token(),
+                asset_eligibility_monitor: startup_barrier.token(),
             },
         },
         #[cfg(any(test, feature = "test-support"))]
@@ -844,6 +845,7 @@ mod tests {
                 executor_maintenance: barrier.token(),
                 base_gas_monitor: barrier.token(),
                 ethereum_gas_monitor: barrier.token(),
+                asset_eligibility_monitor: barrier.token(),
             },
         }
     }

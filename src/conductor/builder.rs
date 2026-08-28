@@ -29,6 +29,7 @@ use super::job::{
     TerminalFailureInfo, TerminalFailureSignal, build_best_effort_worker, build_supervised_worker,
     build_worker_inner,
 };
+use super::monitor::asset_eligibility::AssetEligibilityMonitor;
 use super::monitor::executor_maintenance::ExecutorMaintenance;
 use super::monitor::gas::{GasMonitor, ProviderBalanceReader};
 use super::monitor::inventory::InventoryMonitor;
@@ -124,6 +125,9 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) cache: SymbolCache,
     pub(crate) provider: Prov,
     pub(crate) executor: Exec,
+    /// `None` under the dry-run broker: overnight eligibility is an
+    /// Alpaca surface and the sync then has nothing to refresh.
+    pub(crate) asset_eligibility_monitor: Option<AssetEligibilityMonitor>,
     pub(crate) execution_threshold: ExecutionThreshold,
     pub(crate) frameworks: CqrsFrameworks,
     pub(crate) pool: SqlitePool,
@@ -484,6 +488,7 @@ where
         executor_maintenance: executor_maintenance_startup,
         base_gas_monitor: base_gas_monitor_startup,
         ethereum_gas_monitor: ethereum_gas_monitor_startup,
+        asset_eligibility_monitor: asset_eligibility_startup,
     } = context.supervisor_startup;
 
     let order_fill_monitor = OrderFillMonitor::new(
@@ -537,6 +542,23 @@ where
         );
     } else {
         executor_maintenance_startup.acknowledge();
+    }
+
+    log_optional_task_status(
+        "asset eligibility sync",
+        context.asset_eligibility_monitor.is_some(),
+    );
+
+    if let Some(eligibility_monitor) = context.asset_eligibility_monitor {
+        supervisor_builder = supervisor_builder.with_task(
+            "asset-eligibility-monitor",
+            StartupTask {
+                task: eligibility_monitor,
+                token: asset_eligibility_startup,
+            },
+        );
+    } else {
+        asset_eligibility_startup.acknowledge();
     }
 
     log_optional_task_status("gas monitors", gas_monitors.is_some());
