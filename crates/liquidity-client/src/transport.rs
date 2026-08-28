@@ -26,7 +26,9 @@ pub struct Client<A> {
 
 impl<A: TokenSource + Sync> Client<A> {
     pub fn new(base_url: Url, read_auth: A, write_auth: A) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder().build()?;
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
         Ok(Self {
             http,
             base_url,
@@ -63,7 +65,14 @@ impl<A: TokenSource + Sync> Client<A> {
         let url = self.url(WRITE_PREFIX, path, &[]);
         let target = url.to_string();
         let token = self.write_auth.bearer().await?;
-        self.dispatch(self.http.post(url), target, token).await
+        self.dispatch(
+            self.http
+                .post(url)
+                .header(reqwest::header::CONTENT_LENGTH, "0"),
+            target,
+            token,
+        )
+        .await
     }
 
     async fn dispatch(
@@ -76,21 +85,53 @@ impl<A: TokenSource + Sync> Client<A> {
             .bearer_auth(token)
             .send()
             .await
-            .map_err(|source| Error::Transport(target, source))?;
+            .map_err(|source| Error::Transport(target.clone(), source))?;
         let status = response.status();
-        if status.is_success() {
-            return response
-                .json::<serde_json::Value>()
-                .await
-                .map_err(Error::Decode);
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        if status.is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            return Err(Error::Unauthorized(format!(
+                "IAP redirected to sign-in (status {status}, location {location}); the token was missing, expired, or not accepted"
+            )));
         }
-        let body = response.text().await.unwrap_or_default();
+        let body = response
+            .text()
+            .await
+            .map_err(|source| Error::Transport(target, source))?;
+        if status.is_success() {
+            return serde_json::from_str::<serde_json::Value>(&body).map_err(|source| {
+                Error::Decode(format!(
+                    "expected JSON but the endpoint returned {content_type} ({source}); this usually means the ops API is not deployed at this path. Body starts: {}",
+                    body_prefix(&body)
+                ))
+            });
+        }
         Err(match status {
             StatusCode::UNAUTHORIZED => Error::Unauthorized(body),
             StatusCode::FORBIDDEN => Error::Forbidden(body),
             other => Error::Http(other, body),
         })
     }
+}
+
+/// A short, single-line preview of a response body, for error messages.
+fn body_prefix(body: &str) -> String {
+    body.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(120)
+        .collect()
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ pub enum Error {
     Unauthorized(String),
     Forbidden(String),
     Http(StatusCode, String),
-    Decode(reqwest::Error),
+    Decode(String),
     Encode(serde_json::Error),
     Auth(String),
 }
@@ -52,13 +52,13 @@ impl fmt::Display for Error {
             Self::Http(status, body) => {
                 write!(f, "HTTP {status}: the request failed.{}", server_said(body))
             }
-            Self::Decode(source) => write!(f, "the API response could not be decoded: {source}"),
+            Self::Decode(detail) => write!(f, "the API response could not be decoded: {detail}"),
             Self::Encode(source) => {
                 write!(f, "the response could not be re-encoded as JSON: {source}")
             }
             Self::Auth(reason) => write!(
                 f,
-                "could not obtain a T0 Google identity: {reason}\nEnsure Application Default Credentials are configured (a service account, workload identity, or impersonation) that can mint an ID token for the configured audience.",
+                "could not obtain a T0 Google identity: {reason}\nFor staging, complete the browser sign-in when prompted. For production, ensure Application Default Credentials (a service account, workload identity, or impersonation) can mint an ID token for the configured audience.",
             ),
         }
     }
