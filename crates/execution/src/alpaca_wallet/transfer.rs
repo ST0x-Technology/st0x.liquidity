@@ -6,15 +6,15 @@
 
 use alloy::primitives::{Address, TxHash};
 use chrono::{DateTime, Utc};
+use rain_math_float::Float;
 use reqwest::StatusCode;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use rain_math_float::Float;
 use st0x_finance::Usdc;
 
 use super::client::{AlpacaWalletClient, AlpacaWalletError};
-use crate::Positive;
+use crate::{AlpacaAmount, Positive};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenSymbol(pub String);
@@ -100,8 +100,7 @@ pub struct Transfer {
     #[serde(rename = "tx_hash", default)]
     pub tx: Option<TxHash>,
     pub direction: TransferDirection,
-    #[serde(deserialize_with = "deserialize_float_from_string")]
-    pub amount: Float,
+    pub amount: AlpacaAmount,
     pub chain: String,
     pub asset: TokenSymbol,
     #[serde(rename = "from_address")]
@@ -147,14 +146,6 @@ impl std::fmt::Display for Network {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
-}
-
-fn deserialize_float_from_string<'de, D>(deserializer: D) -> Result<Float, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let raw = String::deserialize(deserializer)?;
-    Float::parse(raw).map_err(serde::de::Error::custom)
 }
 
 #[derive(Serialize)]
@@ -272,6 +263,51 @@ mod tests {
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     #[test]
+    fn transfer_response_floors_usdc_amount_to_six_decimals() {
+        let transfer: Transfer = serde_json::from_value(json!({
+            "id": "33333333-3333-4333-8333-333333333333",
+            "tx_hash": null,
+            "direction": "INCOMING",
+            "amount": "9.794019706",
+            "chain": "ETH",
+            "asset": "USDC",
+            "from_address": "0xabcdef1234567890abcdef1234567890abcdef12",
+            "to_address": "0x1234567890abcdef1234567890abcdef12345678",
+            "status": "COMPLETE",
+            "created_at": "2026-08-21T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            Usdc::new(transfer.amount.into_normalized()),
+            Usdc::new(float!(9.794019))
+        );
+    }
+
+    #[test]
+    fn non_usdc_transfer_uses_the_same_crypto_amount_boundary() {
+        let transfer: Transfer = serde_json::from_value(json!({
+            "id": "44444444-4444-4444-8444-444444444444",
+            "tx_hash": null,
+            "direction": "INCOMING",
+            "amount": "0.123456789",
+            "chain": "BTC",
+            "asset": "BTC",
+            "from_address": "0xabcdef1234567890abcdef1234567890abcdef12",
+            "to_address": "0x1234567890abcdef1234567890abcdef12345678",
+            "status": "COMPLETE",
+            "created_at": "2026-08-21T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert_eq!(transfer.asset.as_ref(), "BTC");
+        assert_eq!(
+            Usdc::new(transfer.amount.into_normalized()),
+            Usdc::new(float!(0.123456))
+        );
+    }
+
+    #[test]
     fn withdrawal_request_serializes_address_as_checksummed() {
         let address = address!("0xbd41F40D91eE4E816Ada1Aa842e94aEb6B6385a6");
         let asset = TokenSymbol::new("USDC");
@@ -346,7 +382,10 @@ mod tests {
 
         assert_eq!(transfer.id, AlpacaTransferId::new(transfer_id));
         assert_eq!(transfer.direction, TransferDirection::Outgoing);
-        assert!(transfer.amount.eq(float!(100.5)).unwrap());
+        assert_eq!(
+            Usdc::new(transfer.amount.into_normalized()),
+            Usdc::new(float!(100.5))
+        );
         assert_eq!(transfer.asset.as_ref(), "USDC");
         assert_eq!(transfer.to, expected_address);
         assert_eq!(transfer.status, TransferStatus::Pending);
@@ -812,8 +851,9 @@ mod tests {
             AlpacaTransferId::from(transfer_id),
             "status polling must request the transfer by ID"
         );
-        assert!(
-            transfer.amount.eq(float!(100)).unwrap(),
+        assert_eq!(
+            Usdc::new(transfer.amount.into_normalized()),
+            Usdc::new(float!(100)),
             "status polling must parse the by-id transfer payload"
         );
         assert_eq!(transfer.direction, TransferDirection::Outgoing);

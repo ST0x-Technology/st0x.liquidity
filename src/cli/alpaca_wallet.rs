@@ -99,11 +99,7 @@ pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write
         TransferStatus::Complete => {
             writeln!(stdout, "Alpaca deposit completed successfully!")?;
             writeln!(stdout, "   Transfer ID: {}", transfer.id)?;
-            writeln!(
-                stdout,
-                "   Amount: {} USDC",
-                format_float_with_fallback(&transfer.amount)
-            )?;
+            writeln!(stdout, "   Amount: {} USDC", transfer.amount)?;
         }
         TransferStatus::Failed => {
             writeln!(stdout, "Alpaca deposit failed!")?;
@@ -287,11 +283,7 @@ pub(super) async fn alpaca_withdraw_command<Registry: IntoErrorRegistry, W: Writ
         TransferStatus::Complete => {
             writeln!(stdout, "Alpaca withdrawal completed successfully!")?;
             writeln!(stdout, "   Transfer ID: {}", final_transfer.id)?;
-            writeln!(
-                stdout,
-                "   Amount: {} USDC",
-                format_float_with_fallback(&final_transfer.amount)
-            )?;
+            writeln!(stdout, "   Amount: {} USDC", final_transfer.amount)?;
 
             if let Some(tx_hash) = final_transfer.tx {
                 writeln!(stdout, "   Transaction hash: {tx_hash}")?;
@@ -572,12 +564,7 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
     for transfer in transfers {
         writeln!(stdout, "Transfer {}", transfer.id)?;
         writeln!(stdout, "   Direction: {:?}", transfer.direction)?;
-        writeln!(
-            stdout,
-            "   Amount: {} {}",
-            format_float_with_fallback(&transfer.amount),
-            transfer.asset
-        )?;
+        writeln!(stdout, "   Amount: {} {}", transfer.amount, transfer.asset)?;
         writeln!(stdout, "   Status: {:?}", transfer.status)?;
         writeln!(stdout, "   Chain: {}", transfer.chain)?;
         writeln!(stdout, "   From: {}", transfer.from)?;
@@ -640,11 +627,7 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     writeln!(stdout, "   Order ID: {}", order.id)?;
     writeln!(stdout, "   Symbol: {}", order.symbol)?;
     if let Some(quantity) = order.quantity {
-        writeln!(
-            stdout,
-            "   Quantity: {}",
-            format_float_with_fallback(&quantity)
-        )?;
+        writeln!(stdout, "   Quantity: {quantity}")?;
     }
     if let Some(notional) = order.notional {
         writeln!(
@@ -662,18 +645,14 @@ pub(super) async fn alpaca_convert_command<W: Write>(
         )?;
     }
     if let Some(filled_quantity) = order.filled_quantity {
-        writeln!(
-            stdout,
-            "   Filled Quantity: {}",
-            format_float_with_fallback(&filled_quantity)
-        )?;
+        writeln!(stdout, "   Filled Quantity: {filled_quantity}")?;
     }
     if let (Some(price), Some(quantity)) = (order.filled_average_price, order.filled_quantity) {
-        let usd_amount = (price * quantity)?;
+        let usd_amount = quantity.cash_value_at(price)?;
         writeln!(
             stdout,
             "   USD Amount: ${}",
-            format_float_with_fallback(&usd_amount)
+            format_float_with_fallback(&usd_amount.inner())
         )?;
     }
     writeln!(stdout, "   Created: {}", order.created_at)?;

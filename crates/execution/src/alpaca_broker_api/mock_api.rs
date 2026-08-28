@@ -2301,7 +2301,7 @@ mod tests {
     use crate::alpaca_broker_api::{
         AccountActivitiesQuery, AlpacaBrokerApi, TimeInForce, market_hours,
     };
-    use crate::{Executor, MarketSession, Symbol, Usd};
+    use crate::{Executor, MarketSession, Symbol, Usd, Usdc};
 
     /// Regression test for the calendar contract between `AlpacaBrokerMock`
     /// and the market-hours parser: `CalendarDay` requires `session_open` /
@@ -2917,7 +2917,10 @@ mod tests {
             "the status poll must keep qty null on a notional order, got {:?}",
             settled.quantity
         );
-        assert!(settled.filled_quantity.unwrap().eq(float!(500.25)).unwrap());
+        assert_eq!(
+            Usdc::new(settled.filled_quantity.unwrap().into_normalized()),
+            Usdc::new(float!(500.25))
+        );
 
         let orders = mock.orders();
         assert_eq!(orders.len(), 1);

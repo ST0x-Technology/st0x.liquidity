@@ -13,10 +13,10 @@ use super::{
     AlpacaBrokerApiError, CryptoOrderFailureReason, DeadlineCancel, MissingOrderField, TimeInForce,
 };
 use crate::{
-    CancellationOutcome, ClientOrderId, Direction, ExecutorOrderId, FractionalShares, MarketOrder,
-    OrderFailureTerminality, OrderPlacement, OrderStatus, OrderUpdate, Positive, Symbol, Usd, Usdc,
-    deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
-    serialize_float_as_string,
+    AlpacaAmount, CancellationOutcome, ClientOrderId, Direction, ExecutorOrderId, FractionalShares,
+    MarketOrder, OrderFailureTerminality, OrderPlacement, OrderStatus, OrderUpdate, Positive,
+    Symbol, Usd, Usdc, deserialize_float_from_number_or_string,
+    deserialize_option_float_from_number_or_string, serialize_float_as_string,
 };
 
 const ALPACA_CRYPTO_MAX_DECIMAL_PLACES: u8 = 6;
@@ -303,12 +303,8 @@ pub struct CryptoOrderResponse {
     /// Base-asset units requested, absent on an order placed by `notional`:
     /// Alpaca derives the quantity from the fill and answers `"qty": null`
     /// until then. Read `filled_quantity` for what was actually bought.
-    #[serde(
-        rename = "qty",
-        default,
-        deserialize_with = "deserialize_option_float_from_number_or_string"
-    )]
-    pub quantity: Option<Float>,
+    #[serde(rename = "qty", default)]
+    pub quantity: Option<AlpacaAmount>,
     /// USD requested, present only on an order placed by `notional`. Carried
     /// so the partial-fill warning can still report what was asked for on the
     /// direction that has no `qty`.
@@ -324,12 +320,8 @@ pub struct CryptoOrderResponse {
         deserialize_with = "deserialize_option_float_from_number_or_string"
     )]
     pub filled_average_price: Option<Float>,
-    #[serde(
-        rename = "filled_qty",
-        default,
-        deserialize_with = "deserialize_option_float_from_number_or_string"
-    )]
-    pub filled_quantity: Option<Float>,
+    #[serde(rename = "filled_qty", default)]
+    pub filled_quantity: Option<AlpacaAmount>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -594,6 +586,7 @@ fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
         HttpClient(_)
         | KmsJwt(_)
         | JsonParse(_)
+        | AlpacaAmount(_)
         | PositionSymbolMismatch { .. }
         | InvalidHeader(_)
         | InvalidOrderId(_)
@@ -2929,7 +2922,10 @@ mod tests {
         mock.assert();
         assert_eq!(order.id.to_string(), "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(order.symbol, "USDCUSD");
-        assert!(order.quantity.unwrap().eq(float!(1000.5)).unwrap());
+        assert_eq!(
+            Usdc::new(order.quantity.unwrap().into_normalized()),
+            Usdc::new(float!(1000.5))
+        );
         assert_eq!(order.status_display(), "filled");
     }
 
@@ -2979,12 +2975,9 @@ mod tests {
         mock.assert();
         assert_eq!(order.id.to_string(), "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(order.symbol, "USDCUSD");
-        assert!(
-            order
-                .filled_quantity
-                .unwrap()
-                .eq(float!(489.700985))
-                .unwrap()
+        assert_eq!(
+            Usdc::new(order.filled_quantity.unwrap().into_normalized()),
+            Usdc::new(float!(489.700985))
         );
         assert_eq!(order.status_display(), "filled");
     }
@@ -2994,7 +2987,7 @@ mod tests {
     /// as the gap between the two (observed on a sandbox account: notional 10
     /// filled 9.794019706 at 1.00101001).
     #[tokio::test]
-    async fn notional_conversion_response_carries_no_requested_quantity() {
+    async fn notional_conversion_response_floors_the_received_quantity() {
         let order: CryptoOrderResponse = serde_json::from_value(json!({
             "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
             "symbol": "USDCUSD",
@@ -3013,12 +3006,9 @@ mod tests {
             order.quantity
         );
         assert!(order.notional.unwrap().eq(float!(10)).unwrap());
-        assert!(
-            order
-                .filled_quantity
-                .unwrap()
-                .eq(float!(9.794019706))
-                .unwrap()
+        assert_eq!(
+            Usdc::new(order.filled_quantity.unwrap().into_normalized()),
+            Usdc::new(float!(9.794019))
         );
         assert_eq!(order.status_display(), "filled");
     }
@@ -3205,7 +3195,10 @@ mod tests {
             .unwrap();
 
         cancel.assert();
-        assert!(order.filled_quantity.unwrap().eq(float!(300)).unwrap());
+        assert_eq!(
+            Usdc::new(order.filled_quantity.unwrap().into_normalized()),
+            Usdc::new(float!(300))
+        );
         assert_eq!(
             order.classify(),
             CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Canceled)
@@ -3291,6 +3284,42 @@ mod tests {
         ));
     }
 
+    /// A broker fill below the six-decimal crypto boundary cannot fund any
+    /// downstream on-chain movement, so it is classified like an unfilled
+    /// conversion after the deadline cancel rather than accepted as a partial
+    /// fill with a normalized quantity of zero.
+    #[tokio::test]
+    async fn stalled_sub_grid_fill_is_cancelled_and_times_out() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let poll = tokio::spawn(async move {
+            let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+            poll_crypto_order_until_filled(&client, STALLED_ORDER_ID, FAST_DEADLINES).await
+        });
+
+        let cancel = respond_to_deadline_cancel(
+            &server,
+            "partially_filled",
+            "0.0000005",
+            204,
+            stalled_order_body("canceled", "0.0000005"),
+        )
+        .await;
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), poll)
+            .await
+            .expect("poll must terminate once the cancel settles")
+            .unwrap()
+            .unwrap_err();
+
+        cancel.assert();
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::ConversionTimedOut { order_id } if order_id == STALLED_ORDER_ID
+        ));
+    }
+
     /// The cancel races the fill: the order goes `filled` between the last
     /// poll and the DELETE, so the settle read observes a fill and the
     /// conversion succeeds instead of being reported as a timeout.
@@ -3321,7 +3350,10 @@ mod tests {
 
         cancel.assert();
         assert_eq!(order.classify(), CryptoOrderOutcome::Filled);
-        assert!(order.filled_quantity.unwrap().eq(float!(500)).unwrap());
+        assert_eq!(
+            Usdc::new(order.filled_quantity.unwrap().into_normalized()),
+            Usdc::new(float!(500))
+        );
     }
 
     /// Alpaca answers the DELETE with 422 when the order is no longer
@@ -3468,7 +3500,10 @@ mod tests {
             } => {
                 assert_eq!(order_id, STALLED_ORDER_ID);
                 assert_eq!(cancel, DeadlineCancel::Accepted);
-                assert!(filled_quantity.unwrap().eq(float!(300)).unwrap());
+                assert_eq!(
+                    Usdc::new(filled_quantity.unwrap().into_normalized()),
+                    Usdc::new(float!(300))
+                );
             }
             other => panic!("expected ConversionCancelNotSettled, got {other:?}"),
         }
@@ -3531,7 +3566,10 @@ mod tests {
             } => {
                 assert_eq!(order_id, STALLED_ORDER_ID);
                 assert_eq!(cancel, DeadlineCancel::Failed);
-                assert!(filled_quantity.unwrap().eq(float!(300)).unwrap());
+                assert_eq!(
+                    Usdc::new(filled_quantity.unwrap().into_normalized()),
+                    Usdc::new(float!(300))
+                );
             }
             other => panic!("expected ConversionCancelNotSettled, got {other:?}"),
         }
@@ -3729,7 +3767,10 @@ mod tests {
             order.classify(),
             CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Canceled)
         );
-        assert!(order.filled_quantity.unwrap().eq(float!(300)).unwrap());
+        assert_eq!(
+            Usdc::new(order.filled_quantity.unwrap().into_normalized()),
+            Usdc::new(float!(300))
+        );
     }
 
     #[tokio::test]
@@ -3950,7 +3991,7 @@ mod tests {
         let make_order = |status: BrokerOrderStatus| CryptoOrderResponse {
             id: Uuid::new_v4(),
             symbol: "USDCUSD".to_string(),
-            quantity: Some(float!(100)),
+            quantity: Some(AlpacaAmount::try_from(float!(100)).unwrap()),
             notional: None,
             status,
             filled_average_price: None,

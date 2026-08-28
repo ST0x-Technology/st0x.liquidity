@@ -11,7 +11,7 @@ use urlencoding::encode;
 use super::AlpacaBrokerApiError;
 use super::client::AlpacaBrokerApiClient;
 use crate::{
-    EquityPosition, FractionalShares, Inventory, Positive, Symbol, Usd,
+    AlpacaAmount, EquityPosition, FractionalShares, Inventory, Positive, Symbol, Usd,
     deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
 };
 
@@ -196,7 +196,9 @@ fn alpaca_usdc_balance(positions: &[PositionResponse]) -> Result<Usdc, AlpacaBro
         .total_quantity
         .ok_or(AlpacaBrokerApiError::MissingPositionQuantity)?;
 
-    Ok(Usdc::new(total_quantity))
+    Ok(Usdc::new(
+        AlpacaAmount::try_from(total_quantity)?.into_normalized(),
+    ))
 }
 
 pub(super) async fn get_account_funds(
@@ -882,7 +884,7 @@ mod tests {
                         "current_price": "0.9995",
                         "exchange": "CRYPTO",
                         "market_value": "0.78812",
-                        "qty": "0.788514",
+                        "qty": "0.788514999",
                         "qty_available": "0.788514",
                         "side": "long",
                         "symbol": "USDCUSD"
@@ -1247,6 +1249,7 @@ mod tests {
         let mark = mark_for(
             Some(json!({
                 "symbol": "AAPL",
+                "qty": "-3",
                 "qty_available": "-3",
                 "current_price": "223.80"
             })),
