@@ -345,15 +345,16 @@ async fn run_bot_session_inner(
         failure_injector,
     )));
 
-    // If this session future is cancelled before `await_shutdown` reaches its
-    // own graceful path (the spawned session task being aborted -- how the e2e
+    // If this session future is cancelled while coordinated shutdown can still
+    // be interrupted (the spawned session task being aborted -- how the e2e
     // chaos tests simulate a process crash), the conductor `JoinHandle` and the
     // runtime supervisor handles would simply be dropped. Dropping a `JoinHandle`
     // detaches its task rather than aborting it, so the conductor would keep
     // trading against the database and the bound server port would leak. This
-    // guard aborts the conductor and shuts both supervisors down on drop, so a
-    // cancelled session actually stops. The graceful path already stops both
-    // before this guard drops, making it a no-op there.
+    // guard therefore stays armed through coordinated shutdown. Every returning
+    // path has stopped the conductor and both supervisors, so
+    // `finish_session_shutdown` disarms the guard immediately afterward and
+    // before propagating the shutdown result.
     let mut session_guard = SessionTaskGuard {
         conductor: bot_task.abort_handle(),
         server_supervisor: server_supervisor.clone(),
@@ -381,44 +382,62 @@ async fn run_bot_session_inner(
     )
     .await?;
 
-    let shutdown_result = match startup_outcome {
-        StartupOutcome::Started => {
-            await_shutdown(
-                server_supervisor,
-                equity_price_supervisor,
-                bot_task,
-                shutdown_token,
-                shutdown_signal,
-                GRACEFUL_SHUTDOWN_TIMEOUT,
-            )
-            .await
-        }
-        StartupOutcome::ShutdownSignal => {
-            shutdown_equity_price_supervisor(equity_price_supervisor.as_ref());
-            drain_for_shutdown_signal(
-                &server_supervisor,
-                bot_task,
-                shutdown_token,
-                GRACEFUL_SHUTDOWN_TIMEOUT,
-            )
-            .await
+    let coordinated_shutdown = async move {
+        match startup_outcome {
+            StartupOutcome::Started => {
+                await_shutdown(
+                    server_supervisor,
+                    equity_price_supervisor,
+                    bot_task,
+                    shutdown_token,
+                    shutdown_signal,
+                    GRACEFUL_SHUTDOWN_TIMEOUT,
+                )
+                .await
+            }
+            StartupOutcome::ShutdownSignal => {
+                shutdown_equity_price_supervisor(equity_price_supervisor.as_ref());
+                drain_for_shutdown_signal(
+                    &server_supervisor,
+                    bot_task,
+                    shutdown_token,
+                    GRACEFUL_SHUTDOWN_TIMEOUT,
+                )
+                .await
+            }
         }
     };
-    session_guard.disarm();
-    shutdown_result?;
+    finish_session_shutdown(&mut session_guard, coordinated_shutdown).await?;
 
     info!(target: "startup", "Shutdown complete");
     Ok(())
 }
 
+/// Awaits coordinated shutdown while its cleanup guard remains armed.
+///
+/// Every return from the supplied future has already stopped the conductor and
+/// both runtime supervisors, including error returns. Disarm immediately after
+/// that await and before propagating its result so dropping the guard does not
+/// repeat supervisor shutdown.
+async fn finish_session_shutdown(
+    session_guard: &mut SessionTaskGuard,
+    coordinated_shutdown: impl Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    let shutdown_result = coordinated_shutdown.await;
+    session_guard.disarm();
+    shutdown_result
+}
+
 /// Drop guard that aborts the conductor task and shuts the runtime supervisors
-/// down when a bot session is cancelled before [`await_shutdown`] runs.
+/// down while the session future can still be cancelled.
 ///
 /// Dropping a `JoinHandle` detaches its task rather than aborting it, so without
 /// this a cancelled session would leave the conductor trading against the
-/// database and leak the bound server port. The graceful shutdown path stops
-/// both before this guard drops, so on the normal path the abort hits an
-/// already-finished task and the second `shutdown` is ignored.
+/// database and leak the bound server port. The guard remains armed while the
+/// session future can be cancelled, including through [`await_shutdown`] and the
+/// startup-signal drain branch. By the time either coordinated-shutdown branch
+/// returns, the conductor and both supervisors have stopped, so the caller must
+/// disarm the guard immediately and before propagating its result.
 ///
 /// Note that `abort()` only schedules cancellation: the conductor task may run
 /// briefly past this drop, settling at its next `.await` point rather than
@@ -1053,7 +1072,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disarmed_session_guard_leaves_completed_shutdown_untouched() {
+    #[tracing_test::traced_test]
+    async fn completed_shutdown_disarms_guard_before_propagating_result() {
         let conductor_task = tokio::spawn(std::future::pending::<()>());
         let supervisor = pending_test_supervisor();
         let mut guard = SessionTaskGuard {
@@ -1063,16 +1083,57 @@ mod tests {
             armed: true,
         };
 
-        guard.disarm();
+        shutdown_supervisor(&supervisor);
+        supervisor.wait().await.unwrap();
+        let error = finish_session_shutdown(
+            &mut guard,
+            std::future::ready(Err(anyhow::anyhow!("coordinated shutdown failed"))),
+        )
+        .await
+        .unwrap_err();
         drop(guard);
         tokio::task::yield_now().await;
 
+        assert_eq!(error.to_string(), "coordinated shutdown failed");
         assert!(
             !conductor_task.is_finished(),
-            "a disarmed cleanup guard must not abort an already-managed task"
+            "a completed coordinated shutdown must disarm cleanup before propagating its result"
+        );
+        assert!(
+            !logs_contain("Supervisor was already stopped"),
+            "dropping the disarmed guard must not repeat supervisor shutdown"
         );
         conductor_task.abort();
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn armed_guard_repeats_completed_shutdown_on_drop() {
+        let conductor_task = tokio::spawn(std::future::pending::<()>());
+        let supervisor = pending_test_supervisor();
+        let guard = SessionTaskGuard {
+            conductor: conductor_task.abort_handle(),
+            server_supervisor: supervisor.clone(),
+            equity_price_supervisor: None,
+            armed: true,
+        };
+
         shutdown_supervisor(&supervisor);
+        supervisor.wait().await.unwrap();
+        drop(guard);
+        let cancellation = tokio::time::timeout(Duration::from_secs(1), conductor_task)
+            .await
+            .expect("the armed guard must cancel its conductor promptly")
+            .expect_err("the armed guard must abort, not complete, its conductor");
+
+        assert!(
+            cancellation.is_cancelled(),
+            "an armed cleanup guard must cancel a task whose coordinated shutdown completed"
+        );
+        assert!(
+            logs_contain("Supervisor was already stopped"),
+            "the armed positive control must repeat supervisor shutdown"
+        );
     }
 
     #[tokio::test]
