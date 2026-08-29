@@ -6048,6 +6048,11 @@ mod tests {
     #[test]
     fn extended_hours_reprice_timeout_rejects_values_chrono_cannot_represent() {
         let broker = BrokerConfig {
+            kind: None,
+            mode: None,
+            account_id: None,
+            client_id: None,
+            kms_key_version: None,
             counter_trade_slippage_bps: Some(100),
             extended_hours_reprice_timeout_secs: Some(u64::MAX),
             close_flatten_reprice_timeout_secs: Some(60),
@@ -6073,6 +6078,11 @@ mod tests {
     #[test]
     fn extended_hours_reprice_timeout_rejects_zero() {
         let broker = BrokerConfig {
+            kind: None,
+            mode: None,
+            account_id: None,
+            client_id: None,
+            kms_key_version: None,
             counter_trade_slippage_bps: Some(100),
             extended_hours_reprice_timeout_secs: Some(0),
             close_flatten_reprice_timeout_secs: Some(60),
@@ -6095,6 +6105,11 @@ mod tests {
     #[test]
     fn extended_hours_reprice_timeout_accepts_chrono_maximum() {
         let broker = BrokerConfig {
+            kind: None,
+            mode: None,
+            account_id: None,
+            client_id: None,
+            kms_key_version: None,
             counter_trade_slippage_bps: Some(100),
             extended_hours_reprice_timeout_secs: Some(MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS),
             close_flatten_reprice_timeout_secs: Some(60),
@@ -6112,6 +6127,11 @@ mod tests {
     #[test]
     fn close_flatten_reprice_timeout_is_required_and_rejects_zero() {
         let missing = BrokerConfig {
+            kind: None,
+            mode: None,
+            account_id: None,
+            client_id: None,
+            kms_key_version: None,
             counter_trade_slippage_bps: Some(100),
             extended_hours_reprice_timeout_secs: Some(300),
             close_flatten_reprice_timeout_secs: None,
@@ -6137,6 +6157,11 @@ mod tests {
     #[test]
     fn extended_hours_close_flatten_window_rejects_values_chrono_cannot_represent() {
         let broker = BrokerConfig {
+            kind: None,
+            mode: None,
+            account_id: None,
+            client_id: None,
+            kms_key_version: None,
             counter_trade_slippage_bps: Some(100),
             extended_hours_reprice_timeout_secs: Some(300),
             close_flatten_reprice_timeout_secs: Some(60),
@@ -6164,6 +6189,11 @@ mod tests {
     #[test]
     fn extended_hours_close_flatten_window_accepts_chrono_maximum() {
         let broker = BrokerConfig {
+            kind: None,
+            mode: None,
+            account_id: None,
+            client_id: None,
+            kms_key_version: None,
             counter_trade_slippage_bps: Some(100),
             extended_hours_reprice_timeout_secs: Some(300),
             close_flatten_reprice_timeout_secs: Some(60),
@@ -6844,19 +6874,30 @@ mod tests {
     #[test]
     fn issuance_ctx_assembles_base_url_and_parses_api_key() {
         // Exercise issuance_ctx directly so the assertion does not depend on a
-        // wallet feature being enabled for a full Ctx::load_files.
-        let ctx = issuance_ctx(Some(IssuanceSecrets {
-            base_url: Url::parse("http://issuance.test:8000").unwrap(),
-            api_key: "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
-                .parse()
-                .unwrap(),
-        }))
+        // wallet feature being enabled for a full Ctx::load_files. The
+        // base_url rides in the deprecated secrets location here, which the
+        // migration shim must still honor (and notice).
+        let mut notices = Vec::new();
+        let ctx = issuance_ctx(
+            None,
+            Some(IssuanceSecretsToml {
+                base_url: Some(Url::parse("http://issuance.test:8000").unwrap()),
+                api_key: "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+                    .to_owned(),
+            }),
+            &mut notices,
+        )
         .expect("a valid issuance secret must assemble the ctx");
 
         assert_eq!(
             ctx.base_url,
             Url::parse("http://issuance.test:8000").unwrap(),
-            "base_url must come from the issuance secrets"
+            "base_url must come from the (deprecated) issuance secrets location"
+        );
+        assert_eq!(
+            notices.len(),
+            1,
+            "the deprecated base_url location must produce a notice"
         );
         // The secret is 0x-prefixed; the header value must be the bare 64-char
         // lowercase hex with no 0x prefix (issuance's X-API-KEY contract).
