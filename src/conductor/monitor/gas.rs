@@ -13,7 +13,11 @@
 //!
 //! - It alerts once on the transition into the low state.
 //! - While low, it re-alerts at most once per `realert_interval`.
-//! - It emits a single recovery notice on the transition back above threshold.
+//! - Recovery is logged (`info!`, target `"gas"`) but never notified: a
+//!   notification is an ERROR-severity operational alert, and paging an
+//!   operator for good news -- re-paging on every poll while a balance
+//!   oscillates around the threshold, since recovery resets the dedup
+//!   state -- would train them to ignore the channel.
 //!
 //! ## Failure handling
 //!
@@ -96,7 +100,8 @@ enum PollOutcome {
     /// Balance remains below threshold and the re-alert interval elapsed:
     /// alert again.
     StillLowRealert,
-    /// Balance recovered to at or above threshold: send recovery notice.
+    /// Balance recovered to at or above threshold: log it (no notification;
+    /// see the module doc).
     Recovered,
 }
 
@@ -205,24 +210,19 @@ impl GasMonitor {
                 );
                 self.send(&message).await;
             }
+            // Deliberately log-only: notifying would page severity-critical
+            // for good news, and because recovery resets the dedup state, a
+            // balance oscillating around the threshold would re-page every
+            // poll with no damping.
             PollOutcome::Recovered => {
-                let balance_eth = format_ether(balance);
-                let threshold_eth = format_ether(self.threshold_wei);
-
                 info!(
                     target: "gas",
                     wallet = %self.wallet,
                     chain = %self.chain,
-                    balance_eth = %balance_eth,
-                    threshold_eth = %threshold_eth,
+                    balance_eth = %format_ether(balance),
+                    threshold_eth = %format_ether(self.threshold_wei),
                     "Wallet native-gas balance recovered above threshold"
                 );
-
-                let message = format!(
-                    "\u{2705} Gas recovered: wallet {} on {} has {} ETH (threshold {} ETH)",
-                    self.wallet, self.chain, balance_eth, threshold_eth
-                );
-                self.send(&message).await;
             }
         }
     }
@@ -405,8 +405,11 @@ mod tests {
         );
     }
 
+    /// Recovery resets the dedup state but must NOT notify: a notification
+    /// is an ERROR-severity operational alert, and a balance oscillating
+    /// around the threshold would otherwise re-page on every poll.
     #[tokio::test]
-    async fn recovery_from_low_notifies_once() {
+    async fn recovery_from_low_resets_state_without_notifying() {
         let low_notifier = Arc::new(CapturingNotifier::new());
         let mut low_monitor = monitor_with(U256::from(50u64), false, low_notifier.clone());
         low_monitor.chain = Chain::Ethereum;
@@ -421,15 +424,9 @@ mod tests {
         let next = recover_monitor.poll_once(low_state, Instant::now()).await;
 
         assert_eq!(next, AlertState::Normal, "recovery returns to Normal");
-        let messages = recover_notifier.messages();
-        assert_eq!(messages.len(), 1, "recovery must notify exactly once");
-        assert_eq!(
-            messages[0],
-            concat!(
-                "\u{2705} Gas recovered: wallet ",
-                "0x0000000000000000000000000000000000000000 on ethereum ",
-                "has 0.000000000000000150 ETH (threshold 0.000000000000000100 ETH)"
-            )
+        assert!(
+            recover_notifier.messages().is_empty(),
+            "recovery is logged, never notified"
         );
     }
 

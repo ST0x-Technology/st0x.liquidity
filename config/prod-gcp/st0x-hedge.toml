@@ -1,3 +1,9 @@
+# DEAD ON GCP: this baked copy is NOT what the production VM runs. The live
+# config is t0.devops terraform/production-liquidity/st0x-hedge.toml, delivered
+# as a pinned Secret Manager version and mounted at /run/t0-config; editing
+# this file changes nothing on the VM. It is deleted entirely once
+# production's VM is replaced.
+
 # HTTP API port for the dashboard and health checks.
 server_port = 8001
 # HTTP port for the apalis-board job queue UI.

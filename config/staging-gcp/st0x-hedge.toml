@@ -1,3 +1,9 @@
+# DEAD ON GCP: this baked copy is NOT what the staging VM runs. The live
+# config is t0.devops terraform/staging-liquidity/st0x-hedge.toml, delivered
+# as a pinned Secret Manager version and mounted at /run/t0-config; editing
+# this file changes nothing on the VM. It is deleted entirely once
+# production's VM is replaced.
+
 # STAGING config for the GCP VM (t0.devops terraform/staging-liquidity).
 # Derived from config/staging/st0x-hedge.toml with exactly two deltas, kept
 # as a SEPARATE file because the DigitalOcean droplet still deploys the

@@ -9,6 +9,9 @@ async fn main() -> anyhow::Result<()> {
     let _file_log_guard =
         setup_tracing(&ctx.log_level, ctx.log_format, ctx.log_dir.as_deref(), None);
 
+    // Surface the notices parsing collected, now that a subscriber exists.
+    ctx.emit_startup_notices();
+
     Box::pin(cli::run_command(ctx, command)).await?;
     Ok(())
 }

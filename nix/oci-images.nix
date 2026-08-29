@@ -12,7 +12,7 @@
 #              command appends --config <baked path> --secrets <mounted
 #              Secret Manager file>. database_url in the configs stays
 #              sqlite:///mnt/data/st0x-hedge.db (the VM mounts its data
-#              disk there — byte-identical to the droplet). Also ships
+#              disk there, byte-identical to the droplet). Also ships
 #              /bin/st0x-cli for operators (docker exec into the running
 #              bot container, same config/secrets/DB and the container's
 #              ambient identity for keyless signing; see docs/cli-ops.md).

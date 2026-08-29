@@ -435,13 +435,14 @@ fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
     /// Domain-based log targets used via `target: "..."` in tracing macros.
     /// These must be listed here so the `EnvFilter` captures them alongside
     /// module-path-based crate targets.
-    const DOMAIN_TARGETS: [&str; 11] = [
+    const DOMAIN_TARGETS: [&str; 12] = [
         "bridge",
         "broker",
         "cqrs",
         "dashboard",
         "hedge",
         "inventory",
+        "operational_alert",
         "orderbook",
         "rebalance",
         "startup",

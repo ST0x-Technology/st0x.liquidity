@@ -25,7 +25,7 @@ Staging:
 ```sh
 gcloud compute ssh t0-liquidity-staging --project t0-liquidity-staging \
   --zone europe-west3-b --tunnel-through-iap \
-  --command 'docker exec "$(docker ps -qf name=bot)" /bin/st0x-cli \
+  --command 'sudo docker exec "$(sudo docker ps -qf name=bot)" /bin/st0x-cli \
     --config /run/t0-config/st0x-hedge.toml \
     --secrets /run/t0-secrets/t0-liquidity-secrets.toml \
     <command> [options]'
@@ -36,15 +36,17 @@ Production:
 ```sh
 gcloud compute ssh t0-liquidity --project t0-liquidity \
   --zone europe-west3-b --tunnel-through-iap \
-  --command 'docker exec "$(docker ps -qf name=bot)" /bin/st0x-cli \
+  --command 'sudo docker exec "$(sudo docker ps -qf name=bot)" /bin/st0x-cli \
     --config /run/t0-config/st0x-hedge.toml \
     --secrets /run/t0-secrets/t0-liquidity-secrets.toml \
     <command> [options]'
 ```
 
 For an interactive session, SSH in first (drop `--command`), then
-`docker exec -it "$(docker ps -qf name=bot)" /bin/st0x-cli ...`. The image has
-no shell, so `docker exec` must invoke `/bin/st0x-cli` directly.
+`sudo docker exec -it "$(sudo docker ps -qf name=bot)" /bin/st0x-cli ...`.
+`sudo` is required throughout: these are OS Login VMs and your login user is not
+in the docker group. The image has no shell, so `docker exec` must invoke
+`/bin/st0x-cli` directly.
 
 ## Token Address Reference
 

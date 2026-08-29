@@ -1112,12 +1112,17 @@ events. A symbol with a balance but no observed price is recorded with
 `usd_mark = NULL` -- never a fabricated zero. A missing or stale mark does not
 block the immutable balance capture; it immediately emits an error, increments
 an operational counter, and begins sending an operator alert through the
-configured alerting channel. Alert delivery is at-least-once: successful
-per-symbol delivery is recorded as a retained aggregate event, while failures
-enqueue an alert-only retry without blocking the next day's capture. Alert
-retries survive process restarts; a crash in the narrow interval after the
-notifier accepts a message but before the delivery event commits may produce a
-duplicate rather than lose the incident.
+configured alerting channel. In-process alert delivery cannot fail: the
+production notifier emits a structured ERROR log and its error type is
+uninhabited outside test builds, so getting the event to a human is the logging
+pipeline's responsibility (see "Structured log channel"). The per-symbol
+delivery event, the alert-only retry queue, and the bounded retry backoff are
+retained as a transport seam -- they are exercised only by test doubles that
+simulate a fallible notifier, and they would become load-bearing again if a
+fallible transport ever returns. Successful per-symbol delivery is still
+recorded as a retained aggregate event, and a crash in the narrow interval after
+the notifier accepts a message but before the delivery event commits may produce
+a duplicate log line rather than lose the incident.
 
 Captured marks are immutable facts, but operators may correct a missing or stale
 historical mark through the portfolio-snapshot `set` recovery command. The
@@ -1295,8 +1300,11 @@ _Configuration management_:
   one release: the deprecated secrets-file copies of these identity fields are
   still accepted with a warning, because deployed secret versions carry them; a
   field set differently in both files is refused at startup rather than silently
-  resolved. The shims and this tolerance are removed next release, together with
-  the `[alerts]` shims described under Operational Alerting.)
+  resolved. The keyless alpaca-broker-api-kms `[broker]` table migrates
+  all-or-nothing: while it remains in the secrets file its fields stay required
+  there, and the migration step is to delete the whole table once the config
+  carries the identity. The shims and this tolerance are removed next release,
+  together with the `[alerts]` shims described under Operational Alerting.)
 
 _Infrastructure_:
 

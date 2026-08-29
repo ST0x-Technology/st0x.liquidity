@@ -5,9 +5,9 @@
 //! The [`Notifier`] trait abstracts the delivery channel; [`LogNotifier`] is
 //! the only production implementation: it emits each alert as a structured
 //! ERROR log with target `operational_alert`. Delivery to humans happens
-//! downstream, in the log pipeline (Cloud Logging -> Grafana alert rules), so
-//! the bot itself holds no delivery credentials and delivery cannot fail
-//! in-process.
+//! downstream, in the log pipeline (Cloud Logging -> Grafana alert rules,
+//! matching on the target string in the gcplogs stream), so the bot itself
+//! holds no delivery credentials and delivery cannot fail in-process.
 //!
 //! Monitors that raise alerts (see `crate::conductor::monitor::gas`) depend on
 //! the trait so they stay testable against a capturing mock.
@@ -41,9 +41,11 @@ pub(crate) enum NotifierError {
 
 /// A [`Notifier`] that emits each alert as a structured ERROR log.
 ///
-/// The `operational_alert` target and `alert = true` field are the contract
-/// the downstream log-based alert rules match on; the human-readable alert
-/// text is the event message (the `message` field in JSON log output).
+/// The target string `operational_alert` is the delivery contract: the
+/// downstream metric filter matches it as a substring of the gcplogs
+/// stream. The `alert = true` field is a secondary marker for structured
+/// queries, and the human-readable alert text is the event message (the
+/// `message` field in JSON log output).
 pub(crate) struct LogNotifier;
 
 #[async_trait]
@@ -93,9 +95,10 @@ mod test_support {
 mod tests {
     use super::*;
 
-    /// The structured shape is the delivery contract: downstream alert rules
-    /// match the `operational_alert` target and the `alert = true` marker and
-    /// read the message text, so all three must survive refactors verbatim.
+    /// The target string is the delivery contract (the downstream metric
+    /// filter substring-matches `operational_alert` on the gcplogs stream);
+    /// the `alert = true` marker and the message text ride along for
+    /// structured queries. All three must survive refactors verbatim.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn notify_emits_a_structured_operational_alert_event() {

@@ -19,9 +19,10 @@ use alloy::primitives::U256;
 use alloy::primitives::utils::{UnitsError, parse_ether};
 use serde::Deserialize;
 use thiserror::Error;
-use tracing::warn;
 
 use st0x_evm::Chain;
+
+use crate::loader::StartupNotice;
 
 /// The chains this binary runs a gas monitor on.
 ///
@@ -95,17 +96,32 @@ impl AlertsCtx {
         }
     }
 
-    pub fn new(config: Option<AlertsConfig>) -> Result<Option<Self>, AlertsAssemblyError> {
+    pub fn new(
+        config: Option<AlertsConfig>,
+        startup_notices: &mut Vec<StartupNotice>,
+    ) -> Result<Option<Self>, AlertsAssemblyError> {
         let Some(config) = config else {
+            startup_notices.push(StartupNotice::info(
+                "[alerts] config section absent; the gas monitor will not run",
+            ));
             return Ok(None);
         };
 
         // Migration shim, removed next release: see `AlertsConfig::chat_id`.
-        if config.chat_id.is_some() || config.message_thread_id.is_some() {
-            warn!(
-                "[alerts] chat_id/message_thread_id are deprecated and ignored (alerts \
-                 are structured logs now); remove them from the [alerts] config section"
-            );
+        let retired: Vec<&str> = [
+            ("chat_id", config.chat_id.is_some()),
+            ("message_thread_id", config.message_thread_id.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(field, present)| present.then_some(field))
+        .collect();
+
+        if !retired.is_empty() {
+            startup_notices.push(StartupNotice::warning(format!(
+                "[alerts] {fields} deprecated and ignored (alerts are structured logs \
+                 now); remove from the [alerts] config section (removed next release)",
+                fields = retired.join("/"),
+            )));
         }
 
         if config.poll_interval == 0 {
@@ -252,7 +268,9 @@ mod tests {
 
     #[test]
     fn new_parses_threshold_and_intervals() {
-        let ctx = AlertsCtx::new(Some(valid_config())).unwrap().unwrap();
+        let ctx = AlertsCtx::new(Some(valid_config()), &mut Vec::new())
+            .unwrap()
+            .unwrap();
 
         // 0.05 ETH = 5 * 10^16 wei.
         assert_eq!(
@@ -289,19 +307,40 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = AlertsCtx::new(Some(config)).unwrap().unwrap();
+        let mut notices = Vec::new();
+        let ctx = AlertsCtx::new(Some(config), &mut notices).unwrap().unwrap();
 
         assert_eq!(
             ctx.low_balance_threshold_wei(Chain::Base),
             Some(U256::from(50_000_000_000_000_000_u64)),
             "the live fields must still load normally alongside the ignored ones"
         );
+        assert_eq!(notices.len(), 1, "exactly one deprecation notice");
+        assert!(
+            notices[0]
+                .message
+                .contains("chat_id/message_thread_id deprecated"),
+            "the notice must name exactly the retired fields seen, got: {}",
+            notices[0].message
+        );
     }
 
     #[test]
     fn new_returns_none_when_config_absent() {
-        let ctx = AlertsCtx::new(None).unwrap();
+        let mut notices = Vec::new();
+        let ctx = AlertsCtx::new(None, &mut notices).unwrap();
+
         assert!(ctx.is_none(), "absent [alerts] config must yield None");
+        assert_eq!(
+            notices.len(),
+            1,
+            "the absent section must be noticed, not silently skipped"
+        );
+        assert!(
+            notices[0].message.contains("gas monitor will not run"),
+            "the notice must say what the absence means, got: {}",
+            notices[0].message
+        );
     }
 
     #[test]
@@ -311,7 +350,7 @@ mod tests {
             .low_balance_thresholds
             .insert(Chain::Base, "not-a-number".to_owned());
 
-        let error = AlertsCtx::new(Some(config)).unwrap_err();
+        let error = AlertsCtx::new(Some(config), &mut Vec::new()).unwrap_err();
 
         assert!(
             matches!(
@@ -333,7 +372,7 @@ mod tests {
             .low_balance_thresholds
             .insert(Chain::Ethereum, "not-a-number".to_owned());
 
-        let error = AlertsCtx::new(Some(config)).unwrap_err();
+        let error = AlertsCtx::new(Some(config), &mut Vec::new()).unwrap_err();
 
         assert!(
             matches!(
@@ -356,7 +395,7 @@ mod tests {
         let mut config = valid_config();
         config.low_balance_thresholds.remove(&Chain::Ethereum);
 
-        let error = AlertsCtx::new(Some(config)).unwrap_err();
+        let error = AlertsCtx::new(Some(config), &mut Vec::new()).unwrap_err();
 
         assert!(
             matches!(
@@ -378,7 +417,7 @@ mod tests {
             .low_balance_thresholds
             .insert(Chain::HyperEvm, "0.05".to_owned());
 
-        let error = AlertsCtx::new(Some(config)).unwrap_err();
+        let error = AlertsCtx::new(Some(config), &mut Vec::new()).unwrap_err();
 
         assert!(
             matches!(
@@ -428,7 +467,7 @@ mod tests {
             .low_balance_thresholds
             .insert(Chain::Base, "0".to_owned());
 
-        let error = AlertsCtx::new(Some(config)).unwrap_err();
+        let error = AlertsCtx::new(Some(config), &mut Vec::new()).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -445,7 +484,7 @@ mod tests {
             .low_balance_thresholds
             .insert(Chain::Ethereum, "0".to_owned());
 
-        let error = AlertsCtx::new(Some(config)).unwrap_err();
+        let error = AlertsCtx::new(Some(config), &mut Vec::new()).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -462,7 +501,7 @@ mod tests {
         let mut config = valid_config();
         config.poll_interval = 0;
 
-        let error = AlertsCtx::new(Some(config)).unwrap_err();
+        let error = AlertsCtx::new(Some(config), &mut Vec::new()).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -479,7 +518,7 @@ mod tests {
         let mut config = valid_config();
         config.realert_interval = 0;
 
-        let error = AlertsCtx::new(Some(config)).unwrap_err();
+        let error = AlertsCtx::new(Some(config), &mut Vec::new()).unwrap_err();
         assert!(
             matches!(
                 error,

@@ -12,7 +12,12 @@ fn main() -> std::process::ExitCode {
     let Env { config, secrets } = Env::parse();
 
     match Ctx::validate_files(&config, &secrets) {
-        Ok(()) => {
+        Ok(startup_notices) => {
+            // No tracing subscriber in this binary; notices go to stderr so
+            // deprecation warnings surface in the deploy gate's output.
+            for notice in &startup_notices {
+                eprintln!("{notice}");
+            }
             eprintln!("Config validation passed");
             std::process::ExitCode::SUCCESS
         }

@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use tracing::{Level, warn};
+use tracing::{Level, info, warn};
 use url::Url;
 
 use st0x_evm::Chain;
@@ -72,6 +72,52 @@ pub struct Env {
     /// Path to encrypted TOML secrets file
     #[clap(long)]
     pub secrets: PathBuf,
+}
+
+/// A migration/deprecation notice produced while parsing config + secrets.
+///
+/// Parsing runs before any tracing subscriber exists (the server and CLI
+/// configure their subscriber FROM the parsed [`Ctx`]), so a `warn!` emitted
+/// during parsing dispatches to `NoSubscriber` and silently vanishes. The
+/// parse collects notices instead; the binaries emit them the moment logging
+/// is up ([`Ctx::emit_startup_notices`]), and `validate-config` prints them
+/// to stderr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupNotice {
+    pub level: StartupNoticeLevel,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupNoticeLevel {
+    Info,
+    Warn,
+}
+
+impl StartupNotice {
+    pub(crate) fn info(message: impl Into<String>) -> Self {
+        Self {
+            level: StartupNoticeLevel::Info,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn warning(message: impl Into<String>) -> Self {
+        Self {
+            level: StartupNoticeLevel::Warn,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for StartupNotice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let level = match self.level {
+            StartupNoticeLevel::Info => "info",
+            StartupNoticeLevel::Warn => "warning",
+        };
+        write!(formatter, "{level}: {message}", message = self.message)
+    }
 }
 
 /// Validated, network-free inputs required by the deploy-time Turnkey approval
@@ -592,6 +638,9 @@ pub struct Ctx {
     /// Optional gas-balance alerting context. `Some` when the `[alerts]`
     /// config section is present.
     pub alerts: Option<AlertsCtx>,
+    /// Notices collected during parsing, before any tracing subscriber
+    /// existed. Emit via [`Ctx::emit_startup_notices`] once logging is up.
+    pub startup_notices: Vec<StartupNotice>,
     /// Live reference prices used exclusively by dashboard USD valuations.
     pub pricing: Option<PricingCtx>,
     pub trading_mode: TradingMode,
@@ -629,7 +678,8 @@ pub struct Ctx {
     pub orchestrator: Option<OrchestratorConfig>,
 }
 
-/// Runtime broker configuration assembled from `BrokerSecrets`.
+/// Runtime broker configuration assembled from the config file's `[broker]`
+/// identity plus the secrets file's credentials (see [`resolve_broker`]).
 #[derive(Clone)]
 pub enum BrokerCtx {
     AlpacaBrokerApi(AlpacaBrokerApiCtx),
@@ -707,14 +757,47 @@ struct SecretsBrokerParts {
 }
 
 impl SecretsBrokerParts {
-    /// Whether the secrets file carried broker identity beyond the
-    /// credential pair and its `type` discriminator -- the content whose
-    /// home is now the config file.
-    fn carries_deprecated_identity(&self) -> bool {
-        self.account_id.is_some()
-            || self.mode.is_some()
-            || self.client_id.is_some()
-            || self.kms_key_version.is_some()
+    /// The deprecation notice for what this secrets `[broker]` table must
+    /// shed before next release, naming exactly what was seen -- or `None`
+    /// when the table is already in its end-state shape (legacy tag +
+    /// credential pair only).
+    ///
+    /// For the keyless and dry-run brokers the table itself is the
+    /// deprecated artifact: their identity's home is the config file and
+    /// they have no credentials, so even a tag-only `type = "dry-run"`
+    /// table must go.
+    fn deprecation_notice(&self) -> Option<StartupNotice> {
+        match self.kind {
+            BrokerKind::AlpacaBrokerApiKms | BrokerKind::DryRun => {
+                Some(StartupNotice::warning(format!(
+                    "the secrets file's [broker] table (type = \"{kind}\") is deprecated: \
+                     this broker type has no credentials, so declare its identity in the \
+                     config file's [broker] section and remove the table from the secrets \
+                     file (removed next release)",
+                    kind = self.kind.as_str(),
+                )))
+            }
+            BrokerKind::AlpacaBrokerApi => {
+                let seen: Vec<&str> = [
+                    ("account_id", self.account_id.is_some()),
+                    ("mode", self.mode.is_some()),
+                ]
+                .into_iter()
+                .filter_map(|(field, present)| present.then_some(field))
+                .collect();
+
+                if seen.is_empty() {
+                    return None;
+                }
+
+                Some(StartupNotice::warning(format!(
+                    "[broker] {fields} in the secrets file are deprecated and move to the \
+                     config file's [broker] section; only type/api_key/api_secret stay in \
+                     the secrets file (removed next release)",
+                    fields = seen.join("/"),
+                )))
+            }
+        }
     }
 }
 
@@ -808,21 +891,31 @@ fn refuse_broker_fields_not_for_kind(
 /// identity copies in the secrets file are still accepted for one release
 /// (see [`BrokerSecrets`]); a field set differently in both places is
 /// refused.
+/// The merged broker identity, ready for per-kind validation. Exists so the
+/// `match` arms in [`resolve_broker`] destructure it EXHAUSTIVELY: adding an
+/// identity field breaks compilation in every arm instead of being silently
+/// ignored for some broker type.
+struct ResolvedIdentity {
+    mode: Option<AlpacaBrokerApiMode>,
+    account_id: Option<AlpacaAccountId>,
+    client_id: Option<String>,
+    kms_key_version: Option<String>,
+    credentials: Option<AlpacaCredentials>,
+}
+
 fn resolve_broker(
     broker_config: Option<&BrokerConfig>,
     secrets: Option<BrokerSecrets>,
+    startup_notices: &mut Vec<StartupNotice>,
 ) -> Result<BrokerCtx, CtxError> {
     let secrets_parts = secrets.map(SecretsBrokerParts::from);
 
-    if let Some(parts) = &secrets_parts
-        && parts.carries_deprecated_identity()
+    // Migration shim, removed next release: see `BrokerSecrets`.
+    if let Some(notice) = secrets_parts
+        .as_ref()
+        .and_then(SecretsBrokerParts::deprecation_notice)
     {
-        // Migration shim, removed next release: see `BrokerSecrets`.
-        warn!(
-            "non-secret [broker] identity fields in the secrets file are deprecated \
-             and move to the config file; only the legacy api_key/api_secret pair \
-             (with its type tag) belongs in the secrets file"
-        );
+        startup_notices.push(notice);
     }
 
     let kind = merge_broker_field(
@@ -869,8 +962,27 @@ fn resolve_broker(
         secrets_kms_key_version,
     )?;
 
+    let identity = ResolvedIdentity {
+        mode,
+        account_id,
+        client_id,
+        kms_key_version,
+        credentials,
+    };
+
+    // Every arm destructures `ResolvedIdentity` exhaustively (no `..`), so a
+    // newly added identity field fails to compile until each broker type
+    // decides whether to require, allow, or refuse it.
     match kind {
         BrokerKind::DryRun => {
+            let ResolvedIdentity {
+                mode,
+                account_id,
+                client_id,
+                kms_key_version,
+                credentials,
+            } = identity;
+
             refuse_broker_fields_not_for_kind(
                 kind,
                 &[
@@ -885,6 +997,14 @@ fn resolve_broker(
             Ok(BrokerCtx::DryRun)
         }
         BrokerKind::AlpacaBrokerApi => {
+            let ResolvedIdentity {
+                mode,
+                account_id,
+                client_id,
+                kms_key_version,
+                credentials,
+            } = identity;
+
             refuse_broker_fields_not_for_kind(
                 kind,
                 &[
@@ -912,6 +1032,19 @@ fn resolve_broker(
             )
         }
         BrokerKind::AlpacaBrokerApiKms => {
+            let ResolvedIdentity {
+                mode,
+                account_id,
+                client_id,
+                kms_key_version,
+                credentials,
+            } = identity;
+
+            refuse_broker_fields_not_for_kind(
+                kind,
+                &[("api_key/api_secret", credentials.is_some())],
+            )?;
+
             // The keyless mint targets the LIVE authx token endpoint; a
             // sandbox (or mock) broker mode paired with it would silently
             // mint production bearer tokens. Fail loud until a sandbox
@@ -998,6 +1131,7 @@ impl std::fmt::Debug for Ctx {
             .field("broker", &self.broker)
             .field("telemetry", &self.telemetry)
             .field("alerts", &self.alerts)
+            .field("startup_notices", &self.startup_notices)
             .field("pricing", &self.pricing)
             .field("trading_mode", &self.trading_mode)
             .field("order_owner", &self.order_owner)
@@ -1121,6 +1255,7 @@ struct ValidatedParts {
     broker: BrokerCtx,
     telemetry: Option<TelemetryCtx>,
     alerts: Option<AlertsCtx>,
+    startup_notices: Vec<StartupNotice>,
     pricing: Option<PricingCtx>,
     execution_threshold: ExecutionThreshold,
     trading_mode: TradingMode,
@@ -1220,14 +1355,10 @@ fn validate_wallet_inputs(
                 wallet_meta,
             ))
         }
-        (None, Some(_)) => {
-            warn!(
-                target: "startup",
-                "[wallet] secrets present but no [wallet] config section -- \
-                 wallet signing will not be available"
-            );
-            Err(CtxError::WalletNotConfigured)
-        }
+        // No warn here: this arm errors immediately, and parsing runs
+        // before any tracing subscriber exists, so the old warn! was
+        // silently dropped. The returned error is the operator signal.
+        (None, Some(_)) => Err(CtxError::WalletNotConfigured),
         (None, None) => Err(CtxError::WalletNotConfigured),
     }
 }
@@ -1360,18 +1491,23 @@ fn parse_and_validate(
     validate_asset_tables(&config.assets, &config.chains)?;
     let polling_intervals = validated_polling_intervals(&config)?;
 
-    let broker = resolve_broker(config.broker.as_ref(), secrets.broker)?;
+    // Collected instead of warn!ed: no tracing subscriber exists yet (the
+    // binaries build theirs from the parsed Ctx), so a warn! here would
+    // dispatch to NoSubscriber and vanish. See `StartupNotice`.
+    let mut startup_notices = Vec::new();
+
+    let broker = resolve_broker(config.broker.as_ref(), secrets.broker, &mut startup_notices)?;
     let telemetry = config.telemetry.map(TelemetryCtx::from);
 
     // Migration shim, removed next release: see the `Secrets::alerts` field.
     if secrets.alerts.is_some() {
-        warn!(
+        startup_notices.push(StartupNotice::warning(
             "[alerts] in the secrets file is deprecated and ignored (alerts are \
-             structured logs now); remove [alerts] from the secrets file"
-        );
+             structured logs now); remove [alerts] from the secrets file",
+        ));
     }
 
-    let alerts = AlertsCtx::new(config.alerts)?;
+    let alerts = AlertsCtx::new(config.alerts, &mut startup_notices)?;
     let pricing = PricingCtx::assemble(
         config.pricing,
         secrets.pricing,
@@ -1500,11 +1636,10 @@ fn parse_and_validate(
             .rest_api
             .map(|cfg| {
                 if secrets.rest_api.is_none() {
-                    warn!(
-                        target: "startup",
-                        "[rest_api] URL configured but no [rest_api] credentials in secrets -- \
-                         requests will be unauthenticated"
-                    );
+                    startup_notices.push(StartupNotice::warning(
+                        "[rest_api] URL configured but no [rest_api] credentials in secrets \
+                         -- requests will be unauthenticated",
+                    ));
                 }
 
                 let key_id = secrets.rest_api.as_ref().map(|s| s.key_id.clone());
@@ -1512,7 +1647,8 @@ fn parse_and_validate(
                 RestApiCtx::new(cfg.url, key_id, key_secret).map_err(CtxError::RestApiClient)
             })
             .transpose()?,
-        issuance: issuance_ctx(config.issuance, secrets.issuance)?,
+        issuance: issuance_ctx(config.issuance, secrets.issuance, &mut startup_notices)?,
+        startup_notices,
         redemption_wallet,
         bot_gas_valuation: config.bot_gas_valuation,
         orchestrator: config.orchestrator,
@@ -1579,6 +1715,7 @@ fn extended_hours_broker_windows(
 fn issuance_ctx(
     config: Option<IssuanceConfig>,
     secrets: Option<IssuanceSecretsToml>,
+    startup_notices: &mut Vec<StartupNotice>,
 ) -> Result<IssuanceStatusCtx, CtxError> {
     let Some(secrets) = secrets else {
         return Err(CtxError::MissingIssuanceConfig);
@@ -1588,10 +1725,11 @@ fn issuance_ctx(
 
     if secrets.base_url.is_some() {
         // Migration shim, removed next release: see `IssuanceSecretsToml`.
-        warn!(
+        startup_notices.push(StartupNotice::warning(
             "[issuance] base_url in the secrets file is deprecated and moves to the \
-             config file; the secrets [issuance] section keeps only api_key"
-        );
+             config file; the secrets [issuance] section keeps only api_key \
+             (removed next release)",
+        ));
     }
 
     let base_url = match (config.map(|config| config.base_url), secrets.base_url) {
@@ -1665,6 +1803,7 @@ impl Ctx {
             broker: parts.broker,
             telemetry: parts.telemetry,
             alerts: parts.alerts,
+            startup_notices: parts.startup_notices,
             pricing: parts.pricing,
             trading_mode: parts.trading_mode,
             order_owner,
@@ -1689,7 +1828,10 @@ impl Ctx {
     /// construction (which connects to RPC endpoints). Suitable for pre-deploy
     /// validation where we want to catch config errors before restarting the
     /// service.
-    pub fn validate_files(config_path: &Path, secrets_path: &Path) -> Result<(), CtxError> {
+    pub fn validate_files(
+        config_path: &Path,
+        secrets_path: &Path,
+    ) -> Result<Vec<StartupNotice>, CtxError> {
         let config_str =
             std::fs::read_to_string(config_path).map_err(|source| CtxError::ConfigIo {
                 path: config_path.to_path_buf(),
@@ -1700,8 +1842,21 @@ impl Ctx {
                 path: secrets_path.to_path_buf(),
                 source,
             })?;
-        parse_and_validate(&config_str, config_path, &secrets_str, secrets_path)?;
-        Ok(())
+        let parts = parse_and_validate(&config_str, config_path, &secrets_str, secrets_path)?;
+        Ok(parts.startup_notices)
+    }
+
+    /// Emits the notices collected during parsing. Call once, right after
+    /// the tracing subscriber is installed -- during parsing itself there
+    /// was no subscriber, so logging there would have vanished.
+    pub fn emit_startup_notices(&self) {
+        for notice in &self.startup_notices {
+            let message = notice.message.as_str();
+            match notice.level {
+                StartupNoticeLevel::Info => info!(target: "startup", "{message}"),
+                StartupNoticeLevel::Warn => warn!(target: "startup", "{message}"),
+            }
+        }
     }
 
     /// Loads deploy-time Turnkey policy inputs without constructing wallets or
@@ -1947,6 +2102,7 @@ impl Ctx {
             broker,
             telemetry: None,
             alerts: None,
+            startup_notices: Vec::new(),
             pricing: None,
             trading_mode,
             order_owner,
@@ -2384,6 +2540,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         broker: BrokerCtx::DryRun,
         telemetry: None,
         alerts: None,
+        startup_notices: Vec::new(),
         pricing: None,
         trading_mode: TradingMode::Standalone,
         order_owner,
@@ -3389,6 +3546,15 @@ mod tests {
         assert_eq!(
             alerts.realert_interval,
             std::time::Duration::from_secs(3600)
+        );
+        assert!(
+            ctx.startup_notices.iter().any(|notice| {
+                notice.level == StartupNoticeLevel::Warn
+                    && notice.message.contains("[alerts] in the secrets file")
+            }),
+            "the deprecated secrets [alerts] table must produce a collected \
+             startup notice, got: {:?}",
+            ctx.startup_notices
         );
     }
 
@@ -4539,6 +4705,17 @@ mod tests {
             "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
                 .parse::<AlpacaAccountId>()
                 .unwrap()
+        );
+        assert!(
+            ctx.startup_notices.iter().any(|notice| {
+                notice.level == StartupNoticeLevel::Warn
+                    && notice
+                        .message
+                        .contains("[broker] account_id in the secrets file")
+            }),
+            "the deprecated identity copy must produce a notice naming exactly \
+             the fields seen, got: {:?}",
+            ctx.startup_notices
         );
     }
 
