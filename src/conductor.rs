@@ -903,7 +903,7 @@ impl Conductor {
             resume_tokenization_queue,
             deliver_mint_authorization_queue,
             deliver_mint_authorization_ctx,
-        } = PositionAndRebalancing::setup(
+        } = PositionAndRebalancing::setup_with_recovery(
             rebalancing,
             RebalancingDeps {
                 pool: pool.clone(),
@@ -919,23 +919,9 @@ impl Conductor {
                 notifier: notifier.clone(),
                 record_bot_gas_receipt_cost_queue: record_bot_gas_receipt_cost_queue.clone(),
             },
+            &backfill_queue,
+            record_bot_gas_receipt_cost_ctx.as_ref(),
         )
-        .await?;
-
-        finish_startup_recovery(StartupRecoveryDeps {
-            schedulers: &schedulers,
-            backfill_queue: &backfill_queue,
-            usdc_to_hedging_ctx: transfer_usdc_to_hedging_ctx.as_ref(),
-            usdc_to_market_making_ctx: transfer_usdc_to_market_making_ctx.as_ref(),
-            equity_to_market_making_ctx: transfer_equity_to_market_making_ctx.as_ref(),
-            equity_to_hedging_ctx: transfer_equity_to_hedging_ctx.as_ref(),
-            record_bot_gas_receipt_cost_queue: &record_bot_gas_receipt_cost_queue,
-            record_bot_gas_receipt_cost_ctx: record_bot_gas_receipt_cost_ctx.as_ref(),
-            pool: &pool,
-            inventory: &inventory,
-            rebalancing_service: rebalancing_service.as_ref(),
-            position_projection: &position_projection,
-        })
         .await?;
 
         let (offchain_order, offchain_order_projection) = setup_offchain_order_store(
@@ -1762,6 +1748,44 @@ fn build_wrapper<Signer: Wallet + Clone>(
 }
 
 impl PositionAndRebalancing {
+    /// The full rebalancing startup phase: builds the position/rebalancing
+    /// aggregates via [`Self::setup`], then runs [`finish_startup_recovery`]
+    /// against them, so every orphaned job is requeued and the inventory
+    /// view is hydrated before any worker starts consuming.
+    async fn setup_with_recovery(
+        rebalancing: Option<RebalancingCtx>,
+        deps: RebalancingDeps,
+        backfill_queue: &BackfillJobQueue,
+        record_bot_gas_receipt_cost_ctx: Option<&Arc<RecordBotGasReceiptCostCtx>>,
+    ) -> anyhow::Result<Self> {
+        // Cloned out before `deps` is consumed by `setup`: recovery must run
+        // against the same handles the aggregates were built around.
+        let pool = deps.pool.clone();
+        let inventory = deps.inventory.clone();
+        let schedulers = deps.schedulers.clone();
+        let record_bot_gas_receipt_cost_queue = deps.record_bot_gas_receipt_cost_queue.clone();
+
+        let assembled = Self::setup(rebalancing, deps).await?;
+
+        finish_startup_recovery(StartupRecoveryDeps {
+            schedulers: &schedulers,
+            backfill_queue,
+            usdc_to_hedging_ctx: assembled.transfer_usdc_to_hedging_ctx.as_ref(),
+            usdc_to_market_making_ctx: assembled.transfer_usdc_to_market_making_ctx.as_ref(),
+            equity_to_market_making_ctx: assembled.transfer_equity_to_market_making_ctx.as_ref(),
+            equity_to_hedging_ctx: assembled.transfer_equity_to_hedging_ctx.as_ref(),
+            record_bot_gas_receipt_cost_queue: &record_bot_gas_receipt_cost_queue,
+            record_bot_gas_receipt_cost_ctx,
+            pool: &pool,
+            inventory: &inventory,
+            rebalancing_service: assembled.service.as_ref(),
+            position_projection: &assembled.position_projection,
+        })
+        .await?;
+
+        Ok(assembled)
+    }
+
     async fn setup(
         rebalancing: Option<RebalancingCtx>,
         deps: RebalancingDeps,
