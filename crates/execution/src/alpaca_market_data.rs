@@ -12,9 +12,9 @@ use crate::alpaca_broker_api::kms_jwt::KmsJwtError;
 
 use crate::rate_limit::retry_after_from_response_headers;
 use crate::{
-    Backpressure, IndicativeQuote, LatestQuote, LatestQuoteError, Permanence, Positive, Symbol,
-    Usd, deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
-    status_permanence,
+    AlpacaBrokerApiError, Backpressure, IndicativeQuote, LatestQuote, LatestQuoteError, Permanence,
+    Positive, Symbol, Usd, deserialize_float_from_number_or_string,
+    deserialize_option_float_from_number_or_string, status_permanence,
 };
 
 /// The latest-quote feed to price against. Not configurable: each session has
@@ -64,6 +64,13 @@ pub enum AlpacaMarketDataError {
     Entitlement { status: StatusCode, body: String },
     #[error("latest quote response for {symbol} did not include a timestamp")]
     MissingQuoteTimestamp { symbol: Symbol },
+    #[error(
+        "overnight quote is {}s old, exceeding the configured maximum of {}s; \
+         refusing to price from a stale indicative quote",
+        age.as_secs(),
+        max_age.as_secs()
+    )]
+    StaleQuote { age: Duration, max_age: Duration },
     #[error("failed to parse latest trade response: {0}")]
     JsonParse(#[from] serde_json::Error),
     #[error("failed to parse latest quote response: {0}")]
@@ -133,6 +140,7 @@ impl AlpacaMarketDataError {
             | Self::MissingBid { .. }
             | Self::MissingAsk { .. }
             | Self::MissingQuoteTimestamp { .. }
+            | Self::StaleQuote { .. }
             | Self::NonPositiveBid { .. }
             | Self::NonPositiveAsk { .. }
             | Self::InvalidQuote { .. } => None,
@@ -162,7 +170,8 @@ impl AlpacaMarketDataError {
 
             // Transport failures can clear, and syntactically valid latest
             // quotes are dynamic snapshots: a later request can carry a
-            // complete, positive, uncrossed book even when this one did not.
+            // complete, positive, uncrossed book even when this one did
+            // not, and a stale quote can be superseded by a fresh one.
             Self::Auth(_)
             | Self::Http(_)
             | Self::LatestQuoteSymbolMismatch { .. }
@@ -170,6 +179,7 @@ impl AlpacaMarketDataError {
             | Self::MissingBid { .. }
             | Self::MissingAsk { .. }
             | Self::MissingQuoteTimestamp { .. }
+            | Self::StaleQuote { .. }
             | Self::NonPositiveBid { .. }
             | Self::NonPositiveAsk { .. }
             | Self::InvalidQuote { .. } => Permanence::Transient,
@@ -322,6 +332,29 @@ pub(crate) async fn fetch_latest_overnight_quote(
     })?;
 
     Ok(IndicativeQuote { quote, at })
+}
+
+/// Rejects an indicative quote older than `max_age` at `now`.
+///
+/// Separate from the fetch on purpose: the CLI's inspection surface must
+/// keep showing stale quotes with their age, while the pricing path
+/// composes fetch + this check so it can never price from one. The bound
+/// is exclusive -- `age == max_age` is the last usable instant, matching
+/// the eligibility window's inclusive-boundary convention. A broker
+/// timestamp ahead of `now` (clock skew) counts as age zero.
+pub fn validate_overnight_quote_age(
+    quote: &IndicativeQuote,
+    now: DateTime<Utc>,
+    max_age: Duration,
+) -> Result<(), AlpacaBrokerApiError> {
+    let age = (now - quote.at).to_std().unwrap_or(Duration::ZERO);
+    if age > max_age {
+        return Err(AlpacaBrokerApiError::LatestQuote(Box::new(
+            AlpacaMarketDataError::StaleQuote { age, max_age },
+        )));
+    }
+
+    Ok(())
 }
 
 async fn fetch_quote_and_timestamp(
@@ -732,6 +765,101 @@ mod tests {
         assert_eq!(error.backpressure(), None);
     }
 
+    /// An indicative quote stamped `age_secs` before the fixed test
+    /// instant, for exercising the staleness bound.
+    fn indicative_quote_aged(now: DateTime<Utc>, age_secs: i64) -> IndicativeQuote {
+        let bid = Positive::new(Usd::new(Float::parse("24.10".to_string()).unwrap())).unwrap();
+        let ask = Positive::new(Usd::new(Float::parse("24.30".to_string()).unwrap())).unwrap();
+        IndicativeQuote {
+            quote: LatestQuote::new(bid, ask).unwrap(),
+            at: now - chrono::Duration::seconds(age_secs),
+        }
+    }
+
+    fn validation_now() -> DateTime<Utc> {
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 29, 1, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn quote_younger_than_the_max_age_passes() {
+        let now = validation_now();
+        validate_overnight_quote_age(
+            &indicative_quote_aged(now, 10),
+            now,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn quote_exactly_at_the_max_age_still_passes() {
+        // The bound is exclusive: age == max_age is the last usable
+        // instant, so an off-by-one cannot reject a quote at the limit.
+        let now = validation_now();
+        validate_overnight_quote_age(
+            &indicative_quote_aged(now, 30),
+            now,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn quote_older_than_the_max_age_is_rejected_with_its_exact_age() {
+        let now = validation_now();
+        let error = validate_overnight_quote_age(
+            &indicative_quote_aged(now, 120),
+            now,
+            Duration::from_secs(30),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                AlpacaBrokerApiError::LatestQuote(inner) if matches!(
+                    **inner,
+                    AlpacaMarketDataError::StaleQuote { age, max_age }
+                        if age == Duration::from_secs(120) && max_age == Duration::from_secs(30)
+                )
+            ),
+            "expected StaleQuote with exact age, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn quote_stamped_ahead_of_now_passes_as_age_zero() {
+        // Broker clock skew can stamp a quote slightly in the future; a
+        // from-the-future quote is fresh, never stale.
+        let now = validation_now();
+        validate_overnight_quote_age(
+            &indicative_quote_aged(now, -5),
+            now,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stale_quote_classifies_transient_without_backpressure() {
+        // A stale indicative quote is a data-freshness condition, not a
+        // credential or provisioning fact: the next fetch can return a
+        // fresh quote, so retry classification is transient, and it is
+        // not broker rate-limiting.
+        let error = AlpacaMarketDataError::StaleQuote {
+            age: Duration::from_secs(120),
+            max_age: Duration::from_secs(30),
+        };
+
+        assert_eq!(error.permanence(), Permanence::Transient);
+        assert_eq!(error.backpressure(), None);
+        assert_eq!(
+            error.to_string(),
+            "overnight quote is 120s old, exceeding the configured maximum of 30s; refusing \
+             to price from a stale indicative quote"
+        );
+    }
+
     async fn overnight_quote_result(
         quote: serde_json::Value,
     ) -> Result<IndicativeQuote, AlpacaMarketDataError> {
@@ -792,6 +920,135 @@ mod tests {
                 if *symbol == Symbol::new("AAPL").unwrap()
         ));
         assert_eq!(error.permanence(), Permanence::Transient);
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_overnight_quote_deserializes_a_real_sandbox_payload() {
+        // The exact response shape the sandbox served on 2026-08-26
+        // (feed=overnight, RKLB demo run): numeric prices, exchange and
+        // condition fields the model must tolerate, millisecond
+        // timestamp precision.
+        let server = MockServer::start();
+        let client = mock_client(&server);
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/stocks/AAPL/quotes/latest")
+                .query_param("feed", "overnight");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "symbol": "AAPL",
+                    "quote": {
+                        "ap": 309.23,
+                        "as": 3,
+                        "ax": "L",
+                        "bp": 308.06,
+                        "bs": 1,
+                        "bx": "L",
+                        "c": ["R"],
+                        "t": "2026-08-26T08:00:00.67Z",
+                        "z": "C"
+                    }
+                }));
+        });
+
+        let indicative = fetch_latest_overnight_quote(&client, &symbol)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            indicative.quote.bid().inner(),
+            Usd::new(Float::parse("308.06".to_string()).unwrap())
+        );
+        assert_eq!(
+            indicative.quote.ask().inner(),
+            Usd::new(Float::parse("309.23".to_string()).unwrap())
+        );
+        assert_eq!(
+            indicative.at,
+            chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 26, 8, 0, 0).unwrap()
+                + chrono::Duration::milliseconds(670)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_overnight_quote_429_keeps_its_backpressure_hint() {
+        let server = MockServer::start();
+        let client = mock_client(&server);
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/stocks/AAPL/quotes/latest")
+                .query_param("feed", "overnight");
+            then.status(429)
+                .header("Retry-After", "17")
+                .json_body(json!({ "message": "too many requests" }));
+        });
+
+        let error = fetch_latest_overnight_quote(&client, &symbol)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.backpressure(),
+            Some(Backpressure {
+                retry_after: Some(Duration::from_secs(17)),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_overnight_quote_5xx_classifies_transient() {
+        let server = MockServer::start();
+        let client = mock_client(&server);
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/stocks/AAPL/quotes/latest")
+                .query_param("feed", "overnight");
+            then.status(503).body("upstream unavailable");
+        });
+
+        let error = fetch_latest_overnight_quote(&client, &symbol)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            AlpacaMarketDataError::ApiError { status, .. }
+                if *status == StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert_eq!(error.permanence(), Permanence::Transient);
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_overnight_quote_malformed_body_classifies_permanent() {
+        let server = MockServer::start();
+        let client = mock_client(&server);
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/stocks/AAPL/quotes/latest")
+                .query_param("feed", "overnight");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body("not json at all");
+        });
+
+        let error = fetch_latest_overnight_quote(&client, &symbol)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            AlpacaMarketDataError::LatestQuoteJsonParse(_)
+        ));
+        assert_eq!(error.permanence(), Permanence::Permanent);
     }
 
     #[tokio::test]

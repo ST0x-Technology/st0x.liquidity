@@ -367,6 +367,15 @@ impl Executor for AlpacaBrokerApi {
         Ok(Some(quote))
     }
 
+    async fn fetch_latest_overnight_quote(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<IndicativeQuote, Self::Error> {
+        crate::alpaca_market_data::fetch_latest_overnight_quote(&self.client, symbol)
+            .await
+            .map_err(|source| AlpacaBrokerApiError::LatestQuote(Box::new(source)))
+    }
+
     async fn market_session(&self) -> Result<MarketSession, Self::Error> {
         super::market_hours::market_session(&self.client).await
     }
@@ -537,22 +546,6 @@ impl AlpacaBrokerApi {
             overnight_tradable: asset.overnight_tradable,
             overnight_halted: asset.overnight_halted,
         })
-    }
-
-    /// Fetches the latest indicative overnight quote (`feed=overnight`) with
-    /// its broker timestamp.
-    ///
-    /// Inherent rather than on the `Executor` trait: the automated overnight
-    /// pricing path is not built yet, and today's only consumer is the CLI's
-    /// overnight inspection surface, which addresses the Alpaca
-    /// implementation directly.
-    pub async fn fetch_latest_overnight_quote(
-        &self,
-        symbol: &Symbol,
-    ) -> Result<IndicativeQuote, AlpacaBrokerApiError> {
-        crate::alpaca_market_data::fetch_latest_overnight_quote(&self.client, symbol)
-            .await
-            .map_err(|source| AlpacaBrokerApiError::LatestQuote(Box::new(source)))
     }
 
     /// Fetches the symbol's asset attributes from the broker

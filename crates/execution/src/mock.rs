@@ -14,9 +14,9 @@ static MOCK_FILL_PRICE: LazyLock<Float> = LazyLock::new(|| float!(100));
 use crate::{
     CancellationOutcome, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
     DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutionError, Executor,
-    ExecutorOrderId, Inventory, InventoryResult, LatestQuote, LimitOrder, MarketOrder,
-    MarketSession, MarketSessionStatus, OrderPlacement, OrderState, Positive, PostCloseGap,
-    SupportedExecutor, Symbol, TryIntoExecutor, Usd, estimate_buffered_cost_cents,
+    ExecutorOrderId, IndicativeQuote, Inventory, InventoryResult, LatestQuote, LimitOrder,
+    MarketOrder, MarketSession, MarketSessionStatus, OrderPlacement, OrderState, Positive,
+    PostCloseGap, SupportedExecutor, Symbol, TryIntoExecutor, Usd, estimate_buffered_cost_cents,
 };
 
 /// Context for MockExecutor (unit struct - no context needed)
@@ -64,6 +64,7 @@ pub struct MockExecutor {
     post_close_gap_override: PostCloseGap,
     primary_limit_quote_override: Option<LatestQuote>,
     latest_quote_override: Option<LatestQuote>,
+    overnight_quote_override: Option<IndicativeQuote>,
     position_mark_override: Option<Positive<Usd>>,
     preflight_price: Float,
 }
@@ -82,6 +83,7 @@ impl MockExecutor {
             post_close_gap_override: PostCloseGap::Unknown,
             primary_limit_quote_override: None,
             latest_quote_override: None,
+            overnight_quote_override: None,
             position_mark_override: None,
             preflight_price: *MOCK_FILL_PRICE,
         }
@@ -124,6 +126,14 @@ impl MockExecutor {
     #[must_use]
     pub fn with_market_session(mut self, session: MarketSession) -> Self {
         self.market_session_override = Some(session);
+        self
+    }
+
+    /// Serves `quote` from `fetch_latest_overnight_quote`; without this
+    /// knob the mock reports the overnight feed as unavailable.
+    #[must_use]
+    pub fn with_overnight_quote(mut self, quote: IndicativeQuote) -> Self {
+        self.overnight_quote_override = Some(quote);
         self
     }
 
@@ -446,6 +456,17 @@ impl Executor for MockExecutor {
         Ok(self.latest_quote_override)
     }
 
+    async fn fetch_latest_overnight_quote(
+        &self,
+        symbol: &crate::Symbol,
+    ) -> Result<IndicativeQuote, Self::Error> {
+        self.fail_if_unhealthy()?;
+        self.overnight_quote_override
+            .ok_or_else(|| ExecutionError::OvernightQuoteUnavailable {
+                symbol: symbol.clone(),
+            })
+    }
+
     async fn place_limit_order(
         &self,
         order: LimitOrder,
@@ -724,6 +745,50 @@ mod tests {
             ExecutionError::MockFailure { message } if message == "broker down"
         ));
         assert_eq!(executor.market_session_status_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn overnight_quote_is_unavailable_until_configured() {
+        // Fail-loud default: an executor that was not explicitly given
+        // an overnight quote must never silently serve one.
+        let executor = MockExecutor::new();
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let error = executor
+            .fetch_latest_overnight_quote(&symbol)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                ExecutionError::OvernightQuoteUnavailable { ref symbol }
+                    if *symbol == Symbol::new("AAPL").unwrap()
+            ),
+            "expected OvernightQuoteUnavailable, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_quote_returns_the_configured_quote() {
+        let quote = IndicativeQuote {
+            quote: LatestQuote::new(
+                Positive::new(Usd::new(float!(24.10))).unwrap(),
+                Positive::new(Usd::new(float!(24.30))).unwrap(),
+            )
+            .unwrap(),
+            at: chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 8, 29, 1, 0, 0).unwrap(),
+        };
+        let executor = MockExecutor::new().with_overnight_quote(quote);
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        assert_eq!(
+            executor
+                .fetch_latest_overnight_quote(&symbol)
+                .await
+                .unwrap(),
+            quote
+        );
     }
 
     #[tokio::test]

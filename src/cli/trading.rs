@@ -1832,6 +1832,13 @@ mod tests {
         type OrderId = String;
         type Ctx = ();
 
+        async fn fetch_latest_overnight_quote(
+            &self,
+            _symbol: &Symbol,
+        ) -> Result<st0x_execution::IndicativeQuote, Self::Error> {
+            unimplemented!("not exercised by this test")
+        }
+
         async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
             Ok(Self::new(vec![OrderState::Pending]))
         }
@@ -1940,6 +1947,7 @@ mod tests {
             inventory_divergence_threshold: std::num::NonZeroU32::MIN,
             order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: std::num::NonZeroU64::new(300),
+            overnight_max_quote_age_secs: None,
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,
@@ -3008,6 +3016,13 @@ mod tests {
         type Error = BackpressureTestError;
         type OrderId = String;
         type Ctx = ();
+
+        async fn fetch_latest_overnight_quote(
+            &self,
+            _symbol: &Symbol,
+        ) -> Result<st0x_execution::IndicativeQuote, Self::Error> {
+            unimplemented!("not exercised by the buy-fill backpressure tests")
+        }
 
         async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
             Ok(Self::new(0, 0))

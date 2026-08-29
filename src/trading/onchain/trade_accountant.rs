@@ -1585,6 +1585,13 @@ mod tests {
         type OrderId = String;
         type Ctx = ();
 
+        async fn fetch_latest_overnight_quote(
+            &self,
+            _symbol: &st0x_execution::Symbol,
+        ) -> Result<st0x_execution::IndicativeQuote, Self::Error> {
+            unimplemented!("not exercised by this test")
+        }
+
         async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
             Ok(Self)
         }

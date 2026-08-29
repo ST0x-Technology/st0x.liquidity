@@ -2909,6 +2909,13 @@ mod tests {
             type OrderId = String;
             type Ctx = ();
 
+            async fn fetch_latest_overnight_quote(
+                &self,
+                _symbol: &st0x_execution::Symbol,
+            ) -> Result<st0x_execution::IndicativeQuote, Self::Error> {
+                unimplemented!("not exercised by the poll-status tests")
+            }
+
             async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
                 unimplemented!()
             }
@@ -3254,6 +3261,13 @@ mod tests {
             type Error = ExecutionError;
             type OrderId = String;
             type Ctx = ();
+
+            async fn fetch_latest_overnight_quote(
+                &self,
+                _symbol: &st0x_execution::Symbol,
+            ) -> Result<st0x_execution::IndicativeQuote, Self::Error> {
+                unimplemented!("not exercised by the poll-status tests")
+            }
 
             async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
                 unimplemented!()

@@ -47,6 +47,10 @@ extended_hours_close_flatten_window_secs = 900
 # Placement prices off the broker's position mark, so this bounds how far it
 # will chase a fill before a weekend or holiday (ADR 0019).
 close_flatten_cross_max_bps = 400
+# Maximum age (seconds) of an indicative overnight quote the pricing path may
+# price from. Optional while no asset has overnight counter-trading enabled;
+# required (and must be nonzero) once one does.
+# overnight_max_quote_age_secs = 30
 
 [broker.travel_rule]
 beneficiary_entity_name = "Acme Corp"
