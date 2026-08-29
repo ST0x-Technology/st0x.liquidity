@@ -5470,7 +5470,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::alerts::{CapturingNotifier, NoopNotifier};
+    use crate::alerts::{CapturingNotifier, LogNotifier};
     use crate::conductor::job::Job;
     use crate::equity_redemption::{
         DetectionFailure, EquityRedemptionCommand, redemption_aggregate_id,
@@ -5597,7 +5597,7 @@ mod tests {
             inventory,
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ))
     }
 
@@ -5641,7 +5641,7 @@ mod tests {
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         );
 
         service.enqueue_recovery_for_current_wallet_balances().await;
@@ -5697,7 +5697,7 @@ mod tests {
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         );
 
         service.enqueue_recovery_for_current_wallet_balances().await;
@@ -5753,7 +5753,7 @@ mod tests {
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         );
 
         service.enqueue_recovery_for_current_wallet_balances().await;
@@ -5874,7 +5874,7 @@ mod tests {
             inventory,
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ))
     }
 
@@ -7511,7 +7511,7 @@ mod tests {
             inventory,
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         );
 
         trigger.check_and_trigger_usdc().await;
@@ -7924,7 +7924,7 @@ mod tests {
         inventory: InventoryView,
         config: RebalancingServiceConfig,
     ) -> Arc<RebalancingService> {
-        make_trigger_with_inventory_config_and_notifier(inventory, config, Arc::new(NoopNotifier))
+        make_trigger_with_inventory_config_and_notifier(inventory, config, Arc::new(LogNotifier))
             .await
     }
 
@@ -8187,7 +8187,7 @@ mod tests {
             inventory,
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ))
     }
 
@@ -8260,7 +8260,7 @@ mod tests {
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ));
         let reactor = trigger.clone();
 
@@ -17064,10 +17064,7 @@ mod tests {
                 .is_ok();
 
             if should_fail {
-                return Err(crate::alerts::NotifierError::ApiError {
-                    status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                    body: "simulated transient failure".to_string(),
-                });
+                return Err(crate::alerts::NotifierError::Simulated);
             }
 
             self.delivered.lock().unwrap().push(message.to_string());
@@ -19493,7 +19490,7 @@ mod tests {
             },
             wrapper,
             schedulers,
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         );
 
         assert!(
@@ -19886,7 +19883,7 @@ mod tests {
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ));
 
         // Set in_progress flag
@@ -20115,7 +20112,7 @@ mod tests {
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ));
         let reactor = trigger.clone();
 
@@ -20185,7 +20182,7 @@ mod tests {
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ));
         let reactor = trigger.clone();
 
@@ -20265,7 +20262,7 @@ mod tests {
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ));
         let reactor = trigger.clone();
 
@@ -20329,7 +20326,7 @@ mod tests {
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ));
         let reactor = trigger.clone();
 
@@ -25384,7 +25381,7 @@ mod tests {
             inventory,
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ));
 
         let id = issuer_request_id("held-for-recovery-timeout");
@@ -25467,7 +25464,7 @@ mod tests {
             inventory,
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ));
 
         // HeldForRecovery: recovery owns the slot -- must be left untouched and

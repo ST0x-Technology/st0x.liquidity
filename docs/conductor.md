@@ -700,8 +700,8 @@ WorkerBuilder::new(name)
    `Display`/`{}` but IS walked by anyhow's `{:?}` "Caused by:" chain.
 6. `Conductor::wait_for_completion` (the async exit path) sees this variant and
    awaits sending an operator alert through `worker_failure_notifier`
-   (`Arc<dyn Notifier>`, `NoopNotifier` when `[alerts]` is unconfigured),
-   bounded by a short timeout so a slow/unreachable Telegram endpoint cannot
+   (`Arc<dyn Notifier>`, a `LogNotifier` emitting a structured ERROR log),
+   bounded by a short timeout so a slow notifier implementation cannot
    delay process exit -- then propagates the error, so the bot process exits
    non-zero.
 
@@ -712,8 +712,8 @@ tearing down all workers; without returning the error, the conductor would never
 see the failure at all.
 
 **Why the alert is sent from the exit path, not from `on_event`.** `on_event` is
-a synchronous `Fn(&WorkerContext, &Event)` -- it cannot `.await` a Telegram HTTP
-call. Firing the alert as a detached `tokio::spawn` from inside that callback
+a synchronous `Fn(&WorkerContext, &Event)` -- it cannot `.await` the async
+notifier. Firing the alert as a detached `tokio::spawn` from inside that callback
 would race process teardown: `ctx.stop()` and the resulting process exit can
 complete before the spawned send does, silently dropping it in the common case.
 `wait_for_completion` is async and runs strictly before the process returns, so

@@ -3,8 +3,8 @@
 //! [`GasMonitor`] is a long-running [`SupervisedTask`] that polls the bot
 //! wallet's native-ETH balance on a fixed interval and raises an alert when it
 //! drops below the configured threshold. Alerts go to two places: a structured
-//! `warn!`/`error!` log (target `"gas"`) and a [`Notifier`] (Telegram in
-//! production).
+//! `warn!`/`error!` log (target `"gas"`) and a [`Notifier`] (structured
+//! operational-alert logs in production).
 //!
 //! ## Alert de-duplication
 //!

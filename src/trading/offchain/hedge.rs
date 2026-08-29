@@ -1764,10 +1764,7 @@ mod tests {
     impl crate::alerts::Notifier for FlakyNotifier {
         async fn notify(&self, message: &str) -> Result<(), crate::alerts::NotifierError> {
             if self.failing.load(Ordering::SeqCst) {
-                return Err(crate::alerts::NotifierError::ApiError {
-                    status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                    body: "injected delivery failure".to_string(),
-                });
+                return Err(crate::alerts::NotifierError::Simulated);
             }
 
             self.delivered.lock().unwrap().push(message.to_string());

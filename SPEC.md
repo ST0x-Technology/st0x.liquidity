@@ -1115,9 +1115,9 @@ an operational counter, and begins sending an operator alert through the
 configured alerting channel. Alert delivery is at-least-once: successful
 per-symbol delivery is recorded as a retained aggregate event, while failures
 enqueue an alert-only retry without blocking the next day's capture. Alert
-retries survive process restarts; a crash in the narrow interval after Telegram
-accepts a message but before the delivery event commits may produce a duplicate
-rather than lose the incident.
+retries survive process restarts; a crash in the narrow interval after the
+notifier accepts a message but before the delivery event commits may produce a
+duplicate rather than lose the incident.
 
 Captured marks are immutable facts, but operators may correct a missing or stale
 historical mark through the portfolio-snapshot `set` recovery command. The
@@ -3242,7 +3242,7 @@ Genuinely ambiguous failures (where the burn may have landed and `is_revert()`
 returns false, e.g. `MessageSentEventNotFound`) are never reclassified and
 always halt for operator review.
 
-**Alerting**: A Telegram alert fires at the warn threshold (`max / 2 + 1`
+**Alerting**: An operational alert fires at the warn threshold (`max / 2 + 1`
 redrives), at the limit, and before any terminal non-redriven error propagates.
 
 ##### Startup re-arm for `BridgingSubmitting` and `WithdrawalSubmitting{BaseToAlpaca}`
@@ -5239,8 +5239,10 @@ requests to the backend.
 ## Operational Alerting
 
 The bot raises out-of-band alerts for conditions an operator must react to
-quickly. Alerting is **optional**: when its configuration is absent the bot runs
-normally with no alert channel and the alert monitors are not spawned.
+quickly. Every alert is emitted as a structured ERROR log (see "Structured log
+channel" below); the `[alerts]` config section is **optional** and gates only
+the gas monitor: when it is absent the bot runs normally and no gas monitor is
+spawned, while all other alert sources still log.
 
 ### Gas balance monitoring
 
@@ -5271,7 +5273,8 @@ observed usage.
   decimal-ETH amount parsed to wei at startup — a missing, malformed, or zero
   value fails fast with no cross-chain fallback), it raises an alert: a
   structured `error!` log (target `gas`) carrying the wallet, chain, current
-  balance and threshold, plus a Telegram notification.
+  balance and threshold, plus an operational-alert notification (see
+  "Structured log channel" below).
 - **De-duplication.** The monitor alerts once on the transition into the low
   state, then re-alerts at most once per `realert_interval` while the balance
   stays low. It never notifies on every poll.
@@ -5287,17 +5290,18 @@ observed usage.
   therefore produce alerts more often than `realert_interval` alone would
   suggest.
 
-### Telegram channel
+### Structured log channel
 
-Alerts are delivered to Telegram via the Bot API `sendMessage` endpoint. The
-non-secret `[alerts]` config supplies the destination `chat_id`, the
-thresholds/intervals, and an optional `message_thread_id`; the encrypted secrets
-supply the bot `bot_token`. When `message_thread_id` is set, alerts post into
-that forum topic (for topic-enabled supergroups); when omitted they go to the
-chat's default topic. When either half (config or secret) is present without the
-other, startup fails fast rather than running with a half-configured alert
-channel. A notification delivery failure is logged but never crashes the
-monitor.
+Alerts are emitted as structured ERROR logs: target `operational_alert`, an
+`alert = true` marker field, and the human-readable alert text in the `message`
+field. Delivery to humans happens downstream in the log pipeline (Cloud
+Logging -> Grafana alert rules, maintained in t0.devops), so the bot holds no
+delivery credentials and in-process delivery cannot fail. The non-secret
+`[alerts]` config supplies only the gas-monitor thresholds and intervals; the
+encrypted secrets carry nothing for alerting. (Migration note: a leftover
+`[alerts]` table in the secrets file -- the retired Telegram `bot_token` -- is
+accepted and ignored with a deprecation warning for one release, then
+rejected.)
 
 ### BaseToAlpaca deposit send
 

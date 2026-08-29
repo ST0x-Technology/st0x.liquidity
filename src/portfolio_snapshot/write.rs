@@ -449,7 +449,7 @@ impl PortfolioSnapshotJob {
     }
 
     /// Defers only failed notification sends ([`AlertDelivery`]): delivery is
-    /// at-least-once and a Telegram outage is expected to heal on its own, so
+    /// at-least-once and a transient delivery failure is expected to heal, so
     /// the job retries itself on a fixed backoff. Every other failure
     /// (missing aggregate state, load/command errors, mark evaluation) is
     /// propagated so apalis's bounded retry and dead-letter machinery sees it
@@ -1278,10 +1278,7 @@ mod tests {
     impl Notifier for FailOnceNotifier {
         async fn notify(&self, _message: &str) -> Result<(), NotifierError> {
             if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                return Err(NotifierError::ApiError {
-                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                    body: "temporary outage".to_owned(),
-                });
+                return Err(NotifierError::Simulated);
             }
             self.delivered.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -1328,7 +1325,7 @@ mod tests {
             // `mark_all_required_fresh` explicitly, the same way they mutate
             // `ctx.inventory` to simulate a poll landing.
             poll_freshness: PollFreshness::new(),
-            notifier: Arc::new(crate::alerts::NoopNotifier),
+            notifier: Arc::new(crate::alerts::LogNotifier),
             queue,
         };
 
@@ -1987,7 +1984,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             detection_count, 1,
-            "detection is persisted despite Telegram failure"
+            "detection is persisted despite delivery failure"
         );
 
         PortfolioSnapshotJob::alert(job.target_et_day)

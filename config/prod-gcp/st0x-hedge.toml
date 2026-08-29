@@ -247,13 +247,11 @@ deviation = 0.05
 [rest_api]
 url = "https://api.st0x.io"
 
-# Low-gas balance alerting for the bot wallet. Telegram bot_token lives in the
-# encrypted secrets file under [alerts]. Every field is required (no defaults).
+# Low-gas balance alerting for the bot wallet. Alerts are structured ERROR
+# logs (target "operational_alert"); delivery to humans happens downstream via
+# the log pipeline (Cloud Logging -> Grafana alert rules). Every field is
+# required (no defaults).
 [alerts]
-# Telegram chat alerts are delivered to (St0x Product Operations supergroup).
-chat_id = -1003850406522
-# Forum topic alerts post into (the "DEX Liquidity" topic).
-message_thread_id = 50
 # Seconds between native-balance polls.
 poll_interval = 300
 # Minimum seconds between repeated alerts while the balance stays below threshold.

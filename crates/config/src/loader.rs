@@ -32,10 +32,10 @@ use crate::chain::TradingChain;
 use crate::pricing::PricingSecrets;
 use crate::wallet::{SigningChain, SigningChains};
 use crate::{
-    AlertsConfig, AlertsCtx, AlertsSecrets, BotGasValuationConfig, ChainConfig, ChainEquityAsset,
-    ChainRegistry, ChainSecrets, ExecutionThreshold, HedgingAssets, InvalidThresholdError,
-    OperationMode, OrchestratorConfig, PricingConfig, PricingCtx, PricingCtxError,
-    RebalancingConfig, RebalancingCtx, RebalancingCtxError, TelemetryConfig, TelemetryCtx,
+    AlertsConfig, AlertsCtx, BotGasValuationConfig, ChainConfig, ChainEquityAsset, ChainRegistry,
+    ChainSecrets, ExecutionThreshold, HedgingAssets, InvalidThresholdError, OperationMode,
+    OrchestratorConfig, PricingConfig, PricingCtx, PricingCtxError, RebalancingConfig,
+    RebalancingCtx, RebalancingCtxError, TelemetryConfig, TelemetryCtx,
 };
 
 /// Alpaca minimum execution threshold: $2.
@@ -422,7 +422,13 @@ impl std::fmt::Debug for TravelRuleConfig {
 struct Secrets {
     chains: BTreeMap<Chain, ChainSecrets>,
     broker: BrokerSecrets,
-    alerts: Option<AlertsSecrets>,
+    /// MIGRATION SHIM, removed next release: the Telegram alert transport is
+    /// retired (alerts are structured logs now), but currently-deployed
+    /// secret versions still carry an `[alerts]` table with `bot_token`.
+    /// Accept and ignore it for one release so those secrets keep parsing
+    /// under `deny_unknown_fields` at rollout; `parse_and_validate` warns
+    /// when it is present.
+    alerts: Option<toml::Value>,
     pricing: Option<PricingSecrets>,
     wallet: Option<toml::Value>,
     rest_api: Option<RestApiSecrets>,
@@ -513,8 +519,8 @@ pub struct Ctx {
     pub apalis_finished_job_cleanup_interval_secs: u64,
     pub broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
-    /// Optional gas-balance alerting context. `Some` when both `[alerts]`
-    /// config and the Telegram `bot_token` secret are present.
+    /// Optional gas-balance alerting context. `Some` when the `[alerts]`
+    /// config section is present.
     pub alerts: Option<AlertsCtx>,
     /// Live reference prices used exclusively by dashboard USD valuations.
     pub pricing: Option<PricingCtx>,
@@ -1079,7 +1085,16 @@ fn parse_and_validate(
 
     let broker = BrokerCtx::from_parts(secrets.broker, config.broker.as_ref())?;
     let telemetry = config.telemetry.map(TelemetryCtx::from);
-    let alerts = AlertsCtx::new(config.alerts, secrets.alerts)?;
+
+    // Migration shim, removed next release: see the `Secrets::alerts` field.
+    if secrets.alerts.is_some() {
+        warn!(
+            "[alerts] in the secrets file is deprecated and ignored (alerts are \
+             structured logs now); remove [alerts] from the secrets file"
+        );
+    }
+
+    let alerts = AlertsCtx::new(config.alerts)?;
     let pricing = PricingCtx::assemble(
         config.pricing,
         secrets.pricing,
@@ -2369,7 +2384,6 @@ mod tests {
             address = "0x0000000000000000000000000000000000000001"
 
             [alerts]
-            chat_id = 1
             poll_interval = 300
             realert_interval = 3600
 
@@ -2943,8 +2957,13 @@ mod tests {
         );
     }
 
+    /// The secrets file deliberately still carries the retired `[alerts]`
+    /// table (bot_token): deployed secret versions do at rollout, and the
+    /// migration shim must accept and ignore it rather than fail the strict
+    /// parse. The shim -- and this fixture's `[alerts]` block -- go away next
+    /// release.
     #[tokio::test]
-    async fn alerts_ctx_built_when_section_and_secret_present() {
+    async fn alerts_ctx_built_when_section_present() {
         let config = toml_file(
             r#"
             database_url = ":memory:"
@@ -2981,7 +3000,6 @@ mod tests {
             address = "0x0000000000000000000000000000000000000001"
 
             [alerts]
-            chat_id = -1_001_234_567_890
             poll_interval = 300
             realert_interval = 3600
 
@@ -3022,7 +3040,6 @@ mod tests {
             .unwrap();
 
         let alerts = ctx.alerts.unwrap();
-        assert_eq!(alerts.chat_id, -1_001_234_567_890);
         assert_eq!(
             alerts.low_balance_threshold_wei(Chain::Base),
             Some(alloy::primitives::U256::from(50_000_000_000_000_000_u64))
@@ -3036,7 +3053,6 @@ mod tests {
             alerts.realert_interval,
             std::time::Duration::from_secs(3600)
         );
-        assert_eq!(alerts.message_thread_id, None);
     }
 
     #[tokio::test]
@@ -3066,9 +3082,6 @@ mod tests {
 
             [broker]
             type = "dry-run"
-
-            [alerts]
-            bot_token = "123:abc"
 
             [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

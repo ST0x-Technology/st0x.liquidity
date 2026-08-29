@@ -19,9 +19,7 @@ mod telemetry;
 mod threshold;
 mod wallet;
 
-pub use alerts::{
-    AlertsAssemblyError, AlertsConfig, AlertsCtx, AlertsSecrets, GAS_MONITORED_CHAINS,
-};
+pub use alerts::{AlertsAssemblyError, AlertsConfig, AlertsCtx, GAS_MONITORED_CHAINS};
 pub use assets::{
     CashHedgePolicy, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset,
     EquityHedgePolicy, HedgedEquities, HedgingAssets, OperationMode,
