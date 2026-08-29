@@ -882,6 +882,10 @@ impl Conductor {
         let notifier: Arc<dyn Notifier> = Arc::new(LogNotifier);
         info!("Operational alerts will be emitted as structured logs");
 
+        // The phase future is boxed like the other startup-phase futures
+        // (`Conductor::run` in lib.rs, `spawn_rebalancing_infrastructure`):
+        // it holds every rebalancing aggregate, too large to keep inline on
+        // the stack (large_futures).
         let PositionAndRebalancing {
             position,
             position_projection,
@@ -903,7 +907,7 @@ impl Conductor {
             resume_tokenization_queue,
             deliver_mint_authorization_queue,
             deliver_mint_authorization_ctx,
-        } = PositionAndRebalancing::setup_with_recovery(
+        } = Box::pin(PositionAndRebalancing::setup_with_recovery(
             rebalancing,
             RebalancingDeps {
                 pool: pool.clone(),
@@ -921,7 +925,7 @@ impl Conductor {
             },
             &backfill_queue,
             record_bot_gas_receipt_cost_ctx.as_ref(),
-        )
+        ))
         .await?;
 
         let (offchain_order, offchain_order_projection) = setup_offchain_order_store(
