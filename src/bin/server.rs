@@ -39,6 +39,11 @@ async fn main() -> anyhow::Result<()> {
         (file_guard, None)
     };
 
+    // Now that a subscriber exists, surface the notices parsing collected
+    // (deprecation shims, absent optional sections). During Ctx::load_files
+    // there was no subscriber, so logging there would have been dropped.
+    ctx.emit_startup_notices();
+
     let result = run_server_bot_session(ctx).await;
 
     // Explicitly drop the telemetry guard to ensure TelemetryGuard::drop runs

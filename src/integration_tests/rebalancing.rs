@@ -295,7 +295,7 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
-        Arc::new(crate::alerts::NoopNotifier),
+        Arc::new(crate::alerts::LogNotifier),
     ));
 
     let position_cqrs = build_position_cqrs_with_service(&pool, &service).await;
@@ -1115,7 +1115,7 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
-        Arc::new(crate::alerts::NoopNotifier),
+        Arc::new(crate::alerts::LogNotifier),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1202,7 +1202,7 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
-        Arc::new(crate::alerts::NoopNotifier),
+        Arc::new(crate::alerts::LogNotifier),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1305,7 +1305,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
-        Arc::new(crate::alerts::NoopNotifier),
+        Arc::new(crate::alerts::LogNotifier),
     ));
 
     // Build snapshot store with the service as the CQRS subscriber — mirrors
@@ -1458,7 +1458,7 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
-        Arc::new(crate::alerts::NoopNotifier),
+        Arc::new(crate::alerts::LogNotifier),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1515,7 +1515,7 @@ async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve()
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
-        Arc::new(crate::alerts::NoopNotifier),
+        Arc::new(crate::alerts::LogNotifier),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1565,7 +1565,7 @@ async fn usdc_none_disables_usdc_rebalancing() {
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
-        Arc::new(crate::alerts::NoopNotifier),
+        Arc::new(crate::alerts::LogNotifier),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1795,7 +1795,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
-        Arc::new(crate::alerts::NoopNotifier),
+        Arc::new(crate::alerts::LogNotifier),
     );
 
     // Cycle 1: excess = 450, capped to 100
@@ -1925,7 +1925,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         Arc::clone(&inventory),
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
-        Arc::new(crate::alerts::NoopNotifier),
+        Arc::new(crate::alerts::LogNotifier),
     );
 
     // First trigger fires: excess = 400, capped to 100
@@ -2024,7 +2024,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             Arc::clone(&inventory),
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         );
 
         trigger.check_and_trigger_usdc().await;
@@ -2085,7 +2085,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             Arc::clone(&inventory),
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         );
 
         trigger.check_and_trigger_usdc().await;

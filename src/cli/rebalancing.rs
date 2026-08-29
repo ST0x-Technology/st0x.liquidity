@@ -2274,6 +2274,7 @@ mod tests {
             broker: BrokerCtx::DryRun,
             telemetry: None,
             alerts: None,
+            startup_notices: Vec::new(),
             pricing: None,
             trading_mode: TradingMode::Standalone,
             order_owner: Address::ZERO,
@@ -2359,6 +2360,7 @@ mod tests {
             broker: BrokerCtx::AlpacaBrokerApi(alpaca_broker_auth),
             telemetry: None,
             alerts: None,
+            startup_notices: Vec::new(),
             pricing: None,
             trading_mode: TradingMode::Rebalancing(Box::new(
                 RebalancingCtx::stub()

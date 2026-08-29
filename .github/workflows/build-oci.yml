@@ -232,8 +232,10 @@ jobs:
           # Refuse to write a file that is missing anything: a dropped
           # GATED_SERVICE_REPLICAS makes the VM's `compose --scale bot=` fail
           # with `strconv.Atoi: invalid syntax` and takes the whole stack unit
-          # down, and an empty image ref fails `compose pull` on the box.
-          for key in BOT_IMAGE DASHBOARD_IMAGE DATASETTE_IMAGE EXPORTER_IMAGE GATED_SERVICE_REPLICAS; do
+          # down, an empty image ref fails `compose pull` on the box, and a
+          # missing CONFIG_VERSION/SECRETS_VERSION silently degrades the VM's
+          # pinned Secret Manager fetches to `latest`.
+          for key in BOT_IMAGE DASHBOARD_IMAGE DATASETTE_IMAGE EXPORTER_IMAGE GATED_SERVICE_REPLICAS CONFIG_VERSION SECRETS_VERSION; do
             grep -q "^${key}=" current.env \
               || { echo "::error::images.env has no ${key} — refusing to write"; exit 1; }
           done

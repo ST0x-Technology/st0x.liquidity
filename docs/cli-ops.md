@@ -11,6 +11,43 @@ stox <command> [options]
 Use `stox --help` to list all commands and `stox <command> --help` for details
 on any specific command.
 
+## Running the CLI on GCP
+
+The bot OCI image ships `/bin/st0x-cli` alongside the server, so on the GCP VMs
+the CLI runs inside the live bot container: same mounted config and secrets,
+same live `/mnt/data/st0x-hedge.db`, and keyless signing through the container's
+ambient service-account identity (the same loader the server uses). There is no
+`stox` wrapper in the container, so pass `--config`/`--secrets` explicitly, with
+the paths the compose file mounts.
+
+Staging:
+
+```sh
+gcloud compute ssh t0-liquidity-staging --project t0-liquidity-staging \
+  --zone europe-west3-b --tunnel-through-iap \
+  --command 'sudo docker exec "$(sudo docker ps -qf name=bot)" /bin/st0x-cli \
+    --config /run/t0-config/st0x-hedge.toml \
+    --secrets /run/t0-secrets/t0-liquidity-secrets.toml \
+    <command> [options]'
+```
+
+Production:
+
+```sh
+gcloud compute ssh t0-liquidity --project t0-liquidity \
+  --zone europe-west3-b --tunnel-through-iap \
+  --command 'sudo docker exec "$(sudo docker ps -qf name=bot)" /bin/st0x-cli \
+    --config /run/t0-config/st0x-hedge.toml \
+    --secrets /run/t0-secrets/t0-liquidity-secrets.toml \
+    <command> [options]'
+```
+
+For an interactive session, SSH in first (drop `--command`), then
+`sudo docker exec -it "$(sudo docker ps -qf name=bot)" /bin/st0x-cli ...`.
+`sudo` is required throughout: these are OS Login VMs and your login user is not
+in the docker group. The image has no shell, so `docker exec` must invoke
+`/bin/st0x-cli` directly.
+
 ## Token Address Reference
 
 The **unwrapped** tokenized-equity contract address per symbol. The tokenization

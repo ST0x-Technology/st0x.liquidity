@@ -1294,7 +1294,7 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::alerts::{CapturingNotifier, NoopNotifier};
+    use crate::alerts::{CapturingNotifier, LogNotifier};
     use crate::offchain::order::poll_status::PollOrderStatusCtx;
     use crate::offchain::order::{
         CounterTradeOrderKind, HandleOrderRejectionJobQueue, OffchainOrder, OffchainOrderCommand,
@@ -1382,7 +1382,7 @@ mod tests {
             close_flatten_policy,
             close_flatten_ramp: CloseFlattenCrossRamp::new(100, 400).unwrap(),
             poll_interval: TEST_POLL_INTERVAL,
-            notifier: Arc::new(NoopNotifier),
+            notifier: Arc::new(LogNotifier),
             alerted_dead_letters: Arc::new(Mutex::new(HashSet::new())),
         };
 
@@ -1710,7 +1710,7 @@ mod tests {
             close_flatten_policy,
             close_flatten_ramp: CloseFlattenCrossRamp::new(100, 400).unwrap(),
             poll_interval: TEST_POLL_INTERVAL,
-            notifier: Arc::new(NoopNotifier),
+            notifier: Arc::new(LogNotifier),
             alerted_dead_letters: Arc::new(Mutex::new(HashSet::new())),
         };
 

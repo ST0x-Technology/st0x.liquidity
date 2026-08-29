@@ -12,7 +12,10 @@
 #              command appends --config <baked path> --secrets <mounted
 #              Secret Manager file>. database_url in the configs stays
 #              sqlite:///mnt/data/st0x-hedge.db (the VM mounts its data
-#              disk there — byte-identical to the droplet).
+#              disk there, byte-identical to the droplet). Also ships
+#              /bin/st0x-cli for operators (docker exec into the running
+#              bot container, same config/secrets/DB and the container's
+#              ambient identity for keyless signing; see docs/cli-ops.md).
 #   datasette: the nixpkgs datasette (same package the droplet runs), NOT
 #              the upstream Docker image -- that one's bundled SQLite is too
 #              old to parse the schema's STRICT table (dashboard_trade_delivery)
@@ -24,6 +27,7 @@
 {
   pkgs,
   st0x-liquidity,
+  st0x-cli,
   st0x-dashboard,
 }:
 
@@ -172,6 +176,12 @@ in
     created = "1970-01-01T00:00:01Z";
     contents = [
       st0x-liquidity
+      # Operator CLI (bin/st0x-cli): run via `docker exec` against the same
+      # mounted config/secrets and the live /mnt/data database, signing
+      # keylessly through the container's ambient service-account identity
+      # (same loader as the server). Not the entrypoint; the server stays
+      # the only long-running process.
+      st0x-cli
       pkgs.cacert
       bakedConfigs
     ];

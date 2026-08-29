@@ -1112,12 +1112,17 @@ events. A symbol with a balance but no observed price is recorded with
 `usd_mark = NULL` -- never a fabricated zero. A missing or stale mark does not
 block the immutable balance capture; it immediately emits an error, increments
 an operational counter, and begins sending an operator alert through the
-configured alerting channel. Alert delivery is at-least-once: successful
-per-symbol delivery is recorded as a retained aggregate event, while failures
-enqueue an alert-only retry without blocking the next day's capture. Alert
-retries survive process restarts; a crash in the narrow interval after Telegram
-accepts a message but before the delivery event commits may produce a duplicate
-rather than lose the incident.
+configured alerting channel. In-process alert delivery cannot fail: the
+production notifier emits a structured ERROR log and its error type is
+uninhabited outside test builds, so getting the event to a human is the logging
+pipeline's responsibility (see "Structured log channel"). The per-symbol
+delivery event, the alert-only retry queue, and the bounded retry backoff are
+retained as a transport seam -- they are exercised only by test doubles that
+simulate a fallible notifier, and they would become load-bearing again if a
+fallible transport ever returns. Successful per-symbol delivery is still
+recorded as a retained aggregate event, and a crash in the narrow interval after
+the notifier accepts a message but before the delivery event commits may produce
+a duplicate log line rather than lose the incident.
 
 Captured marks are immutable facts, but operators may correct a missing or stale
 historical mark through the portfolio-snapshot `set` recovery command. The
@@ -1285,6 +1290,21 @@ _Configuration management_:
   activation to `/run/agenix/`
 - `st0x`-kind binaries use `--config` + `--secrets` flags; `plain`-kind units
   invoke their package binary with declared `args`
+- The secrets file carries only actual secrets: per-chain `rpc_url` entries, the
+  `[rest_api]` key pair, the `[issuance]` `api_key`, and (legacy Alpaca only)
+  the `[broker]` `api_key`/`api_secret` pair under its `type` tag. Everything
+  else that once lived there is identity, not credentials, and belongs in the
+  plaintext config: the broker `type`, `mode`, `account_id` and (keyless
+  variant) `client_id`/`kms_key_version` in the config `[broker]` section, and
+  the issuance `base_url` in the config `[issuance]` section. (Migration note,
+  one release: the deprecated secrets-file copies of these identity fields are
+  still accepted with a warning, because deployed secret versions carry them; a
+  field set differently in both files is refused at startup rather than silently
+  resolved. The keyless alpaca-broker-api-kms `[broker]` table migrates
+  all-or-nothing: while it remains in the secrets file its fields stay required
+  there, and the migration step is to delete the whole table once the config
+  carries the identity. The shims and this tolerance are removed next release,
+  together with the `[alerts]` shims described under Operational Alerting.)
 
 _Infrastructure_:
 
@@ -3242,7 +3262,7 @@ Genuinely ambiguous failures (where the burn may have landed and `is_revert()`
 returns false, e.g. `MessageSentEventNotFound`) are never reclassified and
 always halt for operator review.
 
-**Alerting**: A Telegram alert fires at the warn threshold (`max / 2 + 1`
+**Alerting**: An operational alert fires at the warn threshold (`max / 2 + 1`
 redrives), at the limit, and before any terminal non-redriven error propagates.
 
 ##### Startup re-arm for `BridgingSubmitting` and `WithdrawalSubmitting{BaseToAlpaca}`
@@ -5239,8 +5259,10 @@ requests to the backend.
 ## Operational Alerting
 
 The bot raises out-of-band alerts for conditions an operator must react to
-quickly. Alerting is **optional**: when its configuration is absent the bot runs
-normally with no alert channel and the alert monitors are not spawned.
+quickly. Every alert is emitted as a structured ERROR log (see "Structured log
+channel" below); the `[alerts]` config section is **optional** and gates only
+the gas monitor: when it is absent the bot runs normally and no gas monitor is
+spawned, while all other alert sources still log.
 
 ### Gas balance monitoring
 
@@ -5271,7 +5293,8 @@ observed usage.
   decimal-ETH amount parsed to wei at startup — a missing, malformed, or zero
   value fails fast with no cross-chain fallback), it raises an alert: a
   structured `error!` log (target `gas`) carrying the wallet, chain, current
-  balance and threshold, plus a Telegram notification.
+  balance and threshold, plus an operational-alert notification (see "Structured
+  log channel" below).
 - **De-duplication.** The monitor alerts once on the transition into the low
   state, then re-alerts at most once per `realert_interval` while the balance
   stays low. It never notifies on every poll.
@@ -5287,17 +5310,20 @@ observed usage.
   therefore produce alerts more often than `realert_interval` alone would
   suggest.
 
-### Telegram channel
+### Structured log channel
 
-Alerts are delivered to Telegram via the Bot API `sendMessage` endpoint. The
-non-secret `[alerts]` config supplies the destination `chat_id`, the
-thresholds/intervals, and an optional `message_thread_id`; the encrypted secrets
-supply the bot `bot_token`. When `message_thread_id` is set, alerts post into
-that forum topic (for topic-enabled supergroups); when omitted they go to the
-chat's default topic. When either half (config or secret) is present without the
-other, startup fails fast rather than running with a half-configured alert
-channel. A notification delivery failure is logged but never crashes the
-monitor.
+Alerts are emitted as structured ERROR logs: target `operational_alert`, an
+`alert = true` marker field, and the human-readable alert text in the `message`
+field. Delivery to humans happens downstream in the log pipeline (Cloud Logging
+-> Grafana alert rules, maintained in t0.devops), so the bot holds no delivery
+credentials and in-process delivery cannot fail. The non-secret `[alerts]`
+config supplies only the gas-monitor thresholds and intervals; the encrypted
+secrets carry nothing for alerting. (Migration note: the retired Telegram fields
+are accepted and ignored with a deprecation warning for one release, then
+rejected -- `chat_id`/`message_thread_id` in the `[alerts]` config section, and
+a leftover `[alerts]` table (`bot_token`) in the secrets file. Deployed config
+versions still carry the former, deployed secret versions the latter, and the
+previous build required them.)
 
 ### BaseToAlpaca deposit send
 
