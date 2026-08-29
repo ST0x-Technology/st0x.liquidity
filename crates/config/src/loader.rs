@@ -679,7 +679,8 @@ pub struct Ctx {
 }
 
 /// Runtime broker configuration assembled from the config file's `[broker]`
-/// identity plus the secrets file's credentials (see [`resolve_broker`]).
+/// identity plus the secrets file's credentials (see `resolve_broker` in
+/// this module).
 #[derive(Clone)]
 pub enum BrokerCtx {
     AlpacaBrokerApi(AlpacaBrokerApiCtx),
