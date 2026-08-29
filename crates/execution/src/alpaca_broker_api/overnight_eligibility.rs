@@ -32,8 +32,13 @@ const SYNC_SLOT_ET: NaiveTime = match NaiveTime::from_hms_opt(19, 55, 0) {
 };
 
 /// One symbol's asset attributes as of the last successful sync.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Carries the symbol it was synced for, so a snapshot looked up for
+/// one asset can never authorize an order for another: validation
+/// rejects the mismatch instead of trusting the caller's pairing.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EligibilitySnapshot {
+    pub symbol: Symbol,
     pub synced_at: DateTime<Utc>,
     pub details: AssetDetails,
 }
@@ -46,7 +51,7 @@ pub struct EligibilitySnapshots {
 }
 
 impl EligibilitySnapshots {
-    /// The symbol's last recorded snapshot, copied out so no lock is
+    /// The symbol's last recorded snapshot, cloned out so no lock is
     /// held across the caller's work.
     pub fn get(&self, symbol: &Symbol) -> Option<EligibilitySnapshot> {
         // A panic while holding this lock cannot corrupt the map (it
@@ -56,17 +61,18 @@ impl EligibilitySnapshots {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(symbol)
-            .copied()
+            .cloned()
     }
 
-    /// Records a snapshot. Production writes go through
-    /// [`sync_eligibility`]; public so consuming crates' tests can seed
-    /// the store directly.
-    pub fn record(&self, symbol: Symbol, snapshot: EligibilitySnapshot) {
+    /// Records a snapshot under the symbol it carries, so the map key
+    /// and the snapshot's identity cannot diverge. Production writes go
+    /// through [`sync_eligibility`]; public so consuming crates' tests
+    /// can seed the store directly.
+    pub fn record(&self, snapshot: EligibilitySnapshot) {
         self.inner
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(symbol, snapshot);
+            .insert(snapshot.symbol.clone(), snapshot);
     }
 }
 
@@ -94,13 +100,11 @@ pub async fn sync_eligibility(
     let mut failures = Vec::new();
     for symbol in symbols {
         match broker.refresh_asset_details(symbol).await {
-            Ok(details) => store.record(
-                symbol.clone(),
-                EligibilitySnapshot {
-                    synced_at: Utc::now(),
-                    details,
-                },
-            ),
+            Ok(details) => store.record(EligibilitySnapshot {
+                symbol: symbol.clone(),
+                synced_at: Utc::now(),
+                details,
+            }),
             Err(error) => {
                 warn!(%symbol, ?error, "Asset eligibility refresh failed; keeping the previous snapshot");
                 failures.push((symbol.clone(), error));
@@ -129,6 +133,14 @@ pub enum OvernightOrderShape {
 pub enum OvernightEligibilityError {
     #[error("no eligibility snapshot for {symbol}: the asset sync has not run")]
     NoSnapshot { symbol: Symbol },
+    #[error(
+        "eligibility snapshot is for {snapshot_symbol}, not {requested}; refusing to \
+         authorize one asset's order from another asset's attributes"
+    )]
+    SnapshotSymbolMismatch {
+        requested: Symbol,
+        snapshot_symbol: Symbol,
+    },
     #[error(
         "eligibility snapshot for {symbol} is stale (synced at {synced_at}); \
          refusing to place from outdated attributes"
@@ -181,6 +193,13 @@ pub fn validate_overnight_eligibility(
             symbol: symbol.clone(),
         });
     };
+
+    if snapshot.symbol != *symbol {
+        return Err(OvernightEligibilityError::SnapshotSymbolMismatch {
+            requested: symbol.clone(),
+            snapshot_symbol: snapshot.symbol.clone(),
+        });
+    }
 
     if snapshot.synced_at < eligibility_sync_window_start(now) {
         return Err(OvernightEligibilityError::StaleSnapshot {
@@ -342,6 +361,7 @@ mod tests {
     /// A fully eligible snapshot from the session's own 19:55 ET sync.
     fn eligible_snapshot() -> EligibilitySnapshot {
         EligibilitySnapshot {
+            symbol: rklb(),
             synced_at: Utc.with_ymd_and_hms(2026, 8, 28, 23, 55, 0).unwrap(),
             details: AssetDetails {
                 status: AssetStatus::Active,
@@ -395,6 +415,26 @@ mod tests {
                     if *symbol == rklb() && synced_at == snapshot.synced_at
             ),
             "expected StaleSnapshot, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_for_another_symbol_fails_closed() {
+        // An eligible snapshot looked up for one asset must never
+        // authorize an order for another.
+        let mut snapshot = eligible_snapshot();
+        snapshot.symbol = Symbol::new("AAPL").unwrap();
+
+        let error = validate(Some(&snapshot), OvernightOrderShape::WholeShares).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OvernightEligibilityError::SnapshotSymbolMismatch {
+                    ref requested,
+                    ref snapshot_symbol,
+                } if *requested == rklb() && *snapshot_symbol == Symbol::new("AAPL").unwrap()
+            ),
+            "expected SnapshotSymbolMismatch, got {error:?}"
         );
     }
 
