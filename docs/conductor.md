@@ -701,9 +701,8 @@ WorkerBuilder::new(name)
 6. `Conductor::wait_for_completion` (the async exit path) sees this variant and
    awaits sending an operator alert through `worker_failure_notifier`
    (`Arc<dyn Notifier>`, a `LogNotifier` emitting a structured ERROR log),
-   bounded by a short timeout so a slow notifier implementation cannot
-   delay process exit -- then propagates the error, so the bot process exits
-   non-zero.
+   bounded by a short timeout so a slow notifier implementation cannot delay
+   process exit -- then propagates the error, so the bot process exits non-zero.
 
 **Critical:** the spawned monitor task must select on the shared signal
 alongside `apalis_monitor.run()` and return the terminal error. Without that
@@ -713,12 +712,12 @@ see the failure at all.
 
 **Why the alert is sent from the exit path, not from `on_event`.** `on_event` is
 a synchronous `Fn(&WorkerContext, &Event)` -- it cannot `.await` the async
-notifier. Firing the alert as a detached `tokio::spawn` from inside that callback
-would race process teardown: `ctx.stop()` and the resulting process exit can
-complete before the spawned send does, silently dropping it in the common case.
-`wait_for_completion` is async and runs strictly before the process returns, so
-awaiting the alert there (with a bounded timeout) is what actually guarantees
-delivery-or-timeout instead of delivery-or-silently-lost.
+notifier. Firing the alert as a detached `tokio::spawn` from inside that
+callback would race process teardown: `ctx.stop()` and the resulting process
+exit can complete before the spawned send does, silently dropping it in the
+common case. `wait_for_completion` is async and runs strictly before the process
+returns, so awaiting the alert there (with a bounded timeout) is what actually
+guarantees delivery-or-timeout instead of delivery-or-silently-lost.
 
 **Blast radius: this restores the existing fail-stop design; it does not invent
 universal self-recovery.** `on_terminal_failure`'s `ctx.stop()` + non-zero

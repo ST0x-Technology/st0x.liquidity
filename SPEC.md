@@ -5273,8 +5273,8 @@ observed usage.
   decimal-ETH amount parsed to wei at startup — a missing, malformed, or zero
   value fails fast with no cross-chain fallback), it raises an alert: a
   structured `error!` log (target `gas`) carrying the wallet, chain, current
-  balance and threshold, plus an operational-alert notification (see
-  "Structured log channel" below).
+  balance and threshold, plus an operational-alert notification (see "Structured
+  log channel" below).
 - **De-duplication.** The monitor alerts once on the transition into the low
   state, then re-alerts at most once per `realert_interval` while the balance
   stays low. It never notifies on every poll.
@@ -5294,16 +5294,16 @@ observed usage.
 
 Alerts are emitted as structured ERROR logs: target `operational_alert`, an
 `alert = true` marker field, and the human-readable alert text in the `message`
-field. Delivery to humans happens downstream in the log pipeline (Cloud
-Logging -> Grafana alert rules, maintained in t0.devops), so the bot holds no
-delivery credentials and in-process delivery cannot fail. The non-secret
-`[alerts]` config supplies only the gas-monitor thresholds and intervals; the
-encrypted secrets carry nothing for alerting. (Migration note: the retired
-Telegram fields are accepted and ignored with a deprecation warning for one
-release, then rejected -- `chat_id`/`message_thread_id` in the `[alerts]`
-config section, and a leftover `[alerts]` table (`bot_token`) in the secrets
-file. Deployed config versions still carry the former, deployed secret
-versions the latter, and the previous build required them.)
+field. Delivery to humans happens downstream in the log pipeline (Cloud Logging
+-> Grafana alert rules, maintained in t0.devops), so the bot holds no delivery
+credentials and in-process delivery cannot fail. The non-secret `[alerts]`
+config supplies only the gas-monitor thresholds and intervals; the encrypted
+secrets carry nothing for alerting. (Migration note: the retired Telegram fields
+are accepted and ignored with a deprecation warning for one release, then
+rejected -- `chat_id`/`message_thread_id` in the `[alerts]` config section, and
+a leftover `[alerts]` table (`bot_token`) in the secrets file. Deployed config
+versions still carry the former, deployed secret versions the latter, and the
+previous build required them.)
 
 ### BaseToAlpaca deposit send
 
