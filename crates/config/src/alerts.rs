@@ -1,12 +1,18 @@
-//! Operational alerting configuration: low-gas balance monitoring and the
-//! Telegram channel used to deliver alerts.
+//! Operational alerting configuration: low-gas balance monitoring thresholds
+//! and intervals.
 //!
-//! Like [`crate::telemetry`], this is an OPTIONAL section split across the
-//! plaintext config (`[alerts]`) and the encrypted secrets TOML (the Telegram
-//! `bot_token`). When neither is present the loader yields `None` and no gas
-//! monitor is spawned. When present, the section must fully specify every
-//! field -- there are no silent threshold defaults, per the financial-integrity
-//! rule.
+//! Alerts themselves are emitted as structured ERROR logs (see the binary
+//! crate's `alerts` module); delivery to humans happens downstream, via the
+//! log pipeline (Cloud Logging -> Grafana alert rules). This section therefore
+//! carries no delivery-channel settings and no secrets -- it only tunes the
+//! gas monitor.
+//!
+//! Unlike [`crate::telemetry`], the `[alerts]` section is REQUIRED in the
+//! plaintext config: a bot without a gas monitor silently stops transacting
+//! when its wallet runs dry, so an absent section fails startup
+//! ([`AlertsAssemblyError::MissingConfig`]) rather than skipping the monitor.
+//! The section must also fully specify every field -- there are no silent
+//! threshold defaults, per the financial-integrity rule.
 
 use std::collections::BTreeMap;
 
@@ -16,6 +22,8 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use st0x_evm::Chain;
+
+use crate::loader::StartupNotice;
 
 /// The chains this binary runs a gas monitor on.
 ///
@@ -27,8 +35,6 @@ pub const GAS_MONITORED_CHAINS: [Chain; 2] = [Chain::Base, Chain::Ethereum];
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlertsConfig {
-    /// Telegram chat id alerts are delivered to.
-    pub chat_id: i64,
     /// Native-gas balance threshold per chain, as decimal-ETH strings (e.g.
     /// `"0.05"`), parsed to wei at load time so a malformed value fails fast.
     ///
@@ -42,60 +48,29 @@ pub struct AlertsConfig {
     /// stays below threshold. Bounds alert spam without hiding a persistent
     /// low-balance condition.
     pub realert_interval: u64,
-    /// Optional forum topic (`message_thread_id`) to deliver alerts into. When
-    /// omitted, alerts post to the group's default (General) topic. Only
-    /// meaningful for forum-enabled supergroups; a missing field is a valid
-    /// distinct state, not a silent default.
+    /// MIGRATION SHIM, removed next release (together with the secrets-file
+    /// `[alerts]` shim in the loader): the Telegram delivery fields are
+    /// retired, but the pinned Secret Manager config versions still carry
+    /// them, and the currently-running build requires `chat_id` -- so the
+    /// config cannot drop the fields before this image rolls, and this image
+    /// must not reject them when it rolls. Accepted and ignored with a
+    /// deprecation warning in [`AlertsCtx::new`].
+    pub chat_id: Option<i64>,
+    /// MIGRATION SHIM, removed next release: see [`AlertsConfig::chat_id`].
     pub message_thread_id: Option<i64>,
 }
 
-/// Secret alerting credentials deserialized from the encrypted secrets TOML.
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AlertsSecrets {
-    /// Telegram bot token used to authenticate `sendMessage` calls.
-    pub bot_token: String,
-}
-
-impl std::fmt::Debug for AlertsSecrets {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AlertsSecrets")
-            .field("bot_token", &"[REDACTED]")
-            .finish()
-    }
-}
-
-/// Runtime alerting context assembled from config + secrets.
+/// Runtime alerting context assembled from the `[alerts]` config section.
 ///
-/// Constructed via [`AlertsCtx::new`], which returns `None` when both the
-/// config section and the secret are absent.
-#[derive(Clone)]
+/// Constructed via [`AlertsCtx::new`], which fails when the section is
+/// absent.
+#[derive(Debug, Clone)]
 pub struct AlertsCtx {
-    pub chat_id: i64,
-    pub bot_token: String,
     /// Low-balance threshold in wei, per monitored chain. Validated at
     /// construction to hold exactly [`GAS_MONITORED_CHAINS`].
     low_balance_thresholds_wei: BTreeMap<Chain, U256>,
     pub poll_interval: std::time::Duration,
     pub realert_interval: std::time::Duration,
-    /// Forum topic to deliver alerts into, or `None` for the default topic.
-    pub message_thread_id: Option<i64>,
-}
-
-impl std::fmt::Debug for AlertsCtx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AlertsCtx")
-            .field("chat_id", &self.chat_id)
-            .field("bot_token", &"[REDACTED]")
-            .field(
-                "low_balance_thresholds_wei",
-                &self.low_balance_thresholds_wei,
-            )
-            .field("poll_interval", &self.poll_interval)
-            .field("realert_interval", &self.realert_interval)
-            .field("message_thread_id", &self.message_thread_id)
-            .finish()
-    }
 }
 
 impl AlertsCtx {
@@ -111,70 +86,77 @@ impl AlertsCtx {
     /// validates the threshold map against [`GAS_MONITORED_CHAINS`].
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_test(
-        chat_id: i64,
         low_balance_thresholds_wei: BTreeMap<Chain, U256>,
         poll_interval: std::time::Duration,
         realert_interval: std::time::Duration,
     ) -> Self {
         Self {
-            chat_id,
-            bot_token: "test-token".to_owned(),
             low_balance_thresholds_wei,
             poll_interval,
             realert_interval,
-            message_thread_id: None,
         }
     }
 
     pub fn new(
         config: Option<AlertsConfig>,
-        secrets: Option<AlertsSecrets>,
-    ) -> Result<Option<Self>, AlertsAssemblyError> {
-        match (config, secrets) {
-            (Some(config), Some(secrets)) => {
-                if config.poll_interval == 0 {
-                    return Err(AlertsAssemblyError::ZeroInterval {
-                        field: "poll_interval",
-                    });
-                }
+        startup_notices: &mut Vec<StartupNotice>,
+    ) -> Result<Self, AlertsAssemblyError> {
+        let Some(config) = config else {
+            return Err(AlertsAssemblyError::MissingConfig);
+        };
 
-                if config.realert_interval == 0 {
-                    return Err(AlertsAssemblyError::ZeroInterval {
-                        field: "realert_interval",
-                    });
-                }
+        // Migration shim, removed next release: see `AlertsConfig::chat_id`.
+        let retired: Vec<&str> = [
+            ("chat_id", config.chat_id.is_some()),
+            ("message_thread_id", config.message_thread_id.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(field, present)| present.then_some(field))
+        .collect();
 
-                for chain in config.low_balance_thresholds.keys() {
-                    if !GAS_MONITORED_CHAINS.contains(chain) {
-                        return Err(AlertsAssemblyError::UnmonitoredChain { chain: *chain });
-                    }
-                }
-
-                let low_balance_thresholds_wei = GAS_MONITORED_CHAINS
-                    .into_iter()
-                    .map(|chain| {
-                        let raw = config
-                            .low_balance_thresholds
-                            .get(&chain)
-                            .ok_or(AlertsAssemblyError::MissingThreshold { chain })?;
-
-                        Ok((chain, parse_threshold(chain, raw)?))
-                    })
-                    .collect::<Result<BTreeMap<_, _>, AlertsAssemblyError>>()?;
-
-                Ok(Some(Self {
-                    chat_id: config.chat_id,
-                    bot_token: secrets.bot_token,
-                    low_balance_thresholds_wei,
-                    poll_interval: std::time::Duration::from_secs(config.poll_interval),
-                    realert_interval: std::time::Duration::from_secs(config.realert_interval),
-                    message_thread_id: config.message_thread_id,
-                }))
-            }
-            (None, None) => Ok(None),
-            (Some(_), None) => Err(AlertsAssemblyError::SecretsMissing),
-            (None, Some(_)) => Err(AlertsAssemblyError::ConfigMissing),
+        if !retired.is_empty() {
+            startup_notices.push(StartupNotice::warning(format!(
+                "[alerts] {fields} deprecated and ignored (alerts are structured logs \
+                 now); remove from the [alerts] config section (removed next release)",
+                fields = retired.join("/"),
+            )));
         }
+
+        if config.poll_interval == 0 {
+            return Err(AlertsAssemblyError::ZeroInterval {
+                field: "poll_interval",
+            });
+        }
+
+        if config.realert_interval == 0 {
+            return Err(AlertsAssemblyError::ZeroInterval {
+                field: "realert_interval",
+            });
+        }
+
+        for chain in config.low_balance_thresholds.keys() {
+            if !GAS_MONITORED_CHAINS.contains(chain) {
+                return Err(AlertsAssemblyError::UnmonitoredChain { chain: *chain });
+            }
+        }
+
+        let low_balance_thresholds_wei = GAS_MONITORED_CHAINS
+            .into_iter()
+            .map(|chain| {
+                let raw = config
+                    .low_balance_thresholds
+                    .get(&chain)
+                    .ok_or(AlertsAssemblyError::MissingThreshold { chain })?;
+
+                Ok((chain, parse_threshold(chain, raw)?))
+            })
+            .collect::<Result<BTreeMap<_, _>, AlertsAssemblyError>>()?;
+
+        Ok(Self {
+            low_balance_thresholds_wei,
+            poll_interval: std::time::Duration::from_secs(config.poll_interval),
+            realert_interval: std::time::Duration::from_secs(config.realert_interval),
+        })
     }
 }
 
@@ -194,10 +176,12 @@ fn parse_threshold(chain: Chain, value: &str) -> Result<U256, AlertsAssemblyErro
 
 #[derive(Debug, Error)]
 pub enum AlertsAssemblyError {
-    #[error("[alerts] config present but [alerts] secrets (bot_token) missing")]
-    SecretsMissing,
-    #[error("[alerts] secrets (bot_token) present but [alerts] config missing")]
-    ConfigMissing,
+    #[error(
+        "the [alerts] config section is missing; operational alerting must be \
+         configured explicitly, because a bot without a gas monitor silently \
+         stops transacting when its wallet runs dry"
+    )]
+    MissingConfig,
     #[error("[alerts] {field} must be non-zero")]
     ZeroInterval { field: &'static str },
     #[error("[alerts.low_balance_thresholds] {chain} must be greater than zero")]
@@ -231,20 +215,14 @@ mod tests {
 
     fn valid_config() -> AlertsConfig {
         AlertsConfig {
-            chat_id: -1_001_234_567_890,
             low_balance_thresholds: BTreeMap::from([
                 (Chain::Base, "0.05".to_owned()),
                 (Chain::Ethereum, "0.01".to_owned()),
             ]),
             poll_interval: 300,
             realert_interval: 3600,
+            chat_id: None,
             message_thread_id: None,
-        }
-    }
-
-    fn valid_secrets() -> AlertsSecrets {
-        AlertsSecrets {
-            bot_token: "123:abc".to_owned(),
         }
     }
 
@@ -255,7 +233,6 @@ mod tests {
     fn config_requires_a_threshold_table() {
         let error = toml::from_str::<AlertsConfig>(
             "
-            chat_id = 1
             poll_interval = 300
             realert_interval = 3600
             ",
@@ -275,7 +252,6 @@ mod tests {
     fn config_rejects_the_retired_flat_threshold_fields() {
         let error = toml::from_str::<AlertsConfig>(
             r#"
-            chat_id = 1
             base_low_balance_threshold = "0.05"
             ethereum_low_balance_threshold = "0.01"
             poll_interval = 300
@@ -296,12 +272,8 @@ mod tests {
 
     #[test]
     fn new_parses_threshold_and_intervals() {
-        let ctx = AlertsCtx::new(Some(valid_config()), Some(valid_secrets()))
-            .unwrap()
-            .unwrap();
+        let ctx = AlertsCtx::new(Some(valid_config()), &mut Vec::new()).unwrap();
 
-        assert_eq!(ctx.chat_id, -1_001_234_567_890);
-        assert_eq!(ctx.bot_token, "123:abc");
         // 0.05 ETH = 5 * 10^16 wei.
         assert_eq!(
             ctx.low_balance_threshold_wei(Chain::Base),
@@ -313,27 +285,64 @@ mod tests {
         );
         assert_eq!(ctx.poll_interval, std::time::Duration::from_secs(300));
         assert_eq!(ctx.realert_interval, std::time::Duration::from_secs(3600));
-        assert_eq!(ctx.message_thread_id, None);
     }
 
+    /// The delivery-channel fields retired with the Telegram transport are
+    /// accepted and ignored for one release: the pinned Secret Manager config
+    /// versions still carry them (the previous build required `chat_id`), so
+    /// rejecting them here would crash-loop the bot at roll time until a
+    /// separate config release lands. Removed next release together with the
+    /// secrets-file `[alerts]` shim.
     #[test]
-    fn new_carries_message_thread_id() {
-        let mut config = valid_config();
-        config.message_thread_id = Some(42);
+    fn config_accepts_and_ignores_the_retired_delivery_channel_fields() {
+        let config: AlertsConfig = toml::from_str(
+            r#"
+            chat_id = -1_001_234_567_890
+            message_thread_id = 42
+            poll_interval = 300
+            realert_interval = 3600
 
-        let ctx = AlertsCtx::new(Some(config), Some(valid_secrets()))
-            .unwrap()
-            .unwrap();
+            [low_balance_thresholds]
+            base = "0.05"
+            ethereum = "0.01"
+            "#,
+        )
+        .unwrap();
 
-        assert_eq!(ctx.message_thread_id, Some(42));
-    }
+        let mut notices = Vec::new();
+        let ctx = AlertsCtx::new(Some(config), &mut notices).unwrap();
 
-    #[test]
-    fn new_returns_none_when_both_absent() {
-        let ctx = AlertsCtx::new(None, None).unwrap();
+        assert_eq!(
+            ctx.low_balance_threshold_wei(Chain::Base),
+            Some(U256::from(50_000_000_000_000_000_u64)),
+            "the live fields must still load normally alongside the ignored ones"
+        );
+        assert_eq!(notices.len(), 1, "exactly one deprecation notice");
         assert!(
-            ctx.is_none(),
-            "absent alerts config/secrets must yield None"
+            notices[0]
+                .message
+                .contains("chat_id/message_thread_id deprecated"),
+            "the notice must name exactly the retired fields seen, got: {}",
+            notices[0].message
+        );
+    }
+
+    /// An absent `[alerts]` section is a startup failure, not a silent
+    /// monitor-less run: operational configuration must be explicit, and a
+    /// bot without a gas monitor silently stops transacting when its wallet
+    /// runs dry.
+    #[test]
+    fn new_rejects_an_absent_section() {
+        let mut notices = Vec::new();
+        let error = AlertsCtx::new(None, &mut notices).unwrap_err();
+
+        assert!(
+            matches!(error, AlertsAssemblyError::MissingConfig),
+            "expected MissingConfig for an absent [alerts] section, got: {error}"
+        );
+        assert!(
+            notices.is_empty(),
+            "a hard failure must not also queue startup notices, got: {notices:?}"
         );
     }
 
@@ -344,7 +353,7 @@ mod tests {
             .low_balance_thresholds
             .insert(Chain::Base, "not-a-number".to_owned());
 
-        let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
+        let error = AlertsCtx::new(Some(config), &mut Vec::new()).unwrap_err();
 
         assert!(
             matches!(
@@ -366,7 +375,7 @@ mod tests {
             .low_balance_thresholds
             .insert(Chain::Ethereum, "not-a-number".to_owned());
 
-        let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
+        let error = AlertsCtx::new(Some(config), &mut Vec::new()).unwrap_err();
 
         assert!(
             matches!(
@@ -389,7 +398,7 @@ mod tests {
         let mut config = valid_config();
         config.low_balance_thresholds.remove(&Chain::Ethereum);
 
-        let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
+        let error = AlertsCtx::new(Some(config), &mut Vec::new()).unwrap_err();
 
         assert!(
             matches!(
@@ -411,7 +420,7 @@ mod tests {
             .low_balance_thresholds
             .insert(Chain::HyperEvm, "0.05".to_owned());
 
-        let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
+        let error = AlertsCtx::new(Some(config), &mut Vec::new()).unwrap_err();
 
         assert!(
             matches!(
@@ -428,7 +437,6 @@ mod tests {
     fn thresholds_parse_from_a_chain_keyed_table() {
         let config: AlertsConfig = toml::from_str(
             r#"
-            chat_id = 1
             poll_interval = 300
             realert_interval = 3600
 
@@ -456,31 +464,13 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_config_without_secrets() {
-        let error = AlertsCtx::new(Some(valid_config()), None).unwrap_err();
-        assert!(
-            matches!(error, AlertsAssemblyError::SecretsMissing),
-            "expected SecretsMissing, got: {error}"
-        );
-    }
-
-    #[test]
-    fn new_rejects_secrets_without_config() {
-        let error = AlertsCtx::new(None, Some(valid_secrets())).unwrap_err();
-        assert!(
-            matches!(error, AlertsAssemblyError::ConfigMissing),
-            "expected ConfigMissing, got: {error}"
-        );
-    }
-
-    #[test]
     fn new_rejects_zero_base_threshold() {
         let mut config = valid_config();
         config
             .low_balance_thresholds
             .insert(Chain::Base, "0".to_owned());
 
-        let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
+        let error = AlertsCtx::new(Some(config), &mut Vec::new()).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -497,7 +487,7 @@ mod tests {
             .low_balance_thresholds
             .insert(Chain::Ethereum, "0".to_owned());
 
-        let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
+        let error = AlertsCtx::new(Some(config), &mut Vec::new()).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -514,7 +504,7 @@ mod tests {
         let mut config = valid_config();
         config.poll_interval = 0;
 
-        let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
+        let error = AlertsCtx::new(Some(config), &mut Vec::new()).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -531,7 +521,7 @@ mod tests {
         let mut config = valid_config();
         config.realert_interval = 0;
 
-        let error = AlertsCtx::new(Some(config), Some(valid_secrets())).unwrap_err();
+        let error = AlertsCtx::new(Some(config), &mut Vec::new()).unwrap_err();
         assert!(
             matches!(
                 error,

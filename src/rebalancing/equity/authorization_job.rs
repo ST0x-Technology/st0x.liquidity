@@ -78,8 +78,8 @@ pub(crate) struct DeliverMintAuthorization {
 pub(crate) struct DeliverMintAuthorizationCtx {
     pub(crate) deliverer: Arc<dyn MintAuthorizationDeliverer>,
     pub(crate) mint_store: Arc<Store<TokenizedEquityMint>>,
-    /// Operator alerting for the park outcomes (`NoopNotifier` when
-    /// `[alerts]` is unconfigured -- absence is explicit, never a skip).
+    /// Operator alerting for the park outcomes (structured
+    /// operational-alert logs in production).
     pub(crate) notifier: Arc<dyn Notifier>,
     /// For delayed self-redrives on retryable outcomes.
     pub(crate) job_queue: DeliverMintAuthorizationJobQueue,

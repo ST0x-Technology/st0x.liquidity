@@ -1,53 +1,57 @@
 //! Operational alerting: out-of-band notifications for conditions an operator
-//! must react to (currently, a low native-gas balance on the bot wallet).
+//! must react to (low native-gas balance, stuck rebalancing transfers,
+//! dead-lettered hedges, supervised-worker terminal failures).
 //!
-//! The [`Notifier`] trait abstracts the delivery channel; [`TelegramNotifier`]
-//! is the only implementation today. Monitors that raise alerts (see
-//! `crate::conductor::monitor::gas`) depend on the trait so they stay testable
-//! against a capturing mock.
+//! The [`Notifier`] trait abstracts the delivery channel; [`LogNotifier`] is
+//! the only production implementation: it emits each alert as a structured
+//! ERROR log with target `operational_alert`. Delivery to humans happens
+//! downstream, in the log pipeline (Cloud Logging -> Grafana alert rules,
+//! matching on the target string in the gcplogs stream), so the bot itself
+//! holds no delivery credentials and delivery cannot fail in-process.
 //!
-//! [`NoopNotifier`] is the explicit absence implementation: used when the
-//! `[alerts]` config section is omitted. Its presence in the type system makes
-//! the absence of alerting intentional and visible rather than silently skipped
-//! via `Option`.
-
-pub(crate) mod telegram;
-
-pub(crate) use telegram::TelegramNotifier;
+//! Monitors that raise alerts (see `crate::conductor::monitor::gas`) depend on
+//! the trait so they stay testable against a capturing mock.
 
 use async_trait::async_trait;
-use reqwest::StatusCode;
+use tracing::error;
 
 /// Sends an operational alert over some channel.
 ///
 /// Kept as a trait so monitors depend on the capability, not the concrete
-/// Telegram transport, which keeps them unit-testable with a capturing mock.
+/// log transport, which keeps them unit-testable with a capturing mock.
 #[async_trait]
 pub(crate) trait Notifier: Send + Sync {
     async fn notify(&self, message: &str) -> Result<(), NotifierError>;
 }
 
+/// Error type of [`Notifier::notify`].
+///
+/// Uninhabited outside test builds: the production [`LogNotifier`] emits a
+/// log line and cannot fail, so `notify` is infallible in practice. The
+/// `Result` stays in the trait so alert-failure handling at the call sites
+/// (retry/backoff paths, bounded-timeout sends) remains exercisable in tests.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum NotifierError {
-    #[error("failed to build Telegram HTTP client")]
-    ClientBuild(#[source] reqwest::Error),
-    #[error("Telegram sendMessage request failed")]
-    Request(#[source] reqwest::Error),
-    #[error("Telegram API returned error status {status}: {body}")]
-    ApiError { status: StatusCode, body: String },
+    /// Simulated delivery failure, constructible only from tests, for
+    /// exercising the call sites' alert-failure handling.
+    #[cfg(test)]
+    #[error("simulated notifier delivery failure")]
+    Simulated,
 }
 
-/// A [`Notifier`] that discards every message without error.
+/// A [`Notifier`] that emits each alert as a structured ERROR log.
 ///
-/// Used when the `[alerts]` config section is absent: the caller receives an
-/// `Arc<dyn Notifier>` pointing at this type, making the absence explicit
-/// (no `Option` branch, no silent skip). The no-op path is visible in the
-/// type system and in startup logs.
-pub(crate) struct NoopNotifier;
+/// The target string `operational_alert` is the delivery contract: the
+/// downstream metric filter matches it as a substring of the gcplogs
+/// stream. The `alert = true` field is a secondary marker for structured
+/// queries, and the human-readable alert text is the event message (the
+/// `message` field in JSON log output).
+pub(crate) struct LogNotifier;
 
 #[async_trait]
-impl Notifier for NoopNotifier {
-    async fn notify(&self, _message: &str) -> Result<(), NotifierError> {
+impl Notifier for LogNotifier {
+    async fn notify(&self, message: &str) -> Result<(), NotifierError> {
+        error!(target: "operational_alert", alert = true, "{message}");
         Ok(())
     }
 }
@@ -65,8 +69,8 @@ mod test_support {
     use super::{Notifier, NotifierError};
 
     /// A [`Notifier`] that captures every message passed to `notify()`, for tests
-    /// that assert operator alerts fire at the right moments without a real
-    /// delivery channel. Shared across the crate's test modules.
+    /// that assert operator alerts fire at the right moments without asserting
+    /// on log output. Shared across the crate's test modules.
     #[derive(Default)]
     pub(crate) struct CapturingNotifier {
         captured: std::sync::Mutex<Vec<String>>,
@@ -84,5 +88,33 @@ mod test_support {
             self.captured.lock().unwrap().push(message.to_string());
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The target string is the delivery contract (the downstream metric
+    /// filter substring-matches `operational_alert` on the gcplogs stream);
+    /// the `alert = true` marker and the message text ride along for
+    /// structured queries. All three must survive refactors verbatim.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn notify_emits_a_structured_operational_alert_event() {
+        LogNotifier.notify("gas balance low on base").await.unwrap();
+
+        assert!(
+            logs_contain("operational_alert"),
+            "the alert must be emitted under the operational_alert target"
+        );
+        assert!(
+            logs_contain("alert=true"),
+            "the alert marker field must be present for log-based routing"
+        );
+        assert!(
+            logs_contain("gas balance low on base"),
+            "the alert text must be the event message"
+        );
     }
 }

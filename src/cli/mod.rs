@@ -2165,6 +2165,7 @@ mod tests {
             broker: BrokerCtx::DryRun,
             telemetry: None,
             alerts: None,
+            startup_notices: Vec::new(),
             pricing: None,
             trading_mode: TradingMode::Standalone,
             order_owner: Address::ZERO,
@@ -4005,6 +4006,14 @@ mod tests {
                 [wallet]
                 kind = "private-key"
                 address = "0x0000000000000000000000000000000000000001"
+
+                [alerts]
+                poll_interval = 300
+                realert_interval = 3600
+
+                [alerts.low_balance_thresholds]
+                base = "0.05"
+                ethereum = "0.01"
             "#,
         )
         .unwrap();

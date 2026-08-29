@@ -232,6 +232,7 @@ mod tests {
             broker: BrokerCtx::DryRun,
             telemetry: None,
             alerts: None,
+            startup_notices: Vec::new(),
             pricing: None,
             trading_mode: TradingMode::Standalone,
             order_owner: Address::ZERO,

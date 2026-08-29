@@ -95,3 +95,14 @@ wrapped_equity_recovery = "disabled"
 vault_id = "0xfab"
 tokenized_equity = "0xc941C1506B7555Ba8C506Fb6c9b9CC259902d612"
 tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"
+
+# Required by the config schema: an absent [alerts] section fails startup.
+# This is a CLI-only config -- no server runs from it, so no gas monitor is
+# ever spawned; the values only need to be valid.
+[alerts]
+poll_interval = 300
+realert_interval = 43200
+
+[alerts.low_balance_thresholds]
+base = "0.05"
+ethereum = "0.05"

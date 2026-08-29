@@ -608,6 +608,14 @@ wrapped_equity_recovery = "disabled"
 [chains.base.trading.assets.cash]
 vault_ids = ["{usdc_vault_id:#x}"]
 rebalancing = "enabled"
+
+[alerts]
+poll_interval = 300
+realert_interval = 3600
+
+[alerts.low_balance_thresholds]
+base = "0.05"
+ethereum = "0.01"
 "#,
         database_url = infra.db_path.display(),
         orderbook = infra.base_chain.orderbook,

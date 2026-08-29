@@ -2233,7 +2233,7 @@ mod tests {
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ));
 
         // Reactor-wired stores -- the production wiring that dispatches committed
@@ -2379,7 +2379,7 @@ mod tests {
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ));
 
         let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
@@ -2703,7 +2703,7 @@ mod tests {
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ));
 
         let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())

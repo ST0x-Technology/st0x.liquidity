@@ -92,7 +92,7 @@ const WITHDRAWAL_POLL_ALERT_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60
 /// Redrive delay used AFTER the 4-hour operator alert deadline has elapsed.
 /// Much longer than `WITHDRAWAL_POLL_REDRIVE_DELAY` (30 s) to prevent alert
 /// fatigue: a permanently-stuck poll at 30 s cadence pages ~120 times/hour,
-/// drowning out other alerts on the shared Telegram channel. At 30 minutes the
+/// drowning out other alerts in the operational alert stream. At 30 minutes the
 /// operator receives at most ~2 pages/hour while the guard stays held and
 /// re-polling continues. The re-poll itself is idempotent (same transfer ID),
 /// so a slower post-deadline cadence is harmless for funds in transit.
@@ -120,7 +120,7 @@ const MINT_RECOVERY_REDRIVE_DELAY: Duration = Duration::from_secs(30);
 /// Redrive delay used AFTER the mint-recovery alert deadline has elapsed.
 /// Mirrors `WITHDRAWAL_POLL_POST_DEADLINE_REDRIVE_DELAY`: slows the cadence
 /// from `MINT_RECOVERY_REDRIVE_DELAY` (30 s) to prevent alert fatigue on the
-/// shared Telegram channel, while the guard stays held and the re-probe --
+/// operational alert stream, while the guard stays held and the re-probe --
 /// idempotent against the same CCTP nonce -- keeps running.
 const MINT_RECOVERY_POST_DEADLINE_REDRIVE_DELAY: Duration = Duration::from_secs(30 * 60);
 
@@ -519,9 +519,7 @@ pub(crate) struct TransferUsdcToHedgingCtx {
     /// Maximum consecutive revert-class burn failures reclassified as safe
     /// redrives before the circuit opens. From `RebalancingConfig`.
     pub(crate) max_burn_revert_redrives: u32,
-    /// Alerting channel. `NoopNotifier` when `[alerts]` is unconfigured;
-    /// `TelegramNotifier` otherwise. Never `None` — absence is explicit via
-    /// `NoopNotifier` rather than a silent skip.
+    /// Alerting channel: structured operational-alert logs in production.
     pub(crate) notifier: Arc<dyn Notifier>,
 }
 
@@ -1138,9 +1136,7 @@ pub(crate) struct TransferUsdcToMarketMakingCtx {
     pub(crate) job_queue: TransferUsdcToMarketMakingJobQueue,
     /// Maximum consecutive revert-class burn failures before circuit opens.
     pub(crate) max_burn_revert_redrives: u32,
-    /// Alerting channel. `NoopNotifier` when `[alerts]` is unconfigured;
-    /// `TelegramNotifier` otherwise. Never `None` — absence is explicit via
-    /// `NoopNotifier` rather than a silent skip.
+    /// Alerting channel: structured operational-alert logs in production.
     pub(crate) notifier: Arc<dyn Notifier>,
 }
 
@@ -1883,7 +1879,7 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::alerts::{CapturingNotifier, NoopNotifier};
+    use crate::alerts::{CapturingNotifier, LogNotifier};
     use crate::test_utils::setup_test_apalis_pool;
 
     /// Builds a `QueuePushError` without touching a pool. The classification
@@ -2007,7 +2003,7 @@ mod tests {
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(pool),
             max_burn_revert_redrives: 5,
-            notifier: Arc::new(NoopNotifier),
+            notifier: Arc::new(LogNotifier),
         }
     }
 
@@ -2466,7 +2462,7 @@ mod tests {
             timeout: Duration::from_millis(50),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
-            notifier: Arc::new(NoopNotifier),
+            notifier: Arc::new(LogNotifier),
         };
         let job = TransferUsdcToHedging {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -2518,7 +2514,7 @@ mod tests {
             timeout: Duration::from_millis(50),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
-            notifier: Arc::new(NoopNotifier),
+            notifier: Arc::new(LogNotifier),
         };
         // Simulate a job that has already used all its redrive budget.
         let job = TransferUsdcToHedging {
@@ -2553,7 +2549,7 @@ mod tests {
             transfer,
             job_queue: TransferUsdcToMarketMakingJobQueue::new(pool),
             max_burn_revert_redrives: 5,
-            notifier: Arc::new(NoopNotifier),
+            notifier: Arc::new(LogNotifier),
         }
     }
 
@@ -4554,10 +4550,7 @@ mod tests {
     #[async_trait]
     impl crate::alerts::Notifier for FailingNotifier {
         async fn notify(&self, _message: &str) -> Result<(), crate::alerts::NotifierError> {
-            Err(crate::alerts::NotifierError::ApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                body: "injected test failure".to_string(),
-            })
+            Err(crate::alerts::NotifierError::Simulated)
         }
     }
 
@@ -4703,7 +4696,7 @@ mod tests {
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
-            notifier: Arc::new(NoopNotifier),
+            notifier: Arc::new(LogNotifier),
         };
         let job = TransferUsdcToHedging {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -5218,7 +5211,7 @@ mod tests {
             transfer: Arc::new(BurnRevertAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
-            notifier: Arc::new(NoopNotifier),
+            notifier: Arc::new(LogNotifier),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),

@@ -13,6 +13,17 @@ environment = "e2e"
 traces_endpoint = "http://localhost:10428"
 logs_endpoint = "http://localhost:9428"
 
+# Required by the config schema: an absent [alerts] section fails startup.
+# The e2e harness spawns no long-lived gas monitor assertions; these values
+# only need to be valid.
+[alerts]
+poll_interval = 300
+realert_interval = 3600
+
+[alerts.low_balance_thresholds]
+base = "0.05"
+ethereum = "0.05"
+
 [chains.base.trading.assets.equities.EXAMPLE]
 trading = "enabled"
 rebalancing = "disabled"

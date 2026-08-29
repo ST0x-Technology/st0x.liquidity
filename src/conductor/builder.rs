@@ -338,8 +338,10 @@ where
     };
 
     // Build the gas monitors before `context.provider` is consumed by the
-    // order-fill monitor / accountant below. `None` when `[alerts]` is
-    // unconfigured -- neither monitor is then spawned.
+    // order-fill monitor / accountant below. A loaded Ctx always carries an
+    // AlertsCtx ([alerts] is required at startup); `None` only occurs for
+    // test-support contexts built without one, and then neither monitor is
+    // spawned.
     let gas_monitors = if let Some((alerts, wallet_ctx)) = alerts_with_wallet(&context.ctx)? {
         let base_wallet = wallet_ctx.base_wallet();
         let ethereum_wallet = wallet_ctx.ethereum_wallet();
@@ -1510,7 +1512,6 @@ mod tests {
     fn alerts_require_a_configured_wallet() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.alerts = Some(AlertsCtx::for_test(
-            1,
             BTreeMap::from([
                 (Chain::Base, U256::from(100_u64)),
                 (Chain::Ethereum, U256::from(200_u64)),
@@ -1533,7 +1534,6 @@ mod tests {
     #[tokio::test]
     async fn a_monitored_chain_without_a_threshold_fails_to_build_its_monitor() {
         let alerts = AlertsCtx::for_test(
-            1,
             BTreeMap::from([(Chain::Base, U256::from(100_u64))]),
             Duration::from_secs(300),
             Duration::from_secs(3600),
@@ -1545,7 +1545,7 @@ mod tests {
             address!("0x0000000000000000000000000000000000000ba5"),
             ProviderBuilder::new().connect_mocked_client(Asserter::new()),
             address!("0x0000000000000000000000000000000000000e78"),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         );
 
         let Err(error) = error else {
@@ -1571,7 +1571,6 @@ mod tests {
         ethereum_asserter.push_success(&U256::from(22_u64));
 
         let alerts = AlertsCtx::for_test(
-            1,
             BTreeMap::from([
                 (Chain::Base, U256::from(100_u64)),
                 (Chain::Ethereum, U256::from(200_u64)),
@@ -1587,7 +1586,7 @@ mod tests {
             base_wallet,
             ProviderBuilder::new().connect_mocked_client(ethereum_asserter),
             ethereum_wallet,
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         )
         .unwrap();
 

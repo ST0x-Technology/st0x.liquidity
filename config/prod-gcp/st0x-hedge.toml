@@ -1,3 +1,9 @@
+# DEAD ON GCP: this baked copy is NOT what the production VM runs. The live
+# config is t0.devops terraform/production-liquidity/st0x-hedge.toml, delivered
+# as a pinned Secret Manager version and mounted at /run/t0-config; editing
+# this file changes nothing on the VM. It is deleted entirely once
+# production's VM is replaced.
+
 # HTTP API port for the dashboard and health checks.
 server_port = 8001
 # HTTP port for the apalis-board job queue UI.
@@ -23,6 +29,12 @@ inventory_divergence_threshold = 10
 # droplet-local container; it never existed on this VM.
 ws_url = "wss://st0x-pricing-ccvtustewa-ey.a.run.app/ws"
 gcp_id_token = true
+# Broker identity (type, mode, account_id, and for the keyless variant
+# client_id and kms_key_version) now belongs in this section: it is names and
+# identifiers, not credentials. The values for this deployment still live in
+# the deployed secrets file's [broker] table (accepted for one more release);
+# the next config release moves them here, and only the legacy
+# api_key/api_secret pair may stay in secrets.
 [broker]
 counter_trade_slippage_bps = 100
 extended_hours_reprice_timeout_secs = 300
@@ -247,13 +259,18 @@ deviation = 0.05
 [rest_api]
 url = "https://api.st0x.io"
 
-# Low-gas balance alerting for the bot wallet. Telegram bot_token lives in the
-# encrypted secrets file under [alerts]. Every field is required (no defaults).
+# Issuance internal status API for the rebalancing freeze guard. The
+# non-secret base_url belongs here, in this config file's [issuance] section
+# (only the api_key is a secret); this deployment still carries it in the
+# deployed secrets file, accepted for one more release.
+# [issuance]
+# base_url = "..."
+
+# Low-gas balance alerting for the bot wallet. Alerts are structured ERROR
+# logs (target "operational_alert"); delivery to humans happens downstream via
+# the log pipeline (Cloud Logging -> Grafana alert rules). Every field is
+# required (no defaults).
 [alerts]
-# Telegram chat alerts are delivered to (St0x Product Operations supergroup).
-chat_id = -1003850406522
-# Forum topic alerts post into (the "DEX Liquidity" topic).
-message_thread_id = 50
 # Seconds between native-balance polls.
 poll_interval = 300
 # Minimum seconds between repeated alerts while the balance stays below threshold.

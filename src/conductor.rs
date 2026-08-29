@@ -55,7 +55,7 @@ use st0x_tokenization::AlpacaTokenizationService;
 use st0x_tokenization::Tokenizer;
 use st0x_wrapper::{Wrapper, WrapperService};
 
-use crate::alerts::{NoopNotifier, Notifier, NotifierError, TelegramNotifier};
+use crate::alerts::{LogNotifier, Notifier};
 use crate::bot_gas::{
     BotGasCostLedger, BotGasReceiptCost, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCostCtx,
     RecordBotGasReceiptCostJobQueue,
@@ -423,8 +423,7 @@ pub(crate) struct Conductor {
     apalis_shutdown_token: CancellationToken,
     /// Alerts an operator when a supervised worker fails terminally, awaited
     /// (bounded by [`TERMINAL_FAILURE_ALERT_TIMEOUT`]) from
-    /// `wait_for_completion` before the process returns a non-zero exit --
-    /// `NoopNotifier` when `[alerts]` is unconfigured.
+    /// `wait_for_completion` before the process returns a non-zero exit.
     worker_failure_notifier: Arc<dyn Notifier>,
     /// Cleared once every owned task has been stopped, preventing `Drop` from
     /// issuing a second supervisor shutdown against an already-closed channel.
@@ -876,8 +875,17 @@ impl Conductor {
         run_startup_maintenance(&ctx, &pool).await?;
 
         let rebalancing = optional_rebalancing_ctx(&ctx)?;
-        let notifier = build_alert_notifier(ctx.alerts.as_ref(), "Operational alerting")?;
 
+        // Operational alerts are structured ERROR logs; delivery to humans
+        // happens downstream in the log pipeline, so there is no per-channel
+        // transport to configure and nothing here that can fail.
+        let notifier: Arc<dyn Notifier> = Arc::new(LogNotifier);
+        info!("Operational alerts will be emitted as structured logs");
+
+        // The phase future is boxed like the other startup-phase futures
+        // (`Conductor::run` in lib.rs, `spawn_rebalancing_infrastructure`):
+        // it holds every rebalancing aggregate, too large to keep inline on
+        // the stack (large_futures).
         let PositionAndRebalancing {
             position,
             position_projection,
@@ -899,7 +907,7 @@ impl Conductor {
             resume_tokenization_queue,
             deliver_mint_authorization_queue,
             deliver_mint_authorization_ctx,
-        } = PositionAndRebalancing::setup(
+        } = Box::pin(PositionAndRebalancing::setup_with_recovery(
             rebalancing,
             RebalancingDeps {
                 pool: pool.clone(),
@@ -915,23 +923,9 @@ impl Conductor {
                 notifier: notifier.clone(),
                 record_bot_gas_receipt_cost_queue: record_bot_gas_receipt_cost_queue.clone(),
             },
-        )
-        .await?;
-
-        finish_startup_recovery(StartupRecoveryDeps {
-            schedulers: &schedulers,
-            backfill_queue: &backfill_queue,
-            usdc_to_hedging_ctx: transfer_usdc_to_hedging_ctx.as_ref(),
-            usdc_to_market_making_ctx: transfer_usdc_to_market_making_ctx.as_ref(),
-            equity_to_market_making_ctx: transfer_equity_to_market_making_ctx.as_ref(),
-            equity_to_hedging_ctx: transfer_equity_to_hedging_ctx.as_ref(),
-            record_bot_gas_receipt_cost_queue: &record_bot_gas_receipt_cost_queue,
-            record_bot_gas_receipt_cost_ctx: record_bot_gas_receipt_cost_ctx.as_ref(),
-            pool: &pool,
-            inventory: &inventory,
-            rebalancing_service: rebalancing_service.as_ref(),
-            position_projection: &position_projection,
-        })
+            &backfill_queue,
+            record_bot_gas_receipt_cost_ctx.as_ref(),
+        ))
         .await?;
 
         let (offchain_order, offchain_order_projection) = setup_offchain_order_store(
@@ -1061,8 +1055,8 @@ impl Conductor {
             .maybe_record_bot_gas_receipt_cost_ctx(record_bot_gas_receipt_cost_ctx)
             .job_cleanup(job_cleanup)
             .telemetry_writer(telemetry_writer)
-            // Worker-failure pages share the operational `[alerts]` channel
-            // rather than building a second notifier against the same config.
+            // Worker-failure pages share the operational alert stream
+            // rather than constructing a second notifier.
             .worker_failure_notifier(notifier)
             .call()?;
 
@@ -1146,8 +1140,8 @@ impl Conductor {
     }
 
     /// Sends an operator alert for a supervised worker's terminal failure,
-    /// bounded by [`TERMINAL_FAILURE_ALERT_TIMEOUT`] so a slow or
-    /// unreachable Telegram endpoint cannot delay process exit. The alert
+    /// bounded by [`TERMINAL_FAILURE_ALERT_TIMEOUT`] so a slow notifier
+    /// implementation cannot delay process exit. The alert
     /// text is assembled here, at the point it is actually needed, rather
     /// than flattened into a string when the failure was first recorded --
     /// so `source`'s full `Display` (and, separately, its `#[source]` chain
@@ -1758,6 +1752,44 @@ fn build_wrapper<Signer: Wallet + Clone>(
 }
 
 impl PositionAndRebalancing {
+    /// The full rebalancing startup phase: builds the position/rebalancing
+    /// aggregates via [`Self::setup`], then runs [`finish_startup_recovery`]
+    /// against them, so every orphaned job is requeued and the inventory
+    /// view is hydrated before any worker starts consuming.
+    async fn setup_with_recovery(
+        rebalancing: Option<RebalancingCtx>,
+        deps: RebalancingDeps,
+        backfill_queue: &BackfillJobQueue,
+        record_bot_gas_receipt_cost_ctx: Option<&Arc<RecordBotGasReceiptCostCtx>>,
+    ) -> anyhow::Result<Self> {
+        // Cloned out before `deps` is consumed by `setup`: recovery must run
+        // against the same handles the aggregates were built around.
+        let pool = deps.pool.clone();
+        let inventory = deps.inventory.clone();
+        let schedulers = deps.schedulers.clone();
+        let record_bot_gas_receipt_cost_queue = deps.record_bot_gas_receipt_cost_queue.clone();
+
+        let assembled = Self::setup(rebalancing, deps).await?;
+
+        finish_startup_recovery(StartupRecoveryDeps {
+            schedulers: &schedulers,
+            backfill_queue,
+            usdc_to_hedging_ctx: assembled.transfer_usdc_to_hedging_ctx.as_ref(),
+            usdc_to_market_making_ctx: assembled.transfer_usdc_to_market_making_ctx.as_ref(),
+            equity_to_market_making_ctx: assembled.transfer_equity_to_market_making_ctx.as_ref(),
+            equity_to_hedging_ctx: assembled.transfer_equity_to_hedging_ctx.as_ref(),
+            record_bot_gas_receipt_cost_queue: &record_bot_gas_receipt_cost_queue,
+            record_bot_gas_receipt_cost_ctx,
+            pool: &pool,
+            inventory: &inventory,
+            rebalancing_service: assembled.service.as_ref(),
+            position_projection: &assembled.position_projection,
+        })
+        .await?;
+
+        Ok(assembled)
+    }
+
     async fn setup(
         rebalancing: Option<RebalancingCtx>,
         deps: RebalancingDeps,
@@ -1887,33 +1919,6 @@ impl PositionAndRebalancing {
             })
         }
     }
-}
-
-/// Builds an alert notifier for one `[alerts]`-gated channel. Shared by every
-/// alerting call site (USDC rebalancing, supervised-worker terminal failure)
-/// -- `channel` only labels the log lines so each call site's startup
-/// behaviour stays distinguishable.
-///
-/// Returns `Ok(Arc<NoopNotifier>)` when `[alerts]` is absent — silence is
-/// the correct behaviour for an unconfigured optional channel.
-///
-/// Returns `Err` when `[alerts]` IS present but `TelegramNotifier` fails to
-/// initialise. The caller must propagate this so the server fails to start:
-/// an operator who configured `[alerts]` believes alerts are active; silently
-/// falling back to Noop would suppress that channel's alerts with no runtime
-/// indication.
-fn build_alert_notifier(
-    alerts: Option<&st0x_config::AlertsCtx>,
-    channel: &'static str,
-) -> Result<Arc<dyn crate::alerts::Notifier>, NotifierError> {
-    let Some(alerts) = alerts else {
-        debug!("{channel}: [alerts] section absent, using NoopNotifier");
-        return Ok(Arc::new(NoopNotifier));
-    };
-    let notifier =
-        TelegramNotifier::new(&alerts.bot_token, alerts.chat_id, alerts.message_thread_id)?;
-    info!("{channel}: Telegram notifier configured");
-    Ok(Arc::new(notifier))
 }
 
 /// One-time startup maintenance that must precede
@@ -4611,7 +4616,6 @@ mod tests {
     use apalis::prelude::Status;
     use rain_math_float::Float;
     use sqlx::{ConnectOptions, SqlitePool};
-    use std::collections::BTreeMap;
     use std::future::pending;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex, RwLock};
@@ -4639,7 +4643,7 @@ mod tests {
     use st0x_wrapper::{MockWrapper, RATIO_ONE, UnderlyingPerWrapped, Wrapper};
 
     use super::*;
-    use crate::alerts::CapturingNotifier;
+    use crate::alerts::{CapturingNotifier, NotifierError};
     use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
     use crate::bindings::IRaindexV6::{
         ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4, TakeOrderV3,
@@ -4803,7 +4807,7 @@ mod tests {
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(NoopNotifier),
+            Arc::new(LogNotifier),
         ))
     }
 
@@ -4848,7 +4852,7 @@ mod tests {
             telemetry_writer: tokio::spawn(pending::<()>()),
             shutdown_token: CancellationToken::new(),
             apalis_shutdown_token: CancellationToken::new(),
-            worker_failure_notifier: Arc::new(NoopNotifier),
+            worker_failure_notifier: Arc::new(LogNotifier),
             cleanup_armed: true,
         }
     }
@@ -5509,7 +5513,7 @@ mod tests {
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         );
 
         let resume_queue = ResumeTokenizationJobQueue::new(&apalis_pool);
@@ -6043,7 +6047,7 @@ mod tests {
             inventory.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         );
 
         let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
@@ -6140,7 +6144,7 @@ mod tests {
             inventory2.clone(),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool2),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         );
 
         let mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(
@@ -6314,7 +6318,7 @@ mod tests {
             telemetry_writer,
             shutdown_token: CancellationToken::new(),
             apalis_shutdown_token: CancellationToken::new(),
-            worker_failure_notifier: Arc::new(NoopNotifier),
+            worker_failure_notifier: Arc::new(LogNotifier),
             cleanup_armed: true,
         });
 
@@ -9777,7 +9781,7 @@ mod tests {
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ));
         let reactor = trigger.clone();
 
@@ -9890,7 +9894,7 @@ mod tests {
             Arc::clone(&inventory),
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ));
         let reactor = trigger.clone();
 
@@ -10013,7 +10017,7 @@ mod tests {
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ));
         let reactor = trigger.clone();
 
@@ -10154,7 +10158,7 @@ mod tests {
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::NoopNotifier),
+            Arc::new(crate::alerts::LogNotifier),
         ));
         let reactor = trigger.clone();
 
@@ -10425,7 +10429,7 @@ mod tests {
                 vault_registry_projection,
                 schedulers: RebalancingSchedulers::new(&apalis_pool),
                 telemetry: TelemetrySender::disabled(),
-                notifier: Arc::new(NoopNotifier),
+                notifier: Arc::new(LogNotifier),
                 record_bot_gas_receipt_cost_queue: RecordBotGasReceiptCostJobQueue::new(
                     &apalis_pool,
                 ),
@@ -12429,7 +12433,7 @@ mod tests {
             telemetry_writer: tokio::spawn(pending::<()>()),
             shutdown_token: shutdown_token.clone(),
             apalis_shutdown_token,
-            worker_failure_notifier: Arc::new(NoopNotifier),
+            worker_failure_notifier: Arc::new(LogNotifier),
             cleanup_armed: true,
         };
 
@@ -12468,7 +12472,7 @@ mod tests {
             telemetry_writer: tokio::spawn(pending::<()>()),
             shutdown_token: shutdown_token.clone(),
             apalis_shutdown_token,
-            worker_failure_notifier: Arc::new(NoopNotifier),
+            worker_failure_notifier: Arc::new(LogNotifier),
             cleanup_armed: true,
         };
 
@@ -12669,10 +12673,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Notifier for ErroringNotifier {
         async fn notify(&self, _message: &str) -> Result<(), NotifierError> {
-            Err(NotifierError::ApiError {
-                status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                body: "simulated Telegram outage".to_string(),
-            })
+            Err(NotifierError::Simulated)
         }
     }
 
@@ -13517,52 +13518,6 @@ mod tests {
             !is_pre_wrap_held_for_recovery(&tokens_wrapped, &equity_in_progress),
             "TokensWrapped must NEVER be excluded (deposit idempotent)"
         );
-    }
-
-    /// When `[alerts]` is absent, `build_alert_notifier` returns a
-    /// `NoopNotifier` that silently discards notifications without error --
-    /// exercised here through the USDC alerting call site's exact arguments.
-    /// `channel` only labels log lines (see `build_alert_notifier`'s doc), so
-    /// this also covers the supervised-worker terminal-failure call site,
-    /// which shares this exact code path with a different `channel` string.
-    #[tokio::test]
-    async fn build_usdc_notifier_returns_ok_noop_when_alerts_absent() {
-        let notifier = build_alert_notifier(None, "USDC alerting").unwrap();
-        notifier
-            .notify("test message")
-            .await
-            .expect("NoopNotifier must not error on notify");
-    }
-
-    /// When `[alerts]` IS present, `build_alert_notifier` constructs a real
-    /// Telegram notifier and returns `Ok` -- it must NOT fail startup for a
-    /// well-formed config, and it must NOT silently fall back to `NoopNotifier`
-    /// (which would suppress every redrive-limit and terminal-error page).
-    /// Exercised here through the USDC alerting call site's exact arguments.
-    ///
-    /// The error branch (`Err(NotifierError::ClientBuild)`) is only reachable on
-    /// a reqwest/TLS backend init failure; it cannot be triggered deterministically
-    /// from the `AlertsCtx` inputs, so it is not unit-testable here. At the call
-    /// site the `?` propagation fails startup, which is the behaviour that matters.
-    /// `notify()` is deliberately not exercised: the present-branch notifier posts
-    /// to the live Telegram API, which a unit test must never reach.
-    /// `channel` only labels log lines (see `build_alert_notifier`'s doc), so
-    /// this also covers the supervised-worker terminal-failure call site,
-    /// which shares this exact code path with a different `channel` string.
-    #[tokio::test]
-    async fn build_usdc_notifier_returns_ok_telegram_when_alerts_present() {
-        let alerts = st0x_config::AlertsCtx::for_test(
-            123,
-            BTreeMap::from([
-                (Chain::Base, U256::from(1u64)),
-                (Chain::Ethereum, U256::from(1u64)),
-            ]),
-            std::time::Duration::from_secs(60),
-            std::time::Duration::from_secs(3600),
-        );
-
-        build_alert_notifier(Some(&alerts), "USDC alerting")
-            .expect("a well-formed [alerts] config must yield a notifier, not a startup error");
     }
 
     /// A walletless standalone deployment (no `[wallet]`) that still opts into

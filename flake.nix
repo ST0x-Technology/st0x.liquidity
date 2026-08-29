@@ -391,7 +391,7 @@
               inherit
                 (import ./nix/oci-images.nix {
                   inherit pkgs st0x-dashboard;
-                  inherit (rust) st0x-liquidity;
+                  inherit (rust) st0x-liquidity st0x-cli;
                 })
                 bot-oci
                 dashboard-oci
