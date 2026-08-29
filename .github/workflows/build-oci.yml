@@ -63,7 +63,7 @@ jobs:
             local_name: t0-liquidity-datasette
             image: t0-liquidity-datasette
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -74,7 +74,7 @@ jobs:
       # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
       # (`cannot find flake 'flake:foundry'`); fixed in 2.30. v30 of this
       # action only shipped up to 2.26 — pin a working release.
-      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c  # v35
         with:
           nix_version: "2.31.2"
           nix_conf: |
@@ -99,12 +99,12 @@ jobs:
           gc-max-store-size-linux: 10G
 
       - name: Authenticate to GCP
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093  # v3.0.0
         with:
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
           service_account: ${{ env.DEPLOYER_SA }}
 
-      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f  # v2
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db  # v3.0.1
         with:
           # `container binauthz` lives in the beta component.
           install_components: beta
@@ -200,12 +200,12 @@ jobs:
       CONFIG_BUCKET: t0-liquidity-staging-config
     steps:
       - name: Authenticate to GCP
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093  # v3.0.0
         with:
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
           service_account: ${{ env.DEPLOYER_SA }}
 
-      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f  # v2
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db  # v3.0.1
 
       - name: Rewrite images.env with the digests just built
         id: roll
