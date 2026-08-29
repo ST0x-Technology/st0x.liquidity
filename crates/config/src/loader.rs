@@ -1355,11 +1355,11 @@ fn validate_wallet_inputs(
                 wallet_meta,
             ))
         }
-        // No warn here: this arm errors immediately, and parsing runs
-        // before any tracing subscriber exists, so the old warn! was
-        // silently dropped. The returned error is the operator signal.
-        (None, Some(_)) => Err(CtxError::WalletNotConfigured),
-        (None, None) => Err(CtxError::WalletNotConfigured),
+        // Covers secrets-without-config too, which used to warn before
+        // erroring: parsing runs before any tracing subscriber exists, so
+        // that warn! was silently dropped anyway. The returned error is the
+        // operator signal.
+        (None, _) => Err(CtxError::WalletNotConfigured),
     }
 }
 
