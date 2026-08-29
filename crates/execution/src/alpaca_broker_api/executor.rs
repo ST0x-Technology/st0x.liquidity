@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx};
 use super::client::AlpacaBrokerApiClient;
 use super::journal::JournalResponse;
-use super::order::{AlpacaLimitOrder, ConversionOrder, CryptoOrderResponse};
+use super::order::{AlpacaLimitOrder, ConversionOrder, CryptoOrderResponse, OvernightLimitOrder};
 use super::{AlpacaBrokerApiError, AssetStatus, MissingOrderField, TimeInForce};
 use crate::{
     CancellationOutcome, ClientOrderId, CounterTradePreflight, Direction, Executor,
@@ -525,6 +525,20 @@ impl AlpacaBrokerApi {
         Self::validate_asset(&order.symbol, &asset)?;
 
         super::order::place_limit_order(&self.client, order).await
+    }
+
+    /// Places a validated overnight order.
+    ///
+    /// Construction of [`OvernightLimitOrder`] already proved the whole
+    /// overnight contract (eligibility, fractional matrix, precision,
+    /// `extended_hours`, `day` time-in-force), so no per-call asset
+    /// revalidation runs here: the fail-closed eligibility snapshot is
+    /// the overnight authority, not the placement-side TTL cache.
+    pub async fn place_overnight_order(
+        &self,
+        order: OvernightLimitOrder,
+    ) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
+        super::order::place_overnight_order(&self.client, order).await
     }
 
     /// Returns the symbol's full asset attribute set for inspection.

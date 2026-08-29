@@ -77,7 +77,7 @@ pub use journal::{JournalResponse, JournalStatus};
 pub use kms_jwt::{ALPACA_TOKEN_URL, AuthRuntime, KmsJwtError};
 pub use order::{
     AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, ConversionOrder, CryptoOrderOutcome,
-    CryptoOrderResponse, ParseAlpacaLimitPriceError,
+    CryptoOrderResponse, OvernightLimitOrder, OvernightOrderError, ParseAlpacaLimitPriceError,
 };
 pub use overnight_eligibility::{
     EligibilitySnapshot, EligibilitySnapshots, EligibilitySyncError, OvernightEligibilityError,
