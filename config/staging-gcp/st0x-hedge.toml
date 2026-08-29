@@ -33,9 +33,15 @@ inventory_divergence_threshold = 10
 # droplet-local container; it never existed on this VM.
 ws_url = "wss://st0x-pricing-3z4ofantqq-ey.a.run.app/ws"
 gcp_id_token = true
+# Broker identity (type, mode, account_id, and for the keyless variant
+# client_id and kms_key_version) now belongs in this section: it is names and
+# identifiers, not credentials. The values for this deployment still live in
+# the deployed secrets file's [broker] table (accepted for one more release);
+# the next config release moves them here, and only the legacy
+# api_key/api_secret pair may stay in secrets.
+[broker]
 # Slippage tolerance (basis points) for counter-trades that hedge
 # incoming orderbook fills.
-[broker]
 counter_trade_slippage_bps = 100
 extended_hours_reprice_timeout_secs = 300
 close_flatten_reprice_timeout_secs = 60
@@ -248,6 +254,9 @@ max_burn_revert_redrives = 5
 # Dividend freeze guard: query issuance each equity cycle and fail closed when
 # the status cannot be confirmed. Set to "disabled" to fail open during an
 # issuance outage (issuance secrets stay required, so re-enabling is config-only).
+# The issuance base_url now belongs in this config file's [issuance] section
+# (only the api_key is a secret); this deployment still carries it in the
+# deployed secrets file, accepted for one more release.
 freeze_check = "disabled"
 equity = { target = 0.5, deviation = 0.2 }
 usdc = { mode = "disabled" }

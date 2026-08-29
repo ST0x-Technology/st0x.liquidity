@@ -117,6 +117,9 @@ struct Config {
     #[serde(default)]
     assets: HedgingAssets,
     rest_api: Option<RestApiUrlConfig>,
+    /// Non-secret issuance settings (`base_url`). The issuance `api_key`
+    /// stays in the secrets file.
+    issuance: Option<IssuanceConfig>,
     /// ETH/USD valuation source for bot-gas cost recording. See
     /// [`Ctx::bot_gas_valuation`] for when this is required.
     bot_gas_valuation: Option<BotGasValuationConfig>,
@@ -146,13 +149,27 @@ struct RestApiSecrets {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IssuanceSecretsToml {
-    base_url: Url,
+    /// MIGRATION SHIM, removed next release: `base_url` is not a secret and
+    /// now lives in the config file's `[issuance]` section. The deprecated
+    /// secrets-file copy is still accepted for one release because deployed
+    /// secret versions carry it; [`issuance_ctx`] warns when it is used and
+    /// refuses a value that conflicts with the config one.
+    base_url: Option<Url>,
     api_key: String,
+}
+
+/// Non-secret issuance settings from the plaintext config: where the
+/// internal status API lives. The `api_key` stays in the secrets file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssuanceConfig {
+    base_url: Url,
 }
 
 /// Validated issuance secrets with the API key parsed into a [`B256`].
 struct IssuanceSecrets {
-    base_url: Url,
+    /// Deprecated location; see [`IssuanceSecretsToml::base_url`].
+    base_url: Option<Url>,
     api_key: B256,
 }
 
@@ -280,12 +297,50 @@ impl RestApiCtx {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BrokerConfig {
+    /// Which executor backs hedging. This is the broker's identity, not a
+    /// credential, so it lives here; only actual credentials (the legacy
+    /// `api_key`/`api_secret` pair) stay in the secrets file. `Option` for
+    /// one release while the deprecated secrets-file copy of the identity is
+    /// still accepted; [`resolve_broker`] requires it from one of the two.
+    #[serde(rename = "type")]
+    kind: Option<BrokerKind>,
+    /// Alpaca environment (`production`/`sandbox`). Identity, not secret.
+    mode: Option<AlpacaBrokerApiMode>,
+    /// Alpaca account identifier. Identity, not secret.
+    account_id: Option<AlpacaAccountId>,
+    /// KMS broker only: the BrokerDash credential the KMS key signs for.
+    client_id: Option<String>,
+    /// KMS broker only: fully-qualified Cloud KMS key version resource name.
+    kms_key_version: Option<String>,
     counter_trade_slippage_bps: Option<u16>,
     extended_hours_reprice_timeout_secs: Option<u64>,
     close_flatten_reprice_timeout_secs: Option<u64>,
     extended_hours_close_flatten_window_secs: Option<u64>,
     travel_rule: Option<TravelRuleConfig>,
     close_flatten_cross_max_bps: Option<u16>,
+}
+
+/// The broker identity tag: which executor backs hedging, minus its
+/// credentials. Mirrors the (deprecated) `type` tag of the secrets-file
+/// `[broker]` table so the two locations can be cross-checked during the
+/// migration release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum BrokerKind {
+    AlpacaBrokerApi,
+    AlpacaBrokerApiKms,
+    DryRun,
+}
+
+impl BrokerKind {
+    /// The kebab-case tag as written in the TOML, for error messages.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AlpacaBrokerApi => "alpaca-broker-api",
+            Self::AlpacaBrokerApiKms => "alpaca-broker-api-kms",
+            Self::DryRun => "dry-run",
+        }
+    }
 }
 
 /// Alpaca Travel Rule beneficiary identity, required for whitelist
@@ -421,7 +476,12 @@ impl std::fmt::Debug for TravelRuleConfig {
 #[serde(deny_unknown_fields)]
 struct Secrets {
     chains: BTreeMap<Chain, ChainSecrets>,
-    broker: BrokerSecrets,
+    /// `Option` because the KMS and dry-run brokers carry no credentials at
+    /// all: their identity lives in the config file's `[broker]` section and
+    /// the secrets file then has no `[broker]` table. Only the legacy
+    /// alpaca-broker-api variant still needs one, for its
+    /// `api_key`/`api_secret` credential pair.
+    broker: Option<BrokerSecrets>,
     /// MIGRATION SHIM, removed next release: the Telegram alert transport is
     /// retired (alerts are structured logs now), but currently-deployed
     /// secret versions still carry an `[alerts]` table with `bot_token`.
@@ -435,8 +495,14 @@ struct Secrets {
     issuance: Option<IssuanceSecretsToml>,
 }
 
-/// Broker type tag and all broker credentials.
-/// Deserialized from the `[broker]` section of the secrets TOML.
+/// The `[broker]` table of the secrets TOML.
+///
+/// Only the legacy alpaca-broker-api credential pair belongs here. Every
+/// other field is identity, whose home is now the config file's `[broker]`
+/// section; the copies below are MIGRATION SHIMS, removed next release,
+/// accepted because deployed secret versions still carry the identity here.
+/// [`resolve_broker`] warns when identity comes from this table and refuses
+/// values that conflict with the config file's.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)] // isn't relevant for a brief startup step
@@ -444,13 +510,17 @@ enum BrokerSecrets {
     AlpacaBrokerApi {
         api_key: String,
         api_secret: String,
-        account_id: AlpacaAccountId,
+        /// MIGRATION SHIM, removed next release: moved to config `[broker]`.
+        account_id: Option<AlpacaAccountId>,
+        /// MIGRATION SHIM, removed next release: moved to config `[broker]`.
         mode: Option<AlpacaBrokerApiMode>,
     },
-    /// Keyless variant: no stored credential. The client id names the
-    /// BrokerDash credential whose public half is the named Cloud KMS
-    /// key; the bot signs an RFC 7523 client assertion per token
-    /// request (see st0x-execution's `kms_jwt`).
+    /// Keyless variant: no stored credential, so the entire variant is a
+    /// MIGRATION SHIM in the secrets file (removed next release) -- its
+    /// fields' home is the config `[broker]` section. The client id names
+    /// the BrokerDash credential whose public half is the named Cloud KMS
+    /// key; the bot signs an RFC 7523 client assertion per token request
+    /// (see st0x-execution's `kms_jwt`).
     AlpacaBrokerApiKms {
         client_id: String,
         kms_key_version: String,
@@ -614,18 +684,224 @@ impl BrokerCtx {
             counter_trade_slippage_bps: broker_config.counter_trade_slippage_bps()?,
         }))
     }
+}
 
-    fn from_parts(
-        secrets: BrokerSecrets,
-        broker_config: Option<&BrokerConfig>,
-    ) -> Result<Self, CtxError> {
+/// The legacy Alpaca credential pair: the only genuinely secret part of the
+/// broker configuration, and therefore the only part that stays in the
+/// secrets file.
+struct AlpacaCredentials {
+    api_key: String,
+    api_secret: String,
+}
+
+/// The secrets-file `[broker]` table flattened into identity fields plus the
+/// credential pair, so [`resolve_broker`] can merge the (deprecated)
+/// identity copies field-by-field with the config file's.
+struct SecretsBrokerParts {
+    kind: BrokerKind,
+    mode: Option<AlpacaBrokerApiMode>,
+    account_id: Option<AlpacaAccountId>,
+    client_id: Option<String>,
+    kms_key_version: Option<String>,
+    credentials: Option<AlpacaCredentials>,
+}
+
+impl SecretsBrokerParts {
+    /// Whether the secrets file carried broker identity beyond the
+    /// credential pair and its `type` discriminator -- the content whose
+    /// home is now the config file.
+    fn carries_deprecated_identity(&self) -> bool {
+        self.account_id.is_some()
+            || self.mode.is_some()
+            || self.client_id.is_some()
+            || self.kms_key_version.is_some()
+    }
+}
+
+impl From<BrokerSecrets> for SecretsBrokerParts {
+    fn from(secrets: BrokerSecrets) -> Self {
         match secrets {
             BrokerSecrets::AlpacaBrokerApi {
                 api_key,
                 api_secret,
                 account_id,
                 mode,
-            } => Self::alpaca_ctx(
+            } => Self {
+                kind: BrokerKind::AlpacaBrokerApi,
+                mode,
+                account_id,
+                client_id: None,
+                kms_key_version: None,
+                credentials: Some(AlpacaCredentials {
+                    api_key,
+                    api_secret,
+                }),
+            },
+            BrokerSecrets::AlpacaBrokerApiKms {
+                client_id,
+                kms_key_version,
+                account_id,
+                mode,
+            } => Self {
+                kind: BrokerKind::AlpacaBrokerApiKms,
+                mode,
+                account_id: Some(account_id),
+                client_id: Some(client_id),
+                kms_key_version: Some(kms_key_version),
+                credentials: None,
+            },
+            BrokerSecrets::DryRun => Self {
+                kind: BrokerKind::DryRun,
+                mode: None,
+                account_id: None,
+                client_id: None,
+                kms_key_version: None,
+                credentials: None,
+            },
+        }
+    }
+}
+
+/// Merges one broker-identity field from its two possible locations. Both
+/// present and equal is tolerated (the migration window where the config
+/// release has landed but the secret still carries the old copy); both
+/// present and different is refused rather than silently picking one.
+fn merge_broker_field<Value: PartialEq>(
+    field: &'static str,
+    config_value: Option<Value>,
+    secrets_value: Option<Value>,
+) -> Result<Option<Value>, CtxError> {
+    match (config_value, secrets_value) {
+        (Some(from_config), Some(from_secrets)) => {
+            if from_config == from_secrets {
+                Ok(Some(from_config))
+            } else {
+                Err(CtxError::BrokerIdentityConflict { field })
+            }
+        }
+        (Some(value), None) | (None, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Refuses identity fields that have no meaning for the resolved broker
+/// type: a set-but-never-read field is a misconfiguration that should fail
+/// startup, not be silently ignored.
+fn refuse_broker_fields_not_for_kind(
+    kind: BrokerKind,
+    fields: &[(&'static str, bool)],
+) -> Result<(), CtxError> {
+    for &(field, present) in fields {
+        if present {
+            return Err(CtxError::BrokerFieldNotForKind {
+                field,
+                kind: kind.as_str(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Assembles the broker from its two halves: identity in the config file
+/// (preferred home) and credentials in the secrets file. The deprecated
+/// identity copies in the secrets file are still accepted for one release
+/// (see [`BrokerSecrets`]); a field set differently in both places is
+/// refused.
+fn resolve_broker(
+    broker_config: Option<&BrokerConfig>,
+    secrets: Option<BrokerSecrets>,
+) -> Result<BrokerCtx, CtxError> {
+    let secrets_parts = secrets.map(SecretsBrokerParts::from);
+
+    if let Some(parts) = &secrets_parts
+        && parts.carries_deprecated_identity()
+    {
+        // Migration shim, removed next release: see `BrokerSecrets`.
+        warn!(
+            "non-secret [broker] identity fields in the secrets file are deprecated \
+             and move to the config file; only the legacy api_key/api_secret pair \
+             (with its type tag) belongs in the secrets file"
+        );
+    }
+
+    let kind = merge_broker_field(
+        "type",
+        broker_config.and_then(|config| config.kind),
+        secrets_parts.as_ref().map(|parts| parts.kind),
+    )?
+    .ok_or(CtxError::MissingBrokerType)?;
+
+    let SecretsBrokerParts {
+        kind: _,
+        mode: secrets_mode,
+        account_id: secrets_account_id,
+        client_id: secrets_client_id,
+        kms_key_version: secrets_kms_key_version,
+        credentials,
+    } = secrets_parts.unwrap_or(SecretsBrokerParts {
+        kind,
+        mode: None,
+        account_id: None,
+        client_id: None,
+        kms_key_version: None,
+        credentials: None,
+    });
+
+    let mode = merge_broker_field(
+        "mode",
+        broker_config.and_then(|config| config.mode.clone()),
+        secrets_mode,
+    )?;
+    let account_id = merge_broker_field(
+        "account_id",
+        broker_config.and_then(|config| config.account_id),
+        secrets_account_id,
+    )?;
+    let client_id = merge_broker_field(
+        "client_id",
+        broker_config.and_then(|config| config.client_id.clone()),
+        secrets_client_id,
+    )?;
+    let kms_key_version = merge_broker_field(
+        "kms_key_version",
+        broker_config.and_then(|config| config.kms_key_version.clone()),
+        secrets_kms_key_version,
+    )?;
+
+    match kind {
+        BrokerKind::DryRun => {
+            refuse_broker_fields_not_for_kind(
+                kind,
+                &[
+                    ("mode", mode.is_some()),
+                    ("account_id", account_id.is_some()),
+                    ("client_id", client_id.is_some()),
+                    ("kms_key_version", kms_key_version.is_some()),
+                    ("api_key/api_secret", credentials.is_some()),
+                ],
+            )?;
+
+            Ok(BrokerCtx::DryRun)
+        }
+        BrokerKind::AlpacaBrokerApi => {
+            refuse_broker_fields_not_for_kind(
+                kind,
+                &[
+                    ("client_id", client_id.is_some()),
+                    ("kms_key_version", kms_key_version.is_some()),
+                ],
+            )?;
+
+            let AlpacaCredentials {
+                api_key,
+                api_secret,
+            } = credentials.ok_or(CtxError::MissingBrokerCredentials)?;
+            let account_id = account_id.ok_or(CtxError::MissingBrokerField {
+                field: "account_id",
+            })?;
+
+            BrokerCtx::alpaca_ctx(
                 AlpacaBrokerAuth::Basic {
                     api_key,
                     api_secret,
@@ -633,37 +909,38 @@ impl BrokerCtx {
                 account_id,
                 mode,
                 broker_config,
-            ),
-
-            BrokerSecrets::AlpacaBrokerApiKms {
-                client_id,
-                kms_key_version,
-                account_id,
-                mode,
-            } => {
-                // The keyless mint targets the LIVE authx token endpoint;
-                // a sandbox (or mock) broker mode paired with it would
-                // silently mint production bearer tokens. Fail loud until
-                // a sandbox authx URL is wired through. Exhaustive so a
-                // future mode forces an explicit keyless decision.
-                match mode {
-                    Some(AlpacaBrokerApiMode::Production) => {}
-                    None | Some(_) => {
-                        return Err(CtxError::KmsBrokerRequiresProductionMode);
-                    }
+            )
+        }
+        BrokerKind::AlpacaBrokerApiKms => {
+            // The keyless mint targets the LIVE authx token endpoint; a
+            // sandbox (or mock) broker mode paired with it would silently
+            // mint production bearer tokens. Fail loud until a sandbox
+            // authx URL is wired through. Exhaustive so a future mode
+            // forces an explicit keyless decision.
+            match &mode {
+                Some(AlpacaBrokerApiMode::Production) => {}
+                None | Some(_) => {
+                    return Err(CtxError::KmsBrokerRequiresProductionMode);
                 }
-                Self::alpaca_ctx(
-                    AlpacaBrokerAuth::KmsJwt {
-                        client_id,
-                        kms_key_version,
-                    },
-                    account_id,
-                    mode,
-                    broker_config,
-                )
             }
 
-            BrokerSecrets::DryRun => Ok(Self::DryRun),
+            let client_id = client_id.ok_or(CtxError::MissingBrokerField { field: "client_id" })?;
+            let kms_key_version = kms_key_version.ok_or(CtxError::MissingBrokerField {
+                field: "kms_key_version",
+            })?;
+            let account_id = account_id.ok_or(CtxError::MissingBrokerField {
+                field: "account_id",
+            })?;
+
+            BrokerCtx::alpaca_ctx(
+                AlpacaBrokerAuth::KmsJwt {
+                    client_id,
+                    kms_key_version,
+                },
+                account_id,
+                mode,
+                broker_config,
+            )
         }
     }
 }
@@ -1083,7 +1360,7 @@ fn parse_and_validate(
     validate_asset_tables(&config.assets, &config.chains)?;
     let polling_intervals = validated_polling_intervals(&config)?;
 
-    let broker = BrokerCtx::from_parts(secrets.broker, config.broker.as_ref())?;
+    let broker = resolve_broker(config.broker.as_ref(), secrets.broker)?;
     let telemetry = config.telemetry.map(TelemetryCtx::from);
 
     // Migration shim, removed next release: see the `Secrets::alerts` field.
@@ -1235,13 +1512,7 @@ fn parse_and_validate(
                 RestApiCtx::new(cfg.url, key_id, key_secret).map_err(CtxError::RestApiClient)
             })
             .transpose()?,
-        issuance: issuance_ctx(
-            secrets
-                .issuance
-                .map(IssuanceSecrets::try_from_toml)
-                .transpose()
-                .map_err(|source| CtxError::InvalidIssuanceApiKey { source })?,
-        )?,
+        issuance: issuance_ctx(config.issuance, secrets.issuance)?,
         redemption_wallet,
         bot_gas_valuation: config.bot_gas_valuation,
         orchestrator: config.orchestrator,
@@ -1299,18 +1570,45 @@ fn extended_hours_broker_windows(
     })
 }
 
-/// Assembles the required issuance status context from secrets.
-/// `[issuance]` is mandatory: `base_url` and `api_key` must both be present
-/// and the URL must parse -- no silent fallbacks for an endpoint the
-/// rebalancing freeze guard depends on.
-fn issuance_ctx(secret: Option<IssuanceSecrets>) -> Result<IssuanceStatusCtx, CtxError> {
-    let Some(secret) = secret else {
+/// Assembles the required issuance status context: `api_key` from the
+/// secrets file, `base_url` from the config file (preferred) or its
+/// deprecated secrets-file copy. Both must be present somewhere and the URL
+/// must parse -- no silent fallbacks for an endpoint the rebalancing freeze
+/// guard depends on. A `base_url` set differently in both files is refused
+/// rather than silently resolved.
+fn issuance_ctx(
+    config: Option<IssuanceConfig>,
+    secrets: Option<IssuanceSecretsToml>,
+) -> Result<IssuanceStatusCtx, CtxError> {
+    let Some(secrets) = secrets else {
         return Err(CtxError::MissingIssuanceConfig);
+    };
+    let secrets = IssuanceSecrets::try_from_toml(secrets)
+        .map_err(|source| CtxError::InvalidIssuanceApiKey { source })?;
+
+    if secrets.base_url.is_some() {
+        // Migration shim, removed next release: see `IssuanceSecretsToml`.
+        warn!(
+            "[issuance] base_url in the secrets file is deprecated and moves to the \
+             config file; the secrets [issuance] section keeps only api_key"
+        );
+    }
+
+    let base_url = match (config.map(|config| config.base_url), secrets.base_url) {
+        (Some(from_config), Some(from_secrets)) => {
+            if from_config == from_secrets {
+                from_config
+            } else {
+                return Err(CtxError::IssuanceBaseUrlConflict);
+            }
+        }
+        (Some(base_url), None) | (None, Some(base_url)) => base_url,
+        (None, None) => return Err(CtxError::MissingIssuanceBaseUrl),
     };
 
     Ok(IssuanceStatusCtx {
-        base_url: secret.base_url,
-        api_key: IssuanceApiKey(secret.api_key),
+        base_url,
+        api_key: IssuanceApiKey(secrets.api_key),
     })
 }
 
@@ -1680,6 +1978,38 @@ pub enum CtxError {
          mock broker mode would silently mint production bearer tokens"
     )]
     KmsBrokerRequiresProductionMode,
+    #[error(
+        "[broker] type must be set in the config file's [broker] section (or, \
+         deprecated, in the secrets file's [broker] table)"
+    )]
+    MissingBrokerType,
+    #[error(
+        "[broker] {field} is set to different values in the config and secrets \
+         files; remove the deprecated secrets-file copy"
+    )]
+    BrokerIdentityConflict { field: &'static str },
+    #[error("[broker] {field} does not apply to broker type \"{kind}\"")]
+    BrokerFieldNotForKind {
+        field: &'static str,
+        kind: &'static str,
+    },
+    #[error("[broker] {field} is required for this broker type but was not configured")]
+    MissingBrokerField { field: &'static str },
+    #[error(
+        "[broker] type = \"alpaca-broker-api\" requires api_key and api_secret in \
+         the secrets file's [broker] table"
+    )]
+    MissingBrokerCredentials,
+    #[error(
+        "[issuance] base_url is set to different values in the config and secrets \
+         files; remove the deprecated secrets-file copy"
+    )]
+    IssuanceBaseUrlConflict,
+    #[error(
+        "[issuance] base_url must be set in the config file (or, deprecated, in \
+         the secrets file's [issuance] section)"
+    )]
+    MissingIssuanceBaseUrl,
     #[error("log_query_url_template is not a valid URL")]
     LogQueryUrlTemplateNotAUrl {
         #[source]
@@ -1877,6 +2207,13 @@ impl CtxError {
             Self::InvalidThreshold(_) => "invalid execution threshold",
             Self::MissingCounterTradeSlippageBps => "missing counter trade slippage bps",
             Self::KmsBrokerRequiresProductionMode => "kms broker auth requires production mode",
+            Self::MissingBrokerType => "missing broker type",
+            Self::BrokerIdentityConflict { .. } => "broker identity conflict",
+            Self::BrokerFieldNotForKind { .. } => "broker field not for kind",
+            Self::MissingBrokerField { .. } => "missing broker field",
+            Self::MissingBrokerCredentials => "missing broker credentials",
+            Self::IssuanceBaseUrlConflict => "issuance base_url conflict",
+            Self::MissingIssuanceBaseUrl => "missing issuance base_url",
             Self::MissingCloseFlattenCrossMaxBps => "missing close flatten cross max bps",
             Self::CloseFlattenCrossMaxBpsOutOfRange { .. } => {
                 "close flatten cross max bps out of range"
@@ -4021,6 +4358,362 @@ mod tests {
         assert_eq!(
             ctx.order_owner(),
             address!("0xfcad0b19bb29d4674531d6f115237e16afce377c")
+        );
+    }
+
+    /// Config with the broker identity in the config file's `[broker]`
+    /// section (its new home) and `[issuance].base_url` in config.
+    /// `identity_lines` is spliced in above the tuning fields.
+    fn broker_identity_config_toml(identity_lines: &str) -> NamedTempFile {
+        toml_file(&format!(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+
+            [chains.base.trading.assets.equities]
+
+            [chains.base]
+            lifecycle = "active"
+            required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            ingestion_cutoff = "safe"
+
+            [chains.ethereum]
+            lifecycle = "active"
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [issuance]
+            base_url = "http://issuance.test:8000"
+
+            [broker]
+            {identity_lines}
+            counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
+            extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
+            extended_hours_close_flatten_window_secs = 900
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Acme Corp"
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+            "#,
+        ))
+    }
+
+    /// New-shape secrets carrying only actual secrets. `broker_section` and
+    /// `issuance_section` are complete TOML tables (or empty).
+    fn secrets_only_secrets_toml(broker_section: &str, issuance_section: &str) -> NamedTempFile {
+        toml_file(&format!(
+            r#"
+            [chains.base]
+            rpc_url = "http://localhost:8545"
+
+            [chains.ethereum]
+            rpc_url = "https://mainnet.infura.io"
+
+            [chains.hyperevm]
+            rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+            {broker_section}
+
+            {issuance_section}
+            "#,
+        ))
+    }
+
+    const CREDENTIALS_ONLY_BROKER: &str = r#"[broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret""#;
+
+    const API_KEY_ONLY_ISSUANCE: &str = r#"[issuance]
+            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899""#;
+
+    #[tokio::test]
+    async fn legacy_broker_identity_resolves_from_config_with_credentials_only_secrets() {
+        let config = broker_identity_config_toml(
+            r#"type = "alpaca-broker-api"
+            mode = "sandbox"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef""#,
+        );
+        let secrets = secrets_only_secrets_toml(CREDENTIALS_ONLY_BROKER, API_KEY_ONLY_ISSUANCE);
+
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        let BrokerCtx::AlpacaBrokerApi(alpaca) = ctx.broker else {
+            panic!("expected the Alpaca broker, got DryRun");
+        };
+        assert_eq!(
+            alpaca.account_id,
+            "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+                .parse::<AlpacaAccountId>()
+                .unwrap()
+        );
+        assert!(
+            matches!(
+                alpaca.auth,
+                AlpacaBrokerAuth::Basic { ref api_key, ref api_secret }
+                    if api_key == "test-key" && api_secret == "test-secret"
+            ),
+            "credentials must come from the secrets file"
+        );
+        assert_eq!(
+            ctx.issuance.base_url.as_str(),
+            "http://issuance.test:8000/",
+            "issuance base_url must come from the config file"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_broker_fully_in_config_needs_no_broker_secrets() {
+        let config = broker_identity_config_toml(
+            r#"type = "alpaca-broker-api-kms"
+            mode = "production"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            client_id = "CKEXAMPLE"
+            kms_key_version = "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1""#,
+        );
+        let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
+
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        let BrokerCtx::AlpacaBrokerApi(alpaca) = ctx.broker else {
+            panic!("expected the Alpaca broker, got DryRun");
+        };
+        assert!(
+            matches!(
+                alpaca.auth,
+                AlpacaBrokerAuth::KmsJwt { ref client_id, ref kms_key_version }
+                    if client_id == "CKEXAMPLE"
+                        && kms_key_version
+                            == "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1"
+            ),
+            "the keyless broker must assemble entirely from the config file"
+        );
+    }
+
+    /// The migration window: the config release has landed (identity in
+    /// config) while the deployed secret still carries the old copy. Equal
+    /// values are tolerated; see the conflict test for differing ones.
+    #[tokio::test]
+    async fn duplicated_equal_broker_identity_is_tolerated() {
+        let config = broker_identity_config_toml(
+            r#"type = "alpaca-broker-api"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef""#,
+        );
+        let secrets = alpaca_secrets_toml();
+
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        let BrokerCtx::AlpacaBrokerApi(alpaca) = ctx.broker else {
+            panic!("expected the Alpaca broker, got DryRun");
+        };
+        assert_eq!(
+            alpaca.account_id,
+            "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+                .parse::<AlpacaAccountId>()
+                .unwrap()
+        );
+    }
+
+    /// A field set differently in both files must fail startup rather than
+    /// silently prefer either copy: whichever file the operator believed
+    /// they changed, half their intent would be discarded.
+    #[tokio::test]
+    async fn conflicting_broker_account_id_is_refused() {
+        let config = broker_identity_config_toml(
+            r#"type = "alpaca-broker-api"
+            account_id = "aaaaaaaa-eeee-aaaa-dddd-beeeeeeeeeef""#,
+        );
+        let secrets = alpaca_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::BrokerIdentityConflict {
+                    field: "account_id"
+                }
+            ),
+            "expected BrokerIdentityConflict for account_id, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_broker_type_is_refused() {
+        let config = broker_identity_config_toml(r#"type = "dry-run""#);
+        let secrets = alpaca_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::BrokerIdentityConflict { field: "type" }),
+            "expected BrokerIdentityConflict for type, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_broker_type_everywhere_is_refused() {
+        let config = alpaca_trading_config_toml();
+        let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::MissingBrokerType),
+            "expected MissingBrokerType, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_broker_resolves_from_config_alone() {
+        let config = broker_identity_config_toml(r#"type = "dry-run""#);
+        let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
+
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(ctx.broker, BrokerCtx::DryRun),
+            "expected DryRun, got: {:?}",
+            ctx.broker
+        );
+    }
+
+    /// A set-but-never-read identity field is a misconfiguration (probably a
+    /// stale copy from a broker-type switch) and must fail startup instead
+    /// of being silently ignored.
+    #[tokio::test]
+    async fn broker_field_not_applicable_to_kind_is_refused() {
+        let config = broker_identity_config_toml(
+            r#"type = "dry-run"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef""#,
+        );
+        let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::BrokerFieldNotForKind {
+                    field: "account_id",
+                    kind: "dry-run"
+                }
+            ),
+            "expected BrokerFieldNotForKind for account_id, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_broker_without_credentials_is_refused() {
+        let config = broker_identity_config_toml(
+            r#"type = "alpaca-broker-api"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef""#,
+        );
+        let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::MissingBrokerCredentials),
+            "expected MissingBrokerCredentials, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn issuance_base_url_conflict_is_refused() {
+        let config = broker_identity_config_toml(r#"type = "dry-run""#);
+        let secrets = secrets_only_secrets_toml(
+            "",
+            r#"[issuance]
+            base_url = "http://issuance.elsewhere:8000"
+            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899""#,
+        );
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::IssuanceBaseUrlConflict),
+            "expected IssuanceBaseUrlConflict, got: {error}"
+        );
+    }
+
+    /// The migration window for issuance: both files naming the same
+    /// base_url is tolerated until the shim is removed.
+    #[tokio::test]
+    async fn issuance_base_url_duplicated_equal_is_tolerated() {
+        let config = broker_identity_config_toml(r#"type = "dry-run""#);
+        let secrets = secrets_only_secrets_toml(
+            "",
+            r#"[issuance]
+            base_url = "http://issuance.test:8000"
+            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899""#,
+        );
+
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.issuance.base_url.as_str(), "http://issuance.test:8000/");
+    }
+
+    #[tokio::test]
+    async fn issuance_base_url_missing_everywhere_is_refused() {
+        let config = toml_file(&String::from_utf8_lossy(minimal_config_toml_bytes()));
+        let secrets = secrets_only_secrets_toml(
+            r#"[broker]
+            type = "dry-run""#,
+            API_KEY_ONLY_ISSUANCE,
+        );
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::MissingIssuanceBaseUrl),
+            "expected MissingIssuanceBaseUrl, got: {error}"
         );
     }
 

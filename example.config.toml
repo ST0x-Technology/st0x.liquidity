@@ -37,7 +37,22 @@ logs_endpoint = "http://100.x.x.x:9428"
 
 # Travel Rule info for Alpaca whitelist creation (required since 2026-03-27).
 # Only needed when using Alpaca Broker API.
+# Broker identity: which executor backs hedging. These are names and
+# identifiers, not credentials, so they live here; only the legacy
+# api_key/api_secret pair stays in the secrets file.
 [broker]
+type = "alpaca-broker-api"
+mode = "sandbox"
+account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+# Keyless alternative (no stored credential anywhere): the bot signs RFC 7523
+# client assertions with a Cloud KMS key whose public half is registered on a
+# BrokerDash credential, and buys 15-minute bearer tokens. With this variant
+# the secrets file needs no [broker] table at all. Requires
+# roles/cloudkms.signerVerifier on the VM's service account.
+# type = "alpaca-broker-api-kms"
+# mode = "production"
+# client_id = "CKEXAMPLE"
+# kms_key_version = "projects/p/locations/l/keyRings/r/cryptoKeys/alpaca-api-key/cryptoKeyVersions/1"
 counter_trade_slippage_bps = 100
 extended_hours_reprice_timeout_secs = 300
 close_flatten_reprice_timeout_secs = 60
@@ -247,6 +262,11 @@ rebalancing = "enabled"
 # Credentials go in the secrets file under [rest_api].
 # [rest_api]
 # url = "https://api.example.com"
+
+# Required: issuance internal status API origin for the rebalancing freeze
+# guard. The api_key stays in the secrets file under [issuance].
+[issuance]
+base_url = "http://issuance.internal:8000"
 
 # Optional — low-gas balance alerting for the bot wallet. When absent, no gas
 # monitor runs. When present, every field is required (no silent defaults).
