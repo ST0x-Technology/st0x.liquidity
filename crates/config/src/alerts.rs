@@ -19,6 +19,7 @@ use alloy::primitives::U256;
 use alloy::primitives::utils::{UnitsError, parse_ether};
 use serde::Deserialize;
 use thiserror::Error;
+use tracing::warn;
 
 use st0x_evm::Chain;
 
@@ -45,6 +46,16 @@ pub struct AlertsConfig {
     /// stays below threshold. Bounds alert spam without hiding a persistent
     /// low-balance condition.
     pub realert_interval: u64,
+    /// MIGRATION SHIM, removed next release (together with the secrets-file
+    /// `[alerts]` shim in the loader): the Telegram delivery fields are
+    /// retired, but the pinned Secret Manager config versions still carry
+    /// them, and the currently-running build requires `chat_id` -- so the
+    /// config cannot drop the fields before this image rolls, and this image
+    /// must not reject them when it rolls. Accepted and ignored with a
+    /// deprecation warning in [`AlertsCtx::new`].
+    pub chat_id: Option<i64>,
+    /// MIGRATION SHIM, removed next release: see [`AlertsConfig::chat_id`].
+    pub message_thread_id: Option<i64>,
 }
 
 /// Runtime alerting context assembled from the `[alerts]` config section.
@@ -88,6 +99,14 @@ impl AlertsCtx {
         let Some(config) = config else {
             return Ok(None);
         };
+
+        // Migration shim, removed next release: see `AlertsConfig::chat_id`.
+        if config.chat_id.is_some() || config.message_thread_id.is_some() {
+            warn!(
+                "[alerts] chat_id/message_thread_id are deprecated and ignored (alerts \
+                 are structured logs now); remove them from the [alerts] config section"
+            );
+        }
 
         if config.poll_interval == 0 {
             return Err(AlertsAssemblyError::ZeroInterval {
@@ -182,6 +201,8 @@ mod tests {
             ]),
             poll_interval: 300,
             realert_interval: 3600,
+            chat_id: None,
+            message_thread_id: None,
         }
     }
 
@@ -246,12 +267,15 @@ mod tests {
         assert_eq!(ctx.realert_interval, std::time::Duration::from_secs(3600));
     }
 
-    /// The delivery-channel fields retired with the Telegram transport must
-    /// be rejected by name: a config still carrying them belongs to the old
-    /// scheme and should fail startup loudly instead of half-loading.
+    /// The delivery-channel fields retired with the Telegram transport are
+    /// accepted and ignored for one release: the pinned Secret Manager config
+    /// versions still carry them (the previous build required `chat_id`), so
+    /// rejecting them here would crash-loop the bot at roll time until a
+    /// separate config release lands. Removed next release together with the
+    /// secrets-file `[alerts]` shim.
     #[test]
-    fn config_rejects_the_retired_delivery_channel_fields() {
-        let error = toml::from_str::<AlertsConfig>(
+    fn config_accepts_and_ignores_the_retired_delivery_channel_fields() {
+        let config: AlertsConfig = toml::from_str(
             r#"
             chat_id = -1_001_234_567_890
             message_thread_id = 42
@@ -263,11 +287,14 @@ mod tests {
             ethereum = "0.01"
             "#,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            error.to_string().contains("chat_id"),
-            "the retired chat_id field must be rejected by name, got: {error}"
+        let ctx = AlertsCtx::new(Some(config)).unwrap().unwrap();
+
+        assert_eq!(
+            ctx.low_balance_threshold_wei(Chain::Base),
+            Some(U256::from(50_000_000_000_000_000_u64)),
+            "the live fields must still load normally alongside the ignored ones"
         );
     }
 
