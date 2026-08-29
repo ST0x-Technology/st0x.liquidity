@@ -210,7 +210,7 @@ impl OvernightLimitOrder {
 /// overnight-ness is defined by construction: [`OvernightLimitOrder`]
 /// proves `extended_hours = true`, the `day` time-in-force, and the
 /// fail-closed eligibility checks.
-pub(crate) async fn place_overnight_order(
+pub(super) async fn place_overnight_order(
     client: &AlpacaBrokerApiClient,
     overnight: OvernightLimitOrder,
 ) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
@@ -719,6 +719,7 @@ fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
         | ConversionCancelNotSettled { .. }
         | ConversionOrderNotFound { .. }
         | DuplicateOrderNotFound { .. }
+        | ConsecutiveSellPending { .. }
         | CalendarIterationInvariantViolation
         | CalendarDateMismatch { .. }
         | CalendarLocalTimeUnresolvable { .. }
@@ -819,6 +820,19 @@ pub(super) async fn place_limit_order(
                 parse_limit_price(existing.limit_price)?
                     .or(Some(*limit_order.limit_price.as_price())),
             )
+        }
+        // The overnight venue holds a new sell while an earlier closing
+        // order for the position is still live, using a plain 422. Convert
+        // it to its own transient variant so the retry loop keeps re-sending
+        // instead of treating it as a permanent contract rejection -- and so
+        // it is never confused with the duplicate-client_order_id 422 above,
+        // which adopts.
+        Err(AlpacaBrokerApiError::ApiError {
+            status, message, ..
+        }) if status == StatusCode::UNPROCESSABLE_ENTITY
+            && message.contains("open closing position orders") =>
+        {
+            return Err(AlpacaBrokerApiError::ConsecutiveSellPending { message });
         }
         Err(error) => return Err(error),
     };
@@ -1392,6 +1406,7 @@ async fn request_cancel(
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
     use httpmock::prelude::*;
     use proptest::prelude::*;
     use reqwest::StatusCode;
@@ -1399,11 +1414,7 @@ mod tests {
     use tracing_test::traced_test;
     use uuid::uuid;
 
-    #[test]
-    fn kms_jwt_errors_are_never_the_duplicate_order_case() {
-        let error = AlpacaBrokerApiError::KmsJwt(crate::KmsJwtError::ClockBeforeEpoch);
-        assert!(!is_duplicate_client_order_id(&error));
-    }
+    use st0x_float_macro::float;
 
     use super::*;
     use crate::ClientOrderId;
@@ -1411,7 +1422,12 @@ mod tests {
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
     use crate::alpaca_broker_api::{AssetDetails, AssetStatus, duplicate_client_order_id_body};
-    use st0x_float_macro::float;
+
+    #[test]
+    fn kms_jwt_errors_are_never_the_duplicate_order_case() {
+        let error = AlpacaBrokerApiError::KmsJwt(crate::KmsJwtError::ClockBeforeEpoch);
+        assert!(!is_duplicate_client_order_id(&error));
+    }
 
     fn overnight_shares(value: &str) -> Positive<FractionalShares> {
         Positive::new(FractionalShares::new(
@@ -1423,13 +1439,13 @@ mod tests {
     /// 21:00 EDT on 2026-08-28: inside an overnight session whose sync
     /// window opened at 19:45 EDT (23:45 UTC).
     fn overnight_now() -> DateTime<Utc> {
-        chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 29, 1, 0, 0).unwrap()
+        Utc.with_ymd_and_hms(2026, 8, 29, 1, 0, 0).unwrap()
     }
 
     /// A fully eligible snapshot from the session's own 19:55 ET sync.
     fn eligible_overnight_snapshot() -> EligibilitySnapshot {
         EligibilitySnapshot {
-            synced_at: chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 28, 23, 55, 0).unwrap(),
+            synced_at: Utc.with_ymd_and_hms(2026, 8, 28, 23, 55, 0).unwrap(),
             details: AssetDetails {
                 status: AssetStatus::Active,
                 tradable: true,
@@ -1515,8 +1531,7 @@ mod tests {
     fn overnight_order_refuses_a_stale_snapshot() {
         let mut snapshot = eligible_overnight_snapshot();
         // Synced at 11:00 EDT, before the session's 19:45 window.
-        snapshot.synced_at =
-            chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 28, 15, 0, 0).unwrap();
+        snapshot.synced_at = Utc.with_ymd_and_hms(2026, 8, 28, 15, 0, 0).unwrap();
 
         let error = overnight_order("5", Some(&snapshot)).unwrap_err();
 
@@ -1578,6 +1593,286 @@ mod tests {
              orders reject over-precision instead of truncating"
         );
         assert_eq!(error.permanence(), Permanence::Permanent);
+    }
+
+    #[tokio::test]
+    async fn place_overnight_order_sends_the_exact_overnight_contract_body() {
+        // The wire contract the sign-off sheet demands: limit type, day
+        // time-in-force, extended_hours true, fractional quantity
+        // serialized undamaged. Exact body match -- an extra or missing
+        // field fails the mock.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let place_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "RKLB",
+                    "qty": "0.5",
+                    "side": "buy",
+                    "type": "limit",
+                    "limit_price": "24.15",
+                    "time_in_force": "day",
+                    "extended_hours": true,
+                    "client_order_id": "cli-4d6d9f40-5434-4f77-89f6-7156e375b739"
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "RKLB",
+                    "qty": "0.5",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let snapshot = eligible_overnight_snapshot();
+        let order = OvernightLimitOrder::new(
+            Symbol::new("RKLB").unwrap(),
+            overnight_shares("0.5"),
+            Direction::Buy,
+            "24.15".parse::<AlpacaLimitPrice>().unwrap(),
+            ClientOrderId::cli(uuid!("4d6d9f40-5434-4f77-89f6-7156e375b739")),
+            Some(&snapshot),
+            overnight_now(),
+        )
+        .unwrap();
+
+        let placement = place_overnight_order(&client, order).await.unwrap();
+
+        place_mock.assert();
+        assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
+        assert_eq!(placement.shares.inner(), FractionalShares::new(float!(0.5)));
+        assert!(placement.extended_hours);
+        assert_eq!(
+            placement.limit_price,
+            Some(Positive::new(Usd::new(float!(24.15))).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn place_overnight_order_sells_with_the_same_contract() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let place_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "RKLB",
+                    "qty": "3",
+                    "side": "sell",
+                    "type": "limit",
+                    "limit_price": "23.85",
+                    "time_in_force": "day",
+                    "extended_hours": true,
+                    "client_order_id": "cli-5e7e0f51-6445-4f88-9af7-8267f486e840"
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "72f8c127-ad02-4ba8-ac23-3551ae476d1e",
+                    "symbol": "RKLB",
+                    "qty": "3",
+                    "side": "sell",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let snapshot = eligible_overnight_snapshot();
+        let order = OvernightLimitOrder::new(
+            Symbol::new("RKLB").unwrap(),
+            overnight_shares("3"),
+            Direction::Sell,
+            "23.85".parse::<AlpacaLimitPrice>().unwrap(),
+            ClientOrderId::cli(uuid!("5e7e0f51-6445-4f88-9af7-8267f486e840")),
+            Some(&snapshot),
+            overnight_now(),
+        )
+        .unwrap();
+
+        let placement = place_overnight_order(&client, order).await.unwrap();
+
+        place_mock.assert();
+        assert_eq!(placement.order_id, "72f8c127-ad02-4ba8-ac23-3551ae476d1e");
+        assert_eq!(placement.direction, Direction::Sell);
+        assert!(placement.extended_hours);
+    }
+
+    #[tokio::test]
+    async fn place_overnight_order_adopts_the_existing_order_with_its_echoed_terms() {
+        // Lost-response reconciliation through the overnight path: the
+        // 422 duplicate reveals a prior attempt's order, and the
+        // placement reports the ADOPTED order's echoed terms, not the
+        // request's.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let place_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(422)
+                .header("content-type", "application/json")
+                .json_body(duplicate_client_order_id_body());
+        });
+        let lookup_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(
+                    "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders:by_client_order_id",
+                )
+                .query_param(
+                    "client_order_id",
+                    "cli-4d6d9f40-5434-4f77-89f6-7156e375b739",
+                );
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "72f8c127-ad02-4ba8-ac23-3551ae476d1e",
+                    "symbol": "RKLB",
+                    "qty": "0.5",
+                    "side": "buy",
+                    "status": "new",
+                    "extended_hours": true,
+                    "limit_price": "24.20",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let snapshot = eligible_overnight_snapshot();
+        let order = OvernightLimitOrder::new(
+            Symbol::new("RKLB").unwrap(),
+            overnight_shares("0.5"),
+            Direction::Buy,
+            "24.15".parse::<AlpacaLimitPrice>().unwrap(),
+            ClientOrderId::cli(uuid!("4d6d9f40-5434-4f77-89f6-7156e375b739")),
+            Some(&snapshot),
+            overnight_now(),
+        )
+        .unwrap();
+
+        let placement = place_overnight_order(&client, order).await.unwrap();
+
+        place_mock.assert();
+        lookup_mock.assert();
+        assert_eq!(placement.order_id, "72f8c127-ad02-4ba8-ac23-3551ae476d1e");
+        assert!(placement.extended_hours);
+        assert_eq!(
+            placement.limit_price,
+            Some(Positive::new(Usd::new(float!(24.2))).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn place_overnight_order_adoption_reports_a_non_overnight_echo_honestly() {
+        // The broker does not echo a session; overnight-ness of an
+        // adoption is whatever the echoed terms say. An adopted order
+        // echoing extended_hours = false is reported as such -- the
+        // placement never stamps the request's overnight terms over the
+        // broker's own record.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(422)
+                .header("content-type", "application/json")
+                .json_body(duplicate_client_order_id_body());
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(
+                    "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders:by_client_order_id",
+                )
+                .query_param(
+                    "client_order_id",
+                    "cli-4d6d9f40-5434-4f77-89f6-7156e375b739",
+                );
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "72f8c127-ad02-4ba8-ac23-3551ae476d1e",
+                    "symbol": "RKLB",
+                    "qty": "0.5",
+                    "side": "buy",
+                    "status": "new",
+                    "extended_hours": false,
+                    "limit_price": "24.20",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let snapshot = eligible_overnight_snapshot();
+        let order = OvernightLimitOrder::new(
+            Symbol::new("RKLB").unwrap(),
+            overnight_shares("0.5"),
+            Direction::Buy,
+            "24.15".parse::<AlpacaLimitPrice>().unwrap(),
+            ClientOrderId::cli(uuid!("4d6d9f40-5434-4f77-89f6-7156e375b739")),
+            Some(&snapshot),
+            overnight_now(),
+        )
+        .unwrap();
+
+        let placement = place_overnight_order(&client, order).await.unwrap();
+
+        assert!(!placement.extended_hours);
+    }
+
+    #[tokio::test]
+    async fn place_overnight_order_classifies_a_consecutive_sell_rejection_as_transient() {
+        // Blue Ocean rejects a second sell for a symbol while an earlier
+        // closing order is still live. That is a wait-and-retry
+        // condition, not a permanent contract violation: the retry
+        // succeeds once the prior sell fills or cancels. It must never
+        // be confused with the duplicate-client_order_id 422, which
+        // triggers adoption instead.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(422)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "message": "unable to open new notional orders while having open \
+                                closing position orders"
+                }));
+        });
+
+        let snapshot = eligible_overnight_snapshot();
+        let order = OvernightLimitOrder::new(
+            Symbol::new("RKLB").unwrap(),
+            overnight_shares("1"),
+            Direction::Sell,
+            "23.85".parse::<AlpacaLimitPrice>().unwrap(),
+            ClientOrderId::cli(uuid!("4d6d9f40-5434-4f77-89f6-7156e375b739")),
+            Some(&snapshot),
+            overnight_now(),
+        )
+        .unwrap();
+
+        let error = place_overnight_order(&client, order).await.unwrap_err();
+
+        let AlpacaBrokerApiError::ConsecutiveSellPending { message } = &error else {
+            panic!("expected ConsecutiveSellPending, got {error:?}");
+        };
+        assert!(
+            message.contains("open closing position orders"),
+            "message should carry the broker's reason, got {message:?}"
+        );
+        assert_eq!(error.permanence(), Permanence::Transient);
+        assert_eq!(error.backpressure(), None);
     }
 
     #[test]

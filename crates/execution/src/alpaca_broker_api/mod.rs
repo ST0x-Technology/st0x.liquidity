@@ -352,6 +352,16 @@ pub enum AlpacaBrokerApiError {
     )]
     DuplicateOrderNotFound { client_order_id: ClientOrderId },
 
+    /// Alpaca's overnight venue holds a new sell while an earlier closing
+    /// order for the position is still open, rejecting it with a plain 422.
+    /// Kept distinct from [`Self::ApiError`] so it classifies as transient:
+    /// the same request succeeds once the prior sell fills or cancels.
+    #[error(
+        "broker rejected the sell because an earlier closing order for the position is \
+         still open: {message}; the retry succeeds once the prior sell settles"
+    )]
+    ConsecutiveSellPending { message: String },
+
     #[error("Internal error: calendar was non-empty but iteration returned None")]
     CalendarIterationInvariantViolation,
 
@@ -510,6 +520,7 @@ impl AlpacaBrokerApiError {
             | Self::ConversionCancelNotSettled { .. }
             | Self::ConversionOrderNotFound { .. }
             | Self::DuplicateOrderNotFound { .. }
+            | Self::ConsecutiveSellPending { .. }
             | Self::CalendarIterationInvariantViolation
             | Self::CalendarDateMismatch { .. }
             | Self::CalendarLocalTimeUnresolvable { .. }
@@ -567,6 +578,11 @@ impl AlpacaBrokerApiError {
             Self::HttpClient(_) | Self::KmsJwt(_) | Self::PositionSymbolMismatch { .. } => {
                 Permanence::Transient
             }
+
+            // The broker clears this rejection on its own once the prior
+            // closing order fills or cancels, so the retry loop must keep
+            // re-sending the identical request.
+            Self::ConsecutiveSellPending { .. } => Permanence::Transient,
 
             // Everything else is decided locally -- from a response that
             // already arrived, from configuration, or from arithmetic on
