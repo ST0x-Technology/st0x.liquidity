@@ -2277,6 +2277,23 @@ fn rebalancing_bot_gas_enqueuer(deps: &RebalancingDeps) -> BotGasReceiptCostEnqu
     }
 }
 
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "inventory poll interval {poll_interval:?} is too large to derive a freshness \
+     window with one interval of grace"
+)]
+struct InventoryFreshnessWindowOverflow {
+    poll_interval: Duration,
+}
+
+fn derive_inventory_freshness_window(
+    poll_interval: Duration,
+) -> Result<Duration, InventoryFreshnessWindowOverflow> {
+    poll_interval
+        .checked_mul(2)
+        .ok_or(InventoryFreshnessWindowOverflow { poll_interval })
+}
+
 fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     redemption_wallet: Address,
@@ -2350,11 +2367,15 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let transfer_equity_to_market_making_queue =
             deps.schedulers.transfer_equity_to_market_making.clone();
         let transfer_equity_to_hedging_queue = deps.schedulers.transfer_equity_to_hedging.clone();
+        let inventory_freshness_window = derive_inventory_freshness_window(Duration::from_secs(
+            deps.ctx.inventory_poll_interval,
+        ))?;
 
         let rebalancing_service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
                 equity: rebalancing_ctx.equity,
                 usdc: rebalancing_ctx.usdc,
+                inventory_freshness_window,
                 transfer_timeout: rebalancing_ctx.transfer_timeout,
                 assets: deps.ctx.assets.clone(),
             },
@@ -4662,6 +4683,24 @@ mod tests {
     use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryId;
     use crate::vault_lookup::MockVaultLookup;
 
+    #[test]
+    fn inventory_freshness_window_includes_one_poll_interval_of_grace() {
+        assert_eq!(
+            derive_inventory_freshness_window(Duration::from_secs(60)).unwrap(),
+            Duration::from_secs(120),
+        );
+    }
+
+    #[test]
+    fn inventory_freshness_window_rejects_overflow() {
+        assert!(matches!(
+            derive_inventory_freshness_window(Duration::MAX),
+            Err(InventoryFreshnessWindowOverflow {
+                poll_interval: Duration::MAX,
+            })
+        ));
+    }
+
     struct TaskDropFlag(Arc<AtomicBool>);
 
     impl Drop for TaskDropFlag {
@@ -4754,6 +4793,7 @@ mod tests {
                     deviation: float!(0.2),
                 },
                 usdc: None,
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(60),
                 assets: AssetsConfig {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
@@ -5459,6 +5499,7 @@ mod tests {
                     deviation: st0x_float_macro::float!(0.2),
                 },
                 usdc: None,
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(60),
                 assets: AssetsConfig {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
@@ -5992,6 +6033,7 @@ mod tests {
                     deviation: st0x_float_macro::float!(0.2),
                 },
                 usdc: None,
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(60),
                 assets: AssetsConfig {
                     // wrapped_equity_recovery ENABLED: recover_mint_state will set
@@ -6088,6 +6130,7 @@ mod tests {
                     deviation: st0x_float_macro::float!(0.2),
                 },
                 usdc: None,
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(60),
                 assets: AssetsConfig {
                     // wrapped_equity_recovery DISABLED: recover_mint_state keeps
@@ -9680,6 +9723,7 @@ mod tests {
                 chrono::Utc::now(),
             )
             .unwrap()
+            .with_rebalancing_sources_observed_at(chrono::Utc::now())
     }
 
     #[tokio::test]
@@ -9728,6 +9772,7 @@ mod tests {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 }),
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
@@ -9840,6 +9885,7 @@ mod tests {
             RebalancingServiceConfig {
                 equity: threshold,
                 usdc: Some(threshold),
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
@@ -9962,6 +10008,7 @@ mod tests {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 }),
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
                     equities: rebalancing_enabled_equities(&["AAPL"]),
@@ -10085,7 +10132,8 @@ mod tests {
                 ),
                 chrono::Utc::now(),
             )
-            .unwrap();
+            .unwrap()
+            .with_rebalancing_sources_observed_at(chrono::Utc::now());
 
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
@@ -10102,6 +10150,7 @@ mod tests {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 }),
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
                     equities: rebalancing_enabled_equities(&["AAPL"]),

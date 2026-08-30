@@ -2221,6 +2221,7 @@ mod tests {
                     deviation: float!(0.2),
                 },
                 usdc: None,
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(1800),
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
@@ -2369,6 +2370,7 @@ mod tests {
                     deviation: float!(0.2),
                 },
                 usdc: None,
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(1800),
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
@@ -2695,6 +2697,7 @@ mod tests {
                     deviation: float!(0.2),
                 },
                 usdc: None,
+                inventory_freshness_window: Duration::from_secs(60),
                 transfer_timeout: Duration::from_secs(1800),
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),

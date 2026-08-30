@@ -124,6 +124,7 @@ async fn direct_high_precision_sell_price_still_hedges() -> anyhow::Result<()> {
         .await?;
 
     poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Filled", 1).await;
+    poll_for_hedged_position(&mut bot, &infra.db_path, "AAPL").await;
 
     let pool = connect_db(&infra.db_path).await?;
 
