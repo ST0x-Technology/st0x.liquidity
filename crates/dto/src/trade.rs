@@ -396,6 +396,20 @@ impl<'de> Deserialize<'de> for TradeOutcome {
     }
 }
 
+/// The trading session an offchain counter-trade was recorded in.
+///
+/// Mirrors the execution crate's session model on the wire; the
+/// serialized variant names match, so view payloads and DTO rows spell
+/// the session identically. Onchain fills have no session -- `Trade`
+/// carries `None` for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub enum MarketSession {
+    Regular,
+    Extended,
+    Overnight,
+    Closed,
+}
+
 /// A completed onchain fill or terminal offchain counter-trade.
 #[derive(Debug, Clone, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -415,6 +429,12 @@ pub struct Trade {
     /// known.
     #[ts(type = "string")]
     pub shares: Positive<FractionalShares>,
+    /// The session the counter-trade was recorded in. `None` for onchain
+    /// fills, and for offchain rows serialized before the session was
+    /// recorded on terminal states.
+    #[serde(default)]
+    #[ts(rename = "marketSession")]
+    pub market_session: Option<MarketSession>,
     pub outcome: TradeOutcome,
 }
 
@@ -454,7 +474,7 @@ where
         TradeOutcome::Filled => true,
         TradeOutcome::Failed { .. } | TradeOutcome::Cancelled { .. } => false,
     };
-    let mut trade = serializer.serialize_struct("Trade", 7 + usize::from(is_filled))?;
+    let mut trade = serializer.serialize_struct("Trade", 8 + usize::from(is_filled))?;
     trade.serialize_field("id", &value.id)?;
     trade.serialize_field("occurredAt", &value.occurred_at)?;
     if is_filled {
@@ -464,6 +484,7 @@ where
     trade.serialize_field("direction", &value.direction)?;
     trade.serialize_field("symbol", &value.symbol)?;
     trade.serialize_field("shares", &value.shares)?;
+    trade.serialize_field("marketSession", &value.market_session)?;
     trade.serialize_field("outcome", &value.outcome)?;
     trade.end()
 }
@@ -728,6 +749,7 @@ mod tests {
     #[test]
     fn filled_trade_serializes_all_fields() {
         let trade = Trade {
+            market_session: None,
             id: "test-order-id".to_string(),
             occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             venue: TradingVenue::Alpaca,
@@ -744,12 +766,34 @@ mod tests {
         assert_eq!(json["shares"], json!("5.5"));
         assert_eq!(json["occurredAt"], json!("2023-11-14T22:13:20Z"));
         assert_eq!(json["filledAt"], json!("2023-11-14T22:13:20Z"));
+        assert_eq!(json["marketSession"], json!(null));
         assert_eq!(json["outcome"], json!({ "status": "filled" }));
+    }
+
+    #[test]
+    fn trade_serializes_the_market_session_when_present() {
+        let trade = Trade {
+            market_session: Some(MarketSession::Overnight),
+            id: "overnight-order-id".to_string(),
+            occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            venue: TradingVenue::Alpaca,
+            direction: Direction::Sell,
+            symbol: Symbol::new("TSLA").unwrap(),
+            shares: positive_shares("1"),
+            outcome: TradeOutcome::Filled,
+        };
+
+        let json = serde_json::to_value(&trade).expect("serialization should succeed");
+        assert_eq!(json["marketSession"], json!("Overnight"));
+
+        let restored: Trade = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.market_session, Some(MarketSession::Overnight));
     }
 
     #[test]
     fn trade_roundtrips_through_persistent_job_payload() {
         let trade = Trade {
+            market_session: None,
             id: "durable-order-id".to_string(),
             occurred_at: DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap(),
             venue: TradingVenue::Alpaca,
@@ -798,6 +842,7 @@ mod tests {
     #[test]
     fn failed_trade_serializes_error() {
         let trade = Trade {
+            market_session: None,
             id: "failed-order-id".to_string(),
             occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             venue: TradingVenue::Alpaca,
@@ -875,6 +920,7 @@ mod tests {
     #[test]
     fn cancelled_trade_roundtrips_explicit_zero_fill() {
         let trade = Trade {
+            market_session: None,
             id: "cancelled-order-id".to_string(),
             occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             venue: TradingVenue::Alpaca,
@@ -911,6 +957,7 @@ mod tests {
     #[test]
     fn cancelled_trade_roundtrips_all_null_provenance_in_job_payload() {
         let trade = Trade {
+            market_session: None,
             id: "legacy-cancelled-order-id".to_string(),
             occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             venue: TradingVenue::Alpaca,
@@ -1135,6 +1182,7 @@ mod tests {
     #[test]
     fn terminal_outcomes_v1_preserves_non_null_legacy_failure_shape() {
         let trade = Trade {
+            market_session: None,
             id: "failed-order-id".to_string(),
             occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             venue: TradingVenue::Alpaca,
@@ -1163,6 +1211,7 @@ mod tests {
     #[test]
     fn terminal_outcomes_v1_assumes_the_requested_quantity_when_acceptance_is_unknown() {
         let trade = Trade {
+            market_session: None,
             id: "failed-order-id".to_string(),
             occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             venue: TradingVenue::Alpaca,
@@ -1200,6 +1249,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("SPCX").unwrap(),
             shares: positive_shares("1"),
+            market_session: None,
             outcome: TradeOutcome::Filled,
         };
         let failed = Trade {
@@ -1229,6 +1279,7 @@ mod tests {
         let timestamp = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
         let older = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let trade = |id: &str, occurred_at, venue| Trade {
+            market_session: None,
             id: id.to_string(),
             occurred_at,
             venue,
@@ -1261,6 +1312,7 @@ mod tests {
         let earlier = DateTime::from_timestamp(1_700_000_000, 123_456_788).unwrap();
         let later = DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
         let trade = |id: &str, occurred_at| Trade {
+            market_session: None,
             id: id.to_string(),
             occurred_at,
             venue: TradingVenue::Alpaca,

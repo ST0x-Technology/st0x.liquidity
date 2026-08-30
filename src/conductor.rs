@@ -325,6 +325,7 @@ where
             .await?;
 
     rebuild_stale_offchain_order_projection(pool, &offchain_order_projection).await?;
+    rebuild_stale_terminal_session_projection(pool, &offchain_order_projection).await?;
 
     // Startup recovery runs before any job worker starts, so no concurrent
     // placement can race its broker re-drive -- it intentionally runs without
@@ -344,22 +345,100 @@ where
 
 const OFFCHAIN_ORDER_QUANTITY_PROVENANCE_REPAIR: &str = "offchain_order_quantity_provenance_v1";
 
+/// Terminal states gained `market_session` after the quantity-provenance
+/// repair shipped, so this needs its OWN checkpoint: a deployment that
+/// already recorded the older repair would otherwise skip the scan entirely
+/// and keep serving terminal rows that default to `Regular`.
+const OFFCHAIN_ORDER_TERMINAL_SESSION_REPAIR: &str = "offchain_order_terminal_session_v1";
+
+/// Rows written before `requested_shares`/`filled_shares` reached the live
+/// and terminal states.
+const QUANTITY_PROVENANCE_STALE_ROWS: &str = "SELECT EXISTS( \
+     SELECT 1 FROM offchain_order_view \
+     WHERE (json_type(payload, '$.Live.Submitted') IS NOT NULL \
+            AND json_type(payload, '$.Live.Submitted.requested_shares') IS NULL) \
+        OR (json_type(payload, '$.Live.PartiallyFilled') IS NOT NULL \
+            AND json_type(payload, '$.Live.PartiallyFilled.requested_shares') IS NULL) \
+        OR (json_type(payload, '$.Live.Cancelling') IS NOT NULL \
+            AND json_type(payload, '$.Live.Cancelling.requested_shares') IS NULL) \
+        OR (json_type(payload, '$.Live.Failed') IS NOT NULL \
+            AND (json_type(payload, '$.Live.Failed.requested_shares') IS NULL \
+                 OR json_type(payload, '$.Live.Failed.filled_shares') IS NULL)) \
+        OR (json_type(payload, '$.Live.Cancelled') IS NOT NULL \
+            AND (json_type(payload, '$.Live.Cancelled.requested_shares') IS NULL \
+                 OR json_type(payload, '$.Live.Cancelled.filled_shares') IS NULL)) \
+     LIMIT 1 \
+ )";
+
+/// Terminal rows written before the session propagated past acceptance. They
+/// carry no `market_session` key at all, so deserialization defaults them to
+/// `Regular` and `try_into_trade` would publish a historical extended-hours
+/// or overnight order as a regular-session one. The events still hold the
+/// truth, so a rebuild recovers it.
+const TERMINAL_SESSION_STALE_ROWS: &str = "SELECT EXISTS( \
+     SELECT 1 FROM offchain_order_view \
+     WHERE (json_type(payload, '$.Live.Filled') IS NOT NULL \
+            AND json_type(payload, '$.Live.Filled.market_session') IS NULL) \
+        OR (json_type(payload, '$.Live.Failed') IS NOT NULL \
+            AND json_type(payload, '$.Live.Failed.market_session') IS NULL) \
+        OR (json_type(payload, '$.Live.Cancelled') IS NOT NULL \
+            AND json_type(payload, '$.Live.Cancelled.market_session') IS NULL) \
+     LIMIT 1 \
+ )";
+
 async fn rebuild_stale_offchain_order_projection(
     pool: &SqlitePool,
     projection: &Projection<OffchainOrder>,
+) -> Result<(), st0x_event_sorcery::ProjectionError<OffchainOrder>> {
+    rebuild_projection_for_repair(
+        pool,
+        projection,
+        OFFCHAIN_ORDER_QUANTITY_PROVENANCE_REPAIR,
+        QUANTITY_PROVENANCE_STALE_ROWS,
+        "quantity provenance",
+    )
+    .await
+}
+
+async fn rebuild_stale_terminal_session_projection(
+    pool: &SqlitePool,
+    projection: &Projection<OffchainOrder>,
+) -> Result<(), st0x_event_sorcery::ProjectionError<OffchainOrder>> {
+    rebuild_projection_for_repair(
+        pool,
+        projection,
+        OFFCHAIN_ORDER_TERMINAL_SESSION_REPAIR,
+        TERMINAL_SESSION_STALE_ROWS,
+        "terminal market session",
+    )
+    .await
+}
+
+/// Runs one checkpointed projection repair: skip when its checkpoint is
+/// recorded, otherwise rebuild if `stale_rows` finds the old serialized
+/// shape, then record the checkpoint.
+///
+/// Each repair owns a checkpoint, so a later schema change is never masked by
+/// an earlier repair that already completed.
+async fn rebuild_projection_for_repair(
+    pool: &SqlitePool,
+    projection: &Projection<OffchainOrder>,
+    repair: &'static str,
+    stale_rows: &'static str,
+    shape: &'static str,
 ) -> Result<(), st0x_event_sorcery::ProjectionError<OffchainOrder>> {
     let repair_complete: bool = sqlx::query_scalar(
         "SELECT EXISTS( \
              SELECT 1 FROM projection_repair_checkpoint WHERE repair = ? \
          )",
     )
-    .bind(OFFCHAIN_ORDER_QUANTITY_PROVENANCE_REPAIR)
+    .bind(repair)
     .fetch_one(pool)
     .await?;
 
     if repair_complete {
         warn!(
-            repair = OFFCHAIN_ORDER_QUANTITY_PROVENANCE_REPAIR,
+            repair,
             "Skipping the offchain order projection repair scan because its checkpoint is complete"
         );
         return Ok(());
@@ -372,31 +451,12 @@ async fn rebuild_stale_offchain_order_projection(
     // next startup. A present JSON null is current; SQL NULL means the field is
     // absent from a projection row created before the corresponding schema
     // version.
-    let has_stale_rows: i64 = sqlx::query_scalar(
-        "SELECT EXISTS( \
-             SELECT 1 FROM offchain_order_view \
-             WHERE (json_type(payload, '$.Live.Submitted') IS NOT NULL \
-                    AND json_type(payload, '$.Live.Submitted.requested_shares') IS NULL) \
-                OR (json_type(payload, '$.Live.PartiallyFilled') IS NOT NULL \
-                    AND json_type(payload, '$.Live.PartiallyFilled.requested_shares') IS NULL) \
-                OR (json_type(payload, '$.Live.Cancelling') IS NOT NULL \
-                    AND json_type(payload, '$.Live.Cancelling.requested_shares') IS NULL) \
-                OR (json_type(payload, '$.Live.Failed') IS NOT NULL \
-                    AND (json_type(payload, '$.Live.Failed.requested_shares') IS NULL \
-                         OR json_type(payload, '$.Live.Failed.filled_shares') IS NULL)) \
-                OR (json_type(payload, '$.Live.Cancelled') IS NOT NULL \
-                    AND (json_type(payload, '$.Live.Cancelled.requested_shares') IS NULL \
-                         OR json_type(payload, '$.Live.Cancelled.filled_shares') IS NULL)) \
-             LIMIT 1 \
-         )",
-    )
-    .fetch_one(pool)
-    .await?;
+    let has_stale_rows: i64 = sqlx::query_scalar(stale_rows).fetch_one(pool).await?;
 
     if has_stale_rows != 0 {
         info!(
-            "Offchain order projection rows predate quantity provenance; \
-             rebuilding the full projection"
+            shape,
+            "Offchain order projection rows predate {shape}; rebuilding the full projection"
         );
         projection.rebuild_all().await?;
     }
@@ -405,7 +465,7 @@ async fn rebuild_stale_offchain_order_projection(
         "INSERT INTO projection_repair_checkpoint (repair) VALUES (?) \
          ON CONFLICT (repair) DO NOTHING",
     )
-    .bind(OFFCHAIN_ORDER_QUANTITY_PROVENANCE_REPAIR)
+    .bind(repair)
     .execute(pool)
     .await?;
 
@@ -6661,6 +6721,142 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    /// A terminal row written before the session reached terminal states has
+    /// no `market_session` key, so it deserializes as `Regular` and would
+    /// publish a historical extended-hours order as a regular-session trade.
+    /// The events still carry the truth, so the repair must rebuild it.
+    #[tokio::test]
+    async fn interrupted_schema_change_rebuilds_terminal_market_session() {
+        let pool = setup_test_db().await;
+        let (store, projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+            .build(noop_order_placer())
+            .await
+            .unwrap();
+        let filled_id = OffchainOrderId::new();
+
+        place_and_accept_extended_projection_order(&store, &filled_id).await;
+        store
+            .send(
+                &filled_id,
+                OffchainOrderCommand::CompleteFill {
+                    price: Usd::new(float!(100)),
+                    filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        remove_projection_field(&pool, &filled_id, "$.Live.Filled.market_session").await;
+        assert!(
+            matches!(
+                projection.load(&filled_id).await.unwrap().unwrap(),
+                OffchainOrder::Filled {
+                    market_session: MarketSession::Regular,
+                    ..
+                }
+            ),
+            "the stripped row must read back as Regular, which is the mislabeling"
+        );
+
+        rebuild_stale_terminal_session_projection(&pool, &projection)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                projection.load(&filled_id).await.unwrap().unwrap(),
+                OffchainOrder::Filled {
+                    market_session: MarketSession::Extended,
+                    ..
+                }
+            ),
+            "the rebuild must recover the accepted session from the events"
+        );
+    }
+
+    /// The quantity-provenance checkpoint must not mask this repair: a
+    /// deployment that already completed the older repair still has to
+    /// rebuild terminal rows that predate the session field.
+    #[tokio::test]
+    async fn completed_quantity_repair_does_not_skip_the_terminal_session_repair() {
+        let pool = setup_test_db().await;
+        let (store, projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+            .build(noop_order_placer())
+            .await
+            .unwrap();
+        let filled_id = OffchainOrderId::new();
+
+        place_and_accept_extended_projection_order(&store, &filled_id).await;
+        store
+            .send(
+                &filled_id,
+                OffchainOrderCommand::CompleteFill {
+                    price: Usd::new(float!(100)),
+                    filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        rebuild_stale_offchain_order_projection(&pool, &projection)
+            .await
+            .unwrap();
+        remove_projection_field(&pool, &filled_id, "$.Live.Filled.market_session").await;
+
+        rebuild_stale_terminal_session_projection(&pool, &projection)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                projection.load(&filled_id).await.unwrap().unwrap(),
+                OffchainOrder::Filled {
+                    market_session: MarketSession::Extended,
+                    ..
+                }
+            ),
+            "the session repair owns its own checkpoint, so the completed \
+             quantity repair must not skip it"
+        );
+    }
+
+    /// Accepts with the broker echoing extended hours, so the terminal state
+    /// carries a session that `Regular` would visibly contradict.
+    async fn place_and_accept_extended_projection_order(
+        store: &Store<OffchainOrder>,
+        id: &OffchainOrderId,
+    ) {
+        store
+            .send(
+                id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("SPCX").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::ExtendedHoursLimit {
+                        limit_price: Positive::new(Usd::new(float!(100))).unwrap(),
+                        close_flatten: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new(id),
+                    placed_shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    submitted_at: Utc::now(),
+                    is_extended_hours: true,
+                    limit_price: Some(Positive::new(Usd::new(float!(100))).unwrap()),
+                },
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -14418,6 +14614,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let order_id = OffchainOrderId::new();
         let order = OffchainOrder::Cancelled {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares: Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap(),
             requested_shares: Some(
@@ -14451,6 +14648,7 @@ mod tests {
         let order_id = OffchainOrderId::new();
         let broker_cancelled_at = Utc::now();
         let order = OffchainOrder::Cancelled {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares: Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap(),
             requested_shares: Some(
@@ -14604,6 +14802,7 @@ mod tests {
         let offchain_order_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
 
         let cancelled = OffchainOrder::Cancelled {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares,
             requested_shares: Some(shares),
@@ -15090,6 +15289,7 @@ mod tests {
         // here is unexpected. Dispatch must surface a retryable error rather than
         // clear the claim -- it must not fail an order that has already filled.
         let filled_state = OffchainOrder::Filled {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares,
             direction: Direction::Sell,
@@ -15145,6 +15345,7 @@ mod tests {
         let offchain_order_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
 
         let failed_state = OffchainOrder::Failed {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares,
             requested_shares: None,
@@ -15202,6 +15403,7 @@ mod tests {
         let offchain_order_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
 
         let failed_state = OffchainOrder::Failed {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares,
             requested_shares: None,
@@ -15663,6 +15865,7 @@ mod tests {
         let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
         let offchain_order_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
         let cancelled_partial = OffchainOrder::Cancelled {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares,
             requested_shares: Some(shares),

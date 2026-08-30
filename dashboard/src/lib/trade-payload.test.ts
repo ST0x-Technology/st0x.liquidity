@@ -14,6 +14,7 @@ const validTrade = (overrides: Record<string, unknown> = {}): unknown => ({
   direction: 'sell',
   symbol: 'AAPL',
   shares: '1.25',
+  marketSession: null,
   outcome: { status: 'filled' },
   ...overrides
 })
@@ -104,6 +105,26 @@ describe('trade payload validation', () => {
     ]
   ])('rejects an invalid %s', (_case, overrides, path) => {
     expect(() => parseTrade(validTrade(overrides))).toThrow(`Invalid trade payload at ${path}`)
+  })
+
+  it('retains a valid market session', () => {
+    expect(parseTrade(validTrade({ marketSession: 'Overnight' }))).toEqual(
+      validTrade({ marketSession: 'Overnight' })
+    )
+  })
+
+  it('normalizes an absent market session to null', () => {
+    // Onchain fills and rows serialized before the session was recorded omit
+    // the field entirely; that is not a payload error.
+    const { marketSession: _omitted, ...withoutSession } = validTrade() as Record<string, unknown>
+
+    expect(parseTrade(withoutSession)).toEqual({ ...withoutSession, marketSession: null })
+  })
+
+  it('rejects an unknown market session at its own path', () => {
+    expect(() => parseTrade(validTrade({ marketSession: 'Twilight' }))).toThrow(
+      'Invalid trade payload at marketSession'
+    )
   })
 
   it('accepts explicit unknown provenance without inventing zero quantities', () => {
