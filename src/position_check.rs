@@ -1885,7 +1885,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("broker-eh-1"),
                     placed_shares: shares,
                     submitted_at: chrono::Utc::now(),
-                    market_session: MarketSession::Extended,
+                    is_extended_hours: true,
                     limit_price: Some(limit_price),
                 },
             )
@@ -3698,7 +3698,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("alpaca-eh-1"),
                     placed_shares: shares,
                     submitted_at: chrono::Utc::now(),
-                    market_session: MarketSession::Extended,
+                    is_extended_hours: true,
                     limit_price: Some(limit_price),
                 },
             )
@@ -4053,7 +4053,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("test-accept"),
                     placed_shares: shares,
                     submitted_at: chrono::Utc::now(),
-                    market_session: st0x_execution::MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )

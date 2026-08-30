@@ -52,7 +52,7 @@ use st0x_execution::Symbol;
 #[cfg(any(test, feature = "test-support"))]
 use st0x_execution::{
     CancellationOutcome, ClientOrderId, Direction, ExecutorOrderId, FractionalShares, LimitOrder,
-    MarketOrder, MarketSession, Positive, SupportedExecutor,
+    MarketOrder, Positive, SupportedExecutor,
 };
 #[cfg(any(test, feature = "test-support"))]
 use st0x_finance::Usd;
@@ -305,7 +305,7 @@ pub async fn seed_simulated_hedge_latency_history(
                         executor_order_id: executor_order_id.clone(),
                         placed_shares: amount,
                         submitted_at,
-                        market_session: MarketSession::Regular,
+                        is_extended_hours: false,
                         limit_price: None,
                     },
                 )

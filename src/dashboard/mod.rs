@@ -485,8 +485,7 @@ mod tests {
     use st0x_dto::{Direction, Trade, TradingVenue};
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::{
-        ClientOrderId, ExecutorOrderId, FractionalShares, MarketSession, Positive,
-        SupportedExecutor, Symbol, Usd,
+        ClientOrderId, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol, Usd,
     };
     use st0x_float_macro::float;
 
@@ -900,7 +899,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("broker-fill"),
                     placed_shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
                     submitted_at: chrono::Utc::now(),
-                    market_session: MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )

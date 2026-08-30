@@ -288,7 +288,7 @@ pub(crate) async fn place_offchain_order_at_broker(
                 executor_order_id: result.executor_order_id,
                 placed_shares: result.placed_shares,
                 submitted_at: Utc::now(),
-                market_session: market_session_from_extended(result.is_extended_hours),
+                is_extended_hours: result.is_extended_hours,
                 limit_price: result.limit_price,
             }
         }
@@ -394,6 +394,28 @@ fn market_session_from_extended(is_extended_hours: bool) -> MarketSession {
     }
 }
 
+/// Reconciles the requested session with the broker's echoed
+/// extended-hours flag at acceptance time.
+///
+/// An agreeing echo keeps the requested session exact -- the bool cannot
+/// distinguish Extended from Overnight, so the request is the only
+/// source of that distinction. A contradicting echo means duplicate
+/// adoption surfaced an order with different terms; the accepted record
+/// then describes the order the broker actually holds, derived from the
+/// echo alone.
+fn accepted_market_session(requested: MarketSession, is_extended_hours: bool) -> MarketSession {
+    let requested_extended = match requested {
+        MarketSession::Extended | MarketSession::Overnight => true,
+        MarketSession::Regular | MarketSession::Closed => false,
+    };
+
+    if requested_extended == is_extended_hours {
+        requested
+    } else {
+        market_session_from_extended(is_extended_hours)
+    }
+}
+
 fn placed_event(
     symbol: Symbol,
     shares: Positive<FractionalShares>,
@@ -418,7 +440,7 @@ fn placed_event(
         direction,
         executor,
         placed_at,
-        is_extended_hours: requested_market_session == MarketSession::Extended,
+        market_session: requested_market_session,
         limit_price,
         client_order_id: Some(client_order_id.clone()),
         close_flatten,
@@ -593,7 +615,7 @@ fn originate_offchain_order(event: &OffchainOrderEvent) -> Option<OffchainOrder>
             direction,
             executor,
             placed_at,
-            is_extended_hours,
+            market_session,
             limit_price: _,
             client_order_id: _,
             close_flatten,
@@ -603,7 +625,7 @@ fn originate_offchain_order(event: &OffchainOrderEvent) -> Option<OffchainOrder>
             direction: *direction,
             executor: *executor,
             placed_at: *placed_at,
-            market_session: market_session_from_extended(*is_extended_hours),
+            market_session: *market_session,
             close_flatten: *close_flatten,
         }),
         _ => None,
@@ -731,7 +753,7 @@ impl EventSourced for OffchainOrder {
 
     const AGGREGATE_TYPE: &'static str = "OffchainOrder";
     const PROJECTION: Table = Table("offchain_order_view");
-    const SCHEMA_VERSION: u64 = 4;
+    const SCHEMA_VERSION: u64 = 5;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         originate_offchain_order(event)
@@ -1050,16 +1072,33 @@ impl EventSourced for OffchainOrder {
                 executor_order_id,
                 placed_shares,
                 submitted_at,
-                market_session,
+                is_extended_hours,
                 limit_price,
             } => match self {
-                Self::Pending { .. } => Ok(vec![OffchainOrderEvent::Accepted {
-                    executor_order_id,
-                    placed_shares,
-                    submitted_at,
-                    market_session,
-                    limit_price,
-                }]),
+                Self::Pending {
+                    symbol,
+                    market_session: requested,
+                    ..
+                } => {
+                    let market_session = accepted_market_session(*requested, is_extended_hours);
+                    if market_session != *requested {
+                        warn!(
+                            %symbol,
+                            ?requested,
+                            adopted = ?market_session,
+                            "Broker echo contradicts the requested session; recording the \
+                             adopted order's terms"
+                        );
+                    }
+
+                    Ok(vec![OffchainOrderEvent::Accepted {
+                        executor_order_id,
+                        placed_shares,
+                        submitted_at,
+                        market_session,
+                        limit_price,
+                    }])
+                }
                 // Idempotent: a retried placement whose order already left
                 // `Pending` (acceptance recorded, or already terminal) is a no-op.
                 Self::Submitted { .. }
@@ -2534,8 +2573,9 @@ pub struct OrderPlacementResult {
     /// the order a prior attempt already created -- possibly with different
     /// session terms (e.g. a regular-hours market retry adopting a still-live
     /// extended-hours limit order after a lost placement response). The
-    /// aggregate must record THIS value so the regular-open cancel-and-replace
-    /// sweep (which keys off `is_extended_hours`) converges the adopted order.
+    /// `MarkAccepted` handler reconciles this echo against the requested
+    /// session, so the regular-open cancel-and-replace sweep (which keys off
+    /// the recorded `market_session`) converges the adopted order.
     pub is_extended_hours: bool,
     /// The broker-held limit price, if any. Same adoption semantics as
     /// `is_extended_hours`.
@@ -2905,10 +2945,13 @@ pub enum OffchainOrderCommand {
         executor_order_id: ExecutorOrderId,
         placed_shares: Positive<FractionalShares>,
         submitted_at: DateTime<Utc>,
-        /// Broker-adopted session terms. Usually match the requested
-        /// [`CounterTradeOrderKind`], but may differ when a duplicate
-        /// client_order_id adopts an existing broker order.
-        market_session: MarketSession,
+        /// The broker's echoed extended-hours flag, verbatim. Usually
+        /// agrees with the requested session, but may contradict it when
+        /// a duplicate client_order_id adopts an existing broker order
+        /// with different terms. The handler reconciles it against the
+        /// pending order's requested session, since the broker never
+        /// echoes a session of its own.
+        is_extended_hours: bool,
         limit_price: Option<Positive<Usd>>,
     },
     /// Outcome command for a placement-initiated failure: the broker call errored
@@ -2938,12 +2981,18 @@ pub enum OffchainOrderEvent {
         direction: Direction,
         executor: SupportedExecutor,
         placed_at: DateTime<Utc>,
-        /// Whether this order was placed during extended hours as a limit
-        /// order. Used by the cancel-and-replace logic to avoid cancelling
-        /// regular-hours market orders. Defaults to `false` for events
-        /// persisted before this field existed.
-        #[serde(default)]
-        is_extended_hours: bool,
+        /// The exact session this order was requested in. Used by the
+        /// cancel-and-replace logic to avoid cancelling regular-hours
+        /// market orders. Replaces the retired `is_extended_hours: bool`,
+        /// which the alias still accepts on replay (`true` -> Extended,
+        /// `false` -> Regular); events predating both encodings default
+        /// to Regular.
+        #[serde(
+            default = "regular_market_session",
+            alias = "is_extended_hours",
+            deserialize_with = "deserialize_market_session"
+        )]
+        market_session: MarketSession,
         /// The limit price submitted to the broker for an extended-hours order
         /// (`None` for market orders). Audit-only: not applied to entity state,
         /// recorded so the actual submitted price is reconstructable from the
@@ -3309,7 +3358,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("TEST-ACCEPT"),
                     placed_shares: noop_placed_shares(requested),
                     submitted_at: Utc::now(),
-                    market_session: MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -3357,7 +3406,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("TEST-ACCEPT"),
                     placed_shares: noop_placed_shares(requested),
                     submitted_at: Utc::now(),
-                    market_session: MarketSession::Extended,
+                    is_extended_hours: true,
                     limit_price: Some(Positive::new(Usd::new(float!(100))).unwrap()),
                 },
             )
@@ -3438,7 +3487,7 @@ mod tests {
             direction: Direction::Buy,
             executor: SupportedExecutor::DryRun,
             placed_at: Utc::now(),
-            is_extended_hours: true,
+            market_session: MarketSession::Extended,
             limit_price: Some(Positive::new(Usd::new(float!(195.25))).unwrap()),
             client_order_id: Some(ClientOrderId::from_uuid(uuid::Uuid::new_v4())),
             close_flatten: true,
@@ -3478,6 +3527,164 @@ mod tests {
             !OffchainOrder::originate(&legacy).unwrap().close_flatten(),
             "the legacy event default must propagate into pending aggregate state"
         );
+    }
+
+    fn overnight_placed_event() -> OffchainOrderEvent {
+        OffchainOrderEvent::Placed {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::DryRun,
+            placed_at: Utc::now(),
+            market_session: MarketSession::Overnight,
+            limit_price: Some(Positive::new(Usd::new(float!(195.25))).unwrap()),
+            client_order_id: Some(ClientOrderId::from_uuid(uuid::Uuid::new_v4())),
+            close_flatten: false,
+        }
+    }
+
+    #[test]
+    fn placed_event_round_trips_the_exact_market_session() {
+        // The event must persist the session verbatim -- an overnight
+        // placement replayed later is still Overnight, never collapsed
+        // into the extended-hours bool it replaced.
+        let event = overnight_placed_event();
+
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["Placed"]["market_session"], json!("Overnight"));
+        assert_eq!(value["Placed"].get("is_extended_hours"), None);
+
+        let replayed: OffchainOrderEvent = serde_json::from_value(value).unwrap();
+        let OffchainOrderEvent::Placed { market_session, .. } = &replayed else {
+            panic!("expected Placed, got {replayed:?}");
+        };
+        assert_eq!(*market_session, MarketSession::Overnight);
+
+        let OffchainOrder::Pending { market_session, .. } =
+            OffchainOrder::originate(&replayed).unwrap()
+        else {
+            panic!("expected Pending state");
+        };
+        assert_eq!(market_session, MarketSession::Overnight);
+    }
+
+    #[test]
+    fn placed_event_replays_legacy_extended_hours_bools_as_sessions() {
+        // Events persisted before the session field carried
+        // `is_extended_hours: bool`; each polarity must map to the
+        // session it meant at the time, and the meaning must survive
+        // into the originated aggregate state.
+        for (legacy_bool, expected) in [
+            (true, MarketSession::Extended),
+            (false, MarketSession::Regular),
+        ] {
+            let mut value = serde_json::to_value(overnight_placed_event()).unwrap();
+            let placed = value["Placed"].as_object_mut().unwrap();
+            placed.remove("market_session");
+            placed.insert("is_extended_hours".to_string(), json!(legacy_bool));
+
+            let replayed: OffchainOrderEvent = serde_json::from_value(value).unwrap();
+            let OffchainOrder::Pending { market_session, .. } =
+                OffchainOrder::originate(&replayed).unwrap()
+            else {
+                panic!("expected Pending state");
+            };
+            assert_eq!(
+                market_session, expected,
+                "legacy is_extended_hours = {legacy_bool} must replay as {expected:?}"
+            );
+        }
+    }
+
+    fn pending_with_session(market_session: MarketSession) -> OffchainOrder {
+        OffchainOrder::Pending {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::DryRun,
+            placed_at: Utc::now(),
+            market_session,
+            close_flatten: false,
+        }
+    }
+
+    fn mark_accepted_with_echo(is_extended_hours: bool) -> OffchainOrderCommand {
+        OffchainOrderCommand::MarkAccepted {
+            executor_order_id: ExecutorOrderId::new("ACCEPT-ECHO"),
+            placed_shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            submitted_at: Utc::now(),
+            is_extended_hours,
+            limit_price: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_accepted_preserves_the_requested_session_when_the_echo_agrees() {
+        // The broker echoes only a bool; an agreeing echo must never
+        // collapse the requested session -- Overnight stays Overnight.
+        for (requested, echo) in [
+            (MarketSession::Overnight, true),
+            (MarketSession::Extended, true),
+            (MarketSession::Regular, false),
+        ] {
+            let pending = pending_with_session(requested);
+
+            let events = pending
+                .transition(mark_accepted_with_echo(echo), &noop_order_placer())
+                .await
+                .unwrap();
+
+            let [OffchainOrderEvent::Accepted { market_session, .. }] = events.as_slice() else {
+                panic!("expected a single Accepted event, got {events:?}");
+            };
+            assert_eq!(
+                *market_session, requested,
+                "requested {requested:?} with agreeing echo {echo} must stay {requested:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_accepted_records_the_adopted_terms_on_an_echo_mismatch() {
+        // A contradicting echo means duplicate adoption surfaced an
+        // order with different session terms; the record must describe
+        // the order the broker actually holds, not the request.
+        for (requested, echo, expected) in [
+            (MarketSession::Overnight, false, MarketSession::Regular),
+            (MarketSession::Extended, false, MarketSession::Regular),
+            (MarketSession::Regular, true, MarketSession::Extended),
+        ] {
+            let pending = pending_with_session(requested);
+
+            let events = pending
+                .transition(mark_accepted_with_echo(echo), &noop_order_placer())
+                .await
+                .unwrap();
+
+            let [OffchainOrderEvent::Accepted { market_session, .. }] = events.as_slice() else {
+                panic!("expected a single Accepted event, got {events:?}");
+            };
+            assert_eq!(
+                *market_session, expected,
+                "requested {requested:?} with echo {echo} must record {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn placed_event_without_any_session_key_replays_as_regular() {
+        // The oldest events predate both encodings entirely.
+        let mut value = serde_json::to_value(overnight_placed_event()).unwrap();
+        value["Placed"]
+            .as_object_mut()
+            .unwrap()
+            .remove("market_session");
+
+        let replayed: OffchainOrderEvent = serde_json::from_value(value).unwrap();
+        let OffchainOrderEvent::Placed { market_session, .. } = &replayed else {
+            panic!("expected Placed, got {replayed:?}");
+        };
+        assert_eq!(*market_session, MarketSession::Regular);
     }
 
     #[test]
@@ -4093,7 +4300,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("TEST-ACCEPT"),
                     placed_shares: accepted,
                     submitted_at: Utc::now(),
-                    market_session: MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -4555,7 +4762,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("SETUP"),
                     placed_shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
                     submitted_at: Utc::now(),
-                    market_session: MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -4644,7 +4851,7 @@ mod tests {
                             placed_shares: Positive::new(FractionalShares::new(float!(100)))
                                 .unwrap(),
                             submitted_at: Utc::now(),
-                            market_session: MarketSession::Regular,
+                            is_extended_hours: false,
                             limit_price: None,
                         },
                     )
@@ -4789,7 +4996,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("SECOND-ACCEPT"),
                     placed_shares: Positive::new(FractionalShares::new(float!(50))).unwrap(),
                     submitted_at: Utc::now(),
-                    market_session: MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -4871,7 +5078,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("LATE-ACCEPT"),
                     placed_shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
                     submitted_at: Utc::now(),
-                    market_session: MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -6111,7 +6318,7 @@ mod tests {
             direction: Direction::Sell,
             executor: SupportedExecutor::DryRun,
             placed_at: Utc::now(),
-            is_extended_hours: false,
+            market_session: MarketSession::Regular,
             limit_price: None,
             client_order_id: None,
             close_flatten: false,
@@ -6202,7 +6409,7 @@ mod tests {
                 direction: Direction::Sell,
                 executor: SupportedExecutor::DryRun,
                 placed_at,
-                is_extended_hours: false,
+                market_session: MarketSession::Regular,
                 limit_price: None,
                 client_order_id: None,
                 close_flatten: false,
