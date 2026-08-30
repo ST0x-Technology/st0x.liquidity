@@ -30,6 +30,12 @@ use st0x_dto::Statement;
 use st0x_execution::MockExecutorCtx;
 
 use crate::conductor::{ConductorStartupTokens, DatabasePools, SupervisorStartupTokens};
+#[cfg(any(test, feature = "test-support"))]
+use crate::inventory::job::{
+    PollBaseWalletUnwrappedEquity, PollBaseWalletUsdc, PollBaseWalletWrappedEquity,
+    PollEthereumWalletUsdc, PollInflightEquity, PollOffchainInventory, PollOnchainEquity,
+    PollOnchainUsdc,
+};
 use crate::trading::offchain::hedge::HedgeJobQueue;
 use crate::trading::onchain::trade_accountant::DexTradeAccountingJobQueue;
 
@@ -101,6 +107,23 @@ pub fn check_positions_job_type() -> &'static str {
 #[cfg(any(test, feature = "test-support"))]
 pub fn portfolio_snapshot_job_type() -> &'static str {
     std::any::type_name::<portfolio_snapshot::PortfolioSnapshotJob>()
+}
+/// Returns apalis job type identifiers for jobs that always leave a scheduled
+/// successor in the persistent queue.
+#[cfg(any(test, feature = "test-support"))]
+pub fn perpetual_job_types() -> [&'static str; 10] {
+    [
+        std::any::type_name::<position_check::CheckPositions>(),
+        portfolio_snapshot_job_type(),
+        std::any::type_name::<PollInflightEquity>(),
+        std::any::type_name::<PollOnchainEquity>(),
+        std::any::type_name::<PollOnchainUsdc>(),
+        std::any::type_name::<PollEthereumWalletUsdc>(),
+        std::any::type_name::<PollBaseWalletUsdc>(),
+        std::any::type_name::<PollBaseWalletUnwrappedEquity>(),
+        std::any::type_name::<PollBaseWalletWrappedEquity>(),
+        std::any::type_name::<PollOffchainInventory>(),
+    ]
 }
 #[cfg(any(test, feature = "test-support"))]
 pub use conductor::job::{FailureInjector, JobKind};
