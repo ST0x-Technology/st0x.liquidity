@@ -127,6 +127,7 @@ mod tests {
     #[test]
     fn statement_trade_update_serializes_with_type_tag() {
         let trade = Trade {
+            market_session: None,
             id: "0x0000000000000000000000000000000000000000000000000000000000000000:0".to_string(),
             occurred_at: Utc::now(),
             venue: TradingVenue::Raindex,

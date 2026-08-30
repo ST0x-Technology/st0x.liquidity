@@ -19,6 +19,7 @@ const staleTrade: Trade = {
   direction: 'buy',
   symbol: 'SPCX',
   shares: '1',
+  marketSession: null,
   outcome: { status: 'filled' }
 }
 
@@ -29,6 +30,7 @@ const failedTrade = (id: string, overrides: Partial<Trade> = {}): Trade => ({
   direction: 'buy',
   symbol: 'SPCX',
   shares: '1',
+  marketSession: null,
   outcome: {
     status: 'failed',
     error: 'broker rejected remainder',
@@ -156,6 +158,7 @@ describe('TradeHistoryPanel', () => {
       direction: 'buy',
       symbol: 'COIN',
       shares: '1',
+      marketSession: null,
       outcome: { status: 'filled' }
     }
     const fetchMock = vi.fn((_input: RequestInfo | URL) =>
@@ -193,6 +196,36 @@ describe('TradeHistoryPanel', () => {
     target.remove()
   })
 
+  it('marks overnight trades next to their venue and leaves regular rows unmarked', async () => {
+    const overnightTrade: Trade = {
+      id: 'overnight-counter-trade',
+      occurredAt: '2026-08-31T01:00:00Z',
+      venue: 'alpaca',
+      direction: 'buy',
+      symbol: 'RKLB',
+      shares: '1',
+      marketSession: 'Overnight',
+      outcome: { status: 'filled' }
+    }
+    const fetchMock = vi.fn((_input: RequestInfo | URL) =>
+      Promise.resolve(tradeResponse([overnightTrade, staleTrade], 2))
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { target } = mountPanel()
+
+    await vi.waitFor(() => {
+      expect(target.textContent).toContain('RKLB')
+      expect(target.textContent).toContain('· Overnight')
+    })
+
+    // staleTrade carries no session, so exactly one row is marked.
+    const markers = target.textContent.match(/· Overnight/g)
+    expect(markers).toHaveLength(1)
+
+    target.remove()
+  })
+
   it('keeps downgraded Raindex rows visible for a Bebop-only fallback filter', async () => {
     const downgradedBebop: Trade = {
       id: `0x${'b'.repeat(64)}:194`,
@@ -201,6 +234,7 @@ describe('TradeHistoryPanel', () => {
       direction: 'buy',
       symbol: 'DOWNGRADED',
       shares: '1',
+      marketSession: null,
       outcome: { status: 'filled' }
     }
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
@@ -281,6 +315,7 @@ describe('TradeHistoryPanel', () => {
       direction: 'buy',
       symbol: 'COIN',
       shares: '1',
+      marketSession: null,
       outcome: { status: 'filled' }
     }
     vi.stubGlobal(

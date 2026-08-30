@@ -3871,6 +3871,7 @@ mod tests {
             .unwrap();
 
         let filled = OffchainOrder::Filled {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares,
             direction: Direction::Sell,
@@ -3993,6 +3994,7 @@ mod tests {
             .unwrap();
 
         let failed = OffchainOrder::Failed {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares,
             requested_shares: Some(shares),
@@ -4083,6 +4085,7 @@ mod tests {
             .unwrap();
 
         let failed = OffchainOrder::Failed {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares,
             requested_shares: Some(shares),
