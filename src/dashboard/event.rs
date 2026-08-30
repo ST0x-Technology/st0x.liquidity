@@ -1411,7 +1411,7 @@ mod tests {
                     executor_order_id: st0x_execution::ExecutorOrderId::new("broker-order"),
                     placed_shares: shares,
                     submitted_at: chrono::Utc::now(),
-                    market_session: st0x_execution::MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -2832,7 +2832,7 @@ mod tests {
                     )
                     .unwrap(),
                     submitted_at: now,
-                    market_session: st0x_execution::MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -2919,7 +2919,7 @@ mod tests {
                     )
                     .unwrap(),
                     submitted_at: now,
-                    market_session: st0x_execution::MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -3060,7 +3060,7 @@ mod tests {
                     executor_order_id: st0x_execution::ExecutorOrderId::new("partial-cancel"),
                     placed_shares: shares,
                     submitted_at: now,
-                    market_session: st0x_execution::MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )

@@ -514,8 +514,7 @@ mod tests {
     use st0x_event_sorcery::{Store, StoreBuilder};
     use st0x_evm::Chain;
     use st0x_execution::{
-        ClientOrderId, Direction, ExecutorOrderId, FractionalShares, MarketSession, Positive,
-        SupportedExecutor,
+        ClientOrderId, Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor,
     };
     use st0x_finance::Usd;
     use st0x_float_macro::float;
@@ -611,7 +610,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("broker"),
                     placed_shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
                     submitted_at: Utc::now(),
-                    market_session: MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )

@@ -1315,8 +1315,7 @@ pub mod position {
     mod tests {
         use st0x_event_sorcery::{load_entity, send_command};
         use st0x_execution::{
-            ClientOrderId, Direction, ExecutorOrderId, FractionalShares, MarketSession,
-            SupportedExecutor, Symbol,
+            ClientOrderId, Direction, ExecutorOrderId, FractionalShares, SupportedExecutor, Symbol,
         };
         use st0x_finance::{Positive, Usd};
         use st0x_float_macro::float;
@@ -1365,7 +1364,7 @@ pub mod position {
                     executor_order_id: ExecutorOrderId::new("seed-accept"),
                     placed_shares: positive_shares("0.5"),
                     submitted_at: chrono::Utc::now(),
-                    market_session: MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
                 noop_order_placer(),
