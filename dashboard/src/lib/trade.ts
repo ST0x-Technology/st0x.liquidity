@@ -16,6 +16,7 @@ export const normalizeTrade = (trade: Trade | LegacyTrade): Trade => {
     direction: trade.direction,
     symbol: trade.symbol,
     shares: trade.shares,
+    marketSession: null,
     outcome: { status: 'filled' }
   }
 }

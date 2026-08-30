@@ -1176,6 +1176,7 @@ impl Reactor for Broadcaster {
                             direction,
                             symbol,
                             shares: Positive::new(FractionalShares::new(amount))?,
+                            market_session: None,
                             outcome: TradeOutcome::Filled,
                         })
                         .await?;
@@ -1367,6 +1368,7 @@ mod tests {
 
     fn test_trade() -> Trade {
         Trade {
+            market_session: None,
             id: "terminal-trade-1".to_string(),
             occurred_at: chrono::Utc::now(),
             venue: TradingVenue::Alpaca,

@@ -3819,6 +3819,7 @@ mod tests {
             .unwrap();
 
         let failed_order = OffchainOrder::Failed {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares: positive_shares("1"),
             requested_shares: None,
@@ -3908,6 +3909,7 @@ mod tests {
             .unwrap();
 
         let failed_order = OffchainOrder::Failed {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares: positive_shares("1"),
             requested_shares: None,
@@ -4145,6 +4147,7 @@ mod tests {
             .unwrap();
 
         let cancelled_order = OffchainOrder::Cancelled {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares: positive_shares("1"),
             requested_shares: Some(positive_shares("1")),

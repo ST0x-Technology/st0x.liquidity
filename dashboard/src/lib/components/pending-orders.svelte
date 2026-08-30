@@ -16,6 +16,7 @@
     submittedAt: string | null
     sharesFilled: string | null
     avgPrice: string | null
+    marketSession: string
   }
 
   const POLL_INTERVAL_MS = 5000
@@ -110,6 +111,10 @@
             <span class="font-mono font-medium">{order.symbol}</span>
 
             <span class="font-mono">{order.shares}</span>
+
+            {#if order.marketSession !== 'Regular'}
+              <span class="text-muted-foreground">· {order.marketSession}</span>
+            {/if}
 
             {#if order.sharesFilled}
               <span class="text-muted-foreground">filled: {order.sharesFilled}</span>

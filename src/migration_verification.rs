@@ -866,6 +866,7 @@ mod tests {
                 error: "rejected".to_string(),
                 placed_at: now,
                 failed_at: now,
+                market_session: MarketSession::Regular,
             })
             .is_empty()
         );
