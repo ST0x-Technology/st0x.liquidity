@@ -123,10 +123,14 @@ decision.
 | [0008](0008-counter-trading-during-dividend-freeze.md)                  | Counter-trading (broker hedging) during a dividend freeze                            | Proposed |
 | [0009](0009-record-overfill-as-acceptance.md)                           | Record a broker over-fill as an acceptance, not a failure                            | Accepted |
 | [0010](0010-bounded-pending-ack-set-for-cross-process-exactly-once.md)  | Bounded pending-acknowledgement set for cross-process exactly-once                   | Accepted |
+| [0013](0013-equity-family-side-effect-extraction.md)                    | Extract equity-family side effects into existing durable-job orchestrators           | Proposed |
 | [0014](0014-runtime-stuck-pending-recovery-and-serialized-placement.md) | Recover stuck Pending placements at runtime, and serialize broker-placement attempts | Accepted |
 | [0015](0015-bot-gas-pnl-requires-explicit-receipt-cost-ledger.md)       | Require an explicit receipt cost ledger for bot gas PnL                              | Proposed |
 | [0016](0016-store-bot-gas-costs-in-the-event-stream.md)                 | Store bot-gas costs in the event stream                                              | Proposed |
 | [0017](0017-eth-usd-valuation-via-pyth-base-block-pinned.md)            | Value bot-paid gas in USD via Pyth ETH/USD on Base, block-pinned                     | Proposed |
+| [0018](0018-back-pnl-with-a-cqrs-read-model.md)                         | Back /pnl with a CQRS read model instead of raw SQL over the events table            | Accepted |
+| [0018](0018-block-watermarked-onchain-fill-absorption.md)               | Block-watermarked absorption of onchain fill deltas                                  | Accepted |
+| [0019](0019-mark-priced-close-flatten-with-widening-cross.md)           | Resolve close-flatten prices through a fallback chain                                | Accepted |
 | [0020](0020-reconstruct-pre-burn-usdc-inventory-on-resume.md)           | Reconstruct pre-burn Alpaca-to-Base USDC inventory before resume                     | Proposed |
 | [0021](0021-independent-durable-inventory-source-jobs.md)               | Run inventory observations as independent durable source jobs                        | Proposed |
 
