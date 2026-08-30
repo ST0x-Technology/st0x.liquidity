@@ -14,6 +14,7 @@ const validTrade = (overrides: Record<string, unknown> = {}): unknown => ({
   direction: 'sell',
   symbol: 'AAPL',
   shares: '1.25',
+  marketSession: null,
   outcome: { status: 'filled' },
   ...overrides
 })

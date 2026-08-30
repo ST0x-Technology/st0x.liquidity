@@ -60,6 +60,7 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     Trade::export_all_to(out_dir)?;
     LegacyTrade::export_all_to(out_dir)?;
     TradeOutcome::export_all_to(out_dir)?;
+    MarketSession::export_all_to(out_dir)?;
     Position::export_all_to(out_dir)?;
     EquityPrice::export_all_to(out_dir)?;
     EquityPriceStatus::export_all_to(out_dir)?;
