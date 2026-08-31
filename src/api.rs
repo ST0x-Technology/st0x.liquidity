@@ -152,7 +152,7 @@ async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRespon
 
     // Gated on the startup barrier: every essential run loop (conductor
     // startup checks included -- broker account verification, chain-id
-    // confirmations, cutoff probe) has acknowledged before this reports
+    // confirmations, cutoff probe, configured-asset read canary) has acknowledged before this reports
     // healthy. A deploy probe polling this endpoint therefore cannot see a
     // 200 from a bot that failed its startup checks.
     let (status_code, status) = if state.health.is_ready() {
