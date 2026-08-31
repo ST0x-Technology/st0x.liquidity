@@ -64,12 +64,14 @@ pub struct AssetSettings {
 
 /// Counter-trading (hedging) configuration for an asset.
 ///
-/// Extended-hours counter-trading only makes sense when counter-trading is
-/// enabled: the hedge path gates on counter-trading before it ever consults the
-/// extended-hours session, so extended hours without counter-trading is a dead
-/// configuration that can never execute. Nesting `extended_hours` under
-/// `Enabled` makes that invalid combination unrepresentable on the wire, so the
-/// dashboard can never receive a contradictory pair.
+/// Session flags only make sense when counter-trading is enabled: the
+/// hedge path gates on counter-trading before it ever consults a session,
+/// so extended hours or overnight without counter-trading is a dead
+/// configuration that can never execute. Nesting both flags under
+/// `Enabled` makes those invalid combinations unrepresentable on the
+/// wire, so the dashboard can never receive a contradictory pair. The two
+/// session flags are independent of each other: overnight has a separate
+/// broker entitlement, feed, and risk profile.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase", tag = "status")]
 pub enum CounterTrading {
@@ -77,6 +79,7 @@ pub enum CounterTrading {
     #[serde(rename_all = "camelCase")]
     Enabled {
         extended_hours: bool,
+        overnight: bool,
     },
 }
 
@@ -98,20 +101,40 @@ mod tests {
     fn counter_trading_enabled_serializes_extended_hours_flag() {
         let value = serde_json::to_value(CounterTrading::Enabled {
             extended_hours: true,
+            overnight: false,
         })
         .unwrap();
-        assert_eq!(value, json!({ "status": "enabled", "extendedHours": true }));
+        assert_eq!(
+            value,
+            json!({ "status": "enabled", "extendedHours": true, "overnight": false })
+        );
     }
 
     #[test]
     fn counter_trading_enabled_without_extended_hours_serializes_false_flag() {
         let value = serde_json::to_value(CounterTrading::Enabled {
             extended_hours: false,
+            overnight: false,
         })
         .unwrap();
         assert_eq!(
             value,
-            json!({ "status": "enabled", "extendedHours": false })
+            json!({ "status": "enabled", "extendedHours": false, "overnight": false })
+        );
+    }
+
+    #[test]
+    fn counter_trading_enabled_serializes_overnight_flag_independently() {
+        // Overnight is independent of extended hours: enabled overnight
+        // with disabled extended hours is a valid wire shape.
+        let value = serde_json::to_value(CounterTrading::Enabled {
+            extended_hours: false,
+            overnight: true,
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({ "status": "enabled", "extendedHours": false, "overnight": true })
         );
     }
 
@@ -121,6 +144,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             counter_trading: CounterTrading::Enabled {
                 extended_hours: true,
+                overnight: true,
             },
             rebalancing: false,
             operational_limit: None,
@@ -130,7 +154,7 @@ mod tests {
         assert_eq!(value["symbol"], json!("AAPL"));
         assert_eq!(
             value["counterTrading"],
-            json!({ "status": "enabled", "extendedHours": true })
+            json!({ "status": "enabled", "extendedHours": true, "overnight": true })
         );
         assert_eq!(value["rebalancing"], json!(false));
         assert_eq!(value["operationalLimit"], json!(null));
