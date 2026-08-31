@@ -147,15 +147,29 @@ struct TradeResponse {
     has_more: bool,
 }
 
-async fn health() -> Json<HealthResponse> {
+async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
     let uptime = Utc::now() - *STARTED_AT;
 
-    Json(HealthResponse {
-        status: "healthy".to_string(),
-        timestamp: Utc::now(),
-        git_commit: GIT_COMMIT.to_string(),
-        uptime_seconds: uptime.num_seconds(),
-    })
+    // Gated on the startup barrier: every essential run loop (conductor
+    // startup checks included -- broker account verification, chain-id
+    // confirmations, cutoff probe) has acknowledged before this reports
+    // healthy. A deploy probe polling this endpoint therefore cannot see a
+    // 200 from a bot that failed its startup checks.
+    let (status_code, status) = if state.health.is_ready() {
+        (StatusCode::OK, "healthy")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "starting")
+    };
+
+    (
+        status_code,
+        Json(HealthResponse {
+            status: status.to_string(),
+            timestamp: Utc::now(),
+            git_commit: GIT_COMMIT.to_string(),
+            uptime_seconds: uptime.num_seconds(),
+        }),
+    )
 }
 
 /// Deadline for bringing the PnL ledger current on the `/pnl` request path.
@@ -1771,6 +1785,7 @@ mod tests {
             resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
             pnl_report_admission: crate::dashboard::pnl::pnl_report_admission(),
             metrics_handle: crate::metrics::setup().expect("metrics setup"),
+            health: crate::startup::HealthGate::default(),
         }
     }
 
@@ -3765,9 +3780,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_health_endpoint() {
+    async fn health_reports_starting_with_503_until_startup_completes() {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = body_to_string(response).await;
+        let health_response: HealthResponse =
+            serde_json::from_str(&body).expect("valid JSON response");
+
+        assert_eq!(health_response.status, "starting");
+    }
+
+    #[tokio::test]
+    async fn health_reports_healthy_with_200_once_startup_completes() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+        let app = build_app(state);
 
         let response = app
             .oneshot(
