@@ -19,7 +19,22 @@ server_port = 8001
 # HTTP port for the apalis-board job queue UI.
 board_port = 8002
 # Minimum log level: trace, debug, info, warn, error.
-log_level = "trace"
+#
+# NOT trace. On 2026-08-30 trace filled the production bot's 10 GB data disk
+# with its own logs and SQLite began failing every write with SQLITE_FULL:
+# order-fill polling stopped, no hedge fills for 20 hours, every telemetry
+# collector went stale, and the process stayed up throughout so nothing
+# paged. Same failure as 2026-06-08, which is why LOG_RETENTION_DAYS keeps
+# seven daily files; that bound is on FILE COUNT, and at 2-2.9 GB a file
+# seven of them could never fit on the disk.
+#
+# Measured on the 2026-08-29 production file: TRACE was 99.0% of the bytes,
+# DEBUG 0.9%, INFO 0.1%. debug therefore cuts volume ~100x while keeping
+# every line anything reads: the metrics exporter ships ERROR/WARN/INFO,
+# /performance/reliability counts ERROR/WARN, and the SPA log viewer still
+# shows debug. This one level also drives the console layer and both OTel
+# exporters, so trace was being paid for in Cloud Logging ingest too.
+log_level = "debug"
 # Directory for rotated log files (stdout if omitted).
 log_dir = "/mnt/data/logs"
 # SQLite database path for event store, projections, and job queue.
