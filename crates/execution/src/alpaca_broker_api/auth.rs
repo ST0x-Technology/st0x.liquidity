@@ -130,9 +130,14 @@ impl AlpacaBrokerApiMode {
         }
     }
 
+    /// Sandbox keys authenticate only against the sandbox market-data host
+    /// (the production host answers 401 for them; verified empirically
+    /// 2026-08-25), so the data host splits by mode exactly like the broker
+    /// host.
     pub(super) fn market_data_base_url(&self) -> &str {
         match self {
-            Self::Sandbox | Self::Production => "https://data.alpaca.markets",
+            Self::Sandbox => "https://data.sandbox.alpaca.markets",
+            Self::Production => "https://data.alpaca.markets",
             #[cfg(any(test, feature = "mock"))]
             Self::Mock(url) => url,
         }
@@ -301,6 +306,20 @@ mod tests {
         assert_eq!(
             AlpacaBrokerApiMode::Production.base_url(),
             "https://broker-api.alpaca.markets"
+        );
+    }
+
+    #[test]
+    fn test_market_data_base_url_splits_by_mode() {
+        // Sandbox keys 401 against the production data host, so the data
+        // host must follow the mode exactly like the broker host.
+        assert_eq!(
+            AlpacaBrokerApiMode::Sandbox.market_data_base_url(),
+            "https://data.sandbox.alpaca.markets"
+        );
+        assert_eq!(
+            AlpacaBrokerApiMode::Production.market_data_base_url(),
+            "https://data.alpaca.markets"
         );
     }
 

@@ -27,7 +27,7 @@ mod rate_limit;
 
 pub use alpaca_broker_api::{
     AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError,
-    AlpacaBrokerApiMode, AlpacaBrokerAuth, ConversionDirection, ConversionOrder,
+    AlpacaBrokerApiMode, AlpacaBrokerAuth, AssetDetails, ConversionDirection, ConversionOrder,
     CryptoOrderOutcome, DeadlineCancel, JournalResponse, JournalStatus, TimeInForce,
 };
 pub use alpaca_broker_api::{AuthRuntime, KmsJwtError};
@@ -168,6 +168,19 @@ impl LatestQuote {
     pub const fn ask(self) -> Positive<Usd> {
         self.ask
     }
+}
+
+/// An indicative overnight quote with the broker timestamp it was generated
+/// at, so consumers can judge its age before pricing from it.
+///
+/// The overnight feed is indicative (derived from Blue Ocean data), not a
+/// firm tape quote: fills can deviate from it, and a stale indicative quote
+/// must never be priced from silently. That is why the timestamp is required
+/// here while the regular [`LatestQuote`] path ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndicativeQuote {
+    pub quote: LatestQuote,
+    pub at: DateTime<Utc>,
 }
 
 /// Error returned when constructing a latest quote.
