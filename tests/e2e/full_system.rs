@@ -178,6 +178,7 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
                             Symbol::new(symbol).unwrap(),
                             EquityHedgePolicy {
                                 extended_hours_counter_trading: OperationMode::Disabled,
+                                overnight_counter_trading: OperationMode::Disabled,
                             },
                         )
                     })
@@ -551,9 +552,11 @@ beneficiary_entity_name = "Simulate Failures"
 
 [assets.equities.AAPL]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.TSLA]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [chains.base]
 lifecycle = "active"
