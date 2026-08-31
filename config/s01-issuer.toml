@@ -36,6 +36,7 @@ retired_symbols = []
 # On-chain orderbook settings (same Rain Orderbook on Base as the bot).
 [assets.equities.SGOV]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [chains.base]
 # Trades, hedges and rebalances: everything is on, subject to the

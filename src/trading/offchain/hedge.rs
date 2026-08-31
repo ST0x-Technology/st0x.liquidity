@@ -1621,6 +1621,7 @@ mod tests {
                     Symbol::new(symbol).unwrap(),
                     EquityHedgePolicy {
                         extended_hours_counter_trading,
+                        overnight_counter_trading: OperationMode::Disabled,
                     },
                 ))
                 .collect(),
