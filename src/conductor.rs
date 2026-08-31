@@ -742,28 +742,6 @@ where
         .http(trading_chain.rpc_url.clone());
     let provider = ProviderBuilder::new().connect_client(rpc_client);
 
-    // The HTTP transport connects lazily, so probe it once at startup to
-    // fail fast on a misconfigured or unreachable RPC rather than only
-    // surfacing it as repeated poll-loop retries. systemd's bounded
-    // restart loop handles a genuinely-down endpoint from here.
-    let chain_tip = provider
-        .get_block_number()
-        .await
-        .context("failed to reach RPC endpoint at startup")?;
-
-    confirm_chain_id(&provider, trading_chain.chain).await?;
-
-    // Probe the configured cutoff block tag at startup to surface a
-    // misconfigured or unsupported endpoint before the fill monitor starts
-    // polling. A null response is allowed through (cold start); an error or
-    // a detected `finalized`-aliasing-to-`latest` returns Err and fails startup.
-    match probe_cutoff_block_support(&provider, chain_tip, trading_chain.ingestion_cutoff)
-        .await
-        .context("RPC endpoint cannot serve the configured cutoff block tag at startup")?
-    {
-        CutoffProbe::Supported | CutoffProbe::NotYetAvailable => {}
-    }
-
     // Spawn the writer before returning the sender: the executor, RPC layer,
     // and the returned sender each hold a clone. When all three are dropped,
     // the channel closes and the writer task exits cleanly.
@@ -848,7 +826,7 @@ impl Conductor {
         let (executor, provider, telemetry_writer, telemetry) =
             setup_instrumentation(executor_ctx, ctx.chains.sole_trading(), pool.clone()).await?;
 
-        confirm_startup_reads(&ctx, &provider).await?;
+        startup_smoke_checks(&executor, &provider, &ctx).await?;
         let cache = SymbolCache::default();
 
         let (job_queue, backfill_queue, dashboard_delivery, schedulers) =
@@ -2141,15 +2119,51 @@ async fn confirm_transport_chain_ids(ctx: &Ctx) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Post-wiring startup confirmations, all read-only: the transport signers
-/// report the chain ids their registry entries name, and one configured
-/// asset answers a view call on the trading chain.
-async fn confirm_startup_reads<P: Provider + Clone + 'static>(
-    ctx: &Ctx,
-    provider: &P,
-) -> anyhow::Result<()> {
+/// Every startup smoke check, in one place, all read-only. `/health` reports
+/// healthy only after these pass AND every run loop has acknowledged the
+/// startup barrier, so a deploy probe cannot see a 200 from a bot that failed
+/// any of them.
+///
+/// The broker account itself is verified during executor construction
+/// (`try_from_ctx` refuses an inactive account); the clock read here is the
+/// explicit round-trip proving the session works, not just the credentials.
+async fn startup_smoke_checks<E, P>(executor: &E, provider: &P, ctx: &Ctx) -> anyhow::Result<()>
+where
+    E: Executor,
+    P: Provider + Clone + 'static,
+{
+    let trading_chain = ctx.chains.sole_trading();
+
+    // The HTTP transport connects lazily, so reach the RPC once to fail fast
+    // on a misconfigured or unreachable endpoint rather than only surfacing
+    // it as repeated poll-loop retries.
+    let chain_tip = provider
+        .get_block_number()
+        .await
+        .context("failed to reach RPC endpoint at startup")?;
+
+    confirm_chain_id(provider, trading_chain.chain).await?;
+
+    // A null response is allowed through (cold start); an error or a detected
+    // `finalized`-aliasing-to-`latest` fails startup before the fill monitor
+    // starts polling.
+    match probe_cutoff_block_support(provider, chain_tip, trading_chain.ingestion_cutoff)
+        .await
+        .context("RPC endpoint cannot serve the configured cutoff block tag at startup")?
+    {
+        CutoffProbe::Supported | CutoffProbe::NotYetAvailable => {}
+    }
+
     confirm_transport_chain_ids(ctx).await?;
-    confirm_configured_asset_responds(provider, ctx.chains.sole_trading()).await
+
+    let market_open = executor
+        .is_market_open()
+        .await
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("broker API round-trip failed at startup")?;
+    info!(target: "startup", market_open, "Confirmed the broker API answers");
+
+    confirm_configured_asset_responds(provider, trading_chain).await
 }
 
 /// Startup read-path canary: one configured equity's token contract must
