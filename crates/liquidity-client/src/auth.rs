@@ -295,7 +295,11 @@ fn refresh_token_path() -> Option<std::path::PathBuf> {
 
 /// Reads the cached refresh token, if any.
 fn load_refresh_token() -> Option<String> {
-    let path = refresh_token_path()?;
+    load_refresh_token_at(&refresh_token_path()?)
+}
+
+/// Reads the cached refresh token from a specific path.
+fn load_refresh_token_at(path: &std::path::Path) -> Option<String> {
     let contents = std::fs::read_to_string(path).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&contents).ok()?;
     parsed
@@ -307,9 +311,14 @@ fn load_refresh_token() -> Option<String> {
 /// Persists the refresh token with owner-only permissions. Best effort: a cache
 /// write failure must not fail the command, only cost the next run a sign-in.
 fn store_refresh_token(refresh_token: &str) {
-    let Some(path) = refresh_token_path() else {
-        return;
-    };
+    if let Some(path) = refresh_token_path() {
+        store_refresh_token_at(&path, refresh_token);
+    }
+}
+
+/// Writes the refresh token to a specific path, creating parent directories and
+/// pinning owner-only (0600) permissions on both new and existing files.
+fn store_refresh_token_at(path: &std::path::Path, refresh_token: &str) {
     if let Some(directory) = path.parent() {
         let _ = std::fs::create_dir_all(directory);
     }
@@ -326,15 +335,15 @@ fn store_refresh_token(refresh_token: &str) {
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(&path)
+            .open(path)
         {
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
             let _ = file.write_all(body.as_bytes());
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = std::fs::write(&path, body);
+        let _ = std::fs::write(path, body);
     }
 }
 
@@ -355,6 +364,40 @@ mod tests {
     fn extract_id_token_rejects_a_missing_jwt() {
         let token = serde_json::json!({ "access_token": "no-id-here" });
         assert!(matches!(extract_id_token(&token), Err(AuthError::Flow(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_refresh_token_writes_owner_only_and_roundtrips() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let dir =
+            std::env::temp_dir().join(format!("st0x-cli-cache-{}-{nanos}", std::process::id()));
+        let path = dir.join("nested").join("oauth.json");
+
+        // Creates parent directories and the file at mode 0600, and roundtrips.
+        super::store_refresh_token_at(&path, "rtok-1");
+        let mode = std::fs::metadata(&path).map(|meta| meta.permissions().mode() & 0o777);
+        assert_eq!(mode.ok(), Some(0o600));
+        assert_eq!(
+            super::load_refresh_token_at(&path),
+            Some("rtok-1".to_owned())
+        );
+
+        // Rewriting an existing file keeps 0600 and updates the stored value.
+        super::store_refresh_token_at(&path, "rtok-2");
+        let mode = std::fs::metadata(&path).map(|meta| meta.permissions().mode() & 0o777);
+        assert_eq!(mode.ok(), Some(0o600));
+        assert_eq!(
+            super::load_refresh_token_at(&path),
+            Some("rtok-2".to_owned())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Connects to the loopback listener and sends one raw HTTP GET whose
