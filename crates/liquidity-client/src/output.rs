@@ -1,3 +1,5 @@
+//! Renders one JSON document to stdout as a single compact line.
+
 use std::io::Write;
 
 use crate::error::Error;

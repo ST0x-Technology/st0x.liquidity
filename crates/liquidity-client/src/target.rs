@@ -1,6 +1,8 @@
 //! Target resolution: reads each environment's base URL and auth inputs from
 //! the process environment and validates them into a `Target`.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use url::Url;
 
@@ -49,6 +51,10 @@ pub struct Target {
     pub auth: Auth,
     /// Optional T0 Cloud Logging console URL, printed alongside API errors.
     pub logging_url: Option<String>,
+    /// Overall per-request timeout for the HTTP client.
+    pub request_timeout: Duration,
+    /// TCP connect timeout for the HTTP client.
+    pub connect_timeout: Duration,
 }
 
 fn required(variable: &str, hint: &str) -> Result<String> {
@@ -66,6 +72,25 @@ fn parse_base_url(prefix: &str, raw: &str) -> Result<Url> {
         anyhow::bail!("{prefix}_URL must include a host, got: {raw}");
     }
     Ok(url)
+}
+
+/// Parses a positive integer number of seconds into a `Duration`, rejecting
+/// zero and non-numeric values so a misconfigured timeout fails loudly.
+fn parse_timeout_secs(name: &str, raw: &str) -> Result<Duration> {
+    let secs: u64 = raw
+        .parse()
+        .with_context(|| format!("{name} must be a whole number of seconds, got: {raw}"))?;
+    if secs == 0 {
+        anyhow::bail!("{name} must be greater than zero");
+    }
+    Ok(Duration::from_secs(secs))
+}
+
+/// Reads a required timeout setting from the environment and parses it.
+fn required_timeout(prefix: &str, suffix: &str, hint: &str) -> Result<Duration> {
+    let name = format!("{prefix}_{suffix}");
+    let raw = required(&name, hint)?;
+    parse_timeout_secs(&name, &raw)
 }
 
 pub fn resolve(env: Env) -> Result<Target> {
@@ -98,16 +123,28 @@ pub fn resolve(env: Env) -> Result<Target> {
         },
     };
     let logging_url = std::env::var(format!("{prefix}_LOGGING_URL")).ok();
+    let request_timeout = required_timeout(
+        prefix,
+        "REQUEST_TIMEOUT_SECS",
+        "to the overall per-request timeout in seconds",
+    )?;
+    let connect_timeout = required_timeout(
+        prefix,
+        "CONNECT_TIMEOUT_SECS",
+        "to the TCP connect timeout in seconds",
+    )?;
     Ok(Target {
         base_url,
         auth,
         logging_url,
+        request_timeout,
+        connect_timeout,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_base_url;
+    use super::{parse_base_url, parse_timeout_secs};
 
     #[test]
     fn accepts_https_url_with_host() {
@@ -127,5 +164,23 @@ mod tests {
     #[test]
     fn rejects_malformed_url() {
         assert!(parse_base_url("T0_LIQUIDITY_STAGING", "not a url").is_err());
+    }
+
+    #[test]
+    fn parses_positive_timeout_seconds() {
+        assert_eq!(
+            parse_timeout_secs("T", "30").ok(),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn rejects_zero_timeout() {
+        assert!(parse_timeout_secs("T", "0").is_err());
+    }
+
+    #[test]
+    fn rejects_non_numeric_timeout() {
+        assert!(parse_timeout_secs("T", "abc").is_err());
     }
 }

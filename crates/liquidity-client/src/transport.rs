@@ -1,3 +1,7 @@
+//! Thin HTTP transport for the liquidity ops API: builds role-prefixed
+//! requests, attaches the per-role bearer token, and maps each response to the
+//! client's `Error` type.
+
 use reqwest::StatusCode;
 use url::Url;
 
@@ -25,11 +29,17 @@ pub struct Client<A> {
 }
 
 impl<A: TokenSource + Sync> Client<A> {
-    pub fn new(base_url: Url, read_auth: A, write_auth: A) -> anyhow::Result<Self> {
+    pub fn new(
+        base_url: Url,
+        read_auth: A,
+        write_auth: A,
+        request_timeout: std::time::Duration,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(request_timeout)
+            .connect_timeout(connect_timeout)
             .build()?;
         Ok(Self {
             http,
@@ -199,6 +209,8 @@ mod tests {
             base,
             FakeToken("read-token"),
             FakeToken("write-token"),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
         )?)
     }
 
