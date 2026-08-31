@@ -11,16 +11,16 @@ use crate::target::Env;
     about = "T0 liquidity bot operations client",
     version
 )]
-pub struct Cli {
+pub(crate) struct Cli {
     /// Target environment; selects the IAP-fronted API base URL.
-    #[arg(long, value_enum, global = true, default_value = "staging")]
-    pub env: Env,
+    #[arg(long, value_enum)]
+    pub(crate) env: Env,
     #[command(subcommand)]
-    pub command: Command,
+    pub(crate) command: Command,
 }
 
 #[derive(Subcommand)]
-pub enum Command {
+pub(crate) enum Command {
     /// Read-only queries against the liquidity bot.
     #[command(subcommand)]
     Read(Read),
@@ -30,7 +30,7 @@ pub enum Command {
 }
 
 #[derive(Subcommand)]
-pub enum Read {
+pub(crate) enum Read {
     /// Fetch a fixed read resource (pnl, trades, health, and so on).
     Resource(ResourceArgs),
     /// Lifecycle events for one trade aggregate.
@@ -40,39 +40,39 @@ pub enum Read {
 }
 
 #[derive(Args)]
-pub struct ResourceArgs {
+pub(crate) struct ResourceArgs {
     /// Resource to read.
     #[arg(value_enum)]
-    pub resource: ReadResource,
+    pub(crate) resource: ReadResource,
     /// Extra query parameter, repeatable: --param key=value
     #[arg(long = "param", value_parser = parse_key_value)]
-    pub params: Vec<(String, String)>,
+    pub(crate) params: Vec<(String, String)>,
 }
 
 #[derive(Args)]
-pub struct TradeEventsArgs {
+pub(crate) struct TradeEventsArgs {
     /// Trading venue path segment.
-    pub venue: String,
+    pub(crate) venue: String,
     /// Aggregate id path segment.
-    pub aggregate_id: String,
+    pub(crate) aggregate_id: String,
     /// Extra query parameter, repeatable: --param key=value
     #[arg(long = "param", value_parser = parse_key_value)]
-    pub params: Vec<(String, String)>,
+    pub(crate) params: Vec<(String, String)>,
 }
 
 #[derive(Args)]
-pub struct TransferEventsArgs {
+pub(crate) struct TransferEventsArgs {
     /// Transfer kind path segment (for example mint or redemption).
-    pub kind: String,
+    pub(crate) kind: String,
     /// Aggregate id path segment.
-    pub aggregate_id: String,
+    pub(crate) aggregate_id: String,
     /// Extra query parameter, repeatable: --param key=value
     #[arg(long = "param", value_parser = parse_key_value)]
-    pub params: Vec<(String, String)>,
+    pub(crate) params: Vec<(String, String)>,
 }
 
 #[derive(Subcommand)]
-pub enum Debug {
+pub(crate) enum Debug {
     /// Resume interrupted mint and redemption transfers.
     Resume,
     /// Re-check a stuck transfer by kind and aggregate id.
@@ -85,7 +85,7 @@ pub enum Debug {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
-pub enum ReadResource {
+pub(crate) enum ReadResource {
     Pnl,
     Trades,
     Transfers,
@@ -102,7 +102,7 @@ pub enum ReadResource {
 }
 
 impl ReadResource {
-    pub fn path(self) -> &'static str {
+    pub(crate) fn path(self) -> &'static str {
         match self {
             Self::Pnl => "/pnl",
             Self::Trades => "/trades",
@@ -150,6 +150,26 @@ mod tests {
         assert_eq!(
             parse_key_value("filter=a=b"),
             Ok(("filter".to_owned(), "a=b".to_owned()))
+        );
+    }
+
+    #[test]
+    fn requires_explicit_env() {
+        use clap::Parser as _;
+        assert!(
+            super::Cli::try_parse_from(["st0x-liquidity-client", "read", "resource", "health"])
+                .is_err()
+        );
+        assert!(
+            super::Cli::try_parse_from([
+                "st0x-liquidity-client",
+                "--env",
+                "staging",
+                "read",
+                "resource",
+                "health",
+            ])
+            .is_ok()
         );
     }
 }

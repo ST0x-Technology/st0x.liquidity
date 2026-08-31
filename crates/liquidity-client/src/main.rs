@@ -8,9 +8,8 @@ mod output;
 mod target;
 mod transport;
 
-use std::process::ExitCode;
-
 use clap::Parser;
+use std::process::ExitCode;
 
 use crate::auth::{Adc, StaticToken, TokenSource};
 use crate::cli::{Cli, Command, Debug, Read};
