@@ -227,6 +227,13 @@ pub struct EquityHedgePolicy {
     /// `Position` per symbol, so the bot cannot hedge the same exposure under
     /// two session policies at once.
     pub extended_hours_counter_trading: OperationMode,
+    /// When enabled, counter-trades for this equity may be placed during
+    /// the overnight session (20:00-04:00 ET) as limit orders priced
+    /// from the indicative overnight feed. Independent of
+    /// `extended_hours_counter_trading`: overnight has a separate broker
+    /// entitlement, feed, and risk profile. Must be explicitly
+    /// configured; there is no default.
+    pub overnight_counter_trading: OperationMode,
 }
 
 /// Broker-side cash policy.
@@ -380,9 +387,11 @@ mod tests {
 
             [equities.AAPL]
             extended_hours_counter_trading = "enabled"
+            overnight_counter_trading = "disabled"
 
             [equities.TSLA]
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
         "#;
 
         let hedging: HedgingAssets = toml::from_str(toml_str).unwrap();
@@ -392,11 +401,49 @@ mod tests {
     }
 
     #[test]
+    fn overnight_counter_trading_parses_enabled_and_disabled_from_toml() {
+        let toml_str = r#"
+            [equities]
+            retired_symbols = []
+
+            [equities.AAPL]
+            extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "enabled"
+
+            [equities.TSLA]
+            extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
+        "#;
+
+        let hedging: HedgingAssets = toml::from_str(toml_str).unwrap();
+
+        let aapl = &hedging.equities.symbols[&Symbol::new("AAPL").unwrap()];
+        let tsla = &hedging.equities.symbols[&Symbol::new("TSLA").unwrap()];
+        assert_eq!(aapl.overnight_counter_trading, OperationMode::Enabled);
+        assert_eq!(tsla.overnight_counter_trading, OperationMode::Disabled);
+    }
+
+    #[test]
+    fn overnight_counter_trading_is_required_per_equity() {
+        let toml_str = r#"
+            [equities.AAPL]
+            extended_hours_counter_trading = "disabled"
+        "#;
+
+        let result = toml::from_str::<HedgingAssets>(toml_str);
+        assert!(
+            result.is_err(),
+            "Expected error for missing overnight_counter_trading, got {result:?}"
+        );
+    }
+
+    #[test]
     fn retired_symbols_policy_defaults_to_empty() {
         let hedging = toml::from_str::<HedgingAssets>(
             r#"
                 [equities.AAPL]
                 extended_hours_counter_trading = "disabled"
+                overnight_counter_trading = "disabled"
             "#,
         )
         .unwrap();
@@ -599,12 +646,14 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             EquityHedgePolicy {
                 extended_hours_counter_trading: OperationMode::Enabled,
+                overnight_counter_trading: OperationMode::Disabled,
             },
         );
         symbols.insert(
             Symbol::new("RKLB").unwrap(),
             EquityHedgePolicy {
                 extended_hours_counter_trading: OperationMode::Disabled,
+                overnight_counter_trading: OperationMode::Disabled,
             },
         );
 

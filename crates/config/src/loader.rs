@@ -1619,6 +1619,22 @@ fn validate_asset_tables(
                 symbol: symbol.clone(),
             });
         }
+
+        // Same dead-configuration rule as extended hours: the hedge path
+        // gates on `trading` before it consults any session, so overnight
+        // enabled with counter-trading disabled can never execute. Overnight
+        // stays independent of the extended-hours flag on purpose --
+        // separate broker entitlement, feed, and risk profile -- so no
+        // combination of the two session flags is rejected here.
+        if policy.overnight_counter_trading == OperationMode::Enabled
+            && listed
+                .iter()
+                .all(|asset| asset.trading == OperationMode::Disabled)
+        {
+            return Err(CtxError::OvernightWithoutCounterTrading {
+                symbol: symbol.clone(),
+            });
+        }
     }
 
     Ok(())
@@ -2378,6 +2394,7 @@ impl Ctx {
                             symbol.clone(),
                             crate::EquityHedgePolicy {
                                 extended_hours_counter_trading: OperationMode::Disabled,
+                                overnight_counter_trading: OperationMode::Disabled,
                             },
                         )
                     })
@@ -2690,6 +2707,13 @@ pub enum CtxError {
          so this combination can never execute"
     )]
     ExtendedHoursWithoutCounterTrading { symbol: Symbol },
+    #[error(
+        "assets.equities.{symbol}: overnight_counter_trading cannot be \
+         enabled when trading is disabled -- overnight counter-trades only \
+         run while counter-trading is enabled, so this combination can never \
+         execute"
+    )]
+    OvernightWithoutCounterTrading { symbol: Symbol },
     #[error("{field} must be non-zero")]
     ZeroPollingInterval { field: &'static str },
     #[error("server_port and board_port must differ; both set to {port}")]
@@ -2771,6 +2795,9 @@ impl CtxError {
             Self::MissingEquityVaultId { .. } => "missing equity vault_ids",
             Self::ExtendedHoursWithoutCounterTrading { .. } => {
                 "extended hours enabled without counter-trading"
+            }
+            Self::OvernightWithoutCounterTrading { .. } => {
+                "overnight enabled without counter-trading"
             }
             Self::ZeroPollingInterval { .. } => "zero polling interval",
             Self::ServerAndBoardPortsMatch { .. } => "server_port and board_port must differ",
@@ -3354,6 +3381,7 @@ mod tests {
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
         "#,
         );
         let secrets = alpaca_secrets_toml();
@@ -3649,6 +3677,7 @@ mod tests {
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
 
             [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
@@ -4282,18 +4311,20 @@ mod tests {
         );
     }
 
-    /// `alpaca_config_toml` with an `overnight_max_quote_age_secs` line
-    /// injected into `[broker]`. Body duplication follows the
-    /// `alerts_config_toml` precedent for varying one section per test.
+    /// The minimal config with an `overnight_max_quote_age_secs` line
+    /// injected into its existing `[broker]` block (the minimal config
+    /// already carries the always-required broker knobs, so appending a
+    /// second `[broker]` table would be a duplicate-key parse error).
     fn overnight_quote_age_config_toml(quote_age_line: &str) -> NamedTempFile {
-        // The minimal config already carries a [broker] block; inject the
-        // quote-age line into it rather than appending a duplicate table.
-        toml_file(
-            &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
-                "counter_trade_slippage_bps = 100",
-                &format!("counter_trade_slippage_bps = 100\n            {quote_age_line}"),
-            ),
-        )
+        let minimal = String::from_utf8_lossy(minimal_config_toml_bytes()).into_owned();
+        assert!(
+            minimal.contains("counter_trade_slippage_bps = 100"),
+            "minimal config lost its [broker] anchor line"
+        );
+        toml_file(&minimal.replace(
+            "counter_trade_slippage_bps = 100",
+            &format!("counter_trade_slippage_bps = 100\n            {quote_age_line}"),
+        ))
     }
 
     #[tokio::test]
@@ -4897,6 +4928,58 @@ mod tests {
                 } if *symbol == Symbol::new("AAPL").unwrap()
             ),
             "a listed symbol with no [chains.<name>.trading.assets.equities] entry must be refused, got: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_counter_trading_is_required_per_equity() {
+        // Overnight has its own entitlement and risk profile, so every
+        // configured equity must state its overnight mode explicitly --
+        // an absent field fails the load, never defaults open or closed
+        // silently.
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+
+            [assets.equities.AAPL]
+            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::ConfigToml { .. }),
+            "expected config parse failure for missing overnight flag, got: {error:#}"
+        );
+
+        let source = std::error::Error::source(&error).unwrap();
+        let source_display = source.to_string();
+        assert!(
+            source_display.contains("overnight_counter_trading"),
+            "expected parse error to mention the overnight flag, got: {source_display}"
         );
     }
 
@@ -8400,6 +8483,7 @@ mod tests {
 
                 [assets.equities.AAPL]
                 extended_hours_counter_trading = "disabled"
+                overnight_counter_trading = "disabled"
             "#,
         );
 
@@ -8438,6 +8522,7 @@ mod tests {
 
                 [assets.equities.QSEP]
                 extended_hours_counter_trading = "disabled"
+                overnight_counter_trading = "disabled"
             "#,
         );
 
@@ -8944,6 +9029,7 @@ mod tests {
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
 
             [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -9599,6 +9685,7 @@ mod tests {
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
 
             [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0x4444444444444444444444444444444444444444"
@@ -9753,6 +9840,7 @@ mod tests {
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
 
             [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0x4444444444444444444444444444444444444444"
@@ -9945,6 +10033,7 @@ mod tests {
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "enabled"
+            overnight_counter_trading = "disabled"
 
             [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
@@ -10014,6 +10103,7 @@ mod tests {
 
             [assets.equities.AAPL]
             extended_hours_counter_trading = "enabled"
+            overnight_counter_trading = "disabled"
 
             [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
@@ -10064,6 +10154,181 @@ mod tests {
             {REQUIRED_TOPOLOGY_SECTIONS}
         "#
         ));
+        let secrets = alpaca_pricing_secrets_toml();
+
+        Ctx::validate_files(config.path(), secrets.path()).unwrap();
+    }
+
+    #[test]
+    fn validate_files_rejects_overnight_without_counter_trading() {
+        // Overnight counter-trades only run while counter-trading is
+        // enabled, so overnight = enabled with trading = disabled is a
+        // dead configuration that can never execute.
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            log_level = "debug"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
+
+            [assets.equities]
+            retired_symbols = []
+
+            [assets.equities.AAPL]
+            extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "enabled"
+
+            [chains.base.trading.assets.equities.AAPL]
+            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            trading = "disabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+
+            [pricing]
+            ws_url = "wss://pricing.test/ws"
+
+            [chains.base]
+            lifecycle = "active"
+            required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "legacy"
+            inventory_adapters = []
+            vault_owner = "0x0000000000000000000000000000000000000001"
+            deployment_block = 1
+            ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
+
+            [chains.ethereum]
+            lifecycle = "active"
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#,
+        );
+        let secrets = alpaca_pricing_secrets_toml();
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CtxError::OvernightWithoutCounterTrading { ref symbol }
+                    if *symbol == "AAPL"
+            ),
+            "Expected OvernightWithoutCounterTrading for AAPL, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_files_accepts_overnight_without_extended_hours() {
+        // The independence rule: overnight has its own entitlement, feed,
+        // and risk profile, so enabling it must not require -- or change
+        // -- pre-/post-market behavior. An asset may hedge overnight while
+        // extended hours stays disabled.
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            log_level = "debug"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
+
+            [assets.equities]
+            retired_symbols = []
+
+            [assets.equities.AAPL]
+            extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "enabled"
+
+            [chains.base.trading.assets.equities.AAPL]
+            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+
+            [pricing]
+            ws_url = "wss://pricing.test/ws"
+
+            [chains.base]
+            lifecycle = "active"
+            required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "legacy"
+            inventory_adapters = []
+            vault_owner = "0x0000000000000000000000000000000000000001"
+            deployment_block = 1
+            ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+            [chains.ethereum]
+            lifecycle = "active"
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [broker]
+            counter_trade_slippage_bps = 100
+            extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
+            extended_hours_close_flatten_window_secs = 900
+            close_flatten_cross_max_bps = 400
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Entity"
+
+            [rebalancing]
+            transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+            freeze_check = "disabled"
+
+            [rebalancing.equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [rebalancing.usdc]
+            mode = "disabled"
+
+            [alerts]
+            poll_interval = 300
+            realert_interval = 3600
+
+            [alerts.low_balance_thresholds]
+            base = "0.05"
+            ethereum = "0.01"
+
+            [bot_gas_valuation]
+            chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#,
+        );
         let secrets = alpaca_pricing_secrets_toml();
 
         Ctx::validate_files(config.path(), secrets.path()).unwrap();
