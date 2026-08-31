@@ -104,6 +104,7 @@
     counterTrading: boolean
     rebalancing: boolean
     extendedHours: boolean
+    overnight: boolean
   }
 
   const positionMap = $derived(
@@ -123,12 +124,14 @@
             ? {
                 counterTrading: true,
                 rebalancing: asset.rebalancing,
-                extendedHours: counterTrading.extendedHours
+                extendedHours: counterTrading.extendedHours,
+                overnight: counterTrading.overnight
               }
             : {
                 counterTrading: false,
                 rebalancing: asset.rebalancing,
-                extendedHours: false
+                extendedHours: false,
+                overnight: false
               }
 
         return [asset.symbol, flags] as const
@@ -580,6 +583,10 @@
             <span title="Extended-hours counter-trading (only active while counter-trading is enabled): green enabled, red disabled, grey not configured."
               >Ext</span
             >
+
+            <span title="Overnight counter-trading (only active while counter-trading is enabled): green enabled, red disabled, grey not configured."
+              >Ovn</span
+            >
           </div>
         </Table.Head>
 
@@ -673,6 +680,7 @@
         {@const ctState = lightState(row.flags, 'counterTrading')}
         {@const rebalState = lightState(row.flags, 'rebalancing')}
         {@const extState = lightState(row.flags, 'extendedHours')}
+        {@const ovnState = lightState(row.flags, 'overnight')}
         <Table.Row class={idx % 2 === 0 ? 'bg-muted/40' : ''}>
           <Table.Cell class="font-mono font-medium {ctActive ? '' : 'opacity-40'}"
             >{row.asset}</Table.Cell
@@ -699,6 +707,13 @@
                 role="img"
                 title={statusLabel('Extended hours', extState)}
                 aria-label={statusLabel('Extended hours', extState)}
+              ></span>
+
+              <span
+                class={statusLightClass(ovnState)}
+                role="img"
+                title={statusLabel('Overnight', ovnState)}
+                aria-label={statusLabel('Overnight', ovnState)}
               ></span>
             </div>
           </Table.Cell>
