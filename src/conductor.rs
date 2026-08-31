@@ -42,7 +42,7 @@ use st0x_event_sorcery::{
     AggregateError, EventSourced, LifecycleError, Projection, ProjectionError, RetryOnBusy,
     SendError, Store, StoreBuilder, compact_events, incremental_vacuum, load_all_ids, load_entity,
 };
-use st0x_evm::{Chain, OpenChainErrorRegistry, USDC_BASE, Wallet};
+use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, USDC_BASE, Wallet};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, ClientOrderId, CounterTradePreflight,
     CounterTradeReservation, CounterTradeSkipReason, ExecutionError, Executor, FractionalShares,
@@ -848,7 +848,7 @@ impl Conductor {
         let (executor, provider, telemetry_writer, telemetry) =
             setup_instrumentation(executor_ctx, ctx.chains.sole_trading(), pool.clone()).await?;
 
-        confirm_transport_chain_ids(&ctx).await?;
+        confirm_startup_reads(&ctx, &provider).await?;
         let cache = SymbolCache::default();
 
         let (job_queue, backfill_queue, dashboard_delivery, schedulers) =
@@ -2137,6 +2137,70 @@ async fn confirm_transport_chain_ids(ctx: &Ctx) -> anyhow::Result<()> {
         };
         confirm_chain_id(signer.provider(), chain).await?;
     }
+
+    Ok(())
+}
+
+/// Post-wiring startup confirmations, all read-only: the transport signers
+/// report the chain ids their registry entries name, and one configured
+/// asset answers a view call on the trading chain.
+async fn confirm_startup_reads<P: Provider + Clone + 'static>(
+    ctx: &Ctx,
+    provider: &P,
+) -> anyhow::Result<()> {
+    confirm_transport_chain_ids(ctx).await?;
+    confirm_configured_asset_responds(provider, ctx.chains.sole_trading()).await
+}
+
+/// Startup read-path canary: one configured equity's token contract must
+/// answer a `decimals()` view call on the trading chain.
+///
+/// Proves the configured address is a live contract on the endpoint the
+/// registry entry names -- config, RPC transport, and ABI decoding exercised
+/// in one read, before any funds-adjacent work starts. Read-only and
+/// cold-start-safe: a chain with no configured equities is the normal
+/// bring-up state and skips with a log instead of failing.
+async fn confirm_configured_asset_responds<P: Provider + Clone + 'static>(
+    provider: &P,
+    trading_chain: &TradingChain,
+) -> anyhow::Result<()> {
+    let Some((symbol, asset)) = trading_chain
+        .assets
+        .equities
+        .symbols
+        .iter()
+        .min_by_key(|(symbol, _)| (*symbol).clone())
+    else {
+        info!(
+            target: "startup",
+            chain = %trading_chain.chain,
+            "No equities configured on the trading chain; skipping the asset read canary"
+        );
+        return Ok(());
+    };
+
+    let evm = ReadOnlyEvm::new(provider.clone());
+    let decimals = evm
+        .call::<OpenChainErrorRegistry, _>(asset.tokenized_equity, IERC20::decimalsCall {})
+        .await
+        .with_context(|| {
+            format!(
+                "startup read canary failed: [chains.{chain}] equity {symbol} at \
+                 {token} did not answer decimals() -- wrong address, wrong chain, \
+                 or a broken endpoint",
+                chain = trading_chain.chain,
+                token = asset.tokenized_equity,
+            )
+        })?;
+
+    info!(
+        target: "startup",
+        chain = %trading_chain.chain,
+        %symbol,
+        token = %asset.tokenized_equity,
+        decimals,
+        "Confirmed a configured asset responds on the trading chain"
+    );
 
     Ok(())
 }
@@ -4686,6 +4750,94 @@ mod tests {
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
+    }
+
+    fn trading_chain_with_equity(symbol: &str, token: Address) -> TradingChain {
+        let mut trading = create_test_ctx_with_order_owner(Address::ZERO)
+            .chains
+            .sole_trading()
+            .clone();
+        trading.assets = ChainAssets {
+            equities: ChainEquities {
+                operational_limit: None,
+                symbols: HashMap::from([(
+                    Symbol::new(symbol).unwrap(),
+                    ChainEquityAsset {
+                        tokenized_equity: token,
+                        tokenized_equity_derivative: Address::ZERO,
+                        vault_ids: vec![],
+                        trading: OperationMode::Enabled,
+                        rebalancing: OperationMode::Disabled,
+                        wrapped_equity_recovery: OperationMode::Disabled,
+                        operational_limit: None,
+                    },
+                )]),
+            },
+            cash: None,
+        };
+        trading
+    }
+
+    #[tokio::test]
+    async fn asset_canary_accepts_a_token_that_answers_decimals() {
+        let asserter = Asserter::new();
+        asserter.push_success(
+            &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
+                &18u8,
+            ),
+        );
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let trading = trading_chain_with_equity(
+            "AAPL",
+            address!("0x1111111111111111111111111111111111111111"),
+        );
+
+        confirm_configured_asset_responds(&provider, &trading)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn asset_canary_refuses_a_token_that_does_not_answer() {
+        // A dead address, a wrong-chain endpoint, or a broken RPC all surface
+        // here as a failed read; startup must refuse rather than run with a
+        // configured asset nothing can actually read.
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("connection reset by peer");
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let trading = trading_chain_with_equity(
+            "AAPL",
+            address!("0x1111111111111111111111111111111111111111"),
+        );
+
+        let error = confirm_configured_asset_responds(&provider, &trading)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("did not answer decimals()"),
+            "the error must name the canary read: {error}"
+        );
+        assert!(
+            error.to_string().contains("AAPL"),
+            "the error must name the symbol: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn asset_canary_skips_when_no_equities_are_configured() {
+        // Bring-up state: an empty asset table is valid, and the empty
+        // Asserter doubles as proof no RPC call is made.
+        let asserter = Asserter::new();
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let trading = create_test_ctx_with_order_owner(Address::ZERO)
+            .chains
+            .sole_trading()
+            .clone();
+
+        confirm_configured_asset_responds(&provider, &trading)
+            .await
+            .unwrap();
     }
 
     /// An RPC pointed at the wrong network is the failure the chain-id check
