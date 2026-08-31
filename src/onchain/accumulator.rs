@@ -102,7 +102,10 @@ async fn check_market_session<E: Executor>(
             Ok(Some(session))
         }
 
-        MarketSession::Extended | MarketSession::Closed => {
+        // Overnight defers unconditionally until automated overnight
+        // counter-trading ships; the per-asset overnight opt-in will gate
+        // readiness here the same way `extended_hours_enabled` does.
+        MarketSession::Extended | MarketSession::Overnight | MarketSession::Closed => {
             debug!(
                 target: "hedge",
                 %symbol,
@@ -453,6 +456,44 @@ mod tests {
         assert!(
             result.is_none(),
             "Should return None when market is closed, even with position above threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_execution_readiness_returns_none_in_overnight_session() {
+        let pool = setup_test_db().await;
+        let (store, query) = create_test_position_infra(&pool).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        initialize_position_with_fill(
+            &store,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let executor = MockExecutor::new().with_market_session(MarketSession::Overnight);
+
+        let result = check_execution_readiness(
+            &executor,
+            &query,
+            &symbol,
+            SupportedExecutor::DryRun,
+            // Extended hours genuinely enabled for the symbol, so this pins
+            // the UNCONDITIONAL overnight deferral: a future
+            // `Overnight if overnight_enabled` readiness guard must not
+            // inherit the extended-hours flag.
+            &assets_with_extended_hours(&symbol, true),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.is_none(),
+            "Overnight must defer until automated overnight counter-trading ships, \
+             even with the position above threshold and extended hours enabled"
         );
     }
 

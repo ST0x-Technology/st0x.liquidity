@@ -279,7 +279,10 @@ where
                     // previous tick is caught on this one.
                     ctx.request_extended_hours_cancellations().await;
                 }
-                Ok(MarketSession::Closed) => {}
+                // Overnight has no cancellation maintenance yet: overnight
+                // orders cannot be placed until automated overnight
+                // counter-trading ships, so there is nothing to sweep.
+                Ok(MarketSession::Overnight | MarketSession::Closed) => {}
                 Err(error) => {
                     warn!("Failed to check market session for order cancellation: {error}");
                 }
@@ -1942,6 +1945,61 @@ mod tests {
             panic!("stale extended-hours order must be cancelling, got: {order:?}");
         };
         assert_eq!(reason, CancellationReason::ExtendedHoursRepriceTimeout);
+    }
+
+    #[tokio::test]
+    async fn overnight_session_issues_no_cancellation_maintenance() {
+        // The third leg of the Overnight-defer contract: the accumulator
+        // and the hedge job pin their defers, and this pins the session
+        // check's. The order here is stale enough that an Extended tick
+        // would cancel it for reprice and a Regular tick would cancel it
+        // for replacement -- an Overnight tick must leave it untouched.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Overnight)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-eh-1"),
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_extended_hours_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            chrono::Utc::now() - chrono::Duration::seconds(301),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let order = ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        assert!(
+            matches!(order, OffchainOrder::Submitted { .. }),
+            "an Overnight tick must not cancel a live extended-hours order, got: {order:?}"
+        );
     }
 
     #[tokio::test]
