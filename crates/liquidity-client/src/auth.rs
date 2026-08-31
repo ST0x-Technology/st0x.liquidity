@@ -8,12 +8,43 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::error::Error;
+/// Failure obtaining a T0 Google identity. `Display` explains the failure and,
+/// per environment, how to fix it.
+#[derive(Debug)]
+pub enum AuthError {
+    /// ADC / Google credential failure; the original typed error is retained
+    /// as the source.
+    Credentials(Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// Desktop OAuth sign-in flow failure, with an operator-facing reason.
+    Flow(String),
+}
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason: &dyn std::fmt::Display = match self {
+            Self::Credentials(source) => source,
+            Self::Flow(reason) => reason,
+        };
+        write!(
+            f,
+            "could not obtain a T0 Google identity: {reason}\nFor staging, complete the browser sign-in when prompted. For production, ensure Application Default Credentials (a service account, workload identity, or impersonation) can mint an ID token for the configured audience."
+        )
+    }
+}
+
+impl std::error::Error for AuthError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Credentials(source) => Some(&**source),
+            Self::Flow(_) => None,
+        }
+    }
+}
 
 /// Supplies the bearer token attached to each API request. Abstracted so the
 /// transport can be exercised in tests without live Google credentials.
 pub trait TokenSource {
-    fn bearer(&self) -> impl Future<Output = Result<String, Error>> + Send;
+    fn bearer(&self) -> impl Future<Output = Result<String, AuthError>> + Send;
 }
 
 /// Mints Google OIDC ID tokens for the IAP audience from Application Default
@@ -26,20 +57,20 @@ pub struct Adc {
 }
 
 impl Adc {
-    pub fn new(audience: &str) -> Result<Self, Error> {
+    pub fn new(audience: &str) -> Result<Self, AuthError> {
         let credentials = idtoken::Builder::new(audience.to_owned())
             .build()
-            .map_err(|source| Error::Auth(source.to_string()))?;
+            .map_err(|source| AuthError::Credentials(Box::new(source)))?;
         Ok(Self { credentials })
     }
 }
 
 impl TokenSource for Adc {
-    async fn bearer(&self) -> Result<String, Error> {
+    async fn bearer(&self) -> Result<String, AuthError> {
         self.credentials
             .id_token()
             .await
-            .map_err(|source| Error::Auth(source.to_string()))
+            .map_err(|source| AuthError::Credentials(Box::new(source)))
     }
 }
 
@@ -50,7 +81,7 @@ impl TokenSource for Adc {
 pub struct StaticToken(pub String);
 
 impl TokenSource for StaticToken {
-    async fn bearer(&self) -> Result<String, Error> {
+    async fn bearer(&self) -> Result<String, AuthError> {
         Ok(self.0.clone())
     }
 }
@@ -63,7 +94,7 @@ const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 /// the client id IAP expects. A cached refresh token drives a silent refresh
 /// when present; otherwise a one-time browser sign-in (loopback + PKCE) runs
 /// and its refresh token is cached so later invocations stay silent.
-pub async fn desktop_id_token(client_id: &str, client_secret: &str) -> Result<String, Error> {
+pub async fn desktop_id_token(client_id: &str, client_secret: &str) -> Result<String, AuthError> {
     if let Some(refresh_token) = load_refresh_token()
         && let Ok(id_token) = refresh_id_token(client_id, client_secret, &refresh_token).await
     {
@@ -74,12 +105,13 @@ pub async fn desktop_id_token(client_id: &str, client_secret: &str) -> Result<St
 
 /// Runs the browser loopback + PKCE authorization once, exchanges the returned
 /// code for an ID token, and caches the refresh token for silent reuse.
-async fn interactive_id_token(client_id: &str, client_secret: &str) -> Result<String, Error> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|source| Error::Auth(format!("could not open the sign-in listener: {source}")))?;
+async fn interactive_id_token(client_id: &str, client_secret: &str) -> Result<String, AuthError> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|source| {
+        AuthError::Flow(format!("could not open the sign-in listener: {source}"))
+    })?;
     let port = listener
         .local_addr()
-        .map_err(|source| Error::Auth(format!("could not read the sign-in port: {source}")))?
+        .map_err(|source| AuthError::Flow(format!("could not read the sign-in port: {source}")))?
         .port();
     let redirect_uri = format!("http://127.0.0.1:{port}");
     let verifier = random_token(32);
@@ -87,7 +119,7 @@ async fn interactive_id_token(client_id: &str, client_secret: &str) -> Result<St
     let state = random_token(16);
 
     let mut auth_url = Url::parse(AUTH_ENDPOINT)
-        .map_err(|source| Error::Auth(format!("invalid authorization endpoint: {source}")))?;
+        .map_err(|source| AuthError::Flow(format!("invalid authorization endpoint: {source}")))?;
     auth_url
         .query_pairs_mut()
         .append_pair("client_id", client_id)
@@ -107,7 +139,7 @@ async fn interactive_id_token(client_id: &str, client_secret: &str) -> Result<St
     let expected_state = state.clone();
     let code = tokio::task::spawn_blocking(move || capture_code(&listener, &expected_state))
         .await
-        .map_err(|source| Error::Auth(format!("the sign-in listener panicked: {source}")))??;
+        .map_err(|source| AuthError::Flow(format!("the sign-in listener panicked: {source}")))??;
 
     let token = post_token(&[
         ("grant_type", "authorization_code"),
@@ -133,7 +165,7 @@ async fn refresh_id_token(
     client_id: &str,
     client_secret: &str,
     refresh_token: &str,
-) -> Result<String, Error> {
+) -> Result<String, AuthError> {
     let token = post_token(&[
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
@@ -145,50 +177,52 @@ async fn refresh_id_token(
 }
 
 /// POSTs a form to the Google token endpoint and returns the decoded JSON.
-async fn post_token(form: &[(&str, &str)]) -> Result<serde_json::Value, Error> {
+async fn post_token(form: &[(&str, &str)]) -> Result<serde_json::Value, AuthError> {
     let response = reqwest::Client::new()
         .post(TOKEN_ENDPOINT)
         .form(form)
         .send()
         .await
-        .map_err(|source| Error::Auth(format!("token request failed: {source}")))?;
+        .map_err(|source| AuthError::Flow(format!("token request failed: {source}")))?;
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|source| Error::Auth(format!("could not read the token response: {source}")))?;
+    let body = response.text().await.map_err(|source| {
+        AuthError::Flow(format!("could not read the token response: {source}"))
+    })?;
     if !status.is_success() {
-        return Err(Error::Auth(format!(
+        return Err(AuthError::Flow(format!(
             "the token endpoint returned {status}: {body}"
         )));
     }
     serde_json::from_str(&body)
-        .map_err(|source| Error::Auth(format!("could not decode the token response: {source}")))
+        .map_err(|source| AuthError::Flow(format!("could not decode the token response: {source}")))
 }
 
 /// Pulls the `id_token` out of a token response; this JWT is what IAP validates.
-fn extract_id_token(token: &serde_json::Value) -> Result<String, Error> {
+fn extract_id_token(token: &serde_json::Value) -> Result<String, AuthError> {
     token
         .get("id_token")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| Error::Auth("the token response carried no id_token".to_owned()))
+        .ok_or_else(|| AuthError::Flow("the token response carried no id_token".to_owned()))
 }
 
 /// Accepts the single loopback redirect, returns the authorization code, and
 /// serves a small page telling the operator the sign-in is done. Blocking, so
 /// it runs on a blocking task off the async runtime.
-fn capture_code(listener: &std::net::TcpListener, expected_state: &str) -> Result<String, Error> {
-    let (mut stream, _) = listener
-        .accept()
-        .map_err(|source| Error::Auth(format!("the sign-in redirect never arrived: {source}")))?;
+fn capture_code(
+    listener: &std::net::TcpListener,
+    expected_state: &str,
+) -> Result<String, AuthError> {
+    let (mut stream, _) = listener.accept().map_err(|source| {
+        AuthError::Flow(format!("the sign-in redirect never arrived: {source}"))
+    })?;
     let cloned = stream
         .try_clone()
-        .map_err(|source| Error::Auth(format!("could not read the redirect: {source}")))?;
+        .map_err(|source| AuthError::Flow(format!("could not read the redirect: {source}")))?;
     let mut reader = std::io::BufReader::new(cloned);
     let mut request_line = String::new();
     std::io::BufRead::read_line(&mut reader, &mut request_line)
-        .map_err(|source| Error::Auth(format!("could not read the redirect: {source}")))?;
+        .map_err(|source| AuthError::Flow(format!("could not read the redirect: {source}")))?;
 
     let query = request_line
         .split_whitespace()
@@ -208,17 +242,19 @@ fn capture_code(listener: &std::net::TcpListener, expected_state: &str) -> Resul
     let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
 
     if let Some(reason) = params.get("error") {
-        return Err(Error::Auth(format!("authorization was denied: {reason}")));
+        return Err(AuthError::Flow(format!(
+            "authorization was denied: {reason}"
+        )));
     }
     if params.get("state").map(String::as_str) != Some(expected_state) {
-        return Err(Error::Auth(
+        return Err(AuthError::Flow(
             "the sign-in redirect state did not match; ignoring a possible forgery".to_owned(),
         ));
     }
     params
         .get("code")
         .cloned()
-        .ok_or_else(|| Error::Auth("the sign-in redirect carried no code".to_owned()))
+        .ok_or_else(|| AuthError::Flow("the sign-in redirect carried no code".to_owned()))
 }
 
 /// A URL-safe, unpadded base64 string of `bytes` random bytes, for the PKCE

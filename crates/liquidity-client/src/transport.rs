@@ -1,12 +1,71 @@
 //! Thin HTTP transport for the liquidity ops API: builds role-prefixed
 //! requests, attaches the per-role bearer token, and maps each response to the
-//! client's `Error` type.
+//! module's own `TransportError`.
 
 use reqwest::StatusCode;
 use url::Url;
 
-use crate::auth::TokenSource;
-use crate::error::Error;
+use crate::auth::{AuthError, TokenSource};
+/// Failure talking to the liquidity ops API over HTTP.
+#[derive(Debug)]
+pub enum TransportError {
+    /// The HTTP request could not be sent, or its body could not be read.
+    Transport(String, reqwest::Error),
+    /// HTTP 401: the identity was missing, expired, or not accepted.
+    Unauthorized(String),
+    /// HTTP 403: authenticated, but not on the command's access list.
+    Forbidden(String),
+    /// Any other non-success status.
+    Http(StatusCode, String),
+    /// A success response whose body was not the expected JSON.
+    Decode(String),
+    /// The bearer token could not be minted for the request.
+    Auth(AuthError),
+}
+
+fn server_said(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("\nServer said: {trimmed}")
+    }
+}
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(url, source) => {
+                write!(f, "could not reach the liquidity API at {url}: {source}")
+            }
+            Self::Unauthorized(body) => write!(
+                f,
+                "HTTP 401 Unauthorized: the T0 Google identity was missing, expired, or invalid.\nRefresh the T0 login (gcloud auth login) or, in CI, the T0 workload identity, then retry.{}",
+                server_said(body)
+            ),
+            Self::Forbidden(body) => write!(
+                f,
+                "HTTP 403 Forbidden: authenticated, but your T0 Workspace group is not on this command's access list.{}",
+                server_said(body)
+            ),
+            Self::Http(status, body) => {
+                write!(f, "HTTP {status}: the request failed.{}", server_said(body))
+            }
+            Self::Decode(detail) => write!(f, "the API response could not be decoded: {detail}"),
+            Self::Auth(source) => write!(f, "{source}"),
+        }
+    }
+}
+
+impl std::error::Error for TransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(_, source) => Some(source),
+            Self::Auth(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// Role prefix the load balancer routes to the read IAP backend.
 const READ_PREFIX: &str = "/liquidity-read";
@@ -66,17 +125,25 @@ impl<A: TokenSource + Sync> Client<A> {
         &self,
         path: &str,
         params: &[(String, String)],
-    ) -> Result<serde_json::Value, Error> {
+    ) -> Result<serde_json::Value, TransportError> {
         let url = self.url(READ_PREFIX, path, params);
         let target = url.to_string();
-        let token = self.read_auth.bearer().await?;
+        let token = self
+            .read_auth
+            .bearer()
+            .await
+            .map_err(TransportError::Auth)?;
         self.dispatch(self.http.get(url), target, token).await
     }
 
-    pub async fn post(&self, path: &str) -> Result<serde_json::Value, Error> {
+    pub async fn post(&self, path: &str) -> Result<serde_json::Value, TransportError> {
         let url = self.url(WRITE_PREFIX, path, &[]);
         let target = url.to_string();
-        let token = self.write_auth.bearer().await?;
+        let token = self
+            .write_auth
+            .bearer()
+            .await
+            .map_err(TransportError::Auth)?;
         self.dispatch(
             self.http
                 .post(url)
@@ -92,12 +159,12 @@ impl<A: TokenSource + Sync> Client<A> {
         request: reqwest::RequestBuilder,
         target: String,
         token: String,
-    ) -> Result<serde_json::Value, Error> {
+    ) -> Result<serde_json::Value, TransportError> {
         let response = request
             .bearer_auth(token)
             .send()
             .await
-            .map_err(|source| Error::Transport(target.clone(), source))?;
+            .map_err(|source| TransportError::Transport(target.clone(), source))?;
         let status = response.status();
         let content_type = response
             .headers()
@@ -112,26 +179,26 @@ impl<A: TokenSource + Sync> Client<A> {
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .to_owned();
-            return Err(Error::Unauthorized(format!(
+            return Err(TransportError::Unauthorized(format!(
                 "IAP redirected to sign-in (status {status}, location {location}); the token was missing, expired, or not accepted"
             )));
         }
         let body = response
             .text()
             .await
-            .map_err(|source| Error::Transport(target, source))?;
+            .map_err(|source| TransportError::Transport(target, source))?;
         if status.is_success() {
             return serde_json::from_str::<serde_json::Value>(&body).map_err(|source| {
-                Error::Decode(format!(
+                TransportError::Decode(format!(
                     "expected JSON but the endpoint returned {content_type} ({source}); this usually means the ops API is not deployed at this path. Body starts: {}",
                     body_prefix(&body)
                 ))
             });
         }
         Err(match status {
-            StatusCode::UNAUTHORIZED => Error::Unauthorized(body),
-            StatusCode::FORBIDDEN => Error::Forbidden(body),
-            other => Error::Http(other, body),
+            StatusCode::UNAUTHORIZED => TransportError::Unauthorized(body),
+            StatusCode::FORBIDDEN => TransportError::Forbidden(body),
+            other => TransportError::Http(other, body),
         })
     }
 }
@@ -173,12 +240,13 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc::{Receiver, channel};
 
-    use super::{Client, Error, TokenSource};
+    use super::{Client, TokenSource};
+    use crate::auth::AuthError;
 
     struct FakeToken(&'static str);
 
     impl TokenSource for FakeToken {
-        async fn bearer(&self) -> Result<String, Error> {
+        async fn bearer(&self) -> Result<String, AuthError> {
             Ok(self.0.to_owned())
         }
     }

@@ -3,7 +3,6 @@
 
 mod auth;
 mod cli;
-mod error;
 mod output;
 mod target;
 mod transport;
@@ -11,11 +10,11 @@ mod transport;
 use clap::Parser;
 use std::process::ExitCode;
 
-use crate::auth::{Adc, StaticToken, TokenSource};
+use crate::auth::{Adc, AuthError, StaticToken, TokenSource};
 use crate::cli::{Cli, Command, Debug, Read};
-use crate::error::Error;
+use crate::output::OutputError;
 use crate::target::Auth;
-use crate::transport::{Client, encode_segment};
+use crate::transport::{Client, TransportError, encode_segment};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -38,9 +37,70 @@ async fn main() -> ExitCode {
 enum Failure {
     Setup(anyhow::Error),
     Api {
-        error: Error,
+        error: ApiError,
         logging_url: Option<String>,
     },
+}
+
+/// Aggregates the feature errors at the CLI boundary for display and exit
+/// codes. Auth and access-denied failures exit 77; everything else exits 1.
+#[derive(Debug)]
+enum ApiError {
+    Transport(TransportError),
+    Output(OutputError),
+    Auth(AuthError),
+}
+
+impl ApiError {
+    fn exit_code(&self) -> u8 {
+        match self {
+            Self::Auth(_)
+            | Self::Transport(
+                TransportError::Unauthorized(_)
+                | TransportError::Forbidden(_)
+                | TransportError::Auth(_),
+            ) => 77,
+            _ => 1,
+        }
+    }
+}
+
+impl From<TransportError> for ApiError {
+    fn from(error: TransportError) -> Self {
+        Self::Transport(error)
+    }
+}
+
+impl From<OutputError> for ApiError {
+    fn from(error: OutputError) -> Self {
+        Self::Output(error)
+    }
+}
+
+impl From<AuthError> for ApiError {
+    fn from(error: AuthError) -> Self {
+        Self::Auth(error)
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(error) => write!(f, "{error}"),
+            Self::Output(error) => write!(f, "{error}"),
+            Self::Auth(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            Self::Output(error) => Some(error),
+            Self::Auth(error) => Some(error),
+        }
+    }
 }
 
 async fn execute(cli: Cli) -> Result<(), Failure> {
@@ -54,7 +114,7 @@ async fn execute(cli: Cli) -> Result<(), Failure> {
             let token = auth::desktop_id_token(&client_id, &client_secret)
                 .await
                 .map_err(|error| Failure::Api {
-                    error,
+                    error: error.into(),
                     logging_url: logging_url.clone(),
                 })?;
             let client = Client::new(
@@ -74,11 +134,11 @@ async fn execute(cli: Cli) -> Result<(), Failure> {
             write_audience,
         } => {
             let read_auth = Adc::new(&read_audience).map_err(|error| Failure::Api {
-                error,
+                error: error.into(),
                 logging_url: logging_url.clone(),
             })?;
             let write_auth = Adc::new(&write_audience).map_err(|error| Failure::Api {
-                error,
+                error: error.into(),
                 logging_url: logging_url.clone(),
             })?;
             let client = Client::new(
@@ -99,7 +159,7 @@ async fn execute(cli: Cli) -> Result<(), Failure> {
 async fn dispatch<A: TokenSource + Sync>(
     client: &Client<A>,
     command: Command,
-) -> Result<(), Error> {
+) -> Result<(), ApiError> {
     let value = match command {
         Command::Read(Read::Resource(args)) => {
             client.get(args.resource.path(), &args.params).await?
@@ -129,7 +189,7 @@ async fn dispatch<A: TokenSource + Sync>(
                 .await?
         }
     };
-    output::print(&value)
+    output::print(&value).map_err(ApiError::from)
 }
 
 #[cfg(test)]
