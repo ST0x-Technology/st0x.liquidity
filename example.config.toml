@@ -51,6 +51,14 @@ close_flatten_cross_max_bps = 400
 # price from. Optional while no asset has overnight counter-trading enabled;
 # required (and must be nonzero) once one does.
 # overnight_max_quote_age_secs = 30
+# Protection bound (bps) for overnight limit prices, separate from
+# counter_trade_slippage_bps because indicative-feed spreads are not comparable
+# to tape pricing. Same requiredness as overnight_max_quote_age_secs;
+# accepted range 1-9999.
+# overnight_slippage_bps = 150
+# Reprice cadence (seconds) for unfilled overnight limit orders. Same
+# requiredness as overnight_max_quote_age_secs; must be nonzero.
+# overnight_reprice_timeout_secs = 120
 
 [broker.travel_rule]
 beneficiary_entity_name = "Acme Corp"

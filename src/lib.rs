@@ -233,12 +233,32 @@ pub async fn run_bot_session_with_injector(
     .await
 }
 
+/// One startup line per configured equity with its effective
+/// counter-trading modes, so the enabled session surface is readable
+/// from the log without opening the config file. Sorted by symbol for
+/// stable output.
+fn log_effective_asset_modes(assets: &st0x_config::AssetsConfig) {
+    let mut equities: Vec<_> = assets.equities.symbols.iter().collect();
+    equities.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (symbol, config) in equities {
+        info!(
+            target: "startup",
+            %symbol,
+            trading = ?config.trading,
+            extended_hours = ?config.extended_hours_counter_trading,
+            overnight = ?config.overnight_counter_trading,
+            "Configured equity counter-trading modes"
+        );
+    }
+}
+
 async fn run_bot_session_inner(
     ctx: Ctx,
     event_sender: broadcast::Sender<Statement>,
     startup_notifier: Arc<dyn startup::StartupNotifier>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> anyhow::Result<()> {
+    log_effective_asset_modes(&ctx.assets);
     let pool = ctx.get_sqlite_pool().await?;
     let apalis_pool = conductor::connect_apalis_pool(&ctx.database_url).await?;
     sqlx::migrate!().set_ignore_missing(true).run(&pool).await?;
@@ -786,11 +806,16 @@ async fn run_conductor_session(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
+    use alloy::primitives::{Address, address};
+    use std::collections::HashMap;
     use std::io;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use st0x_config::create_test_ctx_with_order_owner;
+    use st0x_config::{
+        AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode,
+        create_test_ctx_with_order_owner,
+    };
+    use st0x_execution::Symbol;
 
     use super::*;
 
@@ -1307,5 +1332,43 @@ mod tests {
             message.contains("Bot task panicked"),
             "expected panic to be reported, got: {message}"
         );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn startup_logs_each_equity_mode_line() {
+        // The issue requires the effective per-asset modes to be visible
+        // in startup logs, so an operator can read the enabled session
+        // surface without opening the config file.
+        let mut symbols = HashMap::new();
+        symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            EquityAssetConfig {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
+                overnight_counter_trading: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+        let assets = AssetsConfig {
+            equities: EquitiesConfig {
+                operational_limit: None,
+                symbols,
+            },
+            cash: None,
+        };
+
+        log_effective_asset_modes(&assets);
+
+        assert!(logs_contain("Configured equity counter-trading modes"));
+        assert!(logs_contain("AAPL"));
+        assert!(logs_contain("trading=Enabled"));
+        assert!(logs_contain("extended_hours=Disabled"));
+        assert!(logs_contain("overnight=Enabled"));
     }
 }
