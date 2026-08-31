@@ -18,6 +18,7 @@ trading = "enabled"
 rebalancing = "disabled"
 wrapped_equity_recovery = "disabled"
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 

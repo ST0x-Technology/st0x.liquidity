@@ -263,6 +263,7 @@ mod tests {
                         rebalancing: OperationMode::Disabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         extended_hours_counter_trading,
+                        overnight_counter_trading: OperationMode::Disabled,
                         operational_limit: None,
                     },
                 )]),
@@ -727,6 +728,7 @@ mod tests {
                         rebalancing: OperationMode::Disabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         extended_hours_counter_trading: OperationMode::Disabled,
+                        overnight_counter_trading: OperationMode::Disabled,
                         operational_limit: Some(
                             Positive::new(FractionalShares::new(float!(3.0))).unwrap(),
                         ),

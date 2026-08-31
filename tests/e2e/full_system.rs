@@ -114,6 +114,7 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
                     rebalancing: OperationMode::Enabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     extended_hours_counter_trading: OperationMode::Disabled,
+                    overnight_counter_trading: OperationMode::Disabled,
                     operational_limit: None,
                 },
             ))
@@ -566,6 +567,7 @@ trading = "enabled"
 rebalancing = "enabled"
 wrapped_equity_recovery = "disabled"
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.TSLA]
 tokenized_equity = "{tsla_unwrapped}"
@@ -575,6 +577,7 @@ trading = "enabled"
 rebalancing = "enabled"
 wrapped_equity_recovery = "disabled"
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.cash]
 vault_ids = ["{usdc_vault_id:#x}"]
