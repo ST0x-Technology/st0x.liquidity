@@ -471,9 +471,17 @@ struct BrokerConfig {
     close_flatten_reprice_timeout_secs: Option<u64>,
     extended_hours_close_flatten_window_secs: Option<u64>,
     /// Maximum age (seconds) of an indicative overnight quote the pricing
-    /// path may price from. Optional until an asset opts into overnight
-    /// counter-trading; that per-asset flag brings the requiredness gate.
+    /// path may price from. Required once any asset opts into overnight
+    /// counter-trading; optional (and still zero-rejected) otherwise.
     overnight_max_quote_age_secs: Option<u64>,
+    /// Protection bound (bps) for overnight limit prices, separate from
+    /// `counter_trade_slippage_bps` because indicative-feed spreads are
+    /// not comparable to tape pricing. Same requiredness gate as the
+    /// quote-age knob.
+    overnight_slippage_bps: Option<u16>,
+    /// Reprice cadence (seconds) for unfilled overnight limits. Same
+    /// requiredness gate as the quote-age knob.
+    overnight_reprice_timeout_secs: Option<u64>,
     travel_rule: Option<TravelRuleConfig>,
     close_flatten_cross_max_bps: Option<u16>,
 }
@@ -542,6 +550,40 @@ impl BrokerConfig {
     fn overnight_max_quote_age(&self) -> Result<Option<NonZeroU64>, CtxError> {
         self.overnight_max_quote_age_secs
             .map(|secs| NonZeroU64::new(secs).ok_or(CtxError::OvernightMaxQuoteAgeZero))
+            .transpose()
+    }
+
+    fn overnight_slippage_bps(&self) -> Result<Option<u16>, CtxError> {
+        self.overnight_slippage_bps
+            .map(|configured| {
+                if (MIN_COUNTER_TRADE_SLIPPAGE_BPS..=MAX_COUNTER_TRADE_SLIPPAGE_BPS)
+                    .contains(&configured)
+                {
+                    Ok(configured)
+                } else {
+                    Err(CtxError::OvernightSlippageBpsOutOfRange {
+                        configured,
+                        min: MIN_COUNTER_TRADE_SLIPPAGE_BPS,
+                        max: MAX_COUNTER_TRADE_SLIPPAGE_BPS,
+                    })
+                }
+            })
+            .transpose()
+    }
+
+    fn overnight_reprice_timeout(&self) -> Result<Option<NonZeroU64>, CtxError> {
+        self.overnight_reprice_timeout_secs
+            .map(|configured| {
+                // Same ceiling as the extended-hours cadence: the spec
+                // gives the overnight cadence the same configuration
+                // contract.
+                NonZeroU64::new(configured)
+                    .filter(|timeout| timeout.get() <= MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS)
+                    .ok_or(CtxError::OvernightRepriceTimeoutOutOfRange {
+                        configured,
+                        max: MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS,
+                    })
+            })
             .transpose()
     }
 
@@ -751,9 +793,16 @@ pub struct Ctx {
     /// Alpaca and extended-hours-enabled DryRun contexts always contain `Some`.
     pub extended_hours_reprice_timeout_secs: Option<NonZeroU64>,
     /// Maximum age (seconds) of an indicative overnight quote the pricing
-    /// path may price from. `None` until configured; becomes required once
-    /// any asset opts into overnight counter-trading.
+    /// path may price from. `Some` whenever any asset enables overnight
+    /// counter-trading (startup validation enforces it).
     pub overnight_max_quote_age_secs: Option<NonZeroU64>,
+    /// Protection bound (bps) for overnight limit prices, separate from
+    /// `counter_trade_slippage_bps`. Same presence contract as
+    /// `overnight_max_quote_age_secs`.
+    pub overnight_slippage_bps: Option<u16>,
+    /// Reprice cadence for unfilled overnight limits. Same presence
+    /// contract as `overnight_max_quote_age_secs`.
+    pub overnight_reprice_timeout_secs: Option<NonZeroU64>,
     /// Maximum age (seconds) for a close-flatten limit hedge before it is
     /// cancelled and repriced further along the widening cross ramp.
     pub close_flatten_reprice_timeout_secs: u64,
@@ -1306,6 +1355,11 @@ impl std::fmt::Debug for Ctx {
                 "overnight_max_quote_age_secs",
                 &self.overnight_max_quote_age_secs,
             )
+            .field("overnight_slippage_bps", &self.overnight_slippage_bps)
+            .field(
+                "overnight_reprice_timeout_secs",
+                &self.overnight_reprice_timeout_secs,
+            )
             .field(
                 "close_flatten_reprice_timeout_secs",
                 &self.close_flatten_reprice_timeout_secs,
@@ -1443,6 +1497,8 @@ struct ValidatedParts {
     hedge_order_gate_reconciliation_timeout_secs: NonZeroU64,
     extended_hours_reprice_timeout_secs: Option<NonZeroU64>,
     overnight_max_quote_age_secs: Option<NonZeroU64>,
+    overnight_slippage_bps: Option<u16>,
+    overnight_reprice_timeout_secs: Option<NonZeroU64>,
     close_flatten_reprice_timeout_secs: u64,
     extended_hours_close_flatten_window_secs: u64,
     close_flatten_cross_max_bps: u16,
@@ -1900,12 +1956,7 @@ fn parse_and_validate(
         return Err(CtxError::MissingTravelRule);
     }
 
-    let overnight_max_quote_age_secs = config
-        .broker
-        .as_ref()
-        .map(BrokerConfig::overnight_max_quote_age)
-        .transpose()?
-        .flatten();
+    let overnight = overnight_broker_config(config.broker.as_ref(), &config.assets)?;
 
     Ok(ValidatedParts {
         database_url: config.database_url,
@@ -1924,7 +1975,9 @@ fn parse_and_validate(
         hedge_order_gate_reconciliation_timeout_secs: config
             .hedge_order_gate_reconciliation_timeout_secs,
         extended_hours_reprice_timeout_secs,
-        overnight_max_quote_age_secs,
+        overnight_max_quote_age_secs: overnight.max_quote_age_secs,
+        overnight_slippage_bps: overnight.slippage_bps,
+        overnight_reprice_timeout_secs: overnight.reprice_timeout_secs,
         close_flatten_reprice_timeout_secs,
         extended_hours_close_flatten_window_secs,
         close_flatten_cross_max_bps,
@@ -1990,6 +2043,53 @@ fn extended_hours_broker_windows(
         close_flatten_window_secs: broker_config.extended_hours_close_flatten_window_secs()?,
         close_flatten_cross_max_bps: broker_config
             .close_flatten_cross_max_bps(broker.counter_trade_slippage_bps())?,
+    })
+}
+
+/// The overnight operational bounds. Every field is `Some` when some
+/// asset enables overnight counter-trading (the gate below enforces it),
+/// and passes through whatever was configured otherwise -- provided
+/// values are always validated, so a half-written config fails at
+/// startup instead of lying in wait until the first asset flips on.
+struct OvernightBrokerConfig {
+    max_quote_age_secs: Option<NonZeroU64>,
+    slippage_bps: Option<u16>,
+    reprice_timeout_secs: Option<NonZeroU64>,
+}
+
+fn overnight_broker_config(
+    broker_config: Option<&BrokerConfig>,
+    assets: &HedgingAssets,
+) -> Result<OvernightBrokerConfig, CtxError> {
+    let max_quote_age_secs = broker_config
+        .map(BrokerConfig::overnight_max_quote_age)
+        .transpose()?
+        .flatten();
+    let slippage_bps = broker_config
+        .map(BrokerConfig::overnight_slippage_bps)
+        .transpose()?
+        .flatten();
+    let reprice_timeout_secs = broker_config
+        .map(BrokerConfig::overnight_reprice_timeout)
+        .transpose()?
+        .flatten();
+
+    if assets.any_overnight_enabled() {
+        if max_quote_age_secs.is_none() {
+            return Err(CtxError::MissingOvernightMaxQuoteAge);
+        }
+        if slippage_bps.is_none() {
+            return Err(CtxError::MissingOvernightSlippageBps);
+        }
+        if reprice_timeout_secs.is_none() {
+            return Err(CtxError::MissingOvernightRepriceTimeout);
+        }
+    }
+
+    Ok(OvernightBrokerConfig {
+        max_quote_age_secs,
+        slippage_bps,
+        reprice_timeout_secs,
     })
 }
 
@@ -2094,6 +2194,8 @@ impl Ctx {
                 .hedge_order_gate_reconciliation_timeout_secs,
             extended_hours_reprice_timeout_secs: parts.extended_hours_reprice_timeout_secs,
             overnight_max_quote_age_secs: parts.overnight_max_quote_age_secs,
+            overnight_slippage_bps: parts.overnight_slippage_bps,
+            overnight_reprice_timeout_secs: parts.overnight_reprice_timeout_secs,
             close_flatten_reprice_timeout_secs: parts.close_flatten_reprice_timeout_secs,
             extended_hours_close_flatten_window_secs: parts
                 .extended_hours_close_flatten_window_secs,
@@ -2432,6 +2534,8 @@ impl Ctx {
             hedge_order_gate_reconciliation_timeout_secs,
             extended_hours_reprice_timeout_secs: NonZeroU64::new(300),
             overnight_max_quote_age_secs: None,
+            overnight_slippage_bps: None,
+            overnight_reprice_timeout_secs: None,
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,
@@ -2607,6 +2711,31 @@ pub enum CtxError {
          every overnight quote as stale"
     )]
     OvernightMaxQuoteAgeZero,
+    #[error(
+        "[broker] overnight_max_quote_age_secs is required when any asset enables \
+         overnight_counter_trading"
+    )]
+    MissingOvernightMaxQuoteAge,
+    #[error(
+        "[broker] overnight_slippage_bps is required when any asset enables \
+         overnight_counter_trading"
+    )]
+    MissingOvernightSlippageBps,
+    #[error(
+        "[broker] overnight_slippage_bps {configured} is out of range; \
+         expected {min}..={max}"
+    )]
+    OvernightSlippageBpsOutOfRange { configured: u16, min: u16, max: u16 },
+    #[error(
+        "[broker] overnight_reprice_timeout_secs is required when any asset enables \
+         overnight_counter_trading"
+    )]
+    MissingOvernightRepriceTimeout,
+    #[error(
+        "[broker] overnight_reprice_timeout_secs {configured} is out of range; \
+         expected 1..={max}"
+    )]
+    OvernightRepriceTimeoutOutOfRange { configured: u64, max: u64 },
     #[error(
         "[broker] close_flatten_reprice_timeout_secs is required when using \
          Alpaca Broker API"
@@ -2799,6 +2928,13 @@ impl CtxError {
             Self::OvernightWithoutCounterTrading { .. } => {
                 "overnight enabled without counter-trading"
             }
+            Self::MissingOvernightMaxQuoteAge => "missing overnight_max_quote_age_secs",
+            Self::MissingOvernightSlippageBps => "missing overnight_slippage_bps",
+            Self::OvernightSlippageBpsOutOfRange { .. } => "overnight_slippage_bps out of range",
+            Self::MissingOvernightRepriceTimeout => "missing overnight_reprice_timeout_secs",
+            Self::OvernightRepriceTimeoutOutOfRange { .. } => {
+                "overnight_reprice_timeout_secs out of range"
+            }
             Self::ZeroPollingInterval { .. } => "zero polling interval",
             Self::ServerAndBoardPortsMatch { .. } => "server_port and board_port must differ",
             Self::FloatComparison(_) => "float comparison failed",
@@ -2987,6 +3123,8 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         hedge_order_gate_reconciliation_timeout_secs: NonZeroU64::MIN,
         extended_hours_reprice_timeout_secs: NonZeroU64::new(300),
         overnight_max_quote_age_secs: None,
+        overnight_slippage_bps: None,
+        overnight_reprice_timeout_secs: None,
         close_flatten_reprice_timeout_secs: 60,
         extended_hours_close_flatten_window_secs: 900,
         close_flatten_cross_max_bps: 400,
@@ -4368,6 +4506,248 @@ mod tests {
             matches!(error, CtxError::OvernightMaxQuoteAgeZero),
             "expected OvernightMaxQuoteAgeZero, got {error:?}"
         );
+    }
+
+    /// Config with one AAPL equity whose overnight mode is parameterized,
+    /// and the `[broker]` overnight knobs supplied as raw lines.
+    fn overnight_knobs_config_toml(overnight_mode: &str, overnight_lines: &str) -> NamedTempFile {
+        toml_file(&format!(
+            r#"
+            database_url = ":memory:"
+            log_level = "debug"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
+
+            [assets.equities]
+            retired_symbols = []
+
+            [assets.equities.AAPL]
+            extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "{overnight_mode}"
+
+            [chains.base.trading.assets.equities.AAPL]
+            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+
+            [pricing]
+            ws_url = "wss://pricing.test/ws"
+
+            [chains.base]
+            lifecycle = "active"
+            required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+            [chains.ethereum]
+            lifecycle = "active"
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [broker]
+            counter_trade_slippage_bps = 100
+            extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
+            extended_hours_close_flatten_window_secs = 900
+            close_flatten_cross_max_bps = 400
+            {overnight_lines}
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Entity"
+
+            [rebalancing]
+            transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+            freeze_check = "disabled"
+
+            [rebalancing.equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [rebalancing.usdc]
+            mode = "disabled"
+
+            [alerts]
+            poll_interval = 300
+            realert_interval = 3600
+
+            [alerts.low_balance_thresholds]
+            base = "0.05"
+            ethereum = "0.01"
+
+            [bot_gas_valuation]
+            chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#
+        ))
+    }
+
+    #[tokio::test]
+    async fn overnight_enabled_requires_max_quote_age() {
+        let config = overnight_knobs_config_toml(
+            "enabled",
+            "overnight_slippage_bps = 150\novernight_reprice_timeout_secs = 120",
+        );
+        let secrets = alpaca_pricing_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::MissingOvernightMaxQuoteAge),
+            "expected MissingOvernightMaxQuoteAge, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_enabled_requires_slippage_bps() {
+        let config = overnight_knobs_config_toml(
+            "enabled",
+            "overnight_max_quote_age_secs = 30\novernight_reprice_timeout_secs = 120",
+        );
+        let secrets = alpaca_pricing_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::MissingOvernightSlippageBps),
+            "expected MissingOvernightSlippageBps, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_enabled_requires_reprice_timeout() {
+        let config = overnight_knobs_config_toml(
+            "enabled",
+            "overnight_max_quote_age_secs = 30\novernight_slippage_bps = 150",
+        );
+        let secrets = alpaca_pricing_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::MissingOvernightRepriceTimeout),
+            "expected MissingOvernightRepriceTimeout, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_slippage_bps_out_of_range_is_rejected() {
+        for bad in ["0", "10000"] {
+            let lines = format!(
+                "overnight_max_quote_age_secs = 30\novernight_slippage_bps = {bad}\n\
+                 overnight_reprice_timeout_secs = 120"
+            );
+            let config = overnight_knobs_config_toml("enabled", &lines);
+            let secrets = alpaca_pricing_secrets_toml();
+
+            let error = Ctx::load_files(config.path(), secrets.path())
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(error, CtxError::OvernightSlippageBpsOutOfRange { .. }),
+                "expected OvernightSlippageBpsOutOfRange for {bad}, got {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_overnight_reprice_timeout_is_rejected() {
+        let config = overnight_knobs_config_toml(
+            "enabled",
+            "overnight_max_quote_age_secs = 30\novernight_slippage_bps = 150\n\
+             overnight_reprice_timeout_secs = 0",
+        );
+        let secrets = alpaca_pricing_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::OvernightRepriceTimeoutOutOfRange { .. }),
+            "expected OvernightRepriceTimeoutOutOfRange, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_knobs_are_optional_while_every_asset_is_disabled() {
+        let config = overnight_knobs_config_toml("disabled", "");
+        let secrets = alpaca_pricing_secrets_toml();
+
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.overnight_max_quote_age_secs, None);
+        assert_eq!(ctx.overnight_slippage_bps, None);
+        assert_eq!(ctx.overnight_reprice_timeout_secs, None);
+    }
+
+    #[tokio::test]
+    async fn overnight_knob_values_are_validated_even_while_disabled() {
+        // A half-written config must fail loudly at deploy time, not lie
+        // in wait until the first asset flips to enabled.
+        let config = overnight_knobs_config_toml("disabled", "overnight_slippage_bps = 10000");
+        let secrets = alpaca_pricing_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::OvernightSlippageBpsOutOfRange { .. }),
+            "expected OvernightSlippageBpsOutOfRange, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_knobs_reach_the_ctx() {
+        let config = overnight_knobs_config_toml(
+            "enabled",
+            "overnight_max_quote_age_secs = 30\novernight_slippage_bps = 150\n\
+             overnight_reprice_timeout_secs = 120",
+        );
+        let secrets = alpaca_pricing_secrets_toml();
+
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.overnight_max_quote_age_secs, NonZeroU64::new(30));
+        assert_eq!(ctx.overnight_slippage_bps, Some(150));
+        assert_eq!(ctx.overnight_reprice_timeout_secs, NonZeroU64::new(120));
     }
 
     #[tokio::test]
@@ -7167,6 +7547,8 @@ mod tests {
             close_flatten_reprice_timeout_secs: Some(60),
             extended_hours_close_flatten_window_secs: Some(300),
             overnight_max_quote_age_secs: None,
+            overnight_slippage_bps: None,
+            overnight_reprice_timeout_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -7198,6 +7580,8 @@ mod tests {
             close_flatten_reprice_timeout_secs: Some(60),
             extended_hours_close_flatten_window_secs: Some(300),
             overnight_max_quote_age_secs: None,
+            overnight_slippage_bps: None,
+            overnight_reprice_timeout_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -7226,6 +7610,8 @@ mod tests {
             close_flatten_reprice_timeout_secs: Some(60),
             extended_hours_close_flatten_window_secs: Some(300),
             overnight_max_quote_age_secs: None,
+            overnight_slippage_bps: None,
+            overnight_reprice_timeout_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -7249,6 +7635,8 @@ mod tests {
             close_flatten_reprice_timeout_secs: None,
             extended_hours_close_flatten_window_secs: Some(300),
             overnight_max_quote_age_secs: None,
+            overnight_slippage_bps: None,
+            overnight_reprice_timeout_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -7280,6 +7668,8 @@ mod tests {
             close_flatten_reprice_timeout_secs: Some(60),
             extended_hours_close_flatten_window_secs: Some(u64::MAX),
             overnight_max_quote_age_secs: None,
+            overnight_slippage_bps: None,
+            overnight_reprice_timeout_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -7315,6 +7705,8 @@ mod tests {
                 MAX_EXTENDED_HOURS_CLOSE_FLATTEN_WINDOW_SECS,
             ),
             overnight_max_quote_age_secs: None,
+            overnight_slippage_bps: None,
+            overnight_reprice_timeout_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -9374,6 +9766,8 @@ mod tests {
             counter_trade_slippage_bps: Some(100),
             extended_hours_reprice_timeout_secs: None,
             overnight_max_quote_age_secs: None,
+            overnight_slippage_bps: None,
+            overnight_reprice_timeout_secs: None,
             close_flatten_reprice_timeout_secs: None,
             extended_hours_close_flatten_window_secs: None,
             travel_rule: None,
@@ -10293,6 +10687,9 @@ mod tests {
             close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
             close_flatten_cross_max_bps = 400
+            overnight_max_quote_age_secs = 30
+            overnight_slippage_bps = 150
+            overnight_reprice_timeout_secs = 120
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Entity"

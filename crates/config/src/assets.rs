@@ -290,6 +290,24 @@ impl HedgingAssets {
             .values()
             .any(|policy| policy.extended_hours_counter_trading == OperationMode::Enabled)
     }
+
+    /// Whether the symbol opts into overnight counter-trading. An
+    /// unconfigured symbol is never enabled (fail closed).
+    pub fn is_overnight_enabled(&self, symbol: &Symbol) -> bool {
+        self.equities
+            .symbols
+            .get(symbol)
+            .is_some_and(|policy| policy.overnight_counter_trading == OperationMode::Enabled)
+    }
+
+    /// Returns whether any configured equity enables overnight
+    /// counter-trading.
+    pub fn any_overnight_enabled(&self) -> bool {
+        self.equities
+            .symbols
+            .values()
+            .any(|policy| policy.overnight_counter_trading == OperationMode::Enabled)
+    }
 }
 
 #[cfg(test)]
@@ -672,6 +690,42 @@ mod tests {
             "unknown symbols are fail-closed"
         );
         assert!(hedging.any_extended_hours_enabled());
+    }
+
+    #[test]
+    fn overnight_accessors_return_configured_values() {
+        let mut symbols = HashMap::new();
+        symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            EquityHedgePolicy {
+                extended_hours_counter_trading: OperationMode::Disabled,
+                overnight_counter_trading: OperationMode::Enabled,
+            },
+        );
+        symbols.insert(
+            Symbol::new("TSLA").unwrap(),
+            EquityHedgePolicy {
+                extended_hours_counter_trading: OperationMode::Enabled,
+                overnight_counter_trading: OperationMode::Disabled,
+            },
+        );
+
+        let hedging = HedgingAssets {
+            equities: HedgedEquities {
+                retired_symbols: Vec::new(),
+                symbols,
+            },
+            cash: None,
+        };
+
+        assert!(hedging.is_overnight_enabled(&Symbol::new("AAPL").unwrap()));
+        assert!(!hedging.is_overnight_enabled(&Symbol::new("TSLA").unwrap()));
+        assert!(
+            !hedging.is_overnight_enabled(&Symbol::new("MSFT").unwrap()),
+            "an unconfigured symbol is never overnight-enabled"
+        );
+        assert!(hedging.any_overnight_enabled());
+        assert!(!HedgingAssets::default().any_overnight_enabled());
     }
 
     #[test]
