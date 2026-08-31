@@ -240,7 +240,7 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc::{Receiver, channel};
 
-    use super::{Client, TokenSource};
+    use super::{Client, TokenSource, TransportError};
     use crate::auth::AuthError;
 
     struct FakeToken(&'static str);
@@ -251,24 +251,51 @@ mod tests {
         }
     }
 
-    /// Accepts one connection, captures the raw request bytes, and replies with
-    /// an empty JSON object. Returns the bound port and a channel of the
-    /// captured request.
-    fn capture_server() -> std::io::Result<(u16, Receiver<String>)> {
+    /// Serves one connection: accumulates the request headers up to the
+    /// terminator, hands them back over the channel, then writes `response`.
+    fn serve(response: &'static str) -> std::io::Result<(u16, Receiver<String>)> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         let (sender, receiver) = channel();
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut buffer = [0u8; 4096];
-                let read = stream.read(&mut buffer).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                let _ = sender.send(request);
-                let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == &b"\r\n\r\n"[..]) {
+                        break;
+                    }
+                }
+                let _ = sender.send(String::from_utf8_lossy(&request).into_owned());
                 let _ = stream.write_all(response.as_bytes());
             }
         });
         Ok((port, receiver))
+    }
+
+    const OK_JSON: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+
+    fn capture_server() -> std::io::Result<(u16, Receiver<String>)> {
+        serve(OK_JSON)
+    }
+
+    /// The HTTP request line (method, target, version) of a captured request.
+    fn request_line(request: &str) -> &str {
+        request.lines().next().unwrap_or_default()
+    }
+
+    /// The value of a captured request header, matched case-insensitively.
+    fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then_some(value.trim())
+        })
     }
 
     fn fake_client(port: u16) -> Result<Client<FakeToken>, Box<dyn std::error::Error>> {
@@ -296,16 +323,11 @@ mod tests {
         assert_eq!(value, serde_json::json!({}));
 
         let request = requests.recv()?;
-        assert!(
-            request
-                .to_lowercase()
-                .contains("authorization: bearer read-token"),
-            "read did not use the read token: {request}"
+        assert_eq!(
+            request_line(&request),
+            "GET /liquidity-read/transfers/interrupted?since=0 HTTP/1.1"
         );
-        assert!(
-            request.contains("GET /liquidity-read/transfers/interrupted?since=0 "),
-            "read did not use the read prefix: {request}"
-        );
+        assert_eq!(header(&request, "authorization"), Some("Bearer read-token"));
         Ok(())
     }
 
@@ -318,16 +340,89 @@ mod tests {
         assert_eq!(value, serde_json::json!({}));
 
         let request = requests.recv()?;
-        assert!(
-            request
-                .to_lowercase()
-                .contains("authorization: bearer write-token"),
-            "write did not use the write token: {request}"
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/transfers/recheck/mint/abc HTTP/1.1"
         );
-        assert!(
-            request.contains("POST /liquidity-write/transfers/recheck/mint/abc "),
-            "write did not use the write prefix: {request}"
+        assert_eq!(
+            header(&request, "authorization"),
+            Some("Bearer write-token")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redirect_maps_to_unauthorized_with_location() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (port, _requests) = serve(
+            "HTTP/1.1 302 Found\r\nLocation: https://accounts.google.com/signin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        let client = fake_client(port)?;
+        match client.get("/pnl", &[]).await {
+            Err(TransportError::Unauthorized(message)) => {
+                assert!(
+                    message.contains("https://accounts.google.com/signin"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Unauthorized, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_401_maps_to_unauthorized() -> Result<(), Box<dyn std::error::Error>> {
+        let (port, _requests) = serve(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndenied",
+        )?;
+        let client = fake_client(port)?;
+        match client.get("/pnl", &[]).await {
+            Err(TransportError::Unauthorized(body)) => assert_eq!(body, "denied"),
+            other => panic!("expected Unauthorized, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_403_maps_to_forbidden() -> Result<(), Box<dyn std::error::Error>> {
+        let (port, _requests) =
+            serve("HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope")?;
+        let client = fake_client(port)?;
+        match client.get("/pnl", &[]).await {
+            Err(TransportError::Forbidden(body)) => assert_eq!(body, "nope"),
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn other_status_maps_to_http() -> Result<(), Box<dyn std::error::Error>> {
+        let (port, _requests) = serve(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\nConnection: close\r\n\r\nboom",
+        )?;
+        let client = fake_client(port)?;
+        match client.get("/pnl", &[]).await {
+            Err(TransportError::Http(status, body)) => {
+                assert_eq!(status.as_u16(), 500);
+                assert_eq!(body, "boom");
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn success_non_json_maps_to_decode() -> Result<(), Box<dyn std::error::Error>> {
+        let (port, _requests) = serve(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\nConnection: close\r\n\r\n<html></html>",
+        )?;
+        let client = fake_client(port)?;
+        match client.get("/pnl", &[]).await {
+            Err(TransportError::Decode(message)) => {
+                assert!(message.contains("text/html"), "{message}");
+            }
+            other => panic!("expected Decode, got {other:?}"),
+        }
         Ok(())
     }
 

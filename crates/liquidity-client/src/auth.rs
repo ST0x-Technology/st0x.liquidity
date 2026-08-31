@@ -96,7 +96,8 @@ const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 /// and its refresh token is cached so later invocations stay silent.
 pub async fn desktop_id_token(client_id: &str, client_secret: &str) -> Result<String, AuthError> {
     if let Some(refresh_token) = load_refresh_token()
-        && let Ok(id_token) = refresh_id_token(client_id, client_secret, &refresh_token).await
+        && let Ok(id_token) =
+            refresh_id_token(TOKEN_ENDPOINT, client_id, client_secret, &refresh_token).await
     {
         return Ok(id_token);
     }
@@ -141,14 +142,17 @@ async fn interactive_id_token(client_id: &str, client_secret: &str) -> Result<St
         .await
         .map_err(|source| AuthError::Flow(format!("the sign-in listener panicked: {source}")))??;
 
-    let token = post_token(&[
-        ("grant_type", "authorization_code"),
-        ("code", &code),
-        ("code_verifier", &verifier),
-        ("client_id", client_id),
-        ("client_secret", client_secret),
-        ("redirect_uri", &redirect_uri),
-    ])
+    let token = post_token(
+        TOKEN_ENDPOINT,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("code_verifier", &verifier),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("redirect_uri", &redirect_uri),
+        ],
+    )
     .await?;
 
     if let Some(refresh_token) = token
@@ -162,24 +166,28 @@ async fn interactive_id_token(client_id: &str, client_secret: &str) -> Result<St
 
 /// Exchanges a cached refresh token for a fresh ID token, no browser needed.
 async fn refresh_id_token(
+    endpoint: &str,
     client_id: &str,
     client_secret: &str,
     refresh_token: &str,
 ) -> Result<String, AuthError> {
-    let token = post_token(&[
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token),
-        ("client_id", client_id),
-        ("client_secret", client_secret),
-    ])
+    let token = post_token(
+        endpoint,
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+        ],
+    )
     .await?;
     extract_id_token(&token)
 }
 
 /// POSTs a form to the Google token endpoint and returns the decoded JSON.
-async fn post_token(form: &[(&str, &str)]) -> Result<serde_json::Value, AuthError> {
+async fn post_token(endpoint: &str, form: &[(&str, &str)]) -> Result<serde_json::Value, AuthError> {
     let response = reqwest::Client::new()
-        .post(TOKEN_ENDPOINT)
+        .post(endpoint)
         .form(form)
         .send()
         .await
@@ -327,5 +335,122 @@ fn store_refresh_token(refresh_token: &str) {
     #[cfg(not(unix))]
     {
         let _ = std::fs::write(&path, body);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    use super::{AuthError, capture_code, extract_id_token, refresh_id_token};
+
+    #[test]
+    fn extract_id_token_reads_the_jwt() {
+        let token = serde_json::json!({ "id_token": "jwt-value" });
+        assert_eq!(extract_id_token(&token).ok(), Some("jwt-value".to_owned()));
+    }
+
+    #[test]
+    fn extract_id_token_rejects_a_missing_jwt() {
+        let token = serde_json::json!({ "access_token": "no-id-here" });
+        assert!(matches!(extract_id_token(&token), Err(AuthError::Flow(_))));
+    }
+
+    /// Connects to the loopback listener and sends one raw HTTP GET whose
+    /// target carries `query`, then drains the reply so `capture_code` can
+    /// finish writing its page.
+    fn send_redirect(port: u16, query: &str) {
+        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+            let request = format!("GET /?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+            let _ = stream.write_all(request.as_bytes());
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink);
+        }
+    }
+
+    /// Drives `capture_code` against a single loopback redirect carrying
+    /// `query`, returning what it parsed.
+    fn capture(
+        query: &'static str,
+        expected_state: &str,
+    ) -> Result<Result<String, AuthError>, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let sender = std::thread::spawn(move || send_redirect(port, query));
+        let result = capture_code(&listener, expected_state);
+        let _ = sender.join();
+        Ok(result)
+    }
+
+    #[test]
+    fn capture_code_returns_the_authorization_code() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            capture("code=abc&state=xyz", "xyz")?.ok(),
+            Some("abc".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn capture_code_rejects_a_mismatched_state() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(matches!(
+            capture("code=abc&state=wrong", "xyz")?,
+            Err(AuthError::Flow(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn capture_code_rejects_a_missing_code() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(matches!(
+            capture("state=xyz", "xyz")?,
+            Err(AuthError::Flow(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn capture_code_surfaces_a_denial() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(matches!(
+            capture("error=access_denied&state=xyz", "xyz")?,
+            Err(AuthError::Flow(_))
+        ));
+        Ok(())
+    }
+
+    /// Serves one token-endpoint response over loopback and returns its URL.
+    fn token_server(response: &'static str) -> Result<String, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        Ok(format!("http://127.0.0.1:{port}/token"))
+    }
+
+    #[tokio::test]
+    async fn refresh_decodes_a_fresh_id_token() -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = token_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"id_token\":\"fresh\"}",
+        )?;
+        let result = refresh_id_token(&endpoint, "cid", "secret", "rtok").await;
+        assert_eq!(result.ok(), Some("fresh".to_owned()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_fails_on_a_rejected_token_request() -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint =
+            token_server("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\ninvalid_grant")?;
+        assert!(matches!(
+            refresh_id_token(&endpoint, "cid", "secret", "rtok").await,
+            Err(AuthError::Flow(_))
+        ));
+        Ok(())
     }
 }
