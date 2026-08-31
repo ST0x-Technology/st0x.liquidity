@@ -28,6 +28,8 @@ impl<A: TokenSource + Sync> Client<A> {
     pub fn new(base_url: Url, read_auth: A, write_auth: A) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()?;
         Ok(Self {
             http,
@@ -134,6 +136,27 @@ fn body_prefix(body: &str) -> String {
         .collect()
 }
 
+/// Percent-encodes one path segment so an interpolated value (a venue, kind,
+/// or aggregate id) cannot inject extra `/` segments or a `?`/`#` that would
+/// change routing. Keeps the RFC 3986 unreserved set; encodes everything else.
+pub(crate) fn encode_segment(segment: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(segment.len());
+    for &byte in segment.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -226,5 +249,15 @@ mod tests {
             "write did not use the write prefix: {request}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn encode_segment_escapes_path_separators() {
+        assert_eq!(super::encode_segment("a/b"), "a%2Fb");
+        assert_eq!(super::encode_segment("x?y#z"), "x%3Fy%23z");
+        assert_eq!(
+            super::encode_segment("7fc7c900-aa6d-4911"),
+            "7fc7c900-aa6d-4911"
+        );
     }
 }

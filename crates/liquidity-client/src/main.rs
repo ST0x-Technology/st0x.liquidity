@@ -1,3 +1,6 @@
+//! Binary entrypoint: resolves the target environment, builds the auth-backed
+//! transport, dispatches the parsed command, and maps failures to exit codes.
+
 mod auth;
 mod cli;
 mod error;
@@ -13,7 +16,7 @@ use crate::auth::{Adc, StaticToken, TokenSource};
 use crate::cli::{Cli, Command, Debug, Read};
 use crate::error::Error;
 use crate::target::Auth;
-use crate::transport::Client;
+use crate::transport::{Client, encode_segment};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -95,15 +98,25 @@ async fn dispatch<A: TokenSource + Sync>(
             client.get(args.resource.path(), &args.params).await?
         }
         Command::Read(Read::TradeEvents(args)) => {
-            let path = format!("/trades/{}/{}/events", args.venue, args.aggregate_id);
+            let path = format!(
+                "/trades/{}/{}/events",
+                encode_segment(&args.venue),
+                encode_segment(&args.aggregate_id)
+            );
             client.get(&path, &args.params).await?
         }
         Command::Read(Read::TransferEvents(args)) => {
-            let path = format!("/transfers/{}/{}/events", args.kind, args.aggregate_id);
+            let path = format!(
+                "/transfers/{}/{}/events",
+                encode_segment(&args.kind),
+                encode_segment(&args.aggregate_id)
+            );
             client.get(&path, &args.params).await?
         }
         Command::Debug(Debug::Resume) => client.post("/transfers/resume").await?,
         Command::Debug(Debug::Recheck { kind, id }) => {
+            let kind = encode_segment(&kind);
+            let id = encode_segment(&id);
             client
                 .post(&format!("/transfers/recheck/{kind}/{id}"))
                 .await?

@@ -1,3 +1,6 @@
+//! Target resolution: reads each environment's base URL and auth inputs from
+//! the process environment and validates them into a `Target`.
+
 use anyhow::{Context, Result};
 use url::Url;
 
@@ -52,14 +55,26 @@ fn required(variable: &str, hint: &str) -> Result<String> {
     std::env::var(variable).with_context(|| format!("set {variable} {hint}"))
 }
 
+/// Parses and validates the API base URL: it must be a well-formed HTTPS URL
+/// with a host, since the client only talks to the IAP-fronted HTTPS endpoint.
+fn parse_base_url(prefix: &str, raw: &str) -> Result<Url> {
+    let url = Url::parse(raw).with_context(|| format!("{prefix}_URL is not a valid URL: {raw}"))?;
+    if url.scheme() != "https" {
+        anyhow::bail!("{prefix}_URL must use https, got: {raw}");
+    }
+    if url.host_str().unwrap_or_default().is_empty() {
+        anyhow::bail!("{prefix}_URL must include a host, got: {raw}");
+    }
+    Ok(url)
+}
+
 pub fn resolve(env: Env) -> Result<Target> {
     let prefix = env.prefix();
     let raw_url = required(
         &format!("{prefix}_URL"),
         "to the IAP-fronted liquidity API base URL for this environment",
     )?;
-    let base_url = Url::parse(&raw_url)
-        .with_context(|| format!("{prefix}_URL is not a valid URL: {raw_url}"))?;
+    let base_url = parse_base_url(prefix, &raw_url)?;
     let auth = match env {
         Env::Staging => Auth::OauthDesktop {
             client_id: required(
@@ -88,4 +103,29 @@ pub fn resolve(env: Env) -> Result<Target> {
         auth,
         logging_url,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_base_url;
+
+    #[test]
+    fn accepts_https_url_with_host() {
+        assert!(parse_base_url("T0_LIQUIDITY_STAGING", "https://liquidity.example.com").is_ok());
+    }
+
+    #[test]
+    fn rejects_non_https_scheme() {
+        assert!(parse_base_url("T0_LIQUIDITY_STAGING", "http://liquidity.example.com").is_err());
+    }
+
+    #[test]
+    fn rejects_url_without_host() {
+        assert!(parse_base_url("T0_LIQUIDITY_STAGING", "https://").is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_url() {
+        assert!(parse_base_url("T0_LIQUIDITY_STAGING", "not a url").is_err());
+    }
 }

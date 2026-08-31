@@ -1,3 +1,6 @@
+//! Command-line model for the liquidity client: the argument parser, the
+//! command and resource enums, and their fixed API path mappings.
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::target::Env;
@@ -122,5 +125,31 @@ fn parse_key_value(raw: &str) -> Result<(String, String), String> {
     match raw.split_once('=') {
         Some((key, value)) if !key.is_empty() => Ok((key.to_owned(), value.to_owned())),
         _ => Err(format!("expected key=value, got `{raw}`")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_key_value;
+
+    #[test]
+    fn parses_key_and_value() {
+        assert_eq!(
+            parse_key_value("since=0"),
+            Ok(("since".to_owned(), "0".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rejects_empty_key() {
+        assert!(parse_key_value("=value").is_err());
+    }
+
+    #[test]
+    fn keeps_equals_in_value() {
+        assert_eq!(
+            parse_key_value("filter=a=b"),
+            Ok(("filter".to_owned(), "a=b".to_owned()))
+        );
     }
 }

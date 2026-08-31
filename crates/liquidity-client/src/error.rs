@@ -1,3 +1,6 @@
+//! Operator-facing error type: one `Error` enum whose `Display` explains the
+//! failure and, for auth failures, how to fix it.
+
 use std::fmt;
 
 use reqwest::StatusCode;
@@ -13,6 +16,7 @@ pub enum Error {
     Decode(String),
     Encode(serde_json::Error),
     Auth(String),
+    Output(std::io::Error),
 }
 
 impl Error {
@@ -60,8 +64,18 @@ impl fmt::Display for Error {
                 f,
                 "could not obtain a T0 Google identity: {reason}\nFor staging, complete the browser sign-in when prompted. For production, ensure Application Default Credentials (a service account, workload identity, or impersonation) can mint an ID token for the configured audience.",
             ),
+            Self::Output(source) => write!(f, "could not write output: {source}"),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(_, source) => Some(source),
+            Self::Encode(source) => Some(source),
+            Self::Output(source) => Some(source),
+            _ => None,
+        }
+    }
+}

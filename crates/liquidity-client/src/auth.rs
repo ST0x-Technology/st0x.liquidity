@@ -266,11 +266,26 @@ fn store_refresh_token(refresh_token: &str) {
         let _ = std::fs::create_dir_all(directory);
     }
     let body = serde_json::json!({ "refresh_token": refresh_token }).to_string();
-    if std::fs::write(&path, body).is_ok() {
-        #[cfg(unix)]
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // Create with owner-only mode from the outset so the token is never
+        // briefly world-readable between creation and a later chmod; re-assert
+        // 0600 to also cover an already-existing file, whose mode open keeps.
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
         {
-            use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            let _ = file.write_all(body.as_bytes());
         }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(&path, body);
     }
 }
