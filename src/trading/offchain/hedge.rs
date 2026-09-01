@@ -20,8 +20,9 @@ use st0x_config::{AssetsConfig, ExecutionThreshold};
 use st0x_event_sorcery::{AggregateError, LifecycleError, Store};
 use st0x_execution::{
     Backpressure, ClientOrderId, CounterTradePreflight, CounterTradeSkipReason, Direction,
-    FractionalShares, MarketOrder, MarketSession, Permanence, Positive, PostCloseGap,
-    SupportedExecutor, Symbol, Usd,
+    EligibilitySnapshots, FractionalShares, MarketOrder, MarketSession, OvernightEligibilityError,
+    OvernightOrderShape, Permanence, Positive, PostCloseGap, SupportedExecutor, Symbol, Usd,
+    validate_overnight_eligibility,
 };
 
 use crate::alerts::Notifier;
@@ -132,6 +133,17 @@ pub(crate) struct HedgeCtx {
     /// always-succeeds-in-practice `Result` through the hot placement path.
     pub(crate) close_flatten_policy: CloseFlattenPolicy,
     pub(crate) close_flatten_ramp: CloseFlattenCrossRamp,
+    /// The per-symbol eligibility store the conductor's 19:55 ET sync
+    /// task writes. The overnight order-kind selection reads it fail
+    /// closed: a missing or stale snapshot defers the hedge with no
+    /// broker call.
+    pub(crate) overnight_eligibility: EligibilitySnapshots,
+    /// `Some` whenever any asset enables overnight counter-trading
+    /// (startup validation enforces it); an enabled symbol reaching the
+    /// overnight path with `None` here is a wiring bug and defers loudly.
+    pub(crate) overnight_max_quote_age: Option<Duration>,
+    /// Same presence contract as `overnight_max_quote_age`.
+    pub(crate) overnight_slippage_bps: Option<u16>,
     /// Serialises broker submissions across hedge jobs and the inline
     /// counter-trade path in `conductor.rs`, so a preflight running under
     /// this same lock (the inline path's) observes any prior submission
@@ -330,17 +342,9 @@ async fn select_order_kind_for_current_session(
             );
             Ok(None)
         }
-        // Overnight defers like Closed until automated overnight
-        // counter-trading ships; it will then select an overnight limit
-        // order priced from the indicative overnight feed.
         MarketSession::Overnight => {
-            info!(
-                target: "hedge",
-                %symbol,
-                "Overnight session at perform time; overnight counter-trading is not \
-                 implemented yet, skipping hedge, CheckPositions will re-enqueue"
-            );
-            Ok(None)
+            select_overnight_order_kind(ctx, symbol, shares, direction, submitted_price_preflight)
+                .await
         }
         MarketSession::Extended => {
             if !ctx.assets.is_extended_hours_enabled(symbol) {
@@ -507,7 +511,7 @@ async fn extended_hours_preflight_at_submitted_price(
     }
 }
 
-/// Which source supplied the price an extended-hours limit was derived from.
+/// Which source supplied the price a session limit order was derived from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReferencePriceSource {
     /// An optional current bid/ask market-data quote. The preferred source when
@@ -519,6 +523,10 @@ pub(crate) enum ReferencePriceSource {
     /// A `delayed_sip` quote, used only when neither the optional primary quote
     /// nor the mark can supply a reference. A real NBBO, fifteen minutes stale.
     DelayedSipQuote,
+    /// The indicative overnight feed: the ONLY permissible source during
+    /// the overnight session -- there is no fallback chain (RAI-1947
+    /// contract).
+    OvernightQuote,
 }
 
 impl ReferencePriceSource {
@@ -527,6 +535,7 @@ impl ReferencePriceSource {
             Self::PrimaryQuote => "primary_quote",
             Self::Mark => "mark",
             Self::DelayedSipQuote => "delayed_sip_quote",
+            Self::OvernightQuote => "overnight_quote",
         }
     }
 }
@@ -759,6 +768,237 @@ pub(crate) async fn resolve_extended_hours_reference_price(
             Direction::Sell => quote.bid(),
         },
         source: ReferencePriceSource::DelayedSipQuote,
+    })
+}
+
+/// Why an overnight reference price could not be established. Unlike the
+/// extended-hours chain, every case defers the hedge: the indicative
+/// overnight feed is the only permissible source (RAI-1947 contract), so
+/// there is nothing to fall back to.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OvernightReferenceError {
+    /// The overnight quote fetch failed or the feed had no quote.
+    #[error("overnight quote fetch failed: {0}")]
+    QuoteFetch(Box<dyn std::error::Error + Send + Sync>),
+    /// The quote's own timestamp is older than the configured bound; a
+    /// stale indicative quote must never be priced from.
+    #[error(
+        "overnight quote is {age:?} old, exceeding the configured maximum \
+         of {max_age:?}"
+    )]
+    Stale {
+        age: std::time::Duration,
+        max_age: std::time::Duration,
+    },
+}
+
+/// Records one deferred overnight hedge attempt with its concrete
+/// reason, then reports the defer.
+fn defer_overnight(symbol: &Symbol, reason: &'static str) -> Option<CounterTradeOrderKind> {
+    counter!(
+        "hedge_scan_skipped_total",
+        "symbol" => symbol.to_string(),
+        "reason" => reason
+    )
+    .increment(1);
+    None
+}
+
+/// The overnight arm of order-kind selection. Every gate defers with a
+/// concrete reason and no broker call: per-symbol opt-in, fail-closed
+/// eligibility against the synced snapshot, and a priceable indicative
+/// quote. A passing symbol gets an overnight limit crossed from the
+/// indicative feed and bounded by `overnight_slippage_bps`.
+async fn select_overnight_order_kind(
+    ctx: &HedgeCtx,
+    symbol: &Symbol,
+    shares: Positive<FractionalShares>,
+    direction: Direction,
+    submitted_price_preflight: SubmittedPricePreflight,
+) -> Result<Option<CounterTradeOrderKind>, TradeAccountingError> {
+    if !ctx.assets.is_overnight_enabled(symbol) {
+        info!(
+            target: "hedge",
+            %symbol,
+            "Overnight session but symbol is not enabled for overnight counter-trading; \
+             skipping, CheckPositions will re-enqueue"
+        );
+        return Ok(defer_overnight(symbol, "overnight_disabled"));
+    }
+
+    let now = chrono::Utc::now();
+    let snapshot = ctx.overnight_eligibility.get(symbol);
+    let shape = match shares.inner().is_whole() {
+        Ok(true) => OvernightOrderShape::WholeShares,
+        Ok(false) => OvernightOrderShape::Fractional,
+        Err(error) => {
+            warn!(
+                target: "hedge",
+                %symbol, ?error,
+                "Quantity shape check failed; deferring the overnight hedge fail-closed"
+            );
+            return Ok(defer_overnight(symbol, "overnight_ineligible"));
+        }
+    };
+    if let Err(error) = validate_overnight_eligibility(symbol, snapshot.as_ref(), shape, now) {
+        info!(
+            target: "hedge",
+            %symbol, %error,
+            "Overnight eligibility refused; deferring, CheckPositions will re-enqueue"
+        );
+        let reason = match &error {
+            OvernightEligibilityError::OvernightHalted { .. } => "overnight_halted",
+            OvernightEligibilityError::NoSnapshot { .. }
+            | OvernightEligibilityError::StaleSnapshot { .. } => "stale_asset_sync",
+            OvernightEligibilityError::NotTradable { .. }
+            | OvernightEligibilityError::NotOvernightTradable { .. }
+            | OvernightEligibilityError::FractionalNotEligible { .. } => "overnight_ineligible",
+        };
+        return Ok(defer_overnight(symbol, reason));
+    }
+    // Validation just proved the snapshot present.
+    let Some(snapshot) = snapshot else {
+        return Ok(defer_overnight(symbol, "stale_asset_sync"));
+    };
+
+    // Present whenever any asset is enabled (startup validation); absence
+    // here is a wiring bug, so defer loudly rather than silently assume a
+    // bound.
+    let (Some(max_quote_age), Some(slippage_bps)) =
+        (ctx.overnight_max_quote_age, ctx.overnight_slippage_bps)
+    else {
+        warn!(
+            target: "hedge",
+            %symbol,
+            "Overnight knobs absent despite an enabled symbol; deferring fail-closed"
+        );
+        return Ok(defer_overnight(symbol, "overnight_ineligible"));
+    };
+
+    let reference = match resolve_overnight_reference_price(
+        ctx.order_placer.as_ref(),
+        symbol,
+        direction,
+        max_quote_age,
+        now,
+    )
+    .await
+    {
+        Ok(reference) => reference,
+        Err(error) => {
+            info!(
+                target: "hedge",
+                %symbol, %error,
+                "Overnight quote unpriceable; deferring, CheckPositions will re-enqueue"
+            );
+            return Ok(defer_overnight(symbol, "overnight_unpriceable"));
+        }
+    };
+
+    counter!(
+        "hedge_price_source_total",
+        "symbol" => symbol.to_string(),
+        "path" => "overnight",
+        "source" => reference.source.metric_label()
+    )
+    .increment(1);
+
+    let limit_price = apply_slippage(reference.price.inner(), direction, slippage_bps)
+        .map_err(TradeAccountingError::SlippageCalculation)?;
+
+    // Same submitted-price gate as extended hours, minus the
+    // close-flatten dimensions (a non-concept overnight): a buy re-checks
+    // cash against the exact limit it is about to submit.
+    if direction == Direction::Buy
+        && matches!(submitted_price_preflight, SubmittedPricePreflight::Required)
+        && !overnight_preflight_at_submitted_price(ctx, symbol, shares, direction, limit_price)
+            .await?
+    {
+        return Ok(defer_overnight(symbol, "overnight_preflight_blocked"));
+    }
+
+    Ok(Some(CounterTradeOrderKind::OvernightLimit {
+        limit_price,
+        snapshot,
+    }))
+}
+
+/// The overnight twin of `extended_hours_preflight_at_submitted_price`,
+/// without the close-flatten coupling that path carries.
+async fn overnight_preflight_at_submitted_price(
+    ctx: &HedgeCtx,
+    symbol: &Symbol,
+    shares: Positive<FractionalShares>,
+    direction: Direction,
+    limit_price: Positive<Usd>,
+) -> Result<bool, TradeAccountingError> {
+    let order = MarketOrder {
+        symbol: symbol.clone(),
+        shares,
+        direction,
+        // Preflight only; this id is never sent to the broker. Use a fresh
+        // value so callers cannot mistake it for a real key.
+        client_order_id: ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+    };
+
+    let preflight = ctx
+        .order_placer
+        .preflight_counter_trade_at_price(order, limit_price)
+        .await
+        .map_err(|source| TradeAccountingError::OvernightPreflightAtPrice {
+            symbol: symbol.clone(),
+            source,
+        })?;
+
+    match preflight {
+        CounterTradePreflight::Allowed { .. } => Ok(true),
+        CounterTradePreflight::Skipped(reason) => {
+            warn!(
+                target: "hedge",
+                %symbol, %reason, %limit_price,
+                "Overnight hedge blocked at submission time: the exact limit no longer \
+                 passes the preflight"
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// Resolves the overnight reference price from the indicative feed alone:
+/// the ask for buys, the bid for sells. Crossed and non-positive quotes
+/// are unrepresentable upstream (`LatestQuote` validates at
+/// construction), so the only defer causes here are a failed fetch and
+/// staleness against the quote's own timestamp.
+pub(crate) async fn resolve_overnight_reference_price(
+    order_placer: &dyn OrderPlacer,
+    symbol: &Symbol,
+    direction: Direction,
+    max_quote_age: std::time::Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<ReferencePrice, OvernightReferenceError> {
+    let indicative = order_placer
+        .fetch_latest_overnight_quote(symbol)
+        .await
+        .map_err(OvernightReferenceError::QuoteFetch)?;
+
+    // Same skew clamp as the executor-side validator: a quote stamped
+    // slightly ahead of our clock has age zero, never an unsigned wrap.
+    let age = (now - indicative.at)
+        .to_std()
+        .unwrap_or(std::time::Duration::ZERO);
+    if age > max_quote_age {
+        return Err(OvernightReferenceError::Stale {
+            age,
+            max_age: max_quote_age,
+        });
+    }
+
+    Ok(ReferencePrice {
+        price: match direction {
+            Direction::Buy => indicative.quote.ask(),
+            Direction::Sell => indicative.quote.bid(),
+        },
+        source: ReferencePriceSource::OvernightQuote,
     })
 }
 
@@ -1581,8 +1821,8 @@ mod tests {
     use st0x_config::{EquitiesConfig, EquityAssetConfig, ExecutionThreshold, OperationMode};
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::{
-        ClientOrderId, Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor,
-        Symbol,
+        ClientOrderId, Direction, ExecutorOrderId, FractionalShares, IndicativeQuote, LatestQuote,
+        MockExecutor, Positive, SupportedExecutor, Symbol,
     };
     use st0x_finance::Usd;
     use st0x_float_macro::float;
@@ -1865,6 +2105,9 @@ mod tests {
             assets: extended_hours_assets("AAPL", true),
             close_flatten_policy: CloseFlattenPolicy::from_secs(900).unwrap(),
             close_flatten_ramp: CloseFlattenCrossRamp::new(100, 400).unwrap(),
+            overnight_eligibility: EligibilitySnapshots::default(),
+            overnight_max_quote_age: Some(std::time::Duration::from_secs(30)),
+            overnight_slippage_bps: Some(150),
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
             poll_interval: TEST_POLL_INTERVAL,
             notifier: notifier.clone(),
@@ -2484,12 +2727,13 @@ mod tests {
     /// because the enum carries no iteration, but [`sample_symbol_scoped_error`]
     /// matches it exhaustively, so a new variant cannot be added without the
     /// compiler pointing at this pair.
-    const EVERY_SYMBOL_SCOPED_REASON: [SymbolScopedReason; 5] = [
+    const EVERY_SYMBOL_SCOPED_REASON: [SymbolScopedReason; 6] = [
         SymbolScopedReason::MarkFetch,
         SymbolScopedReason::LimitQuoteFetch,
         SymbolScopedReason::LimitQuoteUnavailable,
         SymbolScopedReason::SlippageCalculation,
         SymbolScopedReason::CloseFlattenPreflightAtPrice,
+        SymbolScopedReason::OvernightPreflightAtPrice,
     ];
 
     /// Builds the error variant `scope()` classifies as `reason`, with a cause
@@ -2520,6 +2764,12 @@ mod tests {
             ),
             SymbolScopedReason::CloseFlattenPreflightAtPrice => {
                 TradeAccountingError::CloseFlattenPreflightAtPrice {
+                    symbol: symbol.clone(),
+                    source: "preflight endpoint unavailable".into(),
+                }
+            }
+            SymbolScopedReason::OvernightPreflightAtPrice => {
+                TradeAccountingError::OvernightPreflightAtPrice {
                     symbol: symbol.clone(),
                     source: "preflight endpoint unavailable".into(),
                 }
@@ -4833,6 +5083,9 @@ mod tests {
             assets: extended_hours_assets("AAPL", true),
             close_flatten_policy: CloseFlattenPolicy::from_secs(900).unwrap(),
             close_flatten_ramp: CloseFlattenCrossRamp::new(100, 400).unwrap(),
+            overnight_eligibility: EligibilitySnapshots::default(),
+            overnight_max_quote_age: Some(std::time::Duration::from_secs(30)),
+            overnight_slippage_bps: Some(150),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
             poll_interval: TEST_POLL_INTERVAL,
             notifier: notifier.clone(),
@@ -5984,6 +6237,242 @@ mod tests {
         assert_eq!(reference.price, usd("110.00"));
     }
 
+    fn overnight_quote(bid: &str, ask: &str, at: chrono::DateTime<chrono::Utc>) -> IndicativeQuote {
+        IndicativeQuote {
+            quote: LatestQuote::new(usd(bid), usd(ask)).unwrap(),
+            at,
+        }
+    }
+
+    #[tokio::test]
+    async fn overnight_reference_prices_buys_from_the_ask_and_sells_from_the_bid() {
+        let now = chrono::Utc::now();
+        let placer = crate::offchain::order::ExecutorOrderPlacer(
+            MockExecutor::new().with_overnight_quote(overnight_quote("24.10", "24.30", now)),
+        );
+        let symbol = Symbol::new("RKLB").unwrap();
+        let max_age = std::time::Duration::from_secs(30);
+
+        let buy = resolve_overnight_reference_price(&placer, &symbol, Direction::Buy, max_age, now)
+            .await
+            .unwrap();
+        let sell =
+            resolve_overnight_reference_price(&placer, &symbol, Direction::Sell, max_age, now)
+                .await
+                .unwrap();
+
+        assert_eq!(buy.price, usd("24.30"));
+        assert_eq!(buy.source, ReferencePriceSource::OvernightQuote);
+        assert_eq!(sell.price, usd("24.10"));
+        assert_eq!(sell.source, ReferencePriceSource::OvernightQuote);
+    }
+
+    #[tokio::test]
+    async fn overnight_reference_defers_on_a_stale_quote() {
+        let now = chrono::Utc::now();
+        let stale_at = now - chrono::Duration::seconds(45);
+        let placer = crate::offchain::order::ExecutorOrderPlacer(
+            MockExecutor::new().with_overnight_quote(overnight_quote("24.10", "24.30", stale_at)),
+        );
+        let symbol = Symbol::new("RKLB").unwrap();
+        let max_age = std::time::Duration::from_secs(30);
+
+        let error =
+            resolve_overnight_reference_price(&placer, &symbol, Direction::Buy, max_age, now)
+                .await
+                .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                OvernightReferenceError::Stale { age, max_age }
+                    if age == std::time::Duration::from_secs(45)
+                        && max_age == std::time::Duration::from_secs(30)
+            ),
+            "expected the exact staleness, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_reference_tolerates_broker_clock_ahead_of_ours() {
+        // A quote stamped slightly in the future (broker clock skew) has
+        // age zero, never a huge unsigned wrap -- the same clamp the
+        // executor-side validator applies.
+        let now = chrono::Utc::now();
+        let future_at = now + chrono::Duration::seconds(5);
+        let placer = crate::offchain::order::ExecutorOrderPlacer(
+            MockExecutor::new().with_overnight_quote(overnight_quote("24.10", "24.30", future_at)),
+        );
+        let symbol = Symbol::new("RKLB").unwrap();
+
+        let reference = resolve_overnight_reference_price(
+            &placer,
+            &symbol,
+            Direction::Buy,
+            std::time::Duration::from_secs(30),
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reference.price, usd("24.30"));
+    }
+
+    #[tokio::test]
+    async fn overnight_reference_defers_when_the_quote_fetch_fails() {
+        // No fallback chain: a failed overnight quote fetch defers the
+        // hedge rather than pricing from a mark or delayed print.
+        let placer = crate::offchain::order::ExecutorOrderPlacer(MockExecutor::new());
+        let symbol = Symbol::new("RKLB").unwrap();
+
+        let error = resolve_overnight_reference_price(
+            &placer,
+            &symbol,
+            Direction::Buy,
+            std::time::Duration::from_secs(30),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, OvernightReferenceError::QuoteFetch(_)),
+            "expected QuoteFetch, got {error:?}"
+        );
+    }
+
+    /// One equity with trading enabled and the overnight flag as given.
+    fn overnight_assets(symbol: &str, enabled: bool) -> AssetsConfig {
+        let overnight_counter_trading = if enabled {
+            OperationMode::Enabled
+        } else {
+            OperationMode::Disabled
+        };
+
+        AssetsConfig {
+            equities: EquitiesConfig {
+                operational_limit: None,
+                symbols: std::iter::once((
+                    Symbol::new(symbol).unwrap(),
+                    EquityAssetConfig {
+                        tokenized_equity: Address::ZERO,
+                        tokenized_equity_derivative: Address::ZERO,
+                        vault_ids: Vec::new(),
+                        trading: OperationMode::Enabled,
+                        rebalancing: OperationMode::Disabled,
+                        wrapped_equity_recovery: OperationMode::Disabled,
+                        extended_hours_counter_trading: OperationMode::Disabled,
+                        overnight_counter_trading,
+                        operational_limit: None,
+                    },
+                ))
+                .collect(),
+            },
+            cash: None,
+        }
+    }
+
+    fn eligible_details() -> st0x_execution::AssetDetails {
+        st0x_execution::AssetDetails {
+            status: st0x_execution::alpaca_broker_api::AssetStatus::Active,
+            tradable: true,
+            fractionable: Some(true),
+            fractional_eh_enabled: Some(true),
+            overnight_tradable: Some(true),
+            overnight_halted: Some(false),
+        }
+    }
+
+    #[tokio::test]
+    async fn overnight_session_defers_a_disabled_symbol_with_no_broker_call() {
+        let placer = Arc::new(crate::offchain::order::ExecutorOrderPlacer(
+            MockExecutor::new().with_market_session(MarketSession::Overnight),
+        ));
+        let infra = create_hedge_ctx_with(placer, overnight_assets("RKLB", false)).await;
+        let symbol = Symbol::new("RKLB").unwrap();
+
+        let kind = select_order_kind_for_current_session(
+            &infra.ctx,
+            &symbol,
+            Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            Direction::Buy,
+            MarketSession::Overnight,
+            SubmittedPricePreflight::Required,
+        )
+        .await
+        .unwrap();
+
+        assert!(kind.is_none(), "a disabled symbol must defer, got {kind:?}");
+    }
+
+    #[tokio::test]
+    async fn overnight_session_defers_without_an_eligibility_snapshot() {
+        // Enabled but never synced: fail closed with no broker call.
+        let placer = Arc::new(crate::offchain::order::ExecutorOrderPlacer(
+            MockExecutor::new().with_market_session(MarketSession::Overnight),
+        ));
+        let infra = create_hedge_ctx_with(placer, overnight_assets("RKLB", true)).await;
+        let symbol = Symbol::new("RKLB").unwrap();
+
+        let kind = select_order_kind_for_current_session(
+            &infra.ctx,
+            &symbol,
+            Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            Direction::Buy,
+            MarketSession::Overnight,
+            SubmittedPricePreflight::Required,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            kind.is_none(),
+            "an unsynced symbol must defer fail-closed, got {kind:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_session_selects_a_slippage_bounded_limit_for_an_eligible_symbol() {
+        // Ask 24.30 with the fixture's 150 bps bound: 24.30 * 1.015 =
+        // 24.6645, buy-rounded up to the 24.67 tick.
+        let now = chrono::Utc::now();
+        let placer = Arc::new(crate::offchain::order::ExecutorOrderPlacer(
+            MockExecutor::new()
+                .with_market_session(MarketSession::Overnight)
+                .with_overnight_quote(overnight_quote("24.10", "24.30", now)),
+        ));
+        let infra = create_hedge_ctx_with(placer, overnight_assets("RKLB", true)).await;
+        let symbol = Symbol::new("RKLB").unwrap();
+        infra.ctx.overnight_eligibility.record(
+            symbol.clone(),
+            st0x_execution::EligibilitySnapshot {
+                synced_at: now,
+                details: eligible_details(),
+            },
+        );
+
+        let kind = select_order_kind_for_current_session(
+            &infra.ctx,
+            &symbol,
+            Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            Direction::Buy,
+            MarketSession::Overnight,
+            SubmittedPricePreflight::SkipForIdempotentRecovery,
+        )
+        .await
+        .unwrap();
+
+        let Some(CounterTradeOrderKind::OvernightLimit {
+            limit_price,
+            snapshot,
+        }) = kind
+        else {
+            panic!("expected an overnight limit, got {kind:?}");
+        };
+        assert_eq!(limit_price, usd("24.67"));
+        assert_eq!(snapshot.details, eligible_details());
+    }
+
     #[tokio::test]
     async fn price_fetch_failure_during_extended_session_does_not_claim_position() {
         // order_placer is Some but the latest-trade-price lookup fails (e.g.
@@ -6345,6 +6834,9 @@ mod tests {
             assets,
             close_flatten_policy: CloseFlattenPolicy::from_secs(900).unwrap(),
             close_flatten_ramp: CloseFlattenCrossRamp::new(100, 400).unwrap(),
+            overnight_eligibility: EligibilitySnapshots::default(),
+            overnight_max_quote_age: Some(std::time::Duration::from_secs(30)),
+            overnight_slippage_bps: Some(150),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
             poll_interval: TEST_POLL_INTERVAL,
             notifier: notifier.clone(),

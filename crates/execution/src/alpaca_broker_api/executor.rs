@@ -90,7 +90,7 @@ impl CachedAsset {
 ///
 /// An `Option` field is `None` when the broker's asset payload omitted it;
 /// eligibility decisions treat that as ineligible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AssetDetails {
     pub status: AssetStatus,
     pub tradable: bool,

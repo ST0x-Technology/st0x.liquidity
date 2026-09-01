@@ -6,6 +6,7 @@ use apalis::prelude::Monitor;
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use task_supervisor::SupervisorBuilder;
 use thiserror::Error;
 use tokio::task::JoinHandle;
@@ -422,6 +423,12 @@ where
         counter_trade_submission_lock: counter_trade_submission_lock.clone(),
         close_flatten_policy,
         close_flatten_ramp,
+        overnight_eligibility: context.overnight_eligibility.clone(),
+        overnight_max_quote_age: context
+            .ctx
+            .overnight_max_quote_age_secs
+            .map(|secs| Duration::from_secs(secs.get())),
+        overnight_slippage_bps: context.ctx.overnight_slippage_bps,
         poll_interval,
         notifier: notifier.clone(),
         alerted_dead_letters: alerted_dead_letters.clone(),

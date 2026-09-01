@@ -259,6 +259,26 @@ pub(crate) async fn place_offchain_order_at_broker(
             };
             order_placer.place_limit_order(limit_order).await
         }
+        CounterTradeOrderKind::OvernightLimit {
+            limit_price,
+            snapshot,
+        } => {
+            let limit_order = LimitOrder {
+                symbol,
+                shares,
+                direction,
+                limit_price,
+                extended_hours: true,
+                client_order_id,
+            };
+            // Construction inside the executor re-proves the fail-closed
+            // overnight contract against the snapshot at THIS instant --
+            // a job that sat queued past the snapshot's session window is
+            // refused here rather than placed on stale eligibility.
+            order_placer
+                .place_overnight_order(limit_order, Some(&snapshot), Utc::now())
+                .await
+        }
     };
     let outcome = match placement {
         Ok(result) => {
@@ -443,6 +463,7 @@ fn placed_event(
             limit_price,
             close_flatten,
         } => (Some(*limit_price), *close_flatten),
+        CounterTradeOrderKind::OvernightLimit { limit_price, .. } => (Some(*limit_price), false),
         CounterTradeOrderKind::Market => (None, false),
     };
 
@@ -2975,14 +2996,24 @@ pub(crate) fn noop_placed_shares(
 }
 
 /// Determines whether a counter-trade is placed as a market order (regular
-/// hours) or a limit order with `extended_hours: true` (pre-market /
-/// after-hours).
+/// hours), a limit order with `extended_hours: true` (pre-market /
+/// after-hours), or an overnight limit order priced from the indicative
+/// overnight feed (20:00-04:00 ET).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CounterTradeOrderKind {
     Market,
     ExtendedHoursLimit {
         limit_price: Positive<Usd>,
         close_flatten: bool,
+    },
+    /// No `close_flatten`: close flattening is an extended-session-close
+    /// concept and a non-concept for overnight. Carries the eligibility
+    /// snapshot the selection gate validated against, so placement
+    /// re-proves the fail-closed contract at its own instant -- the
+    /// pre-placement session re-check the overnight spec requires.
+    OvernightLimit {
+        limit_price: Positive<Usd>,
+        snapshot: EligibilitySnapshot,
     },
 }
 
@@ -2991,6 +3022,7 @@ impl CounterTradeOrderKind {
         match self {
             Self::Market => MarketSession::Regular,
             Self::ExtendedHoursLimit { .. } => MarketSession::Extended,
+            Self::OvernightLimit { .. } => MarketSession::Overnight,
         }
     }
 }
