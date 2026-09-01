@@ -17,6 +17,8 @@ pub enum AuthError {
     Credentials(Box<dyn std::error::Error + Send + Sync + 'static>),
     /// Desktop OAuth sign-in flow failure, with an operator-facing reason.
     Flow(String),
+    /// Construction of the HTTP client for the sign-in exchanges failed.
+    Client(reqwest::Error),
 }
 
 impl std::fmt::Display for AuthError {
@@ -24,6 +26,12 @@ impl std::fmt::Display for AuthError {
         let reason: &dyn std::fmt::Display = match self {
             Self::Credentials(source) => source,
             Self::Flow(reason) => reason,
+            Self::Client(source) => {
+                return write!(
+                    formatter,
+                    "could not build the HTTP client for the T0 sign-in: {source}"
+                );
+            }
         };
         write!(
             formatter,
@@ -36,6 +44,7 @@ impl std::error::Error for AuthError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Credentials(source) => Some(&**source),
+            Self::Client(source) => Some(source),
             Self::Flow(_) => None,
         }
     }
@@ -127,7 +136,7 @@ fn build_http(
         .timeout(request_timeout)
         .connect_timeout(connect_timeout)
         .build()
-        .map_err(|source| AuthError::Flow(format!("could not build the HTTP client: {source}")))
+        .map_err(AuthError::Client)
 }
 
 /// Runs the browser loopback + PKCE authorization once, exchanges the returned

@@ -206,11 +206,12 @@ mod tests {
     use std::time::Duration;
 
     use super::{ApiError, dispatch};
-    use crate::auth::StaticToken;
+    use crate::auth::{AuthError, StaticToken};
     use crate::cli::{
         Command, Debug, Read, ReadResource, ResourceArgs, TradeEventsArgs, TransferEventsArgs,
     };
-    use crate::transport::Client;
+    use crate::output::OutputError;
+    use crate::transport::{Client, TransportError};
 
     /// Accepts one connection, captures the raw request bytes, and replies with
     /// an empty JSON object.
@@ -325,9 +326,6 @@ mod tests {
 
     #[test]
     fn exit_code_is_77_for_auth_and_access_denied() {
-        use crate::auth::AuthError;
-        use crate::transport::TransportError;
-
         assert_eq!(
             ApiError::Auth(AuthError::Flow("x".to_owned())).exit_code(),
             77
@@ -348,9 +346,6 @@ mod tests {
 
     #[test]
     fn exit_code_is_1_for_other_failures() {
-        use crate::output::OutputError;
-        use crate::transport::TransportError;
-
         assert_eq!(
             ApiError::Transport(TransportError::Decode("x".to_owned())).exit_code(),
             1
