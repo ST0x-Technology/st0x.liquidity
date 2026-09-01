@@ -730,6 +730,7 @@ fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
         | ConversionOrderNotFound { .. }
         | DuplicateOrderNotFound { .. }
         | ConsecutiveSellPending { .. }
+        | Overnight(_)
         | CalendarIterationInvariantViolation
         | CalendarDateMismatch { .. }
         | CalendarLocalTimeUnresolvable { .. }
