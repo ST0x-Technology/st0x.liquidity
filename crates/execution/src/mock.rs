@@ -492,6 +492,37 @@ impl Executor for MockExecutor {
         })
     }
 
+    async fn place_overnight_order(
+        &self,
+        order: LimitOrder,
+        _snapshot: Option<&crate::EligibilitySnapshot>,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+        self.fail_if_unhealthy()?;
+
+        let order_id = Self::order_id(&order.client_order_id, order.shares);
+
+        debug!(
+            target: "broker",
+            "[TEST] Would execute overnight limit order: {} {} shares of {} at {} (order_id: {})",
+            order.direction, order.shares, order.symbol, order.limit_price, order_id
+        );
+
+        // Mirrors the real contract's output shape: overnight placements
+        // always report extended_hours = true regardless of the input
+        // flag. Eligibility enforcement stays with the real impl; hedge
+        // tests exercise defers at the selection gate instead.
+        Ok(OrderPlacement {
+            order_id,
+            symbol: order.symbol,
+            shares: order.shares,
+            direction: order.direction,
+            placed_at: chrono::Utc::now(),
+            extended_hours: true,
+            limit_price: Some(order.limit_price),
+        })
+    }
+
     async fn cancel_order(
         &self,
         order_id: &Self::OrderId,

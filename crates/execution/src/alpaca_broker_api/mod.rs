@@ -352,6 +352,12 @@ pub enum AlpacaBrokerApiError {
     )]
     DuplicateOrderNotFound { client_order_id: ClientOrderId },
 
+    /// An overnight order refused to construct: ineligible asset,
+    /// over-precise quantity, or arithmetic failure. Deterministic for
+    /// the same inputs, so the delegated classification is Permanent.
+    #[error("overnight order construction refused: {0}")]
+    Overnight(#[from] OvernightOrderError),
+
     /// Alpaca's overnight venue holds a new sell while an earlier closing
     /// order for the position is still open, rejecting it with a plain 422.
     /// Kept distinct from [`Self::ApiError`] so it classifies as transient:
@@ -521,6 +527,7 @@ impl AlpacaBrokerApiError {
             | Self::ConversionOrderNotFound { .. }
             | Self::DuplicateOrderNotFound { .. }
             | Self::ConsecutiveSellPending { .. }
+            | Self::Overnight(_)
             | Self::CalendarIterationInvariantViolation
             | Self::CalendarDateMismatch { .. }
             | Self::CalendarLocalTimeUnresolvable { .. }
@@ -583,6 +590,10 @@ impl AlpacaBrokerApiError {
             // closing order fills or cancels, so the retry loop must keep
             // re-sending the identical request.
             Self::ConsecutiveSellPending { .. } => Permanence::Transient,
+
+            // Construction refusals are deterministic for the same
+            // inputs; delegate to the 1948 error's own classification.
+            Self::Overnight(source) => source.permanence(),
 
             // Everything else is decided locally -- from a response that
             // already arrived, from configuration, or from arithmetic on

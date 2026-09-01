@@ -1593,6 +1593,15 @@ mod tests {
             unimplemented!("not exercised by this test")
         }
 
+        async fn place_overnight_order(
+            &self,
+            _order: st0x_execution::LimitOrder,
+            _snapshot: Option<&st0x_execution::EligibilitySnapshot>,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<st0x_execution::OrderPlacement<Self::OrderId>, Self::Error> {
+            unimplemented!("not exercised by this test")
+        }
+
         async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
             Ok(Self)
         }
