@@ -841,7 +841,9 @@ placement:
   the number of attempts inside a window. Each later reprice samples the time
   ramp further along, so it crosses wider than the one before it. Both timeout
   fields are required whenever extended-hours broker windows are active; neither
-  cadence is an implicit fallback.
+  cadence is an implicit fallback. Every cancel request a maintenance sweep
+  issues increments `hedge_cancellations_requested_total{symbol,reason}`, so the
+  operator can observe each cadence's real rate per cause.
 - `close_flatten_outcomes_total{symbol,direction,outcome}` records terminal
   broker-state dispatches for close-flatten placements, with `outcome` equal to
   `filled`, `cancelled`, or `failed`. Evaluate attempt fill rate per
