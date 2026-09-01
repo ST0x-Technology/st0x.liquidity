@@ -488,7 +488,8 @@ impl DurableSymbolReferences for InventorySnapshot {
     fn add_durable_symbol_references(&self, references: &mut SymbolReferences) {
         let symbols = self
             .onchain_equity
-            .keys()
+            .values()
+            .flat_map(BTreeMap::keys)
             .chain(self.offchain_equity.keys())
             .chain(self.base_wallet_unwrapped_equity.keys())
             .chain(self.base_wallet_wrapped_equity.keys())
@@ -675,6 +676,7 @@ mod tests {
             .send(
                 &id,
                 InventorySnapshotCommand::OnchainEquity {
+                    chain: Chain::Base,
                     balances: BTreeMap::from([(
                         Symbol::new(symbol).unwrap(),
                         FractionalShares::new(float!(1)),
@@ -755,7 +757,7 @@ mod tests {
                     captured_at,
                     rows: vec![PortfolioBalanceRowWithMark {
                         row: PortfolioBalanceRow {
-                            location: PortfolioLocation::MarketMaking,
+                            location: PortfolioLocation::MarketMaking(Chain::Base),
                             asset: PortfolioAsset::Equity(Symbol::new(symbol).unwrap()),
                             available: float!(0),
                             inflight: float!(0),

@@ -10685,6 +10685,78 @@ mod tests {
         drop(inventory);
     }
 
+    /// Terminal settlement must credit the configured trading chain's
+    /// onchain slot: with inventory keyed under Ethereum, a Base-hardcoded
+    /// credit would leave the Ethereum slot at its seeded balance.
+    #[tokio::test]
+    async fn terminal_deposit_credits_the_configured_trading_chain_slot() {
+        let inventory =
+            InventoryView::for_trading_chain(Chain::Ethereum).with_usdc(usdc(100), usdc(900));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(500)),
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_bridged_with_amounts(usdc(499), usdc(1)),
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap();
+
+        assert_usdc_inventory_balances(&trigger, usdc(599), Usdc::ZERO, usdc(400), Usdc::ZERO)
+            .await;
+    }
+
+    /// Cancelling a failed onchain-sourced rebalance must release and credit
+    /// back the configured trading chain's slot. The mid-flight assertion
+    /// pins the debit to the Ethereum slot; the final one pins the
+    /// cancel's release and credit-back to the same slot.
+    #[tokio::test]
+    async fn terminal_cancel_releases_the_configured_trading_chain_slot() {
+        let inventory =
+            InventoryView::for_trading_chain(Chain::Ethereum).with_usdc(usdc(900), usdc(100));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+            )
+            .await
+            .unwrap();
+
+        assert_usdc_inventory_balances(&trigger, usdc(500), usdc(400), usdc(100), Usdc::ZERO).await;
+
+        harness
+            .receive::<UsdcRebalance>(id, make_usdc_withdrawal_failed())
+            .await
+            .unwrap();
+
+        assert_usdc_inventory_balances(&trigger, usdc(900), Usdc::ZERO, usdc(100), Usdc::ZERO)
+            .await;
+    }
+
     #[tokio::test]
     async fn alpaca_to_base_terminal_deposit_with_reserved_inflight_enqueues_one_check() {
         // Companion to the DeferredToSnapshot-path tests above: a normal

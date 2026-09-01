@@ -58,6 +58,7 @@ use tracing::{error, warn};
 use st0x_event_sorcery::{
     AggregateError, LifecycleError, LoadAllIdsError, Projection, SendError, Store, load_all_ids,
 };
+use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, HasZero, Symbol};
 use st0x_float_macro::float;
 use st0x_float_serde::format_float;
@@ -135,6 +136,8 @@ pub(crate) struct PortfolioSnapshotCtx {
     /// inventory poller always agree on what "fully hydrated" means.
     pub(crate) configured_equity_symbols: HashSet<Symbol>,
     pub(crate) usdc_tracking_enabled: bool,
+    /// Chain whose market-making slots the completeness gates require.
+    pub(crate) trading_chain: Chain,
     /// Mirrors whether `[wallet_polling]` is configured (the same source the
     /// live inventory poller reads, `crate::inventory::WalletPollingCtx`):
     /// when `true`, [`hydration_gap`] also requires the wallet-transit
@@ -747,14 +750,20 @@ fn required_slots(
     ctx: &PortfolioSnapshotCtx,
 ) -> impl Iterator<Item = (PortfolioLocation, PortfolioAsset)> + '_ {
     let equity_pairs = ctx.configured_equity_symbols.iter().flat_map(|symbol| {
-        [PortfolioLocation::MarketMaking, PortfolioLocation::Hedging]
-            .into_iter()
-            .map(move |location| (location, PortfolioAsset::Equity(symbol.clone())))
+        [
+            PortfolioLocation::MarketMaking(ctx.trading_chain),
+            PortfolioLocation::Hedging,
+        ]
+        .into_iter()
+        .map(move |location| (location, PortfolioAsset::Equity(symbol.clone())))
     });
 
     let usdc_pairs = ctx
         .usdc_tracking_enabled
-        .then_some([PortfolioLocation::MarketMaking, PortfolioLocation::Hedging])
+        .then_some([
+            PortfolioLocation::MarketMaking(ctx.trading_chain),
+            PortfolioLocation::Hedging,
+        ])
         .into_iter()
         .flatten()
         .map(|location| (location, PortfolioAsset::Usdc));
@@ -1018,7 +1027,7 @@ async fn convert_wrapped_equity_rows(
         }
         if !matches!(
             row.location,
-            PortfolioLocation::MarketMaking | PortfolioLocation::BaseWalletWrapped
+            PortfolioLocation::MarketMaking(_) | PortfolioLocation::BaseWalletWrapped
         ) {
             continue;
         }
@@ -1314,6 +1323,7 @@ mod tests {
         let queue = PortfolioSnapshotJobQueue::new(&apalis_pool);
 
         let ctx = PortfolioSnapshotCtx {
+            trading_chain: Chain::Base,
             inventory: broadcasting(inventory),
             position_projection,
             portfolio_snapshot,
@@ -1930,7 +1940,7 @@ mod tests {
         let et_day = et_day(Utc::now()).to_string();
         let stored: Option<String> = sqlx::query_scalar(
             "SELECT usd_mark FROM portfolio_snapshot \
-             WHERE et_day = ? AND asset = 'AAPL' AND location = 'market_making'",
+             WHERE et_day = ? AND asset = 'AAPL' AND location = 'market_making:base'",
         )
         .bind(&et_day)
         .fetch_one(&pool)
@@ -2063,7 +2073,7 @@ mod tests {
         let et_day = et_day(Utc::now()).to_string();
         let stored: Option<String> = sqlx::query_scalar(
             "SELECT usd_mark FROM portfolio_snapshot \
-             WHERE et_day = ? AND asset = 'AAPL' AND location = 'market_making'",
+             WHERE et_day = ? AND asset = 'AAPL' AND location = 'market_making:base'",
         )
         .bind(&et_day)
         .fetch_one(&pool)
@@ -2137,7 +2147,7 @@ mod tests {
         let et_day = et_day(Utc::now()).to_string();
         let (usd_mark, mark_captured_at): (Option<String>, Option<String>) = sqlx::query_as(
             "SELECT usd_mark, mark_captured_at FROM portfolio_snapshot \
-             WHERE et_day = ? AND asset = 'AAPL' AND location = 'market_making'",
+             WHERE et_day = ? AND asset = 'AAPL' AND location = 'market_making:base'",
         )
         .bind(&et_day)
         .fetch_one(&pool)
@@ -2639,7 +2649,7 @@ mod tests {
             .unwrap();
         let seeded_row = PortfolioBalanceRowWithMark {
             row: PortfolioBalanceRow {
-                location: PortfolioLocation::MarketMaking,
+                location: PortfolioLocation::MarketMaking(Chain::Base),
                 asset: PortfolioAsset::Equity(aapl()),
                 available: float!(10),
                 inflight: float!(0),
@@ -2881,7 +2891,7 @@ mod tests {
         match error {
             PortfolioSnapshotJobError::MissingWrapper { symbol, location } => {
                 assert_eq!(symbol, aapl());
-                assert_eq!(location, PortfolioLocation::MarketMaking);
+                assert_eq!(location, PortfolioLocation::MarketMaking(Chain::Base));
             }
             other => panic!("expected MissingWrapper, got {other:?}"),
         }
@@ -3161,7 +3171,7 @@ mod tests {
         }
 
         assert_eq!(
-            available_balance(&pool, &et_day, "market_making").await,
+            available_balance(&pool, &et_day, "market_making:base").await,
             "15",
             "10 wrapped shares * 1.5 ratio = 15 underlying-equivalent shares"
         );
@@ -3171,12 +3181,12 @@ mod tests {
             "offchain balance is already underlying units and must stay unconverted"
         );
         assert_eq!(
-            inflight_balance(&pool, &et_day, "base_wallet_wrapped").await,
+            inflight_balance(&pool, &et_day, "base_wallet_wrapped:base").await,
             "3",
             "2 wrapped shares * 1.5 ratio = 3 underlying-equivalent shares"
         );
         assert_eq!(
-            inflight_balance(&pool, &et_day, "base_wallet_unwrapped").await,
+            inflight_balance(&pool, &et_day, "base_wallet_unwrapped:base").await,
             "3",
             "unwrapped transit balance is already underlying units and must stay unconverted"
         );
@@ -3244,7 +3254,7 @@ mod tests {
         assert_eq!(
             freshness_gap(&ctx, target_et_day),
             Some(format!(
-                "AAPL not observed by a poll on/after {target_et_day} at market_making"
+                "AAPL not observed by a poll on/after {target_et_day} at market_making:base"
             ))
         );
     }
@@ -3305,7 +3315,7 @@ mod tests {
         assert_eq!(
             freshness_gap(&ctx, target_et_day),
             Some(format!(
-                "AAPL not observed by a poll on/after {target_et_day} at base_wallet_unwrapped"
+                "AAPL not observed by a poll on/after {target_et_day} at base_wallet_unwrapped:base"
             ))
         );
         assert!(

@@ -458,6 +458,7 @@ where
     });
 
     let portfolio_snapshot_ctx = Arc::new(PortfolioSnapshotCtx {
+        trading_chain: context.ctx.chains.sole_trading().chain,
         inventory: context.inventory.clone(),
         position_projection: context.frameworks.position_projection.clone(),
         portfolio_snapshot: context.frameworks.portfolio_snapshot.clone(),

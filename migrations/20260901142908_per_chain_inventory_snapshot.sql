@@ -13,7 +13,14 @@ UPDATE snapshots
 SET payload = json_set(
     payload,
     '$.Live.onchain_equity',
-    json_object('base', json_extract(payload, '$.Live.onchain_equity')),
+    -- Like the siblings below: a never-polled legacy value must not become a
+    -- phantom {"base": {}} entry that the fetched_at/block maps disagree with.
+    CASE
+        WHEN json_extract(payload, '$.Live.onchain_equity') IS NULL
+          OR json_extract(payload, '$.Live.onchain_equity') = '{}'
+        THEN json('{}')
+        ELSE json_object('base', json_extract(payload, '$.Live.onchain_equity'))
+    END,
     '$.Live.onchain_equity_fetched_at',
     CASE
         WHEN json_extract(payload, '$.Live.onchain_equity_fetched_at') IS NULL THEN json('{}')
