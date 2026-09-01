@@ -212,7 +212,7 @@ impl IapVerifier {
     }
 
     async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, IapError> {
-        if let Some(key) = self.cached_key(kid).await {
+        if let Some(key) = self.cached_key(kid, false).await {
             return Ok(key);
         }
 
@@ -220,13 +220,17 @@ impl IapVerifier {
         // not seen. The last case is what a rotation looks like from here.
         self.refresh(kid).await?;
 
-        self.cached_key(kid).await.ok_or_else(|| {
+        // Accept whatever the cache holds now, stale included: a retained key
+        // is still Google's, and a signature verifying against it is still
+        // proof of a genuine token. Staleness drives the refresh cadence
+        // above; it is never by itself a reason to reject.
+        self.cached_key(kid, true).await.ok_or_else(|| {
             warn!(target: "iap", role = self.role, kid, "IAP assertion names an unknown key");
             IapError::UnknownKey
         })
     }
 
-    async fn cached_key(&self, kid: &str) -> Option<DecodingKey> {
+    async fn cached_key(&self, kid: &str, allow_stale: bool) -> Option<DecodingKey> {
         let guard = self.keys.read().await;
 
         // Cloning the key out and dropping the guard before returning keeps
@@ -234,7 +238,7 @@ impl IapVerifier {
         // write lock is not queued behind a caller that has already finished
         // reading.
         let key = guard.as_ref().and_then(|cached| {
-            if cached.fetched_at.elapsed() > JWKS_TTL {
+            if !allow_stale && cached.fetched_at.elapsed() > JWKS_TTL {
                 return None;
             }
 
@@ -259,9 +263,12 @@ impl IapVerifier {
             if fresh && cached.keys.iter().any(|(id, _)| id == kid) {
                 return Ok(());
             }
-            if fresh && cached.last_refresh_attempt.elapsed() < UNKNOWN_KID_REFRESH_INTERVAL {
-                // Recently refreshed and the key still is not there, so this
-                // is a bad token rather than a rotation we have missed.
+            if cached.last_refresh_attempt.elapsed() < UNKNOWN_KID_REFRESH_INTERVAL {
+                // One outbound request per interval, whatever the trigger: an
+                // unknown kid on a fresh set is a bad token rather than a
+                // rotation we have missed, and a stale set during a Google
+                // outage must not turn every request into a fetch. The
+                // retained keys keep serving in the meantime.
                 return Ok(());
             }
         }
@@ -355,8 +362,6 @@ pub(crate) async fn require_iap(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use axum::Router;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
@@ -369,6 +374,8 @@ mod tests {
     use p256::pkcs8::EncodePrivateKey;
     use serde::Serialize;
     use tower::ServiceExt as _;
+
+    use super::*;
 
     const TEST_KID: &str = "test-key";
     const READ_AUDIENCE: &str = "/projects/1/global/backendServices/11";
@@ -609,5 +616,76 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Seeds the verifier's cache as if the keys were fetched two TTLs ago.
+    async fn seed_stale_cache(verifier: &IapVerifier, key: &TestKey) {
+        let decoding = DecodingKey::from_ec_components(&key.x, &key.y).expect("test key converts");
+        let long_ago = Instant::now()
+            .checked_sub(JWKS_TTL * 2)
+            .expect("process uptime is irrelevant to a monotonic clock epoch");
+
+        *verifier.keys.write().await = Some(CachedKeys {
+            keys: vec![(TEST_KID.to_string(), decoding)],
+            fetched_at: long_ago,
+            last_refresh_attempt: long_ago,
+        });
+    }
+
+    /// The stated policy is that a stale key set beats refusing every request
+    /// over a transient failure to reach Google: after a failed refresh the
+    /// retained keys must actually be SERVED, not merely retained.
+    #[tokio::test]
+    async fn serves_the_retained_keys_when_a_stale_cache_cannot_be_refreshed() {
+        let key = test_key();
+        let unreachable = MockServer::start();
+        let mock = unreachable.mock(|when, then| {
+            when.method(GET).path("/keys");
+            then.status(500);
+        });
+
+        let iap = verifier(READ_AUDIENCE, &unreachable);
+        seed_stale_cache(&iap, &key).await;
+
+        let status = call(
+            iap.clone(),
+            Some(&token(&key, READ_AUDIENCE, IAP_ISSUER, 300)),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        // The staleness did trigger a refresh attempt; the failure just did
+        // not take the retained keys down with it.
+        mock.assert_hits(1);
+    }
+
+    /// A Google outage on a stale cache must not turn every request into an
+    /// outbound fetch: the refresh floor applies to stale sets exactly as it
+    /// does to unknown-kid streams.
+    #[tokio::test]
+    async fn throttles_refreshes_while_serving_a_stale_cache() {
+        let key = test_key();
+        let unreachable = MockServer::start();
+        let mock = unreachable.mock(|when, then| {
+            when.method(GET).path("/keys");
+            then.status(500);
+        });
+
+        let iap = verifier(READ_AUDIENCE, &unreachable);
+        seed_stale_cache(&iap, &key).await;
+
+        for _ in 0..3 {
+            let status = call(
+                iap.clone(),
+                Some(&token(&key, READ_AUDIENCE, IAP_ISSUER, 300)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        // The first request's failed refresh stamps last_refresh_attempt; the
+        // two that follow inside the interval serve the stale keys without
+        // going back to Google.
+        mock.assert_hits(1);
     }
 }
