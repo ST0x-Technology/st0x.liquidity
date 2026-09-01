@@ -6353,29 +6353,23 @@ mod tests {
         );
     }
 
-    /// One equity with trading enabled and the overnight flag as given.
-    fn overnight_assets(symbol: &str, enabled: bool) -> AssetsConfig {
+    /// One hedged equity with the overnight flag as given and extended
+    /// hours disabled.
+    fn overnight_assets(symbol: &str, enabled: bool) -> HedgingAssets {
         let overnight_counter_trading = if enabled {
             OperationMode::Enabled
         } else {
             OperationMode::Disabled
         };
 
-        AssetsConfig {
-            equities: EquitiesConfig {
-                operational_limit: None,
+        HedgingAssets {
+            equities: HedgedEquities {
+                retired_symbols: Vec::new(),
                 symbols: std::iter::once((
                     Symbol::new(symbol).unwrap(),
-                    EquityAssetConfig {
-                        tokenized_equity: Address::ZERO,
-                        tokenized_equity_derivative: Address::ZERO,
-                        vault_ids: Vec::new(),
-                        trading: OperationMode::Enabled,
-                        rebalancing: OperationMode::Disabled,
-                        wrapped_equity_recovery: OperationMode::Disabled,
+                    EquityHedgePolicy {
                         extended_hours_counter_trading: OperationMode::Disabled,
                         overnight_counter_trading,
-                        operational_limit: None,
                     },
                 ))
                 .collect(),

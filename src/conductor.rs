@@ -131,7 +131,9 @@ use crate::telemetry::rpc::RpcTelemetryLayer;
 use crate::telemetry::{TelemetrySender, spawn_dependency_call_writer};
 use crate::tokenized_equity_mint::{TokenizedEquityMint, interrupted_mint_ids};
 use crate::trading::offchain::close_flatten::{CloseFlattenCrossRamp, CloseFlattenPolicy};
-use crate::trading::offchain::hedge::{apply_slippage, resolve_extended_hours_reference_price};
+use crate::trading::offchain::hedge::{
+    apply_slippage, resolve_extended_hours_reference_price, resolve_overnight_reference_price,
+};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, TradeAccountingError};
 use crate::unwrapped_equity_recovery::{UnwrappedEquityRecovery, UnwrappedEquityRecoveryServices};
@@ -441,6 +443,13 @@ pub struct TradeProcessingCqrs {
     /// still-open order) is skipped instead of forking a new
     /// self-perpetuating chain.
     pub poll_interval: Duration,
+    /// `Some` whenever any asset enables overnight counter-trading (startup
+    /// validation enforces it). The inline fill path's overnight preflight
+    /// prices from the indicative feed under this bound; an enabled symbol
+    /// reaching it with `None` here is a wiring bug and skips fail-closed.
+    pub overnight_max_quote_age: Option<Duration>,
+    /// Same presence contract as `overnight_max_quote_age`.
+    pub overnight_slippage_bps: Option<u16>,
 }
 
 /// Orchestrates the bot's runtime by composing long-running supervised tasks
@@ -4340,18 +4349,28 @@ where
         return Ok(None);
     };
 
-    // Extended-hours counter-trades cannot be placed inline. Instead of waiting
-    // for the next CheckPositions scan (~1 min), enqueue an immediate PlaceHedge
-    // job. CheckPositions remains the backstop. Preflight buys from the same
-    // crossed reference the job will price from; the ordinary latest-trade
-    // preflight can understate a ramped limit's buying-power requirement.
-    if execution.market_session == MarketSession::Extended {
-        let Some(preflight) = resolve_extended_hours_preflight(&execution, cqrs).await else {
-            return Ok(None);
-        };
+    // Extended-hours and overnight counter-trades cannot be placed inline.
+    // Instead of waiting for the next CheckPositions scan (~1 min), enqueue an
+    // immediate PlaceHedge job. CheckPositions remains the backstop. Preflight
+    // buys from the same crossed reference the job will price from; the
+    // ordinary latest-trade preflight can understate a crossed limit's
+    // buying-power requirement.
+    let queued_session_preflight = match execution.market_session {
+        MarketSession::Regular | MarketSession::Closed => None,
+        MarketSession::Extended => match resolve_extended_hours_preflight(&execution, cqrs).await {
+            Some(preflight) => Some(preflight),
+            None => return Ok(None),
+        },
+        MarketSession::Overnight => match resolve_overnight_preflight(&execution, cqrs).await {
+            Some(preflight) => Some(preflight),
+            None => return Ok(None),
+        },
+    };
+
+    if let Some(preflight) = queued_session_preflight {
         let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
 
-        match preflight_extended_hours_trade_submission(executor, &execution, preflight).await? {
+        match preflight_queued_hedge_submission(executor, &execution, preflight).await? {
             CounterTradeSubmissionCheck::Skipped => return Ok(None),
             CounterTradeSubmissionCheck::Allowed { reservation } => {
                 clamp_shares_to_reservation(&mut execution, reservation.as_ref());
@@ -4364,7 +4383,8 @@ where
             symbol = %execution.symbol,
             shares = %execution.shares,
             direction = ?execution.direction,
-            "Extended hours: enqueueing immediate PlaceHedge (limit order via the job's OrderPlacer)"
+            session = ?execution.market_session,
+            "Enqueueing immediate PlaceHedge (limit order via the job's OrderPlacer)"
         );
 
         let job = crate::trading::offchain::hedge::PlaceHedge {
@@ -4384,7 +4404,8 @@ where
                 target: "hedge",
                 symbol = %execution.symbol,
                 %error,
-                "Failed to enqueue extended-hours hedge; position remains ready for CheckPositions retry"
+                session = ?execution.market_session,
+                "Failed to enqueue immediate hedge; position remains ready for CheckPositions retry"
             );
         }
 
@@ -4527,7 +4548,12 @@ enum CounterTradeSubmissionCheck {
     Skipped,
 }
 
-enum ExtendedHoursPreflight {
+/// How the inline fill path preflights a hedge it is about to enqueue as an
+/// immediate `PlaceHedge` job (Extended and Overnight sessions both place
+/// through the job, never inline). `ExactPrice` carries the same crossed
+/// limit the job will submit at, so the preflight cannot understate the
+/// buying-power requirement.
+enum QueuedHedgePreflight {
     Standard,
     ExactPrice(Positive<Usd>),
 }
@@ -4535,9 +4561,9 @@ enum ExtendedHoursPreflight {
 async fn resolve_extended_hours_preflight(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
-) -> Option<ExtendedHoursPreflight> {
+) -> Option<QueuedHedgePreflight> {
     if execution.direction == st0x_execution::Direction::Sell {
-        return Some(ExtendedHoursPreflight::Standard);
+        return Some(QueuedHedgePreflight::Standard);
     }
 
     let status = match cqrs.order_placer.market_session_status().await {
@@ -4605,18 +4631,105 @@ async fn resolve_extended_hours_preflight(
             }
         };
 
-    Some(ExtendedHoursPreflight::ExactPrice(reference_price))
+    Some(QueuedHedgePreflight::ExactPrice(reference_price))
 }
 
-async fn preflight_extended_hours_trade_submission<E: Executor>(
+/// The overnight twin of [`resolve_extended_hours_preflight`], without the
+/// close-flatten coupling that path carries (a non-concept overnight): buys
+/// preflight at the indicative reference crossed by the flat
+/// `overnight_slippage_bps`, matching the limit the queued job derives.
+///
+/// `None` skips the immediate enqueue; `CheckPositions` remains the backstop,
+/// and the queued job re-runs every overnight gate (opt-in, eligibility,
+/// quote freshness) at its own instant regardless of what is resolved here.
+async fn resolve_overnight_preflight(
+    execution: &ExecutionCtx,
+    cqrs: &TradeProcessingCqrs,
+) -> Option<QueuedHedgePreflight> {
+    if execution.direction == st0x_execution::Direction::Sell {
+        return Some(QueuedHedgePreflight::Standard);
+    }
+
+    // Present whenever any asset enables overnight (startup validation), and
+    // only an enabled symbol reaches here (readiness gates on the per-symbol
+    // opt-in); absence is a wiring bug, so skip fail-closed rather than
+    // silently assume a bound.
+    let (Some(max_quote_age), Some(slippage_bps)) =
+        (cqrs.overnight_max_quote_age, cqrs.overnight_slippage_bps)
+    else {
+        record_scan_skip(
+            &execution.symbol,
+            HedgeScanSkipReason::OvernightIneligible,
+            None,
+        );
+        warn!(
+            target: "hedge",
+            symbol = %execution.symbol,
+            "Skipping immediate overnight hedge enqueue: overnight knobs absent despite an \
+             enabled symbol"
+        );
+        return None;
+    };
+
+    let reference = match resolve_overnight_reference_price(
+        cqrs.order_placer.as_ref(),
+        &execution.symbol,
+        execution.direction,
+        max_quote_age,
+        Utc::now(),
+    )
+    .await
+    {
+        Ok(reference) => reference,
+        Err(error) => {
+            record_scan_skip(
+                &execution.symbol,
+                HedgeScanSkipReason::OvernightUnpriceable,
+                None,
+            );
+            warn!(
+                target: "hedge",
+                symbol = %execution.symbol,
+                %error,
+                "Skipping immediate overnight hedge enqueue: no indicative reference price \
+                 for crossed-price preflight"
+            );
+            return None;
+        }
+    };
+
+    let reference_price =
+        match apply_slippage(reference.price.inner(), execution.direction, slippage_bps) {
+            Ok(reference_price) => reference_price,
+            Err(error) => {
+                record_scan_skip(
+                    &execution.symbol,
+                    HedgeScanSkipReason::SlippageCalculation,
+                    None,
+                );
+                warn!(
+                    target: "hedge",
+                    symbol = %execution.symbol,
+                    %error,
+                    "Skipping immediate overnight hedge enqueue: failed to cross the \
+                     preflight reference price"
+                );
+                return None;
+            }
+        };
+
+    Some(QueuedHedgePreflight::ExactPrice(reference_price))
+}
+
+async fn preflight_queued_hedge_submission<E: Executor>(
     executor: &E,
     execution: &ExecutionCtx,
-    preflight: ExtendedHoursPreflight,
+    preflight: QueuedHedgePreflight,
 ) -> Result<CounterTradeSubmissionCheck, TradeAccountingError>
 where
     TradeAccountingError: From<E::Error>,
 {
-    let ExtendedHoursPreflight::ExactPrice(reference_price) = preflight else {
+    let QueuedHedgePreflight::ExactPrice(reference_price) = preflight else {
         return preflight_counter_trade_submission(executor, execution, None).await;
     };
 
@@ -4635,7 +4748,16 @@ where
             Ok(CounterTradeSubmissionCheck::Allowed { reservation })
         }
         CounterTradePreflight::Skipped(reason) => {
-            log_counter_trade_skip(execution, "extended_hours_crossed_price", &reason);
+            // ExactPrice preflights only exist for the two queued sessions;
+            // Regular/Closed fills never build one, so labeling them the
+            // extended way is unreachable rather than wrong.
+            let source = match execution.market_session {
+                MarketSession::Overnight => "overnight_crossed_price",
+                MarketSession::Extended | MarketSession::Regular | MarketSession::Closed => {
+                    "extended_hours_crossed_price"
+                }
+            };
+            log_counter_trade_skip(execution, source, &reason);
             Ok(CounterTradeSubmissionCheck::Skipped)
         }
     }
@@ -5348,8 +5470,8 @@ mod tests {
     use st0x_evm::{USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM};
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiMode, AlpacaBrokerAuth, Direction, EquityPosition,
-        ExecutorOrderId, Inventory as ExecutionInventory, MarketOrder, MockExecutor, Positive,
-        SupportedExecutor, Symbol, TimeInForce,
+        ExecutorOrderId, IndicativeQuote, Inventory as ExecutionInventory, LatestQuote,
+        MarketOrder, MockExecutor, Positive, SupportedExecutor, Symbol, TimeInForce,
     };
     use st0x_finance::{Usd, Usdc};
     use st0x_float_macro::float;
@@ -8923,6 +9045,8 @@ mod tests {
             poll_status_queue: PollOrderStatusJobQueue::new(apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
+            overnight_max_quote_age: None,
+            overnight_slippage_bps: None,
         };
 
         (cqrs, assets)
@@ -8971,6 +9095,36 @@ mod tests {
                 )]),
             },
             cash: None,
+        }
+    }
+
+    /// Overnight enabled, extended hours deliberately disabled, so a test
+    /// through the Overnight routing cannot pass by leaning on the
+    /// extended-hours flag.
+    fn overnight_hedging(symbol: &Symbol) -> HedgingAssets {
+        HedgingAssets {
+            equities: st0x_config::HedgedEquities {
+                retired_symbols: Vec::new(),
+                symbols: HashMap::from([(
+                    symbol.clone(),
+                    st0x_config::EquityHedgePolicy {
+                        extended_hours_counter_trading: OperationMode::Disabled,
+                        overnight_counter_trading: OperationMode::Enabled,
+                    },
+                )]),
+            },
+            cash: None,
+        }
+    }
+
+    fn overnight_quote_at(bid: &str, ask: &str, at: DateTime<Utc>) -> IndicativeQuote {
+        IndicativeQuote {
+            quote: LatestQuote::new(
+                Positive::new(Usd::new(float!(bid))).unwrap(),
+                Positive::new(Usd::new(float!(ask))).unwrap(),
+            )
+            .unwrap(),
+            at,
         }
     }
 
@@ -10393,7 +10547,7 @@ mod tests {
         let resolved = resolve_extended_hours_preflight(&execution, &cqrs)
             .await
             .unwrap();
-        let preflight = preflight_extended_hours_trade_submission(&executor, &execution, resolved)
+        let preflight = preflight_queued_hedge_submission(&executor, &execution, resolved)
             .await
             .unwrap();
 
@@ -10564,7 +10718,7 @@ mod tests {
         let resolved = resolve_extended_hours_preflight(&execution, &cqrs)
             .await
             .unwrap();
-        let preflight = preflight_extended_hours_trade_submission(&executor, &execution, resolved)
+        let preflight = preflight_queued_hedge_submission(&executor, &execution, resolved)
             .await
             .unwrap();
 
@@ -10576,6 +10730,245 @@ mod tests {
             executor.market_session_status_call_count(),
             1,
             "the immediate path must resolve the active ramp window"
+        );
+    }
+
+    #[tokio::test]
+    async fn immediate_overnight_sell_uses_the_standard_preflight() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (mut cqrs, _) = trade_processing_cqrs_with_assets(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+            extended_hours_assets(&symbol),
+        );
+        cqrs.hedging = overnight_hedging(&symbol);
+        let execution = ExecutionCtx {
+            symbol,
+            direction: Direction::Sell,
+            shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            executor: st0x_execution::SupportedExecutor::DryRun,
+            market_session: MarketSession::Overnight,
+        };
+
+        let resolved = resolve_overnight_preflight(&execution, &cqrs)
+            .await
+            .expect("a sell needs no indicative reference and must not defer");
+
+        assert!(
+            matches!(resolved, QueuedHedgePreflight::Standard),
+            "sells keep the ordinary inventory preflight; price cannot constrain the reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn immediate_overnight_buy_preflights_at_the_crossed_indicative_ask() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Overnight)
+            .with_overnight_quote(overnight_quote_at("99.50", "100.00", Utc::now()));
+        let (mut cqrs, _) = trade_processing_cqrs_with_assets(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+            extended_hours_assets(&symbol),
+        );
+        cqrs.hedging = overnight_hedging(&symbol);
+        cqrs.order_placer = Arc::new(ExecutorOrderPlacer(executor));
+        cqrs.overnight_max_quote_age = Some(Duration::from_secs(30));
+        cqrs.overnight_slippage_bps = Some(100);
+        let execution = ExecutionCtx {
+            symbol,
+            direction: Direction::Buy,
+            shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            executor: st0x_execution::SupportedExecutor::DryRun,
+            market_session: MarketSession::Overnight,
+        };
+
+        let resolved = resolve_overnight_preflight(&execution, &cqrs)
+            .await
+            .expect("a fresh indicative quote must produce an exact-price preflight");
+
+        // The ask (100.00) crossed up by 100 bps, matching the limit the
+        // queued job derives from the same feed and knob.
+        let QueuedHedgePreflight::ExactPrice(price) = resolved else {
+            panic!("an overnight buy must preflight at the exact crossed limit");
+        };
+        assert_eq!(price, Positive::new(Usd::new(float!(101))).unwrap());
+    }
+
+    #[tokio::test]
+    async fn immediate_overnight_buy_skips_on_a_stale_indicative_quote() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Overnight)
+            .with_overnight_quote(overnight_quote_at(
+                "99.50",
+                "100.00",
+                Utc::now() - chrono::Duration::seconds(120),
+            ));
+        let (mut cqrs, _) = trade_processing_cqrs_with_assets(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+            extended_hours_assets(&symbol),
+        );
+        cqrs.hedging = overnight_hedging(&symbol);
+        cqrs.order_placer = Arc::new(ExecutorOrderPlacer(executor));
+        cqrs.overnight_max_quote_age = Some(Duration::from_secs(30));
+        cqrs.overnight_slippage_bps = Some(100);
+        let execution = ExecutionCtx {
+            symbol,
+            direction: Direction::Buy,
+            shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            executor: st0x_execution::SupportedExecutor::DryRun,
+            market_session: MarketSession::Overnight,
+        };
+
+        assert!(
+            resolve_overnight_preflight(&execution, &cqrs)
+                .await
+                .is_none(),
+            "a stale indicative quote must not reach submission preflight"
+        );
+        let rendered = metrics_handle.render();
+        assert!(
+            rendered.contains("reason=\"overnight_unpriceable\""),
+            "the skipped immediate enqueue must be counted with its cause, in:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn immediate_overnight_buy_skips_when_the_knobs_are_missing() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Overnight)
+            .with_overnight_quote(overnight_quote_at("99.50", "100.00", Utc::now()));
+        let (mut cqrs, _) = trade_processing_cqrs_with_assets(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+            extended_hours_assets(&symbol),
+        );
+        cqrs.hedging = overnight_hedging(&symbol);
+        cqrs.order_placer = Arc::new(ExecutorOrderPlacer(executor));
+        let execution = ExecutionCtx {
+            symbol,
+            direction: Direction::Buy,
+            shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            executor: st0x_execution::SupportedExecutor::DryRun,
+            market_session: MarketSession::Overnight,
+        };
+
+        assert!(
+            resolve_overnight_preflight(&execution, &cqrs)
+                .await
+                .is_none(),
+            "absent overnight knobs are a wiring bug and must skip fail-closed, \
+             never assume a staleness bound or cross width"
+        );
+        let rendered = metrics_handle.render();
+        assert!(
+            rendered.contains("reason=\"overnight_ineligible\""),
+            "the fail-closed skip must be counted, in:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_trade_enqueues_immediate_hedge_job() {
+        // With overnight counter-trading enabled and the broker in an
+        // Overnight session, an onchain fill must enqueue an immediate
+        // PlaceHedge job (whose OrderPlacer places the overnight limit)
+        // rather than place inline or wait for the next CheckPositions scan.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (mut cqrs, assets) = trade_processing_cqrs_with_assets(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+            extended_hours_assets(&symbol),
+        );
+        cqrs.hedging = overnight_hedging(&symbol);
+        cqrs.overnight_max_quote_age = Some(Duration::from_secs(30));
+        cqrs.overnight_slippage_bps = Some(100);
+
+        let trade_event = make_trade_event(78);
+        let trade = test_trade_with_amount_and_direction(float!(5.0), 78, Direction::Buy);
+
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Overnight)
+            .with_inventory(ExecutionInventory {
+                positions: vec![EquityPosition {
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(float!(10.0)),
+                    market_value: None,
+                }],
+                usd_balance_cents: 1_000_000,
+                cash_buying_power_cents: Some(1_000_000),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            });
+
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result, None,
+            "no inline offchain order is placed overnight; the PlaceHedge job \
+             claims the position when it runs"
+        );
+        assert!(
+            offchain_order_projection
+                .load_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "overnight hedge must be deferred to a PlaceHedge job, not placed inline"
+        );
+
+        let job_bytes: Vec<u8> = sqlx::query_scalar("SELECT job FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<
+                crate::trading::offchain::hedge::PlaceHedge,
+            >())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let job: crate::trading::offchain::hedge::PlaceHedge =
+            serde_json::from_slice(&job_bytes).unwrap();
+
+        assert_eq!(job.symbol, symbol);
+        assert_eq!(
+            job.direction,
+            Direction::Sell,
+            "an onchain buy must be hedged by an offchain sell"
+        );
+        assert_eq!(
+            job.market_session,
+            MarketSession::Overnight,
+            "the enqueue path must carry the observed Overnight session into the job \
+             payload so the job selects the overnight order kind"
         );
     }
 
@@ -10633,6 +11026,8 @@ mod tests {
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
+            overnight_max_quote_age: None,
+            overnight_slippage_bps: None,
         };
 
         let trade_event = make_trade_event(77);
