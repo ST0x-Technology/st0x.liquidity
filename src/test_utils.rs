@@ -139,6 +139,7 @@ pub(crate) fn rebalancing_enabled_equities(symbols: &[&str]) -> EquitiesConfig {
                         rebalancing: OperationMode::Enabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         extended_hours_counter_trading: OperationMode::Disabled,
+                        overnight_counter_trading: OperationMode::Disabled,
                         operational_limit: None,
                     },
                 )

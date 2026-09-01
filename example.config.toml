@@ -206,6 +206,12 @@ wrapped_equity_recovery = "disabled"
 # `[broker].counter_trade_slippage_bps`. Leave disabled to restrict hedging
 # to regular-hours market orders.
 extended_hours_counter_trading = "disabled"
+# When enabled, counter-trades for this asset may be placed during the
+# overnight session (20:00-04:00 ET) as limit orders priced from the
+# indicative overnight feed. Independent of extended_hours_counter_trading:
+# overnight has a separate broker entitlement, feed, and risk profile.
+# Requires the [broker] overnight knobs once any asset enables it.
+overnight_counter_trading = "disabled"
 # Single vault: vault_ids = "0xab12"
 # Multiple vaults: vault_ids = ["0xab12", "0xcd34"]
 # operational_limit = 100.0

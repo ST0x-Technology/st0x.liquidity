@@ -95,6 +95,13 @@ pub struct EquityAssetConfig {
     /// extended (pre-/after-market) sessions as limit orders, instead of
     /// waiting for the regular open. Must be explicitly configured.
     pub extended_hours_counter_trading: OperationMode,
+    /// When enabled, counter-trades for this equity may be placed during
+    /// the overnight session (20:00-04:00 ET) as limit orders priced
+    /// from the indicative overnight feed. Independent of
+    /// `extended_hours_counter_trading`: overnight has a separate broker
+    /// entitlement, feed, and risk profile. Must be explicitly
+    /// configured; there is no default.
+    pub overnight_counter_trading: OperationMode,
     pub operational_limit: Option<Positive<FractionalShares>>,
 }
 
@@ -1143,6 +1150,26 @@ fn validate_extended_hours_counter_trading(assets: &AssetsConfig) -> Result<(), 
     Ok(())
 }
 
+fn validate_overnight_counter_trading(assets: &AssetsConfig) -> Result<(), CtxError> {
+    // Same dead-configuration rule as extended hours: the hedge path gates
+    // on `trading` before it consults any session, so overnight enabled
+    // with counter-trading disabled can never execute. Overnight stays
+    // independent of the extended-hours flag on purpose -- separate broker
+    // entitlement, feed, and risk profile -- so no combination of the two
+    // session flags is rejected here.
+    for (symbol, equity) in &assets.equities.symbols {
+        if equity.overnight_counter_trading == OperationMode::Enabled
+            && equity.trading == OperationMode::Disabled
+        {
+            return Err(CtxError::OvernightWithoutCounterTrading {
+                symbol: symbol.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// The poll cadences with defaults applied, each rejected at zero -- a zero
 /// interval would spin the corresponding poller in a hot loop.
 struct PollingIntervals {
@@ -1209,6 +1236,7 @@ fn parse_and_validate(
     }
 
     validate_extended_hours_counter_trading(&config.assets)?;
+    validate_overnight_counter_trading(&config.assets)?;
     let polling_intervals = validated_polling_intervals(&config)?;
 
     let broker = BrokerCtx::from_parts(secrets.broker, config.broker.as_ref())?;
@@ -2014,6 +2042,13 @@ pub enum CtxError {
          execute"
     )]
     ExtendedHoursWithoutCounterTrading { symbol: Symbol },
+    #[error(
+        "assets.equities.{symbol}: overnight_counter_trading cannot be \
+         enabled when trading is disabled -- overnight counter-trades only \
+         run while counter-trading is enabled, so this combination can never \
+         execute"
+    )]
+    OvernightWithoutCounterTrading { symbol: Symbol },
     #[error("{field} must be non-zero")]
     ZeroPollingInterval { field: &'static str },
     #[error("server_port and board_port must differ; both set to {port}")]
@@ -2081,6 +2116,9 @@ impl CtxError {
             Self::MissingEquityVaultId { .. } => "missing equity vault_ids",
             Self::ExtendedHoursWithoutCounterTrading { .. } => {
                 "extended hours enabled without counter-trading"
+            }
+            Self::OvernightWithoutCounterTrading { .. } => {
+                "overnight enabled without counter-trading"
             }
             Self::ZeroPollingInterval { .. } => "zero polling interval",
             Self::ServerAndBoardPortsMatch { .. } => "server_port and board_port must differ",
@@ -2570,6 +2608,7 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
 
             {pricing}
 
@@ -3363,6 +3402,58 @@ mod tests {
         assert!(
             source_display.contains("extended_hours_counter_trading"),
             "expected parse error to mention extended-hours flag, got: {source_display}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_counter_trading_is_required_per_equity() {
+        // Overnight has its own entitlement and risk profile, so every
+        // configured equity must state its overnight mode explicitly --
+        // an absent field fails the load, never defaults open or closed
+        // silently.
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+
+            [assets.equities.AAPL]
+            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::ConfigToml { .. }),
+            "expected config parse failure for missing overnight flag, got: {error:#}"
+        );
+
+        let source = std::error::Error::source(&error).unwrap();
+        let source_display = source.to_string();
+        assert!(
+            source_display.contains("overnight_counter_trading"),
+            "expected parse error to mention the overnight flag, got: {source_display}"
         );
     }
 
@@ -5945,6 +6036,7 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
         "#;
 
         let error = toml::from_str::<Config>(toml_str)
@@ -6237,6 +6329,7 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
             bogus_field = "should fail"
 
             [raindex]
@@ -6429,6 +6522,7 @@ mod tests {
             rebalancing = "enabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
             operational_limit = 5
 
             [equities.SPYM]
@@ -6438,6 +6532,7 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
 
             [cash]
             vault_id = "0x0000000000000000000000000000000000000000000000000000000000000fab"
@@ -6476,6 +6571,7 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "enabled"
+            overnight_counter_trading = "disabled"
 
             [equities.TSLA]
             tokenized_equity = "0x8fdf41116f755771bfe0747d5f8c3711d5debfbb"
@@ -6484,12 +6580,41 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
         "#;
         let config: AssetsConfig = toml::from_str(toml_str).unwrap();
         let aapl = Symbol::new("AAPL").unwrap();
         let tsla = Symbol::new("TSLA").unwrap();
         assert!(config.is_extended_hours_enabled(&aapl));
         assert!(!config.is_extended_hours_enabled(&tsla));
+    }
+
+    #[test]
+    fn overnight_counter_trading_parses_enabled_and_disabled_from_toml() {
+        let toml_str = r#"
+            [equities.AAPL]
+            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "enabled"
+
+            [equities.TSLA]
+            tokenized_equity = "0x8fdf41116f755771bfe0747d5f8c3711d5debfbb"
+            tokenized_equity_derivative = "0x31c2c14134e6e3b7ef9478297f199331133fc2d8"
+            trading = "disabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
+        "#;
+        let config: AssetsConfig = toml::from_str(toml_str).unwrap();
+        let aapl = &config.equities.symbols[&Symbol::new("AAPL").unwrap()];
+        let tsla = &config.equities.symbols[&Symbol::new("TSLA").unwrap()];
+        assert_eq!(aapl.overnight_counter_trading, OperationMode::Enabled);
+        assert_eq!(tsla.overnight_counter_trading, OperationMode::Disabled);
     }
 
     #[test]
@@ -6503,6 +6628,7 @@ mod tests {
             rebalancing = "enabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
         "#;
 
         let config: AssetsConfig = toml::from_str(toml_str).unwrap();
@@ -6524,6 +6650,7 @@ mod tests {
             rebalancing = "enabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
         "#;
 
         let config: AssetsConfig = toml::from_str(toml_str).unwrap();
@@ -6549,6 +6676,7 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
         "#;
 
         let result = toml::from_str::<AssetsConfig>(toml_str);
@@ -6567,6 +6695,7 @@ mod tests {
             trading = "enabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
         "#;
 
         let result = toml::from_str::<AssetsConfig>(toml_str);
@@ -6585,6 +6714,7 @@ mod tests {
             trading = "enabled"
             rebalancing = "disabled"
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
         "#;
 
         let result = toml::from_str::<AssetsConfig>(toml_str);
@@ -6604,6 +6734,7 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
             operational_limit = 10
 
             [equities.TSLA]
@@ -6613,6 +6744,7 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
         "#;
 
         let config: AssetsConfig = toml::from_str(toml_str).unwrap();
@@ -6634,6 +6766,7 @@ mod tests {
         symbols.insert(
             Symbol::new("RKLB").unwrap(),
             EquityAssetConfig {
+                overnight_counter_trading: OperationMode::Disabled,
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
@@ -6683,6 +6816,7 @@ mod tests {
         symbols.insert(
             Symbol::new("AAPL").unwrap(),
             EquityAssetConfig {
+                overnight_counter_trading: OperationMode::Disabled,
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
@@ -6696,6 +6830,7 @@ mod tests {
         symbols.insert(
             Symbol::new("TSLA").unwrap(),
             EquityAssetConfig {
+                overnight_counter_trading: OperationMode::Disabled,
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
@@ -6743,6 +6878,7 @@ mod tests {
         symbols.insert(
             Symbol::new("RKLB").unwrap(),
             EquityAssetConfig {
+                overnight_counter_trading: OperationMode::Disabled,
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
@@ -6793,6 +6929,7 @@ mod tests {
         symbols.insert(
             Symbol::new("AAPL").unwrap(),
             EquityAssetConfig {
+                overnight_counter_trading: OperationMode::Disabled,
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
@@ -6842,6 +6979,7 @@ mod tests {
         symbols.insert(
             Symbol::new("SPYM").unwrap(),
             EquityAssetConfig {
+                overnight_counter_trading: OperationMode::Disabled,
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
@@ -6981,6 +7119,7 @@ mod tests {
                     rebalancing = "{rebalancing}"
                     wrapped_equity_recovery = "disabled"
                     extended_hours_counter_trading = "disabled"
+                    overnight_counter_trading = "disabled"
                     "#,
                     "", "",
                 );
@@ -7540,6 +7679,7 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "disabled"
 
             [pricing]
             ws_url = "wss://pricing.test/ws"
@@ -7640,6 +7780,7 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "enabled"
+            overnight_counter_trading = "disabled"
 
             [pricing]
             ws_url = "wss://pricing.test/ws"
@@ -7688,6 +7829,7 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "enabled"
+            overnight_counter_trading = "disabled"
 
             [pricing]
             ws_url = "wss://pricing.test/ws"
@@ -7718,6 +7860,103 @@ mod tests {
     }
 
     #[test]
+    fn validate_files_rejects_overnight_without_counter_trading() {
+        // Overnight counter-trades only run while counter-trading is
+        // enabled, so overnight = enabled with trading = disabled is a
+        // dead configuration that can never execute.
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+
+            [assets.equities.AAPL]
+            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            trading = "disabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "enabled"
+
+            [pricing]
+            ws_url = "wss://pricing.test/ws"
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "legacy"
+            inventory_adapters = []
+            vault_owner = "0x0000000000000000000000000000000000000001"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#,
+        );
+        let secrets = dry_run_pricing_secrets_toml();
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CtxError::OvernightWithoutCounterTrading { ref symbol }
+                    if *symbol == "AAPL"
+            ),
+            "Expected OvernightWithoutCounterTrading for AAPL, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_files_accepts_overnight_without_extended_hours() {
+        // The independence rule: overnight has its own entitlement, feed,
+        // and risk profile, so enabling it must not require -- or change
+        // -- pre-/post-market behavior. An asset may hedge overnight while
+        // extended hours stays disabled.
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+
+            [assets.equities.AAPL]
+            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
+            overnight_counter_trading = "enabled"
+
+            [pricing]
+            ws_url = "wss://pricing.test/ws"
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "legacy"
+            inventory_adapters = []
+            vault_owner = "0x0000000000000000000000000000000000000001"
+            deployment_block = 1
+            required_confirmations = 3
+            ingestion_cutoff = "safe"
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#,
+        );
+        let secrets = dry_run_pricing_secrets_toml();
+
+        Ctx::validate_files(config.path(), secrets.path()).unwrap();
+    }
+
+    #[test]
     fn dry_run_broker_requires_extended_hours_reprice_timeout_when_extended_hours_enabled() {
         let config = toml_file(
             r#"
@@ -7734,6 +7973,7 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "enabled"
+            overnight_counter_trading = "disabled"
 
             [pricing]
             ws_url = "wss://pricing.test/ws"
@@ -7780,6 +8020,7 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "enabled"
+            overnight_counter_trading = "disabled"
 
             [pricing]
             ws_url = "wss://pricing.test/ws"
@@ -7845,6 +8086,7 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "enabled"
+            overnight_counter_trading = "disabled"
 
             [pricing]
             ws_url = "wss://pricing.test/ws"
@@ -7938,6 +8180,7 @@ mod tests {
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
             extended_hours_counter_trading = "enabled"
+            overnight_counter_trading = "disabled"
 
             [pricing]
             ws_url = "wss://pricing.test/ws"

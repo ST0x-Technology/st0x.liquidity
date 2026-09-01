@@ -1625,6 +1625,7 @@ mod tests {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     extended_hours_counter_trading: extended_hours,
+                    overnight_counter_trading: OperationMode::Disabled,
                     operational_limit: None,
                 },
             );
