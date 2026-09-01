@@ -1797,7 +1797,7 @@ pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
     let loopback_only = Router::new()
         .route("/transfers/resume", post(resume_transfers))
         .route("/transfers/recheck/{kind}/{id}", post(recheck_transfer))
-        .layer(axum::middleware::from_fn(require_loopback));
+        .route_layer(axum::middleware::from_fn(require_loopback));
 
     Router::new()
         .merge(ops_api_routes(ops_api))
