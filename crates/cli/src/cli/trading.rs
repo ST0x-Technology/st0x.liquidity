@@ -18,8 +18,8 @@ use st0x_execution::alpaca_broker_api::{AlpacaLimitOrder, AlpacaLimitPrice};
 use st0x_execution::{
     ALPACA_MAX_DECIMAL_PLACES, AlpacaBrokerApi, AlpacaBrokerApiError, CancellationOutcome,
     ClientOrderId, Direction, EligibilitySnapshot, Executor, ExecutorOrderId, FractionalShares,
-    MarketOrder, MarketSession, MockExecutor, OrderFailureTerminality, OrderPlacement, OrderState,
-    OvernightLimitOrder, Positive, Symbol, TimeInForce, TryIntoExecutor,
+    LimitOrder, MarketOrder, MarketSession, MockExecutor, OrderFailureTerminality, OrderPlacement,
+    OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
 };
 use st0x_float_serde::format_float_with_fallback;
 use st0x_hedge::operator::conductor::{
@@ -583,24 +583,28 @@ async fn place_alpaca_limit_for_session<W: Write>(
             details,
         };
 
-        let order = OvernightLimitOrder::new(
-            request.symbol.clone(),
-            request.shares,
-            request.direction,
-            limit_price,
+        // The trait impl constructs the validated overnight order
+        // internally (eligibility, fractional matrix, precision, forced
+        // extended_hours), so a refusal surfaces here as a typed error
+        // before any order HTTP.
+        let order = LimitOrder {
+            symbol: request.symbol.clone(),
+            shares: request.shares,
+            direction: request.direction,
+            limit_price: *limit_price.as_price(),
+            extended_hours: true,
             client_order_id,
-            Some(&snapshot),
-            now,
-        )?;
+        };
+        let placement = retry_on_backpressure(
+            || broker.place_overnight_order(order.clone(), Some(&snapshot), now),
+            BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+        )
+        .await?;
         writeln!(
             stdout,
             "   Overnight eligibility: verified from a fresh attribute fetch"
         )?;
-        retry_on_backpressure(
-            || broker.place_overnight_order(order.clone()),
-            BACKPRESSURE_RETRY_MAX_ATTEMPTS,
-        )
-        .await?
+        placement
     } else {
         let order = AlpacaLimitOrder {
             symbol: request.symbol.clone(),
@@ -1794,13 +1798,15 @@ mod tests {
         .await
         .unwrap_err();
 
-        let overnight_error = error.downcast::<OvernightOrderError>().unwrap();
+        let broker_error = error.downcast::<AlpacaBrokerApiError>().unwrap();
         assert!(
             matches!(
-                &overnight_error,
-                OvernightOrderError::Ineligible(OvernightEligibilityError::OvernightHalted { .. })
+                &broker_error,
+                AlpacaBrokerApiError::Overnight(OvernightOrderError::Ineligible(
+                    OvernightEligibilityError::OvernightHalted { .. }
+                ))
             ),
-            "expected OvernightHalted, got {overnight_error:?}"
+            "expected OvernightHalted through the trait chain, got {broker_error:?}"
         );
         assert!(mock.orders().is_empty());
     }
@@ -1821,16 +1827,16 @@ mod tests {
         .await
         .unwrap_err();
 
-        let overnight_error = error.downcast::<OvernightOrderError>().unwrap();
+        let broker_error = error.downcast::<AlpacaBrokerApiError>().unwrap();
         assert!(
             matches!(
-                &overnight_error,
-                OvernightOrderError::QuantityTooPrecise {
+                &broker_error,
+                AlpacaBrokerApiError::Overnight(OvernightOrderError::QuantityTooPrecise {
                     max_decimal_places: 9,
                     ..
-                }
+                })
             ),
-            "expected QuantityTooPrecise, got {overnight_error:?}"
+            "expected QuantityTooPrecise through the trait chain, got {broker_error:?}"
         );
         assert!(mock.orders().is_empty());
     }
@@ -1967,6 +1973,15 @@ mod tests {
             &self,
             _symbol: &Symbol,
         ) -> Result<st0x_execution::IndicativeQuote, Self::Error> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn place_overnight_order(
+            &self,
+            _order: st0x_execution::LimitOrder,
+            _snapshot: Option<&st0x_execution::EligibilitySnapshot>,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<st0x_execution::OrderPlacement<Self::OrderId>, Self::Error> {
             unimplemented!("not exercised by this test")
         }
 
@@ -3107,6 +3122,15 @@ mod tests {
             _symbol: &Symbol,
         ) -> Result<st0x_execution::IndicativeQuote, Self::Error> {
             unimplemented!("not exercised by the buy-fill backpressure tests")
+        }
+
+        async fn place_overnight_order(
+            &self,
+            _order: st0x_execution::LimitOrder,
+            _snapshot: Option<&st0x_execution::EligibilitySnapshot>,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<st0x_execution::OrderPlacement<Self::OrderId>, Self::Error> {
+            unimplemented!("not exercised by this test")
         }
 
         async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
