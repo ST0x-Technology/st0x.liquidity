@@ -977,6 +977,8 @@ async fn create_test_cqrs_with_assets(
         order_placer,
         hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),
         poll_interval: TEST_POLL_INTERVAL,
+        overnight_max_quote_age: None,
+        overnight_slippage_bps: None,
     };
 
     (

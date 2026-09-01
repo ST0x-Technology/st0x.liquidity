@@ -656,6 +656,14 @@ pub(crate) enum DeadLetterReason {
     /// rate-limiting outlives the reschedule budget, so every abandonment
     /// path shares one counter and is told apart by this label.
     BackpressureExhausted,
+    /// Not a [`TradeAccountingError`] classification: raised only by the
+    /// position scan when the overnight indicative quote fetch fails with a
+    /// non-retryable classification (an entitlement rejection, or an
+    /// unclassified error). The hedge job never raises it -- an unpriceable
+    /// overnight symbol defers there rather than erroring -- so without this
+    /// scan-side page a revoked feed entitlement would leave a standing
+    /// per-symbol delta behind nothing but a counter.
+    OvernightQuoteFetch,
 }
 
 impl DeadLetterReason {
@@ -663,6 +671,7 @@ impl DeadLetterReason {
         match self {
             Self::SymbolScoped(reason) => reason.metric_label(),
             Self::BackpressureExhausted => "backpressure_exhausted",
+            Self::OvernightQuoteFetch => "overnight_quote_fetch",
         }
     }
 }
@@ -858,6 +867,8 @@ mod tests {
             poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
+            overnight_max_quote_age: None,
+            overnight_slippage_bps: None,
         };
 
         let job_queue = DexTradeAccountingJobQueue::new(apalis_pool);

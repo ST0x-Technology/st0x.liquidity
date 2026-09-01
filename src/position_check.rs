@@ -42,8 +42,9 @@ use crate::trading::offchain::close_flatten::{
     CloseFlattenCrossRamp, CloseFlattenPolicy, CloseFlattenWindow, preflight_skip_reason_label,
 };
 use crate::trading::offchain::hedge::{
-    HedgeJobQueue, PlaceHedge, ReferencePriceError, TransientFailureStreak, alert_dead_letter,
-    apply_slippage, resolve_extended_hours_reference_price,
+    HedgeJobQueue, OvernightReferenceError, PlaceHedge, ReferencePriceError,
+    TransientFailureStreak, alert_dead_letter, apply_slippage,
+    resolve_extended_hours_reference_price, resolve_overnight_reference_price,
 };
 use crate::trading::onchain::trade_accountant::{DeadLetterReason, SymbolScopedReason};
 
@@ -123,6 +124,15 @@ pub(crate) enum HedgeScanSkipReason {
     MarkFetchFailed,
     QuoteFetchFailed,
     SlippageCalculation,
+    /// The overnight knobs were absent despite an enabled symbol (a wiring
+    /// bug; startup validation makes them present whenever any asset opts
+    /// in). Shares the label the hedge job uses for the same fail-closed
+    /// deferral.
+    OvernightIneligible,
+    /// The indicative overnight feed produced no usable reference (failed
+    /// fetch or a quote staler than `overnight_max_quote_age_secs`). Shares
+    /// the label the hedge job uses when its own resolution defers.
+    OvernightUnpriceable,
 }
 
 impl HedgeScanSkipReason {
@@ -133,6 +143,8 @@ impl HedgeScanSkipReason {
             Self::MarkFetchFailed => "mark_fetch_failed",
             Self::QuoteFetchFailed => "quote_fetch_failed",
             Self::SlippageCalculation => "slippage_calculation",
+            Self::OvernightIneligible => "overnight_ineligible",
+            Self::OvernightUnpriceable => "overnight_unpriceable",
         }
     }
 }
@@ -189,6 +201,22 @@ fn should_page_reference_price_failure(
     match error {
         ReferencePriceError::Unavailable => executor != SupportedExecutor::DryRun,
         ReferencePriceError::MarkFetch(source) | ReferencePriceError::QuoteFetch(source) => {
+            find_backpressure(source.as_ref()).is_none()
+                && find_permanence(source.as_ref()) != Some(Permanence::Transient)
+        }
+    }
+}
+
+/// A stale quote is a freshness race the next scan retries against a live
+/// feed, never an incident. A failed fetch pages under the same
+/// permanent-or-unclassified rule as [`should_page_reference_price_failure`]:
+/// an entitlement rejection (classified `Permanent`) must page rather than
+/// leave the standing delta behind nothing but a counter, while transient and
+/// rate-limited failures wait for the next scan.
+fn should_page_overnight_reference_failure(error: &OvernightReferenceError) -> bool {
+    match error {
+        OvernightReferenceError::Stale { .. } => false,
+        OvernightReferenceError::QuoteFetch(source) => {
             find_backpressure(source.as_ref()).is_none()
                 && find_permanence(source.as_ref()) != Some(Permanence::Transient)
         }
@@ -279,9 +307,10 @@ where
                     // previous tick is caught on this one.
                     ctx.request_extended_hours_cancellations().await;
                 }
-                // Overnight has no cancellation maintenance yet: overnight
-                // orders cannot be placed until automated overnight
-                // counter-trading ships, so there is nothing to sweep.
+                // Overnight has no cancellation maintenance yet: boundary
+                // sweeps and the reprice policy for live overnight orders
+                // land with their own policy work, separate from the
+                // extended-hours sweeps above.
                 Ok(MarketSession::Overnight | MarketSession::Closed) => {}
                 Err(error) => {
                     warn!("Failed to check market session for order cancellation: {error}");
@@ -452,13 +481,18 @@ where
         // resolver and cross at scan time, matching the placement path whether
         // close-flatten is active or not. A failed session/window lookup fails
         // this scan tick closed; it never falls through to
-        // `preflight_counter_trade`'s different reference. Regular-hours buys
-        // and all sells keep the ordinary preflight, avoiding an unnecessary
-        // calendar request and exact-price check where price cannot constrain
-        // the reservation.
+        // `preflight_counter_trade`'s different reference. Overnight buys do
+        // the same from the indicative feed and `overnight_slippage_bps`.
+        // Regular-hours buys and all sells keep the ordinary preflight,
+        // avoiding an unnecessary calendar request and exact-price check where
+        // price cannot constrain the reservation.
         let extended_hours_buy = ready.direction == Direction::Buy
             && ready.market_session == MarketSession::Extended
             && self.ctx.assets.is_extended_hours_enabled(&ready.symbol);
+
+        let overnight_buy = ready.direction == Direction::Buy
+            && ready.market_session == MarketSession::Overnight
+            && self.ctx.assets.is_overnight_enabled(&ready.symbol);
 
         let close_flatten_window = if extended_hours_buy {
             match self
@@ -507,6 +541,14 @@ where
                 Ok(Some(preflight)) => Ok(preflight),
                 // `preflight_extended_hours_buy` counted and logged the cause
                 // it dropped this buy for; the scan just skips the tick.
+                Ok(None) => return false,
+                Err(error) => Err(error),
+            }
+        } else if overnight_buy {
+            match self.preflight_overnight_buy(order).await {
+                Ok(Some(preflight)) => Ok(preflight),
+                // `preflight_overnight_buy` counted and logged the cause it
+                // dropped this buy for; the scan just skips the tick.
                 Ok(None) => return false,
                 Err(error) => Err(error),
             }
@@ -717,6 +759,109 @@ where
                 return Ok(None);
             }
         };
+
+        self.executor
+            .preflight_counter_trade_at_price(order, limit_price)
+            .await
+            .map(Some)
+    }
+
+    /// Preflights an overnight buy against the exact limit it will be
+    /// submitted at: the indicative ask crossed by `overnight_slippage_bps`,
+    /// the same derivation the placement path performs. The overnight twin of
+    /// `preflight_extended_hours_buy`, without the close-flatten coupling
+    /// that path carries. Every skip is counted on
+    /// `hedge_scan_skipped_total`; a non-retryable quote-fetch failure (an
+    /// entitlement rejection above all) additionally pages the operator under
+    /// the shared dead-letter dedup, since the hedge job defers rather than
+    /// errors overnight and would never page for the standing delta itself.
+    ///
+    /// `Ok(None)` means the buy has no price to preflight against, which the
+    /// caller treats as "skip this tick" rather than an error.
+    async fn preflight_overnight_buy(
+        &self,
+        order: MarketOrder,
+    ) -> Result<Option<CounterTradePreflight>, E::Error> {
+        // Present whenever any asset enables overnight (startup validation),
+        // and only an enabled symbol reaches here; absence is a wiring bug,
+        // so skip fail-closed rather than silently assume a bound.
+        let (Some(max_quote_age_secs), Some(slippage_bps)) = (
+            self.ctx.overnight_max_quote_age_secs,
+            self.ctx.overnight_slippage_bps,
+        ) else {
+            record_scan_skip(
+                &order.symbol,
+                HedgeScanSkipReason::OvernightIneligible,
+                None,
+            );
+            warn!(
+                target: "hedge",
+                symbol = %order.symbol,
+                "Skipping hedge enqueue: overnight knobs absent despite an enabled symbol"
+            );
+            return Ok(None);
+        };
+
+        let reference = match resolve_overnight_reference_price(
+            self.order_placer.as_ref(),
+            &order.symbol,
+            order.direction,
+            Duration::from_secs(max_quote_age_secs.get()),
+            Utc::now(),
+        )
+        .await
+        {
+            Ok(reference) => reference,
+            Err(error) => {
+                record_scan_skip(
+                    &order.symbol,
+                    HedgeScanSkipReason::OvernightUnpriceable,
+                    None,
+                );
+                warn!(
+                    target: "hedge",
+                    symbol = %order.symbol,
+                    %error,
+                    "Skipping hedge enqueue: no indicative reference price to preflight against"
+                );
+                if should_page_overnight_reference_failure(&error) {
+                    alert_dead_letter(
+                        self.notifier.as_ref(),
+                        &self.alerted_dead_letters,
+                        &order.symbol,
+                        DeadLetterReason::OvernightQuoteFetch,
+                        &format!(
+                            "Hedge for {} skipped: the overnight indicative quote fetch \
+                             failed with a non-retryable classification, leaving no \
+                             reference price. The scan keeps skipping it, so the symbol \
+                             carries a standing delta until the feed access is fixed.",
+                            order.symbol
+                        ),
+                    )
+                    .await;
+                }
+                return Ok(None);
+            }
+        };
+
+        let limit_price =
+            match apply_slippage(reference.price.inner(), order.direction, slippage_bps) {
+                Ok(limit_price) => limit_price,
+                Err(error) => {
+                    record_scan_skip(
+                        &order.symbol,
+                        HedgeScanSkipReason::SlippageCalculation,
+                        None,
+                    );
+                    warn!(
+                        target: "hedge",
+                        symbol = %order.symbol,
+                        %error,
+                        "Skipping hedge enqueue: could not cross the indicative reference price"
+                    );
+                    return Ok(None);
+                }
+            };
 
         self.executor
             .preflight_counter_trade_at_price(order, limit_price)
@@ -1204,8 +1349,7 @@ fn extended_hours_reprice_timeout_for_order(
 
 /// Only Extended-session orders participate in the stale-limit reprice
 /// sweep. Orders recorded with an Overnight session return `None` on
-/// purpose: none can exist before the automated overnight placement path
-/// lands, and overnight repricing gets its own policy (indicative-quote
+/// purpose: overnight repricing gets its own policy (indicative-quote
 /// staleness bounds) rather than inheriting the extended-hours timeout.
 fn live_extended_hours_order_placed_at(order: &OffchainOrder) -> Option<DateTime<Utc>> {
     match order {
@@ -1280,6 +1424,7 @@ mod tests {
     use reqwest::StatusCode;
     use sqlx::SqlitePool;
     use std::collections::HashMap;
+    use std::num::NonZeroU64;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1292,8 +1437,9 @@ mod tests {
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::{
         AlpacaBrokerApiError, AlpacaMarketDataError, CancellationOutcome, ClientOrderId, Direction,
-        ExecutorOrderId, FractionalShares, Inventory, LimitOrder, MockExecutor, MockExecutorCtx,
-        OrderState, Positive, SupportedExecutor, Symbol, TryIntoExecutor,
+        ExecutorOrderId, FractionalShares, IndicativeQuote, Inventory, LatestQuote, LimitOrder,
+        MockExecutor, MockExecutorCtx, OrderState, Positive, SupportedExecutor, Symbol,
+        TryIntoExecutor,
     };
     use st0x_finance::Usd;
     use st0x_float_macro::float;
@@ -2885,6 +3031,371 @@ mod tests {
         );
     }
 
+    /// Overnight enabled with both knobs present, extended hours deliberately
+    /// disabled so no scan-side overnight test can pass by leaning on the
+    /// extended-hours flag or its close-flatten machinery.
+    fn overnight_ctx(symbols: &[&str]) -> Ctx {
+        let mut equity_symbols = HashMap::new();
+        for symbol in symbols {
+            equity_symbols.insert(
+                Symbol::new(*symbol).unwrap(),
+                EquityAssetConfig {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    extended_hours_counter_trading: OperationMode::Disabled,
+                    overnight_counter_trading: OperationMode::Enabled,
+                    operational_limit: None,
+                },
+            );
+        }
+
+        Ctx {
+            assets: AssetsConfig {
+                equities: EquitiesConfig {
+                    operational_limit: None,
+                    symbols: equity_symbols,
+                },
+                cash: None,
+            },
+            execution_threshold: ExecutionThreshold::whole_share(),
+            overnight_max_quote_age_secs: Some(NonZeroU64::new(30).unwrap()),
+            overnight_slippage_bps: Some(100),
+            ..create_test_ctx_with_order_owner(address!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ))
+        }
+    }
+
+    fn indicative_quote_at(
+        bid: &str,
+        ask: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> IndicativeQuote {
+        IndicativeQuote {
+            quote: LatestQuote::new(
+                Positive::new(Usd::new(float!(bid))).unwrap(),
+                Positive::new(Usd::new(float!(ask))).unwrap(),
+            )
+            .unwrap(),
+            at,
+        }
+    }
+
+    /// An overnight buy is preflighted against the indicative ask ($100.00)
+    /// crossed by `overnight_slippage_bps` (100 bps -> $101.00), the exact
+    /// price the placement will use. Cash covers the bare ask ($200.00 for
+    /// two shares) but not the crossed one ($202.00), so this fails if the
+    /// scan preflights the un-crossed reference or a non-indicative source.
+    #[tokio::test]
+    async fn overnight_buy_preflights_the_crossed_indicative_ask() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = overnight_ctx(&["AAPL"]);
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Overnight)
+            .with_overnight_quote(indicative_quote_at("99.50", "100.00", chrono::Utc::now()))
+            .with_inventory(Inventory {
+                positions: Vec::new(),
+                usd_balance_cents: 20_100,
+                cash_buying_power_cents: Some(20_100),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            });
+        let (ctx, position) = build_ctx_with_executor(
+            pool,
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            executor,
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Sell,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            0,
+            "cash covering only the un-crossed indicative ask must block the buy"
+        );
+        let rendered = metrics_handle.render();
+        assert!(
+            !rendered.contains("close_flatten_blocked_total{"),
+            "an overnight block is not a close-flatten block, in:\n{rendered}"
+        );
+    }
+
+    /// Companion to the block above: the same overnight path must still
+    /// enqueue once cash covers the crossed ask, or every overnight buy would
+    /// be silently dropped.
+    #[tokio::test]
+    async fn overnight_buy_enqueues_when_cash_covers_the_crossed_ask() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = overnight_ctx(&["AAPL"]);
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Overnight)
+            .with_overnight_quote(indicative_quote_at("99.50", "100.00", chrono::Utc::now()))
+            .with_inventory(Inventory {
+                positions: Vec::new(),
+                usd_balance_cents: 20_500,
+                cash_buying_power_cents: Some(20_500),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            });
+        let (ctx, position) = build_ctx_with_executor(
+            pool,
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            executor,
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Sell,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            1,
+            "an overnight buy with sufficient cash for the crossed ask must be enqueued"
+        );
+    }
+
+    /// A stale indicative quote must block the enqueue with its own counted
+    /// reason: pricing an overnight buy from a quote older than
+    /// `overnight_max_quote_age_secs` is exactly what the RAI-1947 contract
+    /// forbids, and there is no fallback source to try.
+    #[tokio::test]
+    async fn overnight_buy_with_a_stale_quote_blocks_enqueue() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = overnight_ctx(&["AAPL"]);
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Overnight)
+            .with_overnight_quote(indicative_quote_at(
+                "99.50",
+                "100.00",
+                chrono::Utc::now() - chrono::Duration::seconds(120),
+            ))
+            .with_inventory(Inventory {
+                positions: Vec::new(),
+                usd_balance_cents: 20_500,
+                cash_buying_power_cents: Some(20_500),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            });
+        let (mut ctx, position) = build_ctx_with_executor(
+            pool,
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            executor,
+        )
+        .await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        ctx.notifier = notifier.clone();
+        let symbol = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Sell,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            0,
+            "a stale indicative quote must block the overnight buy enqueue"
+        );
+        let rendered = metrics_handle.render();
+        assert!(
+            rendered.contains("reason=\"overnight_unpriceable\""),
+            "the blocked scan tick must be counted with its cause, in:\n{rendered}"
+        );
+        assert_eq!(
+            notifier.messages(),
+            Vec::<String>::new(),
+            "staleness is a freshness race retried next scan, never an operator page"
+        );
+    }
+
+    /// The hedge job defers rather than errors when the overnight feed is
+    /// unpriceable, so it never dead-letters for it -- this scan-side page is
+    /// the only push signal for a symbol whose feed access is gone. It must
+    /// fire for a non-retryable classification (an entitlement rejection) and
+    /// stay deduped across scans under `(symbol, OvernightQuoteFetch)`.
+    #[tokio::test]
+    async fn a_failing_overnight_quote_lookup_pages_with_its_own_reason() {
+        struct EntitlementFailingPlacer;
+
+        #[async_trait]
+        impl OrderPlacer for EntitlementFailingPlacer {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("a skipped buy must never reach the broker")
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("a skipped buy must never reach the broker")
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(CancellationOutcome::Requested)
+            }
+
+            async fn fetch_latest_overnight_quote(
+                &self,
+                _symbol: &Symbol,
+            ) -> Result<IndicativeQuote, Box<dyn std::error::Error + Send + Sync>> {
+                // Wrapped the way the production executor surfaces it, so the
+                // paging predicate classifies the same chain it will in prod.
+                Err(Box::new(AlpacaBrokerApiError::LatestQuote(Box::new(
+                    AlpacaMarketDataError::Entitlement {
+                        status: StatusCode::FORBIDDEN,
+                        body: "subscription does not permit querying overnight feed".to_string(),
+                    },
+                ))))
+            }
+        }
+
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = overnight_ctx(&["AAPL"]);
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Overnight)
+            .with_inventory(Inventory {
+                positions: Vec::new(),
+                usd_balance_cents: 100_000,
+                cash_buying_power_cents: Some(100_000),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            });
+        let (mut ctx, position) = build_ctx_with_order_placer(
+            pool,
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            executor,
+            Arc::new(EntitlementFailingPlacer),
+        )
+        .await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        ctx.notifier = notifier.clone();
+        let symbol = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Sell,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            0,
+            "a buy with no overnight reference price must fail closed"
+        );
+        let rendered = metrics_handle.render();
+        assert!(
+            rendered.contains("reason=\"overnight_unpriceable\""),
+            "the skip must name its cause, in:\n{rendered}"
+        );
+
+        let expected_page = "Hedge for AAPL skipped: the overnight indicative quote fetch \
+             failed with a non-retryable classification, leaving no reference price. The \
+             scan keeps skipping it, so the symbol carries a standing delta until the feed \
+             access is fixed."
+            .to_string();
+        assert_eq!(notifier.messages(), vec![expected_page.clone()]);
+
+        // The scan re-skips this buy every tick, so the page must be deduped
+        // by the same `(symbol, reason)` key mechanism the hedge job's
+        // dead-letter uses.
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(notifier.messages(), vec![expected_page]);
+    }
+
+    /// Overnight sells keep the ordinary inventory preflight: no indicative
+    /// quote is needed (the mock has none to serve), because price cannot
+    /// constrain an equity-backed sell reservation.
+    #[tokio::test]
+    async fn overnight_sell_enqueues_with_the_ordinary_preflight() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = overnight_ctx(&["AAPL"]);
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Overnight)
+            .with_inventory(Inventory {
+                positions: vec![st0x_execution::EquityPosition {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: FractionalShares::new(float!(10.0)),
+                    market_value: None,
+                }],
+                usd_balance_cents: 1_000_000,
+                cash_buying_power_cents: Some(1_000_000),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            });
+        let (ctx, position) = build_ctx_with_executor(
+            pool,
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            executor,
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            1,
+            "an overnight sell must enqueue through the ordinary preflight without \
+             touching the indicative feed"
+        );
+    }
+
     fn quote_fetch_error(status: StatusCode) -> ReferencePriceError {
         ReferencePriceError::QuoteFetch(Box::new(AlpacaBrokerApiError::LatestQuote(Box::new(
             AlpacaMarketDataError::ApiError {
@@ -2959,6 +3470,8 @@ mod tests {
                 HedgeScanSkipReason::MarkFetchFailed,
                 HedgeScanSkipReason::QuoteFetchFailed,
                 HedgeScanSkipReason::SlippageCalculation,
+                HedgeScanSkipReason::OvernightIneligible,
+                HedgeScanSkipReason::OvernightUnpriceable,
             ]
             .map(HedgeScanSkipReason::metric_label),
             [
@@ -2967,8 +3480,46 @@ mod tests {
                 "mark_fetch_failed",
                 "quote_fetch_failed",
                 "slippage_calculation",
+                "overnight_ineligible",
+                "overnight_unpriceable",
             ]
         );
+    }
+
+    /// The overnight paging rule matches the extended one on classification:
+    /// an entitlement rejection (`Permanent`) and an unclassified failure
+    /// page; rate-limited and transient failures wait for the next scan; a
+    /// stale quote is a freshness race, never an incident.
+    #[test]
+    fn scan_pages_only_non_retryable_overnight_quote_failures() {
+        // Wrapped the way the production executor surfaces feed failures:
+        // `AlpacaBrokerApiError::LatestQuote(market data error)`, which is
+        // the chain the permanence/backpressure probes classify.
+        let entitlement = OvernightReferenceError::QuoteFetch(Box::new(
+            AlpacaBrokerApiError::LatestQuote(Box::new(AlpacaMarketDataError::Entitlement {
+                status: StatusCode::FORBIDDEN,
+                body: "subscription does not permit querying overnight feed".to_string(),
+            })),
+        ));
+        assert!(should_page_overnight_reference_failure(&entitlement));
+
+        let unclassified = OvernightReferenceError::QuoteFetch("market data endpoint down".into());
+        assert!(should_page_overnight_reference_failure(&unclassified));
+
+        let rate_limited = OvernightReferenceError::QuoteFetch(Box::new(
+            AlpacaBrokerApiError::LatestQuote(Box::new(AlpacaMarketDataError::ApiError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body: "test response".to_string(),
+                retry_after: None,
+            })),
+        ));
+        assert!(!should_page_overnight_reference_failure(&rate_limited));
+
+        let stale = OvernightReferenceError::Stale {
+            age: Duration::from_secs(120),
+            max_age: Duration::from_secs(30),
+        };
+        assert!(!should_page_overnight_reference_failure(&stale));
     }
 
     /// The scan short-circuits before a `PlaceHedge` job exists, so

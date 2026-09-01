@@ -33,6 +33,11 @@ markets by providing continuous two-sided liquidity.
   offchain hedge executions
 - **Exposure Hedging**: Automatically executes offsetting trades to reduce
   directional exposure from onchain fills
+- **Overnight Hedging (24/5)**: Places limit orders in Alpaca's overnight
+  session (20:00–04:00 ET), priced only from the indicative overnight feed and
+  bounded by `overnight_slippage_bps`. Opt-in per asset via
+  `overnight_counter_trading`; ineligible, halted, or unpriceable symbols defer
+  with a concrete reason and no broker call
 - **Operator Vault Controls**: CLI supports generic ERC20 deposits to and
   withdrawals from Raindex vaults, with a USDC-specific withdrawal shortcut
 - **Orchestrator-Mode Mint Authorization**: For assets issuance serves through
@@ -204,6 +209,13 @@ counter-trade slippage ceiling. All five are required and have no implicit
 defaults. Ordinary extended-hours orders retain their 300-second timeout, while
 close-flatten orders use the dedicated 60-second timeout and cross progressively
 wider until the session closes.
+
+When any asset sets `overnight_counter_trading = "enabled"`, three more
+`[broker]` knobs become required: `broker.overnight_max_quote_age_secs`, the
+maximum age of an indicative overnight quote before pricing defers;
+`broker.overnight_slippage_bps`, the protection bound on overnight limit orders;
+and `broker.overnight_reprice_timeout_secs`, the overnight reprice cadence.
+Startup validates their values even while every asset is disabled.
 
 Extended-hours limit orders use an ordered reference chain: an optional current
 bid/ask quote source, the broker's **position mark**, then an emergency
