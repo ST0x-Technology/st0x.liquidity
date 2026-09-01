@@ -497,7 +497,7 @@ where
             let balance = inventory
                 .get_venue(venue, chain)
                 .unwrap_or_default()
-                .apply_snapshot(snapshot_balance)?;
+                .apply_snapshot(snapshot_balance, fetched_at)?;
 
             Ok(inventory.set_venue(venue, chain, Some(balance)))
         })
@@ -515,13 +515,14 @@ where
     pub(crate) fn force_on_snapshot<E: std::fmt::Debug + Send + 'static>(
         venue: Venue,
         snapshot_balance: T,
+        fetched_at: DateTime<Utc>,
         recovering_from: E,
     ) -> Box<dyn FnOnce(Self, Chain) -> Result<Self, InventoryError<T>> + Send> {
         Box::new(move |inventory, chain| {
             let balance = inventory
                 .get_venue(venue, chain)
                 .unwrap_or_default()
-                .force_apply_snapshot(snapshot_balance, &recovering_from);
+                .force_apply_snapshot(snapshot_balance, fetched_at, &recovering_from);
 
             Ok(inventory.set_venue(venue, chain, Some(balance)))
         })
@@ -2679,7 +2680,7 @@ impl InventoryView {
 
         let view = self.update_equity(
             symbol,
-            Inventory::force_on_snapshot(Venue::Hedging, broker_position, witness),
+            Inventory::force_on_snapshot(Venue::Hedging, broker_position, fetched_at, witness),
             now,
         )?;
 
@@ -2774,7 +2775,7 @@ impl InventoryView {
         };
 
         let view = self.update_usdc(
-            Inventory::force_on_snapshot(Venue::Hedging, broker_usdc, witness),
+            Inventory::force_on_snapshot(Venue::Hedging, broker_usdc, fetched_at, witness),
             now,
         )?;
 
@@ -3050,6 +3051,7 @@ impl InventoryView {
                     Inventory::force_on_snapshot(
                         Venue::MarketMaking,
                         *snapshot_balance,
+                        fetched_at,
                         reason.clone(),
                     ),
                     now,
@@ -3097,13 +3099,19 @@ impl InventoryView {
                 chain,
                 usdc_balance,
                 block_number,
+                fetched_at,
                 ..
             } => {
                 let block_number = *block_number;
                 let chain = *chain;
                 self.update_usdc_at(
                     chain,
-                    Inventory::force_on_snapshot(Venue::MarketMaking, *usdc_balance, reason),
+                    Inventory::force_on_snapshot(
+                        Venue::MarketMaking,
+                        *usdc_balance,
+                        *fetched_at,
+                        reason,
+                    ),
                     now,
                 )
                 // Same as the equity arm above: the forced balance is
@@ -3139,6 +3147,7 @@ impl InventoryView {
                         Inventory::force_on_snapshot(
                             Venue::Hedging,
                             *snapshot_balance,
+                            *fetched_at,
                             reason.clone(),
                         ),
                         now,
@@ -3217,7 +3226,7 @@ impl InventoryView {
                 let usdc = Usdc::from_cents(*usd_balance_cents)
                     .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
                 let updated = self.update_usdc(
-                    Inventory::force_on_snapshot(Venue::Hedging, usdc, reason),
+                    Inventory::force_on_snapshot(Venue::Hedging, usdc, *fetched_at, reason),
                     now,
                 )?;
                 Ok(Self {

@@ -1,5 +1,6 @@
 //! Generic venue balance tracking for inventory management.
 
+use chrono::{DateTime, Utc};
 use rain_math_float::FloatError;
 use serde::{Deserialize, Serialize};
 use std::ops::{Add, Sub};
@@ -12,6 +13,7 @@ impl<T: HasZero> Default for VenueBalance<T> {
         Self {
             available: T::ZERO,
             inflight: T::ZERO,
+            fetched_at: None,
         }
     }
 }
@@ -40,6 +42,11 @@ pub(super) struct VenueBalance<T> {
     /// destination venue (e.g., shares being minted into tokens, tokens being
     /// redeemed into shares, or USDC being bridged).
     inflight: T,
+    /// When the last venue snapshot was applied to this balance. `None`
+    /// until the first snapshot lands (fresh construction or restart), so
+    /// staleness checks treat an unpolled balance as conservatively stale.
+    /// Delta operations preserve it: only a snapshot proves freshness.
+    fetched_at: Option<DateTime<Utc>>,
 }
 
 impl<T> VenueBalance<T>
@@ -57,6 +64,7 @@ where
         Self {
             available,
             inflight,
+            fetched_at: None,
         }
     }
 
@@ -98,6 +106,7 @@ where
         Ok(Self {
             available: new_available,
             inflight: new_inflight,
+            ..self
         })
     }
 
@@ -115,6 +124,7 @@ where
         Ok(Self {
             available: self.available,
             inflight: new_inflight,
+            ..self
         })
     }
 
@@ -134,6 +144,7 @@ where
         Ok(Self {
             available: new_available,
             inflight: new_inflight,
+            ..self
         })
     }
 
@@ -144,6 +155,7 @@ where
         Ok(Self {
             available: new_available,
             inflight: self.inflight,
+            ..self
         })
     }
 
@@ -161,6 +173,7 @@ where
         Ok(Self {
             available: new_available,
             inflight: self.inflight,
+            ..self
         })
     }
 
@@ -178,6 +191,7 @@ where
         Ok(Self {
             available: self.available,
             inflight,
+            ..self
         })
     }
 
@@ -187,7 +201,16 @@ where
     /// When inflight is non-zero, returns self unchanged - we cannot safely reconcile
     /// while transfers are in progress because the snapshot alone cannot distinguish
     /// between "transfer completed" vs "unrelated inventory change".
-    pub(super) fn apply_snapshot(self, snapshot_balance: T) -> Result<Self, FloatError> {
+    ///
+    /// `fetched_at` is caller-supplied because the stamp must record when the
+    /// venue was READ, not when the event was applied: snapshot events re-fold
+    /// on every boot, and stamping the apply time would mark replayed old
+    /// reads as fresh.
+    pub(super) fn apply_snapshot(
+        self,
+        snapshot_balance: T,
+        fetched_at: DateTime<Utc>,
+    ) -> Result<Self, FloatError> {
         if !self.inflight.is_zero()? {
             debug!(
                 target: "inventory",
@@ -200,6 +223,7 @@ where
         Ok(Self {
             available: snapshot_balance,
             inflight: self.inflight,
+            fetched_at: Some(fetched_at),
         })
     }
 
@@ -217,6 +241,7 @@ where
     pub(super) fn force_apply_snapshot<E: std::fmt::Debug>(
         self,
         snapshot_balance: T,
+        fetched_at: DateTime<Utc>,
         recovering_from: &E,
     ) -> Self {
         warn!(
@@ -229,6 +254,7 @@ where
         Self {
             available: snapshot_balance,
             inflight: T::ZERO,
+            fetched_at: Some(fetched_at),
         }
     }
 }
@@ -397,11 +423,18 @@ mod tests {
         let balance = equity_balance(90, 10);
         let snapshot_balance = FractionalShares::new(float!(95));
 
-        let result = balance.apply_snapshot(snapshot_balance).unwrap();
+        let fetched_at = Utc::now();
+        let result = balance
+            .apply_snapshot(snapshot_balance, fetched_at)
+            .unwrap();
 
         // Balance unchanged when inflight is non-zero
         assert!(result.available().inner().eq(float!(90)).unwrap());
         assert!(result.inflight().inner().eq(float!(10)).unwrap());
+        assert_eq!(
+            result.fetched_at, None,
+            "a skipped snapshot must not claim freshness"
+        );
     }
 
     #[test]
@@ -409,10 +442,14 @@ mod tests {
         let balance = equity_balance(100, 0);
         let snapshot_balance = FractionalShares::new(float!(75));
 
-        let result = balance.apply_snapshot(snapshot_balance).unwrap();
+        let fetched_at = Utc::now();
+        let result = balance
+            .apply_snapshot(snapshot_balance, fetched_at)
+            .unwrap();
 
         assert!(result.available().inner().eq(float!(75)).unwrap());
         assert!(result.inflight().is_zero().unwrap());
+        assert_eq!(result.fetched_at, Some(fetched_at));
     }
 
     #[test]
@@ -420,10 +457,49 @@ mod tests {
         let balance = usdc_balance(1000, 0);
         let snapshot_balance = Usdc::new(float!(950));
 
-        let result = balance.apply_snapshot(snapshot_balance).unwrap();
+        let fetched_at = Utc::now();
+        let result = balance
+            .apply_snapshot(snapshot_balance, fetched_at)
+            .unwrap();
 
         assert!(result.available().inner().eq(float!(950)).unwrap());
         assert!(result.inflight().is_zero().unwrap());
+        assert_eq!(result.fetched_at, Some(fetched_at));
+    }
+
+    #[test]
+    fn new_balance_carries_no_snapshot_stamp() {
+        assert_eq!(equity_balance(100, 0).fetched_at, None);
+        assert_eq!(VenueBalance::<FractionalShares>::default().fetched_at, None);
+    }
+
+    #[test]
+    fn delta_operations_preserve_the_snapshot_stamp() {
+        let fetched_at = Utc::now();
+        let amount = FractionalShares::new(float!(10));
+        let stamped = equity_balance(100, 0)
+            .apply_snapshot(FractionalShares::new(float!(100)), fetched_at)
+            .unwrap();
+
+        let after_deltas = stamped
+            .move_to_inflight(amount)
+            .unwrap()
+            .cancel_inflight(amount)
+            .unwrap()
+            .add_available(amount)
+            .unwrap()
+            .remove_available(amount)
+            .unwrap()
+            .set_inflight(amount)
+            .unwrap()
+            .confirm_inflight(amount)
+            .unwrap();
+
+        assert_eq!(
+            after_deltas.fetched_at,
+            Some(fetched_at),
+            "delta operations must neither clear nor refresh the stamp"
+        );
     }
 
     #[derive(Debug)]
@@ -473,10 +549,16 @@ mod tests {
             _reason: "stuck inflight",
         };
 
-        let result = balance.force_apply_snapshot(snapshot_balance, &error);
+        let fetched_at = Utc::now();
+        let result = balance.force_apply_snapshot(snapshot_balance, fetched_at, &error);
 
         assert!(result.available().inner().eq(float!(95)).unwrap());
         assert!(result.inflight().is_zero().unwrap());
+        assert_eq!(
+            result.fetched_at,
+            Some(fetched_at),
+            "a force-applied snapshot is a real venue read and must stamp"
+        );
     }
 
     #[test]
@@ -487,7 +569,7 @@ mod tests {
             _reason: "recovery",
         };
 
-        let result = balance.force_apply_snapshot(snapshot_balance, &error);
+        let result = balance.force_apply_snapshot(snapshot_balance, Utc::now(), &error);
 
         assert!(result.available().inner().eq(float!(75)).unwrap());
         assert!(result.inflight().is_zero().unwrap());
@@ -501,7 +583,7 @@ mod tests {
             _reason: "usdc corruption",
         };
 
-        let result = balance.force_apply_snapshot(snapshot_balance, &error);
+        let result = balance.force_apply_snapshot(snapshot_balance, Utc::now(), &error);
 
         assert!(result.available().inner().eq(float!(950)).unwrap());
         assert!(result.inflight().is_zero().unwrap());

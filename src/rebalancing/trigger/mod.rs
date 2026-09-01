@@ -1861,10 +1861,15 @@ impl RebalancingService {
         *inventory = inventory.reset_preserving_offchain_order_state();
 
         let updated = match &event {
-            OnchainUsdc { usdc_balance, .. } => inventory.clone().update_usdc(
+            OnchainUsdc {
+                usdc_balance,
+                fetched_at,
+                ..
+            } => inventory.clone().update_usdc(
                 Inventory::force_on_snapshot(
                     Venue::MarketMaking,
                     *usdc_balance,
+                    *fetched_at,
                     recovery_reason.clone(),
                 ),
                 now,
