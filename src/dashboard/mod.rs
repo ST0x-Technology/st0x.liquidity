@@ -733,6 +733,7 @@ mod tests {
             resume_lock: Arc::new(crate::api::ResumeLock(tokio::sync::Mutex::new(()))),
             pnl_report_admission: pnl::pnl_report_admission(),
             metrics_handle: crate::metrics::setup().expect("metrics setup"),
+            overnight_eligibility: st0x_execution::EligibilitySnapshots::default(),
         }
     }
 

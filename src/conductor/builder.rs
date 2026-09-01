@@ -12,10 +12,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use st0x_config::{AlertsCtx, Ctx, ExecutionThreshold, OnchainWalletCtx};
+use st0x_config::{AlertsCtx, BrokerCtx, Ctx, ExecutionThreshold, OnchainWalletCtx};
 use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::{Evm, ReadOnlyEvm, Wallet};
-use st0x_execution::{Executor, Symbol};
+use st0x_execution::{EligibilitySnapshots, Executor, Symbol};
 use st0x_finance::{HasZero, Positive, Usd};
 use st0x_raindex::RaindexService;
 use st0x_registry::SymbolCache;
@@ -125,9 +125,9 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) cache: SymbolCache,
     pub(crate) provider: Prov,
     pub(crate) executor: Exec,
-    /// `None` under the dry-run broker: overnight eligibility is an
-    /// Alpaca surface and the sync then has nothing to refresh.
-    pub(crate) asset_eligibility_monitor: Option<AssetEligibilityMonitor>,
+    /// The shared overnight eligibility store the sync task writes and
+    /// the server's `/overnight/eligibility` endpoint reads.
+    pub(crate) overnight_eligibility: EligibilitySnapshots,
     pub(crate) execution_threshold: ExecutionThreshold,
     pub(crate) frameworks: CqrsFrameworks,
     pub(crate) pool: SqlitePool,
@@ -347,6 +347,20 @@ where
         None
     };
 
+    // Alpaca-specific on purpose: overnight eligibility is an Alpaca
+    // surface, so the monitor takes the concrete broker ctx instead of
+    // widening the generic `Executor` bound; the dry-run broker has
+    // nothing to sync.
+    let asset_eligibility_monitor = match &context.ctx.broker {
+        BrokerCtx::AlpacaBrokerApi(alpaca_ctx) => Some(AssetEligibilityMonitor {
+            broker_ctx: alpaca_ctx.clone(),
+            symbols: configured_equity_symbols.iter().cloned().collect(),
+            store: context.overnight_eligibility.clone(),
+            notifier: notifier.clone(),
+        }),
+        BrokerCtx::DryRun => None,
+    };
+
     let poll_interval = context.ctx.order_polling_interval();
     info!("Constructing order-job context with poll interval: {poll_interval:?}");
 
@@ -546,10 +560,10 @@ where
 
     log_optional_task_status(
         "asset eligibility sync",
-        context.asset_eligibility_monitor.is_some(),
+        asset_eligibility_monitor.is_some(),
     );
 
-    if let Some(eligibility_monitor) = context.asset_eligibility_monitor {
+    if let Some(eligibility_monitor) = asset_eligibility_monitor {
         supervisor_builder = supervisor_builder.with_task(
             "asset-eligibility-monitor",
             StartupTask {
