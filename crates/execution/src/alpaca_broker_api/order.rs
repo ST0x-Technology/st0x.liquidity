@@ -583,7 +583,8 @@ fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
             *status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
                 && message.contains("client_order_id must be unique")
         }
-        HttpClient(_)
+        UsdConversionInsufficientBalance { .. }
+        | HttpClient(_)
         | KmsJwt(_)
         | JsonParse(_)
         | AlpacaAmount(_)
@@ -993,7 +994,32 @@ pub(crate) async fn convert_usdc_usd(
         client_order_id: client_order_id.clone(),
     };
 
-    client.place_crypto_order(&request).await
+    client
+        .place_crypto_order(&request)
+        .await
+        .map_err(|error| classify_conversion_placement_error(order, error))
+}
+
+/// Only a rejected USD-notional placement is safe to resize. Matching both
+/// the HTTP status and Alpaca's numeric code prevents a message-text change or
+/// the same code on another conversion direction from widening that contract.
+fn classify_conversion_placement_error(
+    order: ConversionOrder,
+    error: AlpacaBrokerApiError,
+) -> AlpacaBrokerApiError {
+    match (order, error) {
+        (
+            ConversionOrder::BuyWithUsd(_),
+            error @ AlpacaBrokerApiError::ApiError {
+                status: StatusCode::FORBIDDEN,
+                alpaca_code: Some(40_310_000),
+                ..
+            },
+        ) => AlpacaBrokerApiError::UsdConversionInsufficientBalance {
+            source: Box::new(error),
+        },
+        (_, error) => error,
+    }
 }
 
 /// How long a conversion order may stay non-terminal before the remainder is
@@ -2980,6 +3006,113 @@ mod tests {
             Usdc::new(float!(489.700985))
         );
         assert_eq!(order.status_display(), "filled");
+    }
+
+    #[tokio::test]
+    async fn usd_to_usdc_classifies_placement_insufficient_balance() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(403)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "code": 40_310_000,
+                    "message": "insufficient balance for USD (requested: 69.38, available: 69.36)"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = convert_usdc_usd(
+            &client,
+            ConversionOrder::BuyWithUsd(Positive::new(Usd::new(float!(69.38))).unwrap()),
+            &ClientOrderId::from_uuid(uuid!("23232323-2323-4323-8323-232323232323")),
+        )
+        .await
+        .unwrap_err();
+
+        mock.assert();
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::UsdConversionInsufficientBalance { ref source }
+                    if matches!(
+                        **source,
+                        AlpacaBrokerApiError::ApiError {
+                            status: StatusCode::FORBIDDEN,
+                            alpaca_code: Some(40_310_000),
+                            ..
+                        }
+                    )
+            ),
+            "expected a placement-scoped insufficient-balance error, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn usdc_to_usd_does_not_classify_insufficient_usd_balance() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(403)
+                .header("content-type", "application/json")
+                .json_body(json!({"code": 40_310_000, "message": "insufficient balance for USD"}));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = convert_usdc_usd(
+            &client,
+            ConversionOrder::SellUsdc(Positive::new(Usdc::new(float!(69.38))).unwrap()),
+            &ClientOrderId::from_uuid(uuid!("24242424-2424-4424-8424-242424242424")),
+        )
+        .await
+        .unwrap_err();
+
+        mock.assert();
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::ApiError {
+                status: StatusCode::FORBIDDEN,
+                alpaca_code: Some(40_310_000),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn usd_to_usdc_does_not_classify_another_forbidden_code() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(403)
+                .header("content-type", "application/json")
+                .json_body(json!({"code": 40_320_000, "message": "forbidden"}));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = convert_usdc_usd(
+            &client,
+            ConversionOrder::BuyWithUsd(Positive::new(Usd::new(float!(69.38))).unwrap()),
+            &ClientOrderId::from_uuid(uuid!("25252525-2525-4525-8525-252525252525")),
+        )
+        .await
+        .unwrap_err();
+
+        mock.assert();
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::ApiError {
+                status: StatusCode::FORBIDDEN,
+                alpaca_code: Some(40_320_000),
+                ..
+            }
+        ));
     }
 
     /// A notional order names dollars, so Alpaca answers with `qty: null` and

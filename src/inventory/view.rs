@@ -825,6 +825,32 @@ pub(crate) struct InventoryView {
     restart_tainted_offchain_cash: bool,
 }
 
+/// Computes outbound Alpaca capacity from a fresh broker cash reading while
+/// preserving the configured reserve. Kept independent of [`InventoryView`]
+/// so conversion retries apply the same rule to a point-in-time broker response
+/// instead of waiting for the inventory projection to update.
+pub(crate) fn alpaca_to_base_usdc_capacity(
+    withdrawable_cash_cents: Option<i64>,
+    reserved: Option<Usd>,
+) -> Result<Option<Usdc>, InventoryViewError> {
+    let Some(withdrawable_cents) = withdrawable_cash_cents else {
+        warn!("Broker withdrawable cash is unavailable for Alpaca-to-Base capacity");
+        return Ok(None);
+    };
+    if withdrawable_cents < 0 {
+        return Err(InventoryViewError::UsdBalanceConversion(withdrawable_cents));
+    }
+    let withdrawable = Usdc::from_cents(withdrawable_cents)
+        .ok_or(InventoryViewError::UsdBalanceConversion(withdrawable_cents))?;
+    let reserved = reserved.map_or(Usdc::ZERO, |amount| Usdc::new(amount.inner()));
+
+    if reserved.gt(&withdrawable)? {
+        return Ok(Some(Usdc::ZERO));
+    }
+
+    Ok(Some((withdrawable - reserved)?))
+}
+
 impl InventoryView {
     /// Checks a single equity for imbalance against the threshold.
     ///
@@ -942,18 +968,7 @@ impl InventoryView {
         &self,
         reserved: Option<Usd>,
     ) -> Result<Option<Usdc>, InventoryViewError> {
-        let Some(withdrawable_cents) = self.withdrawable_cash_cents else {
-            return Ok(None);
-        };
-        let withdrawable = Usdc::from_cents(withdrawable_cents)
-            .ok_or(InventoryViewError::UsdBalanceConversion(withdrawable_cents))?;
-        let reserved = reserved.map_or(Usdc::ZERO, |amount| Usdc::new(amount.inner()));
-
-        if reserved.gt(&withdrawable)? {
-            return Ok(Some(Usdc::ZERO));
-        }
-
-        Ok(Some((withdrawable - reserved)?))
+        alpaca_to_base_usdc_capacity(self.withdrawable_cash_cents, reserved)
     }
 
     /// Converts the in-memory inventory view to a DTO for dashboard serialization.
@@ -7051,5 +7066,79 @@ mod tests {
         let capacity = view.alpaca_to_base_usdc_capacity(None).unwrap();
 
         assert_eq!(capacity, None);
+    }
+
+    fn usd_from_cents(cents: u64) -> Usd {
+        Usd::new(Float::from_fixed_decimal(U256::from(cents), 2).unwrap())
+    }
+
+    proptest! {
+        #[test]
+        fn alpaca_capacity_missing_cash_is_always_unknown(
+            reserved_cents in 0u64..=1_000_000_000u64,
+        ) {
+            prop_assert_eq!(
+                alpaca_to_base_usdc_capacity(None, Some(usd_from_cents(reserved_cents))).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn alpaca_capacity_rejects_negative_withdrawable_cents(
+            withdrawable_cents in i64::MIN..0i64,
+        ) {
+            let error = alpaca_to_base_usdc_capacity(Some(withdrawable_cents), None).unwrap_err();
+
+            prop_assert!(matches!(
+                error,
+                InventoryViewError::UsdBalanceConversion(value)
+                    if value == withdrawable_cents
+            ));
+        }
+
+        #[test]
+        fn alpaca_capacity_zero_reserve_preserves_withdrawable_cash(
+            withdrawable_cents in 0i64..=1_000_000_000i64,
+        ) {
+            prop_assert_eq!(
+                alpaca_to_base_usdc_capacity(
+                    Some(withdrawable_cents),
+                    Some(usd_from_cents(0)),
+                )
+                .unwrap(),
+                Some(Usdc::from_cents(withdrawable_cents).unwrap())
+            );
+        }
+
+        #[test]
+        fn alpaca_capacity_equal_reserve_yields_zero(
+            withdrawable_cents in 0i64..=1_000_000_000i64,
+        ) {
+            prop_assert_eq!(
+                alpaca_to_base_usdc_capacity(
+                    Some(withdrawable_cents),
+                    Some(usd_from_cents(u64::try_from(withdrawable_cents).unwrap())),
+                )
+                .unwrap(),
+                Some(Usdc::ZERO)
+            );
+        }
+
+        #[test]
+        fn alpaca_capacity_larger_reserve_yields_zero(
+            withdrawable_cents in 0i64..=1_000_000_000i64,
+            excess_cents in 1i64..=1_000_000_000i64,
+        ) {
+            prop_assert_eq!(
+                alpaca_to_base_usdc_capacity(
+                    Some(withdrawable_cents),
+                    Some(usd_from_cents(
+                        u64::try_from(withdrawable_cents + excess_cents).unwrap()
+                    )),
+                )
+                .unwrap(),
+                Some(Usdc::ZERO)
+            );
+        }
     }
 }

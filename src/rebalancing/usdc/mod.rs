@@ -31,6 +31,7 @@ use st0x_finance::{Usd, Usdc, UsdcConversionError};
 use st0x_raindex::RaindexError;
 
 use crate::bot_gas::redrive::BotGasFailureClassifier;
+use crate::inventory::InventoryViewError;
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceId};
 
 #[derive(Debug, Error)]
@@ -102,6 +103,18 @@ pub(crate) enum UsdcTransferError {
     /// sized at zero or below; refused before any aggregate event exists.
     #[error(transparent)]
     NotPositiveUsd(#[from] NotPositive<Usd>),
+    #[error("inventory capacity calculation failed: {0}")]
+    InventoryView(#[from] InventoryViewError),
+    #[error("Alpaca did not report withdrawable cash while resizing USDC rebalance {id}")]
+    WithdrawableCashUnavailable { id: UsdcRebalanceId },
+    #[error(
+        "USDC rebalance {id} resized USD notional {available} is below the Alpaca-to-Base minimum {minimum}"
+    )]
+    ResizedConversionBelowMinimum {
+        id: UsdcRebalanceId,
+        available: Usd,
+        minimum: Usd,
+    },
     #[error(
         "Conversion order {order_id} filled but \
          filled_quantity is missing"
@@ -433,6 +446,9 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::InvalidShares(_)
             | Self::NotPositive(_)
             | Self::NotPositiveUsd(_)
+            | Self::InventoryView(_)
+            | Self::WithdrawableCashUnavailable { .. }
+            | Self::ResizedConversionBelowMinimum { .. }
             | Self::MissingFilledQuantity { .. }
             | Self::MissingFilledAveragePrice { .. }
             | Self::ResumeIndeterminateConversion { .. }

@@ -1,9 +1,8 @@
 //! Latency/error capture decorator over Alpaca's conversion-only broker methods.
 //!
-//! The rebalancer calls three methods (`convert_usdc_usd`, `find_conversion_order`,
-//! `poll_conversion_to_terminal`) that are specific to Alpaca and not on the generic
-//! `Executor` trait, so `InstrumentedExecutor` does not cover them. This decorator
-//! wraps an `AlpacaBrokerApi` once at rebalancer startup, in
+//! The rebalancer calls Alpaca-specific conversion methods plus a fresh
+//! withdrawable-cash read while resizing rejected conversions. This decorator wraps an
+//! `AlpacaBrokerApi` once at rebalancer startup, in
 //! `spawn_rebalancing_infrastructure`, and emits `dependency='broker'` samples for
 //! each call. Lives in the main crate: the execution crate stays telemetry-free.
 //!
@@ -12,7 +11,8 @@
 //! The `duration` field in recorded samples has different meanings depending on
 //! the operation:
 //!
-//! - `find_conversion_order` -- a single HTTP request; duration reflects
+//! - `find_conversion_order` and `withdrawable_cash_cents` -- bounded HTTP reads;
+//!   duration reflects
 //!   point-in-time network latency (milliseconds).
 //! - `convert_usdc_usd` and `poll_conversion_to_terminal` -- these methods
 //!   poll with 500 ms sleeps until the crypto order reaches a terminal state,
@@ -32,9 +32,8 @@ use super::{Dependency, DependencyCallSample, TelemetrySender, scrub_secrets};
 
 /// An [`AlpacaBrokerApi`] whose USDC conversion calls are timed and recorded.
 ///
-/// Only the three conversion methods the rebalancer uses are exposed and timed;
-/// they are the calls that produce `dependency='broker'` gaps in the dashboard.
-/// Other `AlpacaBrokerApi` methods are intentionally not surfaced here.
+/// Only the conversion and inventory methods the rebalancer uses are exposed
+/// and timed. Other `AlpacaBrokerApi` methods are intentionally not surfaced.
 #[derive(Debug, Clone)]
 pub(crate) struct InstrumentedAlpacaBroker {
     inner: AlpacaBrokerApi,
@@ -75,6 +74,15 @@ impl InstrumentedAlpacaBroker {
             .convert_usdc_usd(conversion, client_order_id)
             .await;
         self.record("convert_usdc_usd", started, &result);
+        result
+    }
+
+    pub(crate) async fn withdrawable_cash_cents(
+        &self,
+    ) -> Result<Option<i64>, AlpacaBrokerApiError> {
+        let started = Instant::now();
+        let result = self.inner.withdrawable_cash_cents().await;
+        self.record("withdrawable_cash_cents", started, &result);
         result
     }
 
@@ -150,7 +158,9 @@ mod tests {
                 .header("content-type", "application/json")
                 .json_body(json!({
                     "id": TEST_ACCOUNT_ID.to_string(),
-                    "status": "ACTIVE"
+                    "status": "ACTIVE",
+                    "cash": "100.25",
+                    "cash_withdrawable": "100.25"
                 }));
         });
 
@@ -330,6 +340,28 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].dependency, "broker");
         assert_eq!(rows[0].operation, "find_conversion_order");
+        assert_eq!(rows[0].outcome, "ok");
+        assert_eq!(rows[0].error, None);
+    }
+
+    #[tokio::test]
+    async fn records_withdrawable_cash_as_broker_operation() {
+        let pool = setup_test_db().await;
+        let server = MockServer::start();
+        let broker = make_broker(&server).await;
+
+        let (sender, receiver) = TelemetrySender::channel();
+        let instrumented = InstrumentedAlpacaBroker::new(broker, sender.clone());
+
+        assert_eq!(
+            instrumented.withdrawable_cash_cents().await.unwrap(),
+            Some(10_025)
+        );
+
+        let rows = drain_samples(&pool, instrumented, sender, receiver).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].dependency, "broker");
+        assert_eq!(rows[0].operation, "withdrawable_cash_cents");
         assert_eq!(rows[0].outcome, "ok");
         assert_eq!(rows[0].error, None);
     }

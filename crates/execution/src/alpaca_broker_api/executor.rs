@@ -368,6 +368,17 @@ impl TryIntoExecutor for AlpacaBrokerApiCtx {
 }
 
 impl AlpacaBrokerApi {
+    /// Reads cash that Alpaca reports as immediately withdrawable.
+    ///
+    /// Conversion retries need only this point-in-time account value. Keeping
+    /// the read narrow avoids fetching and parsing the full positions list on
+    /// every rejected placement.
+    pub async fn withdrawable_cash_cents(&self) -> Result<Option<i64>, AlpacaBrokerApiError> {
+        Ok(super::positions::get_account_funds(&self.client)
+            .await?
+            .withdrawable)
+    }
+
     /// Convert USDC to/from USD buying power.
     ///
     /// This uses the USDC/USD trading pair on Alpaca, and `order` carries its
