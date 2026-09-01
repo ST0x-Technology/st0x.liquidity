@@ -20,6 +20,7 @@ apalis_finished_job_cleanup_interval_secs = 3600
 # Hedging balance for a symbol before the poller escalates a forced snapshot
 # reconciliation.
 inventory_divergence_threshold = 10
+hedge_order_gate_reconciliation_timeout_secs = 10
 
 [pricing]
 # The pricing plane on Cloud Run for THIS environment. Auth is the VM's

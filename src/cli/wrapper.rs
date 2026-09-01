@@ -294,6 +294,7 @@ mod tests {
             position_check_interval: 60,
             inventory_poll_interval: 60,
             inventory_divergence_threshold: std::num::NonZeroU32::MIN,
+            hedge_order_gate_reconciliation_timeout_secs: std::num::NonZeroU64::MIN,
             order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: std::num::NonZeroU64::new(300),
             close_flatten_reprice_timeout_secs: 60,

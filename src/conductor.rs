@@ -22,7 +22,7 @@ use apalis_core::error::BoxDynError;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use sqlx_apalis::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::num::TryFromIntError;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -1607,7 +1607,7 @@ async fn compact_inventory_snapshot_events(pool: &SqlitePool) -> Result<u64, sql
 /// The same setter also stamps the restart taint (symbols whose hedge order
 /// straddled the restart, whose hydrated Hedging balances are therefore
 /// ambiguous): cleared with the gate on entry, seeded with the gate below.
-/// See `InventoryView::set_pending_offchain_order_symbols`.
+/// See `InventoryView::set_pending_offchain_orders`.
 pub(crate) async fn restore_inventory_at_boot(
     pool: &SqlitePool,
     inventory: &Arc<BroadcastingInventory>,
@@ -1617,13 +1617,13 @@ pub(crate) async fn restore_inventory_at_boot(
     inventory
         .write_without_broadcast()
         .await
-        .set_pending_offchain_order_symbols(HashSet::new());
+        .set_pending_offchain_orders(HashMap::new());
 
     hydrate_inventory_from_snapshot(pool, inventory).await;
 
     if let Some(service) = rebalancing_service {
         service
-            .recover_pending_offchain_order_symbols(position_projection)
+            .recover_pending_offchain_orders(position_projection)
             .await?;
     }
 

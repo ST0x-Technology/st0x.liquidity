@@ -23,6 +23,7 @@ board_port = 8012
 database_url = "sqlite:///mnt/data/s01-issuer.db"
 apalis_finished_job_cleanup_interval_secs = 3600
 inventory_divergence_threshold = 10
+hedge_order_gate_reconciliation_timeout_secs = 10
 
 [pricing]
 ws_url = "ws://st0x-pricing:8080/ws"

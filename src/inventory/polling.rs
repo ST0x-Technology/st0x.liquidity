@@ -15,9 +15,11 @@ use rain_math_float::{Float, FloatError};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
-use st0x_event_sorcery::{SendError, Store};
+use st0x_event_sorcery::{AggregateError, SendError, Store};
 use st0x_evm::{Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE, USDC_ETHEREUM, Wallet};
 use st0x_execution::{Executor, FractionalShares, InventoryResult, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, UsdToCentsError, Usdc};
@@ -25,13 +27,17 @@ use st0x_raindex::{RaindexError, RaindexService, RaindexVaultId};
 use st0x_tokenization::{IssuerRequestId, TokenizationRequestId};
 use st0x_tokenization::{TokenizationRequestType, Tokenizer, TokenizerError};
 
+use super::BroadcastingInventory;
 use super::divergence::InventoryDivergenceRecoveryCtx;
-use super::view::Venue;
+use super::view::{HedgeOrderGateCorrection, Venue};
+use crate::alerts::Notifier;
 use crate::inventory::freshness::PollFreshness;
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
 };
 use crate::inventory::view::{PortfolioAsset, PortfolioLocation};
+use crate::offchain::order::OffchainOrderId;
+use crate::position::Position;
 use crate::rebalancing::usdc::{UsdcTransferError, u256_to_usdc};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
@@ -75,6 +81,8 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
     #[error(transparent)]
     VaultRegistry(#[from] SendError<VaultRegistry>),
     #[error(transparent)]
+    Position(#[from] SendError<Position>),
+    #[error(transparent)]
     Evm(#[from] EvmError),
     #[error(transparent)]
     UsdcConversion(#[from] UsdcTransferError),
@@ -112,6 +120,93 @@ pub(crate) struct WalletPollingCtx {
     pub(crate) base: Arc<dyn Wallet<Provider = RootProvider>>,
     pub(crate) unwrapped_equity_token_addresses: HashMap<Symbol, Address>,
     pub(crate) wrapped_equity_token_addresses: HashMap<Symbol, Address>,
+}
+
+/// Durable authority and alerting used to heal reordered hedge-order gates
+/// before broker snapshots reach the deduplicating snapshot aggregate.
+pub(crate) struct HedgeOrderGateReconciliationCtx {
+    pub(crate) inventory: Arc<BroadcastingInventory>,
+    pub(crate) positions: Arc<Store<Position>>,
+    pub(crate) notifier: Arc<dyn Notifier>,
+    pub(crate) deadline: Duration,
+}
+
+async fn load_positions_before_deadline<T, LoadFuture>(
+    deadline: Duration,
+    load: LoadFuture,
+) -> Result<T, SendError<Position>>
+where
+    LoadFuture: Future<Output = Result<T, SendError<Position>>>,
+{
+    timeout(deadline, load)
+        .await
+        .map_err(|error| AggregateError::UnexpectedError(Box::new(error)))?
+}
+
+async fn reconcile_hedge_order_gates<KnownSymbols, Load, LoadFuture, LoadError>(
+    inventory: &BroadcastingInventory,
+    known_symbols: KnownSymbols,
+    load_durable_orders: Load,
+) -> Result<Vec<HedgeOrderGateCorrection>, LoadError>
+where
+    KnownSymbols: IntoIterator<Item = Symbol>,
+    Load: FnOnce(Vec<Symbol>) -> LoadFuture,
+    LoadFuture: Future<Output = Result<HashMap<Symbol, OffchainOrderId>, LoadError>>,
+{
+    // Position events are committed before their reactor takes this same lock,
+    // so either a concurrent placement/terminal is visible to the durable
+    // loads, or its reactor runs immediately after this correction. Releasing
+    // the lock between observation and correction could resurrect an order
+    // that reached terminal state during the read.
+    let mut inventory = inventory.write_without_broadcast().await;
+    let observed_orders = inventory.pending_offchain_orders();
+    let symbols = known_symbols
+        .into_iter()
+        .chain(observed_orders.keys().cloned())
+        .collect::<HashSet<_>>();
+    if symbols.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let durable_orders = load_durable_orders(symbols.into_iter().collect()).await?;
+    Ok(inventory.reconcile_pending_offchain_orders(&observed_orders, &durable_orders))
+}
+
+async fn report_hedge_order_gate_corrections(
+    notifier: &dyn Notifier,
+    corrections: Vec<HedgeOrderGateCorrection>,
+) {
+    let (missing_gate_installs, actionable_corrections): (Vec<_>, Vec<_>) =
+        corrections.into_iter().partition(|correction| {
+            correction.stale_order_id.is_none() && correction.durable_order_id.is_some()
+        });
+    if !missing_gate_installs.is_empty() {
+        warn!(
+            target: "inventory",
+            corrections = ?missing_gate_installs,
+            "Installed hedge-order gates from durable Position state; an in-flight placement may be the cause"
+        );
+    }
+    if actionable_corrections.is_empty() {
+        return;
+    }
+
+    error!(
+        target: "inventory",
+        corrections = ?actionable_corrections,
+        "Removed or replaced hedge-order gates against durable Position state"
+    );
+    let message = format!(
+        "Removed or replaced {} hedge-order gate(s) against durable Position state: {actionable_corrections:?}",
+        actionable_corrections.len()
+    );
+    if let Err(error) = notifier.notify(&message).await {
+        error!(
+            target: "inventory",
+            ?error,
+            "Failed to alert operator about hedge-order gate corrections"
+        );
+    }
 }
 
 /// Comparison of one symbol's broker reading against the view, per poll.
@@ -201,6 +296,10 @@ where
     /// divergence recovery. Production always wires it in the conductor
     /// builder.
     divergence_recovery: Option<InventoryDivergenceRecoveryCtx>,
+    /// `None` only in focused tests that do not exercise hedge-order gates.
+    /// Production always wires this from the same inventory and Position store
+    /// used by the rebalancing reactor.
+    hedge_order_gate_reconciliation: Option<HedgeOrderGateReconciliationCtx>,
     /// Consecutive diverging polls per symbol. Kept in memory on purpose: a
     /// restart resets the count, and restart hydration restores the view.
     divergence_counters: Mutex<HashMap<Symbol, u32>>,
@@ -252,6 +351,7 @@ where
             configured_usdc_vaults: None,
             reserved_cash,
             divergence_recovery: None,
+            hedge_order_gate_reconciliation: None,
             divergence_counters: Mutex::new(HashMap::new()),
             cash_divergence_counter: Mutex::new(0),
             poll_freshness,
@@ -289,6 +389,14 @@ where
         recovery: InventoryDivergenceRecoveryCtx,
     ) -> Self {
         self.divergence_recovery = Some(recovery);
+        self
+    }
+
+    pub(crate) fn with_hedge_order_gate_reconciliation(
+        mut self,
+        reconciliation: HedgeOrderGateReconciliationCtx,
+    ) -> Self {
+        self.hedge_order_gate_reconciliation = Some(reconciliation);
         self
     }
 
@@ -694,6 +802,8 @@ where
             return Ok(());
         };
 
+        self.reconcile_pending_offchain_order_gates().await?;
+
         let positions = self.normalize_offchain_positions(inventory.positions);
         let symbols: Vec<Symbol> = positions.keys().cloned().collect();
 
@@ -1001,6 +1111,58 @@ where
                  the dispatch gate engaged and the counter at the threshold"
             );
         }
+
+        Ok(())
+    }
+
+    async fn reconcile_pending_offchain_order_gates(
+        &self,
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        let Some(reconciliation) = &self.hedge_order_gate_reconciliation else {
+            warn!(
+                target: "inventory",
+                "No hedge-order gate reconciliation configured; skipping hedge-order gate \
+                 reconciliation"
+            );
+            return Ok(());
+        };
+        let configured_symbols = self
+            .configured_equity_symbols
+            .iter()
+            .flat_map(|symbols| symbols.iter().cloned());
+        let corrections = reconcile_hedge_order_gates(
+            &reconciliation.inventory,
+            configured_symbols,
+            |symbols| async move {
+                let durable_positions = load_positions_before_deadline(
+                    reconciliation.deadline,
+                    try_join_all(symbols.iter().map(|symbol| async {
+                        Ok::<_, SendError<Position>>((
+                            symbol.clone(),
+                            reconciliation.positions.load(symbol).await?,
+                        ))
+                    })),
+                )
+                .await?;
+                Ok::<HashMap<Symbol, OffchainOrderId>, SendError<Position>>(
+                    durable_positions
+                        .into_iter()
+                        .filter_map(|(symbol, position)| {
+                            position
+                                .and_then(|position| position.pending_offchain_order_id)
+                                .map(|order_id| (symbol, order_id))
+                        })
+                        .collect(),
+                )
+            },
+        )
+        .await?;
+
+        if corrections.is_empty() {
+            return Ok(());
+        }
+
+        report_hedge_order_gate_corrections(reconciliation.notifier.as_ref(), corrections).await;
 
         Ok(())
     }
@@ -1694,27 +1856,41 @@ mod tests {
     use chrono::Utc;
     use httpmock::prelude::*;
     use sqlx::{Row, SqlitePool};
+    use st0x_config::ExecutionThreshold;
     use st0x_dto::Statement;
     use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_evm::ReadOnlyEvm;
-    use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
+    use st0x_execution::{
+        Direction, EquityPosition, FractionalShares, Inventory, MockExecutor, Positive,
+        SupportedExecutor, Symbol,
+    };
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
     use st0x_raindex::RaindexContracts;
     use st0x_tokenization::issuer_request_id;
+    use std::convert::Infallible;
     use std::num::NonZeroU32;
-    use tokio::sync::broadcast;
+    use std::time::Duration;
+    use tokio::sync::{Barrier, Notify, broadcast};
+    use tokio::time::timeout;
     use uuid::Uuid;
 
     use super::*;
+    use crate::alerts::CapturingNotifier;
     use crate::equity_redemption::RedemptionAggregateId;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::inventory::{
         BroadcastingInventory, InventoryDivergenceGate, InventoryProjection, InventoryView,
     };
+    use crate::offchain::order::OffchainOrderId;
+    use crate::position::{PositionCommand, TradeId};
     use crate::test_utils::setup_test_db;
     use crate::usdc_rebalance::UsdcRebalanceId;
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
+
+    fn test_order_id() -> OffchainOrderId {
+        OffchainOrderId::from_uuid(Uuid::nil())
+    }
 
     #[derive(Clone, Default)]
     struct TestPendingRequestOwnership(PendingRequestOwnershipSnapshot);
@@ -5066,6 +5242,379 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn terminal_event_waits_for_observation_and_durable_read_to_reconcile() {
+        let symbol = test_symbol("SPYM");
+        let stale_order_id = OffchainOrderId::new();
+        let durable_order_id = OffchainOrderId::new();
+        let mut view = InventoryView::default();
+        view.mark_offchain_order_pending(symbol.clone(), stale_order_id);
+        let inventory = broadcasting_inventory(view);
+        let durable_read_started = Arc::new(Barrier::new(2));
+        let release_durable_read = Arc::new(Notify::new());
+
+        let reconciliation_inventory = Arc::clone(&inventory);
+        let reconciliation_started = Arc::clone(&durable_read_started);
+        let reconciliation_release = Arc::clone(&release_durable_read);
+        let reconciliation_symbol = symbol.clone();
+        let reconciliation = tokio::spawn(async move {
+            reconcile_hedge_order_gates(
+                &reconciliation_inventory,
+                Vec::new(),
+                move |_symbols| async move {
+                    reconciliation_started.wait().await;
+                    reconciliation_release.notified().await;
+                    Ok::<_, Infallible>(HashMap::from([(reconciliation_symbol, durable_order_id)]))
+                },
+            )
+            .await
+            .unwrap()
+        });
+        durable_read_started.wait().await;
+
+        let terminal_started = Arc::new(Barrier::new(2));
+        let terminal_inventory = Arc::clone(&inventory);
+        let terminal_symbol = symbol.clone();
+        let terminal_signal = Arc::clone(&terminal_started);
+        let mut terminal = tokio::spawn(async move {
+            terminal_signal.wait().await;
+            terminal_inventory
+                .write_without_broadcast()
+                .await
+                .clear_offchain_order_pending(&terminal_symbol, durable_order_id, None);
+        });
+        terminal_started.wait().await;
+
+        assert!(
+            timeout(Duration::from_millis(50), &mut terminal)
+                .await
+                .is_err(),
+            "terminal handling must wait until reconciliation releases the inventory lock"
+        );
+        release_durable_read.notify_one();
+
+        assert_eq!(
+            reconciliation.await.unwrap(),
+            vec![HedgeOrderGateCorrection {
+                symbol: symbol.clone(),
+                stale_order_id: Some(stale_order_id),
+                durable_order_id: Some(durable_order_id),
+            }]
+        );
+        terminal.await.unwrap();
+        assert!(
+            !inventory.read().await.has_pending_offchain_order(&symbol),
+            "the terminal event must clear the durable replacement after reconciliation"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_read_timeout_releases_the_inventory_lock() {
+        let symbol = test_symbol("SPYM");
+        let inventory = broadcasting_inventory(InventoryView::default());
+
+        let result =
+            reconcile_hedge_order_gates(&inventory, [symbol], |_symbols| {
+                load_positions_before_deadline(
+                    Duration::from_millis(1),
+                    std::future::pending::<
+                        Result<HashMap<Symbol, OffchainOrderId>, SendError<Position>>,
+                    >(),
+                )
+            })
+            .await;
+
+        assert!(matches!(result, Err(AggregateError::UnexpectedError(_))));
+        let _guard = timeout(Duration::from_secs(1), inventory.write_without_broadcast())
+            .await
+            .expect("the timed-out durable load must release the inventory write lock");
+    }
+
+    #[tokio::test]
+    async fn missing_gate_install_does_not_alert_the_operator() {
+        let notifier = CapturingNotifier::default();
+
+        report_hedge_order_gate_corrections(
+            &notifier,
+            vec![HedgeOrderGateCorrection {
+                symbol: test_symbol("AAPL"),
+                stale_order_id: None,
+                durable_order_id: Some(OffchainOrderId::new()),
+            }],
+        )
+        .await;
+
+        assert!(notifier.messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unchanged_cash_poll_removes_gate_with_no_durable_open_order() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider);
+        let (orderbook, order_owner) = test_addresses();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let snapshot = Arc::new(test_store::<InventorySnapshot>(pool.clone(), ()));
+        snapshot
+            .send(
+                &snapshot_id,
+                InventorySnapshotCommand::OffchainUsd {
+                    usd_balance_cents: 0,
+                    gross_usd_cents: None,
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let symbol = test_symbol("SPYM");
+        let stale_order_id = OffchainOrderId::new();
+        let mut view = InventoryView::default().with_usdc(Usdc::ZERO, Usdc::ZERO);
+        view.clear_offchain_order_pending(&symbol, stale_order_id, None);
+        view.set_pending_offchain_orders(HashMap::from([(symbol.clone(), stale_order_id)]));
+        let inventory = broadcasting_inventory(view);
+        let positions = Arc::new(test_store::<Position>(pool.clone(), ()));
+        let notifier = Arc::new(CapturingNotifier::default());
+        let service = InventoryPollingService::new(
+            PollFreshness::new(),
+            raindex_service,
+            MockExecutor::new().with_inventory(zero_broker_inventory()),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            snapshot_id.clone(),
+            order_owner,
+            Arc::clone(&snapshot),
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_hedge_order_gate_reconciliation(HedgeOrderGateReconciliationCtx {
+            inventory: Arc::clone(&inventory),
+            positions,
+            notifier: notifier.clone(),
+            deadline: Duration::from_secs(10),
+        });
+
+        service.poll_offchain(&snapshot_id).await.unwrap();
+
+        assert!(!inventory.read().await.has_pending_offchain_order(&symbol));
+        assert_eq!(notifier.messages().len(), 1);
+        assert_eq!(
+            load_snapshot_events(&pool, orderbook, order_owner)
+                .await
+                .into_iter()
+                .filter(|event| matches!(event, InventorySnapshotEvent::OffchainUsd { .. }))
+                .count(),
+            1,
+            "the unchanged cash command should remain deduplicated after the gate is healed"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_replaces_stale_gate_with_committed_open_order() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider);
+        let (orderbook, order_owner) = test_addresses();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let snapshot = Arc::new(test_store::<InventorySnapshot>(pool.clone(), ()));
+        let symbol = test_symbol("SPYM");
+        let stale_order_id = OffchainOrderId::new();
+        let durable_order_id = OffchainOrderId::new();
+        let mut view = InventoryView::default().with_usdc(Usdc::ZERO, Usdc::ZERO);
+        view.mark_offchain_order_pending(symbol.clone(), stale_order_id);
+        let inventory = broadcasting_inventory(view);
+        let positions = Arc::new(test_store::<Position>(pool.clone(), ()));
+        positions
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: test_shares(1),
+                    direction: Direction::Buy,
+                    price_usdc: float!(1),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        positions
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: durable_order_id,
+                    shares: Positive::new(test_shares(1)).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        let notifier = Arc::new(CapturingNotifier::default());
+        let service = InventoryPollingService::new(
+            PollFreshness::new(),
+            raindex_service,
+            MockExecutor::new().with_inventory(zero_broker_inventory()),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            snapshot_id.clone(),
+            order_owner,
+            snapshot,
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_hedge_order_gate_reconciliation(HedgeOrderGateReconciliationCtx {
+            inventory: Arc::clone(&inventory),
+            positions,
+            notifier: notifier.clone(),
+            deadline: Duration::from_secs(10),
+        });
+
+        service.poll_offchain(&snapshot_id).await.unwrap();
+
+        assert_eq!(
+            inventory
+                .read()
+                .await
+                .pending_offchain_orders()
+                .get(&symbol),
+            Some(&durable_order_id),
+            "the committed open order must remain protected"
+        );
+        assert_eq!(notifier.messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn poll_installs_missing_durable_gate_and_alerts_only_for_stale_corrections() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider);
+        let (orderbook, order_owner) = test_addresses();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let missing_symbol = test_symbol("AAPL");
+        let stale_symbol = test_symbol("SPYM");
+        let durable_order_id = OffchainOrderId::new();
+        let stale_order_id = OffchainOrderId::new();
+        let expected_equity = test_shares(7);
+        let expected_cash = Usdc::from_cents(10_000).unwrap();
+        let mut view = InventoryView::default()
+            .with_equity(
+                missing_symbol.clone(),
+                FractionalShares::ZERO,
+                expected_equity,
+            )
+            .with_usdc(Usdc::ZERO, expected_cash);
+        view.clear_offchain_order_pending(&stale_symbol, stale_order_id, None);
+        view.set_pending_offchain_orders(HashMap::from([(stale_symbol.clone(), stale_order_id)]));
+        let inventory = broadcasting_inventory(view);
+        let positions = Arc::new(test_store::<Position>(pool.clone(), ()));
+        positions
+            .send(
+                &missing_symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: missing_symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: test_shares(1),
+                    direction: Direction::Buy,
+                    price_usdc: float!(1),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        positions
+            .send(
+                &missing_symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: durable_order_id,
+                    shares: Positive::new(test_shares(1)).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        let notifier = Arc::new(CapturingNotifier::default());
+        let snapshot_store = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+            .with(Arc::new(InventoryProjection::new(inventory.clone())))
+            .build(())
+            .await
+            .unwrap();
+        let service = InventoryPollingService::new(
+            PollFreshness::new(),
+            raindex_service,
+            MockExecutor::new().with_inventory(zero_broker_inventory()),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            snapshot_id.clone(),
+            order_owner,
+            snapshot_store,
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_configured_equity_symbols(HashSet::from([
+            missing_symbol.clone(),
+            stale_symbol.clone(),
+        ]))
+        .with_hedge_order_gate_reconciliation(HedgeOrderGateReconciliationCtx {
+            inventory: Arc::clone(&inventory),
+            positions,
+            notifier: notifier.clone(),
+            deadline: Duration::from_secs(10),
+        });
+
+        service.poll_offchain(&snapshot_id).await.unwrap();
+
+        let (pending_orders, available_equity, available_cash) = {
+            let inventory = inventory.read().await;
+            (
+                inventory.pending_offchain_orders(),
+                inventory.equity_available(&missing_symbol, Venue::Hedging),
+                inventory.usdc_available(Venue::Hedging),
+            )
+        };
+        assert_eq!(pending_orders.get(&missing_symbol), Some(&durable_order_id));
+        assert!(!pending_orders.contains_key(&stale_symbol));
+        assert_eq!(
+            available_equity,
+            Some(expected_equity),
+            "the missing gate must be installed before the equity snapshot applies"
+        );
+        assert_eq!(
+            available_cash,
+            Some(expected_cash),
+            "the missing gate must be installed before the cash snapshot applies"
+        );
+        let messages = notifier.messages();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("SPYM"));
+        assert!(
+            !messages[0].contains("AAPL"),
+            "a possibly in-flight missing-gate install must not be included in the operator alert"
+        );
+    }
+
     async fn reconciled_events(
         pool: &SqlitePool,
         orderbook: Address,
@@ -5349,11 +5898,11 @@ mod tests {
     async fn divergence_counter_frozen_while_hedge_order_pending() {
         assert_counter_frozen_while_busy(
             |mut view, symbol| {
-                view.mark_offchain_order_pending(symbol.clone());
+                view.mark_offchain_order_pending(symbol.clone(), test_order_id());
                 view
             },
             |mut view, symbol| {
-                view.clear_offchain_order_pending(symbol, None);
+                view.clear_offchain_order_pending(symbol, test_order_id(), None);
                 view
             },
         )
@@ -5370,6 +5919,7 @@ mod tests {
             |mut view, symbol| {
                 view.clear_offchain_order_pending(
                     symbol,
+                    test_order_id(),
                     Some(Utc::now() + chrono::Duration::hours(1)),
                 );
                 view
@@ -5377,6 +5927,7 @@ mod tests {
             |mut view, symbol| {
                 view.clear_offchain_order_pending(
                     symbol,
+                    test_order_id(),
                     Some(Utc::now() - chrono::Duration::hours(1)),
                 );
                 view
@@ -5793,11 +6344,11 @@ mod tests {
     async fn cash_divergence_counter_frozen_while_hedge_order_pending() {
         assert_cash_counter_frozen_while_busy(
             |mut view| {
-                view.mark_offchain_order_pending(test_symbol("SPYM"));
+                view.mark_offchain_order_pending(test_symbol("SPYM"), test_order_id());
                 view
             },
             |mut view| {
-                view.clear_offchain_order_pending(&test_symbol("SPYM"), None);
+                view.clear_offchain_order_pending(&test_symbol("SPYM"), test_order_id(), None);
                 view
             },
         )
@@ -5814,6 +6365,7 @@ mod tests {
             |mut view| {
                 view.clear_offchain_order_pending(
                     &test_symbol("SPYM"),
+                    test_order_id(),
                     Some(Utc::now() + chrono::Duration::hours(1)),
                 );
                 view
@@ -5821,6 +6373,7 @@ mod tests {
             |mut view| {
                 view.clear_offchain_order_pending(
                     &test_symbol("SPYM"),
+                    test_order_id(),
                     Some(Utc::now() - chrono::Duration::hours(1)),
                 );
                 view
@@ -5977,8 +6530,8 @@ mod tests {
     /// clears its order gate the way a terminal fill does -- the exact
     /// state a restart-straddling order leaves for the poller.
     fn taint_from_restart(view: &mut InventoryView, symbol: &Symbol) {
-        view.set_pending_offchain_order_symbols(HashSet::from([symbol.clone()]));
-        view.clear_offchain_order_pending(symbol, None);
+        view.set_pending_offchain_orders(HashMap::from([(symbol.clone(), test_order_id())]));
+        view.clear_offchain_order_pending(symbol, test_order_id(), None);
     }
 
     /// A restart-tainted divergence is already confirmed, so it must not
@@ -6127,9 +6680,12 @@ mod tests {
         let mut view = InventoryView::default()
             .with_equity(spym.clone(), test_shares(0), test_shares(0))
             .with_equity(aapl.clone(), test_shares(0), test_shares(136));
-        view.set_pending_offchain_order_symbols(HashSet::from([spym.clone(), aapl.clone()]));
-        view.clear_offchain_order_pending(&spym, None);
-        view.clear_offchain_order_pending(&aapl, None);
+        view.set_pending_offchain_orders(HashMap::from([
+            (spym.clone(), test_order_id()),
+            (aapl.clone(), test_order_id()),
+        ]));
+        view.clear_offchain_order_pending(&spym, test_order_id(), None);
+        view.clear_offchain_order_pending(&aapl, test_order_id(), None);
         let inventory = broadcasting_inventory(view);
         let gate = Arc::new(InventoryDivergenceGate::default());
         let service = reconciling_service(
