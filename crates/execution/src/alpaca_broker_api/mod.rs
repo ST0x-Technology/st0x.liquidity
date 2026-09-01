@@ -50,7 +50,7 @@ mod overnight_eligibility;
 mod positions;
 
 /// Asset status from Alpaca Broker API (public because it's exposed in error types)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AssetStatus {
     Active,
