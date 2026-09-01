@@ -2648,7 +2648,12 @@ impl InventoryView {
 
         let fetched_at = event.timestamp();
         match event {
+            // INTERIM (this PR, next commit): the aggregate is per-chain but
+            // the view still holds one onchain slot; with a single trading
+            // chain the routing is identity. The (chain, symbol) view keying
+            // replaces this pass-through.
             OnchainEquity {
+                chain: _,
                 balances,
                 block_number,
                 ..
@@ -2865,6 +2870,7 @@ impl InventoryView {
 
         match event {
             OnchainEquity {
+                chain: _,
                 balances,
                 fetched_at,
                 block_number,
@@ -3104,6 +3110,7 @@ mod tests {
     use super::*;
     use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotCommand};
     use crate::offchain::order::OffchainOrderId;
+    use st0x_evm::Chain;
 
     fn shares(amount: i64) -> FractionalShares {
         FractionalShares::new(float!(&amount.to_string()))
@@ -3161,6 +3168,7 @@ mod tests {
         let fetched_at = rebalanced_at - Duration::seconds(10);
         let symbol = Symbol::new("AAPL").unwrap();
         let event = snapshot_event(InventorySnapshotCommand::OnchainEquity {
+            chain: Chain::Base,
             balances: BTreeMap::from([(symbol.clone(), shares(999))]),
             fetched_at,
             block_number: Some(42),
@@ -3183,6 +3191,7 @@ mod tests {
         let rebalanced_at = handled_at - Duration::seconds(10);
         let fetched_at = rebalanced_at - Duration::seconds(10);
         let event = snapshot_event(InventorySnapshotCommand::OnchainUsdc {
+            chain: Chain::Base,
             usdc_balance: Usdc::new(float!(999)),
             fetched_at,
             block_number: Some(42),
@@ -4643,6 +4652,7 @@ mod tests {
         let view = view
             .apply_snapshot_event(
                 &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Base,
                     balances,
                     fetched_at: now - Duration::seconds(1),
                     block_number: None,
@@ -4677,6 +4687,7 @@ mod tests {
         let view = InventoryView::default()
             .apply_snapshot_event(
                 &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Base,
                     balances: BTreeMap::from([(aapl.clone(), shares(60))]),
                     fetched_at: now,
                     block_number: Some(100),
@@ -4686,6 +4697,7 @@ mod tests {
             .unwrap()
             .apply_snapshot_event(
                 &InventorySnapshotEvent::OnchainUsdc {
+                    chain: Chain::Base,
                     usdc_balance: Usdc::new(float!(8500)),
                     fetched_at: now,
                     block_number: Some(100),
@@ -4740,6 +4752,7 @@ mod tests {
         let view = view
             .apply_snapshot_event(
                 &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Base,
                     balances: BTreeMap::from([(aapl.clone(), shares(60))]),
                     fetched_at: now,
                     block_number: Some(100),
@@ -4749,6 +4762,7 @@ mod tests {
             .unwrap()
             .apply_snapshot_event(
                 &InventorySnapshotEvent::OnchainUsdc {
+                    chain: Chain::Base,
                     usdc_balance: Usdc::new(float!(8500)),
                     fetched_at: now,
                     block_number: Some(100),
@@ -4779,6 +4793,7 @@ mod tests {
         let apply = |view: InventoryView, block: u64, balance: i64, fetched_at: DateTime<Utc>| {
             view.apply_snapshot_event(
                 &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Base,
                     balances: BTreeMap::from([(aapl.clone(), shares(balance))]),
                     fetched_at,
                     block_number: Some(block),
@@ -4788,6 +4803,7 @@ mod tests {
             .unwrap()
             .apply_snapshot_event(
                 &InventorySnapshotEvent::OnchainUsdc {
+                    chain: Chain::Base,
                     usdc_balance: Usdc::new(float!(&balance.to_string())),
                     fetched_at,
                     block_number: Some(block),
@@ -4842,6 +4858,7 @@ mod tests {
         let view = InventoryView::default()
             .apply_snapshot_event(
                 &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Base,
                     balances: BTreeMap::from([(aapl.clone(), shares(60))]),
                     fetched_at: now,
                     block_number: Some(200),
@@ -4851,6 +4868,7 @@ mod tests {
             .unwrap()
             .apply_snapshot_event(
                 &InventorySnapshotEvent::OnchainUsdc {
+                    chain: Chain::Base,
                     usdc_balance: Usdc::new(float!(8500)),
                     fetched_at: now,
                     block_number: Some(200),
@@ -4862,6 +4880,7 @@ mod tests {
         let forced = view
             .force_apply_snapshot_event(
                 &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Base,
                     balances: BTreeMap::from([(aapl.clone(), shares(30))]),
                     fetched_at: now + Duration::seconds(1),
                     block_number: Some(100),
@@ -4872,6 +4891,7 @@ mod tests {
             .unwrap()
             .force_apply_snapshot_event(
                 &InventorySnapshotEvent::OnchainUsdc {
+                    chain: Chain::Base,
                     usdc_balance: Usdc::new(float!(4000)),
                     fetched_at: now + Duration::seconds(1),
                     block_number: Some(100),
@@ -5160,6 +5180,7 @@ mod tests {
         let result = view
             .apply_snapshot_event(
                 &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Base,
                     balances,
                     fetched_at: now,
                     block_number: None,

@@ -307,6 +307,7 @@ where
         raindex_service,
         context.executor.clone(),
         context.frameworks.vault_registry.clone(),
+        context.ctx.chains.sole_trading().chain,
         snapshot_id,
         context.ctx.vault_owner(),
         context.frameworks.snapshot,
