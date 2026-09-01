@@ -4901,7 +4901,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("TEST-ACCEPTED"),
                     placed_shares: accepted_shares,
                     submitted_at: Utc::now(),
-                    market_session: MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -4990,7 +4990,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new(id),
                     placed_shares: Positive::new(FractionalShares::new(float!(0.5))).unwrap(),
                     submitted_at: Utc::now(),
-                    market_session: MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -5156,7 +5156,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("TEST-CANCELLED"),
                     placed_shares: accepted_shares,
                     submitted_at: Utc::now(),
-                    market_session: MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -10491,7 +10491,7 @@ mod tests {
                             executor_order_id: ExecutorOrderId::new("already-poll-failed"),
                             placed_shares: order.shares,
                             submitted_at: Utc::now(),
-                            market_session: MarketSession::Regular,
+                            is_extended_hours: false,
                             limit_price: None,
                         },
                     )
@@ -10808,7 +10808,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("test-order"),
                     placed_shares: shares,
                     submitted_at: Utc::now(),
-                    market_session: st0x_execution::MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -11630,7 +11630,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("cancel-test-order"),
                     placed_shares: shares,
                     submitted_at: Utc::now(),
-                    market_session: st0x_execution::MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -11779,7 +11779,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("cancelling-test-order"),
                     placed_shares: shares,
                     submitted_at: Utc::now(),
-                    market_session: st0x_execution::MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -11905,7 +11905,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("partial-cancel-test-order"),
                     placed_shares: shares,
                     submitted_at: Utc::now(),
-                    market_session: st0x_execution::MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -12840,7 +12840,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("ORD_TERMINAL"),
                     placed_shares: shares,
                     submitted_at: Utc::now(),
-                    market_session: st0x_execution::MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -12951,7 +12951,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("ORD_SUBMITTED"),
                     placed_shares: shares,
                     submitted_at: Utc::now(),
-                    market_session: st0x_execution::MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -13043,7 +13043,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("ORD_SUBMITTED_NO_POLL"),
                     placed_shares: shares,
                     submitted_at: Utc::now(),
-                    market_session: st0x_execution::MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -13125,7 +13125,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("ORD_OVERFLOW"),
                     placed_shares: shares,
                     submitted_at: Utc::now(),
-                    market_session: st0x_execution::MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )

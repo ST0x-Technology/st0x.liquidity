@@ -260,7 +260,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("noop"),
                     placed_shares: noop_placed_shares(shares),
                     submitted_at: Utc::now(),
-                    market_session: st0x_execution::MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )

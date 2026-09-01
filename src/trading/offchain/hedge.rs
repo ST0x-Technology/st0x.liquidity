@@ -2945,7 +2945,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("different-live-claim"),
                     placed_shares: stale_job.shares,
                     submitted_at: chrono::Utc::now(),
-                    market_session: MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -3125,7 +3125,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("filled-order-1"),
                     placed_shares: job.shares,
                     submitted_at: chrono::Utc::now(),
-                    market_session: MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
@@ -4762,7 +4762,7 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("preflight-skip-live-claim"),
                     placed_shares: stale_job.shares,
                     submitted_at: chrono::Utc::now(),
-                    market_session: MarketSession::Extended,
+                    is_extended_hours: true,
                     limit_price: Some(Positive::new(Usd::new(float!(101.00))).unwrap()),
                 },
             )

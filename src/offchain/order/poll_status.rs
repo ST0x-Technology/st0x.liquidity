@@ -1868,7 +1868,7 @@ mod tests {
                     executor_order_id: accepted_executor_order_id,
                     placed_shares: shares,
                     submitted_at: Utc::now(),
-                    market_session: st0x_execution::MarketSession::Regular,
+                    is_extended_hours: false,
                     limit_price: None,
                 },
             )
