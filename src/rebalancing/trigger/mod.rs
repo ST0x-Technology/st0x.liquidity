@@ -8407,6 +8407,7 @@ mod tests {
                 owner: TEST_ORDER_OWNER,
             },
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(50))]),
                 fetched_at: snapshot_at,
                 block_number: None,
@@ -8451,6 +8452,7 @@ mod tests {
                 owner: TEST_ORDER_OWNER,
             },
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(80))]),
                 fetched_at: newer_snapshot_at,
                 block_number: None,
@@ -8466,6 +8468,7 @@ mod tests {
                 owner: TEST_ORDER_OWNER,
             },
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(10))]),
                 fetched_at: older_snapshot_at,
                 block_number: None,
@@ -8556,6 +8559,7 @@ mod tests {
                 owner: TEST_ORDER_OWNER,
             },
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(50))]),
                 fetched_at: snapshot_at,
                 block_number: None,
@@ -8659,6 +8663,7 @@ mod tests {
                 owner: TEST_ORDER_OWNER,
             },
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(100))]),
                 fetched_at: snapshot_at,
                 block_number: None,
@@ -9792,6 +9797,7 @@ mod tests {
             trigger.clone(),
             snapshot_id.clone(),
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(60))]),
                 fetched_at: Utc::now(),
                 block_number: Some(100),
@@ -9803,6 +9809,7 @@ mod tests {
             trigger.clone(),
             snapshot_id,
             InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance: usdc(8500),
                 fetched_at: Utc::now(),
                 block_number: Some(100),
@@ -9856,6 +9863,7 @@ mod tests {
             trigger.clone(),
             snapshot_id.clone(),
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(60))]),
                 fetched_at: Utc::now(),
                 block_number: Some(100),
@@ -9867,6 +9875,7 @@ mod tests {
             trigger.clone(),
             snapshot_id,
             InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance: usdc(8500),
                 fetched_at: Utc::now(),
                 block_number: Some(100),
@@ -9917,6 +9926,7 @@ mod tests {
             trigger.clone(),
             snapshot_id,
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(60))]),
                 fetched_at: Utc::now(),
                 block_number: Some(100),
@@ -9965,6 +9975,7 @@ mod tests {
             trigger.clone(),
             snapshot_id,
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(60))]),
                 fetched_at: Utc::now(),
                 block_number: None,
@@ -10016,6 +10027,7 @@ mod tests {
             trigger.clone(),
             snapshot_id.clone(),
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(60))]),
                 fetched_at: Utc::now(),
                 block_number: Some(100),
@@ -10027,6 +10039,7 @@ mod tests {
             trigger.clone(),
             snapshot_id,
             InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance: usdc(10000),
                 fetched_at: Utc::now(),
                 block_number: Some(90),
@@ -10157,6 +10170,7 @@ mod tests {
             reactor.clone(),
             id.clone(),
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances,
                 fetched_at: Utc::now(),
                 block_number: None,
@@ -11864,6 +11878,7 @@ mod tests {
             reactor.clone(),
             id.clone(),
             InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance: usdc(900),
                 fetched_at: Utc::now(),
                 block_number: None,
@@ -20157,6 +20172,7 @@ mod tests {
         balances.insert(symbol.clone(), shares(100)); // 100 shares onchain
 
         let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            chain: Chain::Base,
             balances,
             fetched_at: Utc::now(),
             block_number: None,
@@ -20226,6 +20242,7 @@ mod tests {
         balances.insert(symbol.clone(), shares(100));
 
         let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            chain: Chain::Base,
             balances,
             fetched_at: Utc::now(),
             block_number: None,
@@ -20306,6 +20323,7 @@ mod tests {
         balances.insert(symbol.clone(), shares(100));
 
         let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            chain: Chain::Base,
             balances,
             fetched_at: Utc::now(),
             block_number: None,
@@ -20373,6 +20391,7 @@ mod tests {
             reactor.clone(),
             id.clone(),
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances,
                 fetched_at: Utc::now(),
                 block_number: None,
@@ -21007,6 +21026,7 @@ mod tests {
             reactor.clone(),
             id,
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances,
                 fetched_at: Utc::now(),
                 block_number: None,
@@ -23939,6 +23959,7 @@ mod tests {
             .on_snapshot_recovery(
                 error,
                 InventorySnapshotEvent::OnchainUsdc {
+                    chain: Chain::Base,
                     usdc_balance: usdc(500),
                     fetched_at: Utc::now(),
                     block_number: None,

@@ -48,6 +48,7 @@ use tracing::warn;
 use st0x_config::ExecutionThreshold;
 #[cfg(any(test, feature = "test-support"))]
 use st0x_event_sorcery::{RetryOnBusy, StoreBuilder};
+#[cfg(any(test, feature = "test-support"))]
 use st0x_evm::Chain;
 use st0x_execution::Symbol;
 #[cfg(any(test, feature = "test-support"))]

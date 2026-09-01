@@ -357,6 +357,7 @@ mod tests {
             .send(
                 &id,
                 InventorySnapshotCommand::OnchainEquity {
+                    chain: Chain::Base,
                     balances,
                     fetched_at: chrono::Utc::now(),
                     block_number: None,

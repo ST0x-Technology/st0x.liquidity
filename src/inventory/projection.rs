@@ -106,6 +106,7 @@ mod tests {
     use crate::inventory::view::{InFlightCashLocation, InFlightEquityLocation};
     use crate::inventory::{InventoryView, Venue};
     use crate::test_utils::setup_test_db;
+    use st0x_evm::Chain;
 
     fn shares(amount: i64) -> FractionalShares {
         FractionalShares::new(float!(&amount.to_string()))
@@ -187,6 +188,7 @@ mod tests {
         let mut balances = BTreeMap::new();
         balances.insert(symbol("RKLB"), shares(2));
         let event = InventorySnapshotEvent::OnchainEquity {
+            chain: Chain::Base,
             balances,
             fetched_at: Utc::now(),
             block_number: None,
@@ -365,6 +367,7 @@ mod tests {
         let forced = seed
             .force_apply_snapshot_event(
                 &InventorySnapshotEvent::OnchainUsdc {
+                    chain: Chain::Base,
                     usdc_balance: Usdc::from_cents(2_000_000).unwrap(),
                     fetched_at: Utc::now(),
                     block_number: None,
@@ -403,6 +406,7 @@ mod tests {
 
         projection
             .apply(&InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance: Usdc::from_cents(2_000_000).unwrap(),
                 fetched_at: Utc::now(),
                 block_number: None,
@@ -451,6 +455,7 @@ mod tests {
             .send(
                 &id,
                 InventorySnapshotCommand::OnchainEquity {
+                    chain: Chain::Base,
                     balances,
                     fetched_at: Utc::now(),
                     block_number: None,

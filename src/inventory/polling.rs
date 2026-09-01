@@ -20,7 +20,9 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use st0x_event_sorcery::{AggregateError, SendError, Store};
-use st0x_evm::{Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE, USDC_ETHEREUM, Wallet};
+use st0x_evm::{
+    Chain, Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE, USDC_ETHEREUM, Wallet,
+};
 use st0x_execution::{Executor, FractionalShares, InventoryResult, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, UsdToCentsError, Usdc};
 use st0x_raindex::{RaindexError, RaindexService, RaindexVaultId};
@@ -273,6 +275,9 @@ where
     raindex_service: Arc<RaindexService<Rpc>>,
     executor: Exe,
     vault_registry: Arc<Store<VaultRegistry>>,
+    /// Chain the vault reads run on: stamps every onchain snapshot command so
+    /// balances land in that chain's slot.
+    trading_chain: Chain,
     snapshot_id: InventorySnapshotId,
     /// On-chain owner of the Raindex vaults (`vaultBalance2` owner key and vault
     /// registry key). Distinct from `snapshot_id.owner` (the signing wallet used
@@ -325,6 +330,7 @@ where
         raindex_service: Arc<RaindexService<Rpc>>,
         executor: Exe,
         vault_registry: Arc<Store<VaultRegistry>>,
+        trading_chain: Chain,
         snapshot_id: InventorySnapshotId,
         vault_owner: Address,
         snapshot: Arc<Store<InventorySnapshot>>,
@@ -335,6 +341,7 @@ where
         Self {
             raindex_service,
             executor,
+            trading_chain,
             vault_registry,
             snapshot_id,
             vault_owner,
@@ -559,6 +566,7 @@ where
             .send(
                 snapshot_id,
                 InventorySnapshotCommand::OnchainEquity {
+                    chain: self.trading_chain,
                     balances,
                     fetched_at,
                     block_number: Some(block_number),
@@ -614,6 +622,7 @@ where
             .send(
                 snapshot_id,
                 InventorySnapshotCommand::OnchainUsdc {
+                    chain: self.trading_chain,
                     usdc_balance,
                     fetched_at,
                     block_number: Some(block_number),
@@ -2165,6 +2174,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -2225,6 +2235,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -2292,6 +2303,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -2352,6 +2364,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -2406,6 +2419,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -2468,6 +2482,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -2528,6 +2543,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -2587,6 +2603,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -2627,6 +2644,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -2693,6 +2711,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -2742,6 +2761,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -2793,6 +2813,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -2892,6 +2913,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -2948,6 +2970,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -3005,6 +3028,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -3070,6 +3094,7 @@ mod tests {
             raindex_service,
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: snapshot_owner,
@@ -3141,6 +3166,7 @@ mod tests {
             create_test_raindex_service(provider),
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -3209,6 +3235,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -3252,6 +3279,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -3316,6 +3344,7 @@ mod tests {
             raindex_service,
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -3370,6 +3399,7 @@ mod tests {
             raindex_service,
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -3420,6 +3450,7 @@ mod tests {
             raindex_service,
             MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -3472,6 +3503,7 @@ mod tests {
             raindex_service,
             MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             snapshot_id.clone(),
             snapshot_id.owner,
             Arc::new(test_store(pool.clone(), ())),
@@ -3517,6 +3549,7 @@ mod tests {
             raindex_service,
             MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             snapshot_id.clone(),
             snapshot_id.owner,
             Arc::new(test_store(pool.clone(), ())),
@@ -3562,6 +3595,7 @@ mod tests {
             raindex_service,
             MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -3625,6 +3659,7 @@ mod tests {
             raindex_service,
             MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -3713,6 +3748,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -3763,6 +3799,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -3808,6 +3845,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -3851,6 +3889,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -3898,6 +3937,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -3939,6 +3979,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -3986,6 +4027,7 @@ mod tests {
             raindex_service,
             MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -4044,6 +4086,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -4099,6 +4142,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -4156,6 +4200,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -4210,6 +4255,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -4266,6 +4312,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -4340,6 +4387,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -4392,6 +4440,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -4449,6 +4498,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -4506,6 +4556,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -4555,6 +4606,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -4695,6 +4747,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -4749,6 +4802,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -4796,6 +4850,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -4837,6 +4892,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -4898,6 +4954,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -4966,6 +5023,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -5035,6 +5093,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -5101,6 +5160,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -5224,6 +5284,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -5383,6 +5444,7 @@ mod tests {
             raindex_service,
             MockExecutor::new().with_inventory(zero_broker_inventory()),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             snapshot_id.clone(),
             order_owner,
             Arc::clone(&snapshot),
@@ -5469,6 +5531,7 @@ mod tests {
             raindex_service,
             MockExecutor::new().with_inventory(zero_broker_inventory()),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             snapshot_id.clone(),
             order_owner,
             snapshot,
@@ -5568,6 +5631,7 @@ mod tests {
             raindex_service,
             MockExecutor::new().with_inventory(zero_broker_inventory()),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             snapshot_id.clone(),
             order_owner,
             snapshot_store,
@@ -7043,6 +7107,7 @@ mod tests {
             raindex_service,
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -7120,6 +7185,7 @@ mod tests {
             raindex_service,
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -7168,6 +7234,7 @@ mod tests {
             raindex_service,
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -7232,6 +7299,7 @@ mod tests {
             raindex_service,
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -7286,6 +7354,7 @@ mod tests {
             raindex_service,
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -7373,6 +7442,7 @@ mod tests {
             raindex_service,
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
@@ -7444,6 +7514,7 @@ mod tests {
             raindex_service,
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
