@@ -21,6 +21,7 @@ use rain_math_float::Float;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use thiserror::Error;
 
+use st0x_evm::Chain;
 use st0x_execution::{EmptySymbolError, HasZero, Symbol};
 use st0x_float_macro::float;
 use st0x_float_serde::parse_float_string_or_hex;
@@ -553,15 +554,22 @@ fn parse_et_day(value: &str) -> Result<NaiveDate, ReadError> {
 /// which is what `PortfolioSnapshotProjection` persists into the `location`
 /// column (`row.row.location.to_string()`).
 fn parse_portfolio_location(value: &str) -> Result<PortfolioLocation, ReadError> {
-    match value {
-        "market_making" => Ok(PortfolioLocation::MarketMaking),
-        "hedging" => Ok(PortfolioLocation::Hedging),
-        "ethereum_wallet" => Ok(PortfolioLocation::EthereumWallet),
-        "base_wallet_unwrapped" => Ok(PortfolioLocation::BaseWalletUnwrapped),
-        "base_wallet_wrapped" => Ok(PortfolioLocation::BaseWalletWrapped),
-        _ => Err(ReadError::InvalidLocation {
-            value: value.to_owned(),
-        }),
+    if value == "hedging" {
+        return Ok(PortfolioLocation::Hedging);
+    }
+
+    let invalid = || ReadError::InvalidLocation {
+        value: value.to_owned(),
+    };
+    let (name, chain) = value.split_once(':').ok_or_else(invalid)?;
+    let chain: Chain = chain.parse().map_err(|_| invalid())?;
+
+    match (name, chain) {
+        ("market_making", chain) => Ok(PortfolioLocation::MarketMaking(chain)),
+        ("ethereum_wallet", Chain::Ethereum) => Ok(PortfolioLocation::EthereumWallet),
+        ("base_wallet_unwrapped", Chain::Base) => Ok(PortfolioLocation::BaseWalletUnwrapped),
+        ("base_wallet_wrapped", Chain::Base) => Ok(PortfolioLocation::BaseWalletWrapped),
+        _ => Err(invalid()),
     }
 }
 
@@ -632,7 +640,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-18",
-            "market_making",
+            "market_making:base",
             "USDC",
             "1000",
             Some("1"),
@@ -642,7 +650,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-18",
-            "market_making",
+            "market_making:base",
             "AAPL",
             "2",
             Some("50"),
@@ -671,7 +679,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-18",
-            "market_making",
+            "market_making:base",
             "USDC",
             "1000",
             Some("1"),
@@ -681,7 +689,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-18",
-            "market_making",
+            "market_making:base",
             "AAPL",
             "2",
             None,
@@ -708,7 +716,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-18",
-            "market_making",
+            "market_making:base",
             "AAPL",
             "2",
             Some("50"),
@@ -737,7 +745,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-18",
-            "market_making",
+            "market_making:base",
             "USDC",
             "1000",
             Some("1"),
@@ -763,7 +771,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-17",
-            "market_making",
+            "market_making:base",
             "USDC",
             "1000",
             Some("1"),
@@ -773,7 +781,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-18",
-            "market_making",
+            "market_making:base",
             "USDC",
             "2000",
             Some("1"),
@@ -783,7 +791,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-19",
-            "market_making",
+            "market_making:base",
             "USDC",
             "3000",
             Some("1"),
@@ -811,7 +819,7 @@ mod tests {
             insert_row(
                 &pool,
                 et_day,
-                "market_making",
+                "market_making:base",
                 "USDC",
                 "1000",
                 Some("1"),
@@ -849,7 +857,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-17",
-            "market_making",
+            "market_making:base",
             "USDC",
             "1000",
             Some("1"),
@@ -859,7 +867,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-19",
-            "market_making",
+            "market_making:base",
             "USDC",
             "3000",
             Some("1"),
@@ -894,7 +902,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-17",
-            "market_making",
+            "market_making:base",
             "USDC",
             "1000",
             Some("1"),
@@ -929,7 +937,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-18",
-            "market_making",
+            "market_making:base",
             "USDC",
             "5000",
             Some("1"),
@@ -949,7 +957,7 @@ mod tests {
         insert_row(
             &pool,
             "2026-07-18",
-            "market_making",
+            "market_making:base",
             "AAPL",
             "10",
             Some("150"),
@@ -1022,7 +1030,9 @@ mod tests {
         for (et_day, market_making, hedging) in
             [("2026-07-18", "60", "40"), ("2026-07-19", "50", "50")]
         {
-            for (location, available) in [("market_making", market_making), ("hedging", hedging)] {
+            for (location, available) in
+                [("market_making:base", market_making), ("hedging", hedging)]
+            {
                 insert_row(
                     &pool,
                     et_day,
@@ -1080,10 +1090,10 @@ mod tests {
     async fn usdc_contributes_to_capital_at_every_location() {
         let pool = setup_test_db().await;
         for (location, available) in [
-            ("market_making", "1000"),
+            ("market_making:base", "1000"),
             ("hedging", "2000"),
-            ("ethereum_wallet", "300"),
-            ("base_wallet_unwrapped", "40"),
+            ("ethereum_wallet:ethereum", "300"),
+            ("base_wallet_unwrapped:base", "40"),
         ] {
             insert_row(
                 &pool,
@@ -1338,7 +1348,7 @@ mod tests {
         insert_row(
             &pool,
             et_day_value,
-            "market_making",
+            "market_making:base",
             "AAPL",
             "2",
             Some("50"),
@@ -1365,7 +1375,7 @@ mod tests {
         insert_row(
             &pool,
             et_day_value,
-            "market_making",
+            "market_making:base",
             "AAPL",
             "2",
             Some("50"),

@@ -2905,7 +2905,7 @@ async fn build_pnl_report_populates_capital_when_snapshots_exist() {
     insert_portfolio_snapshot_row(
         &pool,
         "2026-05-15",
-        "market_making",
+        "market_making:base",
         "USDC",
         "1000",
         Some("1"),
@@ -2973,7 +2973,7 @@ async fn return_uses_only_pnl_from_days_with_usable_capital() {
         insert_portfolio_snapshot_row(
             &pool,
             et_day,
-            "market_making",
+            "market_making:base",
             "USDC",
             "1000",
             Some("1"),
@@ -2984,7 +2984,7 @@ async fn return_uses_only_pnl_from_days_with_usable_capital() {
     insert_portfolio_snapshot_row(
         &pool,
         "2026-05-16",
-        "market_making",
+        "market_making:base",
         "AAPL",
         "10",
         None,
@@ -3047,7 +3047,7 @@ async fn high_precision_derived_prices_do_not_break_the_capital_calculation() {
         insert_portfolio_snapshot_row(
             &pool,
             et_day,
-            "market_making",
+            "market_making:base",
             "USDC",
             "1000",
             Some("1"),
@@ -3101,7 +3101,7 @@ async fn return_excludes_signed_cost_effects_from_days_without_usable_capital() 
         insert_portfolio_snapshot_row(
             &pool,
             et_day,
-            "market_making",
+            "market_making:base",
             "USDC",
             "1000",
             Some("1"),
@@ -3112,7 +3112,7 @@ async fn return_excludes_signed_cost_effects_from_days_without_usable_capital() 
     insert_portfolio_snapshot_row(
         &pool,
         "2026-05-16",
-        "market_making",
+        "market_making:base",
         "AAPL",
         "10",
         None,
@@ -3211,7 +3211,7 @@ async fn build_pnl_report_symbol_filtered_query_omits_capital_with_warning() {
     insert_portfolio_snapshot_row(
         &pool,
         "2026-05-15",
-        "market_making",
+        "market_making:base",
         "USDC",
         "1000",
         Some("1"),
@@ -3253,7 +3253,7 @@ async fn build_pnl_report_empty_symbol_param_preserves_capital() {
     insert_portfolio_snapshot_row(
         &pool,
         "2026-05-15",
-        "market_making",
+        "market_making:base",
         "USDC",
         "1000",
         Some("1"),
@@ -3303,7 +3303,7 @@ async fn build_pnl_report_as_of_rowid_non_current_omits_capital_with_warning() {
     insert_portfolio_snapshot_row(
         &pool,
         "2026-05-15",
-        "market_making",
+        "market_making:base",
         "USDC",
         "1000",
         Some("1"),

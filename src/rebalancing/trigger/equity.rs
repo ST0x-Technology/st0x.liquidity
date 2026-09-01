@@ -557,6 +557,7 @@ mod tests {
     use tokio::sync::broadcast;
 
     use st0x_dto::Statement;
+    use st0x_evm::Chain;
     use st0x_execution::FractionalShares;
     use st0x_float_macro::float;
     use st0x_wrapper::RATIO_ONE;
@@ -564,7 +565,6 @@ mod tests {
     use super::*;
     use crate::inventory::view::Operator;
     use crate::inventory::{Inventory, InventoryView, TransferOp, Venue};
-    use st0x_evm::Chain;
 
     fn make_in_progress() -> Arc<std::sync::RwLock<HashMap<Symbol, GuardState>>> {
         Arc::new(std::sync::RwLock::new(HashMap::new()))

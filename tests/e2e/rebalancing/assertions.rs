@@ -501,7 +501,8 @@ async fn assert_inventory_snapshots(
 
     let onchain_equity = live
         .get("onchain_equity")
-        .ok_or_else(|| anyhow::anyhow!("Snapshot missing onchain_equity"))?;
+        .and_then(|per_chain| per_chain.get("base"))
+        .ok_or_else(|| anyhow::anyhow!("Snapshot missing onchain_equity for base"))?;
     let offchain_equity = live
         .get("offchain_equity")
         .ok_or_else(|| anyhow::anyhow!("Snapshot missing offchain_equity"))?;
@@ -530,8 +531,9 @@ async fn assert_inventory_snapshots(
     if assert_cash {
         let _usdc = live
             .get("onchain_usdc")
+            .and_then(|per_chain| per_chain.get("base"))
             .and_then(|val| val.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Snapshot missing onchain_usdc"))?;
+            .ok_or_else(|| anyhow::anyhow!("Snapshot missing onchain_usdc for base"))?;
     }
 
     Ok(())

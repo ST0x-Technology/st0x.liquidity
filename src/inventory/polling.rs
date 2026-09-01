@@ -578,7 +578,7 @@ where
         // propagates via `?` above) never leaves this slot falsely fresh.
         for symbol in symbols {
             self.poll_freshness.observe(
-                PortfolioLocation::MarketMaking,
+                PortfolioLocation::MarketMaking(self.trading_chain),
                 PortfolioAsset::Equity(symbol),
             );
         }
@@ -632,8 +632,10 @@ where
 
         // Stamped only after `send` returns Ok, so a failed persist (which
         // propagates via `?` above) never leaves this slot falsely fresh.
-        self.poll_freshness
-            .observe(PortfolioLocation::MarketMaking, PortfolioAsset::Usdc);
+        self.poll_freshness.observe(
+            PortfolioLocation::MarketMaking(self.trading_chain),
+            PortfolioAsset::Usdc,
+        );
 
         Ok(())
     }
@@ -7131,13 +7133,21 @@ mod tests {
 
         service.poll_onchain(&snapshot_id).await.unwrap();
         assert!(
-            poll_freshness.observed_since(PortfolioLocation::MarketMaking, &asset, floor),
+            poll_freshness.observed_since(
+                PortfolioLocation::MarketMaking(Chain::Base),
+                &asset,
+                floor
+            ),
             "tick 1 must stamp freshness at/after the floor"
         );
 
         service.poll_onchain(&snapshot_id).await.unwrap();
         assert!(
-            poll_freshness.observed_since(PortfolioLocation::MarketMaking, &asset, floor),
+            poll_freshness.observed_since(
+                PortfolioLocation::MarketMaking(Chain::Base),
+                &asset,
+                floor
+            ),
             "tick 2 (unchanged balance) must still stamp freshness at/after the floor -- the \
              day-scoped signal is independent of InventorySnapshot's change-suppression"
         );
@@ -7321,7 +7331,7 @@ mod tests {
         assert!(
             !observed(
                 &poll_freshness,
-                PortfolioLocation::MarketMaking,
+                PortfolioLocation::MarketMaking(Chain::Base),
                 &PortfolioAsset::Equity(test_symbol("AAPL"))
             ),
             "a failed vault-balance fetch must leave the slot un-observed so the gate keeps it \
@@ -7459,7 +7469,7 @@ mod tests {
         let equity_asset = PortfolioAsset::Equity(symbol);
         assert!(observed(
             &poll_freshness,
-            PortfolioLocation::MarketMaking,
+            PortfolioLocation::MarketMaking(Chain::Base),
             &equity_asset
         ));
         assert!(observed(
@@ -7469,7 +7479,7 @@ mod tests {
         ));
         assert!(observed(
             &poll_freshness,
-            PortfolioLocation::MarketMaking,
+            PortfolioLocation::MarketMaking(Chain::Base),
             &PortfolioAsset::Usdc
         ));
         assert!(observed(

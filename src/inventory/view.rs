@@ -593,7 +593,7 @@ pub(crate) enum InFlightEquityLocation {
 /// since `asset` still distinguishes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum PortfolioLocation {
-    MarketMaking,
+    MarketMaking(Chain),
     Hedging,
     EthereumWallet,
     BaseWalletUnwrapped,
@@ -601,15 +601,20 @@ pub(crate) enum PortfolioLocation {
 }
 
 impl std::fmt::Display for PortfolioLocation {
+    /// Every on-chain location renders `<name>:<chain>` so a chain's
+    /// balances stay attributable per the multi-chain SPEC; the broker-side
+    /// `hedging` has no chain to name. Persisted in `portfolio_snapshot`
+    /// (legacy bare rows were migrated to this qualified form).
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let label = match self {
-            Self::MarketMaking => "market_making",
-            Self::Hedging => "hedging",
-            Self::EthereumWallet => "ethereum_wallet",
-            Self::BaseWalletUnwrapped => "base_wallet_unwrapped",
-            Self::BaseWalletWrapped => "base_wallet_wrapped",
-        };
-        write!(formatter, "{label}")
+        match self {
+            Self::MarketMaking(chain) => write!(formatter, "market_making:{chain}"),
+            Self::Hedging => write!(formatter, "hedging"),
+            Self::EthereumWallet => write!(formatter, "ethereum_wallet:{}", Chain::Ethereum),
+            Self::BaseWalletUnwrapped => {
+                write!(formatter, "base_wallet_unwrapped:{}", Chain::Base)
+            }
+            Self::BaseWalletWrapped => write!(formatter, "base_wallet_wrapped:{}", Chain::Base),
+        }
     }
 }
 
@@ -660,11 +665,6 @@ impl PartialEq for PortfolioBalanceRow {
 /// Observability only -- never changes which snapshots apply.
 const OFFCHAIN_SNAPSHOT_SKIP_WARN_EVERY: u32 = 5;
 
-const PORTFOLIO_VENUES: [(Venue, PortfolioLocation); 2] = [
-    (Venue::MarketMaking, PortfolioLocation::MarketMaking),
-    (Venue::Hedging, PortfolioLocation::Hedging),
-];
-
 /// Wallet-transit cash locations in the fixed order rows are emitted.
 const PORTFOLIO_CASH_TRANSIT_LOCATIONS: [InFlightCashLocation; 2] = [
     InFlightCashLocation::EthereumWallet,
@@ -677,17 +677,13 @@ const PORTFOLIO_EQUITY_TRANSIT_LOCATIONS: [InFlightEquityLocation; 2] = [
     InFlightEquityLocation::BaseWalletWrapped,
 ];
 
-fn legacy_trading_chain() -> Chain {
-    Chain::Base
-}
-
 /// Cross-aggregate projection tracking inventory across venues.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct InventoryView {
     /// Chain the venue-addressed (trading) operations act on. Snapshot
     /// application routes by each event's own chain; everything reaching a
     /// slot through [`Venue::MarketMaking`] means this chain's slot.
-    #[serde(default = "legacy_trading_chain")]
+    #[serde(default = "crate::onchain::legacy_chain")]
     trading_chain: Chain,
     usdc: Inventory<Usdc>,
     equities: HashMap<Symbol, Inventory<FractionalShares>>,
@@ -1107,42 +1103,50 @@ impl InventoryView {
         let mut rows = Vec::new();
 
         for (symbol, inventory) in self.equities.iter().sorted_by_key(|(symbol, _)| *symbol) {
-            for (venue, location) in PORTFOLIO_VENUES {
-                if let Some(balance) = inventory.get_venue(venue, self.trading_chain) {
-                    rows.push(PortfolioBalanceRow {
-                        location,
-                        asset: PortfolioAsset::Equity(symbol.clone()),
-                        available: balance.available().into(),
-                        inflight: balance.inflight().into(),
-                    });
-                }
-            }
-        }
-
-        for (venue, location) in PORTFOLIO_VENUES {
-            if let Some(balance) = self.usdc.get_venue(venue, self.trading_chain) {
-                // Matches on `venue` (exactly 2 variants, `MarketMaking` and
-                // `Hedging`), not `location`: `PORTFOLIO_VENUES` can only ever
-                // produce those two `PortfolioLocation` values, so a wildcard
-                // over the 5-variant `PortfolioLocation` would silently cover
-                // wallet-transit variants this loop never actually sees.
-                let available = match venue {
-                    Venue::Hedging => match self.offchain_gross_usd_cents {
-                        Some(cents) => Float::from(
-                            Usdc::from_cents(cents)
-                                .ok_or(InventoryViewError::UsdBalanceConversion(cents))?,
-                        ),
-                        None => balance.available().into(),
-                    },
-                    Venue::MarketMaking => balance.available().into(),
-                };
+            // One market-making row per chain holding a slot: each chain's
+            // balances stay attributable (SPEC multi-chain), never summed.
+            for (chain, balance) in &inventory.onchain {
                 rows.push(PortfolioBalanceRow {
-                    location,
-                    asset: PortfolioAsset::Usdc,
-                    available,
+                    location: PortfolioLocation::MarketMaking(*chain),
+                    asset: PortfolioAsset::Equity(symbol.clone()),
+                    available: balance.available().into(),
                     inflight: balance.inflight().into(),
                 });
             }
+            if let Some(balance) = inventory.offchain {
+                rows.push(PortfolioBalanceRow {
+                    location: PortfolioLocation::Hedging,
+                    asset: PortfolioAsset::Equity(symbol.clone()),
+                    available: balance.available().into(),
+                    inflight: balance.inflight().into(),
+                });
+            }
+        }
+
+        for (chain, balance) in &self.usdc.onchain {
+            rows.push(PortfolioBalanceRow {
+                location: PortfolioLocation::MarketMaking(*chain),
+                asset: PortfolioAsset::Usdc,
+                available: balance.available().into(),
+                inflight: balance.inflight().into(),
+            });
+        }
+        if let Some(balance) = self.usdc.offchain {
+            // Gross, not net: the reserve must not make the book look
+            // artificially onchain-heavy in the daily capture.
+            let available = match self.offchain_gross_usd_cents {
+                Some(cents) => Float::from(
+                    Usdc::from_cents(cents)
+                        .ok_or(InventoryViewError::UsdBalanceConversion(cents))?,
+                ),
+                None => balance.available().into(),
+            };
+            rows.push(PortfolioBalanceRow {
+                location: PortfolioLocation::Hedging,
+                asset: PortfolioAsset::Usdc,
+                available,
+                inflight: balance.inflight().into(),
+            });
         }
 
         for cash_location in PORTFOLIO_CASH_TRANSIT_LOCATIONS {
@@ -1370,12 +1374,15 @@ impl InventoryView {
     }
 
     /// Sets USDC inventory with specified available balances (zero inflight).
+    /// The onchain balance is seeded under the view's trading chain so
+    /// non-Base fixtures exercise the same slot the venue-addressed
+    /// operations route to.
     #[cfg(test)]
     pub(crate) fn with_usdc(self, onchain_available: Usdc, offchain_available: Usdc) -> Self {
         Self {
             usdc: Inventory {
                 onchain: BTreeMap::from([(
-                    Chain::Base,
+                    self.trading_chain,
                     VenueBalance::new(onchain_available, Usdc::ZERO),
                 )]),
                 offchain: Some(VenueBalance::new(offchain_available, Usdc::ZERO)),
@@ -1402,7 +1409,7 @@ impl InventoryView {
         Self {
             usdc: Inventory {
                 onchain: BTreeMap::from([(
-                    Chain::Base,
+                    self.trading_chain,
                     VenueBalance::new(onchain_available, onchain_inflight),
                 )]),
                 offchain: Some(VenueBalance::new(offchain_available, offchain_inflight)),
@@ -3022,6 +3029,47 @@ impl InventoryView {
     /// non-forced conversion: silently inventing a Usdc from an invalid
     /// cents payload would corrupt financial state, so the original
     /// error resurfaces instead of being masked.
+    /// The forced-recovery half of the `OnchainEquity` arm: authoritative
+    /// balances per symbol on one chain, with the watermarks following the
+    /// forced block exactly rather than keeping the monotonic maximum.
+    fn force_apply_onchain_equity(
+        self,
+        chain: Chain,
+        balances: &BTreeMap<Symbol, FractionalShares>,
+        fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
+        now: DateTime<Utc>,
+        reason: &Arc<InventoryViewError>,
+    ) -> Result<Self, InventoryViewError> {
+        balances
+            .iter()
+            .try_fold(self, |view, (symbol, snapshot_balance)| {
+                view.update_equity_at(
+                    symbol,
+                    chain,
+                    Inventory::force_on_snapshot(
+                        Venue::MarketMaking,
+                        *snapshot_balance,
+                        reason.clone(),
+                    ),
+                    now,
+                )
+            })
+            .map(|view| {
+                view.record_equity_snapshot_watermarks(
+                    Venue::MarketMaking,
+                    chain,
+                    balances.keys(),
+                    fetched_at,
+                )
+                .force_onchain_equity_block_watermarks(
+                    chain,
+                    balances.keys(),
+                    block_number,
+                )
+            })
+    }
+
     pub(crate) fn force_apply_snapshot_event(
         self,
         event: &InventorySnapshotEvent,
@@ -3036,37 +3084,14 @@ impl InventoryView {
                 balances,
                 fetched_at,
                 block_number,
-            } => balances
-                .iter()
-                .try_fold(self, |view, (symbol, snapshot_balance)| {
-                    view.update_equity_at(
-                        symbol,
-                        *chain,
-                        Inventory::force_on_snapshot(
-                            Venue::MarketMaking,
-                            *snapshot_balance,
-                            reason.clone(),
-                        ),
-                        now,
-                    )
-                })
-                .map(|view| {
-                    // The forced balance is authoritative, so the block
-                    // watermark must follow it exactly instead of retaining
-                    // a higher block whose fills this balance does not
-                    // contain.
-                    view.record_equity_snapshot_watermarks(
-                        Venue::MarketMaking,
-                        *chain,
-                        balances.keys(),
-                        *fetched_at,
-                    )
-                    .force_onchain_equity_block_watermarks(
-                        *chain,
-                        balances.keys(),
-                        *block_number,
-                    )
-                }),
+            } => self.force_apply_onchain_equity(
+                *chain,
+                balances,
+                *fetched_at,
+                *block_number,
+                now,
+                &reason,
+            ),
 
             OnchainUsdc {
                 chain,
@@ -6127,7 +6152,7 @@ mod tests {
 
         assert_eq!(rows.len(), 4);
         assert!(rows.contains(&PortfolioBalanceRow {
-            location: PortfolioLocation::MarketMaking,
+            location: PortfolioLocation::MarketMaking(Chain::Base),
             asset: PortfolioAsset::Equity(aapl.clone()),
             available: shares(100).into(),
             inflight: FractionalShares::ZERO.into(),
@@ -6139,7 +6164,7 @@ mod tests {
             inflight: FractionalShares::ZERO.into(),
         }));
         assert!(rows.contains(&PortfolioBalanceRow {
-            location: PortfolioLocation::MarketMaking,
+            location: PortfolioLocation::MarketMaking(Chain::Base),
             asset: PortfolioAsset::Usdc,
             available: Usdc::new(float!(10000)).into(),
             inflight: Usdc::ZERO.into(),
@@ -6164,7 +6189,7 @@ mod tests {
         let rows = view.to_portfolio_snapshot_rows().unwrap();
 
         assert!(rows.contains(&PortfolioBalanceRow {
-            location: PortfolioLocation::MarketMaking,
+            location: PortfolioLocation::MarketMaking(Chain::Base),
             asset: PortfolioAsset::Equity(aapl),
             available: FractionalShares::ZERO.into(),
             inflight: FractionalShares::ZERO.into(),
@@ -6192,7 +6217,10 @@ mod tests {
         let rows = view.to_portfolio_snapshot_rows().unwrap();
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].location, PortfolioLocation::MarketMaking);
+        assert_eq!(
+            rows[0].location,
+            PortfolioLocation::MarketMaking(Chain::Base)
+        );
         assert!(
             !rows
                 .iter()

@@ -115,6 +115,7 @@ impl PollFreshness {
 
 #[cfg(test)]
 mod tests {
+    use st0x_evm::Chain;
     use st0x_execution::Symbol;
 
     use super::*;
@@ -131,7 +132,7 @@ mod tests {
         let poll_freshness = PollFreshness::new();
 
         assert!(!poll_freshness.observed_since(
-            PortfolioLocation::MarketMaking,
+            PortfolioLocation::MarketMaking(Chain::Base),
             &PortfolioAsset::Usdc,
             DateTime::<Utc>::MIN_UTC
         ));
@@ -142,10 +143,13 @@ mod tests {
         let before = Utc::now();
         let poll_freshness = PollFreshness::new();
 
-        poll_freshness.observe(PortfolioLocation::MarketMaking, PortfolioAsset::Usdc);
+        poll_freshness.observe(
+            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioAsset::Usdc,
+        );
 
         assert!(poll_freshness.observed_since(
-            PortfolioLocation::MarketMaking,
+            PortfolioLocation::MarketMaking(Chain::Base),
             &PortfolioAsset::Usdc,
             before
         ));
@@ -158,12 +162,15 @@ mod tests {
     fn observed_since_returns_false_once_the_floor_moves_past_the_stored_timestamp() {
         let poll_freshness = PollFreshness::new();
 
-        poll_freshness.observe(PortfolioLocation::MarketMaking, PortfolioAsset::Usdc);
+        poll_freshness.observe(
+            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioAsset::Usdc,
+        );
 
         let floor_in_the_future = Utc::now() + chrono::Duration::hours(1);
         assert!(
             !poll_freshness.observed_since(
-                PortfolioLocation::MarketMaking,
+                PortfolioLocation::MarketMaking(Chain::Base),
                 &PortfolioAsset::Usdc,
                 floor_in_the_future
             ),
@@ -175,7 +182,10 @@ mod tests {
     fn observing_one_location_does_not_mark_a_different_location_for_the_same_asset() {
         let poll_freshness = PollFreshness::new();
 
-        poll_freshness.observe(PortfolioLocation::MarketMaking, PortfolioAsset::Usdc);
+        poll_freshness.observe(
+            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioAsset::Usdc,
+        );
 
         assert!(!poll_freshness.observed_since(
             PortfolioLocation::Hedging,

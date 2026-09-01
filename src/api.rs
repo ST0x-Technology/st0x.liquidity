@@ -1821,7 +1821,7 @@ mod tests {
         )
         .bind("2026-05-15")
         .bind("2026-05-15T04:05:00+00:00")
-        .bind("market_making")
+        .bind("market_making:base")
         .bind("USDC")
         .bind("not-a-float")
         .bind("0")
@@ -2817,7 +2817,7 @@ mod tests {
     ) -> PortfolioBalanceRowWithMark {
         PortfolioBalanceRowWithMark {
             row: PortfolioBalanceRow {
-                location: PortfolioLocation::MarketMaking,
+                location: PortfolioLocation::MarketMaking(Chain::Base),
                 asset: PortfolioAsset::Usdc,
                 available: float!(&amount.to_string()),
                 inflight: float!(0),
