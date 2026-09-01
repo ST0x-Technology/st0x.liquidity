@@ -362,14 +362,15 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
                     .unwrap_or_else(|_| "?".to_string())
             });
 
-            // Extended hours lives under `Enabled` only. Config validation
-            // rejects `extended_hours_counter_trading = enabled` with
+            // The session flags live under `Enabled` only. Config validation
+            // rejects either session flag being enabled with
             // `trading = disabled`, so a disabled asset never carries a live
-            // extended-hours flag -- this maps valid config, it does not
-            // coerce a contradictory pair.
+            // extended-hours or overnight flag -- this maps valid config, it
+            // does not coerce a contradictory pair.
             let counter_trading = match config.trading {
                 OperationMode::Enabled => st0x_dto::CounterTrading::Enabled {
                     extended_hours: config.extended_hours_counter_trading == OperationMode::Enabled,
+                    overnight: config.overnight_counter_trading == OperationMode::Enabled,
                 },
                 OperationMode::Disabled => st0x_dto::CounterTrading::Disabled,
             };
@@ -674,10 +675,50 @@ mod tests {
         assert!(matches!(
             asset.counter_trading,
             st0x_dto::CounterTrading::Enabled {
-                extended_hours: true
+                extended_hours: true,
+                overnight: false
             }
         ));
         assert!(!asset.rebalancing);
+    }
+
+    #[test]
+    fn settings_from_ctx_maps_the_overnight_flag_independently() {
+        // Overnight enabled with extended hours disabled is a valid
+        // config; the settings endpoint must carry both flags exactly.
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        let symbol = st0x_finance::Symbol::new("RKLB").unwrap();
+        ctx.assets.equities.symbols.insert(
+            symbol.clone(),
+            EquityAssetConfig {
+                tokenized_equity: address!("0x1111111111111111111111111111111111111111"),
+                tokenized_equity_derivative: address!("0x2222222222222222222222222222222222222222"),
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
+                overnight_counter_trading: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+
+        let settings = settings_from_ctx(&ctx);
+        let asset = settings
+            .assets
+            .iter()
+            .find(|asset| asset.symbol == symbol)
+            .expect("RKLB settings should be present");
+
+        assert!(matches!(
+            asset.counter_trading,
+            st0x_dto::CounterTrading::Enabled {
+                extended_hours: false,
+                overnight: true
+            }
+        ));
     }
 
     #[test]
