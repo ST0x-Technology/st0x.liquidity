@@ -11983,6 +11983,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let order_id = OffchainOrderId::new();
         let order = OffchainOrder::Cancelled {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares: Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap(),
             requested_shares: Some(
@@ -12016,6 +12017,7 @@ mod tests {
         let order_id = OffchainOrderId::new();
         let broker_cancelled_at = Utc::now();
         let order = OffchainOrder::Cancelled {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares: Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap(),
             requested_shares: Some(
@@ -12168,6 +12170,7 @@ mod tests {
         let offchain_order_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
 
         let cancelled = OffchainOrder::Cancelled {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares,
             requested_shares: Some(shares),
@@ -12657,6 +12660,7 @@ mod tests {
         // here is unexpected. Dispatch must surface a retryable error rather than
         // clear the claim -- it must not fail an order that has already filled.
         let filled_state = OffchainOrder::Filled {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares,
             direction: Direction::Sell,
@@ -12712,6 +12716,7 @@ mod tests {
         let offchain_order_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
 
         let failed_state = OffchainOrder::Failed {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares,
             requested_shares: None,
@@ -12769,6 +12774,7 @@ mod tests {
         let offchain_order_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
 
         let failed_state = OffchainOrder::Failed {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares,
             requested_shares: None,
@@ -13230,6 +13236,7 @@ mod tests {
         let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
         let offchain_order_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
         let cancelled_partial = OffchainOrder::Cancelled {
+            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares,
             requested_shares: Some(shares),

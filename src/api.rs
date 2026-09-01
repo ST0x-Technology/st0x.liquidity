@@ -98,6 +98,10 @@ struct PendingOrderResponse {
     submitted_at: Option<String>,
     shares_filled: Option<String>,
     avg_price: Option<String>,
+    /// The exact session the order was recorded in
+    /// (`Regular`/`Extended`/`Overnight`/`Closed`), so the dashboard can
+    /// identify overnight orders separately.
+    market_session: String,
 }
 
 /// Where the stranded equity physically sits for a failed transfer.
@@ -652,8 +656,24 @@ fn parse_pending_order(
         submitted_at: inner["submitted_at"].as_str().map(String::from),
         shares_filled: inner["shares_filled"].as_str().map(String::from),
         avg_price: inner["avg_price"].as_str().map(String::from),
+        market_session: pending_order_market_session(inner),
         status,
     })
+}
+
+/// Reads the order's recorded session from a view payload. Rows written
+/// before the session field carried only `is_extended_hours`; map that
+/// bool the same way aggregate replay does, and default the oldest
+/// no-key rows to `Regular`.
+fn pending_order_market_session(inner: &serde_json::Value) -> String {
+    if let Some(session) = inner["market_session"].as_str() {
+        return session.to_string();
+    }
+
+    match inner["is_extended_hours"].as_bool() {
+        Some(true) => "Extended".to_string(),
+        Some(false) | None => "Regular".to_string(),
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -2066,7 +2086,7 @@ mod tests {
         // The cancel-and-replace flow introduced the non-terminal `Cancelling`
         // state; the /orders/pending endpoint must surface it like any other
         // live order rather than dropping it on the floor.
-        let payload = r#"{"Live":{"Cancelling":{"symbol":"AAPL","direction":"Sell","shares":"1.5","executor":"DryRun","placed_at":"2026-01-01T00:00:00Z","submitted_at":"2026-01-01T00:00:01Z","shares_filled":"0.5","avg_price":"195.25"}}}"#;
+        let payload = r#"{"Live":{"Cancelling":{"symbol":"AAPL","direction":"Sell","shares":"1.5","executor":"DryRun","placed_at":"2026-01-01T00:00:00Z","submitted_at":"2026-01-01T00:00:01Z","shares_filled":"0.5","avg_price":"195.25","market_session":"Overnight"}}}"#;
 
         let parsed = parse_pending_order("order-1".to_string(), "Cancelling".to_string(), payload)
             .expect("Cancelling order should parse");
@@ -2081,6 +2101,32 @@ mod tests {
         assert_eq!(parsed.submitted_at.as_deref(), Some("2026-01-01T00:00:01Z"));
         assert_eq!(parsed.shares_filled.as_deref(), Some("0.5"));
         assert_eq!(parsed.avg_price.as_deref(), Some("195.25"));
+        assert_eq!(parsed.market_session, "Overnight");
+    }
+
+    #[test]
+    fn parse_pending_order_maps_legacy_session_encodings() {
+        // View rows written before the session field carried only the
+        // extended-hours bool, or nothing at all; both must map to the
+        // session they meant rather than dropping the row.
+        for (session_fragment, expected) in [
+            (r#","is_extended_hours":true"#, "Extended"),
+            (r#","is_extended_hours":false"#, "Regular"),
+            ("", "Regular"),
+        ] {
+            let payload = format!(
+                r#"{{"Live":{{"Submitted":{{"symbol":"AAPL","direction":"Buy","shares":"1","executor":"DryRun","placed_at":"2026-01-01T00:00:00Z","submitted_at":"2026-01-01T00:00:01Z"{session_fragment}}}}}}}"#
+            );
+
+            let parsed =
+                parse_pending_order("order-2".to_string(), "Submitted".to_string(), &payload)
+                    .expect("Submitted order should parse");
+
+            assert_eq!(
+                parsed.market_session, expected,
+                "fragment {session_fragment:?} must map to {expected}"
+            );
+        }
     }
 
     #[tokio::test]

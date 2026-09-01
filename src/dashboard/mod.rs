@@ -498,6 +498,7 @@ mod tests {
 
     fn dummy_fill(symbol: &str) -> Statement {
         Statement::TradeUpdate(Trade {
+            market_session: None,
             id: format!("test-fill-{symbol}"),
             occurred_at: chrono::Utc::now(),
             venue: TradingVenue::Raindex,
@@ -536,6 +537,7 @@ mod tests {
     #[test]
     fn cancelled_outcomes_require_v2_or_newer() {
         let trade = Trade {
+            market_session: None,
             id: "cancelled-order".to_string(),
             occurred_at: chrono::Utc::now(),
             venue: TradingVenue::Alpaca,
@@ -570,6 +572,7 @@ mod tests {
     #[test]
     fn adapter_venues_are_exposed_only_by_v3() {
         let trade = Trade {
+            market_session: None,
             id: "0xadapter:1".to_string(),
             occurred_at: chrono::Utc::now(),
             venue: TradingVenue::Bebop,
@@ -962,6 +965,7 @@ mod tests {
         assert_eq!(trade["outcome"]["excessShares"], serde_json::Value::Null);
 
         let live_trade = Trade {
+            market_session: None,
             id: "live-fill".to_string(),
             occurred_at: chrono::Utc::now(),
             venue: TradingVenue::Raindex,
@@ -994,6 +998,7 @@ mod tests {
         assert_eq!(v1_live_fill["data"]["outcome"]["status"], "filled");
 
         let failed_live_trade = Trade {
+            market_session: None,
             id: "live-failure".to_string(),
             occurred_at: chrono::Utc::now(),
             venue: TradingVenue::Alpaca,

@@ -860,7 +860,11 @@ where
             // are handled by finalize_terminal_pending_positions, and orders
             // already Cancelling are awaiting the poller's confirmation -- both
             // are skipped here, which is what makes the every-tick sweep
-            // idempotent.
+            // idempotent. Orders recorded with an Overnight session are
+            // deliberately skipped too: none can exist before the automated
+            // overnight placement path lands, and whether a live overnight
+            // limit at the regular open gets replaced is decided with that
+            // path, not defaulted here.
             match &order {
                 OffchainOrder::Submitted {
                     market_session: MarketSession::Extended,
@@ -1198,6 +1202,11 @@ fn extended_hours_reprice_timeout_for_order(
     }
 }
 
+/// Only Extended-session orders participate in the stale-limit reprice
+/// sweep. Orders recorded with an Overnight session return `None` on
+/// purpose: none can exist before the automated overnight placement path
+/// lands, and overnight repricing gets its own policy (indicative-quote
+/// staleness bounds) rather than inheriting the extended-hours timeout.
 fn live_extended_hours_order_placed_at(order: &OffchainOrder) -> Option<DateTime<Utc>> {
     match order {
         OffchainOrder::Submitted {

@@ -108,6 +108,7 @@ describe('legacy trade normalization', () => {
       direction: 'buy',
       symbol: 'SPCX',
       shares: '1.5',
+      marketSession: null,
       outcome: { status: 'filled' }
     })
   })
@@ -120,6 +121,7 @@ describe('legacy trade normalization', () => {
       direction: 'sell',
       symbol: 'SPCX',
       shares: '2',
+      marketSession: null,
       outcome: { status: 'filled' }
     }
 
@@ -135,6 +137,7 @@ describe('live trade history', () => {
     direction: 'buy',
     symbol: 'AAPL',
     shares: '1',
+    marketSession: null,
     outcome: { status: 'filled' },
     ...overrides
   })

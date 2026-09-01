@@ -386,6 +386,18 @@ where
     }
 }
 
+/// Maps the execution-crate session onto the DTO wire enum at the
+/// dashboard boundary; the dto crate cannot depend on the execution
+/// crate, so the variants are mirrored rather than shared.
+fn dto_market_session(session: MarketSession) -> st0x_dto::MarketSession {
+    match session {
+        MarketSession::Regular => st0x_dto::MarketSession::Regular,
+        MarketSession::Extended => st0x_dto::MarketSession::Extended,
+        MarketSession::Overnight => st0x_dto::MarketSession::Overnight,
+        MarketSession::Closed => st0x_dto::MarketSession::Closed,
+    }
+}
+
 fn market_session_from_extended(is_extended_hours: bool) -> MarketSession {
     if is_extended_hours {
         MarketSession::Extended
@@ -561,6 +573,12 @@ pub enum OffchainOrder {
         placed_at: DateTime<Utc>,
         submitted_at: DateTime<Utc>,
         filled_at: DateTime<Utc>,
+        #[serde(
+            default = "regular_market_session",
+            alias = "is_extended_hours",
+            deserialize_with = "deserialize_market_session"
+        )]
+        market_session: MarketSession,
     },
     Failed {
         symbol: Symbol,
@@ -578,6 +596,12 @@ pub enum OffchainOrder {
         error: String,
         placed_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
+        #[serde(
+            default = "regular_market_session",
+            alias = "is_extended_hours",
+            deserialize_with = "deserialize_market_session"
+        )]
+        market_session: MarketSession,
     },
     /// Terminal state after a successful broker cancellation. Distinct
     /// from `Failed` so analytics and the cancel-and-replace recovery
@@ -603,6 +627,12 @@ pub enum OffchainOrder {
         reason: CancellationReason,
         placed_at: DateTime<Utc>,
         cancelled_at: DateTime<Utc>,
+        #[serde(
+            default = "regular_market_session",
+            alias = "is_extended_hours",
+            deserialize_with = "deserialize_market_session"
+        )]
+        market_session: MarketSession,
     },
 }
 
@@ -1258,6 +1288,7 @@ fn evolve_filled(
             executor_order_id,
             placed_at,
             submitted_at,
+            market_session,
             ..
         }
         | OffchainOrder::PartiallyFilled {
@@ -1268,6 +1299,7 @@ fn evolve_filled(
             executor_order_id,
             placed_at,
             submitted_at,
+            market_session,
             ..
         }
         | OffchainOrder::Cancelling {
@@ -1278,6 +1310,7 @@ fn evolve_filled(
             executor_order_id,
             placed_at,
             submitted_at,
+            market_session,
             ..
         } => Some(OffchainOrder::Filled {
             symbol: symbol.clone(),
@@ -1288,6 +1321,7 @@ fn evolve_filled(
             price,
             placed_at: *placed_at,
             submitted_at: *submitted_at,
+            market_session: *market_session,
             filled_at,
         }),
 
@@ -1471,6 +1505,7 @@ fn evolve_failed(
             direction,
             executor,
             placed_at,
+            market_session,
             ..
         } => Some(OffchainOrder::Failed {
             symbol: symbol.clone(),
@@ -1484,6 +1519,7 @@ fn evolve_failed(
             error,
             placed_at: *placed_at,
             failed_at,
+            market_session: *market_session,
         }),
         OffchainOrder::Submitted {
             symbol,
@@ -1493,6 +1529,7 @@ fn evolve_failed(
             executor,
             executor_order_id,
             placed_at,
+            market_session,
             ..
         } => Some(OffchainOrder::Failed {
             symbol: symbol.clone(),
@@ -1506,6 +1543,7 @@ fn evolve_failed(
             error,
             placed_at: *placed_at,
             failed_at,
+            market_session: *market_session,
         }),
         OffchainOrder::PartiallyFilled {
             symbol,
@@ -1518,6 +1556,7 @@ fn evolve_failed(
             avg_price,
             placed_at,
             partially_filled_at,
+            market_session,
             ..
         } => Some(OffchainOrder::Failed {
             symbol: symbol.clone(),
@@ -1538,6 +1577,7 @@ fn evolve_failed(
             error,
             placed_at: *placed_at,
             failed_at,
+            market_session: *market_session,
         }),
         OffchainOrder::Cancelling {
             symbol,
@@ -1548,6 +1588,7 @@ fn evolve_failed(
             executor,
             executor_order_id,
             placed_at,
+            market_session,
             ..
         } => Some(OffchainOrder::Failed {
             symbol: symbol.clone(),
@@ -1561,6 +1602,7 @@ fn evolve_failed(
             error,
             placed_at: *placed_at,
             failed_at,
+            market_session: *market_session,
         }),
         OffchainOrder::Filled { .. }
         | OffchainOrder::Failed { .. }
@@ -1583,6 +1625,7 @@ fn evolve_cancelled(
             executor,
             executor_order_id,
             placed_at,
+            market_session,
             ..
         } => Some(OffchainOrder::Cancelled {
             symbol: symbol.clone(),
@@ -1596,6 +1639,7 @@ fn evolve_cancelled(
             reason,
             placed_at: *placed_at,
             cancelled_at,
+            market_session: *market_session,
         }),
         OffchainOrder::PartiallyFilled {
             symbol,
@@ -1608,6 +1652,7 @@ fn evolve_cancelled(
             avg_price,
             placed_at,
             partially_filled_at,
+            market_session,
             ..
         } => Some(OffchainOrder::Cancelled {
             symbol: symbol.clone(),
@@ -1628,6 +1673,7 @@ fn evolve_cancelled(
             reason,
             placed_at: *placed_at,
             cancelled_at,
+            market_session: *market_session,
         }),
         OffchainOrder::Cancelling {
             symbol,
@@ -1639,6 +1685,7 @@ fn evolve_cancelled(
             executor_order_id,
             reason: requested_reason,
             placed_at,
+            market_session,
             ..
         } => Some(OffchainOrder::Cancelled {
             symbol: symbol.clone(),
@@ -1652,6 +1699,7 @@ fn evolve_cancelled(
             reason: *requested_reason,
             placed_at: *placed_at,
             cancelled_at,
+            market_session: *market_session,
         }),
         OffchainOrder::Pending { .. }
         | OffchainOrder::Filled { .. }
@@ -1800,13 +1848,15 @@ impl OffchainOrder {
         self,
         id: &OffchainOrderId,
     ) -> Result<Trade, TradeConversionError> {
-        let (symbol, shares, direction, executor, occurred_at, outcome) = match self {
+        let (symbol, shares, direction, executor, occurred_at, market_session, outcome) = match self
+        {
             Self::Filled {
                 symbol,
                 shares,
                 direction,
                 executor,
                 filled_at,
+                market_session,
                 ..
             } => (
                 symbol,
@@ -1814,6 +1864,7 @@ impl OffchainOrder {
                 direction,
                 executor,
                 filled_at,
+                market_session,
                 TradeOutcome::Filled,
             ),
             Self::Failed {
@@ -1826,6 +1877,7 @@ impl OffchainOrder {
                 filled_shares,
                 error,
                 failed_at,
+                market_session,
                 ..
             } => {
                 let quantities = terminal_quantity_provenance(
@@ -1841,6 +1893,7 @@ impl OffchainOrder {
                     direction,
                     executor,
                     failed_at,
+                    market_session,
                     TradeOutcome::Failed {
                         error,
                         accepted_shares: quantities.accepted,
@@ -1859,6 +1912,7 @@ impl OffchainOrder {
                 retained_fill,
                 filled_shares,
                 cancelled_at,
+                market_session,
                 ..
             } => {
                 let quantities = terminal_quantity_provenance(
@@ -1874,6 +1928,7 @@ impl OffchainOrder {
                     direction,
                     executor,
                     cancelled_at,
+                    market_session,
                     TradeOutcome::Cancelled {
                         accepted_shares: quantities.accepted,
                         filled_shares: quantities.filled,
@@ -1898,6 +1953,7 @@ impl OffchainOrder {
             direction,
             symbol,
             shares,
+            market_session: Some(dto_market_session(market_session)),
             outcome,
         })
     }
@@ -3671,6 +3727,97 @@ mod tests {
         }
     }
 
+    fn overnight_lifecycle_events() -> Vec<OffchainOrderEvent> {
+        vec![
+            OffchainOrderEvent::Placed {
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Buy,
+                executor: SupportedExecutor::DryRun,
+                placed_at: Utc::now(),
+                market_session: MarketSession::Overnight,
+                limit_price: None,
+                client_order_id: None,
+                close_flatten: false,
+            },
+            OffchainOrderEvent::Accepted {
+                executor_order_id: ExecutorOrderId::new("OVN-1"),
+                placed_shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                submitted_at: Utc::now(),
+                market_session: MarketSession::Overnight,
+                limit_price: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn filled_terminal_state_and_trade_carry_the_exact_session() {
+        let mut events = overnight_lifecycle_events();
+        events.push(OffchainOrderEvent::Filled {
+            price: Usd::new(float!(195.25)),
+            filled_at: Utc::now(),
+        });
+
+        let replayed = replay::<OffchainOrder>(events).unwrap().unwrap();
+        let OffchainOrder::Filled { market_session, .. } = &replayed else {
+            panic!("expected Filled, got {replayed:?}");
+        };
+        assert_eq!(*market_session, MarketSession::Overnight);
+
+        let trade = replayed.try_into_trade(&OffchainOrderId::new()).unwrap();
+        assert_eq!(
+            trade.market_session,
+            Some(st0x_dto::MarketSession::Overnight)
+        );
+    }
+
+    #[test]
+    fn failed_terminal_state_and_trade_carry_the_exact_session() {
+        // Failure straight from Pending: the session must survive even
+        // when the order never reached the broker.
+        let mut events = overnight_lifecycle_events();
+        events.truncate(1);
+        events.push(OffchainOrderEvent::Failed {
+            error: "broker rejected".to_string(),
+            filled_shares: None,
+            failed_at: Utc::now(),
+        });
+
+        let replayed = replay::<OffchainOrder>(events).unwrap().unwrap();
+        let OffchainOrder::Failed { market_session, .. } = &replayed else {
+            panic!("expected Failed, got {replayed:?}");
+        };
+        assert_eq!(*market_session, MarketSession::Overnight);
+
+        let trade = replayed.try_into_trade(&OffchainOrderId::new()).unwrap();
+        assert_eq!(
+            trade.market_session,
+            Some(st0x_dto::MarketSession::Overnight)
+        );
+    }
+
+    #[test]
+    fn cancelled_terminal_state_and_trade_carry_the_exact_session() {
+        let mut events = overnight_lifecycle_events();
+        events.push(OffchainOrderEvent::Cancelled {
+            reason: CancellationReason::MarketOpenReplacement,
+            filled_shares: None,
+            cancelled_at: Utc::now(),
+        });
+
+        let replayed = replay::<OffchainOrder>(events).unwrap().unwrap();
+        let OffchainOrder::Cancelled { market_session, .. } = &replayed else {
+            panic!("expected Cancelled, got {replayed:?}");
+        };
+        assert_eq!(*market_session, MarketSession::Overnight);
+
+        let trade = replayed.try_into_trade(&OffchainOrderId::new()).unwrap();
+        assert_eq!(
+            trade.market_session,
+            Some(st0x_dto::MarketSession::Overnight)
+        );
+    }
+
     #[test]
     fn placed_event_without_any_session_key_replays_as_regular() {
         // The oldest events predate both encodings entirely.
@@ -3695,6 +3842,7 @@ mod tests {
         let fill_time = "2026-01-05T14:30:00Z".parse::<DateTime<Utc>>().unwrap();
         let cancel_time = "2026-01-06T14:32:01Z".parse::<DateTime<Utc>>().unwrap();
         let order = OffchainOrder::Cancelled {
+            market_session: MarketSession::Regular,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
             requested_shares: Some(Positive::new(FractionalShares::new(float!(2))).unwrap()),
@@ -3735,6 +3883,7 @@ mod tests {
         let fill_time = "2026-01-05T14:30:00Z".parse::<DateTime<Utc>>().unwrap();
         let failure_time = "2026-01-06T14:32:01Z".parse::<DateTime<Utc>>().unwrap();
         let order = OffchainOrder::Failed {
+            market_session: MarketSession::Regular,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
             requested_shares: Some(Positive::new(FractionalShares::new(float!(2))).unwrap()),
@@ -3772,6 +3921,7 @@ mod tests {
         // this aggregate does not persist terminality, so it always preserves.
         let failure_time = "2026-01-06T14:32:01Z".parse::<DateTime<Utc>>().unwrap();
         let order = OffchainOrder::Failed {
+            market_session: MarketSession::Regular,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
             requested_shares: Some(Positive::new(FractionalShares::new(float!(1))).unwrap()),
@@ -3800,6 +3950,7 @@ mod tests {
     fn zero_fill_failed_without_executor_order_id_preserves_the_anchor() {
         let failure_time = "2026-01-06T14:32:01Z".parse::<DateTime<Utc>>().unwrap();
         let order = OffchainOrder::Failed {
+            market_session: MarketSession::Regular,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
             requested_shares: Some(Positive::new(FractionalShares::new(float!(1))).unwrap()),
@@ -3829,6 +3980,7 @@ mod tests {
         let fill_time = "2026-01-05T14:30:00Z".parse::<DateTime<Utc>>().unwrap();
         let failure_time = "2026-01-06T14:32:01Z".parse::<DateTime<Utc>>().unwrap();
         let order = OffchainOrder::Failed {
+            market_session: MarketSession::Regular,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1.5))).unwrap(),
             requested_shares: Some(Positive::new(FractionalShares::new(float!(2))).unwrap()),
@@ -3896,6 +4048,7 @@ mod tests {
     fn failed_trade_reports_retained_fill_larger_than_order_as_excess() {
         let failed_at = Utc::now();
         let order = OffchainOrder::Failed {
+            market_session: MarketSession::Regular,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
             requested_shares: Some(Positive::new(FractionalShares::new(float!(1))).unwrap()),
@@ -3950,6 +4103,7 @@ mod tests {
         let accepted = Positive::new(FractionalShares::new(float!(1.5))).unwrap();
         let requested = Positive::new(FractionalShares::new(float!(2))).unwrap();
         let order = OffchainOrder::Cancelled {
+            market_session: MarketSession::Regular,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: accepted,
             requested_shares: Some(requested),
@@ -3993,6 +4147,7 @@ mod tests {
     fn cancelled_trade_preserves_partial_fill_provenance() {
         let cancelled_at = Utc::now();
         let order = OffchainOrder::Cancelled {
+            market_session: MarketSession::Regular,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
             requested_shares: Some(Positive::new(FractionalShares::new(float!(1.25))).unwrap()),
@@ -4075,6 +4230,7 @@ mod tests {
     fn failed_trade_does_not_regress_earlier_cumulative_fill_evidence() {
         let failed_at = Utc::now();
         let order = OffchainOrder::Failed {
+            market_session: MarketSession::Regular,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
             requested_shares: Some(Positive::new(FractionalShares::new(float!(2))).unwrap()),

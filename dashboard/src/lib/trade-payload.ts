@@ -1,6 +1,7 @@
 import Decimal from 'decimal.js'
 import type { Direction } from '$lib/api/Direction'
 import type { LegacyTrade } from '$lib/api/LegacyTrade'
+import type { MarketSession } from '$lib/api/MarketSession'
 import type { Trade } from '$lib/api/Trade'
 import type { TradeOutcome } from '$lib/api/TradeOutcome'
 import type { TradingVenue } from '$lib/api/TradingVenue'
@@ -273,11 +274,24 @@ const parseCommonTradeFields = (trade: JsonRecord, path: string): CommonTradeFie
   shares: parseDecimal(trade['shares'], fieldPath(path, 'shares'), 'positive')
 })
 
+const MARKET_SESSIONS: readonly string[] = ['Regular', 'Extended', 'Overnight', 'Closed']
+
+// Absent on onchain fills and on rows serialized before the session was
+// recorded, so null and undefined both normalize to null.
+const parseMarketSession = (value: unknown, path: string): MarketSession | null => {
+  if (value === null || value === undefined) return null
+  if (typeof value === 'string' && MARKET_SESSIONS.includes(value)) {
+    return value as MarketSession
+  }
+  return invalid(path, 'a market session')
+}
+
 export const parseCanonicalTrade = (value: unknown, path = ''): Trade => {
   const trade = parseRecord(value, path === '' ? 'trade' : path)
   return {
     ...parseCommonTradeFields(trade, path),
     occurredAt: parseTimestamp(trade['occurredAt'], fieldPath(path, 'occurredAt')),
+    marketSession: parseMarketSession(trade['marketSession'], fieldPath(path, 'marketSession')),
     outcome: parseOutcome(trade['outcome'], fieldPath(path, 'outcome'))
   }
 }
