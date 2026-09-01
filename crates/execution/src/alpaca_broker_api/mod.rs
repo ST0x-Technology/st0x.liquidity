@@ -46,6 +46,7 @@ pub use mock_api::{
     TEST_API_SECRET, TransferDirection, TransferFlow, TransferStatus, WhitelistStatus,
 };
 mod order;
+mod overnight_eligibility;
 mod positions;
 
 /// Asset status from Alpaca Broker API (public because it's exposed in error types)
@@ -70,11 +71,18 @@ pub(crate) use client::AlpacaBrokerApiClient;
 
 // `AssetDetails` is the CLI's overnight/fractional asset-inspection surface.
 pub use executor::{AlpacaBrokerApi, AssetDetails};
+// The overnight eligibility gate: consumed by the CLI today and the
+// automated hedge path (RAI-1951) next.
 pub use journal::{JournalResponse, JournalStatus};
 pub use kms_jwt::{ALPACA_TOKEN_URL, AuthRuntime, KmsJwtError};
 pub use order::{
     AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, ConversionOrder, CryptoOrderOutcome,
     CryptoOrderResponse, ParseAlpacaLimitPriceError,
+};
+pub use overnight_eligibility::{
+    EligibilitySnapshot, EligibilitySnapshots, EligibilitySyncError, OvernightEligibilityError,
+    OvernightOrderShape, eligibility_sync_window_start, next_eligibility_sync_at, sync_eligibility,
+    validate_overnight_eligibility,
 };
 
 impl fmt::Display for CryptoOrderFailureReason {

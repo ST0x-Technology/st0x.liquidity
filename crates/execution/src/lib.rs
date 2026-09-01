@@ -29,7 +29,10 @@ pub use alpaca_broker_api::{ALPACA_TOKEN_URL, AuthRuntime, KmsJwtError};
 pub use alpaca_broker_api::{
     AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError,
     AlpacaBrokerApiMode, AlpacaBrokerAuth, AssetDetails, ConversionDirection, ConversionOrder,
-    CryptoOrderOutcome, DeadlineCancel, JournalResponse, JournalStatus, TimeInForce,
+    CryptoOrderOutcome, DeadlineCancel, EligibilitySnapshot, EligibilitySnapshots,
+    EligibilitySyncError, JournalResponse, JournalStatus, OvernightEligibilityError,
+    OvernightOrderShape, TimeInForce, eligibility_sync_window_start, next_eligibility_sync_at,
+    sync_eligibility, validate_overnight_eligibility,
 };
 // `AlpacaMarketDataError` is wrapped by `AlpacaBrokerApiError::LatestTrade`,
 // which delegates its own `backpressure()` classification straight to the

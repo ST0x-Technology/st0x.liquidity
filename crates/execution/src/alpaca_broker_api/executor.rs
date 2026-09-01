@@ -555,6 +555,32 @@ impl AlpacaBrokerApi {
             .map_err(|source| AlpacaBrokerApiError::LatestQuote(Box::new(source)))
     }
 
+    /// Fetches the symbol's asset attributes from the broker
+    /// unconditionally and replaces the cached entry, so the scheduled
+    /// eligibility sync freshens the same cache placement-side
+    /// validation reads instead of serving a pre-window TTL hit.
+    pub async fn refresh_asset_details(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<AssetDetails, AlpacaBrokerApiError> {
+        let response = self.client.get_asset(symbol).await?;
+        let cached = CachedAsset::from_response(&response);
+
+        {
+            let mut cache = self.asset_cache.write().await;
+            cache.insert(symbol.to_string(), cached.clone());
+        }
+
+        Ok(AssetDetails {
+            status: cached.status,
+            tradable: cached.tradable,
+            fractionable: cached.fractionable,
+            fractional_eh_enabled: cached.fractional_eh_enabled,
+            overnight_tradable: cached.overnight_tradable,
+            overnight_halted: cached.overnight_halted,
+        })
+    }
+
     async fn get_asset_cached(&self, symbol: &Symbol) -> Result<CachedAsset, AlpacaBrokerApiError> {
         let symbol_str = symbol.to_string();
 
