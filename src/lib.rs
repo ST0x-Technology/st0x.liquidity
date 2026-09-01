@@ -238,7 +238,7 @@ pub async fn run_bot_session_with_injector(
 /// One startup line per hedged equity with its effective
 /// counter-trading modes, so the enabled session surface is readable
 /// from the log without opening the config file. Sorted by symbol for
-/// stable output. Trading is effective when any watched chain lists
+/// stable output. Trading is effective when any hedged chain lists
 /// the symbol with trading enabled.
 fn log_effective_asset_modes(ctx: &Ctx) {
     let mut equities: Vec<_> = ctx.assets.equities.symbols.iter().collect();
@@ -246,7 +246,7 @@ fn log_effective_asset_modes(ctx: &Ctx) {
     for (symbol, policy) in equities {
         let trading = if ctx
             .chains
-            .watched()
+            .hedged()
             .any(|chain| chain.assets.is_trading_enabled(symbol))
         {
             st0x_config::OperationMode::Enabled

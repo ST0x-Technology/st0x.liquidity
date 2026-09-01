@@ -1,7 +1,7 @@
 use chrono::{NaiveDate, NaiveTime};
 use rain_math_float::Float;
 use rain_math_float::FloatError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use st0x_finance::UsdcConversionError;
 use st0x_float_serde::format_float_with_fallback;
 use std::fmt;
@@ -51,7 +51,7 @@ mod overnight_eligibility;
 mod positions;
 
 /// Asset status from Alpaca Broker API (public because it's exposed in error types)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AssetStatus {
     Active,
