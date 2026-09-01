@@ -3738,6 +3738,8 @@ mod tests {
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
+            overnight_max_quote_age: None,
+            overnight_slippage_bps: None,
         };
 
         // The trade_event payload is never accessed because process_queued_trade

@@ -3354,7 +3354,7 @@ mod tests {
     use serde_json::json;
 
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, TestStore, replay};
-    use st0x_execution::MockExecutor;
+    use st0x_execution::{AssetDetails, MockExecutor, alpaca_broker_api::AssetStatus};
     use st0x_float_macro::float;
 
     use super::*;
@@ -3976,6 +3976,536 @@ mod tests {
             panic!("expected Placed, got {replayed:?}");
         };
         assert_eq!(*market_session, MarketSession::Regular);
+    }
+
+    /// A fresh, fully-eligible snapshot, so the placement path's own
+    /// re-validation at the placement instant passes and the tests exercise
+    /// the lifecycle rather than the eligibility gate.
+    fn eligible_overnight_kind() -> CounterTradeOrderKind {
+        CounterTradeOrderKind::OvernightLimit {
+            limit_price: Positive::new(Usd::new(float!(195.25))).unwrap(),
+            snapshot: EligibilitySnapshot {
+                synced_at: Utc::now(),
+                details: AssetDetails {
+                    status: AssetStatus::Active,
+                    tradable: true,
+                    fractionable: Some(true),
+                    fractional_eh_enabled: Some(true),
+                    overnight_tradable: Some(true),
+                    overnight_halted: Some(false),
+                },
+            },
+        }
+    }
+
+    /// The overnight analogue of [`noop_order_placer`]: succeeds through
+    /// `place_overnight_order` with the same broker-truncation simulation, so
+    /// tests can verify the overnight path persists broker-accepted terms.
+    fn overnight_noop_order_placer() -> Arc<dyn OrderPlacer> {
+        struct OvernightNoop;
+
+        #[async_trait]
+        impl OrderPlacer for OvernightNoop {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("an overnight placement must never fall back to a market order")
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("an overnight placement must go through place_overnight_order")
+            }
+
+            async fn place_overnight_order(
+                &self,
+                order: LimitOrder,
+                _snapshot: Option<&EligibilitySnapshot>,
+                _now: DateTime<Utc>,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("noop-overnight"),
+                    placed_shares: noop_placed_shares(order.shares),
+                    is_extended_hours: true,
+                    limit_price: Some(order.limit_price),
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(CancellationOutcome::Requested)
+            }
+        }
+
+        Arc::new(OvernightNoop)
+    }
+
+    /// Drives an order to Submitted through the overnight kind, so the
+    /// lifecycle tests below prove the fill/failure machinery against an
+    /// order whose session is Overnight rather than the fixtures' default.
+    async fn place_and_submit_overnight(store: &TestStore<OffchainOrder>, id: &OffchainOrderId) {
+        let requested = Positive::new(FractionalShares::new(float!(100))).unwrap();
+        store
+            .send(
+                id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: requested,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    kind: eligible_overnight_kind(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: ExecutorOrderId::new("OVN-ACCEPT"),
+                    placed_shares: noop_placed_shares(requested),
+                    submitted_at: Utc::now(),
+                    is_extended_hours: true,
+                    limit_price: Some(Positive::new(Usd::new(float!(195.25))).unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn place_overnight_limit_at_broker_transitions_to_submitted() {
+        let placer = overnight_noop_order_placer();
+        let order = place_at_broker_with_kind(placer.as_ref(), eligible_overnight_kind()).await;
+
+        let Some(OffchainOrder::Submitted {
+            shares,
+            executor_order_id,
+            market_session,
+            ..
+        }) = order
+        else {
+            panic!("expected Submitted overnight limit order, got: {order:?}");
+        };
+        assert_eq!(executor_order_id, ExecutorOrderId::new("noop-overnight"));
+        assert_eq!(market_session, MarketSession::Overnight);
+        assert_eq!(
+            shares,
+            noop_placed_shares(Positive::new(FractionalShares::new(float!(100))).unwrap()),
+            "the overnight path must persist the broker-accepted quantity, not the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn place_overnight_limit_without_placer_support_fails_closed() {
+        // The plain noop placer never overrode the overnight methods, so the
+        // trait's fail-loud default fires. The placement must land terminal
+        // (releasing the position for a re-hedge), never hang or silently
+        // fall back to another order type.
+        let placer = noop_order_placer();
+        let order = place_at_broker_with_kind(placer.as_ref(), eligible_overnight_kind()).await;
+
+        assert!(
+            matches!(
+                &order,
+                Some(OffchainOrder::Failed { error, .. })
+                    if error.contains("does not support overnight")
+            ),
+            "expected Failed with the unsupported-placer error, got: {order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn place_overnight_limit_at_broker_with_overfill_records_acceptance() {
+        // Per ADR 0009 a broker over-fill is recorded as an acceptance
+        // carrying the actual broker-placed quantity, not a failure -- same
+        // contract as the market path, proven here through the overnight arm.
+        struct OvernightOverfill;
+
+        #[async_trait]
+        impl OrderPlacer for OvernightOverfill {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("an overnight placement must never fall back to a market order")
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("an overnight placement must go through place_overnight_order")
+            }
+
+            async fn place_overnight_order(
+                &self,
+                order: LimitOrder,
+                _snapshot: Option<&EligibilitySnapshot>,
+                _now: DateTime<Utc>,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                let original = order.shares.inner().inner();
+                let extra = st0x_float_macro::float!(1);
+                let overfilled = (original + extra).expect("addition should not fail");
+
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("OVN-OVERFILL"),
+                    placed_shares: Positive::new(FractionalShares::new(overfilled)).unwrap(),
+                    is_extended_hours: true,
+                    limit_price: Some(order.limit_price),
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(CancellationOutcome::Requested)
+            }
+        }
+
+        let order = place_at_broker_with_kind(&OvernightOverfill, eligible_overnight_kind()).await;
+
+        let Some(OffchainOrder::Submitted {
+            shares,
+            executor_order_id,
+            market_session,
+            ..
+        }) = order
+        else {
+            panic!("expected Submitted despite the over-fill, got: {order:?}");
+        };
+        assert_eq!(executor_order_id, ExecutorOrderId::new("OVN-OVERFILL"));
+        assert_eq!(market_session, MarketSession::Overnight);
+        assert_eq!(
+            shares,
+            Positive::new(FractionalShares::new(float!(101))).unwrap(),
+            "the over-filled broker quantity must be adopted, keeping the order poll-able"
+        );
+    }
+
+    /// The three forwarding facts the overnight placement arm owns: the
+    /// broker call carries the placement's own `client_order_id` (the
+    /// idempotency anchor apalis retries dedupe on), the kind's eligibility
+    /// snapshot travels to the executor verbatim (which re-proves the
+    /// fail-closed contract against it -- enforcement itself is pinned in
+    /// the execution crate), and `now` is the placement instant, not the
+    /// enqueue instant, so a job that sat queued is judged on current time.
+    #[tokio::test]
+    async fn overnight_placement_forwards_the_anchoring_id_and_kind_snapshot() {
+        type SeenPlacement = (LimitOrder, Option<EligibilitySnapshot>, DateTime<Utc>);
+
+        struct Recording {
+            seen: std::sync::Mutex<Option<SeenPlacement>>,
+        }
+
+        #[async_trait]
+        impl OrderPlacer for Recording {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("an overnight placement must never fall back to a market order")
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("an overnight placement must go through place_overnight_order")
+            }
+
+            async fn place_overnight_order(
+                &self,
+                order: LimitOrder,
+                snapshot: Option<&EligibilitySnapshot>,
+                now: DateTime<Utc>,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                let placed_shares = noop_placed_shares(order.shares);
+                let limit_price = order.limit_price;
+                *self.seen.lock().unwrap() = Some((order, snapshot.copied(), now));
+
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("OVN-RECORDED"),
+                    placed_shares,
+                    is_extended_hours: true,
+                    limit_price: Some(limit_price),
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(CancellationOutcome::Requested)
+            }
+        }
+
+        let pool = crate::test_utils::setup_test_db().await;
+        let (store, _) = StoreBuilder::<OffchainOrder>::new(pool)
+            .build(noop_order_placer())
+            .await
+            .unwrap();
+        let placer = Recording {
+            seen: std::sync::Mutex::new(None),
+        };
+        let client_order_id = ClientOrderId::from_uuid(Uuid::new_v4());
+        let kind = eligible_overnight_kind();
+        let CounterTradeOrderKind::OvernightLimit {
+            limit_price: kind_limit_price,
+            snapshot: kind_snapshot,
+        } = kind.clone()
+        else {
+            unreachable!("eligible_overnight_kind builds an OvernightLimit");
+        };
+
+        let before = Utc::now();
+        place_offchain_order_at_broker(
+            &store,
+            &placer,
+            &OffchainOrderId::new(),
+            OffchainOrderPlacement::with_kind(
+                Symbol::new("AAPL").unwrap(),
+                Positive::new(FractionalShares::new(float!(100))).unwrap(),
+                Direction::Buy,
+                SupportedExecutor::DryRun,
+                client_order_id.clone(),
+                kind,
+            ),
+        )
+        .await
+        .unwrap();
+        let after = Utc::now();
+
+        let (order, snapshot, now) = placer
+            .seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the overnight arm must reach place_overnight_order");
+        assert_eq!(
+            order.client_order_id, client_order_id,
+            "the broker call must carry the placement's idempotency anchor"
+        );
+        assert_eq!(order.limit_price, kind_limit_price);
+        assert!(order.extended_hours);
+        assert_eq!(
+            snapshot,
+            Some(kind_snapshot),
+            "the kind's eligibility snapshot must reach the executor verbatim"
+        );
+        assert!(
+            now >= before && now <= after,
+            "the eligibility re-check must be judged at the placement instant, \
+             got {now} outside [{before}, {after}]"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_partial_fill_regression_is_skipped() {
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let id = OffchainOrderId::new();
+        let latest_partially_filled_at = Utc::now();
+
+        place_and_submit_overnight(&store, &id).await;
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(75)),
+                    avg_price: Usd::new(float!(195.10)),
+                    partially_filled_at: latest_partially_filled_at,
+                },
+            )
+            .await
+            .unwrap();
+        // A regressed cumulative quantity (a stale broker observation) must
+        // not rewind the recorded fill, or the position would double-count
+        // the difference when the order finalizes.
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(50)),
+                    avg_price: Usd::new(float!(195.00)),
+                    partially_filled_at: latest_partially_filled_at + chrono::Duration::minutes(1),
+                },
+            )
+            .await
+            .unwrap();
+
+        let OffchainOrder::PartiallyFilled {
+            shares_filled,
+            avg_price,
+            market_session,
+            ..
+        } = store.load(&id).await.unwrap().unwrap()
+        else {
+            panic!("expected PartiallyFilled state");
+        };
+        assert_eq!(shares_filled, FractionalShares::new(float!(75)));
+        assert_eq!(avg_price, Usd::new(float!(195.10)));
+        assert_eq!(market_session, MarketSession::Overnight);
+    }
+
+    #[tokio::test]
+    async fn overnight_partial_fill_then_complete_finalizes_exactly_once() {
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let id = OffchainOrderId::new();
+
+        place_and_submit_overnight(&store, &id).await;
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(50)),
+                    avg_price: Usd::new(float!(195.10)),
+                    partially_filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::CompleteFill {
+                    price: Usd::new(float!(195.20)),
+                    filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let filled = store.load(&id).await.unwrap().unwrap();
+        let OffchainOrder::Filled { market_session, .. } = &filled else {
+            panic!("expected Filled, got {filled:?}");
+        };
+        assert_eq!(*market_session, MarketSession::Overnight);
+
+        // A duplicate terminal fill (a poll retry against the same broker
+        // state) must be refused, not applied a second time: the position
+        // finalization keyed off the Filled event happens exactly once.
+        let error = store
+            .send(
+                &id,
+                OffchainOrderCommand::CompleteFill {
+                    price: Usd::new(float!(195.20)),
+                    filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AggregateError::UserError(LifecycleError::Apply(OffchainOrderError::AlreadyCompleted))
+        ));
+    }
+
+    #[tokio::test]
+    async fn overnight_terminal_failure_retains_partial_fill_provenance() {
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let id = OffchainOrderId::new();
+        let broker_failed_at = Utc::now();
+
+        place_and_submit_overnight(&store, &id).await;
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(50)),
+                    avg_price: Usd::new(float!(195.10)),
+                    partially_filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkFailed {
+                    error: "broker rejected the remainder".to_string(),
+                    filled_shares: Some(FractionalShares::new(float!(50))),
+                    failed_at: broker_failed_at,
+                },
+            )
+            .await
+            .unwrap();
+
+        let failed = store.load(&id).await.unwrap().unwrap();
+        let OffchainOrder::Failed {
+            filled_shares,
+            market_session,
+            ..
+        } = &failed
+        else {
+            panic!("expected Failed, got {failed:?}");
+        };
+        assert_eq!(*filled_shares, Some(FractionalShares::new(float!(50))));
+        assert_eq!(
+            *market_session,
+            MarketSession::Overnight,
+            "the terminal failure must keep the session the accounting attributes the fill to"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_rejection_finalizes_the_order_exactly_once() {
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let id = OffchainOrderId::new();
+
+        place_and_submit_overnight(&store, &id).await;
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkFailed {
+                    error: "rejected: asset halted overnight".to_string(),
+                    filled_shares: None,
+                    failed_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        let failed = store.load(&id).await.unwrap().unwrap();
+        let OffchainOrder::Failed { market_session, .. } = &failed else {
+            panic!("expected Failed, got {failed:?}");
+        };
+        assert_eq!(*market_session, MarketSession::Overnight);
+
+        // A retried rejection job re-sends MarkFailed; the recorded failure
+        // must not be overwritten (which would churn failed_at and release
+        // the position a second time under a different timestamp).
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkFailed {
+                    error: "second observation of the same rejection".to_string(),
+                    filled_shares: None,
+                    failed_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            failed,
+            store.load(&id).await.unwrap().unwrap(),
+            "a duplicate rejection must leave the original terminal record untouched"
+        );
     }
 
     #[test]

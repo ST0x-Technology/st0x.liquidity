@@ -483,6 +483,11 @@ where
         poll_status_queue: poll_status_queue.clone(),
         hedge_queue: hedge_queue.clone(),
         poll_interval,
+        overnight_max_quote_age: context
+            .ctx
+            .overnight_max_quote_age_secs
+            .map(|secs| Duration::from_secs(secs.get())),
+        overnight_slippage_bps: context.ctx.overnight_slippage_bps,
     };
 
     let maintenance_interval = context.executor.maintenance_interval();
