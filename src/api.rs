@@ -10,6 +10,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::StatusCode;
+use axum::http::header::{CACHE_CONTROL, HeaderName};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -1265,7 +1266,13 @@ struct InterruptedTransfersResponse {
 
 async fn interrupted_transfers(
     State(state): State<AppState>,
-) -> Result<Json<InterruptedTransfersResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<
+    (
+        [(HeaderName, &'static str); 1],
+        Json<InterruptedTransfersResponse>,
+    ),
+    (StatusCode, Json<ErrorResponse>),
+> {
     let mints = crate::tokenized_equity_mint::interrupted_mint_ids(&state.pool)
         .await
         .map_err(|error| {
@@ -1290,10 +1297,13 @@ async fn interrupted_transfers(
             )
         })?;
 
-    Ok(Json(InterruptedTransfersResponse {
-        interrupted_mints: mints.into_iter().map(|id| id.to_string()).collect(),
-        interrupted_redemptions: redemptions.into_iter().map(|id| id.to_string()).collect(),
-    }))
+    Ok((
+        [(CACHE_CONTROL, "no-store")],
+        Json(InterruptedTransfersResponse {
+            interrupted_mints: mints.into_iter().map(|id| id.to_string()).collect(),
+            interrupted_redemptions: redemptions.into_iter().map(|id| id.to_string()).collect(),
+        }),
+    ))
 }
 
 /// Wire contract for `/transfers/resume`, shared with the CLI wrapper so the
@@ -4367,6 +4377,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store"
+        );
 
         let body = body_to_string(response).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4498,6 +4515,7 @@ mod tests {
         for (method, uri) in [
             ("GET", "/liquidity-read/transfers/interrupted"),
             ("POST", "/liquidity-write/transfers/recheck/equity_mint/x"),
+            ("POST", "/liquidity-write/transfers/resume"),
         ] {
             let response = app
                 .clone()
@@ -4529,6 +4547,7 @@ mod tests {
         for (method, uri) in [
             ("GET", "/liquidity-read/transfers/interrupted"),
             ("POST", "/liquidity-write/transfers/recheck/equity_mint/x"),
+            ("POST", "/liquidity-write/transfers/resume"),
         ] {
             let response = app
                 .clone()
