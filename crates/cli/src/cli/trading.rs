@@ -3,7 +3,6 @@
 use alloy::primitives::TxHash;
 use alloy::providers::Provider;
 use async_trait::async_trait;
-use chrono::Utc;
 use reqwest::StatusCode;
 use sqlx::SqlitePool;
 use std::io::Write;
@@ -16,10 +15,10 @@ use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::alpaca_broker_api::{AlpacaLimitOrder, AlpacaLimitPrice};
 use st0x_execution::{
-    ALPACA_MAX_DECIMAL_PLACES, AlpacaBrokerApi, AlpacaBrokerApiError, CancellationOutcome,
-    ClientOrderId, Direction, EligibilitySnapshot, Executor, ExecutorOrderId, FractionalShares,
-    LimitOrder, MarketOrder, MarketSession, MockExecutor, OrderFailureTerminality, OrderPlacement,
-    OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
+    ALPACA_MAX_DECIMAL_PLACES, AlpacaBrokerApiError, CancellationOutcome, ClientOrderId, Direction,
+    Executor, ExecutorOrderId, FractionalShares, MarketOrder, MarketSession, MockExecutor,
+    OrderFailureTerminality, OrderPlacement, OrderState, Positive, Symbol, TimeInForce,
+    TryIntoExecutor,
 };
 use st0x_float_serde::format_float_with_fallback;
 use st0x_hedge::operator::conductor::{
@@ -519,32 +518,6 @@ async fn execute_alpaca_limit_order<W: Write>(
     ctx: &Ctx,
     stdout: &mut W,
 ) -> anyhow::Result<OrderPlacement<String>> {
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
-
-    writeln!(stdout, "🔄 Executing Alpaca Broker API limit order...")?;
-
-    let broker = alpaca_auth.clone().try_into_executor().await?;
-
-    let session =
-        retry_on_backpressure(|| broker.market_session(), BACKPRESSURE_RETRY_MAX_ATTEMPTS).await?;
-
-    place_alpaca_limit_for_session(request, &broker, session, stdout).await
-}
-
-/// Places the limit order through the path the session demands.
-///
-/// During the overnight session the placement goes through the enforced
-/// overnight contract: a fresh asset-attribute fetch feeds the
-/// fail-closed eligibility gate, and [`OvernightLimitOrder`]
-/// construction proves the matrix, the 9-decimal bound, and
-/// `extended_hours = true` before any order HTTP. Every other session
-/// keeps the plain limit path.
-async fn place_alpaca_limit_for_session<W: Write>(
-    request: &CliOrderRequest,
-    broker: &AlpacaBrokerApi,
-    session: MarketSession,
-    stdout: &mut W,
-) -> anyhow::Result<OrderPlacement<String>> {
     let (limit_price, extended_hours) = match &request.kind {
         CliOrderKind::AlpacaLimit {
             limit_price,
@@ -555,72 +528,40 @@ async fn place_alpaca_limit_for_session<W: Write>(
         }
     };
 
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
+
+    writeln!(stdout, "🔄 Executing Alpaca Broker API limit order...")?;
+
+    let broker = alpaca_auth.clone().try_into_executor().await?;
+
+    let session =
+        retry_on_backpressure(|| broker.market_session(), BACKPRESSURE_RETRY_MAX_ATTEMPTS).await?;
     validate_order_kind_for_session(&request.kind, session)?;
+    if session == MarketSession::Overnight {
+        writeln!(
+            stdout,
+            "🌙 Overnight session: placing a limit day order with extended_hours=true"
+        )?;
+    }
 
     // Same reuse semantics as the market path: an operator-supplied key
     // makes a rerun adopt the accepted order instead of duplicating it.
     let client_order_id = ClientOrderId::cli(request.client_order_id.unwrap_or_else(Uuid::new_v4));
     writeln!(stdout, "   Client Order ID: {client_order_id}")?;
 
-    let placement = if session == MarketSession::Overnight {
-        writeln!(
-            stdout,
-            "🌙 Overnight session: placing a limit day order with extended_hours=true"
-        )?;
-
-        let details = retry_on_backpressure(
-            || broker.refresh_asset_details(&request.symbol),
-            BACKPRESSURE_RETRY_MAX_ATTEMPTS,
-        )
-        .await?;
-        // The CLI is a one-shot process with no scheduled 19:55 ET sync,
-        // so it hands the constructor a snapshot fetched this instant --
-        // inside the session's sync window by construction, while every
-        // fail-closed attribute check still applies.
-        let now = Utc::now();
-        let snapshot = EligibilitySnapshot {
-            symbol: request.symbol.clone(),
-            synced_at: now,
-            details,
-        };
-
-        // The trait impl constructs the validated overnight order
-        // internally (eligibility, fractional matrix, precision, forced
-        // extended_hours), so a refusal surfaces here as a typed error
-        // before any order HTTP.
-        let order = LimitOrder {
-            symbol: request.symbol.clone(),
-            shares: request.shares,
-            direction: request.direction,
-            limit_price: *limit_price.as_price(),
-            extended_hours: true,
-            client_order_id,
-        };
-        let placement = retry_on_backpressure(
-            || broker.place_overnight_order(order.clone(), Some(&snapshot), now),
-            BACKPRESSURE_RETRY_MAX_ATTEMPTS,
-        )
-        .await?;
-        writeln!(
-            stdout,
-            "   Overnight eligibility: verified from a fresh attribute fetch"
-        )?;
-        placement
-    } else {
-        let order = AlpacaLimitOrder {
-            symbol: request.symbol.clone(),
-            shares: request.shares,
-            direction: request.direction,
-            limit_price,
-            extended_hours,
-            client_order_id,
-        };
-        retry_on_backpressure(
-            || broker.place_alpaca_limit_order(order.clone()),
-            BACKPRESSURE_RETRY_MAX_ATTEMPTS,
-        )
-        .await?
+    let order = AlpacaLimitOrder {
+        symbol: request.symbol.clone(),
+        shares: request.shares,
+        direction: request.direction,
+        limit_price,
+        extended_hours,
+        client_order_id,
     };
+    let placement = retry_on_backpressure(
+        || broker.place_alpaca_limit_order(order.clone()),
+        BACKPRESSURE_RETRY_MAX_ATTEMPTS,
+    )
+    .await?;
 
     writeln!(
         stdout,
@@ -1414,12 +1355,11 @@ mod tests {
         LogLevel, OperationMode, TradingChain,
     };
     use st0x_evm::Chain;
-    use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_API_KEY, TEST_API_SECRET};
+    use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
     use st0x_execution::{
-        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaBrokerAuth,
-        CancellationOutcome, CounterTradePreflight, DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-        ExecutionError, InventoryResult, LimitOrder, OvernightEligibilityError,
-        OvernightOrderError, Positive, SupportedExecutor, Usd,
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, CancellationOutcome,
+        CounterTradePreflight, ExecutionError, InventoryResult, LimitOrder, Positive,
+        SupportedExecutor, Usd,
     };
     use st0x_hedge::operator::bindings::IRaindexV6::{ClearConfigV2, ClearV3};
     use st0x_hedge::operator::conductor::{
@@ -1704,144 +1644,6 @@ mod tests {
         .unwrap();
     }
 
-    async fn start_alpaca_mock() -> AlpacaBrokerMock {
-        AlpacaBrokerMock::start()
-            .symbol_fill_prices(vec![])
-            .symbol_positions(vec![])
-            .call()
-            .await
-    }
-
-    async fn alpaca_broker(mock: &AlpacaBrokerMock) -> AlpacaBrokerApi {
-        AlpacaBrokerApiCtx {
-            auth: AlpacaBrokerAuth::Basic {
-                api_key: TEST_API_KEY.to_string(),
-                api_secret: TEST_API_SECRET.to_string(),
-            },
-            account_id: TEST_ACCOUNT_ID,
-            mode: Some(AlpacaBrokerApiMode::Mock(mock.base_url())),
-            asset_cache_ttl: std::time::Duration::from_secs(3600),
-            time_in_force: TimeInForce::Day,
-            counter_trade_slippage_bps: DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-        }
-        .try_into_executor()
-        .await
-        .unwrap()
-    }
-
-    fn overnight_limit_request(shares: &str) -> CliOrderRequest {
-        CliOrderRequest {
-            symbol: Symbol::new("RKLB").unwrap(),
-            shares: positive_fractional(shares),
-            direction: Direction::Buy,
-            kind: CliOrderKind::AlpacaLimit {
-                limit_price: "24.10".parse::<AlpacaLimitPrice>().unwrap(),
-                extended_hours: true,
-            },
-            client_order_id: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn overnight_cli_limit_order_places_through_the_eligibility_gate() {
-        // The mock's default asset is fully overnight-eligible, so the
-        // fresh attribute fetch passes the fail-closed gate and the
-        // placement carries the contract's forced extended_hours.
-        let mock = start_alpaca_mock().await;
-        let broker = alpaca_broker(&mock).await;
-        let request = overnight_limit_request("0.5");
-        let mut stdout = Vec::new();
-
-        let placement = place_alpaca_limit_for_session(
-            &request,
-            &broker,
-            MarketSession::Overnight,
-            &mut stdout,
-        )
-        .await
-        .unwrap();
-
-        assert!(placement.extended_hours);
-        assert_eq!(mock.orders().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn overnight_cli_limit_order_fails_closed_on_a_halted_asset() {
-        // A halted asset must be refused before any order HTTP: the
-        // typed eligibility error surfaces and no placement reaches the
-        // broker.
-        let mock = start_alpaca_mock().await;
-        mock.set_asset_payload(
-            Symbol::new("RKLB").unwrap(),
-            json!({
-                "id": "00000000-0000-0000-0000-000000000000",
-                "symbol": "RKLB",
-                "status": "active",
-                "tradable": true,
-                "fractionable": true,
-                "attributes": [
-                    "fractional_eh_enabled",
-                    "overnight_tradable",
-                    "overnight_halted",
-                ],
-            }),
-        );
-        let broker = alpaca_broker(&mock).await;
-        let request = overnight_limit_request("0.5");
-        let mut stdout = Vec::new();
-
-        let error = place_alpaca_limit_for_session(
-            &request,
-            &broker,
-            MarketSession::Overnight,
-            &mut stdout,
-        )
-        .await
-        .unwrap_err();
-
-        let broker_error = error.downcast::<AlpacaBrokerApiError>().unwrap();
-        assert!(
-            matches!(
-                &broker_error,
-                AlpacaBrokerApiError::Overnight(OvernightOrderError::Ineligible(
-                    OvernightEligibilityError::OvernightHalted { .. }
-                ))
-            ),
-            "expected OvernightHalted through the trait chain, got {broker_error:?}"
-        );
-        assert!(mock.orders().is_empty());
-    }
-
-    #[tokio::test]
-    async fn overnight_cli_limit_order_rejects_an_over_precise_quantity() {
-        let mock = start_alpaca_mock().await;
-        let broker = alpaca_broker(&mock).await;
-        let request = overnight_limit_request("0.1234567891");
-        let mut stdout = Vec::new();
-
-        let error = place_alpaca_limit_for_session(
-            &request,
-            &broker,
-            MarketSession::Overnight,
-            &mut stdout,
-        )
-        .await
-        .unwrap_err();
-
-        let broker_error = error.downcast::<AlpacaBrokerApiError>().unwrap();
-        assert!(
-            matches!(
-                &broker_error,
-                AlpacaBrokerApiError::Overnight(OvernightOrderError::QuantityTooPrecise {
-                    max_decimal_places: 9,
-                    ..
-                })
-            ),
-            "expected QuantityTooPrecise through the trait chain, got {broker_error:?}"
-        );
-        assert!(mock.orders().is_empty());
-    }
-
     #[test]
     fn other_sessions_accept_every_order_kind() {
         for session in [
@@ -1979,10 +1781,10 @@ mod tests {
 
         async fn place_overnight_order(
             &self,
-            _order: st0x_execution::LimitOrder,
+            _order: LimitOrder,
             _snapshot: Option<&st0x_execution::EligibilitySnapshot>,
-            _now: chrono::DateTime<chrono::Utc>,
-        ) -> Result<st0x_execution::OrderPlacement<Self::OrderId>, Self::Error> {
+            _now: chrono::DateTime<Utc>,
+        ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
             unimplemented!("not exercised by this test")
         }
 
@@ -3127,11 +2929,11 @@ mod tests {
 
         async fn place_overnight_order(
             &self,
-            _order: st0x_execution::LimitOrder,
+            _order: LimitOrder,
             _snapshot: Option<&st0x_execution::EligibilitySnapshot>,
-            _now: chrono::DateTime<chrono::Utc>,
-        ) -> Result<st0x_execution::OrderPlacement<Self::OrderId>, Self::Error> {
-            unimplemented!("not exercised by this test")
+            _now: chrono::DateTime<Utc>,
+        ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+            unimplemented!("not exercised by the buy-fill backpressure tests")
         }
 
         async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
@@ -3846,7 +3648,6 @@ mod tests {
             .unwrap();
 
         let failed_order = OffchainOrder::Failed {
-            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares: positive_shares("1"),
             requested_shares: None,
@@ -3856,6 +3657,7 @@ mod tests {
             filled_shares: None,
             executor_order_id: None,
             error: "previous placement failed".to_string(),
+            market_session: st0x_execution::MarketSession::Regular,
             placed_at: block_timestamp,
             failed_at: block_timestamp,
         };
@@ -3936,7 +3738,6 @@ mod tests {
             .unwrap();
 
         let failed_order = OffchainOrder::Failed {
-            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares: positive_shares("1"),
             requested_shares: None,
@@ -3946,6 +3747,7 @@ mod tests {
             filled_shares: None,
             executor_order_id: Some(ExecutorOrderId::new("already-poll-failed")),
             error: "previous placement failed".to_string(),
+            market_session: st0x_execution::MarketSession::Regular,
             placed_at: block_timestamp,
             failed_at: block_timestamp,
         };
@@ -4174,7 +3976,6 @@ mod tests {
             .unwrap();
 
         let cancelled_order = OffchainOrder::Cancelled {
-            market_session: MarketSession::Regular,
             symbol: symbol.clone(),
             shares: positive_shares("1"),
             requested_shares: Some(positive_shares("1")),
@@ -4184,6 +3985,7 @@ mod tests {
             executor: SupportedExecutor::DryRun,
             executor_order_id: ExecutorOrderId::new("broker-order-id"),
             reason: CancellationReason::MarketOpenReplacement,
+            market_session: st0x_execution::MarketSession::Regular,
             placed_at: block_timestamp,
             cancelled_at: block_timestamp,
         };
