@@ -171,6 +171,7 @@ pub(crate) struct AppState {
     pub(crate) pnl_report_admission: dashboard::pnl::PnlReportAdmission,
     pub(crate) pnl_ledger: Arc<dashboard::pnl::PnlLedger>,
     pub(crate) metrics_handle: PrometheusHandle,
+    pub(crate) health: startup::HealthGate,
 }
 
 #[tracing::instrument(skip_all, target = "startup", level = tracing::Level::INFO)]
@@ -281,6 +282,7 @@ async fn run_bot_session_inner(
     // ingestion mutex instead of racing as separate ingesters.
     let pnl_ledger = Arc::new(dashboard::pnl::PnlLedger::new(pools.cqrs.clone()));
 
+    let health = startup::HealthGate::default();
     let state = AppState {
         ctx: ctx.clone(),
         pool: pools.cqrs.clone(),
@@ -293,6 +295,7 @@ async fn run_bot_session_inner(
         pnl_report_admission: dashboard::pnl::pnl_report_admission(),
         pnl_ledger: pnl_ledger.clone(),
         metrics_handle,
+        health: health.clone(),
     };
     let startup_barrier = startup::StartupBarrier::new();
     let equity_price_task = equity_price_monitor.map(|task| startup::StartupTask {
@@ -371,6 +374,7 @@ async fn run_bot_session_inner(
         &mut bot_task,
         &startup_barrier,
         startup_notifier.as_ref(),
+        &health,
         shutdown_signal.as_mut(),
     )
     .await?;
@@ -596,6 +600,7 @@ async fn report_when_started(
     bot_task: &mut JoinHandle<anyhow::Result<()>>,
     startup_barrier: &startup::StartupBarrier,
     startup_notifier: &dyn startup::StartupNotifier,
+    health_gate: &startup::HealthGate,
     shutdown_signal: impl Future<Output = ()>,
 ) -> anyhow::Result<StartupOutcome> {
     tokio::select! {
@@ -610,6 +615,7 @@ async fn report_when_started(
         () = startup_barrier.wait() => {}
     }
 
+    health_gate.set_ready();
     startup::report_ready(startup_notifier)?;
     Ok(StartupOutcome::Started)
 }
@@ -892,6 +898,7 @@ mod tests {
         let _pending_startup = barrier.token();
         let notifications = AtomicUsize::new(0);
         let notifier = RecordingStartupNotifier(&notifications);
+        let health_gate = startup::HealthGate::default();
         let mut bot_task = tokio::spawn(async { anyhow::bail!("startup failed") });
 
         let error = report_when_started(
@@ -899,6 +906,7 @@ mod tests {
             &mut bot_task,
             &barrier,
             &notifier,
+            &health_gate,
             std::future::pending(),
         )
         .await
@@ -906,6 +914,10 @@ mod tests {
 
         assert_eq!(error.to_string(), "startup failed");
         assert_eq!(notifications.load(Ordering::SeqCst), 0);
+        assert!(
+            !health_gate.is_ready(),
+            "a failed startup must not report healthy"
+        );
         shutdown_supervisor(&supervisor);
     }
 
@@ -916,6 +928,7 @@ mod tests {
         let _pending_startup = barrier.token();
         let notifications = AtomicUsize::new(0);
         let notifier = RecordingStartupNotifier(&notifications);
+        let health_gate = startup::HealthGate::default();
         let mut bot_task = tokio::spawn(async { Ok(()) });
 
         let error = report_when_started(
@@ -923,6 +936,7 @@ mod tests {
             &mut bot_task,
             &barrier,
             &notifier,
+            &health_gate,
             std::future::pending(),
         )
         .await
@@ -930,6 +944,10 @@ mod tests {
 
         assert_eq!(error.to_string(), "Bot exited before startup completed");
         assert_eq!(notifications.load(Ordering::SeqCst), 0);
+        assert!(
+            !health_gate.is_ready(),
+            "an early bot exit must not report healthy"
+        );
         shutdown_supervisor(&supervisor);
     }
 
@@ -951,6 +969,7 @@ mod tests {
         barrier.token().acknowledge();
         let notifications = AtomicUsize::new(0);
         let notifier = RecordingStartupNotifier(&notifications);
+        let health_gate = startup::HealthGate::default();
         let mut bot_task = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
 
         let outcome = report_when_started(
@@ -958,6 +977,7 @@ mod tests {
             &mut bot_task,
             &barrier,
             &notifier,
+            &health_gate,
             std::future::pending(),
         )
         .await
@@ -965,6 +985,10 @@ mod tests {
 
         assert_eq!(outcome, StartupOutcome::Started);
         assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        assert!(
+            health_gate.is_ready(),
+            "a completed startup must report healthy"
+        );
         bot_task.abort();
         shutdown_supervisor(&supervisor);
     }
@@ -976,6 +1000,7 @@ mod tests {
         let _pending_startup = barrier.token();
         let notifications = AtomicUsize::new(0);
         let notifier = RecordingStartupNotifier(&notifications);
+        let health_gate = startup::HealthGate::default();
         let mut bot_task = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
 
         let outcome = tokio::time::timeout(
@@ -985,6 +1010,7 @@ mod tests {
                 &mut bot_task,
                 &barrier,
                 &notifier,
+                &health_gate,
                 std::future::ready(()),
             ),
         )
@@ -994,6 +1020,10 @@ mod tests {
 
         assert_eq!(outcome, StartupOutcome::ShutdownSignal);
         assert_eq!(notifications.load(Ordering::SeqCst), 0);
+        assert!(
+            !health_gate.is_ready(),
+            "a pre-startup shutdown must not report healthy"
+        );
         bot_task.abort();
         shutdown_supervisor(&supervisor);
     }
