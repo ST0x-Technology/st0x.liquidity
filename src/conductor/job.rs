@@ -6,7 +6,7 @@
 //! it and calls [`Job::perform`] with the shared context.
 
 use apalis::layers::retry::backoff::Backoff;
-use apalis::prelude::{Attempt, Data, TaskBuilder, TaskSink};
+use apalis::prelude::{Attempt, Data, TaskBuilder, TaskId, TaskSink};
 use apalis_core::backend::TaskSinkError;
 use apalis_core::backend::poll_strategy::{BackoffConfig, IntervalStrategy, StrategyBuilder};
 use apalis_core::error::BoxDynError;
@@ -24,6 +24,8 @@ use tracing::{debug, error, warn};
 
 use st0x_execution::{AlpacaBrokerApiError, AlpacaWalletError, Backpressure, Permanence};
 use st0x_tokenization::{AlpacaTokenizationError, TokenizerError};
+
+use crate::alerts::Notifier;
 
 /// Deterministic exponential backoff for the apalis retry layer.
 /// Doubles the delay each attempt up to `max`, with no jitter (unnecessary
@@ -641,11 +643,12 @@ pub(crate) use build_supervised_worker;
 
 /// Builds a best-effort `Worker` for a `Job<Ctx>` impl.
 ///
-/// A terminal job failure is logged at `error!` level but does NOT trip the
-/// conductor-wide fail-stop, does NOT stop the worker, and does NOT install an
-/// Apalis circuit breaker. The circuit breaker can latch a single-concurrency
-/// worker idle after retries are exhausted because `poll_ready` returns
-/// `Pending` without scheduling a wakeup when the circuit is open.
+/// A terminal job failure is logged and alerts the operator but does NOT trip
+/// the conductor-wide fail-stop, does NOT stop the worker, and does NOT install
+/// an Apalis circuit breaker. The circuit breaker can latch a
+/// single-concurrency worker idle after retries are exhausted because
+/// `poll_ready` returns `Pending` without scheduling a wakeup when the circuit
+/// is open.
 ///
 /// Use for jobs whose exhausted item is a visible dead letter rather than a
 /// process-level fault, including equity transfers and background tokenization
@@ -656,7 +659,8 @@ macro_rules! build_best_effort_worker {
         ::<$ctx_type:ty, $job:ty>,
         $index:expr,
         $queue:expr,
-        $ctx:expr
+        $ctx:expr,
+        $notifier:expr
         $(, $failure_injector:expr)? $(,)?
     ) => {{
         use ::apalis::layers::WorkerBuilderExt;
@@ -685,7 +689,8 @@ macro_rules! build_best_effort_worker {
                 RetryPolicy::retries(3)
                     .with_backoff($crate::conductor::job::RETRY_BACKOFF.clone()),
             )
-            .on_event($crate::conductor::job::on_terminal_failure_log_only(
+            .on_event($crate::conductor::job::on_best_effort_terminal_failure(
+                $notifier,
                 <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_MSG,
             ))
             .build($crate::conductor::job::work::<$ctx_type, $job>)
@@ -748,6 +753,8 @@ pub enum JobKind {
 pub(crate) enum JobError {
     #[error("{label}: {source}")]
     Failed {
+        task_identity: TaskIdentity,
+        durably_terminal: bool,
         label: Label,
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -755,7 +762,47 @@ pub(crate) enum JobError {
 
     #[cfg(any(test, feature = "test-support"))]
     #[error("injected terminal job failure")]
-    Injected,
+    Injected {
+        task_identity: TaskIdentity,
+        durably_terminal: bool,
+    },
+}
+
+impl JobError {
+    fn task_identity(&self) -> &TaskIdentity {
+        match self {
+            Self::Failed { task_identity, .. } => task_identity,
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Injected { task_identity, .. } => task_identity,
+        }
+    }
+
+    fn is_durably_terminal(&self) -> bool {
+        match self {
+            Self::Failed {
+                durably_terminal, ..
+            } => *durably_terminal,
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Injected {
+                durably_terminal, ..
+            } => *durably_terminal,
+        }
+    }
+}
+
+/// Stable identity of the durable apalis row that produced a job error.
+///
+/// The backend's concrete ID remains behind the generic [`TaskId`] extractor;
+/// this newtype keeps alert deduplication tied to row identity rather than
+/// error text without leaking the SQLite backend's identifier type through the
+/// job abstraction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TaskIdentity(String);
+
+impl<IdType: fmt::Display> From<&TaskId<IdType>> for TaskIdentity {
+    fn from(task_id: &TaskId<IdType>) -> Self {
+        Self(task_id.to_string())
+    }
 }
 
 /// Allows e2e tests to force the next job of a specific kind to
@@ -897,6 +944,8 @@ impl FailureInjector {
         job: &J,
         ctx: &Ctx,
         attempt: usize,
+        task_identity: TaskIdentity,
+        durably_terminal: bool,
     ) -> Result<J::Output, JobError>
     where
         Ctx: Send + Sync + 'static,
@@ -904,11 +953,16 @@ impl FailureInjector {
         let label = job.label();
 
         if self.should_inject(kind, &label) {
-            return Err(JobError::Injected);
+            return Err(JobError::Injected {
+                task_identity,
+                durably_terminal,
+            });
         }
 
         log_processing(&label, attempt);
         job.perform(ctx).await.map_err(|source| JobError::Failed {
+            task_identity,
+            durably_terminal,
             label,
             source: Box::new(source),
         })
@@ -931,12 +985,23 @@ pub(crate) async fn work<Ctx, J>(
     injector: Data<FailureInjector>,
     kind: Data<JobKind>,
     attempt: Attempt,
+    sql_context: SqliteContext,
+    task_id: TaskId<impl fmt::Display + Clone + Send + Sync + 'static>,
 ) -> Result<J::Output, JobError>
 where
     Ctx: Send + Sync + 'static,
     J: Job<Ctx> + Sync,
 {
-    injector.perform(*kind, &job, &ctx, attempt.current()).await
+    injector
+        .perform(
+            *kind,
+            &job,
+            &ctx,
+            attempt.current(),
+            TaskIdentity::from(&task_id),
+            is_durably_terminal(&attempt, &sql_context),
+        )
+        .await
 }
 
 /// Generic apalis handler -- production build.
@@ -945,6 +1010,8 @@ pub(crate) async fn work<Ctx, J>(
     job: J,
     ctx: Data<Arc<Ctx>>,
     attempt: Attempt,
+    sql_context: SqliteContext,
+    task_id: TaskId<impl fmt::Display + Clone + Send + Sync + 'static>,
 ) -> Result<J::Output, JobError>
 where
     Ctx: Send + Sync + 'static,
@@ -953,9 +1020,23 @@ where
     let label = job.label();
     log_processing(&label, attempt.current());
     job.perform(&ctx).await.map_err(|source| JobError::Failed {
+        task_identity: TaskIdentity::from(&task_id),
+        durably_terminal: is_durably_terminal(&attempt, &sql_context),
         label,
         source: Box::new(source),
     })
+}
+
+fn is_durably_terminal(attempt: &Attempt, sql_context: &SqliteContext) -> bool {
+    let Ok(max_attempts) = usize::try_from(sql_context.max_attempts()) else {
+        error!(
+            max_attempts = sql_context.max_attempts(),
+            "Apalis job has an invalid negative maximum attempt count"
+        );
+        return false;
+    };
+
+    attempt.current() >= max_attempts
 }
 
 /// Worker name, static failure context, and the original apalis error for a
@@ -1063,23 +1144,77 @@ pub(crate) fn on_terminal_failure(
 }
 
 /// On-event handler for workers where terminal failure must not crash the
-/// conductor. Logs the error at `error!` level but does NOT call
-/// `failure_notify.notify_waiters()` and does NOT call `ctx.stop()`.
+/// conductor. Logs the error, sends one operator alert, but does NOT signal the
+/// supervised failure path or call `ctx.stop()`.
 /// Used for dead-lettering per-item workers (equity transfers and background
 /// tokenization recovery) where a persistently failing individual job should
 /// not bring down hedging and fill detection. See [`build_best_effort_worker!`]
 /// for why these workers do not install Apalis' circuit-breaker layer.
+/// Apalis can emit the same terminal error more than once; repeated copies are
+/// logged but collapsed to one operator alert using the durable task identity.
+/// Distinct dead letters therefore still alert independently even when their
+/// rendered errors are identical.
 ///
-/// Structural invariant: unlike [`on_terminal_failure`], this function takes
-/// no `Notify` argument and therefore can never call `notify_waiters()` or
-/// `ctx.stop()`, regardless of how it is called.
-pub(crate) fn on_terminal_failure_log_only(
+pub(crate) fn on_best_effort_terminal_failure(
+    notifier: Arc<dyn Notifier>,
     error_msg: &'static str,
 ) -> impl Fn(&WorkerContext, &Event) + Send + Sync + 'static {
+    let last_alerted_task = Arc::new(std::sync::Mutex::new(None::<TaskIdentity>));
+
     move |ctx, event| {
-        if let Event::Error(err) = event {
-            error!(%err, worker = %ctx.name(), "{error_msg}");
+        let Event::Error(err) = event else {
+            return;
+        };
+
+        let worker = ctx.name().clone();
+        error!(%err, worker = %worker, "{error_msg}");
+        let Some(job_error) = find_job_error(err.as_ref().as_ref()) else {
+            warn!(worker = %worker, "Terminal job error did not carry job metadata");
+            return;
+        };
+        if !job_error.is_durably_terminal() {
+            debug!(worker = %worker, "Job exhausted the in-memory retry policy but remains retryable in durable storage");
+            return;
         }
+        let task_identity = job_error.task_identity();
+        let mut last_task = match last_alerted_task.lock() {
+            Ok(last_task) => last_task,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if last_task.as_ref() == Some(task_identity) {
+            return;
+        }
+        *last_task = Some(task_identity.clone());
+        drop(last_task);
+
+        let message =
+            format!("st0x-hedge: {worker}: {error_msg}: {err}; worker and conductor will continue");
+        let notifier = Arc::clone(&notifier);
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                super::TERMINAL_FAILURE_ALERT_TIMEOUT,
+                notifier.notify(&message),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(notify_error)) => {
+                    warn!(?notify_error, worker = %worker, "Failed to deliver terminal job failure alert");
+                }
+                Err(_) => {
+                    warn!(worker = %worker, "Timed out delivering terminal job failure alert");
+                }
+            }
+        });
+    }
+}
+
+fn find_job_error<'a>(mut error: &'a (dyn std::error::Error + 'static)) -> Option<&'a JobError> {
+    loop {
+        if let Some(job_error) = error.downcast_ref::<JobError>() {
+            return Some(job_error);
+        }
+        error = error.source()?;
     }
 }
 
@@ -1090,7 +1225,51 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::alerts::CapturingNotifier;
     use crate::test_utils::setup_test_apalis_pool;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("wrapped terminal job error: {0}")]
+    struct WrappedJobError(#[source] JobError);
+
+    fn terminal_job_event(task_identity: &str) -> Event {
+        let error: BoxDynError = Box::new(WrappedJobError(JobError::Injected {
+            task_identity: TaskIdentity(task_identity.to_owned()),
+            durably_terminal: true,
+        }));
+
+        Event::Error(Arc::new(error))
+    }
+
+    #[tokio::test]
+    async fn best_effort_alerts_once_per_task_when_rendered_errors_match() {
+        let notifier = Arc::new(CapturingNotifier::default());
+        let handler =
+            on_best_effort_terminal_failure(notifier.clone(), "test best-effort terminal failure");
+        let ctx = WorkerContext::new::<TestJob>("test-best-effort-worker");
+        let first = terminal_job_event("first-task");
+        let second = terminal_job_event("second-task");
+
+        handler(&ctx, &first);
+        handler(&ctx, &first);
+        handler(&ctx, &second);
+        handler(&ctx, &second);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while notifier.messages().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("each distinct terminal task must alert");
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            2,
+            "duplicate events must collapse without collapsing distinct tasks: {messages:?}",
+        );
+        assert_eq!(messages[0], messages[1], "the rendered errors must match");
+    }
 
     #[derive(Debug, thiserror::Error)]
     #[error("intermediate wrapper: {0}")]
@@ -1659,6 +1838,39 @@ mod tests {
     #[error("test job deliberately failed")]
     struct TestJobError;
 
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct RecoverOnFifthAttemptJob;
+
+    struct RecoverOnFifthAttemptCtx {
+        attempts: AtomicUsize,
+        completed: Arc<tokio::sync::Notify>,
+    }
+
+    impl Job<RecoverOnFifthAttemptCtx> for RecoverOnFifthAttemptJob {
+        type Output = ();
+        type Error = TestJobError;
+
+        const WORKER_NAME: &'static str = "recover-on-fifth-attempt-worker";
+        const JOB_KIND: JobKind = JobKind::OrderFill;
+
+        fn label(&self) -> Label {
+            Label::new("recover-on-fifth-attempt")
+        }
+
+        async fn perform(
+            &self,
+            ctx: &RecoverOnFifthAttemptCtx,
+        ) -> Result<Self::Output, Self::Error> {
+            let attempt = ctx.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt < 5 {
+                return Err(TestJobError);
+            }
+
+            ctx.completed.notify_one();
+            Ok(())
+        }
+    }
+
     /// A job that fails after all retries must halt further processing --
     /// the worker must not pick up the next job with stale state.
     ///
@@ -2058,6 +2270,7 @@ mod tests {
                         index,
                         queue.clone(),
                         ctx.clone(),
+                        Arc::new(crate::alerts::LogNotifier),
                         FailureInjector::new(),
                     )
                 });
@@ -2091,6 +2304,74 @@ mod tests {
             1,
             "second job must complete even after the first job terminally fails;              a permissive circuit breaker must not latch idle on a single failure"
         );
+    }
+
+    #[tokio::test]
+    async fn best_effort_worker_does_not_alert_before_durable_terminality() {
+        let apalis_pool = setup_test_apalis_pool().await;
+        let mut queue: JobQueue<RecoverOnFifthAttemptJob> = JobQueue::new(&apalis_pool);
+        queue.push(RecoverOnFifthAttemptJob).await.unwrap();
+
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let ctx = Arc::new(RecoverOnFifthAttemptCtx {
+            attempts: AtomicUsize::new(0),
+            completed: completed.clone(),
+        });
+        let notifier = Arc::new(CapturingNotifier::default());
+        let monitor_handle = tokio::spawn({
+            let notifier = notifier.clone();
+            let monitor = Monitor::new()
+                .should_restart(|_ctx, _error, _attempt| false)
+                .register(move |index| {
+                    build_best_effort_worker!(
+                        ::<RecoverOnFifthAttemptCtx, RecoverOnFifthAttemptJob>,
+                        index,
+                        queue.clone(),
+                        ctx.clone(),
+                        notifier.clone(),
+                        FailureInjector::new(),
+                    )
+                });
+            async move { monitor.run().await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), completed.notified())
+            .await
+            .expect("the durable fifth attempt must be allowed to recover");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status = sqlx_apalis::query_scalar::<_, String>(
+                    "SELECT status FROM Jobs WHERE job_type = ?",
+                )
+                .bind(std::any::type_name::<RecoverOnFifthAttemptJob>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+                if status == Status::Done.to_string() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the successful fifth attempt must be acknowledged durably");
+
+        assert_eq!(
+            notifier.messages().len(),
+            0,
+            "retry-policy exhaustion before SQLite terminality must not page",
+        );
+        assert_eq!(
+            sqlx_apalis::query_scalar::<_, String>("SELECT status FROM Jobs WHERE job_type = ?",)
+                .bind(std::any::type_name::<RecoverOnFifthAttemptJob>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap(),
+            Status::Done.to_string(),
+            "the fifth attempt must complete instead of being treated as a dead letter",
+        );
+        monitor_handle.abort();
     }
 
     async fn insert_locked_job(

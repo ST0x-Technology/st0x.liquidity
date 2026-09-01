@@ -430,11 +430,9 @@ pub(crate) struct Conductor {
     cleanup_armed: bool,
 }
 
-/// Bounds how long `wait_for_completion` waits for the terminal-failure alert
-/// to send before proceeding with process exit. The fail-stop itself
-/// (non-zero exit, systemd restart) is the load-bearing recovery signal; this
-/// alert is a best-effort convenience on top and must never delay it by more
-/// than a few seconds.
+/// Bounds terminal-failure alert delivery for both supervised and best-effort
+/// workers. A notifier must never delay process exit or accumulate indefinitely
+/// while a best-effort worker continues.
 const TERMINAL_FAILURE_ALERT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Resets a transfer queue's orphaned `Running`/`Queued` rows back to `Pending`
