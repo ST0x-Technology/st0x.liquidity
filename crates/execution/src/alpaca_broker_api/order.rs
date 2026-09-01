@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use rain_math_float::Float;
+use rain_math_float::{Float, FloatError};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use st0x_float_macro::float;
@@ -10,13 +10,15 @@ use uuid::Uuid;
 
 use super::client::AlpacaBrokerApiClient;
 use super::{
-    AlpacaBrokerApiError, CryptoOrderFailureReason, DeadlineCancel, MissingOrderField, TimeInForce,
+    AlpacaBrokerApiError, CryptoOrderFailureReason, DeadlineCancel, EligibilitySnapshot,
+    MissingOrderField, OvernightEligibilityError, OvernightOrderShape, TimeInForce,
+    validate_overnight_eligibility,
 };
 use crate::{
-    CancellationOutcome, ClientOrderId, Direction, ExecutorOrderId, FractionalShares, MarketOrder,
-    OrderFailureTerminality, OrderPlacement, OrderStatus, OrderUpdate, Positive, Symbol, Usd, Usdc,
-    deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
-    serialize_float_as_string,
+    ALPACA_MAX_DECIMAL_PLACES, CancellationOutcome, ClientOrderId, Direction, ExecutorOrderId,
+    FractionalShares, MarketOrder, OrderFailureTerminality, OrderPlacement, OrderStatus,
+    OrderUpdate, Permanence, Positive, Symbol, Usd, Usdc, deserialize_float_from_number_or_string,
+    deserialize_option_float_from_number_or_string, serialize_float_as_string,
 };
 
 const ALPACA_CRYPTO_MAX_DECIMAL_PLACES: u8 = 6;
@@ -102,6 +104,118 @@ pub struct AlpacaLimitOrder {
     pub limit_price: AlpacaLimitPrice,
     pub extended_hours: bool,
     pub client_order_id: ClientOrderId,
+}
+
+/// A validated overnight placement: construction proves the whole
+/// overnight order contract, so an invalid overnight order is
+/// unrepresentable past this point.
+///
+/// The wrapped order always carries `extended_hours = true` and the
+/// limit path's hard-coded `day` time-in-force -- the only shape the
+/// overnight session accepts -- and construction has already passed the
+/// fail-closed eligibility gate, the fractional matrix, and the
+/// 9-decimal quantity bound (rejected, never truncated, per the
+/// sign-off sheet).
+#[derive(Debug, Clone)]
+pub struct OvernightLimitOrder {
+    order: AlpacaLimitOrder,
+}
+
+/// Why an overnight order refused to construct. Deterministic for the
+/// same inputs: every variant classifies [`Permanence::Permanent`], so
+/// callers defer instead of retrying the identical construction.
+#[derive(Debug, thiserror::Error)]
+pub enum OvernightOrderError {
+    #[error(transparent)]
+    Ineligible(#[from] OvernightEligibilityError),
+    #[error(
+        "quantity {shares} exceeds Alpaca's maximum of {max_decimal_places} decimal places; \
+         overnight orders reject over-precision instead of truncating"
+    )]
+    QuantityTooPrecise {
+        shares: Positive<FractionalShares>,
+        max_decimal_places: u8,
+    },
+    #[error("quantity arithmetic failed during overnight validation: {0}")]
+    Float(#[from] FloatError),
+}
+
+impl OvernightOrderError {
+    /// All construction failures are deterministic: eligibility,
+    /// precision, and arithmetic reject identically on an immediate
+    /// retry with the same inputs.
+    pub fn permanence(&self) -> Permanence {
+        match self {
+            Self::Ineligible(_) | Self::QuantityTooPrecise { .. } | Self::Float(_) => {
+                Permanence::Permanent
+            }
+        }
+    }
+}
+
+impl OvernightLimitOrder {
+    /// Validates and assembles an overnight placement.
+    ///
+    /// Validation order: fail-closed eligibility (including the
+    /// fractional matrix, with the order shape derived from whether
+    /// `shares` is whole) -> 9-decimal quantity bound. The eligibility
+    /// snapshot comes from the caller's store lookup; this constructor
+    /// never fetches.
+    pub fn new(
+        symbol: Symbol,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        limit_price: AlpacaLimitPrice,
+        client_order_id: ClientOrderId,
+        snapshot: Option<&EligibilitySnapshot>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, OvernightOrderError> {
+        let shape = if shares.inner().is_whole()? {
+            OvernightOrderShape::WholeShares
+        } else {
+            OvernightOrderShape::Fractional
+        };
+        validate_overnight_eligibility(&symbol, snapshot, shape, now)?;
+
+        let (_, lossless) = shares
+            .inner()
+            .inner()
+            .to_fixed_decimal_lossy(ALPACA_MAX_DECIMAL_PLACES)?;
+        if !lossless {
+            return Err(OvernightOrderError::QuantityTooPrecise {
+                shares,
+                max_decimal_places: ALPACA_MAX_DECIMAL_PLACES,
+            });
+        }
+
+        Ok(Self {
+            order: AlpacaLimitOrder {
+                symbol,
+                shares,
+                direction,
+                limit_price,
+                extended_hours: true,
+                client_order_id,
+            },
+        })
+    }
+}
+
+/// Places a validated overnight order through the shared limit-order
+/// machinery, duplicate `client_order_id` adoption included. The 9dp
+/// truncation inside is a proven no-op: construction already rejected
+/// over-precise quantities.
+///
+/// The broker does not echo a session, so the placement's
+/// overnight-ness is defined by construction: [`OvernightLimitOrder`]
+/// proves `extended_hours = true`, the `day` time-in-force, and the
+/// fail-closed eligibility checks.
+pub(crate) async fn place_overnight_order(
+    client: &AlpacaBrokerApiClient,
+    overnight: OvernightLimitOrder,
+) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
+    let OvernightLimitOrder { order } = overnight;
+    place_limit_order(client, order).await
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1296,8 +1410,186 @@ mod tests {
     use crate::alpaca_broker_api::auth::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
-    use crate::alpaca_broker_api::duplicate_client_order_id_body;
+    use crate::alpaca_broker_api::{AssetDetails, AssetStatus, duplicate_client_order_id_body};
     use st0x_float_macro::float;
+
+    fn overnight_shares(value: &str) -> Positive<FractionalShares> {
+        Positive::new(FractionalShares::new(
+            Float::parse(value.to_string()).unwrap(),
+        ))
+        .unwrap()
+    }
+
+    /// 21:00 EDT on 2026-08-28: inside an overnight session whose sync
+    /// window opened at 19:45 EDT (23:45 UTC).
+    fn overnight_now() -> DateTime<Utc> {
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 29, 1, 0, 0).unwrap()
+    }
+
+    /// A fully eligible snapshot from the session's own 19:55 ET sync.
+    fn eligible_overnight_snapshot() -> EligibilitySnapshot {
+        EligibilitySnapshot {
+            synced_at: chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 28, 23, 55, 0).unwrap(),
+            details: AssetDetails {
+                status: AssetStatus::Active,
+                tradable: true,
+                fractionable: Some(true),
+                fractional_eh_enabled: Some(true),
+                overnight_tradable: Some(true),
+                overnight_halted: Some(false),
+            },
+        }
+    }
+
+    fn overnight_order(
+        shares: &str,
+        snapshot: Option<&EligibilitySnapshot>,
+    ) -> Result<OvernightLimitOrder, OvernightOrderError> {
+        OvernightLimitOrder::new(
+            Symbol::new("RKLB").unwrap(),
+            overnight_shares(shares),
+            Direction::Buy,
+            "24.10".parse::<AlpacaLimitPrice>().unwrap(),
+            ClientOrderId::cli(uuid!("4d6d9f40-5434-4f77-89f6-7156e375b739")),
+            snapshot,
+            overnight_now(),
+        )
+    }
+
+    #[test]
+    fn overnight_order_constructs_for_an_eligible_whole_share_request() {
+        let snapshot = eligible_overnight_snapshot();
+
+        let order = overnight_order("5", Some(&snapshot)).unwrap();
+
+        // Possession of the value proves the contract: extended hours is
+        // forced on, the request's terms are preserved.
+        assert!(order.order.extended_hours);
+        assert_eq!(order.order.symbol, Symbol::new("RKLB").unwrap());
+        assert_eq!(order.order.shares, overnight_shares("5"));
+        assert_eq!(order.order.direction, Direction::Buy);
+    }
+
+    #[test]
+    fn overnight_order_constructs_for_an_eligible_fractional_request() {
+        let snapshot = eligible_overnight_snapshot();
+
+        let order = overnight_order("0.5", Some(&snapshot)).unwrap();
+
+        assert!(order.order.extended_hours);
+        assert_eq!(order.order.shares, overnight_shares("0.5"));
+    }
+
+    #[test]
+    fn overnight_order_refuses_without_a_snapshot() {
+        let error = overnight_order("5", None).unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                OvernightOrderError::Ineligible(OvernightEligibilityError::NoSnapshot { symbol })
+                    if *symbol == Symbol::new("RKLB").unwrap()
+            ),
+            "expected NoSnapshot, got {error:?}"
+        );
+        assert_eq!(error.permanence(), Permanence::Permanent);
+    }
+
+    #[test]
+    fn overnight_order_refuses_a_halted_asset() {
+        let mut snapshot = eligible_overnight_snapshot();
+        snapshot.details.overnight_halted = Some(true);
+
+        let error = overnight_order("5", Some(&snapshot)).unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                OvernightOrderError::Ineligible(OvernightEligibilityError::OvernightHalted { .. })
+            ),
+            "expected OvernightHalted, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn overnight_order_refuses_a_stale_snapshot() {
+        let mut snapshot = eligible_overnight_snapshot();
+        // Synced at 11:00 EDT, before the session's 19:45 window.
+        snapshot.synced_at =
+            chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 28, 15, 0, 0).unwrap();
+
+        let error = overnight_order("5", Some(&snapshot)).unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                OvernightOrderError::Ineligible(OvernightEligibilityError::StaleSnapshot { .. })
+            ),
+            "expected StaleSnapshot, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn overnight_order_applies_the_fractional_matrix_to_fractional_shares() {
+        let mut snapshot = eligible_overnight_snapshot();
+        snapshot.details.fractional_eh_enabled = Some(false);
+
+        let error = overnight_order("0.5", Some(&snapshot)).unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                OvernightOrderError::Ineligible(
+                    OvernightEligibilityError::FractionalNotEligible { .. }
+                )
+            ),
+            "expected FractionalNotEligible, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn overnight_order_allows_whole_shares_on_a_non_fractionable_asset() {
+        let mut snapshot = eligible_overnight_snapshot();
+        snapshot.details.fractionable = Some(false);
+        snapshot.details.fractional_eh_enabled = None;
+
+        overnight_order("5", Some(&snapshot)).unwrap();
+    }
+
+    #[test]
+    fn overnight_order_rejects_an_over_precise_quantity_instead_of_truncating() {
+        let snapshot = eligible_overnight_snapshot();
+
+        let error = overnight_order("0.1234567891", Some(&snapshot)).unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                OvernightOrderError::QuantityTooPrecise {
+                    max_decimal_places: 9,
+                    ..
+                }
+            ),
+            "expected QuantityTooPrecise, got {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "quantity 0.1234567891 exceeds Alpaca's maximum of 9 decimal places; overnight \
+             orders reject over-precision instead of truncating"
+        );
+        assert_eq!(error.permanence(), Permanence::Permanent);
+    }
+
+    #[test]
+    fn overnight_order_keeps_a_nine_decimal_quantity_exact() {
+        // Exactly at the bound: passes, and the quantity is preserved
+        // bit-for-bit rather than re-quantized.
+        let snapshot = eligible_overnight_snapshot();
+
+        let order = overnight_order("0.123456789", Some(&snapshot)).unwrap();
+
+        assert_eq!(order.order.shares, overnight_shares("0.123456789"));
+    }
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
