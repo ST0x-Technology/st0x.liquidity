@@ -144,11 +144,19 @@ pub fn resolve(env: Env) -> Result<Target> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_base_url, parse_timeout_secs};
+    //! Tests for URL and timeout validation and target resolution.
+    use serial_test::serial;
+
+    use super::{Env, parse_base_url, parse_timeout_secs, resolve};
 
     #[test]
     fn accepts_https_url_with_host() {
-        assert!(parse_base_url("T0_LIQUIDITY_STAGING", "https://liquidity.example.com").is_ok());
+        assert_eq!(
+            parse_base_url("T0_LIQUIDITY_STAGING", "https://liquidity.example.com")
+                .ok()
+                .map(|url| url.to_string()),
+            Some("https://liquidity.example.com/".to_owned())
+        );
     }
 
     #[test]
@@ -182,5 +190,65 @@ mod tests {
     #[test]
     fn rejects_non_numeric_timeout() {
         assert!(parse_timeout_secs("T", "abc").is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_fails_when_staging_request_timeout_is_missing() {
+        temp_env::with_vars(
+            [
+                ("T0_LIQUIDITY_STAGING_URL", Some("https://x.example.com")),
+                ("T0_LIQUIDITY_STAGING_CLIENT_ID", Some("cid")),
+                ("T0_LIQUIDITY_STAGING_CLIENT_SECRET", Some("secret")),
+                ("T0_LIQUIDITY_STAGING_REQUEST_TIMEOUT_SECS", None),
+                ("T0_LIQUIDITY_STAGING_CONNECT_TIMEOUT_SECS", Some("10")),
+            ],
+            || assert!(resolve(Env::Staging).is_err()),
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_fails_when_staging_connect_timeout_is_missing() {
+        temp_env::with_vars(
+            [
+                ("T0_LIQUIDITY_STAGING_URL", Some("https://x.example.com")),
+                ("T0_LIQUIDITY_STAGING_CLIENT_ID", Some("cid")),
+                ("T0_LIQUIDITY_STAGING_CLIENT_SECRET", Some("secret")),
+                ("T0_LIQUIDITY_STAGING_REQUEST_TIMEOUT_SECS", Some("30")),
+                ("T0_LIQUIDITY_STAGING_CONNECT_TIMEOUT_SECS", None),
+            ],
+            || assert!(resolve(Env::Staging).is_err()),
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_fails_when_production_request_timeout_is_missing() {
+        temp_env::with_vars(
+            [
+                ("T0_LIQUIDITY_PROD_URL", Some("https://x.example.com")),
+                ("T0_LIQUIDITY_PROD_READ_AUDIENCE", Some("read")),
+                ("T0_LIQUIDITY_PROD_WRITE_AUDIENCE", Some("write")),
+                ("T0_LIQUIDITY_PROD_REQUEST_TIMEOUT_SECS", None),
+                ("T0_LIQUIDITY_PROD_CONNECT_TIMEOUT_SECS", Some("10")),
+            ],
+            || assert!(resolve(Env::Production).is_err()),
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_fails_when_production_connect_timeout_is_missing() {
+        temp_env::with_vars(
+            [
+                ("T0_LIQUIDITY_PROD_URL", Some("https://x.example.com")),
+                ("T0_LIQUIDITY_PROD_READ_AUDIENCE", Some("read")),
+                ("T0_LIQUIDITY_PROD_WRITE_AUDIENCE", Some("write")),
+                ("T0_LIQUIDITY_PROD_REQUEST_TIMEOUT_SECS", Some("30")),
+                ("T0_LIQUIDITY_PROD_CONNECT_TIMEOUT_SECS", None),
+            ],
+            || assert!(resolve(Env::Production).is_err()),
+        );
     }
 }

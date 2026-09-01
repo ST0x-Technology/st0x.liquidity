@@ -236,6 +236,7 @@ pub(crate) fn encode_segment(segment: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for request routing, token attachment, and response classification.
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::{Receiver, channel};

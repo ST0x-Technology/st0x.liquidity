@@ -8,7 +8,7 @@ use std::io::Write;
 pub enum OutputError {
     /// The value could not be serialized to JSON.
     Encode(serde_json::Error),
-    /// Writing the rendered line to stdout failed.
+    /// Writing the rendered line to the output failed.
     Write(std::io::Error),
 }
 
@@ -32,12 +32,49 @@ impl std::error::Error for OutputError {
     }
 }
 
+/// Renders `value` to `writer` as a single compact line, then flushes. Split
+/// from `print` so write and flush failures are testable without stdout.
+fn write_json<W: Write>(writer: &mut W, value: &serde_json::Value) -> Result<(), OutputError> {
+    let rendered = serde_json::to_string(value).map_err(OutputError::Encode)?;
+    writeln!(writer, "{rendered}").map_err(OutputError::Write)?;
+    writer.flush().map_err(OutputError::Write)?;
+    Ok(())
+}
+
 /// Writes one JSON document to stdout as a single compact line, so output is
 /// stable and machine-readable.
 pub fn print(value: &serde_json::Value) -> Result<(), OutputError> {
-    let rendered = serde_json::to_string(value).map_err(OutputError::Encode)?;
-    let mut out = std::io::stdout().lock();
-    writeln!(out, "{rendered}").map_err(OutputError::Write)?;
-    out.flush().map_err(OutputError::Write)?;
-    Ok(())
+    write_json(&mut std::io::stdout().lock(), value)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for JSON rendering and output-write error propagation.
+    use super::{OutputError, write_json};
+
+    #[test]
+    fn writes_compact_json_with_a_trailing_newline() {
+        let mut buffer = Vec::new();
+        let result = write_json(&mut buffer, &serde_json::json!({ "a": 1, "b": [2, 3] }));
+        assert!(matches!(result, Ok(())));
+        assert_eq!(buffer, b"{\"a\":1,\"b\":[2,3]}\n");
+    }
+
+    struct FailWriter;
+
+    impl std::io::Write for FailWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("write refused"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("flush refused"))
+        }
+    }
+
+    #[test]
+    fn propagates_write_failures_as_output_error() {
+        let mut writer = FailWriter;
+        let result = write_json(&mut writer, &serde_json::json!({ "a": 1 }));
+        assert!(matches!(result, Err(OutputError::Write(_))));
+    }
 }

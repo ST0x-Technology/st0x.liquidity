@@ -94,19 +94,49 @@ const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 /// the client id IAP expects. A cached refresh token drives a silent refresh
 /// when present; otherwise a one-time browser sign-in (loopback + PKCE) runs
 /// and its refresh token is cached so later invocations stay silent.
-pub async fn desktop_id_token(client_id: &str, client_secret: &str) -> Result<String, AuthError> {
+pub async fn desktop_id_token(
+    client_id: &str,
+    client_secret: &str,
+    request_timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
+) -> Result<String, AuthError> {
+    let http = build_http(request_timeout, connect_timeout)?;
     if let Some(refresh_token) = load_refresh_token()
-        && let Ok(id_token) =
-            refresh_id_token(TOKEN_ENDPOINT, client_id, client_secret, &refresh_token).await
+        && let Ok(id_token) = refresh_id_token(
+            &http,
+            TOKEN_ENDPOINT,
+            client_id,
+            client_secret,
+            &refresh_token,
+        )
+        .await
     {
         return Ok(id_token);
     }
-    interactive_id_token(client_id, client_secret).await
+    interactive_id_token(&http, client_id, client_secret).await
+}
+
+/// Builds the HTTP client for the token exchanges, applying the caller's
+/// configured request and connect timeouts so a stalled endpoint cannot hang
+/// the sign-in.
+fn build_http(
+    request_timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
+) -> Result<reqwest::Client, AuthError> {
+    reqwest::Client::builder()
+        .timeout(request_timeout)
+        .connect_timeout(connect_timeout)
+        .build()
+        .map_err(|source| AuthError::Flow(format!("could not build the HTTP client: {source}")))
 }
 
 /// Runs the browser loopback + PKCE authorization once, exchanges the returned
 /// code for an ID token, and caches the refresh token for silent reuse.
-async fn interactive_id_token(client_id: &str, client_secret: &str) -> Result<String, AuthError> {
+async fn interactive_id_token(
+    http: &reqwest::Client,
+    client_id: &str,
+    client_secret: &str,
+) -> Result<String, AuthError> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|source| {
         AuthError::Flow(format!("could not open the sign-in listener: {source}"))
     })?;
@@ -143,6 +173,7 @@ async fn interactive_id_token(client_id: &str, client_secret: &str) -> Result<St
         .map_err(|source| AuthError::Flow(format!("the sign-in listener panicked: {source}")))??;
 
     let token = post_token(
+        http,
         TOKEN_ENDPOINT,
         &[
             ("grant_type", "authorization_code"),
@@ -166,12 +197,14 @@ async fn interactive_id_token(client_id: &str, client_secret: &str) -> Result<St
 
 /// Exchanges a cached refresh token for a fresh ID token, no browser needed.
 async fn refresh_id_token(
+    http: &reqwest::Client,
     endpoint: &str,
     client_id: &str,
     client_secret: &str,
     refresh_token: &str,
 ) -> Result<String, AuthError> {
     let token = post_token(
+        http,
         endpoint,
         &[
             ("grant_type", "refresh_token"),
@@ -185,8 +218,12 @@ async fn refresh_id_token(
 }
 
 /// POSTs a form to the Google token endpoint and returns the decoded JSON.
-async fn post_token(endpoint: &str, form: &[(&str, &str)]) -> Result<serde_json::Value, AuthError> {
-    let response = reqwest::Client::new()
+async fn post_token(
+    http: &reqwest::Client,
+    endpoint: &str,
+    form: &[(&str, &str)],
+) -> Result<serde_json::Value, AuthError> {
+    let response = http
         .post(endpoint)
         .form(form)
         .send()
@@ -349,6 +386,7 @@ fn store_refresh_token_at(path: &std::path::Path, refresh_token: &str) {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the desktop OAuth token flow and the refresh-token cache.
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
 
@@ -481,7 +519,10 @@ mod tests {
         let endpoint = token_server(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"id_token\":\"fresh\"}",
         )?;
-        let result = refresh_id_token(&endpoint, "cid", "secret", "rtok").await;
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+        let result = refresh_id_token(&http, &endpoint, "cid", "secret", "rtok").await;
         assert_eq!(result.ok(), Some("fresh".to_owned()));
         Ok(())
     }
@@ -490,8 +531,31 @@ mod tests {
     async fn refresh_fails_on_a_rejected_token_request() -> Result<(), Box<dyn std::error::Error>> {
         let endpoint =
             token_server("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\ninvalid_grant")?;
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
         assert!(matches!(
-            refresh_id_token(&endpoint, "cid", "secret", "rtok").await,
+            refresh_id_token(&http, &endpoint, "cid", "secret", "rtok").await,
+            Err(AuthError::Flow(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_times_out_on_a_stalled_endpoint() -> Result<(), Box<dyn std::error::Error>> {
+        // A listener that accepts the connection but never sends a response.
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        std::thread::spawn(move || {
+            let _accepted = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/token");
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(150))
+            .build()?;
+        assert!(matches!(
+            refresh_id_token(&http, &endpoint, "cid", "secret", "rtok").await,
             Err(AuthError::Flow(_))
         ));
         Ok(())

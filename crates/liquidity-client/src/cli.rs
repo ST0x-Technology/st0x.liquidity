@@ -130,7 +130,11 @@ fn parse_key_value(raw: &str) -> Result<(String, String), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_key_value;
+    //! Tests for CLI argument parsing and the key=value parameter parser.
+    use clap::Parser as _;
+
+    use super::{Cli, parse_key_value};
+    use crate::target::Env;
 
     #[test]
     fn parses_key_and_value() {
@@ -142,7 +146,10 @@ mod tests {
 
     #[test]
     fn rejects_empty_key() {
-        assert!(parse_key_value("=value").is_err());
+        assert_eq!(
+            parse_key_value("=value"),
+            Err("expected key=value, got `=value`".to_owned())
+        );
     }
 
     #[test]
@@ -155,21 +162,24 @@ mod tests {
 
     #[test]
     fn requires_explicit_env() {
-        use clap::Parser as _;
-        assert!(
-            super::Cli::try_parse_from(["st0x-liquidity-client", "read", "resource", "health"])
-                .is_err()
-        );
-        assert!(
-            super::Cli::try_parse_from([
-                "st0x-liquidity-client",
-                "--env",
-                "staging",
-                "read",
-                "resource",
-                "health",
-            ])
-            .is_ok()
-        );
+        match Cli::try_parse_from(["st0x-liquidity-client", "read", "resource", "health"]) {
+            Err(error) => {
+                assert_eq!(
+                    error.kind(),
+                    clap::error::ErrorKind::MissingRequiredArgument
+                );
+            }
+            Ok(_) => panic!("expected a missing --env error"),
+        }
+        let parsed = Cli::try_parse_from([
+            "st0x-liquidity-client",
+            "--env",
+            "staging",
+            "read",
+            "resource",
+            "health",
+        ])
+        .map(|cli| cli.env);
+        assert!(matches!(parsed, Ok(Env::Staging)));
     }
 }

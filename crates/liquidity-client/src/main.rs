@@ -111,12 +111,17 @@ async fn execute(cli: Cli) -> Result<(), Failure> {
             client_id,
             client_secret,
         } => {
-            let token = auth::desktop_id_token(&client_id, &client_secret)
-                .await
-                .map_err(|error| Failure::Api {
-                    error: error.into(),
-                    logging_url: logging_url.clone(),
-                })?;
+            let token = auth::desktop_id_token(
+                &client_id,
+                &client_secret,
+                target.request_timeout,
+                target.connect_timeout,
+            )
+            .await
+            .map_err(|error| Failure::Api {
+                error: error.into(),
+                logging_url: logging_url.clone(),
+            })?;
             let client = Client::new(
                 target.base_url,
                 StaticToken(token.clone()),
@@ -194,12 +199,13 @@ async fn dispatch<A: TokenSource + Sync>(
 
 #[cfg(test)]
 mod tests {
+    //! Tests for command dispatch and CLI-boundary error classification.
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::mpsc::{Receiver, channel};
     use std::time::Duration;
 
-    use super::dispatch;
+    use super::{ApiError, dispatch};
     use crate::auth::StaticToken;
     use crate::cli::{
         Command, Debug, Read, ReadResource, ResourceArgs, TradeEventsArgs, TransferEventsArgs,
@@ -235,6 +241,11 @@ mod tests {
         )?)
     }
 
+    /// The HTTP request line (method, target, version) of a captured request.
+    fn request_line(request: &str) -> &str {
+        request.lines().next().unwrap_or_default()
+    }
+
     /// Dispatches one command against the capture server and returns the raw
     /// request text so a test can assert its method and route.
     async fn request_for(command: Command) -> Result<String, Box<dyn std::error::Error>> {
@@ -251,9 +262,9 @@ mod tests {
             params: vec![],
         })))
         .await?;
-        assert!(
-            request.starts_with("GET /liquidity-read/health "),
-            "{request}"
+        assert_eq!(
+            request_line(&request),
+            "GET /liquidity-read/health HTTP/1.1"
         );
         Ok(())
     }
@@ -266,9 +277,9 @@ mod tests {
             params: vec![],
         })))
         .await?;
-        assert!(
-            request.starts_with("GET /liquidity-read/trades/raindex/abc/events "),
-            "{request}"
+        assert_eq!(
+            request_line(&request),
+            "GET /liquidity-read/trades/raindex/abc/events HTTP/1.1"
         );
         Ok(())
     }
@@ -281,9 +292,9 @@ mod tests {
             params: vec![],
         })))
         .await?;
-        assert!(
-            request.starts_with("GET /liquidity-read/transfers/mint/abc/events "),
-            "{request}"
+        assert_eq!(
+            request_line(&request),
+            "GET /liquidity-read/transfers/mint/abc/events HTTP/1.1"
         );
         Ok(())
     }
@@ -291,9 +302,9 @@ mod tests {
     #[tokio::test]
     async fn resume_posts_the_write_path() -> Result<(), Box<dyn std::error::Error>> {
         let request = request_for(Command::Debug(Debug::Resume)).await?;
-        assert!(
-            request.starts_with("POST /liquidity-write/transfers/resume "),
-            "{request}"
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/transfers/resume HTTP/1.1"
         );
         Ok(())
     }
@@ -305,10 +316,48 @@ mod tests {
             id: "abc".to_owned(),
         }))
         .await?;
-        assert!(
-            request.starts_with("POST /liquidity-write/transfers/recheck/mint/abc "),
-            "{request}"
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/transfers/recheck/mint/abc HTTP/1.1"
         );
         Ok(())
+    }
+
+    #[test]
+    fn exit_code_is_77_for_auth_and_access_denied() {
+        use crate::auth::AuthError;
+        use crate::transport::TransportError;
+
+        assert_eq!(
+            ApiError::Auth(AuthError::Flow("x".to_owned())).exit_code(),
+            77
+        );
+        assert_eq!(
+            ApiError::Transport(TransportError::Unauthorized("x".to_owned())).exit_code(),
+            77
+        );
+        assert_eq!(
+            ApiError::Transport(TransportError::Forbidden("x".to_owned())).exit_code(),
+            77
+        );
+        assert_eq!(
+            ApiError::Transport(TransportError::Auth(AuthError::Flow("x".to_owned()))).exit_code(),
+            77
+        );
+    }
+
+    #[test]
+    fn exit_code_is_1_for_other_failures() {
+        use crate::output::OutputError;
+        use crate::transport::TransportError;
+
+        assert_eq!(
+            ApiError::Transport(TransportError::Decode("x".to_owned())).exit_code(),
+            1
+        );
+        assert_eq!(
+            ApiError::Output(OutputError::Write(std::io::Error::other("x"))).exit_code(),
+            1
+        );
     }
 }
