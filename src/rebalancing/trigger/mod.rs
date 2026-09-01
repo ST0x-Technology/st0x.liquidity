@@ -25,6 +25,7 @@ use st0x_config::{ChainAssets, OperationMode};
 use st0x_event_sorcery::{
     AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, Store, deps,
 };
+use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Positive, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, Usdc};
 use st0x_tokenization::{IssuerRequestId, TokenizationRequestId};
@@ -597,6 +598,7 @@ pub(crate) struct RebalancingService {
 type EquityInventoryUpdate = Box<
     dyn FnOnce(
             Inventory<FractionalShares>,
+            Chain,
         ) -> Result<
             Inventory<FractionalShares>,
             crate::inventory::InventoryError<FractionalShares>,
@@ -1728,24 +1730,30 @@ impl RebalancingService {
 
         let updated = match &event {
             OnchainEquity {
+                chain,
                 balances,
                 block_number,
                 ..
             } => inventory.clone().apply_equity_snapshot(
                 Venue::MarketMaking,
+                *chain,
                 balances.iter(),
                 fetched_at,
                 *block_number,
                 now,
             ),
 
-            OffchainEquity { positions, .. } => inventory.clone().apply_equity_snapshot(
-                Venue::Hedging,
-                positions.iter(),
-                fetched_at,
-                None,
-                now,
-            ),
+            OffchainEquity { positions, .. } => {
+                let trading_chain = inventory.trading_chain();
+                inventory.clone().apply_equity_snapshot(
+                    Venue::Hedging,
+                    trading_chain,
+                    positions.iter(),
+                    fetched_at,
+                    None,
+                    now,
+                )
+            }
 
             // The reconcile arms validate busyness themselves under the
             // write lock, so the generic apply path is the correct route
@@ -2225,6 +2233,7 @@ impl Reactor for RebalancingService {
                 let timestamp = event.timestamp();
                 let (equity_update, usdc_update, offchain_order_id) = match &event {
                     OnChainOrderFilled {
+                        trade_id,
                         amount,
                         direction,
                         price_usdc,
@@ -2246,9 +2255,9 @@ impl Reactor for RebalancingService {
                         {
                             let mut inventory = self.inventory.write().await;
                             let apply_equity_leg = !inventory
-                                .onchain_fill_absorbed_by_equity_snapshot(&symbol, *block_number);
+                                .onchain_fill_absorbed_by_equity_snapshot(&symbol, trade_id.chain, *block_number);
                             let apply_usdc_leg =
-                                !inventory.onchain_fill_absorbed_by_usdc_snapshot(*block_number);
+                                !inventory.onchain_fill_absorbed_by_usdc_snapshot(trade_id.chain, *block_number);
 
                             if !apply_equity_leg || !apply_usdc_leg {
                                 info!(
@@ -2633,9 +2642,10 @@ impl RebalancingService {
         quantity: FractionalShares,
     ) -> EquityInventoryUpdate {
         let now = Utc::now();
-        Box::new(move |inventory| {
-            let cancelled = Inventory::transfer(venue, TransferOp::Cancel, quantity)(inventory)?;
-            Inventory::with_last_rebalancing(now)(cancelled)
+        Box::new(move |inventory, chain| {
+            let cancelled =
+                Inventory::transfer(venue, TransferOp::Cancel, quantity)(inventory, chain)?;
+            Inventory::with_last_rebalancing(now)(cancelled, chain)
         })
     }
 
@@ -2644,10 +2654,10 @@ impl RebalancingService {
         quantity: FractionalShares,
     ) -> EquityInventoryUpdate {
         let now = Utc::now();
-        Box::new(move |inventory| {
+        Box::new(move |inventory, chain| {
             let transferred =
-                Inventory::transfer(venue, TransferOp::Complete, quantity)(inventory)?;
-            Inventory::with_last_rebalancing(now)(transferred)
+                Inventory::transfer(venue, TransferOp::Complete, quantity)(inventory, chain)?;
+            Inventory::with_last_rebalancing(now)(transferred, chain)
         })
     }
 

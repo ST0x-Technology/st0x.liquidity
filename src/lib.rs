@@ -247,7 +247,7 @@ async fn run_bot_session_inner(
     let metrics_handle = metrics::setup().context("failed to install Prometheus recorder")?;
 
     let inventory = Arc::new(inventory::BroadcastingInventory::new(
-        inventory::InventoryView::default(),
+        inventory::InventoryView::for_trading_chain(ctx.chains.sole_trading().chain),
         event_sender.clone(),
     ));
     let equity_prices =
