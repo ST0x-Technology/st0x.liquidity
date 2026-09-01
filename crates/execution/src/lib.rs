@@ -42,6 +42,9 @@ pub use alpaca_broker_api::{
 // ApiError { .. })`) that `fetch_latest_trade_price` produces.
 #[cfg(any(test, feature = "test-support"))]
 pub use alpaca_market_data::AlpacaMarketDataError;
+// The overnight pricing path composes the fetch with this staleness
+// check; exported for the automated hedge resolver.
+pub use alpaca_market_data::validate_overnight_quote_age;
 pub use error::PersistenceError;
 pub use mock::{MockExecutor, MockExecutorCtx};
 pub use order::{
@@ -411,6 +414,19 @@ pub trait Executor: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Fetches the latest indicative overnight quote (`feed=overnight`)
+    /// with its broker timestamp.
+    ///
+    /// Required on purpose, unlike the optional fallback lookup above:
+    /// the indicative feed is the only pricing source overnight, so
+    /// every executor must decide explicitly -- one without the feed
+    /// returns a typed error instead of silently substituting another
+    /// source or no-oping.
+    async fn fetch_latest_overnight_quote(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<IndicativeQuote, Self::Error>;
+
     /// Place a limit order for the specified symbol, quantity, and price.
     ///
     /// Used for counter-trading during extended hours when market orders
@@ -634,6 +650,11 @@ pub enum ExecutionError {
     InvalidMockOrderId(#[from] mock::MockOrderIdError),
     #[error("Mock executor failure: {message}")]
     MockFailure { message: String },
+    #[error(
+        "no overnight quote is configured for {symbol}: the mock serves the overnight feed \
+         only through `with_overnight_quote`"
+    )]
+    OvernightQuoteUnavailable { symbol: Symbol },
     #[error("configured mock preflight price is not positive: {0}")]
     NonPositivePreflightPrice(#[from] NotPositive<Usd>),
     #[error(transparent)]
