@@ -1708,12 +1708,12 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
         .build()
         .expect("static client config cannot fail");
     let read_verifier = Arc::new(IapVerifier::new(
-        ops_api.read_audience.clone(),
+        &ops_api.read_audience,
         "read",
         jwks_http.clone(),
     ));
     let write_verifier = Arc::new(IapVerifier::new(
-        ops_api.write_audience.clone(),
+        &ops_api.write_audience,
         "write",
         jwks_http,
     ));

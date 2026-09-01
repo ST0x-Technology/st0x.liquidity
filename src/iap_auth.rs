@@ -165,9 +165,9 @@ impl IapVerifier {
     /// cheap Arc clone) and MUST carry timeouts: the JWKS fetch otherwise has
     /// no bound, and an unbounded fetch during a Google outage would pin the
     /// refresh slot. See [`ops_api_routes`] for the one place it is built.
-    pub(crate) fn new(audience: String, role: &'static str, http: reqwest::Client) -> Self {
+    pub(crate) fn new(audience: &str, role: &'static str, http: reqwest::Client) -> Self {
         let mut validation = Validation::new(Algorithm::ES256);
-        validation.set_audience(&[&audience]);
+        validation.set_audience(&[audience]);
         validation.set_issuer(&[IAP_ISSUER]);
         validation.leeway = LEEWAY_SECS;
         // `exp` is what bounds a stolen token's usefulness, so its absence
@@ -188,7 +188,7 @@ impl IapVerifier {
     }
 
     #[cfg(test)]
-    fn with_jwks_url(audience: String, role: &'static str, jwks_url: String) -> Self {
+    fn with_jwks_url(audience: &str, role: &'static str, jwks_url: String) -> Self {
         Self {
             jwks_url,
             ..Self::new(audience, role, reqwest::Client::new())
@@ -281,12 +281,11 @@ impl IapVerifier {
         // await; the future would not even be Send).
         let cache_is_cold = {
             let guard = self.keys.read().await;
-            if let Some(cached) = guard.as_ref() {
-                if cached.fetched_at.elapsed() <= JWKS_TTL
-                    && cached.keys.iter().any(|(id, _)| id == kid)
-                {
-                    return Ok(());
-                }
+            if let Some(cached) = guard.as_ref()
+                && cached.fetched_at.elapsed() <= JWKS_TTL
+                && cached.keys.iter().any(|(id, _)| id == kid)
+            {
+                return Ok(());
             }
             guard.is_none()
         };
@@ -524,7 +523,7 @@ mod tests {
 
     fn verifier(audience: &str, jwks: &MockServer) -> Arc<IapVerifier> {
         Arc::new(IapVerifier::with_jwks_url(
-            audience.to_string(),
+            audience,
             "test",
             jwks.url("/keys"),
         ))
@@ -713,7 +712,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         // The staleness did trigger a refresh attempt; the failure just did
         // not take the retained keys down with it.
-        mock.assert_hits(1);
+        mock.assert_calls(1);
     }
 
     /// A Google outage on a stale cache must not turn every request into an
@@ -743,6 +742,6 @@ mod tests {
         // The first request's failed refresh stamps last_refresh_attempt; the
         // two that follow inside the interval serve the stale keys without
         // going back to Google.
-        mock.assert_hits(1);
+        mock.assert_calls(1);
     }
 }
