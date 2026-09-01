@@ -2183,7 +2183,7 @@ async fn confirm_configured_asset_responds<P: Provider + Clone + 'static>(
         .equities
         .symbols
         .iter()
-        .min_by_key(|(symbol, _)| (*symbol).clone())
+        .min_by(|(first, _), (second, _)| first.cmp(second))
     else {
         info!(
             target: "startup",
@@ -4839,6 +4839,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn asset_canary_skips_when_no_equities_are_configured() {
         // Bring-up state: an empty asset table is valid, and the empty
         // Asserter doubles as proof no RPC call is made.
@@ -4852,6 +4853,11 @@ mod tests {
         confirm_configured_asset_responds(&provider, &trading)
             .await
             .unwrap();
+
+        assert!(
+            logs_contain("skipping the asset read canary"),
+            "the skip branch must announce itself rather than pass silently"
+        );
     }
 
     /// An RPC pointed at the wrong network is the failure the chain-id check
