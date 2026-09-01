@@ -3340,6 +3340,7 @@ pub(crate) async fn execute_witness_trade(
     block_timestamp: DateTime<Utc>,
 ) -> Result<bool, SendError<OnChainTrade>> {
     let trade_id = OnChainTradeId {
+        chain: trade.chain,
         tx_hash: trade.tx_hash,
         log_index: trade.log_index,
     };
@@ -3438,6 +3439,7 @@ pub(crate) async fn execute_acknowledge_fill(
         symbol: base_symbol.clone(),
         threshold,
         trade_id: TradeId {
+            chain: trade.chain,
             tx_hash: trade.tx_hash,
             log_index: trade.log_index,
         },
@@ -3507,6 +3509,7 @@ pub(crate) async fn execute_settle_fill(
 
     let command = PositionCommand::SettleOnChainFill {
         trade_id: TradeId {
+            chain: trade.chain,
             tx_hash: trade.tx_hash,
             log_index: trade.log_index,
         },
@@ -3556,12 +3559,14 @@ pub(crate) async fn position_fill_already_recorded(
          WHERE aggregate_type = ? \
          AND aggregate_id = ? \
          AND event_type = ? \
+         AND json_extract(payload, '$.OnChainOrderFilled.trade_id.chain') = ? \
          AND json_extract(payload, '$.OnChainOrderFilled.trade_id.tx_hash') = ? \
          AND CAST(json_extract(payload, '$.OnChainOrderFilled.trade_id.log_index') AS INTEGER) = ?",
     )
     .bind(Position::AGGREGATE_TYPE)
     .bind(symbol.to_string())
     .bind(PositionEvent::ON_CHAIN_ORDER_FILLED_EVENT_TYPE)
+    .bind(trade_id.chain.to_string())
     .bind(tx_hash_str)
     .bind(log_index)
     .fetch_one(pool)
@@ -3588,6 +3593,7 @@ pub(crate) async fn account_for_onchain_fill(
     threshold: ExecutionThreshold,
 ) -> Result<FillAccountingOutcome, TradeAccountingError> {
     let trade_id = OnChainTradeId {
+        chain: trade.chain,
         tx_hash: trade.tx_hash,
         log_index: trade.log_index,
     };
@@ -4870,6 +4876,67 @@ mod tests {
         );
     }
 
+    /// The durable double-hedge guard keys on the full chain-qualified fill
+    /// identity: the same (tx_hash, log_index) on another chain is a distinct
+    /// fill, never a duplicate (SPEC multi-chain invariant 3), while the same
+    /// identity on the same chain stays deduplicated.
+    #[tokio::test]
+    async fn fill_dedupe_is_chain_scoped() {
+        let (pool, _apalis) = crate::test_utils::setup_test_pools().await;
+        let (position_store, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::random();
+
+        let recorded_id = TradeId {
+            chain: Chain::Ethereum,
+            tx_hash,
+            log_index: 3,
+        };
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: recorded_id.clone(),
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let same_chain = OnChainTradeId {
+            chain: Chain::Ethereum,
+            tx_hash,
+            log_index: 3,
+        };
+        assert!(
+            position_fill_already_recorded(&pool, &symbol, &same_chain)
+                .await
+                .unwrap(),
+            "the recorded fill must dedupe against its own identity"
+        );
+
+        let other_chain = OnChainTradeId {
+            chain: Chain::Base,
+            tx_hash,
+            log_index: 3,
+        };
+        assert!(
+            !position_fill_already_recorded(&pool, &symbol, &other_chain)
+                .await
+                .unwrap(),
+            "the same (tx_hash, log_index) on another chain is a distinct fill"
+        );
+    }
+
     /// An RPC pointed at the wrong network is the failure the chain-id check
     /// exists for: every configured address means something different there,
     /// so startup must refuse it rather than route funds by them.
@@ -5063,6 +5130,7 @@ mod tests {
         let (broadcaster, _receiver, queue, _delivery_ctx) = test_broadcaster(&pool, &apalis_pool);
         let store = setup_onchain_trade_store(&pool, broadcaster).await.unwrap();
         let id = crate::onchain_trade::OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: TxHash::ZERO,
             log_index: 0,
         };
@@ -6877,6 +6945,7 @@ mod tests {
         };
 
         EmittedOnChain::from_log(
+            Chain::Base,
             RaindexTradeEvent::ClearV3(Box::new(clear_event)),
             &get_test_log(),
         )
@@ -6897,6 +6966,7 @@ mod tests {
         };
 
         EmittedOnChain::from_log(
+            Chain::Base,
             RaindexTradeEvent::TakeOrderV3(Box::new(take_event)),
             &get_test_log(),
         )
@@ -6920,6 +6990,7 @@ mod tests {
         };
 
         EmittedOnChain::from_log(
+            Chain::Base,
             RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade)),
             &get_test_log(),
         )
@@ -6978,6 +7049,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: B256::ZERO,
                         log_index,
                     },
@@ -7400,12 +7472,18 @@ mod tests {
         hash_bytes[31] = u8::try_from(log_index).unwrap_or(0);
         log.transaction_hash = Some(B256::from(hash_bytes));
 
-        EmittedOnChain::from_log(RaindexTradeEvent::ClearV3(Box::new(event)), &log).unwrap()
+        EmittedOnChain::from_log(
+            Chain::Base,
+            RaindexTradeEvent::ClearV3(Box::new(event)),
+            &log,
+        )
+        .unwrap()
     }
 
     #[test]
     fn position_fill_guard_matches_position_event_json_contract() {
         let trade_id = TradeId {
+            chain: Chain::Base,
             tx_hash: fixed_bytes!(
                 "0x1111111111111111111111111111111111111111111111111111111111111111"
             ),
@@ -7796,6 +7874,7 @@ mod tests {
 
         let witnessed_trade = test_trade_with_amount(float!(1.5), 60);
         let trade_id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: witnessed_trade.tx_hash,
             log_index: witnessed_trade.log_index,
         };
@@ -7865,6 +7944,7 @@ mod tests {
             .block_timestamp
             .expect("test trade carries a block timestamp");
         let trade_id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: trade.tx_hash,
             log_index: trade.log_index,
         };
@@ -7935,6 +8015,7 @@ mod tests {
             .block_timestamp
             .expect("test trade carries a block timestamp");
         let trade_id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: trade.tx_hash,
             log_index: trade.log_index,
         };
@@ -8057,6 +8138,7 @@ mod tests {
             .block_timestamp
             .expect("test trade carries a block timestamp");
         let trade_id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: trade.tx_hash,
             log_index: trade.log_index,
         };
@@ -9146,6 +9228,7 @@ mod tests {
         let trade_event = make_trade_event(77);
         let trade = test_trade_with_amount_and_direction(float!(2.0), 77, Direction::Buy);
         let trade_id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: trade.tx_hash,
             log_index: trade.log_index,
         };
@@ -9981,6 +10064,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 99,
                     },
@@ -10094,6 +10178,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 0,
                     },
@@ -10217,6 +10302,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 99,
                     },
@@ -10373,6 +10459,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 99,
                     },
@@ -10410,6 +10497,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -10440,6 +10528,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 2,
                     },
@@ -10484,6 +10573,7 @@ mod tests {
                         symbol: symbol.clone(),
                         threshold: ExecutionThreshold::whole_share(),
                         trade_id: TradeId {
+                            chain: Chain::Base,
                             tx_hash: TxHash::random(),
                             log_index: 0,
                         },
@@ -10554,6 +10644,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 0,
                     },
@@ -10628,6 +10719,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 0,
                     },
@@ -10964,6 +11056,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: B256::ZERO,
                         log_index: 1,
                     },
@@ -11038,6 +11131,7 @@ mod tests {
             .unwrap();
 
         let trade_id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: fixed_bytes!(
                 "0x1111111111111111111111111111111111111111111111111111111111111111"
             ),
@@ -11084,6 +11178,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: fixed_bytes!(
                             "0000000000000000000000000000000000000000000000000000000000000001"
                         ),
@@ -11213,6 +11308,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: fixed_bytes!(
                             "0000000000000000000000000000000000000000000000000000000000000004"
                         ),
@@ -11336,6 +11432,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: fixed_bytes!(
                             "0000000000000000000000000000000000000000000000000000000000000002"
                         ),
@@ -11440,6 +11537,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: fixed_bytes!(
                             "0000000000000000000000000000000000000000000000000000000000000003"
                         ),
@@ -11587,6 +11685,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: fixed_bytes!(
                             "0000000000000000000000000000000000000000000000000000000000000004"
                         ),
@@ -11701,6 +11800,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: fixed_bytes!(
                             "0000000000000000000000000000000000000000000000000000000000000005"
                         ),
@@ -11798,6 +11898,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: fixed_bytes!(
                             "0000000000000000000000000000000000000000000000000000000000000003"
                         ),
@@ -11906,6 +12007,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: fixed_bytes!(
                             "0000000000000000000000000000000000000000000000000000000000000005"
                         ),
@@ -12054,6 +12156,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: fixed_bytes!(
                             "0000000000000000000000000000000000000000000000000000000000000007"
                         ),
@@ -12180,6 +12283,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: fixed_bytes!(
                             "0000000000000000000000000000000000000000000000000000000000000006"
                         ),
@@ -12398,6 +12502,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: onchain.tx_hash,
                         log_index: onchain.log_index,
                     },

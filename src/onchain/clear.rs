@@ -91,7 +91,15 @@ impl OnchainTrade {
             (bob_order, fill)
         };
 
-        let result = Self::try_from_order_and_fill_details(cache, evm, order, fill, log).await;
+        let result = Self::try_from_order_and_fill_details(
+            trading_chain.chain,
+            cache,
+            evm,
+            order,
+            fill,
+            log,
+        )
+        .await;
 
         if let Ok(Some(ref trade)) = result {
             debug!(
@@ -264,11 +272,13 @@ mod tests {
 
     const TEST_BLOCK_TIMESTAMP: u64 = 1_700_000_000;
 
+    /// A non-Base chain, so a conversion path that hard-codes `Chain::Base`
+    /// fails the chain-propagation assertions below.
     fn create_test_ctx() -> TradingChain {
         TradingChain {
             redemption_wallet: None,
             assets: ChainAssets::default(),
-            chain: Chain::Base,
+            chain: Chain::Ethereum,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -410,6 +420,7 @@ mod tests {
             tokenized_symbol!(WrappedTokenizedShares, "wtAAPL")
         );
         assert_eq!(trade.amount, FractionalShares::new(float!(9)));
+        assert_eq!(trade.chain, Chain::Ethereum);
         assert_eq!(trade.tx_hash, tx_hash);
         assert_eq!(trade.log_index, 1);
         // Alice's order takes USDC in / wtAAPL out -> sold tokenized equity

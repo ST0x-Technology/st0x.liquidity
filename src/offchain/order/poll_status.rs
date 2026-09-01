@@ -1638,6 +1638,7 @@ mod tests {
 
     use st0x_config::ExecutionThreshold;
     use st0x_event_sorcery::StoreBuilder;
+    use st0x_evm::Chain;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, ClientOrderId,
         DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutionError, FractionalShares,
@@ -1805,6 +1806,7 @@ mod tests {
             .with_amount(shares.inner().inner())
             .build();
         let trade_id = TradeId {
+            chain: Chain::Base,
             tx_hash: onchain.tx_hash,
             log_index: onchain.log_index,
         };

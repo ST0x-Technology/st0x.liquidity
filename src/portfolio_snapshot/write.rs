@@ -1250,6 +1250,7 @@ mod tests {
     use st0x_config::ExecutionThreshold;
     use st0x_dto::Statement;
     use st0x_event_sorcery::StoreBuilder;
+    use st0x_evm::Chain;
     use st0x_execution::{Direction, FractionalShares, HasZero};
     use st0x_finance::Usdc;
     use st0x_wrapper::MockWrapper;
@@ -2101,6 +2102,7 @@ mod tests {
                     symbol: aapl(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::ZERO,
                         log_index: 0,
                     },
@@ -2173,6 +2175,7 @@ mod tests {
                     symbol: aapl(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::ZERO,
                         log_index: 0,
                     },
@@ -2252,6 +2255,7 @@ mod tests {
                     symbol: aapl(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::ZERO,
                         log_index: 0,
                     },
@@ -3031,6 +3035,7 @@ mod tests {
                     symbol: aapl(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::ZERO,
                         log_index: 0,
                     },

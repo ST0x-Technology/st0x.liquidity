@@ -25,7 +25,7 @@ use st0x_config::{
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{Store, StoreBuilder, test_store};
-use st0x_evm::IERC20;
+use st0x_evm::{Chain, IERC20};
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
 };
@@ -391,6 +391,7 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
                         symbol: symbol.clone(),
                         threshold: ExecutionThreshold::whole_share(),
                         trade_id: TradeId {
+                            chain: Chain::Base,
                             tx_hash: TxHash::random(),
                             log_index: 0,
                         },
@@ -629,6 +630,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
                 symbol: symbol.clone(),
                 threshold: ExecutionThreshold::whole_share(),
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 2,
                 },
@@ -902,6 +904,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
                 symbol: symbol.clone(),
                 threshold: ExecutionThreshold::whole_share(),
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 2,
                 },
@@ -1634,6 +1637,7 @@ async fn mint_api_failure_produces_rejected_event() {
                 symbol: symbol.clone(),
                 threshold: ExecutionThreshold::whole_share(),
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 2,
                 },
@@ -2189,6 +2193,7 @@ async fn mint_accepted_sets_offchain_inflight() {
                 symbol: symbol.clone(),
                 threshold: ExecutionThreshold::whole_share(),
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 2,
                 },
@@ -2398,6 +2403,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
                 symbol: symbol.clone(),
                 threshold: ExecutionThreshold::whole_share(),
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 2,
                 },

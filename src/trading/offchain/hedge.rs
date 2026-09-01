@@ -1568,6 +1568,7 @@ mod tests {
 
     use st0x_config::{EquityHedgePolicy, ExecutionThreshold, HedgedEquities, OperationMode};
     use st0x_event_sorcery::StoreBuilder;
+    use st0x_evm::Chain;
     use st0x_execution::{
         ClientOrderId, Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor,
         Symbol,
@@ -1870,6 +1871,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },

@@ -1859,7 +1859,7 @@ mod tests {
     use st0x_config::ExecutionThreshold;
     use st0x_dto::Statement;
     use st0x_event_sorcery::{StoreBuilder, test_store};
-    use st0x_evm::ReadOnlyEvm;
+    use st0x_evm::{Chain, ReadOnlyEvm};
     use st0x_execution::{
         Direction, EquityPosition, FractionalShares, Inventory, MockExecutor, Positive,
         SupportedExecutor, Symbol,
@@ -5437,6 +5437,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -5530,6 +5531,7 @@ mod tests {
                     symbol: missing_symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },

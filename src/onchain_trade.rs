@@ -1,8 +1,11 @@
 //! OnChainTrade CQRS/ES aggregate for recording direct Raindex orderbook fills
 //! and fills routed through shared-inventory adapters.
 //!
-//! Keyed by `(tx_hash, log_index)`. Historical enrichment events remain
-//! replayable, but current trade accounting no longer emits them (ADR 0020).
+//! Keyed by `(chain, tx_hash, log_index)`: a transaction hash is unique only
+//! within one chain, so the chain is part of the identity, rendered as a
+//! uniform `chain:tx_hash:log_index` aggregate id (RAI-2078 migrated legacy
+//! bare ids in place). Historical enrichment events remain replayable, but
+//! current trade accounting no longer emits them (ADR 0020).
 
 use std::num::ParseIntError;
 use std::str::FromStr;
@@ -18,26 +21,30 @@ use tracing::warn;
 
 use st0x_dto::{Direction, Trade, TradeOutcome, TradingVenue};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
+use st0x_evm::{Chain, ParseChainError};
 use st0x_execution::Symbol;
 use st0x_finance::{FractionalShares, NotPositive, Positive};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 
 pub(crate) struct OnChainTradeId {
+    pub(crate) chain: Chain,
     pub(crate) tx_hash: TxHash,
     pub(crate) log_index: u64,
 }
 
 impl std::fmt::Display for OnChainTradeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.tx_hash, self.log_index)
+        write!(f, "{}:{}:{}", self.chain, self.tx_hash, self.log_index)
     }
 }
 
 #[derive(Debug, Error)]
 pub(crate) enum ParseOnChainTradeIdError {
-    #[error("expected 'tx_hash:log_index', got '{id_provided}'")]
+    #[error("expected 'chain:tx_hash:log_index', got '{id_provided}'")]
     MissingDelimiter { id_provided: String },
+    #[error("invalid chain: {0}")]
+    Chain(#[from] ParseChainError),
     #[error("invalid tx_hash: {0}")]
     TxHash(#[from] FromHexError),
     #[error("invalid log_index: {0}")]
@@ -48,15 +55,25 @@ impl FromStr for OnChainTradeId {
     type Err = ParseOnChainTradeIdError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (tx_hash_str, log_index_str) =
+        let (chain_str, rest) =
             value
                 .split_once(':')
                 .ok_or_else(|| ParseOnChainTradeIdError::MissingDelimiter {
                     id_provided: value.to_string(),
                 })?;
+        let chain = chain_str.parse()?;
+        let (tx_hash_str, log_index_str) =
+            rest.split_once(':')
+                .ok_or_else(|| ParseOnChainTradeIdError::MissingDelimiter {
+                    id_provided: value.to_string(),
+                })?;
         let tx_hash = tx_hash_str.parse()?;
         let log_index = log_index_str.parse()?;
-        Ok(Self { tx_hash, log_index })
+        Ok(Self {
+            chain,
+            tx_hash,
+            log_index,
+        })
     }
 }
 
@@ -101,7 +118,7 @@ impl EventSourced for OnChainTrade {
 
     const AGGREGATE_TYPE: &'static str = "OnChainTrade";
     const PROJECTION: Table = Table("onchain_trade_view");
-    const SCHEMA_VERSION: u64 = 3;
+    const SCHEMA_VERSION: u64 = 4;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use OnChainTradeEvent::*;
@@ -992,6 +1009,7 @@ mod tests {
         assert_eq!(
             repaired
                 .try_into_trade(&OnChainTradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::ZERO,
                     log_index: 0,
                 })
@@ -1040,6 +1058,7 @@ mod tests {
         assert_eq!(
             repaired
                 .try_into_trade(&OnChainTradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::ZERO,
                     log_index: 0,
                 })
@@ -1134,10 +1153,134 @@ mod tests {
         ));
     }
 
+    /// Runs the identity migration's UPDATE section over raw legacy-shaped
+    /// rows and asserts they come out parseable under current code. The
+    /// direct INSERTs bypass the framework deliberately: they reproduce the
+    /// pre-migration on-disk shape, which no current code path can produce.
+    #[tokio::test]
+    async fn identity_migration_upgrades_legacy_rows() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, \
+             event_version, payload, metadata) VALUES \
+             ('OnChainTrade', \
+              '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:7', \
+              1, 'OnChainTradeEvent::Filled', '1.0', '{}', '{}'), \
+             ('Position', 'AAPL', 1, 'PositionEvent::OnChainOrderFilled', '1.0', \
+              '{\"OnChainOrderFilled\":{\"trade_id\":{\"tx_hash\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"log_index\":7}}}', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO dashboard_trade_delivery (trade_id, delivered_at) VALUES \
+             ('0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:7', \
+              '2026-01-01T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let migration =
+            include_str!("../migrations/20260901124004_chain_qualified_fill_identity.sql");
+        let (updates, _table_rebuilds) = migration
+            .split_once("-- hedge_fill:")
+            .expect("the migration must keep its UPDATE section above the table rebuilds");
+        // Twice: the WHERE guards make the upgrades idempotent.
+        sqlx::raw_sql(updates).execute(&pool).await.unwrap();
+        sqlx::raw_sql(updates).execute(&pool).await.unwrap();
+
+        let (aggregate_id,): (String,) =
+            sqlx::query_as("SELECT aggregate_id FROM events WHERE aggregate_type = 'OnChainTrade'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let parsed: OnChainTradeId = aggregate_id.parse().unwrap();
+        assert_eq!(parsed.chain, Chain::Base);
+        assert_eq!(parsed.log_index, 7);
+
+        let (chain_in_payload,): (String,) = sqlx::query_as(
+            "SELECT json_extract(payload, '$.OnChainOrderFilled.trade_id.chain') \
+             FROM events WHERE aggregate_type = 'Position'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(chain_in_payload, "base");
+
+        let (delivery_id,): (String,) =
+            sqlx::query_as("SELECT trade_id FROM dashboard_trade_delivery")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(delivery_id.starts_with("base:0x"), "got {delivery_id}");
+    }
+
+    #[test]
+    fn trade_id_renders_chain_qualified_on_every_chain() {
+        // The aggregate id is persisted; each spelling is pinned as a literal
+        // so a rendering change cannot slip through as a refactor.
+        let tx_hash: TxHash = "0x1111111111111111111111111111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+
+        for (chain, expected) in [
+            (
+                Chain::Base,
+                "base:0x1111111111111111111111111111111111111111111111111111111111111111:7",
+            ),
+            (
+                Chain::Ethereum,
+                "ethereum:0x1111111111111111111111111111111111111111111111111111111111111111:7",
+            ),
+            (
+                Chain::HyperEvm,
+                "hyperevm:0x1111111111111111111111111111111111111111111111111111111111111111:7",
+            ),
+        ] {
+            let id = OnChainTradeId {
+                chain,
+                tx_hash,
+                log_index: 7,
+            };
+
+            assert_eq!(id.to_string(), expected);
+            assert_eq!(expected.parse::<OnChainTradeId>().unwrap(), id);
+        }
+    }
+
+    #[test]
+    fn trade_id_rejects_the_retired_bare_form() {
+        // The identity migration prefixed every persisted id, so a bare
+        // two-part id can only be a bug; it must not silently read as Base.
+        let error = "0x1111111111111111111111111111111111111111111111111111111111111111:7"
+            .parse::<OnChainTradeId>()
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ParseOnChainTradeIdError::Chain(_)),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn trade_id_rejects_an_unknown_chain_prefix() {
+        let error = "solana:0x1111111111111111111111111111111111111111111111111111111111111111:7"
+            .parse::<OnChainTradeId>()
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ParseOnChainTradeIdError::Chain(_)),
+            "got {error:?}"
+        );
+    }
+
     #[test]
     fn dashboard_trade_rejects_non_positive_fill_quantity() {
         let now = Utc::now();
         let id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: TxHash::ZERO,
             log_index: 0,
         };

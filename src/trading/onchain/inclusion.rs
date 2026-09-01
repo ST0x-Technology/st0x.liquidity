@@ -13,11 +13,17 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::num::TryFromIntError;
 
+use st0x_evm::Chain;
+
 /// Wraps an arbitrary event type with metadata about the exact point
 /// at which the event was included in the ledger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EmittedOnChain<Event> {
     pub(crate) event: Event,
+    /// Defaulted only for in-flight apalis job payloads enqueued before the
+    /// chain-qualified identity deploy.
+    #[serde(default = "crate::onchain::legacy_chain")]
+    pub(crate) chain: Chain,
     pub(crate) tx_hash: TxHash,
     pub(crate) log_index: u64,
     pub(crate) block_number: u64,
@@ -27,7 +33,11 @@ pub(crate) struct EmittedOnChain<Event> {
 impl<Event> EmittedOnChain<Event> {
     /// Extracts block inclusion metadata from an RPC log and pairs it
     /// with the already-decoded event.
-    pub(crate) fn from_log(event: Event, log: &Log) -> Result<Self, BlockInclusionError> {
+    pub(crate) fn from_log(
+        chain: Chain,
+        event: Event,
+        log: &Log,
+    ) -> Result<Self, BlockInclusionError> {
         use BlockInclusionError::MissingLogField;
 
         let tx_hash = log
@@ -49,6 +59,7 @@ impl<Event> EmittedOnChain<Event> {
 
         Ok(Self {
             event,
+            chain,
             tx_hash,
             log_index,
             block_number,
@@ -114,11 +125,30 @@ mod tests {
     }
 
     #[test]
+    fn legacy_job_payload_without_chain_deserializes_as_base() {
+        // In-flight apalis payloads enqueued before the chain-qualified
+        // identity deploy carry no chain field; they must read as Base.
+        let legacy = r#"{
+            "event": 1,
+            "tx_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "log_index": 7,
+            "block_number": 42,
+            "block_timestamp": null
+        }"#;
+
+        let emitted: EmittedOnChain<u64> = serde_json::from_str(legacy).unwrap();
+
+        assert_eq!(emitted.chain, Chain::Base);
+        assert_eq!(emitted.log_index, 7);
+    }
+
+    #[test]
     fn from_log_extracts_all_fields() {
         let log = valid_log();
-        let included = EmittedOnChain::from_log("test_event", &log).unwrap();
+        let included = EmittedOnChain::from_log(Chain::Ethereum, "test_event", &log).unwrap();
 
         assert_eq!(included.event, "test_event");
+        assert_eq!(included.chain, Chain::Ethereum);
         assert_eq!(included.tx_hash, log.transaction_hash.unwrap());
         assert_eq!(included.log_index, 7);
         assert_eq!(included.block_number, 42);
@@ -133,7 +163,7 @@ mod tests {
         let mut log = valid_log();
         log.block_timestamp = None;
 
-        let included = EmittedOnChain::from_log("event", &log).unwrap();
+        let included = EmittedOnChain::from_log(Chain::Base, "event", &log).unwrap();
 
         assert_eq!(included.block_timestamp, None);
     }
@@ -143,7 +173,7 @@ mod tests {
         let mut log = valid_log();
         log.transaction_hash = None;
 
-        let error = EmittedOnChain::from_log("event", &log).unwrap_err();
+        let error = EmittedOnChain::from_log(Chain::Base, "event", &log).unwrap_err();
 
         assert!(
             matches!(
@@ -159,7 +189,7 @@ mod tests {
         let mut log = valid_log();
         log.log_index = None;
 
-        let error = EmittedOnChain::from_log("event", &log).unwrap_err();
+        let error = EmittedOnChain::from_log(Chain::Base, "event", &log).unwrap_err();
 
         assert!(
             matches!(
@@ -175,7 +205,7 @@ mod tests {
         let mut log = valid_log();
         log.block_number = None;
 
-        let error = EmittedOnChain::from_log("event", &log).unwrap_err();
+        let error = EmittedOnChain::from_log(Chain::Base, "event", &log).unwrap_err();
 
         assert!(
             matches!(
@@ -189,7 +219,7 @@ mod tests {
     #[test]
     fn timestamp_parsed_as_utc_datetime() {
         let log = valid_log();
-        let included = EmittedOnChain::from_log("event", &log).unwrap();
+        let included = EmittedOnChain::from_log(Chain::Base, "event", &log).unwrap();
 
         let timestamp = included.block_timestamp.unwrap();
         assert_eq!(timestamp.timestamp(), 1_700_000_000);
