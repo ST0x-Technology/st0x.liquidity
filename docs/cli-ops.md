@@ -269,13 +269,12 @@ race `/transfers/resume` into a double on-chain wrap).
 
 > **Operational guardrail:** the bare `/transfers/resume` and
 > `/transfers/recheck` mounts admit **loopback peers only**: the sanctioned
-> caller is `st0x-cli` running inside the bot's container (`docker exec`),
-> which connects to `127.0.0.1`. Reaching `server_port` over the network (an
-> IAP tunnel to the port, a VPC-internal curl) gets `403` with an
-> `{"error": ...}` body: that is the guard working, not the bot broken. The
-> network route for operators is the IAP-verified `/liquidity-write/*` mount
-> behind the load balancer, which requires membership in the write-tier
-> Workspace group.
+> caller is `st0x-cli` running inside the bot's container (`docker exec`), which
+> connects to `127.0.0.1`. Reaching `server_port` over the network (an IAP
+> tunnel to the port, a VPC-internal curl) gets `403` with an `{"error": ...}`
+> body: that is the guard working, not the bot broken. The network route for
+> operators is the IAP-verified `/liquidity-write/*` mount behind the load
+> balancer, which requires membership in the write-tier Workspace group.
 
 Recoverable cases:
 
