@@ -2,6 +2,7 @@ use chrono::{NaiveDate, NaiveTime};
 use rain_math_float::Float;
 use rain_math_float::FloatError;
 use serde::Deserialize;
+use st0x_finance::UsdcConversionError;
 use st0x_float_serde::format_float_with_fallback;
 use std::fmt;
 use std::str::FromStr;
@@ -11,8 +12,8 @@ use uuid::Uuid;
 
 use crate::alpaca_market_data::AlpacaMarketDataError;
 use crate::{
-    Backpressure, ClientOrderId, CounterTradeCostError, ExecutorOrderId, FractionalShares,
-    OrderFailureTerminality, Permanence, Positive, Symbol, Usd,
+    AlpacaAmount, Backpressure, ClientOrderId, CounterTradeCostError, ExecutorOrderId,
+    FractionalShares, OrderFailureTerminality, Permanence, Positive, Symbol, Usd,
 };
 
 /// Time-in-force specifies how long an order remains active before it expires.
@@ -242,6 +243,9 @@ pub enum AlpacaBrokerApiError {
     #[error("Failed to parse Alpaca API response: {0}")]
     JsonParse(#[from] serde_json::Error),
 
+    #[error("Invalid Alpaca crypto amount: {0}")]
+    AlpacaAmount(#[from] UsdcConversionError),
+
     #[error(
         "position endpoint returned {returned} when {requested} was requested; refusing to price \
          from another symbol"
@@ -317,12 +321,12 @@ pub enum AlpacaBrokerApiError {
         .cancel.clause(),
         .filled_quantity
             .as_ref()
-            .map_or_else(|| "an unreported quantity".to_string(), format_float_with_fallback)
+            .map_or_else(|| "an unreported quantity".to_string(), ToString::to_string)
     )]
     ConversionCancelNotSettled {
         order_id: Uuid,
         cancel: DeadlineCancel,
-        filled_quantity: Option<Float>,
+        filled_quantity: Option<AlpacaAmount>,
     },
 
     /// The broker answered the deadline cancel with a 404. Reading the order
@@ -489,6 +493,7 @@ impl AlpacaBrokerApiError {
             | Self::HttpClient(_)
             | Self::KmsJwt(_)
             | Self::JsonParse(_)
+            | Self::AlpacaAmount(_)
             | Self::PositionSymbolMismatch { .. }
             | Self::InvalidHeader(_)
             | Self::InvalidOrderId(_)
@@ -562,6 +567,7 @@ impl AlpacaBrokerApiError {
             // already arrived, from configuration, or from arithmetic on
             // values in hand -- so the same inputs fail the same way.
             Self::JsonParse(_)
+            | Self::AlpacaAmount(_)
             | Self::InvalidHeader(_)
             | Self::InvalidOrderId(_)
             | Self::IncompleteOrder { .. }

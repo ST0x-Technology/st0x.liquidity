@@ -19,9 +19,9 @@ use st0x_event_sorcery::Store;
 use st0x_evm::{Chain, USDC_BASE, Wallet};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
-    AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, AlpacaWalletService, ClientOrderId,
-    ConversionDirection, ConversionOrder, CryptoOrderOutcome, Network, Positive, TokenSymbol,
-    Transfer, TransferStatus,
+    AlpacaAmount, AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, AlpacaWalletService,
+    ClientOrderId, ConversionDirection, ConversionOrder, CryptoOrderOutcome, Network, Positive,
+    TokenSymbol, Transfer, TransferStatus,
 };
 use st0x_finance::{Usd, Usdc};
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
@@ -958,12 +958,13 @@ impl<
                 initiated_at,
                 ..
             }) => {
-                // Passed through UNfloored: `initiate_alpaca_withdrawal`
+                // Passed through unnormalized: `initiate_alpaca_withdrawal`
                 // sends `Initiate` with this amount, and the aggregate refuses
                 // any amount that differs from the recorded conversion. New
-                // conversions are floored at derivation; a legacy aggregate
-                // that recorded a >6-decimal fill must keep withdrawing that
-                // exact value -- it is floored before any on-chain use by
+                // conversions are normalized at Alpaca ingress; a legacy
+                // aggregate that recorded a >6-decimal fill must keep
+                // withdrawing that exact value -- it is normalized before any
+                // on-chain use by
                 // `continue_alpaca_to_base_from_withdrawal_complete`.
                 self.continue_alpaca_to_base_from_conversion_complete(
                     id,
@@ -1032,7 +1033,7 @@ impl<
                 // on-chain mint receipt, so supplying the nominal here is harmless.
                 self.continue_alpaca_to_base_from_bridging(
                     id,
-                    usdc_to_u256(amount.floor_to_6_decimals()?)?,
+                    normalized_alpaca_usdc_to_u256(amount)?,
                     burn_tx_hash,
                     initiated_at,
                 )
@@ -1049,7 +1050,7 @@ impl<
             }) => {
                 self.continue_alpaca_to_base_from_awaiting_attestation(
                     id,
-                    amount.floor_to_6_decimals()?,
+                    normalize_alpaca_usdc(amount)?,
                     burn_tx_hash,
                     AwaitingAttestationTimestamps {
                         retry_deadline_at,
@@ -1230,9 +1231,8 @@ impl<
                 initiated_at,
                 ..
             }) => {
-                let nominal_u256 = usdc_to_u256(amount.floor_to_6_decimals()?)?;
                 let scan_amount = if let Some(burn_amount) = burn_amount {
-                    usdc_to_u256(burn_amount.floor_to_6_decimals()?)?
+                    normalized_alpaca_usdc_to_u256(burn_amount)?
                 } else {
                     warn!(
                         target: "rebalance",
@@ -1241,7 +1241,7 @@ impl<
                         "BridgingSubmitting has no persisted burn_amount; \
                          falling back to nominal scan amount for legacy compatibility"
                     );
-                    nominal_u256
+                    normalized_alpaca_usdc_to_u256(amount)?
                 };
                 let burn_receipt = self
                     .resume_bridging_submitting_ethereum(
@@ -1329,11 +1329,10 @@ impl<
         initiated_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
         // A legacy aggregate can carry a >6-decimal Alpaca fill recorded
-        // before fills were floored at derivation, and `usdc_to_u256` below
-        // refuses off-grid amounts. Floor at this choke point so every entry
-        // -- the resume arms and the in-memory continuation from
-        // `ConversionComplete` -- burns an on-chain-representable amount.
-        let amount = amount.floor_to_6_decimals()?;
+        // before the ingress boundary was introduced, and `usdc_to_u256`
+        // below refuses off-grid amounts. Pass it through the same boundary
+        // here so every resume path burns an on-chain-representable amount.
+        let amount = normalize_alpaca_usdc(amount)?;
         // DURABLE confirmation re-check: fires on the redrive path
         // (`WithdrawalComplete` -> resume) when the primary gate in
         // `poll_and_confirm_withdrawal` does not re-run. An RPC failure here
@@ -2824,9 +2823,7 @@ impl<
 
                 warn!(target: "rebalance", order_id = %order.id, ?reason, ?partial_fill, "Resumed conversion order failed terminally");
                 let partial_suffix = partial_fill
-                    .map(|filled| {
-                        format!(" (partial fill {} needs reconciliation)", Usdc::new(filled))
-                    })
+                    .map(|filled| format!(" (partial fill {filled} needs reconciliation)"))
                     .unwrap_or_default();
                 self.cqrs
                     .send(
@@ -4258,6 +4255,16 @@ fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcTransferError> {
     Ok(usdc.to_u256_6_decimals()?)
 }
 
+fn normalize_alpaca_usdc(amount: Usdc) -> Result<Usdc, UsdcTransferError> {
+    Ok(Usdc::new(
+        AlpacaAmount::try_from(amount.inner())?.into_normalized(),
+    ))
+}
+
+fn normalized_alpaca_usdc_to_u256(amount: Usdc) -> Result<U256, UsdcTransferError> {
+    usdc_to_u256(normalize_alpaca_usdc(amount)?)
+}
+
 /// Converts a U256 amount (with 6 decimals) to USDC decimal.
 pub(crate) fn u256_to_usdc(amount: U256) -> Result<Usdc, UsdcTransferError> {
     Ok(Usdc::new(Float::from_fixed_decimal(amount, 6)?))
@@ -4281,20 +4288,17 @@ fn conversion_amounts_from_order(
                 order_id: correlation_id.clone(),
             })?;
 
-    let filled_quantity = Usdc::new(filled_quantity);
-    let cash_proceeds = std::ops::Mul::mul(filled_quantity, filled_average_price)?;
+    let cash_proceeds = filled_quantity.cash_value_at(filled_average_price)?;
+    let filled_quantity = Usdc::new(filled_quantity.into_normalized());
 
     Ok(match direction {
-        // Alpaca reports a notional buy's fill with up to 9 decimals;
-        // on-chain USDC has 6. Floor where the received amount is derived, so
-        // the persisted conversion, the withdrawal commands, and the burn all
-        // carry the same on-grid value -- the aggregate refuses a withdrawal
-        // whose amount differs from the recorded conversion. The sub-grid
-        // remainder stays in the Alpaca crypto wallet. Cash proceeds keep the
-        // exact fill: they record what the buy actually spent.
-        ConversionDirection::UsdToUsdc => {
-            ConversionAmounts::new(cash_proceeds, filled_quantity.floor_to_6_decimals()?)
-        }
+        // The Alpaca response boundary has already normalized this USDC
+        // quantity to the on-chain grid. Persist that same value through the
+        // conversion, withdrawal, and burn; the aggregate refuses a withdrawal
+        // whose amount differs from the recorded conversion. Cash proceeds use
+        // the boundary's private raw quantity so they still record what the
+        // broker actually spent.
+        ConversionDirection::UsdToUsdc => ConversionAmounts::new(cash_proceeds, filled_quantity),
         ConversionDirection::UsdcToUsd => ConversionAmounts::new(filled_quantity, cash_proceeds),
     })
 }
@@ -5938,14 +5942,15 @@ mod tests {
     }
 
     /// The fresh-fill path proven end to end: a 9-decimal Alpaca fill is
-    /// floored where it is derived, so the confirmed conversion records the
-    /// on-grid amount and the aggregate accepts an `Initiate` for exactly the
-    /// amount the conversion returned. Flooring after `ConfirmConversion`
-    /// instead would persist the exact fill and make the aggregate refuse the
-    /// floored withdrawal amount -- with a real Alpaca withdrawal already in
-    /// flight.
+    /// normalized at the Alpaca response boundary, so the confirmed conversion
+    /// records the on-grid amount and the aggregate accepts an `Initiate` for
+    /// exactly the amount the conversion returned. Flooring after
+    /// `ConfirmConversion` instead would persist the exact fill and make the
+    /// aggregate refuse the floored withdrawal amount -- with a real Alpaca
+    /// withdrawal already in flight. The boundary keeps the raw quantity
+    /// private so source cash accounting still uses the exact broker fill.
     #[tokio::test]
-    async fn nine_decimal_fresh_fill_confirms_floored_and_accepts_initiate() {
+    async fn nine_decimal_fresh_fill_confirms_normalized_and_accepts_initiate() {
         let server = MockServer::start();
         let _account_mock = create_broker_account_mock(&server);
         let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
@@ -5981,6 +5986,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(received, usdc("9794.019706"));
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        let UsdcRebalance::ConversionComplete { conversion, .. } = state else {
+            panic!("expected ConversionComplete");
+        };
+        assert_eq!(conversion.source_amount, usdc("9794.9991088316861"));
+        assert_eq!(conversion.received_amount, received);
 
         cqrs.send(
             &id,
@@ -8586,12 +8597,12 @@ mod tests {
     }
 
     /// An Alpaca->Base amount persisted with more than 6 decimals (an Alpaca
-    /// notional-buy fill delivers up to 9) must be floored to USDC's on-chain
+    /// notional-buy fill delivers up to 9) must be normalized to USDC's on-chain
     /// grid on resume instead of failing `usdc_to_u256` on every retry. Post
-    /// floor, the flow proceeds to the wallet-balance read -- a transient
+    /// normalization, the flow proceeds to the wallet-balance read -- a transient
     /// redrive, not a terminal conversion error.
     #[tokio::test]
-    async fn resume_from_withdrawal_complete_floors_nine_decimal_fill() {
+    async fn resume_from_withdrawal_complete_normalizes_nine_decimal_fill() {
         let server = MockServer::start();
         let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
 

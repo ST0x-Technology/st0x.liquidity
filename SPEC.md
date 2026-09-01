@@ -3017,15 +3017,20 @@ enum BridgeStage { Burn, Attestation, Mint }
     price it decides how much USDC a notional of N actually buys, always less
     than N. The bot therefore never needs the collar percentage: the received
     USDC is read from the fill, and no broker constant appears in the sizing
-  - Fill precision: Alpaca reports crypto fill quantities with up to 9 decimals;
-    on-chain USDC has 6. The received amount is floored to 6 decimals where it
-    is derived from the fill, always downwards, so the recorded conversion and
-    every downstream step (withdrawal, burn) carry the same on-grid value; the
-    sub-6-decimal remainder stays in the Alpaca crypto wallet. An aggregate
-    recorded before this rule can still carry a finer amount: it is withdrawn
-    exactly as recorded (the aggregate refuses a withdrawal that differs from
-    the recorded conversion) and floored at the withdrawal-complete boundary
-    before any on-chain use
+  - Alpaca crypto precision: Alpaca reports crypto quantities with up to 9
+    decimals; on-chain USDC has 6. Every amount parsed by the Alpaca crypto
+    order and wallet-transfer response models, plus the USDCUSD inventory
+    position, passes through a single denomination-neutral ingress type that
+    floors it to 6 decimals, always downwards. The recorded conversion and every
+    downstream step (withdrawal, burn) therefore carry the same on-grid value;
+    the sub-6-decimal remainder stays in the Alpaca crypto wallet. The boundary
+    retains the raw amount privately only to value the exact broker-side cash
+    proceeds; raw precision cannot enter downstream cash movement. USD
+    notionals, prices, and equity-share quantities do not pass through this
+    boundary. An aggregate recorded before this rule can still carry a finer
+    Alpaca amount: it is withdrawn exactly as recorded (the aggregate refuses a
+    withdrawal that differs from the recorded conversion) and normalized through
+    the same boundary type before any on-chain use
   - Crypto trading is available 24/7 on Alpaca (no market hours restrictions)
   - Market orders are near-instant but NOT guaranteed to fill immediately
   - Slippage: ~17bps observed in live tests (reduces effective USD received)

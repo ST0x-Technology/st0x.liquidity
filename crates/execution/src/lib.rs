@@ -17,6 +17,7 @@ pub(crate) use st0x_float_serde::{
 
 pub use st0x_float_macro::float;
 
+mod alpaca_amount;
 pub mod alpaca_broker_api;
 mod alpaca_market_data;
 mod alpaca_wallet;
@@ -25,6 +26,7 @@ pub mod mock;
 pub mod order;
 mod rate_limit;
 
+pub use alpaca_amount::AlpacaAmount;
 pub use alpaca_broker_api::{
     AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError,
     AlpacaBrokerApiMode, AlpacaBrokerAuth, ConversionDirection, ConversionOrder,
