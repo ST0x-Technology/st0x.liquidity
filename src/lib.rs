@@ -476,7 +476,17 @@ impl SupervisedTask for ServerTask {
         let router = self.router.clone();
         self.startup_token
             .clone()
-            .wrap(async move { axum::serve(listener, router).await })
+            // with_connect_info records each connection's peer address so the
+            // loopback-only guard on the operator mutation paths (api.rs
+            // `require_loopback`) can tell the in-container CLI from a caller
+            // that came over the published port.
+            .wrap(async move {
+                axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await
+            })
             .await?;
         Err("axum server exited unexpectedly".into())
     }
