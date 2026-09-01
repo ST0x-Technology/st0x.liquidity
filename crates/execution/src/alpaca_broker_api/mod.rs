@@ -71,7 +71,7 @@ pub(crate) use client::AlpacaBrokerApiClient;
 // `AssetDetails` is the CLI's overnight/fractional asset-inspection surface.
 pub use executor::{AlpacaBrokerApi, AssetDetails};
 pub use journal::{JournalResponse, JournalStatus};
-pub use kms_jwt::{AuthRuntime, KmsJwtError};
+pub use kms_jwt::{ALPACA_TOKEN_URL, AuthRuntime, KmsJwtError};
 pub use order::{
     AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, ConversionOrder, CryptoOrderOutcome,
     CryptoOrderResponse, ParseAlpacaLimitPriceError,

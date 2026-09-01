@@ -252,12 +252,12 @@ fn validate_order_kind_for_session(
         } => anyhow::bail!(
             "overnight orders require extended_hours = true; retry with --extended-hours"
         ),
-        CliOrderKind::AlpacaLimit {
+        CliOrderKind::Market {
+            time_in_force: Some(TimeInForce::MarketOnClose),
+        }
+        | CliOrderKind::AlpacaLimit {
             extended_hours: true,
             ..
-        }
-        | CliOrderKind::Market {
-            time_in_force: Some(TimeInForce::MarketOnClose),
         } => Ok(()),
     }
 }
