@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use url::Url;
 
 /// Deployment the client talks to. Selects the IAP-fronted API base URL and the
-/// environment's auth model.
+/// desktop OAuth client credentials the client reads.
 #[derive(Clone, Copy, clap::ValueEnum)]
 pub enum Env {
     Staging,
@@ -23,22 +23,15 @@ impl Env {
     }
 }
 
-/// How the client authenticates to IAP for one environment.
-///
-/// Staging uses a Google Desktop OAuth client: an interactive browser sign-in
-/// mints one ID token whose `aud` is the OAuth client id, and IAP admits both
-/// role prefixes on that identity, gating read vs write by Workspace group.
-/// Production uses Application Default Credentials to mint a per-role,
-/// audience-bound ID token (a service account or workload identity), the only
-/// non-interactive path.
+/// How the client authenticates to IAP. Both environments use a Google Desktop
+/// OAuth client: an interactive browser sign-in mints one ID token whose `aud`
+/// is the OAuth client id, and IAP admits both role prefixes on that identity,
+/// gating read vs write by Workspace group. Staging and production differ only
+/// in which desktop client mints the token.
 pub enum Auth {
     OauthDesktop {
         client_id: String,
         client_secret: String,
-    },
-    Adc {
-        read_audience: String,
-        write_audience: String,
     },
 }
 
@@ -100,27 +93,15 @@ pub fn resolve(env: Env) -> Result<Target> {
         "to the IAP-fronted liquidity API base URL for this environment",
     )?;
     let base_url = parse_base_url(prefix, &raw_url)?;
-    let auth = match env {
-        Env::Staging => Auth::OauthDesktop {
-            client_id: required(
-                &format!("{prefix}_CLIENT_ID"),
-                "to the desktop OAuth client id for staging",
-            )?,
-            client_secret: required(
-                &format!("{prefix}_CLIENT_SECRET"),
-                "to the desktop OAuth client secret (it ships in the CLI; the browser sign-in is the security)",
-            )?,
-        },
-        Env::Production => Auth::Adc {
-            read_audience: required(
-                &format!("{prefix}_READ_AUDIENCE"),
-                "to the read backend audience (the terraform ops_api_audiences read value)",
-            )?,
-            write_audience: required(
-                &format!("{prefix}_WRITE_AUDIENCE"),
-                "to the write backend audience (the terraform ops_api_audiences write value)",
-            )?,
-        },
+    let auth = Auth::OauthDesktop {
+        client_id: required(
+            &format!("{prefix}_CLIENT_ID"),
+            "to the desktop OAuth client id",
+        )?,
+        client_secret: required(
+            &format!("{prefix}_CLIENT_SECRET"),
+            "to the desktop OAuth client secret (it ships in the CLI; the browser sign-in is the security)",
+        )?,
     };
     let logging_url = std::env::var(format!("{prefix}_LOGGING_URL")).ok();
     let request_timeout = required_timeout(
@@ -260,8 +241,8 @@ mod tests {
         temp_env::with_vars(
             [
                 ("T0_LIQUIDITY_PROD_URL", Some("https://x.example.com")),
-                ("T0_LIQUIDITY_PROD_READ_AUDIENCE", Some("read")),
-                ("T0_LIQUIDITY_PROD_WRITE_AUDIENCE", Some("write")),
+                ("T0_LIQUIDITY_PROD_CLIENT_ID", Some("cid")),
+                ("T0_LIQUIDITY_PROD_CLIENT_SECRET", Some("secret")),
                 ("T0_LIQUIDITY_PROD_REQUEST_TIMEOUT_SECS", None),
                 ("T0_LIQUIDITY_PROD_CONNECT_TIMEOUT_SECS", Some("10")),
             ],
@@ -281,8 +262,8 @@ mod tests {
         temp_env::with_vars(
             [
                 ("T0_LIQUIDITY_PROD_URL", Some("https://x.example.com")),
-                ("T0_LIQUIDITY_PROD_READ_AUDIENCE", Some("read")),
-                ("T0_LIQUIDITY_PROD_WRITE_AUDIENCE", Some("write")),
+                ("T0_LIQUIDITY_PROD_CLIENT_ID", Some("cid")),
+                ("T0_LIQUIDITY_PROD_CLIENT_SECRET", Some("secret")),
                 ("T0_LIQUIDITY_PROD_REQUEST_TIMEOUT_SECS", Some("30")),
                 ("T0_LIQUIDITY_PROD_CONNECT_TIMEOUT_SECS", None),
             ],

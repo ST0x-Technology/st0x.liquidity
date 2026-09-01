@@ -10,7 +10,7 @@ mod transport;
 use clap::Parser;
 use std::process::ExitCode;
 
-use crate::auth::{Adc, AuthError, StaticToken, TokenSource};
+use crate::auth::{AuthError, StaticToken, TokenSource};
 use crate::cli::{Cli, Command, Debug, Read};
 use crate::output::OutputError;
 use crate::target::Auth;
@@ -106,59 +106,32 @@ impl std::error::Error for ApiError {
 async fn execute(cli: Cli) -> Result<(), Failure> {
     let target = target::resolve(cli.env).map_err(Failure::Setup)?;
     let logging_url = target.logging_url;
-    match target.auth {
-        Auth::OauthDesktop {
-            client_id,
-            client_secret,
-        } => {
-            let token = auth::desktop_id_token(
-                &client_id,
-                &client_secret,
-                target.request_timeout,
-                target.connect_timeout,
-            )
-            .await
-            .map_err(|error| Failure::Api {
-                error: error.into(),
-                logging_url: logging_url.clone(),
-            })?;
-            let client = Client::new(
-                target.base_url,
-                StaticToken(token.clone()),
-                StaticToken(token),
-                target.request_timeout,
-                target.connect_timeout,
-            )
-            .map_err(Failure::Setup)?;
-            dispatch(&client, cli.command)
-                .await
-                .map_err(|error| Failure::Api { error, logging_url })
-        }
-        Auth::Adc {
-            read_audience,
-            write_audience,
-        } => {
-            let read_auth = Adc::new(&read_audience).map_err(|error| Failure::Api {
-                error: error.into(),
-                logging_url: logging_url.clone(),
-            })?;
-            let write_auth = Adc::new(&write_audience).map_err(|error| Failure::Api {
-                error: error.into(),
-                logging_url: logging_url.clone(),
-            })?;
-            let client = Client::new(
-                target.base_url,
-                read_auth,
-                write_auth,
-                target.request_timeout,
-                target.connect_timeout,
-            )
-            .map_err(Failure::Setup)?;
-            dispatch(&client, cli.command)
-                .await
-                .map_err(|error| Failure::Api { error, logging_url })
-        }
-    }
+    let Auth::OauthDesktop {
+        client_id,
+        client_secret,
+    } = target.auth;
+    let token = auth::desktop_id_token(
+        &client_id,
+        &client_secret,
+        target.request_timeout,
+        target.connect_timeout,
+    )
+    .await
+    .map_err(|error| Failure::Api {
+        error: error.into(),
+        logging_url: logging_url.clone(),
+    })?;
+    let client = Client::new(
+        target.base_url,
+        StaticToken(token.clone()),
+        StaticToken(token),
+        target.request_timeout,
+        target.connect_timeout,
+    )
+    .map_err(Failure::Setup)?;
+    dispatch(&client, cli.command)
+        .await
+        .map_err(|error| Failure::Api { error, logging_url })
 }
 
 async fn dispatch<A: TokenSource + Sync>(

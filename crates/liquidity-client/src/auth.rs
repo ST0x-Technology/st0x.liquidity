@@ -3,7 +3,6 @@
 //! PKCE) whose refresh token is cached for silent reuse.
 
 use base64::Engine;
-use google_cloud_auth::credentials::idtoken;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -12,9 +11,6 @@ use url::Url;
 /// per environment, how to fix it.
 #[derive(Debug)]
 pub enum AuthError {
-    /// ADC / Google credential failure; the original typed error is retained
-    /// as the source.
-    Credentials(Box<dyn std::error::Error + Send + Sync + 'static>),
     /// Desktop OAuth sign-in flow failure, with an operator-facing reason.
     Flow(String),
     /// Construction of the HTTP client for the sign-in exchanges failed.
@@ -23,27 +19,22 @@ pub enum AuthError {
 
 impl std::fmt::Display for AuthError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let reason: &dyn std::fmt::Display = match self {
-            Self::Credentials(source) => source,
-            Self::Flow(reason) => reason,
-            Self::Client(source) => {
-                return write!(
-                    formatter,
-                    "could not build the HTTP client for the T0 sign-in: {source}"
-                );
-            }
-        };
-        write!(
-            formatter,
-            "could not obtain a T0 Google identity: {reason}\nFor staging, complete the browser sign-in when prompted. For production, ensure Application Default Credentials (a service account, workload identity, or impersonation) can mint an ID token for the configured audience."
-        )
+        match self {
+            Self::Flow(reason) => write!(
+                formatter,
+                "could not obtain a T0 Google identity: {reason}\nComplete the browser sign-in when prompted."
+            ),
+            Self::Client(source) => write!(
+                formatter,
+                "could not build the HTTP client for the T0 sign-in: {source}"
+            ),
+        }
     }
 }
 
 impl std::error::Error for AuthError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Credentials(source) => Some(&**source),
             Self::Client(source) => Some(source),
             Self::Flow(_) => None,
         }
@@ -54,33 +45,6 @@ impl std::error::Error for AuthError {
 /// transport can be exercised in tests without live Google credentials.
 pub trait TokenSource {
     fn bearer(&self) -> impl Future<Output = Result<String, AuthError>> + Send;
-}
-
-/// Mints Google OIDC ID tokens for the IAP audience from Application Default
-/// Credentials. Holding the credential lets the library cache and refresh the
-/// token across calls, so a caller need not cache the returned string. This is
-/// the non-interactive path: it needs a service account, workload identity, or
-/// impersonation, since a plain user login cannot mint an audience-bound token.
-pub struct Adc {
-    credentials: idtoken::IDTokenCredentials,
-}
-
-impl Adc {
-    pub fn new(audience: &str) -> Result<Self, AuthError> {
-        let credentials = idtoken::Builder::new(audience.to_owned())
-            .build()
-            .map_err(|source| AuthError::Credentials(Box::new(source)))?;
-        Ok(Self { credentials })
-    }
-}
-
-impl TokenSource for Adc {
-    async fn bearer(&self) -> Result<String, AuthError> {
-        self.credentials
-            .id_token()
-            .await
-            .map_err(|source| AuthError::Credentials(Box::new(source)))
-    }
 }
 
 /// A fixed, already-minted bearer token. The desktop OAuth flow yields one ID
