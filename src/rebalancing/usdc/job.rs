@@ -296,6 +296,37 @@ where
     }
 }
 
+async fn intercept_gas_readiness_failure<Ctx, TaskJob>(
+    job: &TaskJob,
+    job_queue: &JobQueue<TaskJob>,
+    result: Result<(), UsdcTransferError>,
+) -> ControlFlow<Result<(), TaskJob::Error>, Result<(), UsdcTransferError>>
+where
+    Ctx: Send + Sync + 'static,
+    TaskJob: Job<Ctx> + Clone + Sync + Unpin,
+    TaskJob::Error: From<UsdcTransferError> + From<QueuePushError>,
+{
+    let Err(error) = result else {
+        return ControlFlow::Continue(Ok(()));
+    };
+    let Some(delay) = error.gas_readiness_retry_interval() else {
+        return ControlFlow::Continue(Err(error));
+    };
+
+    warn!(
+        target: "rebalance",
+        label = %job.label(),
+        ?delay,
+        %error,
+        "Fresh USDC transfer refused by gas-readiness check; rescheduling"
+    );
+    let mut job_queue = job_queue.clone();
+    match job_queue.push_with_delay(job.clone(), delay).await {
+        Ok(()) => ControlFlow::Break(Ok(())),
+        Err(error) => ControlFlow::Break(Err(TaskJob::Error::from(error))),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BackpressureSite {
     Hedging,
@@ -612,6 +643,10 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
         };
 
         let result = match intercept_bot_gas_enqueue_failure(self, &ctx.job_queue, result).await {
+            ControlFlow::Break(outcome) => return outcome,
+            ControlFlow::Continue(result) => result,
+        };
+        let result = match intercept_gas_readiness_failure(self, &ctx.job_queue, result).await {
             ControlFlow::Break(outcome) => return outcome,
             ControlFlow::Continue(result) => result,
         };
@@ -1191,6 +1226,10 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
             .await;
 
         let result = match intercept_bot_gas_enqueue_failure(self, &ctx.job_queue, result).await {
+            ControlFlow::Break(outcome) => return outcome,
+            ControlFlow::Continue(result) => result,
+        };
+        let result = match intercept_gas_readiness_failure(self, &ctx.job_queue, result).await {
             ControlFlow::Break(outcome) => return outcome,
             ControlFlow::Continue(result) => result,
         };
@@ -1818,7 +1857,7 @@ mod tests {
     use reqwest::StatusCode;
     use uuid::{Uuid, uuid};
 
-    use st0x_evm::EvmError;
+    use st0x_evm::{Chain, EvmError};
     use st0x_execution::{
         AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, DeadlineCancel,
     };
@@ -1826,6 +1865,7 @@ mod tests {
 
     use super::*;
     use crate::alerts::{CapturingNotifier, LogNotifier};
+    use crate::native_gas::GasReadinessFailure;
     use crate::test_utils::setup_test_apalis_pool;
 
     /// Builds a `QueuePushError` without touching a pool. The classification
@@ -2351,6 +2391,147 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    struct GasReadinessFailureAlpacaToBase(Duration);
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for GasReadinessFailureAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            _id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::GasReadiness(
+                GasReadinessFailure::below_threshold_for_test(Chain::Ethereum, self.0),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn gas_readiness_failure_delayed_redrives_without_consuming_budget() {
+        let pool = setup_queue_pool().await;
+        let retry_interval = Duration::from_secs(19);
+        let ctx = market_making_ctx(
+            Arc::new(GasReadinessFailureAlpacaToBase(retry_interval)),
+            &pool,
+        );
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 2,
+            backpressure_streak: BackpressureStreak(3),
+        };
+
+        let before = Utc::now().timestamp();
+        Job::perform(&job, &ctx)
+            .await
+            .expect("low gas must delayed-redrive without consuming retry budgets");
+        let after = Utc::now().timestamp();
+
+        let (payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        let redriven: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(redriven.id, job.id);
+        assert_eq!(
+            redriven.revert_redrive_attempts,
+            job.revert_redrive_attempts
+        );
+        assert_eq!(redriven.backpressure_streak, job.backpressure_streak);
+        assert!(
+            run_at >= before + i64::try_from(retry_interval.as_secs()).unwrap() - 5
+                && run_at <= after + i64::try_from(retry_interval.as_secs()).unwrap() + 5
+        );
+    }
+
+    struct GasReadinessFailureBaseToAlpaca(Duration);
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for GasReadinessFailureBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            _id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::GasReadiness(
+                GasReadinessFailure::below_threshold_for_test(Chain::Base, self.0),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn hedging_gas_readiness_failure_delayed_redrives_without_consuming_budgets() {
+        let pool = setup_queue_pool().await;
+        let retry_interval = Duration::from_secs(29);
+        let ctx = hedging_ctx(
+            Arc::new(GasReadinessFailureBaseToAlpaca(retry_interval)),
+            &pool,
+        );
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 2,
+            backpressure_streak: BackpressureStreak(3),
+        };
+
+        let before = Utc::now().timestamp();
+        Job::perform(&job, &ctx)
+            .await
+            .expect("low gas must delayed-redrive without consuming retry budgets");
+        let after = Utc::now().timestamp();
+
+        let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
+        let redriven: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(redriven.id, job.id);
+        assert_eq!(
+            redriven.revert_redrive_attempts,
+            job.revert_redrive_attempts
+        );
+        assert_eq!(redriven.backpressure_streak, job.backpressure_streak);
+        assert!(
+            run_at >= before + i64::try_from(retry_interval.as_secs()).unwrap() - 5
+                && run_at <= after + i64::try_from(retry_interval.as_secs()).unwrap() + 5
+        );
+    }
+
+    struct UnwiredGasReadinessBaseToAlpaca;
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for UnwiredGasReadinessBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            _id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::GasReadiness(
+                GasReadinessFailure::Unwired,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn unwired_gas_readiness_propagates_without_redrive() {
+        let pool = setup_queue_pool().await;
+        let ctx = hedging_ctx(Arc::new(UnwiredGasReadinessBaseToAlpaca), &pool);
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 2,
+            backpressure_streak: BackpressureStreak(3),
+        };
+
+        let error = Job::perform(&job, &ctx).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransferUsdcToHedgingJobError::Transfer(UsdcTransferError::GasReadiness(
+                GasReadinessFailure::Unwired
+            ))
+        ));
+        assert_eq!(
+            pending_job_count::<TransferUsdcToHedging>(&pool).await,
+            0,
+            "an unwired readiness dependency must fail closed without scheduling a retry"
+        );
     }
 
     #[tokio::test]

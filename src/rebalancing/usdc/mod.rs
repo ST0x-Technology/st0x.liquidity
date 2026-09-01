@@ -32,10 +32,13 @@ use st0x_raindex::RaindexError;
 
 use crate::bot_gas::redrive::BotGasFailureClassifier;
 use crate::inventory::InventoryViewError;
+use crate::native_gas::GasReadinessFailure;
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceId};
 
 #[derive(Debug, Error)]
 pub(crate) enum UsdcTransferError {
+    #[error(transparent)]
+    GasReadiness(#[from] GasReadinessFailure),
     #[error("Alpaca wallet error: {0}")]
     AlpacaWallet(#[from] AlpacaWalletError),
     #[error("Alpaca broker API error: {0}")]
@@ -427,11 +430,65 @@ pub(crate) enum UsdcTransferError {
     },
 }
 
+impl UsdcTransferError {
+    pub(crate) fn gas_readiness_retry_interval(&self) -> Option<Duration> {
+        match self {
+            Self::GasReadiness(failure) => failure.retry_interval(),
+            Self::AlpacaWallet(_)
+            | Self::AlpacaBrokerApi(_)
+            | Self::Cctp(_)
+            | Self::BurnRevert(_)
+            | Self::Vault(_)
+            | Self::InsufficientVaultLiquidity { .. }
+            | Self::Aggregate(_)
+            | Self::WithdrawalFailed { .. }
+            | Self::DepositFailed { .. }
+            | Self::UsdcConversion(_)
+            | Self::ConversionPlacementFailed { .. }
+            | Self::Float(_)
+            | Self::InvalidShares(_)
+            | Self::NotPositive(_)
+            | Self::NotPositiveUsd(_)
+            | Self::InventoryView(_)
+            | Self::WithdrawableCashUnavailable { .. }
+            | Self::ResizedConversionBelowMinimum { .. }
+            | Self::MissingFilledQuantity { .. }
+            | Self::MissingFilledAveragePrice { .. }
+            | Self::ResumeIndeterminateConversion { .. }
+            | Self::ConversionBelowWithdrawalMinimum { .. }
+            | Self::BotGasEnqueue(_)
+            | Self::ConversionOutcomeUnresolved { .. }
+            | Self::PostDepositConversionShortFill { .. }
+            | Self::ResumeWithoutMintScanBound { .. }
+            | Self::AttestationTimedOut { .. }
+            | Self::AttestationRetryDeadlineElapsed { .. }
+            | Self::WithdrawalPollInconclusive { .. }
+            | Self::AttestationRetryDeadlineOverflow { .. }
+            | Self::AttestationNonceMismatch { .. }
+            | Self::PreviouslyFailedAggregate { .. }
+            | Self::DepositRefMustBeOnchain { .. }
+            | Self::ResumeDirectionMismatch { .. }
+            | Self::AdoptedWithdrawalAmountMismatch { .. }
+            | Self::WithdrawalRefMustBeAlpacaId { .. }
+            | Self::WalletUsdcInsufficient { .. }
+            | Self::WalletUsdcAmbientBalance { .. }
+            | Self::WithdrawalTxUnderconfirmed { .. }
+            | Self::SettlementCheckTransient { .. }
+            | Self::MintRecoveryInconclusive { .. }
+            | Self::BurnRecordTaskFailed { .. }
+            | Self::BurnRecordFailed { .. }
+            | Self::BurnSubmitInconclusive { .. }
+            | Self::BurnTxDropped { .. } => None,
+        }
+    }
+}
+
 impl BotGasFailureClassifier for UsdcTransferError {
     fn is_bot_gas_enqueue_failure(&self) -> bool {
         match self {
             Self::BotGasEnqueue(_) => true,
-            Self::AlpacaWallet(_)
+            Self::GasReadiness(_)
+            | Self::AlpacaWallet(_)
             | Self::AlpacaBrokerApi(_)
             | Self::Cctp(_)
             | Self::BurnRevert(_)

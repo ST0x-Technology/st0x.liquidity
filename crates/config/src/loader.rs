@@ -640,8 +640,8 @@ pub struct Ctx {
     pub apalis_finished_job_cleanup_interval_secs: u64,
     pub broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
-    /// Optional gas-balance alerting context. `Some` when the `[alerts]`
-    /// config section is present.
+    /// Gas-balance alerting and transfer-readiness context. Optional in
+    /// standalone mode and required in rebalancing mode.
     pub alerts: Option<AlertsCtx>,
     /// Notices collected during parsing, before any tracing subscriber
     /// existed. Emit via [`Ctx::emit_startup_notices`] once logging is up.
@@ -1580,6 +1580,13 @@ fn parse_and_validate(
         return Err(CtxError::MissingBotGasValuation);
     }
 
+    match (&trading_mode, &alerts) {
+        (TradingMode::Rebalancing(_), None) => {
+            return Err(CtxError::MissingAlertsForRebalancing);
+        }
+        (TradingMode::Rebalancing(_), Some(_)) | (TradingMode::Standalone, _) => {}
+    }
+
     let log_level = config.log_level.unwrap_or(LogLevel::Debug);
     let log_format = config.log_format.unwrap_or(LogFormat::Text);
     let log_query_url_template = config
@@ -2033,6 +2040,9 @@ impl Ctx {
         rest_api: Option<RestApiCtx>,
         #[builder(default = create_test_issuance_ctx())] issuance: IssuanceStatusCtx,
         redemption_wallet: Option<Address>,
+        /// Gas thresholds used by rebalancing admission and monitors. Fixtures
+        /// that enable rebalancing must provide this just like production.
+        alerts: Option<AlertsCtx>,
         bot_gas_valuation: Option<BotGasValuationConfig>,
         orchestrator: Option<OrchestratorConfig>,
     ) -> Result<Self, CtxError> {
@@ -2051,6 +2061,13 @@ impl Ctx {
 
         if matches!(trading_mode, TradingMode::Rebalancing(_)) && bot_gas_valuation.is_none() {
             return Err(CtxError::MissingBotGasValuation);
+        }
+
+        match (&trading_mode, &alerts) {
+            (TradingMode::Rebalancing(_), None) => {
+                return Err(CtxError::MissingAlertsForRebalancing);
+            }
+            (TradingMode::Rebalancing(_), Some(_)) | (TradingMode::Standalone, _) => {}
         }
 
         // Legacy: tests simulate the pre-migration state where the bot owns
@@ -2119,7 +2136,7 @@ impl Ctx {
             apalis_finished_job_cleanup_interval_secs,
             broker,
             telemetry: None,
-            alerts: None,
+            alerts,
             startup_notices: Vec::new(),
             pricing: None,
             trading_mode,
@@ -2299,6 +2316,11 @@ pub enum CtxError {
     )]
     MissingBotGasValuation,
     #[error(
+        "[alerts] section is required when rebalancing is enabled so every fresh \
+         transfer can verify its signing wallets have enough native gas"
+    )]
+    MissingAlertsForRebalancing,
+    #[error(
         "operation requires a configured [wallet] section, and a [chains.<name>] \
          entry supplying an rpc_url for every chain it signs on"
     )]
@@ -2374,6 +2396,7 @@ impl CtxError {
             Self::NotRebalancing => "operation requires rebalancing mode",
             Self::MissingTokenization => "operation requires tokenization config",
             Self::MissingBotGasValuation => "missing bot gas valuation config",
+            Self::MissingAlertsForRebalancing => "missing rebalancing gas thresholds",
             Self::ConfigIo { .. } => "failed to read config file",
             Self::SecretsIo { .. } => "failed to read secrets file",
             Self::ConfigToml { .. } => "failed to parse config",
@@ -2642,6 +2665,31 @@ mod tests {
             InventoryMode::Managed { inventory }
         );
         assert_eq!(ctx.chains.sole_trading().vault_owner, inventory);
+    }
+
+    #[test]
+    fn for_test_rebalancing_requires_alert_thresholds() {
+        let rebalancing = RebalancingCtx::stub()
+            .equity(crate::ImbalanceThreshold::new(float!(0.5), float!(0.1)).unwrap())
+            .call();
+
+        let result = Ctx::for_test()
+            .database_url(":memory:".to_owned())
+            .rpc_url(url::Url::parse("http://localhost:8545").unwrap())
+            .orderbook(address!("0x2222222222222222222222222222222222222222"))
+            .deployment_block(1)
+            .broker(BrokerCtx::DryRun)
+            .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing)))
+            .order_owner(address!("0x1111111111111111111111111111111111111111"))
+            .wallet(crate::OnchainWalletCtx::stub())
+            .assets(crate::ChainAssets::default())
+            .redemption_wallet(Address::with_last_byte(3))
+            .bot_gas_valuation(BotGasValuationConfig {
+                chainlink_feed: Address::with_last_byte(4),
+            })
+            .call();
+
+        assert!(matches!(result, Err(CtxError::MissingAlertsForRebalancing)));
     }
 
     /// Pins the first line of defense against database contention: every
@@ -5312,6 +5360,14 @@ mod tests {
             kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
+            [alerts]
+            poll_interval = 300
+            realert_interval = 3600
+
+            [alerts.low_balance_thresholds]
+            base = "0.05"
+            ethereum = "0.05"
+
             [broker]
             counter_trade_slippage_bps = 100
             close_flatten_cross_max_bps = 400
@@ -5412,6 +5468,14 @@ mod tests {
             [wallet]
             kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+            [alerts]
+            poll_interval = 300
+            realert_interval = 3600
+
+            [alerts.low_balance_thresholds]
+            base = "0.05"
+            ethereum = "0.05"
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -5516,6 +5580,37 @@ mod tests {
             bot_gas_valuation.chainlink_feed,
             address!("0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70")
         );
+    }
+
+    #[test]
+    fn rebalancing_without_alert_thresholds_fails() {
+        let config_str = rebalancing_toml_with_bot_gas_valuation(
+            r#"[bot_gas_valuation]
+            chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70""#,
+        )
+        .replace(
+            r#"            [alerts]
+            poll_interval = 300
+            realert_interval = 3600
+
+            [alerts.low_balance_thresholds]
+            base = "0.05"
+            ethereum = "0.05"
+
+"#,
+            "",
+        );
+        let secrets = rebalancing_secrets_toml();
+        let secrets_str = std::fs::read_to_string(secrets.path()).unwrap();
+
+        let result = parse_and_validate(
+            &config_str,
+            Path::new("config.toml"),
+            &secrets_str,
+            Path::new("secrets.toml"),
+        );
+
+        assert!(matches!(result, Err(CtxError::MissingAlertsForRebalancing)));
     }
 
     /// The full bot-gas section plus the section under test -- the splice
@@ -7499,6 +7594,28 @@ mod tests {
                 config.rebalancing.is_none() || config.bot_gas_valuation.is_some(),
                 "{path:?}: [rebalancing] is configured but [bot_gas_valuation] is \
                  missing -- parse_and_validate rejects this combination at startup"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_config_rebalancing_requires_alert_thresholds() {
+        for path in repo_config_paths() {
+            let contents = std::fs::read_to_string(&path).unwrap();
+            let config: Config = toml::from_str(&contents).unwrap();
+
+            if config.rebalancing.is_none() {
+                continue;
+            }
+
+            let alerts = AlertsCtx::new(config.alerts, &mut Vec::new()).unwrap_or_else(|error| {
+                panic!("{path:?}: invalid [alerts] gas thresholds: {error}")
+            });
+
+            assert!(
+                alerts.is_some(),
+                "{path:?}: [rebalancing] is configured but [alerts] is missing -- \
+                 fresh transfers would have no native-gas safety threshold"
             );
         }
     }

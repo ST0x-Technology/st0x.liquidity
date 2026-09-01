@@ -5318,9 +5318,10 @@ requests to the backend.
 
 The bot raises out-of-band alerts for conditions an operator must react to
 quickly. Every alert is emitted as a structured ERROR log (see "Structured log
-channel" below); the `[alerts]` config section is **optional** and gates only
-the gas monitor: when it is absent the bot runs normally and no gas monitor is
-spawned, while all other alert sources still log.
+channel" below). The `[alerts]` config section is optional only in standalone
+mode. Automated rebalancing requires it because its thresholds gate fresh
+transfers; in standalone mode, omitting it disables only the gas monitor while
+all other alert sources still log.
 
 ### Gas balance monitoring
 
@@ -5367,6 +5368,30 @@ observed usage.
   restart. Frequent restarts during a prolonged low-balance condition can
   therefore produce alerts more often than `realert_interval` alone would
   suggest.
+
+**Transfer admission.** Automated rebalancing fails closed on native-gas
+readiness before a fresh transfer can move funds. Equity mint and redemption
+check the Base signing wallet; both USDC directions check the signing wallets on
+Base and Ethereum. Every required balance must be readable and at or above that
+chain's configured low-balance threshold. A read failure or a balance below the
+threshold refuses the transfer with an error that names the chain, wallet,
+observed balance when available, and threshold. The boundary is inclusive: a
+balance exactly equal to the threshold is ready.
+
+The rebalancing trigger checks readiness before enqueueing a new transfer, and
+the transfer implementation checks again before the first fund-moving action to
+close the race between admission and job execution. A refusal creates no
+transfer aggregate events and performs no conversion, withdrawal, burn, mint,
+wrap, unwrap, or deposit. It does not terminally claim the imbalance, so a later
+trigger can retry after the wallet is funded. Once a transfer has started, its
+persisted lifecycle state controls recovery; resuming it does not rerun the
+fresh-transfer admission check or strand funds that are already in flight.
+
+Because rebalancing consumes the gas thresholds as a safety boundary, `[alerts]`
+remains optional only when automated rebalancing is disabled. A configuration
+that enables rebalancing without `[alerts]` fails at startup. Automatic funding
+from another wallet is not part of this behavior; prolonged low balances
+continue to use the monitor's repeated operational alerts.
 
 ### Structured log channel
 

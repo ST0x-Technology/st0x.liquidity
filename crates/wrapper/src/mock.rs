@@ -4,6 +4,7 @@ use alloy::primitives::{Address, TxHash, U256};
 use alloy::transports::RpcError;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use st0x_evm::{EvmError, NODE_SYNC_MAX_ATTEMPTS};
@@ -40,6 +41,7 @@ pub struct MockWrapper {
     tokenized_shares: Address,
     wrapped_token: Address,
     ratio: U256,
+    ratio_calls: AtomicUsize,
     failure: MockFailure,
     /// Maps tx hashes to their submitted amounts for confirm methods.
     submitted_amounts: Mutex<HashMap<TxHash, U256>>,
@@ -55,6 +57,7 @@ impl MockWrapper {
             tokenized_shares: Address::random(),
             wrapped_token: Address::ZERO,
             ratio: RATIO_ONE,
+            ratio_calls: AtomicUsize::new(0),
             failure: MockFailure::None,
             submitted_amounts: Mutex::new(HashMap::new()),
             wait_for_block_calls: Mutex::new(Vec::new()),
@@ -69,6 +72,7 @@ impl MockWrapper {
             tokenized_shares: Address::random(),
             wrapped_token: Address::ZERO,
             ratio,
+            ratio_calls: AtomicUsize::new(0),
             failure: MockFailure::None,
             submitted_amounts: Mutex::new(HashMap::new()),
             wait_for_block_calls: Mutex::new(Vec::new()),
@@ -179,6 +183,11 @@ impl MockWrapper {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
+
+    /// Returns how many onchain ratio reads the mock received.
+    pub fn ratio_calls(&self) -> usize {
+        self.ratio_calls.load(Ordering::SeqCst)
+    }
 }
 
 impl Default for MockWrapper {
@@ -193,6 +202,7 @@ impl Wrapper for MockWrapper {
         &self,
         _symbol: &Symbol,
     ) -> Result<UnderlyingPerWrapped, WrapperError> {
+        self.ratio_calls.fetch_add(1, Ordering::SeqCst);
         Ok(UnderlyingPerWrapped::new(self.ratio)?)
     }
 
