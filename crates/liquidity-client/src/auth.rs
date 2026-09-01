@@ -20,13 +20,13 @@ pub enum AuthError {
 }
 
 impl std::fmt::Display for AuthError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let reason: &dyn std::fmt::Display = match self {
             Self::Credentials(source) => source,
             Self::Flow(reason) => reason,
         };
         write!(
-            f,
+            formatter,
             "could not obtain a T0 Google identity: {reason}\nFor staging, complete the browser sign-in when prompted. For production, ensure Application Default Credentials (a service account, workload identity, or impersonation) can mint an ID token for the configured audience."
         )
     }

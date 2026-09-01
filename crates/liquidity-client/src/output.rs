@@ -13,12 +13,15 @@ pub enum OutputError {
 }
 
 impl std::fmt::Display for OutputError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Encode(source) => {
-                write!(f, "the response could not be re-encoded as JSON: {source}")
+                write!(
+                    formatter,
+                    "the response could not be re-encoded as JSON: {source}"
+                )
             }
-            Self::Write(source) => write!(f, "could not write output: {source}"),
+            Self::Write(source) => write!(formatter, "could not write output: {source}"),
         }
     }
 }
@@ -53,11 +56,11 @@ mod tests {
     use super::{OutputError, write_json};
 
     #[test]
-    fn writes_compact_json_with_a_trailing_newline() {
+    fn writes_compact_json_with_a_trailing_newline() -> Result<(), Box<dyn std::error::Error>> {
         let mut buffer = Vec::new();
-        let result = write_json(&mut buffer, &serde_json::json!({ "a": 1, "b": [2, 3] }));
-        assert!(matches!(result, Ok(())));
+        write_json(&mut buffer, &serde_json::json!({ "a": 1, "b": [2, 3] }))?;
         assert_eq!(buffer, b"{\"a\":1,\"b\":[2,3]}\n");
+        Ok(())
     }
 
     struct FailWriter;

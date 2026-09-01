@@ -161,17 +161,29 @@ mod tests {
 
     #[test]
     fn rejects_non_https_scheme() {
-        assert!(parse_base_url("T0_LIQUIDITY_STAGING", "http://liquidity.example.com").is_err());
+        assert!(
+            parse_base_url("T0_LIQUIDITY_STAGING", "http://liquidity.example.com")
+                .err()
+                .is_some_and(|error| error.to_string().contains("must use https"))
+        );
     }
 
     #[test]
     fn rejects_url_without_host() {
-        assert!(parse_base_url("T0_LIQUIDITY_STAGING", "https://").is_err());
+        assert!(
+            parse_base_url("T0_LIQUIDITY_STAGING", "https://")
+                .err()
+                .is_some_and(|error| error.to_string().contains("is not a valid URL"))
+        );
     }
 
     #[test]
     fn rejects_malformed_url() {
-        assert!(parse_base_url("T0_LIQUIDITY_STAGING", "not a url").is_err());
+        assert!(
+            parse_base_url("T0_LIQUIDITY_STAGING", "not a url")
+                .err()
+                .is_some_and(|error| error.to_string().contains("is not a valid URL"))
+        );
     }
 
     #[test]
@@ -184,12 +196,20 @@ mod tests {
 
     #[test]
     fn rejects_zero_timeout() {
-        assert!(parse_timeout_secs("T", "0").is_err());
+        assert!(
+            parse_timeout_secs("T", "0")
+                .err()
+                .is_some_and(|error| error.to_string().contains("must be greater than zero"))
+        );
     }
 
     #[test]
     fn rejects_non_numeric_timeout() {
-        assert!(parse_timeout_secs("T", "abc").is_err());
+        assert!(parse_timeout_secs("T", "abc").err().is_some_and(|error| {
+            error
+                .to_string()
+                .contains("must be a whole number of seconds")
+        }));
     }
 
     #[test]
@@ -203,7 +223,13 @@ mod tests {
                 ("T0_LIQUIDITY_STAGING_REQUEST_TIMEOUT_SECS", None),
                 ("T0_LIQUIDITY_STAGING_CONNECT_TIMEOUT_SECS", Some("10")),
             ],
-            || assert!(resolve(Env::Staging).is_err()),
+            || {
+                assert!(resolve(Env::Staging).err().is_some_and(|error| {
+                    error
+                        .to_string()
+                        .contains("T0_LIQUIDITY_STAGING_REQUEST_TIMEOUT_SECS")
+                }));
+            },
         );
     }
 
@@ -218,7 +244,13 @@ mod tests {
                 ("T0_LIQUIDITY_STAGING_REQUEST_TIMEOUT_SECS", Some("30")),
                 ("T0_LIQUIDITY_STAGING_CONNECT_TIMEOUT_SECS", None),
             ],
-            || assert!(resolve(Env::Staging).is_err()),
+            || {
+                assert!(resolve(Env::Staging).err().is_some_and(|error| {
+                    error
+                        .to_string()
+                        .contains("T0_LIQUIDITY_STAGING_CONNECT_TIMEOUT_SECS")
+                }));
+            },
         );
     }
 
@@ -233,7 +265,13 @@ mod tests {
                 ("T0_LIQUIDITY_PROD_REQUEST_TIMEOUT_SECS", None),
                 ("T0_LIQUIDITY_PROD_CONNECT_TIMEOUT_SECS", Some("10")),
             ],
-            || assert!(resolve(Env::Production).is_err()),
+            || {
+                assert!(resolve(Env::Production).err().is_some_and(|error| {
+                    error
+                        .to_string()
+                        .contains("T0_LIQUIDITY_PROD_REQUEST_TIMEOUT_SECS")
+                }));
+            },
         );
     }
 
@@ -248,7 +286,13 @@ mod tests {
                 ("T0_LIQUIDITY_PROD_REQUEST_TIMEOUT_SECS", Some("30")),
                 ("T0_LIQUIDITY_PROD_CONNECT_TIMEOUT_SECS", None),
             ],
-            || assert!(resolve(Env::Production).is_err()),
+            || {
+                assert!(resolve(Env::Production).err().is_some_and(|error| {
+                    error
+                        .to_string()
+                        .contains("T0_LIQUIDITY_PROD_CONNECT_TIMEOUT_SECS")
+                }));
+            },
         );
     }
 }

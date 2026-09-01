@@ -33,26 +33,35 @@ fn server_said(body: &str) -> String {
 }
 
 impl std::fmt::Display for TransportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Transport(url, source) => {
-                write!(f, "could not reach the liquidity API at {url}: {source}")
+                write!(
+                    formatter,
+                    "could not reach the liquidity API at {url}: {source}"
+                )
             }
             Self::Unauthorized(body) => write!(
-                f,
+                formatter,
                 "HTTP 401 Unauthorized: the T0 Google identity was missing, expired, or invalid.\nRefresh the T0 login (gcloud auth login) or, in CI, the T0 workload identity, then retry.{}",
                 server_said(body)
             ),
             Self::Forbidden(body) => write!(
-                f,
+                formatter,
                 "HTTP 403 Forbidden: authenticated, but your T0 Workspace group is not on this command's access list.{}",
                 server_said(body)
             ),
             Self::Http(status, body) => {
-                write!(f, "HTTP {status}: the request failed.{}", server_said(body))
+                write!(
+                    formatter,
+                    "HTTP {status}: the request failed.{}",
+                    server_said(body)
+                )
             }
-            Self::Decode(detail) => write!(f, "the API response could not be decoded: {detail}"),
-            Self::Auth(source) => write!(f, "{source}"),
+            Self::Decode(detail) => {
+                write!(formatter, "the API response could not be decoded: {detail}")
+            }
+            Self::Auth(source) => write!(formatter, "{source}"),
         }
     }
 }

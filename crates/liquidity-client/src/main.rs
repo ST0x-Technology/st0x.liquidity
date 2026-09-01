@@ -84,11 +84,11 @@ impl From<AuthError> for ApiError {
 }
 
 impl std::fmt::Display for ApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Transport(error) => write!(f, "{error}"),
-            Self::Output(error) => write!(f, "{error}"),
-            Self::Auth(error) => write!(f, "{error}"),
+            Self::Transport(error) => write!(formatter, "{error}"),
+            Self::Output(error) => write!(formatter, "{error}"),
+            Self::Auth(error) => write!(formatter, "{error}"),
         }
     }
 }
