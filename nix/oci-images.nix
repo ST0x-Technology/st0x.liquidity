@@ -141,12 +141,13 @@ let
         # With no URI part, nginx forwards the original request URI unchanged.
         # Every location is GET-only (limit_except GET also admits HEAD).
         # The dashboard is a read surface; the bot's /transfers/resume and
-        # /transfers/recheck/{kind}/{id} are POST mutation endpoints that
-        # src/api.rs marks TODO(auth) -- unauthenticated by design until the
-        # role-gated API work, so they must stay unreachable through any
-        # exposed surface. Forwarding paths correctly (the fix above) would
-        # otherwise have exposed them here. Operators invoke them via an IAP
-        # tunnel to the bot port directly; this proxy refuses the method.
+        # /transfers/recheck/{kind}/{id} are POST mutation endpoints and now
+        # carry their own guards (src/api.rs): the bare mounts admit only
+        # loopback peers (the in-container st0x-cli via docker exec), and
+        # network operators use the IAP-verified /liquidity-write mount.
+        # This proxy still refuses the method as defense in depth. An IAP
+        # tunnel to the bot port can no longer invoke them: the peer is the
+        # bridge interface, not loopback, and the bot answers 403.
         location /api/ws {
           limit_except GET { deny all; }
           proxy_pass http://$bot_upstream;

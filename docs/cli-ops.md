@@ -267,11 +267,15 @@ so the recovery event dispatches through the in-process inventory reactor (which
 corrects the live inventory view) and shares the bot's resume lock (so it cannot
 race `/transfers/resume` into a double on-chain wrap).
 
-> **Operational guardrail:** like `/transfers/resume`, the `/transfers/recheck`
-> endpoint is currently **unauthenticated** — any caller that can reach
-> `server_port` can recover live transfers and trigger inventory-affecting
-> workflow steps. Until an auth guard is added, the bot's `server_port` **must**
-> be bound to an operator-only/firewalled interface and never exposed publicly.
+> **Operational guardrail:** the bare `/transfers/resume` and
+> `/transfers/recheck` mounts admit **loopback peers only**: the sanctioned
+> caller is `st0x-cli` running inside the bot's container (`docker exec`),
+> which connects to `127.0.0.1`. Reaching `server_port` over the network (an
+> IAP tunnel to the port, a VPC-internal curl) gets `403` with an
+> `{"error": ...}` body: that is the guard working, not the bot broken. The
+> network route for operators is the IAP-verified `/liquidity-write/*` mount
+> behind the load balancer, which requires membership in the write-tier
+> Workspace group.
 
 Recoverable cases:
 

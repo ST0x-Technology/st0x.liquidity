@@ -1403,7 +1403,8 @@ struct RecheckResponse {
 /// Auth: reachable on two mounts with two different gates. The bare mount is
 /// loopback-only (`require_loopback`) -- the in-container `st0x-cli` path --
 /// and the `/liquidity-write` mount is IAP-verified for operators coming
-/// through the load balancer. There is no unauthenticated network route left.
+/// through the load balancer. No unauthenticated network route to the
+/// mutation endpoints remains.
 async fn recheck_transfer(
     State(state): State<AppState>,
     Path((kind_str, id)): Path<(String, String)>,
@@ -1694,8 +1695,26 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
         return Router::new();
     };
 
-    let read_verifier = Arc::new(IapVerifier::new(ops_api.read_audience.clone(), "read"));
-    let write_verifier = Arc::new(IapVerifier::new(ops_api.write_audience.clone(), "write"));
+    // One HTTP client shared by both verifiers (reqwest::Client clones are
+    // Arc clones): both fetch the same Google JWKS document. The timeouts
+    // are load-bearing, not hygiene -- the verifier's refresh slot is held
+    // for the duration of a fetch, so an unbounded request during a Google
+    // outage would pin it. 10s matches the kms_jwt convention.
+    let jwks_http = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("static client config cannot fail");
+    let read_verifier = Arc::new(IapVerifier::new(
+        ops_api.read_audience.clone(),
+        "read",
+        jwks_http.clone(),
+    ));
+    let write_verifier = Arc::new(IapVerifier::new(
+        ops_api.write_audience.clone(),
+        "write",
+        jwks_http,
+    ));
 
     let read = Router::new()
         .route(
@@ -1708,12 +1727,17 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
         }));
 
     // `recheck` re-drives a transfer and completes it if the provider has
-    // settled it, so it moves real state and belongs to the narrower group.
+    // settled it, and `resume` re-drives EVERY interrupted transfer: both
+    // move real state and belong to the narrower group. Resume must be here
+    // because the bare mounts below are loopback-only -- without this mount,
+    // bulk resume would have no network route at all and an incident with
+    // SSH unavailable could not recover interrupted transfers.
     let write = Router::new()
         .route(
             "/liquidity-write/transfers/recheck/{kind}/{id}",
             post(recheck_transfer),
         )
+        .route("/liquidity-write/transfers/resume", post(resume_transfers))
         .layer(axum::middleware::from_fn(move |request, next| {
             let verifier = Arc::clone(&write_verifier);
             async move { require_iap(verifier, request, next).await }
@@ -1734,7 +1758,10 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
 /// so it is refused here and must use the IAP-verified `/liquidity-write`
 /// mount instead. A request with no recorded peer address is refused too:
 /// fail closed rather than guess.
-async fn require_loopback(request: Request, next: Next) -> Result<Response, StatusCode> {
+async fn require_loopback(
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let peer_is_loopback = request
         .extensions()
         .get::<ConnectInfo<std::net::SocketAddr>>()
@@ -1746,7 +1773,16 @@ async fn require_loopback(request: Request, next: Next) -> Result<Response, Stat
             path = %request.uri().path(),
             "Refusing non-loopback caller on an operator-only mutation path"
         );
-        return Err(StatusCode::FORBIDDEN);
+        // Same JSON error shape as the handlers this guard fronts, so ops
+        // tooling parses one contract for the whole route family.
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "operator-only path: use the in-container CLI or the \
+                        /liquidity-write mount"
+                    .to_string(),
+            }),
+        ));
     }
 
     Ok(next.run(request).await)
@@ -4422,6 +4458,31 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "{label}");
         }
+    }
+
+    /// Pins the production serve wiring: `serve_with_peer_info` must record
+    /// the TCP peer, or the loopback gate fails closed and the in-container
+    /// CLI's recovery verbs 403 in production while every hand-injected
+    /// ConnectInfo test stays green. This is the one test that goes through a
+    /// real socket instead of injecting the extension.
+    #[tokio::test]
+    async fn real_listener_supplies_peer_info_to_the_loopback_gate() {
+        let app = axum::Router::new()
+            .route("/op", axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(require_loopback));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("ephemeral port binds");
+        let addr = listener.local_addr().expect("bound socket has an address");
+        tokio::spawn(crate::serve_with_peer_info(listener, app));
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/op"))
+            .send()
+            .await
+            .expect("server reachable");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
     }
 
     /// `routes(None)` must leave the role prefixes unmounted entirely: a

@@ -72,7 +72,7 @@ struct Jwk {
 
 #[derive(Debug, Deserialize)]
 struct JwkSet {
-    keys: Vec<Jwk>,
+    keys: Vec<serde_json::Value>,
 }
 
 /// The claims worth reading. IAP sets more; these are the ones that decide
@@ -89,18 +89,26 @@ struct IapClaims {
 struct CachedKeys {
     keys: Vec<(String, DecodingKey)>,
     fetched_at: Instant,
-    last_refresh_attempt: Instant,
 }
 
 /// Verifies IAP assertions against one expected audience.
 ///
 /// One instance per role prefix: the audience is what separates them.
 pub(crate) struct IapVerifier {
-    audience: String,
     role: &'static str,
     http: reqwest::Client,
     jwks_url: String,
+    /// Built once at construction: audience, issuer, and required claims
+    /// never change per request.
+    validation: Validation,
     keys: RwLock<Option<CachedKeys>>,
+    /// When the last outbound JWKS fetch was STARTED, successful or not.
+    /// Lives outside `CachedKeys` so the refresh floor also covers a cold
+    /// cache during an outage (a per-request fetch storm otherwise) and can
+    /// be claimed without holding the key lock across the network call.
+    /// A std Mutex: only ever held for a read-modify-write, never across an
+    /// await.
+    last_refresh_attempt: std::sync::Mutex<Option<Instant>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -141,19 +149,41 @@ impl IntoResponse for IapError {
     fn into_response(self) -> Response {
         // The body stays deliberately vague. A caller who failed to
         // authenticate learns nothing about which check failed; the detail
-        // goes to the log, where an operator can see it.
-        (self.status(), self.to_string()).into_response()
+        // goes to the log, where an operator can see it. JSON, because the
+        // handlers behind this gate answer {"error": ...} and ops tooling
+        // should parse one shape for the whole route family.
+        (
+            self.status(),
+            axum::Json(serde_json::json!({ "error": self.to_string() })),
+        )
+            .into_response()
     }
 }
 
 impl IapVerifier {
-    pub(crate) fn new(audience: String, role: &'static str) -> Self {
+    /// `http` is shared between the per-role verifiers (reqwest::Client is a
+    /// cheap Arc clone) and MUST carry timeouts: the JWKS fetch otherwise has
+    /// no bound, and an unbounded fetch during a Google outage would pin the
+    /// refresh slot. See [`ops_api_routes`] for the one place it is built.
+    pub(crate) fn new(audience: String, role: &'static str, http: reqwest::Client) -> Self {
+        let mut validation = Validation::new(Algorithm::ES256);
+        validation.set_audience(&[&audience]);
+        validation.set_issuer(&[IAP_ISSUER]);
+        validation.leeway = LEEWAY_SECS;
+        // `exp` is what bounds a stolen token's usefulness, so its absence
+        // must be a rejection rather than an unbounded token.
+        validation.required_spec_claims = ["exp", "aud", "iss"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
         Self {
-            audience,
             role,
-            http: reqwest::Client::new(),
+            http,
             jwks_url: IAP_JWKS_URL.to_string(),
+            validation,
             keys: RwLock::new(None),
+            last_refresh_attempt: std::sync::Mutex::new(None),
         }
     }
 
@@ -161,7 +191,7 @@ impl IapVerifier {
     fn with_jwks_url(audience: String, role: &'static str, jwks_url: String) -> Self {
         Self {
             jwks_url,
-            ..Self::new(audience, role)
+            ..Self::new(audience, role, reqwest::Client::new())
         }
     }
 
@@ -179,18 +209,7 @@ impl IapVerifier {
 
         let key = self.decoding_key(&kid).await?;
 
-        let mut validation = Validation::new(Algorithm::ES256);
-        validation.set_audience(&[&self.audience]);
-        validation.set_issuer(&[IAP_ISSUER]);
-        validation.leeway = LEEWAY_SECS;
-        // `exp` is what bounds a stolen token's usefulness, so its absence
-        // must be a rejection rather than an unbounded token.
-        validation.required_spec_claims = ["exp", "aud", "iss"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-
-        let claims = decode::<IapClaims>(token, &key, &validation).map_err(|error| {
+        let claims = decode::<IapClaims>(token, &key, &self.validation).map_err(|error| {
             // Includes the audience mismatch case: a token minted for another
             // role's backend lands here.
             warn!(
@@ -255,33 +274,50 @@ impl IapVerifier {
     }
 
     async fn refresh(&self, kid: &str) -> Result<(), IapError> {
-        let mut guard = self.keys.write().await;
-
-        // Another task may have refreshed while this one waited for the lock.
-        if let Some(cached) = guard.as_ref() {
-            let fresh = cached.fetched_at.elapsed() <= JWKS_TTL;
-            if fresh && cached.keys.iter().any(|(id, _)| id == kid) {
-                return Ok(());
-            }
-            if cached.last_refresh_attempt.elapsed() < UNKNOWN_KID_REFRESH_INTERVAL {
-                // One outbound request per interval, whatever the trigger: an
-                // unknown kid on a fresh set is a bad token rather than a
-                // rotation we have missed, and a stale set during a Google
-                // outage must not turn every request into a fetch. The
-                // retained keys keep serving in the meantime.
-                return Ok(());
+        // Another task may have refreshed while this one was on its way here.
+        {
+            let guard = self.keys.read().await;
+            if let Some(cached) = guard.as_ref() {
+                if cached.fetched_at.elapsed() <= JWKS_TTL
+                    && cached.keys.iter().any(|(id, _)| id == kid)
+                {
+                    return Ok(());
+                }
             }
         }
 
-        let now = Instant::now();
-        let fetched = self.fetch_keys().await;
+        // Claim the single refresh slot or yield to the floor: one outbound
+        // request per interval, whatever the trigger. An unknown kid on a
+        // fresh set is a bad token rather than a rotation we have missed; a
+        // stale set (or a COLD cache) during a Google outage must not turn
+        // every request into a fetch. Retained keys keep serving meanwhile.
+        {
+            let mut attempt = self
+                .last_refresh_attempt
+                .lock()
+                .map_err(|_| IapError::KeysUnavailable)?;
+            if attempt.is_some_and(|at| at.elapsed() < UNKNOWN_KID_REFRESH_INTERVAL) {
+                // Throttled. With retained keys the caller's follow-up lookup
+                // serves them; with a cold cache there is nothing to judge
+                // against, which is the KeysUnavailable case, not a claim
+                // that the token's key is unknown.
+                if self.keys.read().await.is_none() {
+                    return Err(IapError::KeysUnavailable);
+                }
+                return Ok(());
+            }
+            *attempt = Some(Instant::now());
+        }
 
-        match fetched {
+        // The fetch deliberately runs with NO lock held: a slow or hung
+        // fetch must not block readers away from the retained keys (that
+        // would defeat the stale-serving policy below), and the client's
+        // timeouts bound the slot claimed above.
+        match self.fetch_keys().await {
             Ok(keys) => {
-                *guard = Some(CachedKeys {
+                *self.keys.write().await = Some(CachedKeys {
                     keys,
-                    fetched_at: now,
-                    last_refresh_attempt: now,
+                    fetched_at: Instant::now(),
                 });
                 Ok(())
             }
@@ -292,18 +328,20 @@ impl IapVerifier {
                 // transient failure to reach Google: the keys are still
                 // Google's, and a signature that verifies against one is still
                 // proof the token is genuine. Only a cold cache is fatal.
-                match guard.as_mut() {
-                    Some(cached) => {
-                        cached.last_refresh_attempt = now;
-                        Ok(())
-                    }
-                    None => Err(IapError::KeysUnavailable),
+                if self.keys.read().await.is_some() {
+                    Ok(())
+                } else {
+                    Err(IapError::KeysUnavailable)
                 }
             }
         }
     }
 
     async fn fetch_keys(&self) -> Result<Vec<(String, DecodingKey)>, reqwest::Error> {
+        // Entries are parsed one by one, not as a typed Vec<Jwk>: a single
+        // entry this code cannot use (an RSA key, a key without x/y) must be
+        // SKIPPED, not fail deserialization of the whole document and take
+        // every valid key down with it.
         let set: JwkSet = self
             .http
             .get(&self.jwks_url)
@@ -316,7 +354,12 @@ impl IapVerifier {
         Ok(set
             .keys
             .into_iter()
-            .filter_map(|jwk| {
+            .filter_map(|entry| {
+                let jwk: Jwk = serde_json::from_value(entry)
+                    .inspect_err(|error| {
+                        warn!(target: "iap", %error, "Skipping non-EC IAP key entry");
+                    })
+                    .ok()?;
                 DecodingKey::from_ec_components(&jwk.x, &jwk.y)
                     .inspect_err(|error| {
                         warn!(
@@ -352,10 +395,16 @@ pub(crate) async fn require_iap(
             IapError::MissingAssertion
         })?
         .to_str()
-        .map_err(|_| IapError::MalformedAssertion)?
-        .to_string();
+        .map_err(|_| {
+            warn!(
+                target: "iap",
+                role = verifier.role,
+                "IAP assertion header is not valid UTF-8"
+            );
+            IapError::MalformedAssertion
+        })?;
 
-    verifier.verify(&token).await?;
+    verifier.verify(token).await?;
 
     Ok(next.run(request).await)
 }
@@ -618,7 +667,8 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    /// Seeds the verifier's cache as if the keys were fetched two TTLs ago.
+    /// Seeds the verifier's cache as if the keys were fetched two TTLs ago,
+    /// with the refresh floor long expired so a refresh attempt is permitted.
     async fn seed_stale_cache(verifier: &IapVerifier, key: &TestKey) {
         let decoding = DecodingKey::from_ec_components(&key.x, &key.y).expect("test key converts");
         let long_ago = Instant::now()
@@ -628,8 +678,8 @@ mod tests {
         *verifier.keys.write().await = Some(CachedKeys {
             keys: vec![(TEST_KID.to_string(), decoding)],
             fetched_at: long_ago,
-            last_refresh_attempt: long_ago,
         });
+        *verifier.last_refresh_attempt.lock().expect("not poisoned") = Some(long_ago);
     }
 
     /// The stated policy is that a stale key set beats refusing every request

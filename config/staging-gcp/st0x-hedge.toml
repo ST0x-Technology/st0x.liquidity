@@ -19,17 +19,6 @@ server_port = 8001
 # HTTP port for the apalis-board job queue UI.
 board_port = 8002
 
-# IAP audiences for the role-gated ops API, from the `ops_api_audiences`
-# output of terraform/staging-liquidity (applied 2026-08-27, PR #359). The
-# bot pins the audience per path prefix, so a token IAP minted for the read
-# backend is refused on the write path even though its signature is valid.
-#
-# Not secrets: an audience names an IAM-gated backend and is useless without
-# an identity Google will sign for. Removing this section unmounts the
-# role-gated routes entirely.
-[ops_api]
-read_audience = "/projects/819265953297/global/backendServices/6620592880358364228"
-write_audience = "/projects/819265953297/global/backendServices/6816788502563099716"
 # Minimum log level: trace, debug, info, warn, error.
 log_level = "trace"
 # Directory for rotated log files (stdout if omitted).
@@ -43,6 +32,19 @@ apalis_finished_job_cleanup_interval_secs = 3600
 # reconciliation.
 inventory_divergence_threshold = 10
 hedge_order_gate_reconciliation_timeout_secs = 10
+
+# IAP audiences for the role-gated ops API, from the `ops_api_audiences`
+# output of terraform/staging-liquidity (applied 2026-08-27). The bot pins
+# the audience per path prefix, so a token IAP minted for the read backend
+# is refused on the write path even though its signature is valid.
+#
+# Not secrets: an audience names an IAM-gated backend and is useless without
+# an identity Google will sign for. Removing this section unmounts the
+# role-gated routes entirely. This table header ends the file's top-level
+# key scope, so it must stay BELOW every bare key above.
+[ops_api]
+read_audience = "/projects/819265953297/global/backendServices/6620592880358364228"
+write_audience = "/projects/819265953297/global/backendServices/6816788502563099716"
 
 [pricing]
 # The pricing plane on Cloud Run for THIS environment. Auth is the VM's

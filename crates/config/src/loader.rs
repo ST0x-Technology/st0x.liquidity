@@ -1535,6 +1535,15 @@ fn parse_and_validate(
         if ops_api.read_audience.trim().is_empty() || ops_api.write_audience.trim().is_empty() {
             return Err(CtxError::OpsApiAudienceBlank);
         }
+        // The verifier pins the audience byte for byte (jsonwebtoken compares
+        // `aud` exactly), so a copy-pasted trailing space would pass a
+        // trimmed-only validation here and then 401 every real token at
+        // runtime with no startup signal. Refuse padding outright.
+        if ops_api.read_audience.trim() != ops_api.read_audience
+            || ops_api.write_audience.trim() != ops_api.write_audience
+        {
+            return Err(CtxError::OpsApiAudiencePadded);
+        }
         if ops_api.read_audience == ops_api.write_audience {
             return Err(CtxError::OpsApiAudiencesEqual);
         }
@@ -2197,6 +2206,12 @@ pub enum CtxError {
     )]
     OpsApiAudienceBlank,
     #[error(
+        "[ops_api] audiences must not carry leading or trailing whitespace: the verifier \
+         pins the audience byte for byte, so a padded value would reject every real IAP \
+         token at runtime instead of failing here"
+    )]
+    OpsApiAudiencePadded,
+    #[error(
         "[ops_api] read_audience and write_audience must differ: equal audiences let a \
          read-tier IAP assertion pass the write verifier, collapsing the role tiers"
     )]
@@ -2494,6 +2509,7 @@ impl CtxError {
             }
             Self::LogQueryUrlTemplateNotAUrl { .. } => "log_query_url_template is not a valid URL",
             Self::OpsApiAudienceBlank => "[ops_api] audience is blank",
+            Self::OpsApiAudiencePadded => "[ops_api] audience has surrounding whitespace",
             Self::OpsApiAudiencesEqual => "[ops_api] audiences are equal",
         }
     }
@@ -4307,14 +4323,19 @@ mod tests {
     /// at load so the collapse cannot reach the verifiers.
     #[tokio::test]
     async fn ops_api_audiences_must_differ_and_be_non_blank() {
-        for (read, write, expect_equal) in [
+        for (read, write, expect) in [
             (
                 "/projects/1/global/backendServices/11",
                 "/projects/1/global/backendServices/11",
-                true,
+                "equal",
             ),
-            ("", "/projects/1/global/backendServices/22", false),
-            ("/projects/1/global/backendServices/11", "  ", false),
+            ("", "/projects/1/global/backendServices/22", "blank"),
+            ("/projects/1/global/backendServices/11", "  ", "blank"),
+            (
+                "/projects/1/global/backendServices/11",
+                "/projects/1/global/backendServices/22 ",
+                "padded",
+            ),
         ] {
             let config = toml_file(&format!(
                 r#"
@@ -4362,17 +4383,13 @@ mod tests {
                 .await
                 .unwrap_err();
 
-            if expect_equal {
-                assert!(
-                    matches!(error, CtxError::OpsApiAudiencesEqual),
-                    "expected OpsApiAudiencesEqual, got: {error:#}"
-                );
-            } else {
-                assert!(
-                    matches!(error, CtxError::OpsApiAudienceBlank),
-                    "expected OpsApiAudienceBlank, got: {error:#}"
-                );
-            }
+            let matched = match expect {
+                "equal" => matches!(error, CtxError::OpsApiAudiencesEqual),
+                "blank" => matches!(error, CtxError::OpsApiAudienceBlank),
+                "padded" => matches!(error, CtxError::OpsApiAudiencePadded),
+                other => unreachable!("unknown expectation {other}"),
+            };
+            assert!(matched, "expected {expect} audience error, got: {error:#}");
         }
     }
 
