@@ -1526,6 +1526,20 @@ fn parse_and_validate(
         });
     }
 
+    // The audiences are what keep the read and write tiers apart: each role
+    // prefix's verifier pins the audience IAP minted for that prefix's
+    // backend. Equal (or blank) audiences would make a read-tier assertion
+    // verify on the write path, silently collapsing the tiers, so a config
+    // that says that is refused outright.
+    if let Some(ops_api) = &config.ops_api {
+        if ops_api.read_audience.trim().is_empty() || ops_api.write_audience.trim().is_empty() {
+            return Err(CtxError::OpsApiAudienceBlank);
+        }
+        if ops_api.read_audience == ops_api.write_audience {
+            return Err(CtxError::OpsApiAudiencesEqual);
+        }
+    }
+
     validate_asset_tables(&config.assets, &config.chains)?;
     let polling_intervals = validated_polling_intervals(&config)?;
 
@@ -2178,6 +2192,16 @@ pub enum CtxError {
     #[error("log_query_url_template must contain the {{id}} placeholder")]
     LogQueryUrlTemplateMissingIdPlaceholder,
     #[error(
+        "[ops_api] audiences must not be blank: each role prefix's verifier pins the \
+         audience IAP mints for that prefix's backend, and a blank pin verifies nothing"
+    )]
+    OpsApiAudienceBlank,
+    #[error(
+        "[ops_api] read_audience and write_audience must differ: equal audiences let a \
+         read-tier IAP assertion pass the write verifier, collapsing the role tiers"
+    )]
+    OpsApiAudiencesEqual,
+    #[error(
         "[broker] type = \"alpaca-broker-api-kms\" requires mode = \"production\": the \
          keyless token mint targets the live authx.alpaca.markets endpoint, so a sandbox or \
          mock broker mode would silently mint production bearer tokens"
@@ -2469,6 +2493,8 @@ impl CtxError {
                 "log_query_url_template missing {id} placeholder"
             }
             Self::LogQueryUrlTemplateNotAUrl { .. } => "log_query_url_template is not a valid URL",
+            Self::OpsApiAudienceBlank => "[ops_api] audience is blank",
+            Self::OpsApiAudiencesEqual => "[ops_api] audiences are equal",
         }
     }
 }
@@ -4274,6 +4300,80 @@ mod tests {
             matches!(error, CtxError::ServerAndBoardPortsMatch { port: 8080 }),
             "expected ServerAndBoardPortsMatch for equal ports, got: {error:#}"
         );
+    }
+
+    /// Equal audiences would let a read-tier IAP assertion pass the write
+    /// verifier, and a blank audience pins nothing at all -- both are refused
+    /// at load so the collapse cannot reach the verifiers.
+    #[tokio::test]
+    async fn ops_api_audiences_must_differ_and_be_non_blank() {
+        for (read, write, expect_equal) in [
+            (
+                "/projects/1/global/backendServices/11",
+                "/projects/1/global/backendServices/11",
+                true,
+            ),
+            ("", "/projects/1/global/backendServices/22", false),
+            ("/projects/1/global/backendServices/11", "  ", false),
+        ] {
+            let config = toml_file(&format!(
+                r#"
+                database_url = ":memory:"
+                server_port = 8080
+                board_port = 8081
+                apalis_finished_job_cleanup_interval_secs = 3600
+                inventory_divergence_threshold = 10
+                hedge_order_gate_reconciliation_timeout_secs = 10
+
+                [ops_api]
+                read_audience = "{read}"
+                write_audience = "{write}"
+
+                [chains.base.trading.assets.equities]
+
+                [chains.base]
+                lifecycle = "active"
+                required_confirmations = 3
+
+                [chains.base.trading]
+                orderbook = "0x1111111111111111111111111111111111111111"
+                inventory_mode = "managed"
+                inventory_adapters = []
+                inventory = "0x2222222222222222222222222222222222222222"
+                vault_owner = "0x3333333333333333333333333333333333333333"
+                deployment_block = 1
+                ingestion_cutoff = "safe"
+
+                [chains.ethereum]
+                lifecycle = "active"
+                required_confirmations = 12
+
+                [chains.hyperevm]
+                lifecycle = "observe-only"
+                required_confirmations = 1
+
+                [wallet]
+                kind = "private-key"
+                address = "0x0000000000000000000000000000000000000001"
+            "#
+            ));
+            let secrets = dry_run_secrets_toml();
+            let error = Ctx::load_files(config.path(), secrets.path())
+                .await
+                .unwrap_err();
+
+            if expect_equal {
+                assert!(
+                    matches!(error, CtxError::OpsApiAudiencesEqual),
+                    "expected OpsApiAudiencesEqual, got: {error:#}"
+                );
+            } else {
+                assert!(
+                    matches!(error, CtxError::OpsApiAudienceBlank),
+                    "expected OpsApiAudienceBlank, got: {error:#}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
