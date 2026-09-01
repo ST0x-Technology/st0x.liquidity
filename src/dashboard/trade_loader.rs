@@ -53,7 +53,9 @@ impl Side {
     /// trade's group is its own id.
     const fn sort_group(self) -> &'static str {
         match self {
-            Self::Onchain => "tx_hash",
+            // The id prefix ("chain:0x<tx>"): the same bytes
+            // `sort_trades_newest_first` groups whole ids by.
+            Self::Onchain => "(chain || ':' || tx_hash)",
             Self::Offchain => "view_id",
         }
     }
@@ -510,6 +512,7 @@ mod tests {
     use proptest::prelude::*;
     use st0x_dto::{TradeOutcome, sort_trades_newest_first};
     use st0x_event_sorcery::{Store, StoreBuilder};
+    use st0x_evm::Chain;
     use st0x_execution::{
         ClientOrderId, Direction, ExecutorOrderId, FractionalShares, MarketSession, Positive,
         SupportedExecutor,
@@ -668,6 +671,7 @@ mod tests {
         let pool = setup_test_db().await;
         let store = onchain_store(&pool).await;
         let id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: tx_hash(0),
             log_index: 0,
         };
@@ -690,6 +694,7 @@ mod tests {
         let pool = setup_test_db().await;
         let store = onchain_store(&pool).await;
         let id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: tx_hash(0),
             log_index: 194,
         };
@@ -749,6 +754,7 @@ mod tests {
             }
 
             let id = OnChainTradeId {
+                chain: Chain::Base,
                 tx_hash: tx_hash(0),
                 log_index: u64::try_from(log_index).unwrap(),
             };
@@ -896,7 +902,9 @@ mod tests {
 
     /// The comparator's exact branches: descending time, then ascending sort
     /// group, then DESCENDING NUMERIC log index within one transaction --
-    /// which is why `:20` must precede `:11` and `:2`.
+    /// which is why `:20` must precede `:11` and `:2`. The group key is
+    /// chain-qualified, so the same `tx_hash` on another chain is its own
+    /// group with its own tie-break, never merged into the first chain's.
     #[tokio::test]
     async fn ordering_reproduces_the_dto_comparator() {
         let pool = setup_test_db().await;
@@ -909,6 +917,21 @@ mod tests {
             witness(
                 &onchain,
                 &OnChainTradeId {
+                    chain: Chain::Base,
+                    tx_hash: tx_hash(0xaa),
+                    log_index,
+                },
+                OnChainTradeSource::Raindex,
+                "AAPL",
+                tied,
+            )
+            .await;
+        }
+        for log_index in [2_u64, 20] {
+            witness(
+                &onchain,
+                &OnChainTradeId {
+                    chain: Chain::Ethereum,
                     tx_hash: tx_hash(0xaa),
                     log_index,
                 },
@@ -921,6 +944,7 @@ mod tests {
         witness(
             &onchain,
             &OnChainTradeId {
+                chain: Chain::Base,
                 tx_hash: tx_hash(0xab),
                 log_index: 0,
             },
@@ -932,6 +956,7 @@ mod tests {
         witness(
             &onchain,
             &OnChainTradeId {
+                chain: Chain::Base,
                 tx_hash: tx_hash(0xac),
                 log_index: 0,
             },
@@ -954,18 +979,33 @@ mod tests {
         let same_tx: Vec<&String> = from_sql
             .iter()
             .map(|trade| &trade.id)
-            .filter(|id| id.starts_with(&format!("0x{}", "aa".repeat(32))))
+            .filter(|id| id.starts_with(&format!("base:0x{}", "aa".repeat(32))))
             .collect();
         assert_eq!(
             same_tx,
             [
-                format!("0x{}:20", "aa".repeat(32)),
-                format!("0x{}:11", "aa".repeat(32)),
-                format!("0x{}:2", "aa".repeat(32)),
+                format!("base:0x{}:20", "aa".repeat(32)),
+                format!("base:0x{}:11", "aa".repeat(32)),
+                format!("base:0x{}:2", "aa".repeat(32)),
             ]
             .iter()
             .collect::<Vec<_>>(),
             "same-transaction fills tie-break on numeric log index, descending"
+        );
+        let other_chain: Vec<&String> = from_sql
+            .iter()
+            .map(|trade| &trade.id)
+            .filter(|id| id.starts_with(&format!("ethereum:0x{}", "aa".repeat(32))))
+            .collect();
+        assert_eq!(
+            other_chain,
+            [
+                format!("ethereum:0x{}:20", "aa".repeat(32)),
+                format!("ethereum:0x{}:2", "aa".repeat(32)),
+            ]
+            .iter()
+            .collect::<Vec<_>>(),
+            "the same tx_hash on another chain forms its own group with its own tie-break"
         );
     }
 
@@ -974,6 +1014,7 @@ mod tests {
         let pool = setup_test_db().await;
         let store = onchain_store(&pool).await;
         let id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: tx_hash(0),
             log_index: 0,
         };
@@ -1067,10 +1108,12 @@ mod tests {
         let early = DateTime::from_timestamp(1_700_000_000, 100).unwrap();
         let late = DateTime::from_timestamp(1_700_000_000, 200).unwrap();
         let early_id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: tx_hash(1),
             log_index: 0,
         };
         let late_id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: tx_hash(2),
             log_index: 0,
         };
@@ -1144,6 +1187,7 @@ mod tests {
             witness(
                 &store,
                 &OnChainTradeId {
+                    chain: Chain::Base,
                     tx_hash: tx_hash(0),
                     log_index,
                 },
@@ -1183,6 +1227,7 @@ mod tests {
         witness(
             &store,
             &OnChainTradeId {
+                chain: Chain::Base,
                 tx_hash: tx_hash(0),
                 log_index: 0,
             },
@@ -1248,6 +1293,7 @@ mod tests {
 
         for log_index in 0..=u64::try_from(MAX_TRADES).unwrap() {
             let id = OnChainTradeId {
+                chain: Chain::Base,
                 tx_hash: tx_hash(0),
                 log_index,
             };
@@ -1276,6 +1322,7 @@ mod tests {
         let pool = setup_test_db().await;
         let store = onchain_store(&pool).await;
         let id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: tx_hash(0),
             log_index: 0,
         };
@@ -1310,6 +1357,7 @@ mod tests {
         let pool = setup_test_db().await;
         let store = onchain_store(&pool).await;
         let id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: tx_hash(0),
             log_index: 0,
         };
@@ -1477,20 +1525,27 @@ mod tests {
     #[test]
     fn onchain_and_offchain_ids_never_interleave_within_a_transaction_group() {
         // The comparator falls back to whole-id order across venues while the
-        // query compares only the hash prefix. They agree because an onchain
-        // id's second byte is 'x', which is above every hex digit a UUID can
-        // start with, so no UUID can sort between two ids sharing a hash.
-        let hash = format!("0x{}", "ab".repeat(32));
-        for uuid in [
-            "00000000-0000-0000-0000-000000000000",
-            "0fffffff-ffff-ffff-ffff-ffffffffffff",
-            "ffffffff-ffff-ffff-ffff-ffffffffffff",
-        ] {
-            let mut bounds = [format!("{hash}:2"), format!("{hash}:11")];
-            bounds.sort();
-            let [low, high] = &bounds;
-            let between = uuid > low.as_str() && uuid < high.as_str();
-            assert!(!between, "{uuid} must not sort between ids sharing a hash");
+        // query compares only the `chain:0x<tx>` prefix. They agree because
+        // two ids sharing that prefix agree on more characters than a whole
+        // UUID has, so a UUID either diverges from the shared prefix (sorting
+        // outside the pair) or is a strict prefix of it (sorting below both);
+        // it can never fall between them.
+        for chain in [Chain::Base, Chain::Ethereum] {
+            let group = format!("{chain}:0x{}", "ab".repeat(32));
+            for uuid in [
+                "00000000-0000-0000-0000-000000000000",
+                "0fffffff-ffff-ffff-ffff-ffffffffffff",
+                "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            ] {
+                let mut bounds = [format!("{group}:2"), format!("{group}:11")];
+                bounds.sort();
+                let [low, high] = &bounds;
+                let between = uuid > low.as_str() && uuid < high.as_str();
+                assert!(
+                    !between,
+                    "{uuid} must not sort between ids sharing the group {group}"
+                );
+            }
         }
     }
 
@@ -1503,6 +1558,7 @@ mod tests {
         let pool = setup_test_db().await;
         let store = onchain_store(&pool).await;
         let id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: tx_hash(0),
             log_index: 0,
         };

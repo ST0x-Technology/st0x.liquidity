@@ -578,6 +578,7 @@ mod tests {
     use st0x_config::{DeploymentSymbolPolicy, ExecutionThreshold};
     use st0x_dto::Direction;
     use st0x_event_sorcery::StoreBuilder;
+    use st0x_evm::Chain;
     use st0x_execution::{
         ClientOrderId, FractionalShares, MarketSession, Positive, SupportedExecutor, Symbol,
     };
@@ -704,6 +705,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: one_share_threshold(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::repeat_byte(0x33),
                         log_index: 1,
                     },

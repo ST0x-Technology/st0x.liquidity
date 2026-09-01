@@ -365,12 +365,14 @@ async fn ingest_position(
         } => {
             sqlx::query(
                 "INSERT INTO pnl_onchain_fill \
-                 (event_rowid, symbol, tx_hash, log_index, shares, direction, price_usd, executed_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 (event_rowid, symbol, chain, tx_hash, log_index, shares, direction, price_usd, \
+                  executed_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
                  ON CONFLICT(event_rowid) DO NOTHING",
             )
             .bind(rowid)
             .bind(symbol.to_string())
+            .bind(trade_id.chain.to_string())
             .bind(trade_id.tx_hash.to_string())
             .bind(i64::try_from(trade_id.log_index)?)
             .bind(format_float(&amount.inner())?)
@@ -668,9 +670,12 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 5, 15, 14, minute, 0).unwrap()
     }
 
+    // Ethereum, not Base: the pnl_onchain_fill.chain column defaults to
+    // 'base', so only a non-default chain proves the ingest binds it.
     fn onchain_fill(log_index: u64, minute: u32) -> PositionEvent {
         PositionEvent::OnChainOrderFilled {
             trade_id: TradeId {
+                chain: Chain::Ethereum,
                 tx_hash: TxHash::repeat_byte(0xab),
                 log_index,
             },
@@ -816,19 +821,22 @@ mod tests {
         assert_eq!(head, head_rowid(&pool).await.unwrap());
         assert_eq!(ledger.checkpoint().await.unwrap(), head);
 
-        let (symbol, shares, direction, price, executed_at): (
+        let (symbol, chain, shares, direction, price, executed_at): (
+            String,
             String,
             String,
             String,
             String,
             String,
         ) = sqlx::query_as(
-            "SELECT symbol, shares, direction, price_usd, executed_at FROM pnl_onchain_fill",
+            "SELECT symbol, chain, shares, direction, price_usd, executed_at \
+             FROM pnl_onchain_fill",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(symbol, "AAPL");
+        assert_eq!(chain, "ethereum");
         assert_eq!(shares, "0.5");
         assert_eq!(direction, "Buy");
         assert_eq!(price, "150.25");
@@ -1046,6 +1054,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::repeat_byte(0xab),
                         log_index: 7,
                     },

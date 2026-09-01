@@ -1476,8 +1476,8 @@ mod tests {
         // `+00:00` suffix the schema CHECK requires but is still not a valid
         // RFC3339 datetime, so the loader's parse must reject it.
         sqlx::query(
-            "INSERT INTO hedge_fill (symbol, tx_hash, log_index, block_timestamp, seen_at) \
-             VALUES ('AAPL', '0xbeef', 1, 'garbage+00:00', '2025-01-01T00:00:00+00:00')",
+            "INSERT INTO hedge_fill (chain, symbol, tx_hash, log_index, block_timestamp, seen_at) \
+             VALUES ('base', 'AAPL', '0xbeef', 1, 'garbage+00:00', '2025-01-01T00:00:00+00:00')",
         )
         .execute(&pool)
         .await
@@ -1623,8 +1623,8 @@ mod tests {
         // `+00:00` suffix the schema CHECK requires but is not valid RFC3339,
         // so the parse must reject it.
         sqlx::query(
-            "INSERT INTO hedge_fill (symbol, tx_hash, log_index, block_timestamp, seen_at) \
-             VALUES ('AAPL', '0xdead', 2, 'garbage+00:00', '2025-01-01T00:00:00+00:00')",
+            "INSERT INTO hedge_fill (chain, symbol, tx_hash, log_index, block_timestamp, seen_at) \
+             VALUES ('base', 'AAPL', '0xdead', 2, 'garbage+00:00', '2025-01-01T00:00:00+00:00')",
         )
         .execute(&pool)
         .await

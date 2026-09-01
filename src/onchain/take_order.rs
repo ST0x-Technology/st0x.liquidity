@@ -3,7 +3,7 @@
 use alloy::primitives::Address;
 use alloy::rpc::types::Log;
 
-use st0x_evm::Evm;
+use st0x_evm::{Chain, Evm};
 use st0x_registry::SymbolCache;
 
 use super::OnChainError;
@@ -14,6 +14,7 @@ impl OnchainTrade {
     /// Creates OnchainTrade directly from TakeOrderV3 blockchain events
     #[tracing::instrument(skip_all, fields(tx_hash = ?log.transaction_hash, log_index = ?log.log_index), level = tracing::Level::DEBUG)]
     pub async fn try_from_take_order_if_target_owner<E: Evm>(
+        chain: Chain,
         cache: &SymbolCache,
         evm: &E,
         event: TakeOrderV3,
@@ -43,7 +44,7 @@ impl OnchainTrade {
             output_amount: event.input,
         };
 
-        Self::try_from_order_and_fill_details(cache, evm, order, fill, log).await
+        Self::try_from_order_and_fill_details(chain, cache, evm, order, fill, log).await
     }
 }
 
@@ -127,6 +128,7 @@ mod tests {
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
+            Chain::Base,
             &cache,
             &evm,
             take_event,
@@ -166,6 +168,7 @@ mod tests {
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
 
         let trade = OnchainTrade::try_from_take_order_if_target_owner(
+            Chain::Base,
             &cache,
             &evm,
             take_event,
@@ -195,6 +198,7 @@ mod tests {
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
+            Chain::Base,
             &cache,
             &evm,
             take_event,
@@ -247,6 +251,7 @@ mod tests {
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
+            Chain::Base,
             &cache,
             &evm,
             take_event,
@@ -303,6 +308,7 @@ mod tests {
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
+            Chain::Base,
             &cache,
             &evm,
             take_event,
@@ -358,6 +364,7 @@ mod tests {
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
+            Chain::Base,
             &cache,
             &evm,
             take_event,
@@ -407,6 +414,7 @@ mod tests {
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
+            Chain::Base,
             &cache,
             &evm,
             take_event,

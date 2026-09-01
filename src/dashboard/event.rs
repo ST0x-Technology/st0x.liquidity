@@ -1269,6 +1269,7 @@ mod tests {
 
     use st0x_dto::TradingVenue;
     use st0x_event_sorcery::{LifecycleError, ReactorHarness, StoreBuilder};
+    use st0x_evm::Chain;
     use st0x_execution::Symbol;
 
     use super::*;
@@ -1325,6 +1326,7 @@ mod tests {
     fn onchain_replay_error(source: SendError<OnChainTrade>) -> DashboardTradeHandoffAttemptError {
         DashboardTradeHandoffAttemptError::Onchain(Box::new(OnchainTradeReplayError::Replay {
             id: OnChainTradeId {
+                chain: Chain::Base,
                 tx_hash: alloy::primitives::TxHash::ZERO,
                 log_index: 0,
             },
@@ -1534,6 +1536,7 @@ mod tests {
         harness
             .receive::<OnChainTrade>(
                 crate::onchain_trade::OnChainTradeId {
+                    chain: Chain::Base,
                     tx_hash: alloy::primitives::TxHash::ZERO,
                     log_index: 0,
                 },
@@ -1576,6 +1579,7 @@ mod tests {
         harness
             .receive::<OnChainTrade>(
                 crate::onchain_trade::OnChainTradeId {
+                    chain: Chain::Base,
                     tx_hash: alloy::primitives::TxHash::ZERO,
                     log_index: 9,
                 },
@@ -1871,6 +1875,7 @@ mod tests {
         }
 
         let revision_id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: alloy::primitives::TxHash::ZERO,
             log_index: 198,
         };
@@ -1924,6 +1929,7 @@ mod tests {
             .await
             .unwrap();
         let id = crate::onchain_trade::OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: alloy::primitives::TxHash::ZERO,
             log_index: 7,
         };
@@ -1967,6 +1973,7 @@ mod tests {
             .await
             .unwrap();
         let id = crate::onchain_trade::OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: alloy::primitives::TxHash::ZERO,
             log_index: 9,
         };
@@ -2026,6 +2033,7 @@ mod tests {
             .await
             .unwrap();
         let id = crate::onchain_trade::OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: alloy::primitives::TxHash::ZERO,
             log_index: 8,
         };
@@ -2274,6 +2282,7 @@ mod tests {
         let now = chrono::Utc::now();
         let ingested_at = now + chrono::Duration::seconds(1);
         let id = crate::onchain_trade::OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: alloy::primitives::TxHash::ZERO,
             log_index: 0,
         };
@@ -2331,6 +2340,7 @@ mod tests {
             .unwrap();
         let now = chrono::Utc::now();
         let id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: alloy::primitives::TxHash::ZERO,
             log_index: 194,
         };
@@ -2377,6 +2387,7 @@ mod tests {
             .await
             .unwrap();
         let id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: alloy::primitives::TxHash::ZERO,
             log_index: 195,
         };
@@ -2438,6 +2449,7 @@ mod tests {
             .await
             .unwrap();
         let id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: alloy::primitives::TxHash::ZERO,
             log_index: 194,
         };
@@ -2492,6 +2504,7 @@ mod tests {
             .await
             .unwrap();
         let id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: alloy::primitives::TxHash::ZERO,
             log_index: 195,
         };
@@ -2563,6 +2576,7 @@ mod tests {
             .await
             .unwrap();
         let id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: alloy::primitives::TxHash::ZERO,
             log_index: 196,
         };
@@ -2664,6 +2678,7 @@ mod tests {
             .await
             .unwrap();
         let id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: alloy::primitives::TxHash::ZERO,
             log_index: 197,
         };
@@ -3140,6 +3155,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: alloy::primitives::TxHash::ZERO,
                         log_index: 0,
                     },
@@ -3158,6 +3174,7 @@ mod tests {
                 symbol.clone(),
                 PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: alloy::primitives::TxHash::ZERO,
                         log_index: 0,
                     },
@@ -3217,6 +3234,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: alloy::primitives::TxHash::ZERO,
                         log_index: 0,
                     },

@@ -1285,6 +1285,7 @@ mod tests {
         OperationMode, create_test_ctx_with_order_owner,
     };
     use st0x_event_sorcery::StoreBuilder;
+    use st0x_evm::Chain;
     use st0x_execution::{
         AlpacaBrokerApiError, AlpacaMarketDataError, CancellationOutcome, ClientOrderId, Direction,
         ExecutorOrderId, FractionalShares, Inventory, LimitOrder, MockExecutor, MockExecutorCtx,
@@ -1573,6 +1574,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },

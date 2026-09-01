@@ -722,6 +722,7 @@ pub(super) async fn process_found_trade<W: Write>(
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
 
     let trade_id = OnChainTradeId {
+        chain: onchain_trade.chain,
         tx_hash: onchain_trade.tx_hash,
         log_index: onchain_trade.log_index,
     };
@@ -2480,6 +2481,7 @@ mod tests {
         let block_timestamp = onchain_trade.block_timestamp.unwrap();
 
         let trade_id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: onchain_trade.tx_hash,
             log_index: onchain_trade.log_index,
         };
@@ -2601,6 +2603,7 @@ mod tests {
         let block_timestamp = onchain_trade.block_timestamp.unwrap();
 
         let trade_id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: onchain_trade.tx_hash,
             log_index: onchain_trade.log_index,
         };
@@ -2676,6 +2679,7 @@ mod tests {
         let onchain_trade = OnchainTradeBuilder::default().with_block_number(42).build();
 
         let trade_id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: onchain_trade.tx_hash,
             log_index: onchain_trade.log_index,
         };
@@ -2781,6 +2785,7 @@ mod tests {
         // returns Ok(None) immediately at the is_acknowledged() guard, before
         // reaching the witness step that would use block_number.
         let trade_event = EmittedOnChain {
+            chain: Chain::Base,
             event: RaindexTradeEvent::ClearV3(Box::new(ClearV3 {
                 sender: alloy::primitives::Address::ZERO,
                 alice: get_test_order(),
@@ -2874,6 +2879,7 @@ mod tests {
             .with_block_timestamp(None)
             .build();
         let expected_trade_id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: onchain_trade.tx_hash,
             log_index: onchain_trade.log_index,
         };
@@ -3398,6 +3404,7 @@ mod tests {
         let block_timestamp = onchain_trade.block_timestamp.unwrap();
 
         let trade_id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: onchain_trade.tx_hash,
             log_index: onchain_trade.log_index,
         };
@@ -3501,6 +3508,7 @@ mod tests {
         let block_timestamp = onchain_trade.block_timestamp.unwrap();
 
         let trade_id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: onchain_trade.tx_hash,
             log_index: onchain_trade.log_index,
         };
@@ -3617,10 +3625,12 @@ mod tests {
         let block_timestamp_b = fill_b.block_timestamp.unwrap();
 
         let trade_id_a = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: fill_a.tx_hash,
             log_index: fill_a.log_index,
         };
         let trade_id_b = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: fill_b.tx_hash,
             log_index: fill_b.log_index,
         };
@@ -3763,10 +3773,12 @@ mod tests {
         let block_timestamp_b = fill_b.block_timestamp.unwrap();
 
         let trade_id_a = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: fill_a.tx_hash,
             log_index: fill_a.log_index,
         };
         let trade_id_b = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: fill_b.tx_hash,
             log_index: fill_b.log_index,
         };

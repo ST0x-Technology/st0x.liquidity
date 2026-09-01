@@ -198,6 +198,7 @@ mod tests {
         HedgedEquities, HedgingAssets, OperationMode,
     };
     use st0x_event_sorcery::{Projection, Store, StoreBuilder};
+    use st0x_evm::Chain;
     use st0x_execution::{
         Direction, FractionalShares, MockExecutor, Positive, SupportedExecutor, Symbol,
     };
@@ -229,6 +230,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -605,6 +607,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 2,
                     },

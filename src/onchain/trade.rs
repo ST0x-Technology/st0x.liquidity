@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use st0x_config::{ChainAssets, InventoryAdapterVenue, InventoryAdapters, TradingChain};
-use st0x_evm::{Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE};
+use st0x_evm::{Chain, Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE};
 use st0x_execution::{Direction, FractionalShares, HasZero};
 use st0x_float_serde::format_float_with_fallback;
 use st0x_registry::SymbolCache;
@@ -196,6 +196,7 @@ pub(crate) fn extract_owned_vaults(
 #[derive(Debug, Clone)]
 pub struct OnchainTrade {
     pub(crate) source: OnChainTradeSource,
+    pub(crate) chain: Chain,
     pub(crate) tx_hash: TxHash,
     pub(crate) log_index: u64,
     pub(crate) symbol: TokenizedSymbol<WrappedTokenizedShares>,
@@ -313,6 +314,7 @@ async fn fetch_receipt_metadata<P: Provider>(
 impl OnchainTrade {
     /// Core parsing logic for converting blockchain events to trades
     pub(crate) async fn try_from_order_and_fill_details<EvmImpl: Evm>(
+        chain: Chain,
         cache: &SymbolCache,
         evm: &EvmImpl,
         order: OrderV4,
@@ -368,6 +370,7 @@ impl OnchainTrade {
             trade_details,
             TradeMetadata {
                 source: OnChainTradeSource::Raindex,
+                chain,
                 tx_hash,
                 log_index,
                 block_number: log.block_number.or(receipt_block_number),
@@ -393,6 +396,7 @@ impl OnchainTrade {
     /// fetched (the `process-tx` recovery path via `try_from_tx_hash`), avoiding
     /// a second `eth_getTransactionReceipt` round-trip for the same tx.
     pub(crate) async fn try_from_inventory_trade<EvmImpl: Evm>(
+        chain: Chain,
         cache: &SymbolCache,
         evm: &EvmImpl,
         assets: &ChainAssets,
@@ -477,6 +481,7 @@ impl OnchainTrade {
             TradeMetadata {
                 // Pairing quarantines settlements whose deposit and withdrawal
                 // operators differ, so either side identifies the adapter.
+                chain,
                 source: inventory_trade_source(trade.deposit.operator, inventory_adapters),
                 tx_hash,
                 log_index,
@@ -615,6 +620,7 @@ impl OnchainTrade {
         };
 
         Self::try_from_inventory_trade(
+            config.trading_chain.chain,
             config.cache,
             evm,
             &config.trading_chain.assets,
@@ -719,6 +725,7 @@ fn validate_inventory_token_addresses(
 /// [`OnchainTrade`] once `TradeDetails` has been resolved.
 struct TradeMetadata {
     source: OnChainTradeSource,
+    chain: Chain,
     tx_hash: TxHash,
     log_index: u64,
     block_number: Option<u64>,
@@ -735,6 +742,7 @@ async fn finalize_onchain_trade<P: Provider>(
 ) -> Result<Option<OnchainTrade>, OnChainError> {
     let TradeMetadata {
         source,
+        chain,
         tx_hash,
         log_index,
         block_number,
@@ -773,6 +781,7 @@ async fn finalize_onchain_trade<P: Provider>(
 
     Ok(Some(OnchainTrade {
         source,
+        chain,
         tx_hash,
         log_index,
         symbol: equity_symbol,
@@ -826,6 +835,7 @@ async fn try_convert_log_to_onchain_trade<EvmImpl: Evm>(
 
     if let Ok(take_order_event) = log.log_decode::<TakeOrderV3>() {
         return OnchainTrade::try_from_take_order_if_target_owner(
+            ctx.chain,
             cache,
             evm,
             take_order_event.data().clone(),
@@ -1967,6 +1977,7 @@ mod tests {
         let inv = InventoryTrade { deposit, withdraw };
 
         OnchainTrade::try_from_inventory_trade(
+            Chain::Ethereum,
             &cache,
             &evm,
             &assets,
@@ -1993,6 +2004,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(trade.symbol.to_string(), "wtAAPL");
+        assert_eq!(trade.chain, Chain::Ethereum);
         assert_eq!(trade.direction, Direction::Buy);
         assert_eq!(
             trade.source,
@@ -2046,6 +2058,7 @@ mod tests {
         };
 
         let trade = OnchainTrade::try_from_inventory_trade(
+            Chain::Base,
             &cache,
             &evm,
             &assets,
@@ -2108,6 +2121,7 @@ mod tests {
         let log = crate::test_utils::create_log(7);
 
         let error = OnchainTrade::try_from_inventory_trade(
+            Chain::Base,
             &cache,
             &evm,
             &assets,
@@ -2155,6 +2169,7 @@ mod tests {
         let log = crate::test_utils::create_log(7);
 
         let error = OnchainTrade::try_from_inventory_trade(
+            Chain::Base,
             &cache,
             &evm,
             &assets,
@@ -2266,7 +2281,14 @@ mod tests {
         let adapters = inventory_adapters(InventoryAdapterVenue::Bebop, operator);
 
         let trade = OnchainTrade::try_from_inventory_trade(
-            &cache, &evm, &assets, &adapters, &inv, log, None,
+            Chain::Base,
+            &cache,
+            &evm,
+            &assets,
+            &adapters,
+            &inv,
+            log,
+            None,
         )
         .await
         .unwrap()
@@ -2336,7 +2358,14 @@ mod tests {
         let adapters = inventory_adapters(InventoryAdapterVenue::UniswapV4, operator);
 
         let trade = OnchainTrade::try_from_inventory_trade(
-            &cache, &evm, &assets, &adapters, &inv, log, None,
+            Chain::Base,
+            &cache,
+            &evm,
+            &assets,
+            &adapters,
+            &inv,
+            log,
+            None,
         )
         .await
         .unwrap()

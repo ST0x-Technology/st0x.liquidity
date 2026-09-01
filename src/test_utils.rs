@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use st0x_config::{ChainEquities, ChainEquityAsset, OperationMode};
 use st0x_event_sorcery::{DomainEvent, EventSourced};
+use st0x_evm::Chain;
 use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
 
 use crate::bindings::IRaindexV6::{EvaluableV4, IOV2, OrderV4};
@@ -429,6 +430,7 @@ impl OnchainTradeBuilder {
     pub(crate) fn new() -> Self {
         Self {
             trade: OnchainTrade {
+                chain: Chain::Base,
                 source: OnChainTradeSource::Raindex,
                 tx_hash: fixed_bytes!(
                     "0x1111111111111111111111111111111111111111111111111111111111111111"

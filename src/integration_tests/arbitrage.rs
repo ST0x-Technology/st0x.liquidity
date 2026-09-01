@@ -26,6 +26,7 @@ use st0x_config::{
     ChainAssets, ChainEquities, ChainEquityAsset, ExecutionThreshold, OperationMode,
 };
 use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
+use st0x_evm::Chain;
 use st0x_evm::{ReadOnlyEvm, USDC_BASE};
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, MockExecutor, OrderFailureTerminality,
@@ -150,7 +151,7 @@ struct AnvilTrade {
 
 impl AnvilTrade {
     fn aggregate_id(&self) -> String {
-        format!("{}:{}", self.tx_hash, self.log_index)
+        format!("base:{}:{}", self.tx_hash, self.log_index)
     }
 
     async fn submit(
@@ -668,6 +669,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
 
         let evm = ReadOnlyEvm::new(self.provider.clone());
         let trade = OnchainTrade::try_from_take_order_if_target_owner(
+            Chain::Base,
             &self.symbol_cache,
             &evm,
             take_event,
@@ -682,6 +684,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
         let log_index = trade.log_index;
 
         let trade_event = EmittedOnChain {
+            chain: Chain::Base,
             tx_hash,
             log_index,
             block_number: take_log.block_number.unwrap(),

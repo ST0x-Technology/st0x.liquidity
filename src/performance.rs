@@ -48,6 +48,7 @@ use tracing::warn;
 use st0x_config::ExecutionThreshold;
 #[cfg(any(test, feature = "test-support"))]
 use st0x_event_sorcery::{RetryOnBusy, StoreBuilder};
+use st0x_evm::Chain;
 use st0x_execution::Symbol;
 #[cfg(any(test, feature = "test-support"))]
 use st0x_execution::{
@@ -236,7 +237,11 @@ pub async fn seed_simulated_hedge_latency_history(
 
             onchain_trade
                 .send(
-                    &OnChainTradeId { tx_hash, log_index },
+                    &OnChainTradeId {
+                        chain: Chain::Base,
+                        tx_hash,
+                        log_index,
+                    },
                     OnChainTradeCommand::WitnessAt {
                         source: OnChainTradeSource::Raindex,
                         symbol: symbol.clone(),
@@ -256,7 +261,11 @@ pub async fn seed_simulated_hedge_latency_history(
                     PositionCommand::AcknowledgeOnChainFillAt {
                         symbol: symbol.clone(),
                         threshold,
-                        trade_id: TradeId { tx_hash, log_index },
+                        trade_id: TradeId {
+                            chain: Chain::Base,
+                            tx_hash,
+                            log_index,
+                        },
                         amount: amount.inner(),
                         direction: Direction::Buy,
                         price_usdc: onchain_price,
@@ -512,6 +521,7 @@ pub(super) mod test_helpers {
     use sqlx::SqlitePool;
 
     use st0x_event_sorcery::ReactorHarness;
+    use st0x_evm::Chain;
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
     use st0x_float_macro::float;
 
@@ -529,6 +539,7 @@ pub(super) mod test_helpers {
     pub(crate) fn fill_event(log_index: u64, block_offset: i64, seen_offset: i64) -> PositionEvent {
         PositionEvent::OnChainOrderFilled {
             trade_id: TradeId {
+                chain: Chain::Base,
                 tx_hash: TxHash::random(),
                 log_index,
             },

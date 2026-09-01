@@ -175,6 +175,7 @@ mod tests {
     use st0x_config::{ChainAssets, ExecutionThreshold};
     use st0x_dto::Statement;
     use st0x_event_sorcery::test_store;
+    use st0x_evm::Chain;
     use st0x_execution::{Direction, FractionalShares, Symbol};
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
@@ -479,6 +480,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::ZERO,
                         log_index: 0,
                     },
