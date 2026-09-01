@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use super::auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx};
 use super::client::AlpacaBrokerApiClient;
 use super::journal::JournalResponse;
 use super::order::{AlpacaLimitOrder, ConversionOrder, CryptoOrderResponse, OvernightLimitOrder};
+use super::overnight_eligibility::EligibilitySnapshot;
 use super::{AlpacaBrokerApiError, AssetStatus, MissingOrderField, TimeInForce};
 use crate::{
     CancellationOutcome, ClientOrderId, CounterTradePreflight, Direction, Executor,
@@ -405,6 +407,33 @@ impl Executor for AlpacaBrokerApi {
         super::order::place_limit_order(&self.client, alpaca_order).await
     }
 
+    /// [`OvernightLimitOrder`] construction proves the whole overnight
+    /// contract (fail-closed eligibility, fractional matrix, precision,
+    /// forced `extended_hours`, `day` time-in-force), so no per-call
+    /// asset revalidation runs here: the eligibility snapshot is the
+    /// overnight authority, not the placement-side TTL cache. The
+    /// input's `extended_hours` flag is ignored by design.
+    async fn place_overnight_order(
+        &self,
+        order: LimitOrder,
+        snapshot: Option<&EligibilitySnapshot>,
+        now: DateTime<Utc>,
+    ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+        let alpaca_limit_price = super::order::AlpacaLimitPrice::try_new(order.limit_price)?;
+
+        let overnight = OvernightLimitOrder::new(
+            order.symbol,
+            order.shares,
+            order.direction,
+            alpaca_limit_price,
+            order.client_order_id,
+            snapshot,
+            now,
+        )?;
+
+        super::order::place_overnight_order(&self.client, overnight).await
+    }
+
     async fn cancel_order(
         &self,
         order_id: &Self::OrderId,
@@ -525,20 +554,6 @@ impl AlpacaBrokerApi {
         Self::validate_asset(&order.symbol, &asset)?;
 
         super::order::place_limit_order(&self.client, order).await
-    }
-
-    /// Places a validated overnight order.
-    ///
-    /// Construction of [`OvernightLimitOrder`] already proved the whole
-    /// overnight contract (eligibility, fractional matrix, precision,
-    /// `extended_hours`, `day` time-in-force), so no per-call asset
-    /// revalidation runs here: the fail-closed eligibility snapshot is
-    /// the overnight authority, not the placement-side TTL cache.
-    pub async fn place_overnight_order(
-        &self,
-        order: OvernightLimitOrder,
-    ) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
-        super::order::place_overnight_order(&self.client, order).await
     }
 
     /// Returns the symbol's full asset attribute set for inspection.
@@ -668,6 +683,7 @@ impl AlpacaBrokerApi {
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
     use httpmock::prelude::*;
     use rain_math_float::Float;
     use serde_json::json;
@@ -685,6 +701,7 @@ mod tests {
         CounterTradeReservation, CounterTradeSkipReason, Direction, FractionalShares, LimitOrder,
         OrderFailureTerminality, Permanence, Positive, Usd,
     };
+    use crate::{OvernightEligibilityError, OvernightOrderError};
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -1616,6 +1633,124 @@ mod tests {
                 overnight_halted: None,
             }
         );
+    }
+
+    fn eligible_overnight_snapshot() -> EligibilitySnapshot {
+        EligibilitySnapshot {
+            synced_at: Utc.with_ymd_and_hms(2026, 8, 28, 23, 55, 0).unwrap(),
+            details: AssetDetails {
+                status: AssetStatus::Active,
+                tradable: true,
+                fractionable: Some(true),
+                fractional_eh_enabled: Some(true),
+                overnight_tradable: Some(true),
+                overnight_halted: Some(false),
+            },
+        }
+    }
+
+    fn overnight_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 29, 1, 0, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn trait_place_overnight_order_forces_the_overnight_contract() {
+        // The generic boundary: callers hand a plain LimitOrder (even
+        // with extended_hours = false) and the Alpaca impl constructs the
+        // validated overnight order internally -- the POST carries the
+        // forced extended_hours regardless of the input flag.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let order_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body_includes(
+                    json!({
+                        "type": "limit",
+                        "time_in_force": "day",
+                        "extended_hours": true
+                    })
+                    .to_string(),
+                );
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "RKLB",
+                    "qty": "0.5",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let order = LimitOrder {
+            symbol: Symbol::new("RKLB").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(0.5))).unwrap(),
+            direction: Direction::Buy,
+            limit_price: Positive::new(Usd::new(float!(24.15))).unwrap(),
+            extended_hours: false,
+            client_order_id: ClientOrderId::cli(uuid!("4d6d9f40-5434-4f77-89f6-7156e375b739")),
+        };
+        let snapshot = eligible_overnight_snapshot();
+
+        let placement =
+            Executor::place_overnight_order(&executor, order, Some(&snapshot), overnight_now())
+                .await
+                .unwrap();
+
+        order_mock.assert();
+        assert!(placement.extended_hours);
+        assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
+    }
+
+    #[tokio::test]
+    async fn trait_place_overnight_order_fails_closed_with_no_http() {
+        // An ineligible construction surfaces the typed 1948 error through
+        // the trait's error chain and never reaches the order endpoint.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let order_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({}));
+        });
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let mut snapshot = eligible_overnight_snapshot();
+        snapshot.details.overnight_halted = Some(true);
+        let order = LimitOrder {
+            symbol: Symbol::new("RKLB").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(0.5))).unwrap(),
+            direction: Direction::Buy,
+            limit_price: Positive::new(Usd::new(float!(24.15))).unwrap(),
+            extended_hours: false,
+            client_order_id: ClientOrderId::cli(uuid!("4d6d9f40-5434-4f77-89f6-7156e375b739")),
+        };
+
+        let error =
+            Executor::place_overnight_order(&executor, order, Some(&snapshot), overnight_now())
+                .await
+                .unwrap_err();
+
+        assert_eq!(order_mock.calls(), 0);
+        assert!(
+            matches!(
+                &error,
+                AlpacaBrokerApiError::Overnight(OvernightOrderError::Ineligible(
+                    OvernightEligibilityError::OvernightHalted { .. }
+                ))
+            ),
+            "expected the halted eligibility error through the trait chain, got {error:?}"
+        );
+        assert_eq!(error.permanence(), Permanence::Permanent);
     }
 
     #[tokio::test]

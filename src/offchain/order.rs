@@ -45,9 +45,9 @@ use st0x_dto::{Direction, Trade, TradeOutcome, TradingVenue};
 use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
 use st0x_execution::{
     AlpacaBrokerApiError, CancellationOutcome, ClientOrderId, CounterTradePreflight,
-    ExecutionError, Executor, ExecutorOrderId, FractionalShares, LatestQuote, LimitOrder,
-    MarketOrder, MarketSession, MarketSessionStatus, OrderFailureTerminality, OrderState,
-    PersistenceError, Positive, SupportedExecutor, Symbol,
+    EligibilitySnapshot, ExecutionError, Executor, ExecutorOrderId, FractionalShares,
+    IndicativeQuote, LatestQuote, LimitOrder, MarketOrder, MarketSession, MarketSessionStatus,
+    OrderFailureTerminality, OrderState, PersistenceError, Positive, SupportedExecutor, Symbol,
 };
 use st0x_finance::{NonNegative, NotNonNegative, Usd};
 
@@ -2661,6 +2661,36 @@ pub trait OrderPlacer: Send + Sync {
         order: LimitOrder,
     ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>;
 
+    /// Places a limit order that must execute in the overnight session.
+    /// The executor enforces the overnight contract internally
+    /// (fail-closed eligibility from the snapshot, precision bound,
+    /// forced extended hours, `day` time-in-force); see
+    /// `Executor::place_overnight_order`.
+    ///
+    /// Defaulted to a fail-loud typed error rather than required: dozens
+    /// of placers (CLI repair, simulation fixtures, test doubles) never
+    /// reach the overnight hedge path, and a missed production override
+    /// surfaces as an immediate error on the first placement, never a
+    /// silent no-op.
+    async fn place_overnight_order(
+        &self,
+        _order: LimitOrder,
+        _snapshot: Option<&EligibilitySnapshot>,
+        _now: DateTime<Utc>,
+    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(OvernightUnsupportedByPlacer))
+    }
+
+    /// The overnight indicative quote for the overnight reference-price
+    /// resolver. Same default rationale as
+    /// [`Self::place_overnight_order`].
+    async fn fetch_latest_overnight_quote(
+        &self,
+        _symbol: &Symbol,
+    ) -> Result<IndicativeQuote, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(OvernightUnsupportedByPlacer))
+    }
+
     async fn cancel_order(
         &self,
         executor_order_id: &ExecutorOrderId,
@@ -2757,6 +2787,13 @@ pub trait OrderPlacer: Send + Sync {
 
 /// Bridges `Executor` (which has associated types and is not object-safe)
 /// to `OrderPlacer` (object-safe).
+/// The fail-loud default for [`OrderPlacer`]'s overnight capabilities:
+/// a placer that never overrode them cannot silently no-op an overnight
+/// placement or quote fetch.
+#[derive(Debug, thiserror::Error)]
+#[error("this order placer does not support overnight operations")]
+pub(crate) struct OvernightUnsupportedByPlacer;
+
 pub(crate) struct ExecutorOrderPlacer<E>(pub E);
 
 #[async_trait]
@@ -2785,6 +2822,28 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
             is_extended_hours: placement.extended_hours,
             limit_price: placement.limit_price,
         })
+    }
+
+    async fn place_overnight_order(
+        &self,
+        order: LimitOrder,
+        snapshot: Option<&EligibilitySnapshot>,
+        now: DateTime<Utc>,
+    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+        let placement = self.0.place_overnight_order(order, snapshot, now).await?;
+        Ok(OrderPlacementResult {
+            executor_order_id: ExecutorOrderId::new(&placement.order_id),
+            placed_shares: placement.shares,
+            is_extended_hours: placement.extended_hours,
+            limit_price: placement.limit_price,
+        })
+    }
+
+    async fn fetch_latest_overnight_quote(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<IndicativeQuote, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.0.fetch_latest_overnight_quote(symbol).await?)
     }
 
     async fn cancel_order(
@@ -3583,6 +3642,59 @@ mod tests {
             !OffchainOrder::originate(&legacy).unwrap().close_flatten(),
             "the legacy event default must propagate into pending aggregate state"
         );
+    }
+
+    fn overnight_test_limit_order() -> LimitOrder {
+        LimitOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            direction: Direction::Buy,
+            limit_price: Positive::new(Usd::new(float!(24.15))).unwrap(),
+            extended_hours: false,
+            client_order_id: ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_order_placer_forwards_overnight_placement() {
+        // The production placer must override the fail-loud default and
+        // map the executor's placement into the internal result shape --
+        // including the forced extended-hours flag the overnight
+        // contract reports.
+        let placer = ExecutorOrderPlacer(MockExecutor::new());
+
+        let result = placer
+            .place_overnight_order(overnight_test_limit_order(), None, Utc::now())
+            .await
+            .unwrap();
+
+        assert!(result.is_extended_hours);
+    }
+
+    #[tokio::test]
+    async fn order_placer_defaults_fail_loudly_on_overnight_capabilities() {
+        // A placer that never overrode the overnight methods must error
+        // with the typed marker, never silently no-op a placement or
+        // serve a quote from nowhere.
+        let placer = noop_order_placer();
+
+        let Err(placement_error) = placer
+            .place_overnight_order(overnight_test_limit_order(), None, Utc::now())
+            .await
+        else {
+            panic!("the overnight placement default must fail");
+        };
+        placement_error
+            .downcast_ref::<OvernightUnsupportedByPlacer>()
+            .expect("placement default must surface the typed marker");
+
+        let quote_error = placer
+            .fetch_latest_overnight_quote(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap_err();
+        quote_error
+            .downcast_ref::<OvernightUnsupportedByPlacer>()
+            .expect("quote default must surface the typed marker");
     }
 
     fn overnight_placed_event() -> OffchainOrderEvent {

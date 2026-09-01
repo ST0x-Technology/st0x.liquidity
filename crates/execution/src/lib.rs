@@ -437,6 +437,25 @@ pub trait Executor: Send + Sync + 'static {
         order: LimitOrder,
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error>;
 
+    /// Place a limit order that must execute in the overnight session
+    /// (20:00-04:00 ET).
+    ///
+    /// The caller hands the generic order plus the asset's eligibility
+    /// snapshot and the evaluation instant; the implementation enforces
+    /// the whole overnight contract internally -- fail-closed
+    /// eligibility (including the fractional matrix), the quantity
+    /// precision bound, forced `extended_hours = true`, and `day`
+    /// time-in-force -- so an invalid overnight order is refused with a
+    /// typed error before any broker call. The input's `extended_hours`
+    /// flag is ignored: overnight-ness is defined by this method, not by
+    /// the caller's flag.
+    async fn place_overnight_order(
+        &self,
+        order: LimitOrder,
+        snapshot: Option<&EligibilitySnapshot>,
+        now: DateTime<Utc>,
+    ) -> Result<OrderPlacement<Self::OrderId>, Self::Error>;
+
     /// Cancel a previously placed order by its executor-assigned ID.
     ///
     /// Returns [`CancellationOutcome::Requested`] when the broker accepted
