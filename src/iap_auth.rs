@@ -274,8 +274,12 @@ impl IapVerifier {
     }
 
     async fn refresh(&self, kid: &str) -> Result<(), IapError> {
-        // Another task may have refreshed while this one was on its way here.
-        {
+        // Another task may have refreshed while this one was on its way
+        // here. Read coldness in the same pass: the throttle branch below
+        // needs it, and reading it there would put an await under the
+        // attempt guard (a std Mutex, which must never be held across an
+        // await; the future would not even be Send).
+        let cache_is_cold = {
             let guard = self.keys.read().await;
             if let Some(cached) = guard.as_ref() {
                 if cached.fetched_at.elapsed() <= JWKS_TTL
@@ -284,7 +288,8 @@ impl IapVerifier {
                     return Ok(());
                 }
             }
-        }
+            guard.is_none()
+        };
 
         // Claim the single refresh slot or yield to the floor: one outbound
         // request per interval, whatever the trigger. An unknown kid on a
@@ -300,8 +305,10 @@ impl IapVerifier {
                 // Throttled. With retained keys the caller's follow-up lookup
                 // serves them; with a cold cache there is nothing to judge
                 // against, which is the KeysUnavailable case, not a claim
-                // that the token's key is unknown.
-                if self.keys.read().await.is_none() {
+                // that the token's key is unknown. (`cache_is_cold` is a few
+                // instructions stale; the worst case is one 503 for a
+                // request racing the cache warming, healed on its retry.)
+                if cache_is_cold {
                     return Err(IapError::KeysUnavailable);
                 }
                 return Ok(());

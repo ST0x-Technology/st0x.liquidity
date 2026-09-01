@@ -1700,6 +1700,8 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
     // are load-bearing, not hygiene -- the verifier's refresh slot is held
     // for the duration of a fetch, so an unbounded request during a Google
     // outage would pin it. 10s matches the kms_jwt convention.
+    // Static timeouts on the default TLS backend -- build cannot fail here.
+    #[allow(clippy::expect_used)]
     let jwks_http = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(10))
