@@ -32,7 +32,7 @@ const SYNC_SLOT_ET: NaiveTime = match NaiveTime::from_hms_opt(19, 55, 0) {
 };
 
 /// One symbol's asset attributes as of the last successful sync.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EligibilitySnapshot {
     pub synced_at: DateTime<Utc>,
     pub details: AssetDetails,
