@@ -351,7 +351,11 @@ pub(super) async fn check_imbalance_and_build_operation(
     let decision = {
         let inventory = inventory.read().await;
         let imbalance = inventory
-            .check_usdc_imbalance_with_gross_offchain(threshold, reserved)
+            .check_usdc_imbalance_with_gross_offchain(
+                inventory.trading_chain(),
+                threshold,
+                reserved,
+            )
             .map_err(|error| {
                 warn!(
                     target: "rebalance",
@@ -1090,10 +1094,12 @@ impl RebalancingService {
         let source_venue = tracking.source_venue();
         let initiated_amount = tracking.initiated_amount;
         let now = Utc::now();
-        let update = Box::new(move |inventory| {
+        let update = Box::new(move |inventory, chain| {
             let cancelled =
-                Inventory::transfer(source_venue, TransferOp::Cancel, initiated_amount)(inventory)?;
-            Inventory::with_last_rebalancing(now)(cancelled)
+                Inventory::transfer(source_venue, TransferOp::Cancel, initiated_amount)(
+                    inventory, chain,
+                )?;
+            Inventory::with_last_rebalancing(now)(cancelled, chain)
         });
 
         let mut inventory = self.inventory.write().await;
@@ -1173,12 +1179,12 @@ impl RebalancingService {
         }
 
         let now = Utc::now();
-        let update = Box::new(move |inventory| {
+        let update = Box::new(move |inventory, chain| {
             let settled =
                 Inventory::settle_transfer(source_venue, initiated_amount, settled_amount)(
-                    inventory,
+                    inventory, chain,
                 )?;
-            Inventory::with_last_rebalancing(now)(settled)
+            Inventory::with_last_rebalancing(now)(settled, chain)
         });
 
         let mut inventory = self.inventory.write().await;

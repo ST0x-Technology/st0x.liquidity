@@ -345,7 +345,12 @@ pub(super) async fn check_imbalance_and_build_operation(
 ) -> Result<Option<TriggeredOperation>, EquityTriggerError> {
     let imbalance = {
         let inventory = inventory.read().await;
-        inventory.check_equity_imbalance(symbol, threshold, vault_ratio)?
+        inventory.check_equity_imbalance(
+            symbol,
+            inventory.trading_chain(),
+            threshold,
+            vault_ratio,
+        )?
     };
 
     let Some(imbalance) = imbalance else {
@@ -559,6 +564,7 @@ mod tests {
     use super::*;
     use crate::inventory::view::Operator;
     use crate::inventory::{Inventory, InventoryView, TransferOp, Venue};
+    use st0x_evm::Chain;
 
     fn make_in_progress() -> Arc<std::sync::RwLock<HashMap<Symbol, GuardState>>> {
         Arc::new(std::sync::RwLock::new(HashMap::new()))
@@ -1100,7 +1106,7 @@ mod tests {
         // The leftover (0.000000000579587147) should still be there.
         let remaining_imbalance = {
             let view = inventory.read().await;
-            view.check_equity_imbalance(&symbol, &threshold, &one_to_one_ratio())
+            view.check_equity_imbalance(&symbol, Chain::Base, &threshold, &one_to_one_ratio())
         };
 
         // The leftover is tiny, so it won't exceed the deviation threshold alone.

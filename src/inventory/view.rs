@@ -12,6 +12,7 @@ use tracing::{debug, error, warn};
 
 use st0x_config::ImbalanceThreshold;
 use st0x_dto::{InFlightCash, InFlightEquity, SymbolInventory, UsdcInventory};
+use st0x_evm::Chain;
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_finance::{Usd, Usdc};
 use st0x_tokenization::IssuerRequestId;
@@ -149,7 +150,9 @@ pub(crate) enum EquityReconcileBusy {
 /// [`InventoryView::update_equity`] or [`InventoryView::update_usdc`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Inventory<T> {
-    onchain: Option<VenueBalance<T>>,
+    /// On-chain balance per chain: the same symbol listed on two chains is
+    /// two slots. Absent entry = that chain not yet polled.
+    onchain: BTreeMap<Chain, VenueBalance<T>>,
     offchain: Option<VenueBalance<T>>,
     last_rebalancing: Option<DateTime<Utc>>,
 }
@@ -165,12 +168,11 @@ where
         + std::fmt::Debug,
 {
     fn has_inflight(&self) -> Result<bool, FloatError> {
-        let onchain_inflight = self
-            .onchain
-            .as_ref()
-            .map(|v| v.has_inflight())
-            .transpose()?
-            .unwrap_or(false);
+        for balance in self.onchain.values() {
+            if balance.has_inflight()? {
+                return Ok(true);
+            }
+        }
 
         let offchain_inflight = self
             .offchain
@@ -179,7 +181,7 @@ where
             .transpose()?
             .unwrap_or(false);
 
-        Ok(onchain_inflight || offchain_inflight)
+        Ok(offchain_inflight)
     }
 
     /// The skip conditions of [`Self::on_snapshot`], exposed so callers that
@@ -206,19 +208,25 @@ where
         Ok(true)
     }
 
-    fn get_venue(&self, venue: Venue) -> Option<VenueBalance<T>> {
+    fn get_venue(&self, venue: Venue, chain: Chain) -> Option<VenueBalance<T>>
+    where
+        VenueBalance<T>: Copy,
+    {
         match venue {
-            Venue::MarketMaking => self.onchain,
+            Venue::MarketMaking => self.onchain.get(&chain).copied(),
             Venue::Hedging => self.offchain,
         }
     }
 
-    fn set_venue(self, venue: Venue, balance: Option<VenueBalance<T>>) -> Self {
+    fn set_venue(mut self, venue: Venue, chain: Chain, balance: Option<VenueBalance<T>>) -> Self {
         match venue {
-            Venue::MarketMaking => Self {
-                onchain: balance,
-                ..self
-            },
+            Venue::MarketMaking => {
+                match balance {
+                    Some(balance) => self.onchain.insert(chain, balance),
+                    None => self.onchain.remove(&chain),
+                };
+                self
+            }
             Venue::Hedging => Self {
                 offchain: balance,
                 ..self
@@ -297,7 +305,7 @@ where
 impl<T> Default for Inventory<T> {
     fn default() -> Self {
         Self {
-            onchain: None,
+            onchain: BTreeMap::new(),
             offchain: None,
             last_rebalancing: None,
         }
@@ -327,20 +335,20 @@ where
         venue: Venue,
         op: Operator,
         amount: T,
-    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
-        Box::new(move |inventory| {
+    ) -> Box<dyn FnOnce(Self, Chain) -> Result<Self, InventoryError<T>> + Send> {
+        Box::new(move |inventory, chain| {
             let balance = match op {
-                Operator::Add => match inventory.get_venue(venue) {
+                Operator::Add => match inventory.get_venue(venue, chain) {
                     Some(v) => v.add_available(amount)?,
                     None => VenueBalance::new(amount, T::ZERO),
                 },
                 Operator::Remove => inventory
-                    .get_venue(venue)
+                    .get_venue(venue, chain)
                     .unwrap_or_default()
                     .remove_available(amount)?,
             };
 
-            Ok(inventory.set_venue(venue, Some(balance)))
+            Ok(inventory.set_venue(venue, chain, Some(balance)))
         })
     }
 
@@ -354,40 +362,42 @@ where
         from: Venue,
         op: TransferOp,
         amount: T,
-    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
-        Box::new(move |inventory| match op {
+    ) -> Box<dyn FnOnce(Self, Chain) -> Result<Self, InventoryError<T>> + Send> {
+        Box::new(move |inventory, chain| match op {
             TransferOp::Start => {
                 let balance = inventory
-                    .get_venue(from)
+                    .get_venue(from, chain)
                     .unwrap_or_default()
                     .move_to_inflight(amount)?;
 
-                Ok(inventory.set_venue(from, Some(balance)))
+                Ok(inventory.set_venue(from, chain, Some(balance)))
             }
 
             TransferOp::Complete => {
                 let source = inventory
-                    .get_venue(from)
+                    .get_venue(from, chain)
                     .unwrap_or_default()
                     .confirm_inflight(amount)?;
 
-                let dest = match inventory.get_venue(from.other()) {
+                let dest = match inventory.get_venue(from.other(), chain) {
                     Some(v) => v.add_available(amount)?,
                     None => VenueBalance::new(amount, T::ZERO),
                 };
 
-                Ok(inventory
-                    .set_venue(from, Some(source))
-                    .set_venue(from.other(), Some(dest)))
+                Ok(inventory.set_venue(from, chain, Some(source)).set_venue(
+                    from.other(),
+                    chain,
+                    Some(dest),
+                ))
             }
 
             TransferOp::Cancel => {
                 let balance = inventory
-                    .get_venue(from)
+                    .get_venue(from, chain)
                     .unwrap_or_default()
                     .cancel_inflight(amount)?;
 
-                Ok(inventory.set_venue(from, Some(balance)))
+                Ok(inventory.set_venue(from, chain, Some(balance)))
             }
         })
     }
@@ -404,21 +414,23 @@ where
         from: Venue,
         sent_amount: T,
         received_amount: T,
-    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
-        Box::new(move |inventory| {
+    ) -> Box<dyn FnOnce(Self, Chain) -> Result<Self, InventoryError<T>> + Send> {
+        Box::new(move |inventory, chain| {
             let source = inventory
-                .get_venue(from)
+                .get_venue(from, chain)
                 .unwrap_or_default()
                 .confirm_inflight(sent_amount)?;
 
-            let dest = match inventory.get_venue(from.other()) {
+            let dest = match inventory.get_venue(from.other(), chain) {
                 Some(balance) => balance.add_available(received_amount)?,
                 None => VenueBalance::new(received_amount, T::ZERO),
             };
 
-            Ok(inventory
-                .set_venue(from, Some(source))
-                .set_venue(from.other(), Some(dest)))
+            Ok(inventory.set_venue(from, chain, Some(source)).set_venue(
+                from.other(),
+                chain,
+                Some(dest),
+            ))
         })
     }
 
@@ -428,8 +440,8 @@ where
 
     pub(crate) fn with_last_rebalancing(
         timestamp: DateTime<Utc>,
-    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
-        Box::new(move |inventory| {
+    ) -> Box<dyn FnOnce(Self, Chain) -> Result<Self, InventoryError<T>> + Send> {
+        Box::new(move |inventory, _chain| {
             Ok(Self {
                 last_rebalancing: Some(timestamp),
                 ..inventory
@@ -446,9 +458,9 @@ where
     pub(crate) fn set_inflight(
         venue: Venue,
         amount: T,
-    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
-        Box::new(move |inventory| {
-            let existing = inventory.get_venue(venue);
+    ) -> Box<dyn FnOnce(Self, Chain) -> Result<Self, InventoryError<T>> + Send> {
+        Box::new(move |inventory, chain| {
+            let existing = inventory.get_venue(venue, chain);
 
             // Don't initialize a venue that doesn't exist yet when the
             // inflight amount is zero — that would create a spurious
@@ -459,7 +471,7 @@ where
 
             let balance = existing.unwrap_or_default().set_inflight(amount)?;
 
-            Ok(inventory.set_venue(venue, Some(balance)))
+            Ok(inventory.set_venue(venue, chain, Some(balance)))
         })
     }
 
@@ -476,18 +488,18 @@ where
         venue: Venue,
         snapshot_balance: T,
         fetched_at: DateTime<Utc>,
-    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
-        Box::new(move |inventory| {
+    ) -> Box<dyn FnOnce(Self, Chain) -> Result<Self, InventoryError<T>> + Send> {
+        Box::new(move |inventory, chain| {
             if !inventory.snapshot_would_apply(fetched_at)? {
                 return Ok(inventory);
             }
 
             let balance = inventory
-                .get_venue(venue)
+                .get_venue(venue, chain)
                 .unwrap_or_default()
                 .apply_snapshot(snapshot_balance)?;
 
-            Ok(inventory.set_venue(venue, Some(balance)))
+            Ok(inventory.set_venue(venue, chain, Some(balance)))
         })
     }
 
@@ -504,14 +516,14 @@ where
         venue: Venue,
         snapshot_balance: T,
         recovering_from: E,
-    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
-        Box::new(move |inventory| {
+    ) -> Box<dyn FnOnce(Self, Chain) -> Result<Self, InventoryError<T>> + Send> {
+        Box::new(move |inventory, chain| {
             let balance = inventory
-                .get_venue(venue)
+                .get_venue(venue, chain)
                 .unwrap_or_default()
                 .force_apply_snapshot(snapshot_balance, &recovering_from);
 
-            Ok(inventory.set_venue(venue, Some(balance)))
+            Ok(inventory.set_venue(venue, chain, Some(balance)))
         })
     }
 }
@@ -665,9 +677,18 @@ const PORTFOLIO_EQUITY_TRANSIT_LOCATIONS: [InFlightEquityLocation; 2] = [
     InFlightEquityLocation::BaseWalletWrapped,
 ];
 
+fn legacy_trading_chain() -> Chain {
+    Chain::Base
+}
+
 /// Cross-aggregate projection tracking inventory across venues.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct InventoryView {
+    /// Chain the venue-addressed (trading) operations act on. Snapshot
+    /// application routes by each event's own chain; everything reaching a
+    /// slot through [`Venue::MarketMaking`] means this chain's slot.
+    #[serde(default = "legacy_trading_chain")]
+    trading_chain: Chain,
     usdc: Inventory<Usdc>,
     equities: HashMap<Symbol, Inventory<FractionalShares>>,
     last_updated: DateTime<Utc>,
@@ -734,7 +755,7 @@ pub(crate) struct InventoryView {
     /// Local-clock time: the snapshot aggregate stamps `fetched_at` itself, so
     /// this is never the chain's or the broker's clock.
     #[serde(default)]
-    onchain_equity_snapshot_watermarks: HashMap<Symbol, DateTime<Utc>>,
+    onchain_equity_snapshot_watermarks: HashMap<Chain, HashMap<Symbol, DateTime<Utc>>>,
     /// Latest absolute equity snapshot timestamp by symbol for the offchain venue.
     /// Local-clock time, as above.
     #[serde(default)]
@@ -798,11 +819,11 @@ pub(crate) struct InventoryView {
     /// `OnChainOrderFilled` delta covered by this watermark is already in
     /// the balance and must be skipped (ADR 0018).
     #[serde(default)]
-    onchain_equity_snapshot_block_watermarks: HashMap<Symbol, u64>,
+    onchain_equity_snapshot_block_watermarks: HashMap<Chain, HashMap<Symbol, u64>>,
     /// Highest block number whose `OnchainUsdc` snapshot has been applied.
     /// Venue-level: the USDC balance is one number per venue.
     #[serde(default)]
-    onchain_usdc_snapshot_block_watermark: Option<u64>,
+    onchain_usdc_snapshot_block_watermark: BTreeMap<Chain, u64>,
     /// Symbols whose hydrated Hedging balance is ambiguous because a hedge
     /// order was open across the restart. The aggregate records every poll
     /// -- including mid-order reads the live view's guards refused -- and
@@ -860,9 +881,16 @@ impl InventoryView {
     /// splits or dividends.
     ///
     /// Returns the imbalance if one exists, or None if balanced or symbol not tracked.
+    /// Chain the venue-addressed operations act on (the sole trading chain
+    /// at construction time).
+    pub(crate) fn trading_chain(&self) -> Chain {
+        self.trading_chain
+    }
+
     pub(crate) fn check_equity_imbalance(
         &self,
         symbol: &Symbol,
+        chain: Chain,
         threshold: &ImbalanceThreshold,
         vault_ratio: &UnderlyingPerWrapped,
     ) -> Result<Option<Imbalance<FractionalShares>>, EquityImbalanceError> {
@@ -871,7 +899,7 @@ impl InventoryView {
             .get(symbol)
             .ok_or_else(|| EquityImbalanceError::SymbolNotTracked(symbol.clone()))?;
 
-        let Some(onchain_venue) = inventory.onchain.as_ref() else {
+        let Some(onchain_venue) = inventory.onchain.get(&chain) else {
             return Ok(None);
         };
 
@@ -898,10 +926,11 @@ impl InventoryView {
     /// mechanism.
     pub(crate) fn check_usdc_imbalance_with_gross_offchain(
         &self,
+        chain: Chain,
         threshold: &ImbalanceThreshold,
         reserved: Option<Usd>,
     ) -> Result<Option<Imbalance<Usdc>>, InventoryViewError> {
-        let Some(onchain_venue) = self.usdc.onchain.as_ref() else {
+        let Some(onchain_venue) = self.usdc.onchain.get(&chain) else {
             return Ok(None);
         };
         let Some(offchain_venue) = self.usdc.offchain.as_ref() else {
@@ -983,7 +1012,7 @@ impl InventoryView {
                 let inventory = self.equities.get(symbol);
                 let (onchain_available, onchain_inflight) = inventory
                     .map_or((FractionalShares::ZERO, FractionalShares::ZERO), |item| {
-                        venue_balances(item.onchain)
+                        venue_balances(item.onchain.get(&self.trading_chain).copied())
                     });
 
                 let (offchain_available, offchain_inflight) = inventory
@@ -1013,7 +1042,8 @@ impl InventoryView {
             })
             .collect();
 
-        let (usdc_onchain_available, usdc_onchain_inflight) = venue_balances(self.usdc.onchain);
+        let (usdc_onchain_available, usdc_onchain_inflight) =
+            venue_balances(self.usdc.onchain.get(&self.trading_chain).copied());
 
         let (usdc_offchain_available, usdc_offchain_inflight) = venue_balances(self.usdc.offchain);
 
@@ -1078,7 +1108,7 @@ impl InventoryView {
 
         for (symbol, inventory) in self.equities.iter().sorted_by_key(|(symbol, _)| *symbol) {
             for (venue, location) in PORTFOLIO_VENUES {
-                if let Some(balance) = inventory.get_venue(venue) {
+                if let Some(balance) = inventory.get_venue(venue, self.trading_chain) {
                     rows.push(PortfolioBalanceRow {
                         location,
                         asset: PortfolioAsset::Equity(symbol.clone()),
@@ -1090,7 +1120,7 @@ impl InventoryView {
         }
 
         for (venue, location) in PORTFOLIO_VENUES {
-            if let Some(balance) = self.usdc.get_venue(venue) {
+            if let Some(balance) = self.usdc.get_venue(venue, self.trading_chain) {
                 // Matches on `venue` (exactly 2 variants, `MarketMaking` and
                 // `Hedging`), not `location`: `PORTFOLIO_VENUES` can only ever
                 // produce those two `PortfolioLocation` values, so a wildcard
@@ -1173,6 +1203,16 @@ where
     })
 }
 
+impl InventoryView {
+    /// A fresh view whose venue-addressed operations act on `chain`.
+    pub(crate) fn for_trading_chain(chain: Chain) -> Self {
+        Self {
+            trading_chain: chain,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for InventoryView {
     fn default() -> Self {
         Self {
@@ -1180,7 +1220,7 @@ impl Default for InventoryView {
             equities: HashMap::new(),
             last_updated: Utc::now(),
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
-            onchain_usdc_snapshot_block_watermark: None,
+            onchain_usdc_snapshot_block_watermark: BTreeMap::new(),
             last_offchain_cash_fill_applied_at: None,
             offchain_equity_snapshot_skip_streaks: HashMap::new(),
             offchain_usd_snapshot_skip_streak: 0,
@@ -1203,6 +1243,7 @@ impl Default for InventoryView {
             last_offchain_fill_applied_at: HashMap::new(),
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
+            trading_chain: Chain::Base,
         }
     }
 }
@@ -1219,7 +1260,10 @@ impl InventoryView {
         self.equities.insert(
             symbol,
             Inventory {
-                onchain: Some(VenueBalance::new(onchain_available, FractionalShares::ZERO)),
+                onchain: BTreeMap::from([(
+                    Chain::Base,
+                    VenueBalance::new(onchain_available, FractionalShares::ZERO),
+                )]),
                 offchain: Some(VenueBalance::new(
                     offchain_available,
                     FractionalShares::ZERO,
@@ -1237,7 +1281,9 @@ impl InventoryView {
         venue: Venue,
     ) -> Option<FractionalShares> {
         let inventory = self.equities.get(symbol)?;
-        inventory.get_venue(venue).map(VenueBalance::available)
+        inventory
+            .get_venue(venue, self.trading_chain)
+            .map(VenueBalance::available)
     }
 
     /// Whether divergence recovery must leave this symbol alone, and why.
@@ -1291,13 +1337,20 @@ impl InventoryView {
         venue: Venue,
     ) -> Option<FractionalShares> {
         let inventory = self.equities.get(symbol)?;
-        inventory.get_venue(venue).map(VenueBalance::inflight)
+        inventory
+            .get_venue(venue, self.trading_chain)
+            .map(VenueBalance::inflight)
     }
 
     /// Returns the USDC available balance at the given venue.
     pub(crate) fn usdc_available(&self, venue: Venue) -> Option<Usdc> {
         match venue {
-            Venue::MarketMaking => self.usdc.onchain.map(VenueBalance::available),
+            Venue::MarketMaking => self
+                .usdc
+                .onchain
+                .get(&self.trading_chain)
+                .copied()
+                .map(VenueBalance::available),
             Venue::Hedging => self.usdc.offchain.map(VenueBalance::available),
         }
     }
@@ -1306,7 +1359,12 @@ impl InventoryView {
     #[cfg(test)]
     pub(crate) fn usdc_inflight(&self, venue: Venue) -> Option<Usdc> {
         match venue {
-            Venue::MarketMaking => self.usdc.onchain.map(VenueBalance::inflight),
+            Venue::MarketMaking => self
+                .usdc
+                .onchain
+                .get(&self.trading_chain)
+                .copied()
+                .map(VenueBalance::inflight),
             Venue::Hedging => self.usdc.offchain.map(VenueBalance::inflight),
         }
     }
@@ -1316,7 +1374,10 @@ impl InventoryView {
     pub(crate) fn with_usdc(self, onchain_available: Usdc, offchain_available: Usdc) -> Self {
         Self {
             usdc: Inventory {
-                onchain: Some(VenueBalance::new(onchain_available, Usdc::ZERO)),
+                onchain: BTreeMap::from([(
+                    Chain::Base,
+                    VenueBalance::new(onchain_available, Usdc::ZERO),
+                )]),
                 offchain: Some(VenueBalance::new(offchain_available, Usdc::ZERO)),
                 last_rebalancing: None,
             },
@@ -1340,7 +1401,10 @@ impl InventoryView {
     ) -> Self {
         Self {
             usdc: Inventory {
-                onchain: Some(VenueBalance::new(onchain_available, onchain_inflight)),
+                onchain: BTreeMap::from([(
+                    Chain::Base,
+                    VenueBalance::new(onchain_available, onchain_inflight),
+                )]),
                 offchain: Some(VenueBalance::new(offchain_available, offchain_inflight)),
                 last_rebalancing: None,
             },
@@ -1389,13 +1453,32 @@ impl InventoryView {
         symbol: &Symbol,
         update: impl FnOnce(
             Inventory<FractionalShares>,
+            Chain,
+        )
+            -> Result<Inventory<FractionalShares>, InventoryError<FractionalShares>>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        let chain = self.trading_chain;
+        self.update_equity_at(symbol, chain, update, now)
+    }
+
+    /// Like [`Self::update_equity`], addressed to an explicit chain's slot:
+    /// snapshot application routes by the event's own chain rather than the
+    /// trading chain.
+    fn update_equity_at(
+        self,
+        symbol: &Symbol,
+        chain: Chain,
+        update: impl FnOnce(
+            Inventory<FractionalShares>,
+            Chain,
         )
             -> Result<Inventory<FractionalShares>, InventoryError<FractionalShares>>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
         let inventory = self.equities.get(symbol).cloned().unwrap_or_default();
 
-        let updated = update(inventory)?;
+        let updated = update(inventory, chain)?;
 
         let mut equities = self.equities;
         equities.insert(symbol.clone(), updated);
@@ -1428,15 +1511,27 @@ impl InventoryView {
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
+            trading_chain: self.trading_chain,
         })
     }
 
     pub(crate) fn update_usdc(
         self,
-        update: impl FnOnce(Inventory<Usdc>) -> Result<Inventory<Usdc>, InventoryError<Usdc>>,
+        update: impl FnOnce(Inventory<Usdc>, Chain) -> Result<Inventory<Usdc>, InventoryError<Usdc>>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
-        let updated = update(self.usdc)?;
+        let chain = self.trading_chain;
+        self.update_usdc_at(chain, update, now)
+    }
+
+    /// Like [`Self::update_usdc`], addressed to an explicit chain's slot.
+    fn update_usdc_at(
+        self,
+        chain: Chain,
+        update: impl FnOnce(Inventory<Usdc>, Chain) -> Result<Inventory<Usdc>, InventoryError<Usdc>>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        let updated = update(self.usdc.clone(), chain)?;
 
         Ok(Self {
             usdc: updated,
@@ -1466,17 +1561,22 @@ impl InventoryView {
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
+            trading_chain: self.trading_chain,
         })
     }
 
     pub(crate) fn record_equity_snapshot_watermarks<'a>(
         mut self,
         venue: Venue,
+        chain: Chain,
         symbols: impl IntoIterator<Item = &'a Symbol>,
         fetched_at: DateTime<Utc>,
     ) -> Self {
         let watermarks = match venue {
-            Venue::MarketMaking => &mut self.onchain_equity_snapshot_watermarks,
+            Venue::MarketMaking => self
+                .onchain_equity_snapshot_watermarks
+                .entry(chain)
+                .or_default(),
             Venue::Hedging => &mut self.offchain_equity_snapshot_watermarks,
         };
 
@@ -1496,6 +1596,7 @@ impl InventoryView {
     fn record_onchain_equity_block_watermarks<'a>(
         mut self,
         venue: Venue,
+        chain: Chain,
         symbols: impl IntoIterator<Item = &'a Symbol>,
         block_number: Option<u64>,
     ) -> Self {
@@ -1503,11 +1604,12 @@ impl InventoryView {
             return self;
         };
 
+        let watermarks = self
+            .onchain_equity_snapshot_block_watermarks
+            .entry(chain)
+            .or_default();
         for symbol in symbols {
-            let watermark = self
-                .onchain_equity_snapshot_block_watermarks
-                .entry(symbol.clone())
-                .or_insert(block_number);
+            let watermark = watermarks.entry(symbol.clone()).or_insert(block_number);
             if block_number > *watermark {
                 *watermark = block_number;
             }
@@ -1523,6 +1625,7 @@ impl InventoryView {
     /// fills the forced balance does not contain.
     fn force_onchain_equity_block_watermarks<'a>(
         mut self,
+        chain: Chain,
         symbols: impl IntoIterator<Item = &'a Symbol>,
         block_number: Option<u64>,
     ) -> Self {
@@ -1530,9 +1633,12 @@ impl InventoryView {
             return self;
         };
 
+        let watermarks = self
+            .onchain_equity_snapshot_block_watermarks
+            .entry(chain)
+            .or_default();
         for symbol in symbols {
-            self.onchain_equity_snapshot_block_watermarks
-                .insert(symbol.clone(), block_number);
+            watermarks.insert(symbol.clone(), block_number);
         }
 
         self
@@ -1540,16 +1646,22 @@ impl InventoryView {
 
     /// Advance the venue-level onchain USDC block watermark after an
     /// `OnchainUsdc` snapshot applied.
-    fn record_onchain_usdc_block_watermark(mut self, block_number: Option<u64>) -> Self {
+    fn record_onchain_usdc_block_watermark(
+        mut self,
+        chain: Chain,
+        block_number: Option<u64>,
+    ) -> Self {
         let Some(block_number) = block_number else {
             return self;
         };
 
         let advanced = self
             .onchain_usdc_snapshot_block_watermark
-            .is_none_or(|watermark| block_number > watermark);
+            .get(&chain)
+            .is_none_or(|watermark| block_number > *watermark);
         if advanced {
-            self.onchain_usdc_snapshot_block_watermark = Some(block_number);
+            self.onchain_usdc_snapshot_block_watermark
+                .insert(chain, block_number);
         }
 
         self
@@ -1576,6 +1688,7 @@ impl InventoryView {
     pub(crate) fn onchain_fill_absorbed_by_equity_snapshot(
         &self,
         symbol: &Symbol,
+        chain: Chain,
         block_number: Option<u64>,
     ) -> bool {
         let Some(block_number) = block_number else {
@@ -1583,19 +1696,25 @@ impl InventoryView {
         };
 
         self.onchain_equity_snapshot_block_watermarks
-            .get(symbol)
+            .get(&chain)
+            .and_then(|watermarks| watermarks.get(symbol))
             .is_some_and(|watermark| block_number <= *watermark)
     }
 
     /// Whether a MarketMaking USDC fill delta at `block_number` is already
     /// contained in an applied onchain USDC snapshot (ADR 0018).
-    pub(crate) fn onchain_fill_absorbed_by_usdc_snapshot(&self, block_number: Option<u64>) -> bool {
+    pub(crate) fn onchain_fill_absorbed_by_usdc_snapshot(
+        &self,
+        chain: Chain,
+        block_number: Option<u64>,
+    ) -> bool {
         let Some(block_number) = block_number else {
             return false;
         };
 
         self.onchain_usdc_snapshot_block_watermark
-            .is_some_and(|watermark| block_number <= watermark)
+            .get(&chain)
+            .is_some_and(|watermark| block_number <= *watermark)
     }
 
     /// Marks a symbol as having an open offchain order, so offchain equity
@@ -1787,19 +1906,21 @@ impl InventoryView {
             .iter()
             .filter(|(symbol, _)| self.pending_offchain_orders.contains_key(*symbol))
             .filter_map(|(symbol, inventory)| {
-                inventory.get_venue(Venue::Hedging).map(|balance| {
-                    (
-                        symbol.clone(),
-                        Inventory {
-                            onchain: None,
-                            offchain: Some(VenueBalance::new(
-                                balance.available(),
-                                FractionalShares::ZERO,
-                            )),
-                            last_rebalancing: None,
-                        },
-                    )
-                })
+                inventory
+                    .get_venue(Venue::Hedging, self.trading_chain)
+                    .map(|balance| {
+                        (
+                            symbol.clone(),
+                            Inventory {
+                                onchain: BTreeMap::new(),
+                                offchain: Some(VenueBalance::new(
+                                    balance.available(),
+                                    FractionalShares::ZERO,
+                                )),
+                                last_rebalancing: None,
+                            },
+                        )
+                    })
             })
             .collect();
 
@@ -1811,6 +1932,7 @@ impl InventoryView {
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols.clone(),
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
+            trading_chain: self.trading_chain,
             ..Self::default()
         }
     }
@@ -1909,23 +2031,34 @@ impl InventoryView {
         true
     }
 
-    fn equity_snapshot_watermark(&self, symbol: &Symbol, venue: Venue) -> Option<DateTime<Utc>> {
-        let watermarks = match venue {
-            Venue::MarketMaking => &self.onchain_equity_snapshot_watermarks,
-            Venue::Hedging => &self.offchain_equity_snapshot_watermarks,
-        };
-
-        watermarks.get(symbol).copied()
+    fn equity_snapshot_watermark(
+        &self,
+        symbol: &Symbol,
+        venue: Venue,
+        chain: Chain,
+    ) -> Option<DateTime<Utc>> {
+        match venue {
+            Venue::MarketMaking => self
+                .onchain_equity_snapshot_watermarks
+                .get(&chain)
+                .and_then(|watermarks| watermarks.get(symbol))
+                .copied(),
+            Venue::Hedging => self
+                .offchain_equity_snapshot_watermarks
+                .get(symbol)
+                .copied(),
+        }
     }
 
     fn equity_snapshot_would_apply(
         &self,
         symbol: &Symbol,
         venue: Venue,
+        chain: Chain,
         fetched_at: DateTime<Utc>,
     ) -> Result<bool, InventoryViewError> {
         if self
-            .equity_snapshot_watermark(symbol, venue)
+            .equity_snapshot_watermark(symbol, venue, chain)
             .is_some_and(|watermark| fetched_at <= watermark)
         {
             return Ok(false);
@@ -1989,6 +2122,7 @@ impl InventoryView {
     pub(crate) fn apply_equity_snapshot<'a>(
         self,
         venue: Venue,
+        chain: Chain,
         balances: impl IntoIterator<Item = (&'a Symbol, &'a FractionalShares)>,
         fetched_at: DateTime<Utc>,
         block_number: Option<u64>,
@@ -2012,7 +2146,7 @@ impl InventoryView {
             .equities
             .iter()
             .filter(|(symbol, inventory)| {
-                inventory.get_venue(venue).is_some() && !present.contains(symbol)
+                inventory.get_venue(venue, chain).is_some() && !present.contains(symbol)
             })
             .map(|(symbol, _)| (symbol.clone(), FractionalShares::ZERO))
             .collect();
@@ -2029,7 +2163,8 @@ impl InventoryView {
                     && let Some(block) = block_number
                     && view
                         .onchain_equity_snapshot_block_watermarks
-                        .get(symbol)
+                        .get(&chain)
+                        .and_then(|watermarks| watermarks.get(symbol))
                         .is_some_and(|watermark| block < *watermark)
                 {
                     warn!(
@@ -2043,15 +2178,16 @@ impl InventoryView {
                 }
 
                 let should_record_watermark =
-                    view.equity_snapshot_would_apply(symbol, venue, fetched_at)?;
+                    view.equity_snapshot_would_apply(symbol, venue, chain, fetched_at)?;
                 if !should_record_watermark {
                     let view = view.note_offchain_equity_snapshot_skip(symbol, venue);
                     return Ok::<_, InventoryViewError>((view, applied_symbols));
                 }
 
                 let view = view
-                    .update_equity(
+                    .update_equity_at(
                         symbol,
+                        chain,
                         Inventory::on_snapshot(venue, *snapshot_balance, fetched_at),
                         now,
                     )?
@@ -2064,8 +2200,13 @@ impl InventoryView {
         )?;
 
         Ok(view
-            .record_equity_snapshot_watermarks(venue, applied_symbols.iter(), fetched_at)
-            .record_onchain_equity_block_watermarks(venue, applied_symbols.iter(), block_number))
+            .record_equity_snapshot_watermarks(venue, chain, applied_symbols.iter(), fetched_at)
+            .record_onchain_equity_block_watermarks(
+                venue,
+                chain,
+                applied_symbols.iter(),
+                block_number,
+            ))
     }
 
     /// Record the latest wallet-read USDC balance at an intermediate location.
@@ -2167,8 +2308,9 @@ impl InventoryView {
             return Ok(self);
         };
 
-        let cleared = Inventory::set_inflight(venue, FractionalShares::ZERO)(inventory)?;
-        let cleared = Inventory::with_last_rebalancing(now)(cleared)?;
+        let cleared =
+            Inventory::set_inflight(venue, FractionalShares::ZERO)(inventory, self.trading_chain)?;
+        let cleared = Inventory::with_last_rebalancing(now)(cleared, self.trading_chain)?;
 
         let mut equities = self.equities;
         equities.insert(symbol.clone(), cleared);
@@ -2201,6 +2343,7 @@ impl InventoryView {
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
+            trading_chain: self.trading_chain,
         })
     }
 
@@ -2209,8 +2352,9 @@ impl InventoryView {
         venue: Venue,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
-        let cleared = Inventory::set_inflight(venue, Usdc::ZERO)(self.usdc)?;
-        let cleared = Inventory::with_last_rebalancing(now)(cleared)?;
+        let cleared =
+            Inventory::set_inflight(venue, Usdc::ZERO)(self.usdc.clone(), self.trading_chain)?;
+        let cleared = Inventory::with_last_rebalancing(now)(cleared, self.trading_chain)?;
 
         Ok(Self {
             usdc: cleared,
@@ -2240,6 +2384,7 @@ impl InventoryView {
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
+            trading_chain: self.trading_chain,
         })
     }
 
@@ -2485,7 +2630,7 @@ impl InventoryView {
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
         if self
-            .equity_snapshot_watermark(symbol, Venue::Hedging)
+            .equity_snapshot_watermark(symbol, Venue::Hedging, self.trading_chain)
             .is_some_and(|watermark| fetched_at <= watermark)
         {
             warn!(
@@ -2531,7 +2676,13 @@ impl InventoryView {
             now,
         )?;
 
-        Ok(view.record_equity_snapshot_watermarks(Venue::Hedging, [symbol], fetched_at))
+        let trading_chain = view.trading_chain;
+        Ok(view.record_equity_snapshot_watermarks(
+            Venue::Hedging,
+            trading_chain,
+            [symbol],
+            fetched_at,
+        ))
     }
 
     /// Why cash divergence recovery must leave the venue alone this poll --
@@ -2648,17 +2799,14 @@ impl InventoryView {
 
         let fetched_at = event.timestamp();
         match event {
-            // INTERIM (this PR, next commit): the aggregate is per-chain but
-            // the view still holds one onchain slot; with a single trading
-            // chain the routing is identity. The (chain, symbol) view keying
-            // replaces this pass-through.
             OnchainEquity {
-                chain: _,
+                chain,
                 balances,
                 block_number,
                 ..
             } => self.apply_equity_snapshot(
                 Venue::MarketMaking,
+                *chain,
                 balances.iter(),
                 fetched_at,
                 *block_number,
@@ -2666,6 +2814,7 @@ impl InventoryView {
             ),
 
             OnchainUsdc {
+                chain,
                 usdc_balance,
                 block_number,
                 ..
@@ -2674,9 +2823,12 @@ impl InventoryView {
                 // 0018): a read pinned below the applied watermark would set
                 // a balance that does not contain fills the watermark
                 // already absorbs, understating USDC until the next poll.
-                if let (Some(block_number), Some(watermark)) =
-                    (*block_number, self.onchain_usdc_snapshot_block_watermark)
-                    && block_number < watermark
+                if let (Some(block_number), Some(watermark)) = (
+                    *block_number,
+                    self.onchain_usdc_snapshot_block_watermark
+                        .get(chain)
+                        .copied(),
+                ) && block_number < watermark
                 {
                     warn!(
                         target: "inventory",
@@ -2694,19 +2846,29 @@ impl InventoryView {
                 // actually took.
                 let applies = self.usdc.snapshot_would_apply(fetched_at)?;
                 let block_number = *block_number;
-                let view = self.update_usdc(
+                let chain = *chain;
+                let view = self.update_usdc_at(
+                    chain,
                     Inventory::on_snapshot(Venue::MarketMaking, *usdc_balance, fetched_at),
                     now,
                 )?;
                 Ok(if applies {
-                    view.record_onchain_usdc_block_watermark(block_number)
+                    view.record_onchain_usdc_block_watermark(chain, block_number)
                 } else {
                     view
                 })
             }
 
             OffchainEquity { positions, .. } => {
-                self.apply_equity_snapshot(Venue::Hedging, positions.iter(), fetched_at, None, now)
+                let trading_chain = self.trading_chain;
+                self.apply_equity_snapshot(
+                    Venue::Hedging,
+                    trading_chain,
+                    positions.iter(),
+                    fetched_at,
+                    None,
+                    now,
+                )
             }
 
             OffchainEquityReconciled {
@@ -2870,15 +3032,16 @@ impl InventoryView {
 
         match event {
             OnchainEquity {
-                chain: _,
+                chain,
                 balances,
                 fetched_at,
                 block_number,
             } => balances
                 .iter()
                 .try_fold(self, |view, (symbol, snapshot_balance)| {
-                    view.update_equity(
+                    view.update_equity_at(
                         symbol,
+                        *chain,
                         Inventory::force_on_snapshot(
                             Venue::MarketMaking,
                             *snapshot_balance,
@@ -2894,19 +3057,27 @@ impl InventoryView {
                     // contain.
                     view.record_equity_snapshot_watermarks(
                         Venue::MarketMaking,
+                        *chain,
                         balances.keys(),
                         *fetched_at,
                     )
-                    .force_onchain_equity_block_watermarks(balances.keys(), *block_number)
+                    .force_onchain_equity_block_watermarks(
+                        *chain,
+                        balances.keys(),
+                        *block_number,
+                    )
                 }),
 
             OnchainUsdc {
+                chain,
                 usdc_balance,
                 block_number,
                 ..
             } => {
                 let block_number = *block_number;
-                self.update_usdc(
+                let chain = *chain;
+                self.update_usdc_at(
+                    chain,
                     Inventory::force_on_snapshot(Venue::MarketMaking, *usdc_balance, reason),
                     now,
                 )
@@ -2915,7 +3086,8 @@ impl InventoryView {
                 // than keeping the monotonic maximum.
                 .map(|mut view| {
                     if let Some(block_number) = block_number {
-                        view.onchain_usdc_snapshot_block_watermark = Some(block_number);
+                        view.onchain_usdc_snapshot_block_watermark
+                            .insert(chain, block_number);
                     }
                     view
                 })
@@ -2952,7 +3124,13 @@ impl InventoryView {
                         .keys()
                         .filter(|symbol| !view.has_pending_offchain_order(symbol))
                         .collect();
-                    view.record_equity_snapshot_watermarks(Venue::Hedging, applied, *fetched_at)
+                    let trading_chain = view.trading_chain;
+                    view.record_equity_snapshot_watermarks(
+                        Venue::Hedging,
+                        trading_chain,
+                        applied,
+                        *fetched_at,
+                    )
                 }),
 
             // `reconcile_offchain_equity` validates busyness and the hedge
@@ -3135,7 +3313,7 @@ mod tests {
         offchain_inflight: i64,
     ) -> Inventory<FractionalShares> {
         Inventory {
-            onchain: Some(venue(onchain_available, onchain_inflight)),
+            onchain: BTreeMap::from([(Chain::Base, venue(onchain_available, onchain_inflight))]),
             offchain: Some(venue(offchain_available, offchain_inflight)),
             last_rebalancing: None,
         }
@@ -3270,7 +3448,10 @@ mod tests {
         offchain_inflight: i64,
     ) -> Inventory<Usdc> {
         Inventory {
-            onchain: Some(usdc_venue(onchain_available, onchain_inflight)),
+            onchain: BTreeMap::from([(
+                Chain::Base,
+                usdc_venue(onchain_available, onchain_inflight),
+            )]),
             offchain: Some(usdc_venue(offchain_available, offchain_inflight)),
             last_rebalancing: None,
         }
@@ -3298,13 +3479,14 @@ mod tests {
             last_terminal_offchain_orders: HashMap::new(),
             last_offchain_fill_applied_at: HashMap::new(),
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
-            onchain_usdc_snapshot_block_watermark: None,
+            onchain_usdc_snapshot_block_watermark: BTreeMap::new(),
             last_offchain_cash_fill_applied_at: None,
             offchain_equity_snapshot_skip_streaks: HashMap::new(),
             offchain_usd_snapshot_skip_streak: 0,
             offchain_usd_snapshot_watermark: None,
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
+            trading_chain: Chain::Base,
         }
     }
 
@@ -3340,13 +3522,14 @@ mod tests {
             last_terminal_offchain_orders: HashMap::new(),
             last_offchain_fill_applied_at: HashMap::new(),
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
-            onchain_usdc_snapshot_block_watermark: None,
+            onchain_usdc_snapshot_block_watermark: BTreeMap::new(),
             last_offchain_cash_fill_applied_at: None,
             offchain_equity_snapshot_skip_streaks: HashMap::new(),
             offchain_usd_snapshot_skip_streak: 0,
             offchain_usd_snapshot_watermark: None,
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
+            trading_chain: Chain::Base,
         }
     }
 
@@ -3358,7 +3541,7 @@ mod tests {
         let ratio = one_to_one_ratio();
 
         assert!(
-            view.check_equity_imbalance(&aapl, &thresh, &ratio)
+            view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &ratio)
                 .unwrap()
                 .is_none()
         );
@@ -3371,7 +3554,7 @@ mod tests {
         let thresh = threshold("0.5", "0.2");
         let ratio = one_to_one_ratio();
 
-        let imbalance = view.check_equity_imbalance(&aapl, &thresh, &ratio);
+        let imbalance = view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &ratio);
 
         assert!(matches!(
             imbalance,
@@ -3386,12 +3569,81 @@ mod tests {
         let thresh = threshold("0.5", "0.2");
         let ratio = one_to_one_ratio();
 
-        let imbalance = view.check_equity_imbalance(&aapl, &thresh, &ratio);
+        let imbalance = view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &ratio);
 
         assert!(matches!(
             imbalance,
             Ok(Some(Imbalance::TooMuchOffchain { .. }))
         ));
+    }
+
+    /// The imbalance evaluation reads only the requested chain's slot: a
+    /// balance on another chain must neither satisfy nor distort it
+    /// (SPEC multi-chain: inventory is not fungible across chains).
+    #[test]
+    fn check_equity_imbalance_reads_only_the_requested_chain() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        // Base slot heavily onchain; evaluated against Ethereum, whose slot
+        // was never polled, the check must return None rather than borrow
+        // Base's balance.
+        let view = make_view(vec![(aapl.clone(), make_inventory(80, 0, 20, 0))]);
+        let thresh = threshold("0.5", "0.2");
+        let ratio = one_to_one_ratio();
+
+        assert_eq!(
+            view.check_equity_imbalance(&aapl, Chain::Ethereum, &thresh, &ratio)
+                .unwrap(),
+            None,
+            "an unpolled chain has no onchain slot to evaluate"
+        );
+
+        assert!(matches!(
+            view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &ratio),
+            Ok(Some(Imbalance::TooMuchOnchain { .. }))
+        ));
+    }
+
+    /// A snapshot event from a second chain lands in its own slot and leaves
+    /// the trading chain's balance untouched.
+    #[test]
+    fn second_chain_snapshot_does_not_leak_into_the_trading_chain_slot() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let view = InventoryView::for_trading_chain(Chain::Base)
+            .apply_equity_snapshot(
+                Venue::MarketMaking,
+                Chain::Base,
+                [(&aapl, &shares(50))],
+                now,
+                None,
+                now,
+            )
+            .unwrap()
+            .apply_equity_snapshot(
+                Venue::MarketMaking,
+                Chain::Ethereum,
+                [(&aapl, &shares(7))],
+                now,
+                None,
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            view.equity_available(&aapl, Venue::MarketMaking),
+            Some(shares(50)),
+            "the venue accessor reads the trading chain's slot"
+        );
+
+        let inventory = view.equities.get(&aapl).unwrap();
+        assert_eq!(
+            inventory
+                .onchain
+                .get(&Chain::Ethereum)
+                .map(|balance| balance.available()),
+            Some(shares(7)),
+            "the second chain's balance sits in its own slot"
+        );
     }
 
     #[test]
@@ -3403,7 +3655,7 @@ mod tests {
         let ratio = one_to_one_ratio();
 
         let error = view
-            .check_equity_imbalance(&msft, &thresh, &ratio)
+            .check_equity_imbalance(&msft, Chain::Base, &thresh, &ratio)
             .unwrap_err();
         assert!(matches!(error, EquityImbalanceError::SymbolNotTracked(symbol) if symbol == msft));
     }
@@ -3416,7 +3668,7 @@ mod tests {
         let ratio = one_to_one_ratio();
 
         assert!(
-            view.check_equity_imbalance(&aapl, &thresh, &ratio)
+            view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &ratio)
                 .unwrap()
                 .is_none()
         );
@@ -3429,7 +3681,7 @@ mod tests {
         let thresh = threshold("0.5", "0.2");
         let ratio = one_to_one_ratio();
 
-        let imbalance = view.check_equity_imbalance(&aapl, &thresh, &ratio);
+        let imbalance = view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &ratio);
 
         assert!(matches!(
             imbalance,
@@ -3451,7 +3703,7 @@ mod tests {
         // 1:1 ratio - balanced
         let one_to_one = one_to_one_ratio();
         assert!(
-            view.check_equity_imbalance(&aapl, &thresh, &one_to_one)
+            view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &one_to_one)
                 .unwrap()
                 .is_none()
         );
@@ -3460,7 +3712,7 @@ mod tests {
         let ratio_1_05 =
             UnderlyingPerWrapped::new(U256::from(1_050_000_000_000_000_000u64)).unwrap();
         assert!(
-            view.check_equity_imbalance(&aapl, &thresh, &ratio_1_05)
+            view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &ratio_1_05)
                 .unwrap()
                 .is_none()
         );
@@ -3480,7 +3732,7 @@ mod tests {
         // 1:1 ratio - balanced (65% within threshold)
         let one_to_one = one_to_one_ratio();
         assert!(
-            view.check_equity_imbalance(&aapl, &thresh, &one_to_one)
+            view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &one_to_one)
                 .unwrap()
                 .is_none()
         );
@@ -3488,7 +3740,7 @@ mod tests {
         // 1.5 ratio - triggers imbalance (73.6% exceeds 70% upper bound)
         let ratio_1_5 =
             UnderlyingPerWrapped::new(U256::from(1_500_000_000_000_000_000u64)).unwrap();
-        let imbalance = view.check_equity_imbalance(&aapl, &thresh, &ratio_1_5);
+        let imbalance = view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &ratio_1_5);
         assert!(
             matches!(imbalance, Ok(Some(Imbalance::TooMuchOnchain { .. }))),
             "Expected TooMuchOnchain, got: {imbalance:?}"
@@ -3640,7 +3892,7 @@ mod tests {
     fn wallet_balances_do_not_enter_imbalance_math() {
         let now = Utc::now();
         let imbalance_without_wallet = make_usdc_view(900, 0, 100, 0)
-            .check_usdc_imbalance_with_gross_offchain(&threshold("0.5", "0.3"), None)
+            .check_usdc_imbalance_with_gross_offchain(Chain::Base, &threshold("0.5", "0.3"), None)
             .unwrap();
         assert!(
             matches!(
@@ -3660,7 +3912,7 @@ mod tests {
             )
             .unwrap();
         let imbalance_with_wallet = with_huge_wallet
-            .check_usdc_imbalance_with_gross_offchain(&threshold("0.5", "0.3"), None)
+            .check_usdc_imbalance_with_gross_offchain(Chain::Base, &threshold("0.5", "0.3"), None)
             .unwrap();
         assert_eq!(
             imbalance_without_wallet, imbalance_with_wallet,
@@ -4004,7 +4256,12 @@ mod tests {
             InventoryView::default().with_equity(symbol_aapl.clone(), shares(90), shares(10));
 
         let imbalance_without_wallet = baseline
-            .check_equity_imbalance(&symbol_aapl, &threshold("0.5", "0.3"), &one_to_one_ratio())
+            .check_equity_imbalance(
+                &symbol_aapl,
+                Chain::Base,
+                &threshold("0.5", "0.3"),
+                &one_to_one_ratio(),
+            )
             .unwrap();
         assert!(
             matches!(
@@ -4028,7 +4285,12 @@ mod tests {
             .unwrap();
 
         let imbalance_with_wallet = with_huge_wallet
-            .check_equity_imbalance(&symbol_aapl, &threshold("0.5", "0.3"), &one_to_one_ratio())
+            .check_equity_imbalance(
+                &symbol_aapl,
+                Chain::Base,
+                &threshold("0.5", "0.3"),
+                &one_to_one_ratio(),
+            )
             .unwrap();
         assert_eq!(
             imbalance_without_wallet, imbalance_with_wallet,
@@ -4083,14 +4345,14 @@ mod tests {
         let stale_fetched_at = last_rebalancing - Duration::seconds(10);
 
         let inventory = Inventory {
-            onchain: Some(venue(50, 0)),
+            onchain: BTreeMap::from([(Chain::Base, venue(50, 0))]),
             offchain: Some(venue(50, 0)),
             last_rebalancing: Some(last_rebalancing),
         };
 
         // Stale snapshot should be rejected — inventory unchanged
         let update_fn = Inventory::on_snapshot(Venue::MarketMaking, shares(999), stale_fetched_at);
-        let result = update_fn(inventory.clone()).unwrap();
+        let result = update_fn(inventory.clone(), Chain::Base).unwrap();
         assert_eq!(result, inventory);
     }
 
@@ -4099,17 +4361,17 @@ mod tests {
         let last_rebalancing = Utc::now();
 
         let inventory = Inventory {
-            onchain: Some(venue(50, 0)),
+            onchain: BTreeMap::from([(Chain::Base, venue(50, 0))]),
             offchain: Some(venue(50, 0)),
             last_rebalancing: Some(last_rebalancing),
         };
 
         // fetched_at == last_rebalancing should apply
         let update_fn = Inventory::on_snapshot(Venue::MarketMaking, shares(999), last_rebalancing);
-        let result = update_fn(inventory.clone()).unwrap();
+        let result = update_fn(inventory.clone(), Chain::Base).unwrap();
         assert_ne!(result, inventory);
 
-        let onchain = result.onchain.unwrap();
+        let onchain = result.onchain[&Chain::Base];
         assert_eq!(onchain.total().unwrap(), shares(999));
     }
 
@@ -4119,32 +4381,32 @@ mod tests {
         let fresh_fetched_at = last_rebalancing + Duration::seconds(10);
 
         let inventory = Inventory {
-            onchain: Some(venue(50, 0)),
+            onchain: BTreeMap::from([(Chain::Base, venue(50, 0))]),
             offchain: Some(venue(50, 0)),
             last_rebalancing: Some(last_rebalancing),
         };
 
         let update_fn = Inventory::on_snapshot(Venue::MarketMaking, shares(999), fresh_fetched_at);
-        let result = update_fn(inventory.clone()).unwrap();
+        let result = update_fn(inventory.clone(), Chain::Base).unwrap();
         assert_ne!(result, inventory);
 
-        let onchain = result.onchain.unwrap();
+        let onchain = result.onchain[&Chain::Base];
         assert_eq!(onchain.total().unwrap(), shares(999));
     }
 
     #[test]
     fn on_snapshot_applies_when_no_last_rebalancing() {
         let inventory = Inventory {
-            onchain: Some(venue(50, 0)),
+            onchain: BTreeMap::from([(Chain::Base, venue(50, 0))]),
             offchain: Some(venue(50, 0)),
             last_rebalancing: None,
         };
 
         let update_fn = Inventory::on_snapshot(Venue::MarketMaking, shares(999), Utc::now());
-        let result = update_fn(inventory.clone()).unwrap();
+        let result = update_fn(inventory.clone(), Chain::Base).unwrap();
         assert_ne!(result, inventory);
 
-        let onchain = result.onchain.unwrap();
+        let onchain = result.onchain[&Chain::Base];
         assert_eq!(onchain.total().unwrap(), shares(999));
     }
 
@@ -4185,7 +4447,7 @@ mod tests {
 
         let inventory = result.equities.get(&symbol).unwrap();
         assert_eq!(
-            inventory.onchain.unwrap().inflight(),
+            inventory.onchain[&Chain::Base].inflight(),
             shares(10),
             "Stale snapshot should preserve original inflight of 10, not update to 5"
         );
@@ -4222,7 +4484,7 @@ mod tests {
 
         let inventory = result.equities.get(&symbol).unwrap();
         assert_eq!(
-            inventory.onchain.unwrap().inflight(),
+            inventory.onchain[&Chain::Base].inflight(),
             shares(5),
             "Fresh snapshot should update MarketMaking inflight to the snapshot value"
         );
@@ -4251,7 +4513,7 @@ mod tests {
 
         let inventory = result.equities.get(&symbol).unwrap();
         assert_eq!(
-            inventory.onchain.unwrap().inflight(),
+            inventory.onchain[&Chain::Base].inflight(),
             shares(5),
             "Should update MarketMaking inflight to the snapshot value"
         );
@@ -4278,7 +4540,7 @@ mod tests {
 
         let inventory = result.equities.get(&symbol).unwrap();
         assert_eq!(
-            inventory.onchain.unwrap().inflight(),
+            inventory.onchain[&Chain::Base].inflight(),
             shares(10),
             "Absent symbol should preserve original MarketMaking inflight of 10"
         );
@@ -4295,7 +4557,7 @@ mod tests {
             equities: std::iter::once((
                 symbol.clone(),
                 Inventory {
-                    onchain: None,
+                    onchain: BTreeMap::new(),
                     offchain: Some(VenueBalance::new(shares(100), FractionalShares::ZERO)),
                     last_rebalancing: None,
                 },
@@ -4307,7 +4569,7 @@ mod tests {
         // Onchain (MarketMaking) is None before the snapshot
         let pre = view.equities.get(&symbol).unwrap();
         assert!(
-            pre.onchain.is_none(),
+            pre.onchain.is_empty(),
             "Precondition: onchain should be None"
         );
 
@@ -4321,7 +4583,7 @@ mod tests {
         // Some(available=0, inflight=0) for the missing venue.
         // After fix, the missing venue should remain None.
         assert!(
-            inventory.onchain.is_none(),
+            inventory.onchain.is_empty(),
             "Empty inflight snapshot should not initialize a missing venue to Some(0, 0)"
         );
     }
@@ -4707,19 +4969,19 @@ mod tests {
             .unwrap();
 
         assert!(
-            view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(100)),
+            view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Chain::Base, Some(100)),
             "a fill at the snapshot's block is absorbed"
         );
         assert!(
-            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(101)),
+            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Chain::Base, Some(101)),
             "a fill past the snapshot's block is not absorbed"
         );
         assert!(
-            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, None),
+            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Chain::Base, None),
             "a legacy fill without a block is never absorbed"
         );
         assert!(
-            view.onchain_fill_absorbed_by_usdc_snapshot(Some(100)),
+            view.onchain_fill_absorbed_by_usdc_snapshot(Chain::Base, Some(100)),
             "the USDC leg mirrors the equity behavior at the venue level"
         );
     }
@@ -4772,11 +5034,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(100)),
+            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Chain::Base, Some(100)),
             "an inflight-skipped equity snapshot must not mark fills absorbed"
         );
         assert!(
-            !view.onchain_fill_absorbed_by_usdc_snapshot(Some(100)),
+            !view.onchain_fill_absorbed_by_usdc_snapshot(Chain::Base, Some(100)),
             "an inflight-skipped USDC snapshot must not mark fills absorbed"
         );
     }
@@ -4831,15 +5093,15 @@ mod tests {
             "a below-watermark USDC snapshot must not replace the balance"
         );
         assert!(
-            view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(150)),
+            view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Chain::Base, Some(150)),
             "the equity watermark must stay at the highest applied block"
         );
         assert!(
-            view.onchain_fill_absorbed_by_usdc_snapshot(Some(150)),
+            view.onchain_fill_absorbed_by_usdc_snapshot(Chain::Base, Some(150)),
             "the USDC watermark must stay at the highest applied block"
         );
         assert!(
-            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(201)),
+            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Chain::Base, Some(201)),
             "a fill past the highest applied block is still not absorbed"
         );
     }
@@ -4907,19 +5169,19 @@ mod tests {
             "the force path always writes the balance"
         );
         assert!(
-            !forced.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(150)),
+            !forced.onchain_fill_absorbed_by_equity_snapshot(&aapl, Chain::Base, Some(150)),
             "the equity watermark must drop to the forced block; a fill \
              above it is not absorbed by the forced balance"
         );
         assert!(
-            forced.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(100)),
+            forced.onchain_fill_absorbed_by_equity_snapshot(&aapl, Chain::Base, Some(100)),
             "fills at or below the forced block are absorbed"
         );
         assert!(
-            !forced.onchain_fill_absorbed_by_usdc_snapshot(Some(150)),
+            !forced.onchain_fill_absorbed_by_usdc_snapshot(Chain::Base, Some(150)),
             "the USDC watermark must drop to the forced block"
         );
-        assert!(forced.onchain_fill_absorbed_by_usdc_snapshot(Some(100)));
+        assert!(forced.onchain_fill_absorbed_by_usdc_snapshot(Chain::Base, Some(100)));
     }
 
     /// `#[serde(default)]` on the two block-watermark fields is what keeps
@@ -4945,11 +5207,11 @@ mod tests {
         let view: InventoryView = serde_json::from_value(payload).unwrap();
 
         assert!(
-            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(1)),
+            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Chain::Base, Some(1)),
             "legacy state without watermark fields must absorb no equity fills"
         );
         assert!(
-            !view.onchain_fill_absorbed_by_usdc_snapshot(Some(1)),
+            !view.onchain_fill_absorbed_by_usdc_snapshot(Chain::Base, Some(1)),
             "legacy state without watermark fields must absorb no USDC fills"
         );
     }
@@ -4963,12 +5225,13 @@ mod tests {
 
         let view = InventoryView::default().record_onchain_equity_block_watermarks(
             Venue::Hedging,
+            Chain::Base,
             [&aapl],
             Some(100),
         );
 
         assert!(
-            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Some(100)),
+            !view.onchain_fill_absorbed_by_equity_snapshot(&aapl, Chain::Base, Some(100)),
             "a Hedging recording must not create an onchain block watermark"
         );
     }
@@ -5215,7 +5478,10 @@ mod tests {
                 (
                     aapl.clone(),
                     Inventory {
-                        onchain: Some(VenueBalance::new(shares(90), FractionalShares::ZERO)),
+                        onchain: BTreeMap::from([(
+                            Chain::Base,
+                            VenueBalance::new(shares(90), FractionalShares::ZERO),
+                        )]),
                         offchain: Some(VenueBalance::new(shares(10), FractionalShares::ZERO)),
                         last_rebalancing: None,
                     },
@@ -5223,7 +5489,10 @@ mod tests {
                 (
                     tsla.clone(),
                     Inventory {
-                        onchain: Some(VenueBalance::new(shares(50), FractionalShares::ZERO)),
+                        onchain: BTreeMap::from([(
+                            Chain::Base,
+                            VenueBalance::new(shares(50), FractionalShares::ZERO),
+                        )]),
                         offchain: Some(VenueBalance::new(shares(20), shares(5))),
                         last_rebalancing: None,
                     },
@@ -5331,7 +5600,7 @@ mod tests {
 
         let inventory = result.equities.get(&symbol).unwrap();
         assert_eq!(
-            inventory.onchain.unwrap().inflight(),
+            inventory.onchain[&Chain::Base].inflight(),
             shares(5),
             "Present symbol should have MarketMaking inflight updated from 10 to 5"
         );
@@ -5505,13 +5774,14 @@ mod tests {
             last_terminal_offchain_orders: HashMap::new(),
             last_offchain_fill_applied_at: HashMap::new(),
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
-            onchain_usdc_snapshot_block_watermark: None,
+            onchain_usdc_snapshot_block_watermark: BTreeMap::new(),
             last_offchain_cash_fill_applied_at: None,
             offchain_equity_snapshot_skip_streaks: HashMap::new(),
             offchain_usd_snapshot_skip_streak: 0,
             offchain_usd_snapshot_watermark: None,
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
+            trading_chain: Chain::Base,
         };
 
         let dto = view.to_dto();
@@ -5544,7 +5814,7 @@ mod tests {
             equities: std::iter::once((
                 spy,
                 Inventory {
-                    onchain: Some(venue(75, 0)),
+                    onchain: BTreeMap::from([(Chain::Base, venue(75, 0))]),
                     offchain: None,
                     last_rebalancing: None,
                 },
@@ -5569,13 +5839,14 @@ mod tests {
             last_terminal_offchain_orders: HashMap::new(),
             last_offchain_fill_applied_at: HashMap::new(),
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
-            onchain_usdc_snapshot_block_watermark: None,
+            onchain_usdc_snapshot_block_watermark: BTreeMap::new(),
             last_offchain_cash_fill_applied_at: None,
             offchain_equity_snapshot_skip_streaks: HashMap::new(),
             offchain_usd_snapshot_skip_streak: 0,
             offchain_usd_snapshot_watermark: None,
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
+            trading_chain: Chain::Base,
         };
 
         let dto = view.to_dto();
@@ -5909,7 +6180,7 @@ mod tests {
             equities: std::iter::once((
                 spy,
                 Inventory {
-                    onchain: Some(venue(75, 0)),
+                    onchain: BTreeMap::from([(Chain::Base, venue(75, 0))]),
                     offchain: None,
                     last_rebalancing: None,
                 },

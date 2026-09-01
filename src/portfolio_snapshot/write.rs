@@ -3099,8 +3099,8 @@ mod tests {
 
         let view = InventoryView::default()
             .with_equity(aapl(), wrapped_market_making, unwrapped_offchain)
-            .record_equity_snapshot_watermarks(Venue::MarketMaking, [&aapl()], now)
-            .record_equity_snapshot_watermarks(Venue::Hedging, [&aapl()], now)
+            .record_equity_snapshot_watermarks(Venue::MarketMaking, Chain::Base, [&aapl()], now)
+            .record_equity_snapshot_watermarks(Venue::Hedging, Chain::Base, [&aapl()], now)
             .set_inflight_equity_at_location(
                 InFlightEquityLocation::BaseWalletWrapped,
                 &BTreeMap::from([(aapl(), wrapped_transit)]),
