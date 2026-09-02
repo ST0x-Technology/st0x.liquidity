@@ -284,12 +284,14 @@ pub(crate) async fn place_offchain_order_at_broker(
         | None) => return Ok(settled),
     }
 
-    // Capture metric labels before `symbol` is moved into the market order.
+    // Capture metric labels before `symbol` and `kind` are moved into the
+    // broker order.
     let symbol_label = symbol.to_string();
     let direction_label = match direction {
         Direction::Buy => "buy",
         Direction::Sell => "sell",
     };
+    let session_label = session_metric_label(kind.market_session());
 
     let placement = match kind {
         CounterTradeOrderKind::Market => {
@@ -345,7 +347,8 @@ pub(crate) async fn place_offchain_order_at_broker(
             counter!(
                 "hedge_trades_total",
                 "symbol" => symbol_label,
-                "direction" => direction_label
+                "direction" => direction_label,
+                "session" => session_label
             )
             .increment(1);
 
@@ -376,7 +379,8 @@ pub(crate) async fn place_offchain_order_at_broker(
             counter!(
                 "broker_errors_total",
                 "symbol" => symbol_label,
-                "kind" => "place_order_failed"
+                "kind" => "place_order_failed",
+                "session" => session_label
             )
             .increment(1);
 
@@ -475,6 +479,19 @@ fn dto_market_session(session: MarketSession) -> st0x_dto::MarketSession {
         MarketSession::Extended => st0x_dto::MarketSession::Extended,
         MarketSession::Overnight => st0x_dto::MarketSession::Overnight,
         MarketSession::Closed => st0x_dto::MarketSession::Closed,
+    }
+}
+
+/// The `session` label value shared by every order/fill metric, so one
+/// spelling serves all record sites. `closed` is unreachable on an order
+/// metric (no order is placed in a closed session); the arm exists so the
+/// compiler forces a label decision for any future variant.
+pub(crate) const fn session_metric_label(session: MarketSession) -> &'static str {
+    match session {
+        MarketSession::Regular => "regular",
+        MarketSession::Extended => "extended",
+        MarketSession::Overnight => "overnight",
+        MarketSession::Closed => "closed",
     }
 }
 
@@ -1169,13 +1186,22 @@ impl EventSourced for OffchainOrder {
 
             OffchainOrderCommand::CompleteFill { price, filled_at } => match self {
                 Self::Submitted {
-                    symbol, placed_at, ..
+                    symbol,
+                    placed_at,
+                    market_session,
+                    ..
                 }
                 | Self::PartiallyFilled {
-                    symbol, placed_at, ..
+                    symbol,
+                    placed_at,
+                    market_session,
+                    ..
                 }
                 | Self::Cancelling {
-                    symbol, placed_at, ..
+                    symbol,
+                    placed_at,
+                    market_session,
+                    ..
                 } => {
                     // Wall-clock placement-to-fill latency. A negative delta can
                     // only come from clock skew (never a real latency), so
@@ -1184,8 +1210,12 @@ impl EventSourced for OffchainOrder {
                     // silently swallowed.
                     match (filled_at - *placed_at).to_std() {
                         Ok(latency) => {
-                            histogram!("hedge_fill_latency_seconds", "symbol" => symbol.to_string())
-                                .record(latency.as_secs_f64());
+                            histogram!(
+                                "hedge_fill_latency_seconds",
+                                "symbol" => symbol.to_string(),
+                                "session" => session_metric_label(*market_session)
+                            )
+                            .record(latency.as_secs_f64());
                         }
                         Err(error) => {
                             debug!(
@@ -2092,6 +2122,19 @@ impl OffchainOrder {
             | PartiallyFilled { close_flatten, .. }
             | Cancelling { close_flatten, .. } => *close_flatten,
             Filled { .. } | Failed { .. } | Cancelled { .. } => false,
+        }
+    }
+
+    pub(crate) const fn market_session(&self) -> MarketSession {
+        use OffchainOrder::*;
+        match self {
+            Pending { market_session, .. }
+            | Submitted { market_session, .. }
+            | PartiallyFilled { market_session, .. }
+            | Cancelling { market_session, .. }
+            | Filled { market_session, .. }
+            | Failed { market_session, .. }
+            | Cancelled { market_session, .. } => *market_session,
         }
     }
 
@@ -5522,12 +5565,58 @@ mod tests {
 
         let rendered = handle.render();
         assert!(
-            rendered.contains("hedge_trades_total{") && rendered.contains("direction=\"buy\""),
-            "a successful placement must increment hedge_trades_total{{direction=buy}}, got:\n{rendered}"
+            rendered.contains("hedge_trades_total{")
+                && rendered.contains("direction=\"buy\"")
+                && rendered.contains("session=\"regular\""),
+            "a successful placement must increment hedge_trades_total labelled with \
+             direction and session, got:\n{rendered}"
         );
         assert!(
             !rendered.contains("broker_errors_total{"),
             "a successful placement must not touch broker_errors_total, got:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_placement_labels_hedge_trades_with_the_session() {
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let placer = overnight_noop_order_placer();
+
+        place_at_broker_with_kind(placer.as_ref(), eligible_overnight_kind()).await;
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("hedge_trades_total{") && rendered.contains("session=\"overnight\""),
+            "an overnight placement must increment hedge_trades_total with \
+             session=overnight, got:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_fill_labels_latency_with_the_session() {
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let id = OffchainOrderId::new();
+
+        place_and_submit_overnight(&store, &id).await;
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::CompleteFill {
+                    price: Usd::new(float!(150.00)),
+                    filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                "hedge_fill_latency_seconds_count{symbol=\"AAPL\",session=\"overnight\"} 1"
+            ),
+            "an overnight fill must record its latency sample with \
+             session=overnight, got:\n{rendered}"
         );
     }
 
@@ -5566,8 +5655,10 @@ mod tests {
         let rendered = handle.render();
         assert!(
             rendered.contains("broker_errors_total{")
-                && rendered.contains("kind=\"place_order_failed\""),
-            "a failed placement must increment broker_errors_total{{kind=place_order_failed}}, got:\n{rendered}"
+                && rendered.contains("kind=\"place_order_failed\"")
+                && rendered.contains("session=\"regular\""),
+            "a failed placement must increment broker_errors_total labelled with kind \
+             and session, got:\n{rendered}"
         );
         assert!(
             !rendered.contains("hedge_trades_total{"),
@@ -6338,8 +6429,11 @@ mod tests {
 
         let rendered = handle.render();
         assert!(
-            rendered.contains("hedge_fill_latency_seconds_count{symbol=\"AAPL\"} 1"),
-            "completing a fill must record exactly one hedge_fill_latency_seconds sample, got:\n{rendered}"
+            rendered.contains(
+                "hedge_fill_latency_seconds_count{symbol=\"AAPL\",session=\"regular\"} 1"
+            ),
+            "completing a fill must record exactly one hedge_fill_latency_seconds sample \
+             labelled with the order's session, got:\n{rendered}"
         );
     }
 

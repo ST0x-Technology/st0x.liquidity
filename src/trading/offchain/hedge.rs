@@ -36,7 +36,7 @@ use crate::offchain::order::{
     CounterTradeOrderKind, OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacer,
     PollOrderStatusJobQueue, client_order_id_for_placement,
     finalize_cancelled_position_or_log_unpriced, place_offchain_order_at_broker,
-    push_poll_job_if_absent,
+    push_poll_job_if_absent, session_metric_label,
 };
 use crate::position::{AnchorDisposition, Position, PositionCommand, PositionError};
 use crate::trading::offchain::close_flatten::{CloseFlattenCrossRamp, CloseFlattenPolicy};
@@ -798,6 +798,7 @@ fn defer_overnight(symbol: &Symbol, reason: &'static str) -> Option<CounterTrade
     counter!(
         "hedge_scan_skipped_total",
         "symbol" => symbol.to_string(),
+        "session" => session_metric_label(MarketSession::Overnight),
         "reason" => reason
     )
     .increment(1);
@@ -6385,6 +6386,7 @@ mod tests {
 
     #[tokio::test]
     async fn overnight_session_defers_a_disabled_symbol_with_no_broker_call() {
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
         let placer = Arc::new(crate::offchain::order::ExecutorOrderPlacer(
             MockExecutor::new().with_market_session(MarketSession::Overnight),
         ));
@@ -6403,6 +6405,12 @@ mod tests {
         .unwrap();
 
         assert!(kind.is_none(), "a disabled symbol must defer, got {kind:?}");
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("hedge_scan_skipped_total{")
+                && rendered.contains("session=\"overnight\""),
+            "the defer must be counted with the overnight session label, in:\n{rendered}"
+        );
     }
 
     #[tokio::test]
