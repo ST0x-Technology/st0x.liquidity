@@ -48,7 +48,9 @@ impl std::fmt::Debug for PriceObservation {
     }
 }
 
-/// Whether an offchain order failure releases the position's
+/// Whether an offchain order failure releases its position anchor.
+///
+/// The position's
 /// broker-idempotency anchor (`last_failed_offchain_order_id`) or preserves
 /// it. `Release` requires `Some(OrderFailureTerminality::Terminal)`: positive,
 /// broker-documented evidence that the order under the failed placement's
@@ -1014,7 +1016,7 @@ impl Position {
     /// price available for dollar-value threshold.
     ///
     /// Returns `Err` on arithmetic overflow.
-    pub(crate) fn is_ready_for_execution(
+    pub fn is_ready_for_execution(
         &self,
         shares_limit: Option<Positive<FractionalShares>>,
     ) -> Result<Option<(Direction, FractionalShares)>, PositionError> {
@@ -1375,8 +1377,7 @@ impl DomainEvent for PositionEvent {
 }
 
 impl PositionEvent {
-    pub(crate) const ON_CHAIN_ORDER_FILLED_EVENT_TYPE: &'static str =
-        "PositionEvent::OnChainOrderFilled";
+    pub const ON_CHAIN_ORDER_FILLED_EVENT_TYPE: &'static str = "PositionEvent::OnChainOrderFilled";
 }
 
 /// Compares two optional `Float` prices, treating both-absent as equal.

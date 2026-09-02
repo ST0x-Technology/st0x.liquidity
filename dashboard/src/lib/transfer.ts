@@ -247,7 +247,7 @@ const commandPrefix = (deployment: DeploymentContext): string | null => {
   if (deployment.backendPort === null) return null
 
   const basePath = `/tmp/st0x-simulate-failures-${deployment.backendPort}`
-  return `nix develop --command cargo run --features mock --bin cli -- --config ${basePath}.config.toml --secrets ${basePath}.secrets.toml`
+  return `nix develop --command cargo run -p st0x-cli --features mock -- --config ${basePath}.config.toml --secrets ${basePath}.secrets.toml`
 }
 
 /// Whether a transfer status string (snake_case DTO status) is the terminal

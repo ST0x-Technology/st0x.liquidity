@@ -11,12 +11,12 @@ use st0x_execution::{CounterTradeSkipReason, MarketSession, MarketSessionStatus,
 
 /// Shared close-flatten decision used by position scanning and hedge pricing.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CloseFlattenPolicy {
+pub struct CloseFlattenPolicy {
     window: chrono::Duration,
 }
 
 impl CloseFlattenPolicy {
-    pub(crate) fn from_secs(window_secs: u64) -> Result<Self, chrono::OutOfRangeError> {
+    pub fn from_secs(window_secs: u64) -> Result<Self, chrono::OutOfRangeError> {
         chrono::Duration::from_std(Duration::from_secs(window_secs)).map(|window| Self { window })
     }
 
@@ -70,22 +70,19 @@ pub(crate) struct CloseFlattenWindow {
 /// that first becomes ready mid-window opens partway up the ramp, which is the
 /// intent -- it has less time left to flatten (ADR 0019).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CloseFlattenCrossRamp {
+pub struct CloseFlattenCrossRamp {
     base_bps: u16,
     max_bps: u16,
 }
 
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
-pub(crate) enum CloseFlattenCrossRampError {
+pub enum CloseFlattenCrossRampError {
     #[error("close-flatten cross ceiling {max_bps} bps is below the slippage base {base_bps} bps")]
     CeilingBelowBase { base_bps: u16, max_bps: u16 },
 }
 
 impl CloseFlattenCrossRamp {
-    pub(crate) const fn new(
-        base_bps: u16,
-        max_bps: u16,
-    ) -> Result<Self, CloseFlattenCrossRampError> {
+    pub const fn new(base_bps: u16, max_bps: u16) -> Result<Self, CloseFlattenCrossRampError> {
         if max_bps < base_bps {
             return Err(CloseFlattenCrossRampError::CeilingBelowBase { base_bps, max_bps });
         }

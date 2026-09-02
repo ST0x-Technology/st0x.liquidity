@@ -167,14 +167,14 @@ Manual wrap of tokenized equity into wrapped vault shares (requires rebalancing
 mode and a configured liquidity wallet for the selected network):
 
 ```bash
-cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml wrap-equity --symbol AAPL --quantity 10.5
+cargo run -p st0x-cli -- --config path/to/config.toml --secrets path/to/secrets.toml wrap-equity --symbol AAPL --quantity 10.5
 ```
 
 Manual unwrap of wrapped equity shares (requires rebalancing mode and a
 configured liquidity wallet for the selected network):
 
 ```bash
-cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml unwrap-equity --symbol AAPL --quantity 10.5
+cargo run -p st0x-cli -- --config path/to/config.toml --secrets path/to/secrets.toml unwrap-equity --symbol AAPL --quantity 10.5
 ```
 
 Both commands default to Base and resolve addresses from [assets.equities]. On a
@@ -182,13 +182,13 @@ non Base network, pass the target network and the st0x.registry token list for
 it:
 
 ```bash
-cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml wrap-equity --symbol RKLB --quantity 0.1 --network ethereum --registry path/to/st0x.registry/token-lists/ethereum.json
+cargo run -p st0x-cli -- --config path/to/config.toml --secrets path/to/secrets.toml wrap-equity --symbol RKLB --quantity 0.1 --network ethereum --registry path/to/st0x.registry/token-lists/ethereum.json
 ```
 
 Manual cancellation of an open Alpaca order by the id printed at placement:
 
 ```bash
-cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml cancel 61e7b016-9c91-4a97-b912-615c9d365c9d
+cargo run -p st0x-cli -- --config path/to/config.toml --secrets path/to/secrets.toml cancel 61e7b016-9c91-4a97-b912-615c9d365c9d
 ```
 
 A cancel for an id the broker does not know reports it as unknown, and a cancel
@@ -198,9 +198,9 @@ cancelable — neither is an error.
 Manual repair of local position tracking after an operator trade or rebalance:
 
 ```bash
-cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml position set --symbol SPYM --zero --reason "manual rebalance completed"
-cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml position set --symbol SPYM --long 100 --price 200 --reason "manual buy not observed by bot"
-cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml position set --symbol SPYM --short 12.5 --price 200 --reason "manual sell not observed by bot"
+cargo run -p st0x-cli -- --config path/to/config.toml --secrets path/to/secrets.toml position set --symbol SPYM --zero --reason "manual rebalance completed"
+cargo run -p st0x-cli -- --config path/to/config.toml --secrets path/to/secrets.toml position set --symbol SPYM --long 100 --price 200 --reason "manual buy not observed by bot"
+cargo run -p st0x-cli -- --config path/to/config.toml --secrets path/to/secrets.toml position set --symbol SPYM --short 12.5 --price 200 --reason "manual sell not observed by bot"
 ```
 
 `--price` (USDC per share) is required for a nonzero target when the symbol uses
@@ -214,7 +214,7 @@ After verifying a missing daily snapshot mark against a historical-price source,
 set the preceding regular-session close through the audited CQRS repair command:
 
 ```bash
-cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml portfolio-snapshot set --day 2026-07-20 --symbol AAPL --usd-mark 211.18 --observed-at 2026-07-17T20:00:00Z --source "Nasdaq historical close" --reason "repair missing snapshot mark"
+cargo run -p st0x-cli -- --config path/to/config.toml --secrets path/to/secrets.toml portfolio-snapshot set --day 2026-07-20 --symbol AAPL --usd-mark 211.18 --observed-at 2026-07-17T20:00:00Z --source "Nasdaq historical close" --reason "repair missing snapshot mark"
 ```
 
 The repair updates every captured location for that symbol and day without
@@ -223,7 +223,7 @@ first (the rebuild replays events read at its start; concurrent captures would
 force it to be re-run), then replay all captured balances and corrections with:
 
 ```bash
-cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml view rebuild --aggregate portfolio-snapshot --all
+cargo run -p st0x-cli -- --config path/to/config.toml --secrets path/to/secrets.toml view rebuild --aggregate portfolio-snapshot --all
 ```
 
 ### Brokerage Setup
@@ -495,9 +495,11 @@ Press `Ctrl-C` to stop.
 Workspace crates:
 
 - **`st0x-hedge`** (root) - Main arbitrage bot: event loop, CQRS/ES aggregates,
-  conductor, dashboard backend, and CLI
+  conductor, and dashboard backend
+- **`st0x-cli`** (`crates/cli/`) - Operator command-line application
 - **`st0x-config`** (`crates/config/`) - TOML/secrets loading and runtime
-  context assembly; restricted to `st0x-hedge` binary crates only
+  context assembly; restricted to the `st0x-hedge` and `st0x-cli` application
+  crates
 - **`st0x-dto`** (`crates/dto/`) - Dashboard DTOs and TypeScript binding
   generation
 - **`st0x-execution`** (`crates/execution/`) - Standalone `Executor` trait

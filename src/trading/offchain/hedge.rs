@@ -46,7 +46,7 @@ use crate::trading::onchain::trade_accountant::{
 
 /// Error returned by [`apply_slippage`].
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum SlippageError {
+pub enum SlippageError {
     #[error("float arithmetic failed: {0}")]
     FloatArith(#[from] rain_math_float::FloatError),
     #[error("slippage-adjusted price is non-positive (slippage_bps too large for sell)")]
@@ -105,7 +105,7 @@ pub(crate) fn apply_slippage(
 }
 
 /// Persistent job queue for hedge placement.
-pub(crate) type HedgeJobQueue = JobQueue<PlaceHedge>;
+pub type HedgeJobQueue = JobQueue<PlaceHedge>;
 
 /// Shared dependencies for hedge placement jobs.
 pub(crate) struct HedgeCtx {
@@ -222,7 +222,7 @@ pub(crate) async fn alert_dead_letter(
 /// `PlaceOffChainOrder` and `OffchainOrderCommand::Place` would leave the
 /// position stuck with a pending ID that no retry can ever claim.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct PlaceHedge {
+pub struct PlaceHedge {
     pub(crate) symbol: Symbol,
     pub(crate) direction: Direction,
     pub(crate) shares: Positive<FractionalShares>,

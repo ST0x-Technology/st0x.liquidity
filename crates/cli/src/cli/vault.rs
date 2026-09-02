@@ -86,7 +86,7 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
 
     let raindex_service = RaindexService::new(
         wallet_ctx.base_wallet().clone(),
-        crate::onchain::raindex_contracts(ctx.chains.sole_trading()),
+        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.sole_trading()),
         sender_address,
     );
 
@@ -148,7 +148,7 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
 
     let raindex_service = RaindexService::new(
         wallet_ctx.base_wallet().clone(),
-        crate::onchain::raindex_contracts(ctx.chains.sole_trading()),
+        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.sole_trading()),
         sender_address,
     );
 
@@ -234,7 +234,7 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::inventory::ImbalanceThreshold;
+    use st0x_hedge::operator::inventory::ImbalanceThreshold;
 
     fn create_ctx_without_rebalancing() -> Ctx {
         Ctx {

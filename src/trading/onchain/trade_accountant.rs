@@ -495,7 +495,7 @@ fn reconstruct_log(contracts: RaindexContracts, trade: &EmittedOnChain<RaindexTr
 
 /// Event processing errors for DEX trade accounting.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum TradeAccountingError {
+pub enum TradeAccountingError {
     #[error("Onchain trade processing error: {0}")]
     OnChain(#[from] OnChainError),
     #[error("Onchain trade command failed: {0}")]
@@ -591,7 +591,7 @@ pub(crate) enum TradeAccountingError {
 /// account-wide market-session lookup and all symbol-scoped pricing failures --
 /// while preventing the claimed path from carrying an unclassified error.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ClaimedHedgeOrderKindCause {
+pub enum ClaimedHedgeOrderKindCause {
     #[error("symbol-scoped order-kind selection failed with an outstanding position claim")]
     SymbolScoped {
         reason: SymbolScopedReason,
@@ -625,7 +625,7 @@ impl ClaimedHedgeOrderKindCause {
 /// separate from [`DeadLetterReason`] so `scope()` cannot name a label that
 /// belongs to the other abandonment path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum SymbolScopedReason {
+pub enum SymbolScopedReason {
     MarkFetch,
     LimitQuoteFetch,
     LimitQuoteUnavailable,

@@ -18,16 +18,16 @@ use st0x_evm::Chain;
 /// Wraps an arbitrary event type with metadata about the exact point
 /// at which the event was included in the ledger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct EmittedOnChain<Event> {
-    pub(crate) event: Event,
+pub struct EmittedOnChain<Event> {
+    pub event: Event,
     /// Defaulted only for in-flight apalis job payloads enqueued before the
     /// chain-qualified identity deploy.
     #[serde(default = "crate::onchain::legacy_chain")]
-    pub(crate) chain: Chain,
-    pub(crate) tx_hash: TxHash,
-    pub(crate) log_index: u64,
-    pub(crate) block_number: u64,
-    pub(crate) block_timestamp: Option<DateTime<Utc>>,
+    pub chain: Chain,
+    pub tx_hash: TxHash,
+    pub log_index: u64,
+    pub block_number: u64,
+    pub block_timestamp: Option<DateTime<Utc>>,
 }
 
 impl<Event> EmittedOnChain<Event> {

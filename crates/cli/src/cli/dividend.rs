@@ -149,9 +149,13 @@ mod tests {
         InventoryMode, LogFormat, LogLevel, TradingChain, TradingMode,
     };
     use st0x_evm::Chain;
+    use st0x_hedge::operator::test_utils::try_positive_shares;
 
     use super::*;
-    use crate::test_utils::positive_shares;
+
+    fn positive_shares(value: &str) -> Positive<FractionalShares> {
+        try_positive_shares(value).expect("test shares must be valid and positive")
+    }
 
     struct RecordingDividendBumpOperations {
         filled_quantity: Positive<FractionalShares>,

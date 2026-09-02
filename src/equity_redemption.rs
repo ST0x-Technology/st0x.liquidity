@@ -93,10 +93,10 @@ const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 /// enqueue time so apalis retries and bot restarts always target the same
 /// aggregate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) struct RedemptionAggregateId(pub(crate) Uuid);
+pub struct RedemptionAggregateId(pub(crate) Uuid);
 
 impl RedemptionAggregateId {
-    pub(crate) fn generate() -> Self {
+    pub fn generate() -> Self {
         Self(Uuid::new_v4())
     }
 }
@@ -118,8 +118,8 @@ impl FromStr for RedemptionAggregateId {
 /// Deterministic redemption aggregate id for tests. Maps a human-readable label
 /// to a UUID v5 so test aggregate ids stay valid [`RedemptionAggregateId`]
 /// values.
-#[cfg(test)]
-pub(crate) fn redemption_aggregate_id(label: &str) -> RedemptionAggregateId {
+#[cfg(any(test, feature = "test-support"))]
+pub fn redemption_aggregate_id(label: &str) -> RedemptionAggregateId {
     RedemptionAggregateId(Uuid::new_v5(&Uuid::NAMESPACE_OID, label.as_bytes()))
 }
 
@@ -127,12 +127,12 @@ pub(crate) fn redemption_aggregate_id(label: &str) -> RedemptionAggregateId {
 ///
 /// These errors enforce state machine constraints and prevent invalid transitions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum EquityRedemptionError {
+pub enum EquityRedemptionError {
     /// Raindex vault lookup failed for the given token
     #[error("Token {0} not found in Raindex vault registry")]
     RaindexVaultNotFound(Address),
     /// Raindex vault withdrawal transaction failed.
-    /// RaindexError can't be wrapped with #[from] because it contains
+    /// `RaindexError` cannot be wrapped with `#[from]` because it contains
     /// alloy types that don't implement Serialize/Deserialize (required
     /// by DomainError).
     #[error(
@@ -172,7 +172,7 @@ pub(crate) enum EquityRedemptionError {
         error_message: String,
     },
     /// ERC-4626 unwrap operation failed.
-    /// WrapperError can't be wrapped with #[from] because it contains
+    /// `WrapperError` cannot be wrapped with `#[from]` because it contains
     /// alloy types that don't implement Serialize/Deserialize (required
     /// by DomainError).
     #[error(
@@ -185,7 +185,7 @@ pub(crate) enum EquityRedemptionError {
         error_message: String,
     },
     /// Underlying token address lookup failed after unwrapping.
-    /// WrapperError can't be wrapped with #[from] for the same reason
+    /// `WrapperError` cannot be wrapped with `#[from]` for the same reason
     /// as UnwrapFailed above.
     #[error(
         "Underlying token lookup failed for {symbol}: \
@@ -254,14 +254,14 @@ pub(crate) enum EquityRedemptionError {
     ReconcileReasonRequired,
     /// Enqueueing the bot-gas receipt cost recording job failed after a
     /// vault withdraw / unwrap confirmation succeeded (ADR 0017). See
-    /// [`BotGasEnqueueFailure`] for why the payload is a rendered `String`
+    /// `BotGasEnqueueFailure` for why the payload is a rendered `String`
     /// rather than a typed source.
     #[error(transparent)]
     BotGasEnqueueFailed(#[from] BotGasEnqueueFailure),
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum EquityRedemptionCommand {
+pub enum EquityRedemptionCommand {
     /// Submits vault withdrawal tx and emits VaultWithdrawSubmitted.
     Redeem {
         symbol: Symbol,
@@ -382,14 +382,14 @@ pub(crate) enum EquityRedemptionCommand {
 /// the event log; it carries the operator's `--reason` so the audit trail
 /// records why the redemption was force-failed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum DetectionFailure {
+pub enum DetectionFailure {
     Timeout,
     ApiError { status_code: Option<u16> },
     Operator { reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum EquityRedemptionEvent {
+pub enum EquityRedemptionEvent {
     /// Vault withdrawal requested, awaiting submission.
     VaultWithdrawPending {
         symbol: Symbol,
@@ -812,7 +812,7 @@ impl DomainEvent for EquityRedemptionEvent {
 /// Uses the typestate pattern via enum variants to make invalid states unrepresentable.
 /// Each variant contains exactly the data valid for that state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum EquityRedemption {
+pub enum EquityRedemption {
     /// Vault withdrawal requested, awaiting submission
     VaultWithdrawPending {
         symbol: Symbol,

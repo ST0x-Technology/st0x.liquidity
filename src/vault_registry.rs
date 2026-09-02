@@ -29,9 +29,15 @@ use crate::conductor::job::{Job, JobQueue, Label};
 /// Typed identifier for VaultRegistry aggregates, keyed by
 /// orderbook and owner address pair.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct VaultRegistryId {
+pub struct VaultRegistryId {
     pub(crate) orderbook: Address,
     pub(crate) owner: Address,
+}
+
+impl VaultRegistryId {
+    pub fn new(orderbook: Address, owner: Address) -> Self {
+        Self { orderbook, owner }
+    }
 }
 
 impl fmt::Display for VaultRegistryId {
@@ -41,7 +47,7 @@ impl fmt::Display for VaultRegistryId {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum ParseVaultRegistryIdError {
+pub enum ParseVaultRegistryIdError {
     #[error("expected 'orderbook:owner', got '{id_provided}'")]
     MissingDelimiter { id_provided: String },
 
@@ -160,7 +166,7 @@ impl EventSourced for VaultRegistry {
 /// single-vault operations like deposits and withdrawals, preserving
 /// operator intent from current config ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct VaultRegistry {
+pub struct VaultRegistry {
     /// Equity vaults, grouped by token address then keyed by vault ID.
     pub(crate) equity_vaults: BTreeMap<Address, BTreeMap<B256, EquityVault>>,
     /// USDC vaults, keyed by vault ID.
@@ -409,7 +415,7 @@ impl VaultRegistry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum VaultRegistryCommand {
+pub enum VaultRegistryCommand {
     DiscoverEquityVault {
         token: Address,
         vault_id: B256,
@@ -439,7 +445,7 @@ pub(crate) enum VaultRegistryCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum VaultRegistryEvent {
+pub enum VaultRegistryEvent {
     EquityVaultDiscovered {
         token: Address,
         vault_id: B256,

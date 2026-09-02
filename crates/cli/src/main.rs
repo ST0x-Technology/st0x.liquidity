@@ -1,7 +1,8 @@
 //! Command-line interface for manual trading and authentication operations.
 
-use st0x_hedge::cli;
-use st0x_hedge::setup_tracing;
+mod cli;
+
+use st0x_config::setup_tracing;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

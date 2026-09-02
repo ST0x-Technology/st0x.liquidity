@@ -10,11 +10,11 @@ use std::sync::Arc;
 use st0x_config::Ctx;
 use st0x_evm::Wallet;
 use st0x_execution::{FractionalShares, Positive, Symbol};
+use st0x_hedge::operator::rebalancing::to_wrapped_equities;
 use st0x_wrapper::{WrappedEquity, Wrapper, WrapperService};
 
 use super::TokenizationNetwork;
 use super::token_list::load_wrapped_equities;
-use crate::rebalancing::to_wrapped_equities;
 
 pub(super) async fn wrap_equity_command<Writer: Write>(
     stdout: &mut Writer,
@@ -255,7 +255,8 @@ mod tests {
     use st0x_config::{BrokerCtx, ChainAssets, Ctx, LogFormat, LogLevel, TradingMode};
     use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
     use st0x_evm::Chain;
-    use st0x_execution::Symbol;
+    use st0x_execution::{FractionalShares, Positive, Symbol};
+    use st0x_hedge::operator::test_utils::try_positive_shares;
     use st0x_wrapper::MockWrapper;
 
     use super::{
@@ -263,7 +264,10 @@ mod tests {
         unwrap_equity_command, unwrap_equity_with_wrapper, wrap_equity_command,
         wrap_equity_with_wrapper,
     };
-    use crate::test_utils::positive_shares;
+
+    fn positive_shares(value: &str) -> Positive<FractionalShares> {
+        try_positive_shares(value).expect("test shares must be valid and positive")
+    }
 
     fn create_ctx_without_rebalancing() -> Ctx {
         Ctx {

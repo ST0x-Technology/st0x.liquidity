@@ -15,18 +15,18 @@ use st0x_execution::{
     CancellationOutcome, ExecutorOrderId, FractionalShares, LimitOrder, MarketOrder, Symbol,
 };
 use st0x_float_serde::format_float;
-
-use super::{AuditReason, PortfolioSnapshotRecoveryCommand};
-use crate::conductor::configured_equity_symbols;
-use crate::inventory::PortfolioLocation;
-use crate::offchain::order::{
+use st0x_hedge::operator::conductor::configured_equity_symbols;
+use st0x_hedge::operator::inventory::PortfolioLocation;
+use st0x_hedge::operator::offchain::order::{
     OffchainOrder, OffchainOrderCommand, OffchainOrderError, OffchainOrderId, OrderPlacementResult,
     OrderPlacer,
 };
-use crate::portfolio_snapshot::{
+use st0x_hedge::operator::portfolio_snapshot::{
     PortfolioSnapshot, PortfolioSnapshotCommand, PortfolioSnapshotId, PortfolioSnapshotProjection,
 };
-use crate::position::{AnchorDisposition, Position, PositionCommand};
+use st0x_hedge::operator::position::{AnchorDisposition, Position, PositionCommand};
+
+use super::{AuditReason, PortfolioSnapshotRecoveryCommand};
 
 pub(super) async fn set_portfolio_snapshot_mark_command<W: Write>(
     stdout: &mut W,
@@ -583,13 +583,27 @@ mod tests {
     use st0x_execution::{ClientOrderId, Direction, ExecutorOrderId, FractionalShares};
     use st0x_finance::{Positive, Usd};
     use st0x_float_macro::float;
+    use st0x_hedge::operator::inventory::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
+    use st0x_hedge::operator::portfolio_snapshot::{
+        PortfolioBalanceRowWithMark, PortfolioSnapshotId,
+    };
+    use st0x_hedge::operator::position::TradeId;
+    use st0x_hedge::operator::test_utils::{
+        try_positive_shares, try_rebalancing_enabled_equities, try_setup_test_db,
+    };
     use uuid::Uuid;
 
     use super::*;
-    use crate::inventory::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
-    use crate::portfolio_snapshot::{PortfolioBalanceRowWithMark, PortfolioSnapshotId};
-    use crate::position::TradeId;
-    use crate::test_utils::{positive_shares, setup_test_db};
+
+    fn positive_shares(value: &str) -> Positive<FractionalShares> {
+        try_positive_shares(value).expect("test shares must be valid and positive")
+    }
+
+    async fn setup_test_db() -> SqlitePool {
+        try_setup_test_db()
+            .await
+            .expect("test database setup must succeed")
+    }
 
     fn repair_order_placer() -> Arc<dyn OrderPlacer> {
         Arc::new(RepairOrderPlacer)
@@ -601,7 +615,7 @@ mod tests {
         let mut ctx =
             st0x_config::create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
         ctx.chains.sole_trading_mut().assets.equities =
-            crate::test_utils::rebalancing_enabled_equities(symbols);
+            try_rebalancing_enabled_equities(symbols).expect("test equity symbols must be valid");
         ctx
     }
 
@@ -951,9 +965,9 @@ mod tests {
                 direction: Direction::Sell,
                 executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
                 client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                kind: st0x_hedge::operator::offchain::order::CounterTradeOrderKind::Market,
             },
-            crate::offchain::order::noop_order_placer(),
+            st0x_hedge::operator::offchain::order::noop_order_placer(),
         )
         .await
         .unwrap();
@@ -971,7 +985,7 @@ mod tests {
                 market_session: st0x_execution::MarketSession::Regular,
                 limit_price: None,
             },
-            crate::offchain::order::noop_order_placer(),
+            st0x_hedge::operator::offchain::order::noop_order_placer(),
         )
         .await
         .unwrap();

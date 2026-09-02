@@ -39,7 +39,7 @@ use st0x_float_macro::float;
 use st0x_hedge::ImbalanceThreshold;
 use st0x_hedge::OperationMode;
 use st0x_hedge::bindings::{IRaindexV6, IST0xOrchestratorV1};
-use st0x_hedge::cli::seed_mint_at_tokens_wrapped_for_test;
+use st0x_hedge::e2e_support::seed_mint_at_tokens_wrapped;
 
 use self::assertions::*;
 use crate::assert::{StoredEvent, assert_single_clean_aggregate};
@@ -2861,7 +2861,7 @@ async fn active_mint_in_tokens_wrapped_recovers_into_raindex_vault() -> anyhow::
 
     let recovery_mint_id = issuer_request_id("ISS-RECOVERY-E2E");
 
-    seed_mint_at_tokens_wrapped_for_test(
+    seed_mint_at_tokens_wrapped(
         &pool,
         &recovery_mint_id,
         "AAPL",

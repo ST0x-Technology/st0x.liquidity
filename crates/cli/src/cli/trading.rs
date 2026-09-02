@@ -20,23 +20,23 @@ use st0x_execution::{
     OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
 };
 use st0x_float_serde::format_float_with_fallback;
-
-use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpressure};
-use crate::conductor::{
+use st0x_hedge::operator::conductor::{
     FillAccountingOutcome, account_for_onchain_fill, execute_mark_acknowledged,
     execute_settle_fill, is_expected_place_offchain_order_rejection,
 };
-use crate::offchain::order::{
+use st0x_hedge::operator::offchain::order::{
     OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacementResult, OrderPlacer,
     TerminalPositionFinalization, client_order_id_for_placement, place_offchain_order_at_broker,
     position_command_for_finalization, terminal_position_finalization,
 };
-use crate::onchain::accumulator::check_execution_readiness;
-use crate::onchain::trade::{BotOperator, RecoveryActors};
-use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
-use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
-use crate::position::{AnchorDisposition, Position, PositionCommand};
+use st0x_hedge::operator::onchain::accumulator::check_execution_readiness;
+use st0x_hedge::operator::onchain::trade::{BotOperator, RecoveryActors};
+use st0x_hedge::operator::onchain::{OnChainError, OnchainTrade, TradeValidationError};
+use st0x_hedge::operator::onchain_trade::{OnChainTrade, OnChainTradeId};
+use st0x_hedge::operator::position::{AnchorDisposition, Position, PositionCommand};
 use st0x_registry::SymbolCache;
+
+use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpressure};
 
 /// OrderPlacer for the CLI that delegates to the broker-specific executor
 /// constructed from config.
@@ -721,11 +721,11 @@ pub(super) async fn process_found_trade<W: Write>(
 
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
 
-    let trade_id = OnChainTradeId {
-        chain: onchain_trade.chain,
-        tx_hash: onchain_trade.tx_hash,
-        log_index: onchain_trade.log_index,
-    };
+    let trade_id = OnChainTradeId::new(
+        onchain_trade.chain,
+        onchain_trade.tx_hash,
+        onchain_trade.log_index,
+    );
 
     // Build stores. CLI path: per-invocation instances are fine (single-instance
     // rule applies to the server path only; see AGENTS.md).
@@ -762,7 +762,7 @@ pub(super) async fn process_found_trade<W: Write>(
     };
 
     let executor_type = ctx.broker.to_supported_executor();
-    let base_symbol = onchain_trade.symbol.base();
+    let base_symbol = onchain_trade.symbol();
 
     match reconcile_existing_pending_order(
         &offchain_order_store,
@@ -1164,7 +1164,7 @@ fn display_trade_details<W: Write>(
     onchain_trade: &OnchainTrade,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    let ticker = onchain_trade.symbol.base().to_string();
+    let ticker = onchain_trade.symbol().to_string();
 
     writeln!(stdout, "✅ Found opposite-side trade opportunity:")?;
     writeln!(stdout, "   Transaction: {}", onchain_trade.tx_hash)?;
@@ -1175,7 +1175,7 @@ fn display_trade_details<W: Write>(
     writeln!(
         stdout,
         "   Price per Share: ${}",
-        format_float_with_fallback(&onchain_trade.price.value())
+        format_float_with_fallback(&onchain_trade.price())
     )?;
     Ok(())
 }
@@ -1208,24 +1208,40 @@ mod tests {
         CounterTradePreflight, ExecutionError, InventoryResult, LimitOrder, Positive,
         SupportedExecutor, Usd,
     };
-
-    use super::*;
-    use crate::bindings::IRaindexV6::{ClearConfigV2, ClearV3};
-    use crate::conductor::{
+    use st0x_hedge::operator::bindings::IRaindexV6::{ClearConfigV2, ClearV3};
+    use st0x_hedge::operator::conductor::{
         TradeProcessingCqrs, execute_acknowledge_fill, execute_mark_acknowledged,
         process_queued_trade,
     };
-    use crate::offchain::order::{CancellationReason, PollOrderStatusJobQueue, noop_order_placer};
-    use crate::onchain::trade::RaindexTradeEvent;
-    use crate::onchain_trade::{
+    use st0x_hedge::operator::offchain::order::{
+        CancellationReason, PollOrderStatusJobQueue, noop_order_placer,
+    };
+    use st0x_hedge::operator::onchain::trade::RaindexTradeEvent;
+    use st0x_hedge::operator::onchain_trade::{
         InventoryVenue, OnChainTrade as OnChainTradeCqrs, OnChainTradeCommand, OnChainTradeSource,
     };
-    use crate::test_utils::{
-        OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_order, positive_shares, setup_test_db,
-        setup_test_pools,
+    use st0x_hedge::operator::test_utils::{
+        OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_order, try_positive_shares,
+        try_setup_test_db, try_setup_test_pools,
     };
-    use crate::trading::onchain::inclusion::EmittedOnChain;
-    use crate::trading::onchain::trade_accountant::TradeAccountingError;
+    use st0x_hedge::operator::trading::onchain::inclusion::EmittedOnChain;
+    use st0x_hedge::operator::trading::onchain::trade_accountant::TradeAccountingError;
+
+    use super::*;
+
+    fn positive_shares(value: &str) -> Positive<FractionalShares> {
+        try_positive_shares(value).expect("test shares must be valid and positive")
+    }
+
+    async fn setup_test_db() -> SqlitePool {
+        try_setup_test_db()
+            .await
+            .expect("test database setup must succeed")
+    }
+
+    fn onchain_trade_builder() -> OnchainTradeBuilder {
+        OnchainTradeBuilder::try_new().expect("default onchain trade fixture must be valid")
+    }
 
     /// `OrderPlacer` that always returns a broker error, used to drive the
     /// `OffchainOrder::Failed` path in `process_found_trade` tests.
@@ -2477,14 +2493,11 @@ mod tests {
             operator: Address::repeat_byte(0x8b),
             venue: InventoryVenue::Bebop,
         };
-        let onchain_trade = OnchainTradeBuilder::default().with_source(source).build();
+        let onchain_trade = onchain_trade_builder().with_source(source).build();
         let block_timestamp = onchain_trade.block_timestamp.unwrap();
 
-        let trade_id = OnChainTradeId {
-            chain: Chain::Base,
-            tx_hash: onchain_trade.tx_hash,
-            log_index: onchain_trade.log_index,
-        };
+        let trade_id =
+            OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
 
         // Pre-seed 1: witness + acknowledge the OnChainTrade aggregate.
         let (onchain_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
@@ -2497,10 +2510,10 @@ mod tests {
                 &trade_id,
                 OnChainTradeCommand::WitnessAt {
                     source: OnChainTradeSource::Legacy,
-                    symbol: onchain_trade.symbol.base().clone(),
+                    symbol: onchain_trade.symbol().clone(),
                     amount: onchain_trade.amount.inner(),
                     direction: onchain_trade.direction,
-                    price_usdc: onchain_trade.price.value(),
+                    price_usdc: onchain_trade.price(),
                     block_number: 1,
                     block_timestamp,
                     filled_at: block_timestamp,
@@ -2573,7 +2586,8 @@ mod tests {
             .unwrap()
             .expect("the acknowledged legacy trade must still exist");
         assert_eq!(
-            repaired.source, source,
+            repaired.source(),
+            source,
             "process-tx must append chain-backed venue attribution without re-accounting the fill"
         );
         let (attribution_count,): (i64,) =
@@ -2599,14 +2613,11 @@ mod tests {
         let ctx = create_base_test_ctx();
         let order_placer = create_order_placer(&ctx, &pool);
 
-        let onchain_trade = OnchainTradeBuilder::default().with_block_number(1).build();
+        let onchain_trade = onchain_trade_builder().with_block_number(1).build();
         let block_timestamp = onchain_trade.block_timestamp.unwrap();
 
-        let trade_id = OnChainTradeId {
-            chain: Chain::Base,
-            tx_hash: onchain_trade.tx_hash,
-            log_index: onchain_trade.log_index,
-        };
+        let trade_id =
+            OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
 
         // Pre-seed: witness only (not acknowledged — simulates crash window).
         let (store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
@@ -2619,10 +2630,10 @@ mod tests {
                 &trade_id,
                 OnChainTradeCommand::Witness {
                     source: onchain_trade.source,
-                    symbol: onchain_trade.symbol.base().clone(),
+                    symbol: onchain_trade.symbol().clone(),
                     amount: onchain_trade.amount.inner(),
                     direction: onchain_trade.direction,
-                    price_usdc: onchain_trade.price.value(),
+                    price_usdc: onchain_trade.price(),
                     block_number: 1,
                     block_timestamp,
                 },
@@ -2676,13 +2687,10 @@ mod tests {
         let order_placer = create_order_placer(&ctx, &pool);
 
         // block_number is required for the Witness step on a new fill.
-        let onchain_trade = OnchainTradeBuilder::default().with_block_number(42).build();
+        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
 
-        let trade_id = OnChainTradeId {
-            chain: Chain::Base,
-            tx_hash: onchain_trade.tx_hash,
-            log_index: onchain_trade.log_index,
-        };
+        let trade_id =
+            OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
 
         process_found_trade(
             onchain_trade,
@@ -2728,11 +2736,11 @@ mod tests {
     /// `OnChainOrderFilled` event. This is the primary double-count guard test.
     #[tokio::test]
     async fn process_tx_then_normal_path_does_not_double_count() {
-        let (pool, apalis_pool) = setup_test_pools().await;
+        let (pool, apalis_pool) = try_setup_test_pools().await.unwrap();
         let ctx = create_base_test_ctx();
         let order_placer = create_order_placer(&ctx, &pool);
 
-        let onchain_trade = OnchainTradeBuilder::default().with_block_number(42).build();
+        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
 
         // Step 1: CLI applies the fill.
         process_found_trade(
@@ -2772,12 +2780,12 @@ mod tests {
             assets: ChainAssets::default(),
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
             close_flatten_policy:
-                crate::trading::offchain::close_flatten::CloseFlattenPolicy::from_secs(900).unwrap(),
+                st0x_hedge::operator::trading::offchain::close_flatten::CloseFlattenPolicy::from_secs(900).unwrap(),
             close_flatten_ramp:
-                crate::trading::offchain::close_flatten::CloseFlattenCrossRamp::new(100, 400)
+                st0x_hedge::operator::trading::offchain::close_flatten::CloseFlattenCrossRamp::new(100, 400)
                     .unwrap(),
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
-            hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&apalis_pool),
+            hedge_queue: st0x_hedge::operator::trading::offchain::hedge::HedgeJobQueue::new(&apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
         };
 
@@ -2844,9 +2852,7 @@ mod tests {
         let ctx = create_base_test_ctx();
         let order_placer = create_order_placer(&ctx, &pool);
 
-        let onchain_trade = OnchainTradeBuilder::default()
-            .with_block_number(None)
-            .build();
+        let onchain_trade = onchain_trade_builder().with_block_number(None).build();
 
         let error = process_found_trade(
             onchain_trade,
@@ -2874,15 +2880,12 @@ mod tests {
 
         // block_number is set so the new-fill branch is reached; block_timestamp
         // is None so the bail fires before the witness step.
-        let onchain_trade = OnchainTradeBuilder::default()
+        let onchain_trade = onchain_trade_builder()
             .with_block_number(42)
             .with_block_timestamp(None)
             .build();
-        let expected_trade_id = OnChainTradeId {
-            chain: Chain::Base,
-            tx_hash: onchain_trade.tx_hash,
-            log_index: onchain_trade.log_index,
-        };
+        let expected_trade_id =
+            OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
 
         let error = process_found_trade(
             onchain_trade,
@@ -2938,7 +2941,7 @@ mod tests {
             );
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(FailingOrderPlacer);
-        let onchain_trade = OnchainTradeBuilder::default().with_block_number(42).build();
+        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
 
         let mut stdout = Vec::new();
         process_found_trade(onchain_trade, &ctx, &pool, &mut stdout, order_placer)
@@ -2985,7 +2988,7 @@ mod tests {
             .build(())
             .await
             .unwrap();
-        let onchain_trade = OnchainTradeBuilder::default()
+        let onchain_trade = onchain_trade_builder()
             .with_block_number(42)
             .with_block_timestamp(Some(block_timestamp))
             .build();
@@ -3074,7 +3077,7 @@ mod tests {
             .build(())
             .await
             .unwrap();
-        let onchain_trade = OnchainTradeBuilder::default()
+        let onchain_trade = onchain_trade_builder()
             .with_block_number(42)
             .with_block_timestamp(Some(block_timestamp))
             .build();
@@ -3146,7 +3149,7 @@ mod tests {
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let offchain_order_id = OffchainOrderId::new();
-        let onchain_trade = OnchainTradeBuilder::default().with_block_number(42).build();
+        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
         let block_timestamp = onchain_trade
             .block_timestamp
             .expect("test trade should have a block timestamp");
@@ -3216,7 +3219,7 @@ mod tests {
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let offchain_order_id = OffchainOrderId::new();
-        let onchain_trade = OnchainTradeBuilder::default().with_block_number(42).build();
+        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
         let block_timestamp = onchain_trade
             .block_timestamp
             .expect("test trade should have a block timestamp");
@@ -3306,7 +3309,7 @@ mod tests {
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let offchain_order_id = OffchainOrderId::new();
-        let onchain_trade = OnchainTradeBuilder::default().with_block_number(42).build();
+        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
         let block_timestamp = onchain_trade
             .block_timestamp
             .expect("test trade should have a block timestamp");
@@ -3400,14 +3403,11 @@ mod tests {
         let ctx = create_base_test_ctx();
         let order_placer = create_order_placer(&ctx, &pool);
 
-        let onchain_trade = OnchainTradeBuilder::default().with_block_number(42).build();
+        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
         let block_timestamp = onchain_trade.block_timestamp.unwrap();
 
-        let trade_id = OnChainTradeId {
-            chain: Chain::Base,
-            tx_hash: onchain_trade.tx_hash,
-            log_index: onchain_trade.log_index,
-        };
+        let trade_id =
+            OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
 
         // Simulate a concurrent writer (e.g. the normal pipeline) that witnesses
         // the fill via its own store instance backed by the same pool. When
@@ -3423,10 +3423,10 @@ mod tests {
                 &trade_id,
                 OnChainTradeCommand::Witness {
                     source: onchain_trade.source,
-                    symbol: onchain_trade.symbol.base().clone(),
+                    symbol: onchain_trade.symbol().clone(),
                     amount: onchain_trade.amount.inner(),
                     direction: onchain_trade.direction,
-                    price_usdc: onchain_trade.price.value(),
+                    price_usdc: onchain_trade.price(),
                     block_number: 42,
                     block_timestamp,
                 },
@@ -3504,14 +3504,11 @@ mod tests {
 
         let order_placer = create_order_placer(&ctx, &pool);
 
-        let onchain_trade = OnchainTradeBuilder::default().with_block_number(42).build();
+        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
         let block_timestamp = onchain_trade.block_timestamp.unwrap();
 
-        let trade_id = OnChainTradeId {
-            chain: Chain::Base,
-            tx_hash: onchain_trade.tx_hash,
-            log_index: onchain_trade.log_index,
-        };
+        let trade_id =
+            OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
 
         // Simulate a concurrent writer that has fully processed the fill.
         let (store_a, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
@@ -3524,10 +3521,10 @@ mod tests {
                 &trade_id,
                 OnChainTradeCommand::Witness {
                     source: onchain_trade.source,
-                    symbol: onchain_trade.symbol.base().clone(),
+                    symbol: onchain_trade.symbol().clone(),
                     amount: onchain_trade.amount.inner(),
                     direction: onchain_trade.direction,
-                    price_usdc: onchain_trade.price.value(),
+                    price_usdc: onchain_trade.price(),
                     block_number: 42,
                     block_timestamp,
                 },
@@ -3615,8 +3612,8 @@ mod tests {
 
         // Fill A and fill B: same tx_hash, different log_index so they have
         // distinct (tx_hash, log_index) identities.
-        let fill_a = OnchainTradeBuilder::default().with_block_number(10).build();
-        let fill_b = OnchainTradeBuilder::default()
+        let fill_a = onchain_trade_builder().with_block_number(10).build();
+        let fill_b = onchain_trade_builder()
             .with_log_index(2)
             .with_block_number(11)
             .build();
@@ -3624,16 +3621,8 @@ mod tests {
         let block_timestamp_a = fill_a.block_timestamp.unwrap();
         let block_timestamp_b = fill_b.block_timestamp.unwrap();
 
-        let trade_id_a = OnChainTradeId {
-            chain: Chain::Base,
-            tx_hash: fill_a.tx_hash,
-            log_index: fill_a.log_index,
-        };
-        let trade_id_b = OnChainTradeId {
-            chain: Chain::Base,
-            tx_hash: fill_b.tx_hash,
-            log_index: fill_b.log_index,
-        };
+        let trade_id_a = OnChainTradeId::new(Chain::Base, fill_a.tx_hash, fill_a.log_index);
+        let trade_id_b = OnChainTradeId::new(Chain::Base, fill_b.tx_hash, fill_b.log_index);
 
         let (onchain_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
             .build(())
@@ -3650,10 +3639,10 @@ mod tests {
                 &trade_id_a,
                 OnChainTradeCommand::Witness {
                     source: fill_a.source,
-                    symbol: fill_a.symbol.base().clone(),
+                    symbol: fill_a.symbol().clone(),
                     amount: fill_a.amount.inner(),
                     direction: fill_a.direction,
-                    price_usdc: fill_a.price.value(),
+                    price_usdc: fill_a.price(),
                     block_number: 10,
                     block_timestamp: block_timestamp_a,
                 },
@@ -3680,10 +3669,10 @@ mod tests {
                 &trade_id_b,
                 OnChainTradeCommand::Witness {
                     source: fill_b.source,
-                    symbol: fill_b.symbol.base().clone(),
+                    symbol: fill_b.symbol().clone(),
                     amount: fill_b.amount.inner(),
                     direction: fill_b.direction,
-                    price_usdc: fill_b.price.value(),
+                    price_usdc: fill_b.price(),
                     block_number: 11,
                     block_timestamp: block_timestamp_b,
                 },
@@ -3763,8 +3752,8 @@ mod tests {
         let order_placer = create_order_placer(&ctx, &pool);
 
         // Fill A and fill B have distinct (tx_hash, log_index) identities.
-        let fill_a = OnchainTradeBuilder::default().with_block_number(10).build();
-        let fill_b = OnchainTradeBuilder::default()
+        let fill_a = onchain_trade_builder().with_block_number(10).build();
+        let fill_b = onchain_trade_builder()
             .with_log_index(2)
             .with_block_number(11)
             .build();
@@ -3772,16 +3761,8 @@ mod tests {
         let block_timestamp_a = fill_a.block_timestamp.unwrap();
         let block_timestamp_b = fill_b.block_timestamp.unwrap();
 
-        let trade_id_a = OnChainTradeId {
-            chain: Chain::Base,
-            tx_hash: fill_a.tx_hash,
-            log_index: fill_a.log_index,
-        };
-        let trade_id_b = OnChainTradeId {
-            chain: Chain::Base,
-            tx_hash: fill_b.tx_hash,
-            log_index: fill_b.log_index,
-        };
+        let trade_id_a = OnChainTradeId::new(Chain::Base, fill_a.tx_hash, fill_a.log_index);
+        let trade_id_b = OnChainTradeId::new(Chain::Base, fill_b.tx_hash, fill_b.log_index);
 
         let (onchain_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
             .build(())
@@ -3812,10 +3793,10 @@ mod tests {
                 &trade_id_b,
                 OnChainTradeCommand::Witness {
                     source: fill_b.source,
-                    symbol: fill_b.symbol.base().clone(),
+                    symbol: fill_b.symbol().clone(),
                     amount: fill_b.amount.inner(),
                     direction: fill_b.direction,
-                    price_usdc: fill_b.price.value(),
+                    price_usdc: fill_b.price(),
                     block_number: 11,
                     block_timestamp: block_timestamp_b,
                 },
@@ -3905,7 +3886,7 @@ mod tests {
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(SucceedingOrderPlacer);
 
         // 1 share buy -> net +1 -> is_ready_for_execution returns (Sell, 1).
-        let onchain_trade = OnchainTradeBuilder::default().with_block_number(42).build();
+        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
 
         let mut stdout = Vec::new();
         process_found_trade(onchain_trade, &ctx, &pool, &mut stdout, order_placer)
@@ -3964,7 +3945,9 @@ mod tests {
 
         let (fill_count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
-                .bind(crate::position::PositionEvent::ON_CHAIN_ORDER_FILLED_EVENT_TYPE)
+                .bind(
+                    st0x_hedge::operator::position::PositionEvent::ON_CHAIN_ORDER_FILLED_EVENT_TYPE,
+                )
                 .fetch_one(&pool)
                 .await
                 .unwrap();

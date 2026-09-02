@@ -114,7 +114,7 @@ pub(crate) async fn load_failure_events(
 }
 
 /// Reactor maintaining the lifecycle-failure read model from live events.
-pub(crate) struct LifecycleFailureProjection {
+pub struct LifecycleFailureProjection {
     pool: SqlitePool,
 }
 
@@ -136,7 +136,7 @@ const INSERT_FAILURE_SQL: &str = "INSERT INTO lifecycle_failure_event (aggregate
      ON CONFLICT(aggregate_type, aggregate_id, event_type, occurred_at) DO NOTHING";
 
 impl LifecycleFailureProjection {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 
@@ -187,12 +187,12 @@ impl LifecycleFailureProjection {
     /// Rebuilds the entire lifecycle-failure read model from the event log.
     ///
     /// Truncates both the failure table and its checkpoints, then re-folds every
-    /// stream from scratch via [`Self::replay_pending`] (empty checkpoints mean
+    /// stream from scratch via `Self::replay_pending` (empty checkpoints mean
     /// every event is past `COALESCE(last_sequence, 0)`). Use to repair a
-    /// corrupted read model when an incremental [`Self::catch_up`] is not enough.
+    /// corrupted read model when an incremental `Self::catch_up` is not enough.
     /// Runs in one transaction: a failure mid-rebuild rolls back, never leaving a
     /// half-rebuilt table. Returns the number of events folded.
-    pub(crate) async fn rebuild_all(&self) -> Result<u64, FailureProjectionError> {
+    pub async fn rebuild_all(&self) -> Result<u64, FailureProjectionError> {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query("DELETE FROM lifecycle_failure_event")
@@ -378,7 +378,7 @@ fn map_failure(
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum FailureProjectionError {
+pub enum FailureProjectionError {
     #[error("lifecycle-failure read-model write failed")]
     Database(#[from] sqlx::Error),
 }

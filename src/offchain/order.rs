@@ -25,9 +25,10 @@ pub(crate) mod poll_status;
 pub(crate) mod reconcile_fill;
 
 pub(crate) use handle_rejection::{HandleOrderRejection, HandleOrderRejectionJobQueue};
+pub use poll_status::PollOrderStatusJobQueue;
 pub(crate) use poll_status::{
-    PollOrderStatus, PollOrderStatusJobQueue, push_poll_job_if_absent,
-    recover_submitted_offchain_orders, recover_submitted_offchain_orders_at_startup,
+    PollOrderStatus, push_poll_job_if_absent, recover_submitted_offchain_orders,
+    recover_submitted_offchain_orders_at_startup,
 };
 pub(crate) use reconcile_fill::{ReconcileOrderFill, ReconcileOrderFillJobQueue};
 
@@ -62,7 +63,7 @@ use crate::position::{AnchorDisposition, Position, PositionCommand};
 /// `JobError: From<E::Error>` so `?` lifts whichever executor error the
 /// caller picked. Adding a new executor means adding one variant here.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum JobError {
+pub enum JobError {
     #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
     #[error("Alpaca broker API error: {0}")]
@@ -98,7 +99,7 @@ pub(crate) enum JobError {
 /// order in [`OffchainOrder::Pending`] so the owning durable job can reschedule
 /// the idempotent placement with the same broker `client_order_id`.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum PlaceOffchainOrderError {
+pub enum PlaceOffchainOrderError {
     #[error("Offchain order command failed: {0}")]
     Command(#[from] SendError<OffchainOrder>),
     #[error("Broker placement was rate-limited")]
@@ -109,7 +110,7 @@ pub(crate) enum PlaceOffchainOrderError {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct OffchainOrderPlacement {
+pub struct OffchainOrderPlacement {
     symbol: Symbol,
     shares: Positive<FractionalShares>,
     direction: Direction,
@@ -119,7 +120,7 @@ pub(crate) struct OffchainOrderPlacement {
 }
 
 impl OffchainOrderPlacement {
-    pub(crate) fn market(
+    pub fn market(
         symbol: Symbol,
         shares: Positive<FractionalShares>,
         direction: Direction,
@@ -155,7 +156,9 @@ impl OffchainOrderPlacement {
     }
 }
 
-/// Drives one offchain order placement end to end: records intent via `Place`,
+/// Drives one offchain order placement end to end.
+///
+/// Records intent via `Place`,
 /// performs the external `place_market_order` while the order is still
 /// `Pending`, then feeds the broker outcome back as
 /// `MarkAccepted`/`MarkPlacementFailed`.
@@ -184,7 +187,7 @@ impl OffchainOrderPlacement {
 /// `PlaceHedge`) still hold `counter_trade_submission_lock` to serialise
 /// placement attempts; startup orphan recovery and the CLI `test-trade` command
 /// run without it, which is safe because no concurrent placement runs there.
-pub(crate) async fn place_offchain_order_at_broker(
+pub async fn place_offchain_order_at_broker(
     store: &Store<OffchainOrder>,
     order_placer: &dyn OrderPlacer,
     offchain_order_id: &OffchainOrderId,
@@ -323,7 +326,7 @@ pub(crate) async fn place_offchain_order_at_broker(
 /// [`place_offchain_order_at_broker`] so every placement path -- the
 /// trade-processing path, the hedge job, the CLI, and startup orphan recovery --
 /// derives the key the same way.
-pub(crate) fn client_order_id_for_placement(
+pub fn client_order_id_for_placement(
     offchain_order_id: OffchainOrderId,
     last_failed_offchain_order_id: Option<OffchainOrderId>,
 ) -> ClientOrderId {
@@ -1863,7 +1866,7 @@ impl OffchainOrder {
         })
     }
 
-    pub(crate) fn symbol(&self) -> &Symbol {
+    pub fn symbol(&self) -> &Symbol {
         use OffchainOrder::*;
         match self {
             Pending { symbol, .. }
@@ -1969,7 +1972,7 @@ impl OffchainOrder {
 /// (`filled_at`/`cancelled_at`/`failed_at`), the moment the broker recorded the
 /// outcome -- not the wall-clock time finalization happens to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TerminalPositionFinalization {
+pub enum TerminalPositionFinalization {
     /// Apply the recorded (priced) fill to the position.
     Complete {
         shares_filled: Positive<FractionalShares>,
@@ -1994,7 +1997,7 @@ pub(crate) enum TerminalPositionFinalization {
 /// How a terminal order with no fill ended, mapping 1:1 onto the position
 /// command the caller must issue.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum NoFillOutcome {
+pub enum NoFillOutcome {
     /// Broker-confirmed intentional cancellation: issue
     /// `PositionCommand::CancelOffChainOrder`, which clears the pending slot
     /// and the failure/idempotency anchor. `cancelled_at` is the broker's
@@ -2010,11 +2013,13 @@ pub(crate) enum NoFillOutcome {
     },
 }
 
-/// Maps a [`TerminalPositionFinalization`] onto the [`PositionCommand`] that
+/// Maps terminal order state onto its position command.
+///
+/// A [`TerminalPositionFinalization`] determines the [`PositionCommand`] that
 /// finalizes the owning position. Returns `None` for an unpriced fill, which
 /// must leave the position pending (callers log and let the every-tick
 /// finalize sweep keep surfacing it) rather than dropping the filled shares.
-pub(crate) fn position_command_for_finalization(
+pub fn position_command_for_finalization(
     finalization: TerminalPositionFinalization,
     offchain_order_id: OffchainOrderId,
 ) -> Option<PositionCommand> {
@@ -2077,10 +2082,12 @@ pub(crate) async fn finalize_cancelled_position_or_log_unpriced(
     Ok(())
 }
 
-/// Classifies a terminal [`OffchainOrder`] (`Filled`/`Cancelled`/`Failed`) into
+/// Classifies a terminal [`OffchainOrder`].
+///
+/// `Filled`, `Cancelled`, and `Failed` map into
 /// the [`TerminalPositionFinalization`] it implies. Returns `None` for
 /// non-terminal states (the caller leaves the position pending and retries).
-pub(crate) fn terminal_position_finalization(
+pub fn terminal_position_finalization(
     order: &OffchainOrder,
 ) -> Option<TerminalPositionFinalization> {
     match order {
@@ -2542,7 +2549,9 @@ pub struct OrderPlacementResult {
     pub limit_price: Option<Positive<Usd>>,
 }
 
-/// Type-erased order placement capability used by the durable placement path
+/// Type-erased order placement capability.
+///
+/// Used by the durable placement path
 /// ([`place_offchain_order_at_broker`]) -- the trade-processing context, the
 /// hedge job, and the CLI each hold one. The `OffchainOrder` aggregate keeps
 /// this as its service type for cancel pre-reconciliation and placement-adjacent
@@ -2753,8 +2762,8 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn noop_order_placer() -> Arc<dyn OrderPlacer> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn noop_order_placer() -> Arc<dyn OrderPlacer> {
     struct Noop;
 
     #[async_trait]
@@ -2808,15 +2817,19 @@ pub(crate) fn noop_order_placer() -> Arc<dyn OrderPlacer> {
 /// Returns a placed_shares value distinct from the requested shares,
 /// simulating broker truncation. Used so tests can verify the system
 /// persists the broker-accepted quantity, not the original request.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn noop_placed_shares(
     requested: Positive<FractionalShares>,
 ) -> Positive<FractionalShares> {
     let original = requested.inner().inner();
     let offset = st0x_float_macro::float!(0.001);
-    let truncated = (original - offset).expect("subtraction should not fail");
-
-    Positive::new(FractionalShares::new(truncated)).expect("truncated shares should be positive")
+    let Ok(truncated) = original - offset else {
+        unreachable!("subtraction of fixed valid test values must succeed");
+    };
+    let Ok(placed_shares) = Positive::new(FractionalShares::new(truncated)) else {
+        unreachable!("fixed truncated test shares must remain positive");
+    };
+    placed_shares
 }
 
 /// Determines whether a counter-trade is placed as a market order (regular
@@ -3053,7 +3066,7 @@ impl FromStr for OffchainOrderId {
 }
 
 impl OffchainOrderId {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
@@ -3069,6 +3082,12 @@ impl OffchainOrderId {
     /// fallible string roundtrip.
     pub(crate) fn as_uuid(&self) -> Uuid {
         self.0
+    }
+}
+
+impl Default for OffchainOrderId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -3137,7 +3156,7 @@ pub enum OffchainOrderError {
     /// recorded quantity failed. Carries both operands so the failing
     /// comparison is reproducible from the error alone; the underlying
     /// `rain_math_float::FloatError` is not serializable, so it is logged
-    /// at the comparison site ([`broker_fill_exceeds_local`]) instead.
+    /// at the comparison site (`broker_fill_exceeds_local`) instead.
     #[error(
         "Failed to compare broker-reported fill {broker_shares_filled} \
          against locally recorded fill {local_shares_filled}"

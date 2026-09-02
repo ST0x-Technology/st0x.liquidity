@@ -201,14 +201,14 @@ fn stage_summary(operations: &[WindowedOperation]) -> Vec<RebalanceStageStats> {
 }
 
 /// Reactor maintaining the rebalance stage-timing read model from live events.
-pub(crate) struct RebalanceTimingProjection {
+pub struct RebalanceTimingProjection {
     pool: SqlitePool,
 }
 
 deps!(RebalanceTimingProjection, [UsdcRebalance]);
 
 impl RebalanceTimingProjection {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 
@@ -298,12 +298,12 @@ impl RebalanceTimingProjection {
     /// Rebuilds the entire `rebalance_stage_timing` table from the event log.
     ///
     /// Truncates the table and re-folds every stream from scratch via
-    /// [`Self::replay_pending`] (an empty table has no checkpoints, so every
+    /// `Self::replay_pending` (an empty table has no checkpoints, so every
     /// event is past `COALESCE(last_sequence, 0)`). Use to repair a corrupted
-    /// read model when an incremental [`Self::catch_up`] is not enough. Runs in
+    /// read model when an incremental `Self::catch_up` is not enough. Runs in
     /// one transaction: a failure mid-rebuild rolls back, never leaving a
     /// half-rebuilt table. Returns the number of events replayed.
-    pub(crate) async fn rebuild_all(&self) -> Result<u64, ProjectionError> {
+    pub async fn rebuild_all(&self) -> Result<u64, ProjectionError> {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query("DELETE FROM rebalance_stage_timing")
@@ -424,7 +424,7 @@ impl RebalanceTimingProjection {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum ProjectionError {
+pub enum ProjectionError {
     #[error("rebalance stage-timing read-model write failed")]
     Database(#[from] sqlx::Error),
     #[error("rebalance operation timing (de)serialization failed")]

@@ -47,7 +47,7 @@ pub(crate) mod projection;
 pub(crate) mod read;
 pub(crate) mod write;
 
-pub(crate) use projection::PortfolioSnapshotProjection;
+pub use projection::PortfolioSnapshotProjection;
 #[cfg(test)]
 pub(crate) use read::load_portfolio_days;
 pub(crate) use read::{
@@ -63,13 +63,15 @@ pub(crate) use write::{
 #[cfg(test)]
 pub(crate) use write::et_day;
 
-/// Typed identifier for [`PortfolioSnapshot`] aggregates: one instance per
+/// Typed identifier for [`PortfolioSnapshot`] aggregates.
+///
+/// There is one instance per
 /// Eastern Time calendar day. Using the day itself as the id gives
 /// "has today been captured" idempotency at the framework level -- no extra
 /// state is needed to route a `Capture` command to `initialize` (first
 /// capture) or `transition` (already captured, rejected).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub(crate) struct PortfolioSnapshotId(pub(crate) NaiveDate);
+pub struct PortfolioSnapshotId(pub NaiveDate);
 
 impl fmt::Display for PortfolioSnapshotId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -80,7 +82,7 @@ impl fmt::Display for PortfolioSnapshotId {
 /// Error parsing a [`PortfolioSnapshotId`] from its `YYYY-MM-DD` string form.
 #[derive(Debug, Error)]
 #[error("invalid portfolio snapshot id '{value}': expected YYYY-MM-DD: {source}")]
-pub(crate) struct ParsePortfolioSnapshotIdError {
+pub struct ParsePortfolioSnapshotIdError {
     value: String,
     #[source]
     source: chrono::ParseError,
@@ -100,18 +102,19 @@ impl FromStr for PortfolioSnapshotId {
 }
 
 /// A [`PortfolioBalanceRow`] with the USD mark resolved at capture time.
+///
 /// Composes rather than duplicates `PortfolioBalanceRow`'s fields, so a field
 /// added there is inherited here automatically instead of needing to be
 /// mirrored by hand. The captured value remains immutable in its event; an
 /// audited correction is a later event whose projection value supersedes it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct PortfolioBalanceRowWithMark {
+pub struct PortfolioBalanceRowWithMark {
     #[serde(flatten)]
-    pub(crate) row: PortfolioBalanceRow,
+    pub row: PortfolioBalanceRow,
     /// `None` when the balance is nonzero but no price has been observed
     /// yet -- never a fabricated zero.
-    pub(crate) usd_mark: Option<Float>,
-    pub(crate) mark_captured_at: Option<DateTime<Utc>>,
+    pub usd_mark: Option<Float>,
+    pub mark_captured_at: Option<DateTime<Utc>>,
 }
 
 impl PartialEq for PortfolioBalanceRowWithMark {
@@ -124,7 +127,7 @@ impl PartialEq for PortfolioBalanceRowWithMark {
 
 /// Domain events for [`PortfolioSnapshot`], retained forever.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum PortfolioSnapshotEvent {
+pub enum PortfolioSnapshotEvent {
     Captured {
         captured_at: DateTime<Utc>,
         rows: Vec<PortfolioBalanceRowWithMark>,
@@ -231,7 +234,7 @@ impl DomainEvent for PortfolioSnapshotEvent {
 
 /// Commands for [`PortfolioSnapshot`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum PortfolioSnapshotCommand {
+pub enum PortfolioSnapshotCommand {
     Capture {
         captured_at: DateTime<Utc>,
         rows: Vec<PortfolioBalanceRowWithMark>,
@@ -256,7 +259,7 @@ pub(crate) enum PortfolioSnapshotCommand {
 
 /// Errors from [`PortfolioSnapshot`] command handling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
-pub(crate) enum PortfolioSnapshotError {
+pub enum PortfolioSnapshotError {
     #[error("portfolio already captured for this day")]
     AlreadyCaptured,
     #[error("portfolio has not been captured for this day")]
@@ -273,12 +276,14 @@ pub(crate) enum PortfolioSnapshotError {
     MarkTooStale { symbol: Symbol, et_day: NaiveDate },
 }
 
-/// One instance per ET day. Alongside capture idempotency it retains original
+/// One instance per ET day.
+///
+/// Alongside capture idempotency it retains original
 /// rows and per-symbol correction/alert state so durable job retries neither
 /// lose nor repeatedly send unusable-mark alerts. Queryable balances still
 /// live in the `portfolio_snapshot` projection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct PortfolioSnapshot {
+pub struct PortfolioSnapshot {
     pub(crate) captured_at: DateTime<Utc>,
     captured_rows: Vec<PortfolioBalanceRowWithMark>,
     alerted_symbols: HashSet<Symbol>,
@@ -296,7 +301,7 @@ impl PortfolioSnapshot {
             })
     }
 
-    pub(crate) fn captured_equity_row_count(&self, symbol: &Symbol) -> usize {
+    pub fn captured_equity_row_count(&self, symbol: &Symbol) -> usize {
         self.captured_equity_symbols()
             .filter(|captured| *captured == symbol)
             .count()

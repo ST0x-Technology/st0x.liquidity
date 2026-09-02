@@ -89,7 +89,7 @@ use st0x_finance::{HasZero, Id, Usdc};
 
 /// Unique identifier for a USDC rebalance operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub(crate) struct UsdcRebalanceId(pub(crate) Uuid);
+pub struct UsdcRebalanceId(pub Uuid);
 
 impl Display for UsdcRebalanceId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -107,14 +107,14 @@ impl FromStr for UsdcRebalanceId {
 
 /// Reference to a transfer, either via Alpaca API or onchain transaction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum TransferRef {
+pub enum TransferRef {
     AlpacaId(AlpacaTransferId),
     OnchainTx(TxHash),
 }
 
 /// Direction of the USDC rebalancing operation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum RebalanceDirection {
+pub enum RebalanceDirection {
     AlpacaToBase,
     BaseToAlpaca,
 }
@@ -133,7 +133,7 @@ impl From<RebalanceDirection> for st0x_dto::UsdcBridgeDirection {
 /// Cash amounts remain modeled as [`Usdc`] throughout the system because offchain
 /// USD buying power is normalized into the same cash type as onchain USDC.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ConversionAmounts {
+pub struct ConversionAmounts {
     pub(crate) source_amount: Usdc,
     pub(crate) received_amount: Usdc,
 }
@@ -147,11 +147,13 @@ impl ConversionAmounts {
     }
 }
 
-/// Why an operator reconciled a USDC rebalance stranded in the post-burn
+/// Why an operator reconciled a stranded USDC rebalance.
+///
+/// The rebalance is in the post-burn
 /// terminal `DepositFailed` state. The funds were handled out-of-band, so the
 /// reconcile records the reason rather than re-driving the failed deposit.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum ReconcileReason {
+pub enum ReconcileReason {
     /// The minted USDC was moved to its destination manually.
     FundsMovedManually,
     /// The deposit was credited at the destination outside the bot's view.
@@ -169,7 +171,7 @@ impl Display for ReconcileReason {
 
 /// Errors that can occur during USDC rebalance operations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum UsdcRebalanceError {
+pub enum UsdcRebalanceError {
     /// Attempted to initiate when already in progress
     #[error("Rebalancing has already been initiated")]
     AlreadyInitiated,
@@ -264,7 +266,7 @@ pub(crate) enum UsdcRebalanceError {
 /// - **AlpacaToBase**: Convert USD->USDC BEFORE withdrawal (need USDC for CCTP bridge)
 /// - **BaseToAlpaca**: Convert USDC->USD AFTER deposit (USDC arrives in crypto wallet)
 #[derive(Debug, Clone)]
-pub(crate) enum UsdcRebalanceCommand {
+pub enum UsdcRebalanceCommand {
     /// Start pre-withdrawal conversion for AlpacaToBase direction.
     /// Converts USD buying power to USDC before withdrawal to Alpaca's crypto wallet.
     /// `amount` is the USD spent, mirroring `ConversionAmounts::source_amount`.
@@ -367,7 +369,8 @@ pub(crate) enum UsdcRebalanceCommand {
     },
     /// Record the intent to burn for CCTP bridging BEFORE the on-chain call.
     /// Captures the chain head (`from_block`) for crash recovery, mirroring
-    /// [`BeginWithdrawal`]. Valid only from `WithdrawalComplete` state.
+    /// [`UsdcRebalanceCommand::BeginWithdrawal`]. Valid only from
+    /// `WithdrawalComplete` state.
     BeginBridging {
         from_block: u64,
         burn_amount: Option<Usdc>,
@@ -495,7 +498,7 @@ pub(crate) enum UsdcRebalanceCommand {
 /// Events represent immutable facts that have occurred and are persisted to the event store.
 /// Each event carries only the data relevant to that state transition.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum UsdcRebalanceEvent {
+pub enum UsdcRebalanceEvent {
     /// Conversion operation started (USD<->USDC). Records direction, amount, and order ID.
     ConversionInitiated {
         direction: RebalanceDirection,
@@ -703,7 +706,7 @@ impl DomainEvent for UsdcRebalanceEvent {
 /// Uses the typestate pattern via enum variants to make invalid states unrepresentable.
 /// Each variant contains exactly the data valid for that state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum UsdcRebalance {
+pub enum UsdcRebalance {
     /// USD/USDC conversion has been initiated (AlpacaToBase: USD->USDC, BaseToAlpaca: USDC->USD)
     Converting {
         direction: RebalanceDirection,
@@ -1190,7 +1193,7 @@ impl UsdcRebalance {
     /// reactor holds the guard from dispatch until a clearable-terminal event;
     /// re-deriving that boolean from durable event state keeps a restart from
     /// re-opening the re-burn window. See ADR 0003.
-    pub(crate) fn holds_rebalance_guard(&self) -> bool {
+    pub fn holds_rebalance_guard(&self) -> bool {
         match self {
             // `WithdrawalSubmitting`/`BridgingSubmitting` are transient intent
             // markers persisted immediately before an irreversible on-chain
@@ -1305,7 +1308,7 @@ impl UsdcRebalance {
     /// `amount_received`), so it is not the original requested amount the CLI
     /// prints -- validating `--amount` against it would reject legitimate resumes
     /// whenever slippage or CCTP fees move the effective amount.
-    pub(crate) fn direction(&self) -> RebalanceDirection {
+    pub fn direction(&self) -> RebalanceDirection {
         match self {
             Self::Converting { direction, .. }
             | Self::ConversionComplete { direction, .. }
@@ -1431,7 +1434,7 @@ impl UsdcRebalance {
     /// The persisted effective amount of the transfer (post-conversion /
     /// post-fee where applicable), as opposed to whatever an operator typed
     /// on a CLI resume.
-    pub(crate) fn amount(&self) -> Usdc {
+    pub fn amount(&self) -> Usdc {
         match self {
             // Post-conversion / post-bridge, the actually received amount is
             // the effective one; `amount` is the originally requested figure.

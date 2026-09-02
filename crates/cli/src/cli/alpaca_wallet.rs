@@ -5,6 +5,7 @@ use alloy::primitives::Address;
 use std::io::Write;
 use uuid::Uuid;
 
+use st0x_config::{BrokerCtx, Ctx};
 use st0x_evm::{Evm, IERC20, IntoErrorRegistry, USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA, Wallet};
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApi, AlpacaWalletService, ClientOrderId, ConversionOrder,
@@ -16,7 +17,6 @@ use st0x_float_serde::format_float_with_fallback;
 
 use super::ConvertDirection;
 use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpressure};
-use st0x_config::{BrokerCtx, Ctx};
 
 pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write>(
     stdout: &mut W,
@@ -719,10 +719,10 @@ mod tests {
     use st0x_evm::NoOpErrorRegistry;
     use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
     use st0x_float_macro::float;
+    use st0x_hedge::operator::inventory::ImbalanceThreshold;
 
     use super::*;
     use crate::cli::ConvertDirection;
-    use crate::inventory::ImbalanceThreshold;
 
     fn create_ctx_without_alpaca() -> Ctx {
         Ctx {

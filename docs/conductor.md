@@ -537,10 +537,10 @@ mechanism.** A CLI command is not a durable job: there is no queue row to
 reschedule and no sibling work waiting behind a shared `concurrency(1)` worker
 -- the "worker" is the one-shot process the operator is already waiting on, so
 retrying in place cannot reproduce the incident.
-`src/cli/backpressure_retry.rs`'s `retry_on_backpressure` reuses the same
-`find_backpressure`/`decide_backpressure` building blocks: on a classified 429
-within a small bounded attempt budget (`BACKPRESSURE_RETRY_MAX_ATTEMPTS`), it
-sleeps for the classified delay and retries in place; otherwise
+`crates/cli/src/cli/backpressure_retry.rs`'s `retry_on_backpressure` reuses the
+same `find_backpressure`/`decide_backpressure` building blocks: on a classified
+429 within a small bounded attempt budget (`BACKPRESSURE_RETRY_MAX_ATTEMPTS`),
+it sleeps for the classified delay and retries in place; otherwise
 (non-backpressure error, or budget exhausted) it propagates to the CLI's
 existing `anyhow` error path unchanged. Wired into `cli/trading.rs`
 (market/limit order placement, order-status), `cli/alpaca_wallet.rs` (deposit

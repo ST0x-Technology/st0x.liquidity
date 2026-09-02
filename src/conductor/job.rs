@@ -108,7 +108,9 @@ pub(crate) const BACKPRESSURE_RESCHEDULE_LIMIT: u32 = 500;
 /// page would allow.
 pub(crate) const BACKPRESSURE_ALERT_STREAK: u32 = BACKPRESSURE_RESCHEDULE_LIMIT / 2 + 1;
 
-/// Durable count of consecutive broker rate-limit (429) reschedules leading
+/// Durable count of consecutive broker rate-limit (429) reschedules.
+///
+/// The count leads
 /// up to a job's current attempt (RAI-1494). Every participating job payload
 /// carries this in the same field name (`backpressure_streak`), distinct at
 /// the type level from unrelated durable counters like
@@ -118,13 +120,13 @@ pub(crate) const BACKPRESSURE_ALERT_STREAK: u32 = BACKPRESSURE_RESCHEDULE_LIMIT 
 /// so no schema migration is implied and pre-existing rows still decode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub(crate) struct BackpressureStreak(pub(crate) u32);
+pub struct BackpressureStreak(pub u32);
 
 /// Outcome of [`decide_backpressure`]: the delay before a rescheduled
 /// successor should run, and whether the streak has exhausted
 /// [`BACKPRESSURE_RESCHEDULE_LIMIT`].
-pub(crate) struct BackpressureDecision {
-    pub(crate) delay: Duration,
+pub struct BackpressureDecision {
+    pub delay: Duration,
     /// `true` once `streak` has reached [`BACKPRESSURE_RESCHEDULE_LIMIT`] --
     /// the caller must not reschedule again. Per the RAI-1494 plan's binding
     /// M2 decision, a supervised job's `perform()` treats this as its own
@@ -132,16 +134,18 @@ pub(crate) struct BackpressureDecision {
     /// rather than propagating the original `Err` into the shared
     /// supervised on-event path, so a persistently-429ing item cannot
     /// reach `on_terminal_failure`'s `ctx.stop()` and halt the worker.
-    pub(crate) exhausted: bool,
+    pub exhausted: bool,
 }
 
-/// Pure: computes the reschedule delay and whether the budget is exhausted
+/// Computes the reschedule delay and whether the budget is exhausted.
+///
+/// This is a pure function
 /// for a given consecutive-backpressure streak. No apalis/tower types, no
 /// I/O, no `Job` bound -- trivially unit-testable and shared by every
 /// participating job. Logging (the every-10th-streak visibility line, and
 /// the loud exhaustion log) is the caller's responsibility, keeping this
 /// function a plain computation.
-pub(crate) fn decide_backpressure(
+pub fn decide_backpressure(
     backpressure: &Backpressure,
     streak: BackpressureStreak,
 ) -> BackpressureDecision {
@@ -259,7 +263,9 @@ pub(crate) async fn apply_backpressure_step<
     }
 }
 
-/// Walks the `.source()` chain of a job error looking for a classified
+/// Finds a classified broker rate-limit response in a job error.
+///
+/// Walks the `.source()` chain,
 /// broker rate-limit (429) response, checking the error itself before
 /// descending into its sources. Tries each of four known error types in
 /// turn, short-circuiting on the first `Some` -- this is the one place that
@@ -281,7 +287,7 @@ pub(crate) async fn apply_backpressure_step<
 /// `TokenizerError` (as every `Tokenizer` trait method returns) without ever
 /// downcasting it. `TokenizerError::backpressure()` delegates internally
 /// instead of relying on `.source()`.
-pub(crate) fn find_backpressure(error: &(dyn std::error::Error + 'static)) -> Option<Backpressure> {
+pub fn find_backpressure(error: &(dyn std::error::Error + 'static)) -> Option<Backpressure> {
     std::iter::successors(Some(error), |error| error.source()).find_map(|error| {
         error
             .downcast_ref::<AlpacaBrokerApiError>()
@@ -331,14 +337,15 @@ type Storage<Task> = SqliteStorage<
 >;
 
 /// Persistent job queue backed by apalis `SqliteStorage`.
-pub(crate) struct JobQueue<Task>(Storage<Task>);
+pub struct JobQueue<Task>(Storage<Task>);
 
-/// Concrete error returned by [`JobQueue::push`] / [`JobQueue::push_with_delay`].
+/// Concrete error returned by `JobQueue::push` / `JobQueue::push_with_delay`.
+///
 /// Wrapping [`TaskSinkError`] keeps the failure chain typed so callers can
 /// `#[from]` it into their own error enums instead of boxing.
 #[derive(Debug, thiserror::Error)]
 #[error("Failed to enqueue apalis job: {0}")]
-pub(crate) struct QueuePushError(#[from] pub(crate) TaskSinkError<SqlxError>);
+pub struct QueuePushError(#[from] pub(crate) TaskSinkError<SqlxError>);
 
 impl<Task> Clone for JobQueue<Task> {
     fn clone(&self) -> Self {
@@ -380,7 +387,7 @@ fn build_poll_config<T: 'static>() -> Config {
 }
 
 impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueue<Task> {
-    pub(crate) fn new(pool: &SqlitePool) -> Self {
+    pub fn new(pool: &SqlitePool) -> Self {
         Self(SqliteStorage::new_with_config(
             pool,
             &build_poll_config::<Task>(),
@@ -750,7 +757,7 @@ pub enum JobKind {
 /// Job execution error. Wraps the concrete `Job::Error` type at
 /// the `work()` boundary where the handler is generic over job types.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum JobError {
+pub enum JobError {
     #[error("{label}: {source}")]
     Failed {
         task_identity: TaskIdentity,

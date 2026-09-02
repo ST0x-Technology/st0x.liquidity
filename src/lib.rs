@@ -47,9 +47,10 @@ pub mod bindings;
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod bindings;
 mod bot_gas;
-pub mod cli;
 mod conductor;
 pub(crate) mod dashboard;
+#[cfg(feature = "test-support")]
+pub mod e2e_support;
 mod equity_redemption;
 mod iap_auth;
 mod inventory;
@@ -61,6 +62,7 @@ mod native_gas;
 mod offchain;
 mod onchain;
 mod onchain_trade;
+pub mod operator;
 mod performance;
 mod portfolio_snapshot;
 mod position;
@@ -130,7 +132,7 @@ pub use trading::onchain::trade_accountant::AccountForDexTrade;
 
 #[cfg(test)]
 mod integration_tests;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_utils;
 
 /// Returns the global apalis-board log broadcaster, creating it on first access.

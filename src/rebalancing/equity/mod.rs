@@ -208,21 +208,21 @@ async fn load_mint_recheck_context(
 /// `EquityRedemption` (market-making -> hedging) need Raindex for
 /// vault operations and Tokenizer for Alpaca API interactions.
 #[derive(Clone)]
-pub(crate) struct EquityTransferServices {
-    pub(crate) raindex: Arc<dyn Raindex>,
-    pub(crate) vault_lookup: Arc<dyn VaultLookup>,
-    pub(crate) tokenizer: Arc<dyn Tokenizer>,
-    pub(crate) wrapper: Arc<dyn Wrapper>,
+pub struct EquityTransferServices {
+    pub raindex: Arc<dyn Raindex>,
+    pub vault_lookup: Arc<dyn VaultLookup>,
+    pub tokenizer: Arc<dyn Tokenizer>,
+    pub wrapper: Arc<dyn Wrapper>,
     /// Enqueues bot-gas cost recording after `EquityRedemption`'s vault
     /// withdraw / unwrap confirmations succeed (ADR 0017).
     /// `TokenizedEquityMint`'s confirmations go through
     /// `CrossVenueEquityTransfer`'s own field instead (see that struct).
-    pub(crate) bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
+    pub bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
     /// Signs MintAuthV1 recipient authorizations for orchestrator-mode
     /// mints (RAI-1243). `Disabled` while the config has no
     /// `[orchestrator]` section; `SignMintAuthorization` then fails
     /// loudly instead of guessing an orchestrator address.
-    pub(crate) mint_authorizer: ConfiguredMintAuthorizer,
+    pub mint_authorizer: ConfiguredMintAuthorizer,
 }
 
 impl EquityTransferServices {
@@ -233,7 +233,7 @@ impl EquityTransferServices {
     /// and `Reconcile` commands). Used by the CLI `transfer fail` and
     /// `transfer reconcile` subcommands where no real broker/RPC connection
     /// exists.
-    pub(crate) fn panicking() -> Self {
+    pub fn panicking() -> Self {
         Self {
             raindex: Arc::new(PanickingRaindex),
             vault_lookup: Arc::new(PanickingVaultLookup),
@@ -449,7 +449,7 @@ impl Wrapper for PanickingWrapper {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum MintError {
+pub enum MintError {
     #[error(transparent)]
     GasReadiness(#[from] GasReadinessFailure),
     #[error("Aggregate error: {0}")]
@@ -566,7 +566,7 @@ impl BotGasFailureClassifier for MintError {
 /// because real tokens exist in the wallet and startup recovery will
 /// resume them.
 #[derive(Debug, Error)]
-pub(crate) enum MintTransferError {
+pub enum MintTransferError {
     /// Failure before Alpaca delivered tokens. Safe to clear guard and
     /// retry from scratch.
     #[error(transparent)]
@@ -619,7 +619,7 @@ fn classify_mint_resume_error(
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum RedemptionError {
+pub enum RedemptionError {
     #[error(transparent)]
     GasReadiness(#[from] GasReadinessFailure),
     #[error(transparent)]
@@ -697,7 +697,7 @@ struct WrappedMintResult {
 /// vault operations and tokenization. External code drives transfers only
 /// through [`Self::resume_equity_to_market_making`] and
 /// [`Self::resume_equity_to_hedging`].
-pub(crate) struct CrossVenueEquityTransfer {
+pub struct CrossVenueEquityTransfer {
     raindex: Arc<dyn Raindex>,
     vault_lookup: Arc<dyn VaultLookup>,
     tokenizer: Arc<dyn Tokenizer>,
@@ -751,7 +751,7 @@ pub(crate) struct MintAuthorizationWiring {
 }
 
 impl CrossVenueEquityTransfer {
-    pub(crate) fn new(
+    pub fn new(
         raindex: Arc<dyn Raindex>,
         vault_lookup: Arc<dyn VaultLookup>,
         tokenizer: Arc<dyn Tokenizer>,
@@ -774,7 +774,9 @@ impl CrossVenueEquityTransfer {
         }
     }
 
-    pub(crate) fn with_gas_readiness(mut self, readiness: Arc<GasReadiness>) -> Self {
+    /// Uses the supplied native-gas readiness check before starting a transfer.
+    #[must_use]
+    pub fn with_gas_readiness(mut self, readiness: Arc<GasReadiness>) -> Self {
         self.gas_readiness = ConfiguredGasReadiness::Wired(readiness);
         self
     }
@@ -1932,7 +1934,7 @@ impl CrossVenueEquityTransfer {
     /// absent aggregate starts a new mint, an in-flight one resumes from its
     /// persisted state, and a terminal one is a no-op.
     #[instrument(target = "rebalance", skip_all, fields(%issuer_request_id, %symbol, %quantity))]
-    pub(crate) async fn resume_equity_to_market_making(
+    pub async fn resume_equity_to_market_making(
         &self,
         issuer_request_id: &IssuerRequestId,
         symbol: &Symbol,
@@ -2030,7 +2032,7 @@ impl CrossVenueEquityTransfer {
     /// absent aggregate starts a new redemption, an in-flight one resumes
     /// from its persisted state, and a terminal one is a no-op.
     #[instrument(target = "rebalance", skip_all, fields(%aggregate_id, %symbol, %quantity))]
-    pub(crate) async fn resume_equity_to_hedging(
+    pub async fn resume_equity_to_hedging(
         &self,
         aggregate_id: &RedemptionAggregateId,
         symbol: &Symbol,

@@ -19,9 +19,10 @@ mod job;
 pub(crate) mod redrive;
 mod valuation;
 
+pub use job::BotGasReceiptCostEnqueuer;
 pub(crate) use job::{
-    BotGasEnqueueFailure, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCost,
-    RecordBotGasReceiptCostCtx, RecordBotGasReceiptCostJobQueue,
+    BotGasEnqueueFailure, RecordBotGasReceiptCost, RecordBotGasReceiptCostCtx,
+    RecordBotGasReceiptCostJobQueue,
 };
 
 /// Enqueues bot-gas cost recording for a confirmed Base-chain equity

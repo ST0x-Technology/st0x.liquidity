@@ -80,20 +80,20 @@ const BURN_BROADCAST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Bundled together so constructors that require these values stay within
 /// the 8-argument clippy threshold.
 #[derive(Debug)]
-pub(crate) struct UsdcSettlementParams {
-    pub(crate) attestation_retry_deadline: Duration,
-    pub(crate) required_confirmations: u64,
-    pub(crate) reserved_cash: Option<Usd>,
+pub struct UsdcSettlementParams {
+    pub attestation_retry_deadline: Duration,
+    pub required_confirmations: u64,
+    pub reserved_cash: Option<Usd>,
     /// Circle attestation/fee API base URL (test-only override; production
     /// builds use the [`st0x_bridge::cctp::CIRCLE_API_BASE`] constant).
     #[cfg(feature = "test-support")]
-    pub(crate) circle_api_base: String,
+    pub circle_api_base: String,
     /// `TokenMessengerV2` contract address (test-only override).
     #[cfg(feature = "test-support")]
-    pub(crate) token_messenger: Address,
+    pub token_messenger: Address,
     /// `MessageTransmitterV2` contract address (test-only override).
     #[cfg(feature = "test-support")]
-    pub(crate) message_transmitter: Address,
+    pub message_transmitter: Address,
 }
 
 /// Ethereum-specific helpers used by [`CrossVenueCashTransfer`] that fall
@@ -104,7 +104,7 @@ pub(crate) struct UsdcSettlementParams {
 /// inherent methods. Tests implement it with `unimplemented!()` stubs for
 /// code paths that do not exercise these operations.
 #[async_trait::async_trait]
-pub(crate) trait UsdcBridgeHelper: Send + Sync + 'static {
+pub trait UsdcBridgeHelper: Send + Sync + 'static {
     /// Returns the number of confirmations for `tx_hash` on Ethereum, or
     /// `None` if the transaction has not yet been mined.
     async fn ethereum_tx_confirmations(&self, tx_hash: TxHash) -> Result<Option<u64>, CctpError>;
@@ -238,7 +238,7 @@ fn resize_usd_conversion_notional(
 ///
 /// * `Signer` - Wallet type used for both Ethereum and Base chains
 /// * `B` - Bridge implementation; defaults to [`CctpBridge<Signer, Signer>`]
-pub(crate) struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>> {
+pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>> {
     alpaca_broker: InstrumentedAlpacaBroker,
     alpaca_wallet: Arc<AlpacaWalletService>,
     cctp_bridge: Arc<B>,
@@ -309,7 +309,7 @@ impl<
     B: Bridge<Error = CctpError, Attestation = AttestationResponse> + UsdcBridgeHelper,
 > CrossVenueCashTransfer<Signer, B>
 {
-    pub(crate) fn new(
+    pub fn new(
         alpaca_broker: InstrumentedAlpacaBroker,
         alpaca_wallet: Arc<AlpacaWalletService>,
         cctp_bridge: Arc<B>,
@@ -335,7 +335,9 @@ impl<
         }
     }
 
-    pub(crate) fn with_gas_readiness(mut self, readiness: Arc<GasReadiness>) -> Self {
+    /// Uses the supplied native-gas readiness check before starting a transfer.
+    #[must_use]
+    pub fn with_gas_readiness(mut self, readiness: Arc<GasReadiness>) -> Self {
         self.gas_readiness = ConfiguredGasReadiness::Wired(readiness);
         self
     }
@@ -1026,7 +1028,7 @@ impl<
     // the project guidance, suppress the length lint instead.
     #[allow(clippy::too_many_lines)]
     #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
-    pub(crate) async fn resume_alpaca_to_base(
+    pub async fn resume_alpaca_to_base(
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
@@ -2496,7 +2498,7 @@ impl<
     ///   block inclusion before `Initiate`), so `ConfirmWithdrawal` is always
     ///   safe to send.
     #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
-    pub(crate) async fn resume_base_to_alpaca(
+    pub async fn resume_base_to_alpaca(
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,

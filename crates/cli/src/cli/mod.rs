@@ -36,14 +36,14 @@ use st0x_finance::Usdc;
 use st0x_registry::SymbolCache;
 
 #[cfg(test)]
-use crate::bot_gas::BotGasReceiptCostEnqueuer;
-use crate::offchain::order::{OffchainOrder, OffchainOrderId, OrderPlacer};
-use crate::performance::equity_timing::EquityTimingProjection;
-use crate::performance::rebalance::RebalanceTimingProjection;
-use crate::performance::reliability::LifecycleFailureProjection;
-use crate::portfolio_snapshot::PortfolioSnapshotProjection;
-use crate::position::Position;
-use crate::vault_registry::VaultRegistry;
+use st0x_hedge::operator::bot_gas::BotGasReceiptCostEnqueuer;
+use st0x_hedge::operator::offchain::order::{OffchainOrder, OffchainOrderId, OrderPlacer};
+use st0x_hedge::operator::performance::equity_timing::EquityTimingProjection;
+use st0x_hedge::operator::performance::rebalance::RebalanceTimingProjection;
+use st0x_hedge::operator::performance::reliability::LifecycleFailureProjection;
+use st0x_hedge::operator::portfolio_snapshot::PortfolioSnapshotProjection;
+use st0x_hedge::operator::position::Position;
+use st0x_hedge::operator::vault_registry::VaultRegistry;
 
 /// Direction for transferring assets between trading venues.
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -85,7 +85,7 @@ pub enum ReconcileReasonArg {
     DepositCreditedOffline,
 }
 
-impl From<ReconcileReasonArg> for crate::usdc_rebalance::ReconcileReason {
+impl From<ReconcileReasonArg> for st0x_hedge::operator::usdc_rebalance::ReconcileReason {
     fn from(reason: ReconcileReasonArg) -> Self {
         match reason {
             ReconcileReasonArg::FundsMovedManually => Self::FundsMovedManually,
@@ -948,12 +948,6 @@ impl CliEnv {
     }
 }
 
-pub async fn run(ctx: Ctx) -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let pool = ctx.get_sqlite_pool().await?;
-    run_command_with_writers(ctx, cli.command, &pool, &mut std::io::stdout()).await
-}
-
 pub async fn run_command(ctx: Ctx, command: Commands) -> anyhow::Result<()> {
     let pool = ctx.get_sqlite_pool().await?;
     run_command_with_writers(ctx, command, &pool, &mut std::io::stdout()).await
@@ -1122,109 +1116,6 @@ fn parse_usdc_reconcile_reason(reason: &str) -> anyhow::Result<ReconcileReasonAr
              (expected `funds-moved-manually` or `deposit-credited-offline`)"
         )
     })
-}
-
-#[cfg(feature = "test-support")]
-pub async fn fail_transfer_for_test(
-    pool: &SqlitePool,
-    transfer_type: TransferType,
-    id: &str,
-    reason: &str,
-) -> anyhow::Result<()> {
-    let mut stdout = Vec::new();
-    let reason = reason.parse::<AuditReason>().map_err(anyhow::Error::msg)?;
-    rebalancing::fail_transfer_command(&mut stdout, pool, transfer_type, id, &reason).await
-}
-
-#[cfg(feature = "test-support")]
-pub async fn recheck_transfer_for_test(
-    ctx: &Ctx,
-    transfer_type: TransferType,
-    id: &str,
-) -> anyhow::Result<()> {
-    let mut stdout = Vec::new();
-    rebalancing::recheck_transfer_command(&mut stdout, transfer_type, id, ctx).await
-}
-
-/// Seeds a `TokenizedEquityMint` aggregate at `TokensWrapped`.
-///
-/// Inserts the canonical `MintRequested -> MintAccepted -> TokensReceived ->
-/// WrapSubmitted -> TokensWrapped` event sequence directly, bypassing the
-/// command handlers so no broker/tokenization services are invoked.
-///
-/// Used by the active-mint wrapped-equity recovery e2e to set up an active
-/// mint stuck after wrapping but before the Raindex deposit. Once the bot
-/// starts, its startup recovery detects the interrupted mint and drives it
-/// through `resume_mint`.
-#[cfg(feature = "test-support")]
-pub async fn seed_mint_at_tokens_wrapped_for_test(
-    pool: &SqlitePool,
-    mint_id_str: &str,
-    symbol_str: &str,
-    wallet: Address,
-    wrap_tx_hash: TxHash,
-    wrapped_shares: alloy::primitives::U256,
-    quantity: Float,
-) -> anyhow::Result<()> {
-    use chrono::Utc;
-    use st0x_event_sorcery::DomainEvent;
-    use st0x_tokenization::{IssuerRequestId, tokenization_request_id};
-
-    use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
-
-    let symbol = Symbol::new(symbol_str.to_string())?;
-    let mint_id: IssuerRequestId = mint_id_str.parse()?;
-    let now = Utc::now();
-
-    let events = [
-        TokenizedEquityMintEvent::MintRequested {
-            symbol: symbol.clone(),
-            quantity,
-            wallet,
-            requested_at: now,
-        },
-        TokenizedEquityMintEvent::MintAccepted {
-            issuer_request_id: mint_id.clone(),
-            tokenization_request_id: tokenization_request_id("seeded-tokenization-request-id"),
-            accepted_at: now,
-        },
-        TokenizedEquityMintEvent::TokensReceived {
-            tx_hash: TxHash::random(),
-            shares_minted: wrapped_shares,
-            fees: None,
-            received_at: now,
-        },
-        TokenizedEquityMintEvent::WrapSubmitted {
-            wrap_tx_hash,
-            submitted_at: now,
-        },
-        TokenizedEquityMintEvent::TokensWrapped {
-            wrap_tx_hash,
-            wrapped_shares,
-            wrapped_at: now,
-            wrap_block: None,
-        },
-    ];
-
-    let IssuerRequestId(raw_id) = &mint_id;
-    for (index, event) in events.iter().enumerate() {
-        let payload = serde_json::to_string(event)?;
-        let sequence = i64::try_from(index + 1)?;
-        sqlx::query(
-            "INSERT INTO events \
-             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
-             VALUES ('TokenizedEquityMint', ?, ?, ?, ?, ?, '{}')",
-        )
-        .bind(raw_id.to_string())
-        .bind(sequence)
-        .bind(event.event_type())
-        .bind(event.event_version())
-        .bind(payload)
-        .execute(pool)
-        .await?;
-    }
-
-    Ok(())
 }
 
 /// Commands that require an RPC provider.
@@ -2119,13 +2010,25 @@ mod tests {
     use st0x_wrapper::MockWrapper;
 
     use super::*;
-    use crate::mint_authorization::ConfiguredMintAuthorizer;
-    use crate::offchain::order::OffchainOrderEvent;
-    use crate::onchain::mock::MockRaindex;
-    use crate::rebalancing::equity::EquityTransferServices;
-    use crate::test_utils::{positive_shares, setup_test_db};
-    use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
-    use crate::vault_lookup::MockVaultLookup;
+    use st0x_hedge::operator::mint_authorization::ConfiguredMintAuthorizer;
+    use st0x_hedge::operator::offchain::order::OffchainOrderEvent;
+    use st0x_hedge::operator::onchain::mock::MockRaindex;
+    use st0x_hedge::operator::rebalancing::equity::EquityTransferServices;
+    use st0x_hedge::operator::test_utils::{try_positive_shares, try_setup_test_db};
+    use st0x_hedge::operator::tokenized_equity_mint::{
+        TokenizedEquityMint, TokenizedEquityMintCommand,
+    };
+    use st0x_hedge::operator::vault_lookup::MockVaultLookup;
+
+    fn positive_shares(value: &str) -> Positive<FractionalShares> {
+        try_positive_shares(value).expect("test shares must be valid and positive")
+    }
+
+    async fn setup_test_db() -> SqlitePool {
+        try_setup_test_db()
+            .await
+            .expect("test database setup must succeed")
+    }
 
     fn create_test_ctx() -> Ctx {
         Ctx {

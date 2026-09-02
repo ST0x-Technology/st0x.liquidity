@@ -241,14 +241,14 @@ struct Connected {
     dropped: Arc<AtomicU64>,
 }
 
-/// Non-blocking handle hot paths use to emit [`DependencyCallSample`]s.
+/// Non-blocking handle hot paths use to emit `DependencyCallSample`s.
 ///
 /// `record` never blocks and never fails the caller: when the channel is
 /// full or closed the sample is counted and dropped. A disabled sender
 /// (`connected` is `None`) swallows samples outright -- used where a handle
 /// is structurally required but no writer exists.
 #[derive(Debug, Clone)]
-pub(crate) struct TelemetrySender {
+pub struct TelemetrySender {
     connected: Option<Connected>,
 }
 
@@ -269,7 +269,7 @@ impl TelemetrySender {
     }
 
     /// A sender that swallows every sample.
-    pub(crate) fn disabled() -> Self {
+    pub fn disabled() -> Self {
         Self { connected: None }
     }
 

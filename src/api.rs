@@ -1359,11 +1359,11 @@ async fn interrupted_transfers(
 /// two cannot drift.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ResumeResponse {
-    pub(crate) mints_attempted: usize,
-    pub(crate) mints_failed: usize,
-    pub(crate) redemptions_attempted: usize,
-    pub(crate) redemptions_failed: usize,
+pub struct ResumeResponse {
+    pub mints_attempted: usize,
+    pub mints_failed: usize,
+    pub redemptions_attempted: usize,
+    pub redemptions_failed: usize,
 }
 
 async fn resume_transfers(

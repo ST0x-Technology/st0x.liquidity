@@ -1,21 +1,31 @@
 //! Shared test fixtures: database setup, stub orders/logs,
 //! and builders for onchain trades and offchain executions.
 
+#[cfg(test)]
 use alloy::hex;
+#[cfg(test)]
 use alloy::network::TransactionBuilder;
+#[cfg(test)]
 use alloy::node_bindings::{Anvil, AnvilInstance};
-use alloy::primitives::{Address, B256, LogData, address, bytes, fixed_bytes};
+#[cfg(test)]
+use alloy::primitives::LogData;
+use alloy::primitives::{Address, B256, address, bytes, fixed_bytes};
+#[cfg(test)]
 use alloy::providers::Provider;
+#[cfg(test)]
 use alloy::providers::ext::AnvilApi as _;
+#[cfg(test)]
 use alloy::rpc::types::{Log, TransactionRequest};
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use std::sync::{Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
 use st0x_config::{ChainEquities, ChainEquityAsset, OperationMode};
+#[cfg(any(test, feature = "test-support"))]
 use st0x_event_sorcery::{DomainEvent, EventSourced};
 use st0x_evm::Chain;
 use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
@@ -25,24 +35,30 @@ use crate::onchain::OnchainTrade;
 use crate::onchain::io::{TokenizedSymbol, Usdc, WrappedTokenizedShares};
 use crate::onchain_trade::OnChainTradeSource;
 
+#[cfg(test)]
 const MAX_CONCURRENT_TEST_ANVILS: usize = 4;
 
-/// Shared `order_polling_interval`-equivalent for tests that need a
+/// Shared `order_polling_interval` equivalent for tests.
+///
+/// Tests use a
 /// realistic-but-arbitrary poll interval (e.g. to derive a staleness bound or
 /// populate a `*Ctx.poll_interval` field). A single source of truth avoids the
 /// silent-drift risk of multiple modules each defining their own copy of the
 /// same value under a "matches such-and-such module" comment that nothing
 /// enforces.
-pub(crate) const TEST_POLL_INTERVAL: Duration = Duration::from_secs(15);
+pub const TEST_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
+#[cfg(test)]
 static ANVIL_PERMITS: LazyLock<(Mutex<usize>, Condvar)> =
     LazyLock::new(|| (Mutex::new(0), Condvar::new()));
 
+#[cfg(test)]
 pub(crate) struct TestAnvilInstance {
     instance: AnvilInstance,
     _permit: AnvilPermit,
 }
 
+#[cfg(test)]
 impl std::ops::Deref for TestAnvilInstance {
     type Target = AnvilInstance;
 
@@ -51,8 +67,10 @@ impl std::ops::Deref for TestAnvilInstance {
     }
 }
 
+#[cfg(test)]
 struct AnvilPermit;
 
+#[cfg(test)]
 impl Drop for AnvilPermit {
     fn drop(&mut self) {
         let (lock, available) = &*ANVIL_PERMITS;
@@ -66,6 +84,7 @@ impl Drop for AnvilPermit {
     }
 }
 
+#[cfg(test)]
 fn acquire_anvil_permits(count: usize) -> Vec<AnvilPermit> {
     assert!(
         (1..=MAX_CONCURRENT_TEST_ANVILS).contains(&count),
@@ -90,6 +109,7 @@ fn acquire_anvil_permits(count: usize) -> Vec<AnvilPermit> {
     (0..count).map(|_| AnvilPermit).collect()
 }
 
+#[cfg(test)]
 pub(crate) fn spawn_anvil(anvil: Anvil) -> TestAnvilInstance {
     let permit = acquire_anvil_permits(1).pop().unwrap();
     let instance = anvil.spawn();
@@ -99,6 +119,7 @@ pub(crate) fn spawn_anvil(anvil: Anvil) -> TestAnvilInstance {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn spawn_anvil_pair(
     first: Anvil,
     second: Anvil,
@@ -120,18 +141,20 @@ pub(crate) fn spawn_anvil_pair(
     )
 }
 
-/// Builds an equity assets config with the given symbols whitelisted for
+/// Builds an equity assets config with whitelisted symbols.
+///
+/// The symbols are enabled for
 /// rebalancing. The trigger only dispatches transfers for symbols configured
 /// with `rebalancing = "enabled"`, so trigger tests must whitelist the
 /// symbols they exercise.
-pub(crate) fn rebalancing_enabled_equities(symbols: &[&str]) -> ChainEquities {
-    ChainEquities {
+pub fn try_rebalancing_enabled_equities(symbols: &[&str]) -> anyhow::Result<ChainEquities> {
+    Ok(ChainEquities {
         operational_limit: None,
         symbols: symbols
             .iter()
             .map(|symbol| {
-                (
-                    Symbol::new(*symbol).unwrap(),
+                Ok((
+                    Symbol::new(*symbol)?,
                     ChainEquityAsset {
                         tokenized_equity: Address::ZERO,
                         tokenized_equity_derivative: Address::ZERO,
@@ -141,16 +164,22 @@ pub(crate) fn rebalancing_enabled_equities(symbols: &[&str]) -> ChainEquities {
                         wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
                     },
-                )
+                ))
             })
-            .collect(),
-    }
+            .collect::<anyhow::Result<_>>()?,
+    })
+}
+
+#[cfg(test)]
+pub fn rebalancing_enabled_equities(symbols: &[&str]) -> ChainEquities {
+    try_rebalancing_enabled_equities(symbols).expect("test symbols must be valid")
 }
 
 /// Deterministic singleton address of the TOFUTokenDecimals contract. The
 /// orderbook's `LibTOFUTokenDecimals.ensureDeployed` hardcodes this address and
 /// checks the codehash, so any test exercising deposits, withdrawals, or order
 /// takes must place the canonical runtime here.
+#[cfg(test)]
 pub(crate) const TOFU_TOKEN_DECIMALS: Address =
     address!("0x200e12D10bb0c5E4a17e7018f0F1161919bb9389");
 
@@ -159,12 +188,14 @@ pub(crate) const TOFU_TOKEN_DECIMALS: Address =
 /// Deploying this and etching the resulting runtime at `TOFU_TOKEN_DECIMALS` yields the
 /// codehash `ensureDeployed` requires; rain.orderbook's own recompile of TOFUTokenDecimals.sol
 /// does not match that hash, so its artifact bytecode cannot be used directly.
+#[cfg(test)]
 const TOFU_DECIMALS_CREATION_CODE: &str = "0x6080604052348015600e575f80fd5b5061044b8061001c5f395ff3fe608060405234801561000f575f80fd5b506004361061004a575f3560e01c80630782d7e11461004e57806354636d2b14610078578063b7bad1b11461009d578063f5c36eaf146100b0575b5f80fd5b61006161005c366004610363565b6100c3565b60405161006f929190610403565b60405180910390f35b61008b610086366004610363565b6100d8565b60405160ff909116815260200161006f565b6100616100ab366004610363565b6100e9565b61008b6100be366004610363565b6100f5565b5f806100cf5f84610100565b91509150915091565b5f6100e35f836101f0565b92915050565b5f806100cf5f84610281565b5f6100e35f83610356565b73ffffffffffffffffffffffffffffffffffffffff81165f9081526020838152604080832081518083019092525460ff8082161515835261010090910416818301527f313ce56700000000000000000000000000000000000000000000000000000000808452839283908190816004818a5afa915060203d1015610182575f91505b811561019857505f5160ff811115610198575f91505b816101af57505050602001516003925090506101e9565b83516101c3575f955093506101e992505050565b836020015160ff1681146101d85760026101db565b60015b846020015195509550505050505b9250929050565b5f805f6101fd8585610281565b909250905060018260038111156102165761021661039d565b1415801561023557505f8260038111156102325761023261039d565b14155b156102795783826040517fee07877f000000000000000000000000000000000000000000000000000000008152600401610270929190610421565b60405180910390fd5b949350505050565b5f805f8061028f8686610100565b90925090505f8260038111156102a7576102a761039d565b0361034b576040805180820182526001815260ff838116602080840191825273ffffffffffffffffffffffffffffffffffffffff8a165f908152908b9052939093209151825493517fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00009094169015157fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00ff161761010093909116929092029190911790555b909590945092505050565b5f805f6101fd8585610100565b5f60208284031215610373575f80fd5b813573ffffffffffffffffffffffffffffffffffffffff81168114610396575f80fd5b9392505050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52602160045260245ffd5b600481106103ff577f4e487b71000000000000000000000000000000000000000000000000000000005f52602160045260245ffd5b9052565b6040810161041182856103ca565b60ff831660208301529392505050565b73ffffffffffffffffffffffffffffffffffffffff831681526040810161039660208301846103ca56";
 
 /// Deploys the canonical TOFUTokenDecimals init bytecode and etches the resulting
 /// runtime at [`TOFU_TOKEN_DECIMALS`]. The orderbook checks both the address and
 /// the codehash, so the runtime must come from executing the canonical creation
 /// code rather than from a recompiled artifact.
+#[cfg(test)]
 pub(crate) async fn deploy_tofu_singleton<P: Provider>(provider: &P) {
     let creation_code = hex::decode(TOFU_DECIMALS_CREATION_CODE).unwrap();
     let tx = TransactionRequest::default().with_deploy_code(creation_code);
@@ -189,7 +220,7 @@ pub(crate) async fn deploy_tofu_singleton<P: Provider>(provider: &P) {
 /// Returns a test `OrderV4` instance that is shared across multiple
 /// unit-tests. The exact values are not important -- only that the
 /// structure is valid and deterministic.
-pub(crate) fn get_test_order() -> OrderV4 {
+pub fn get_test_order() -> OrderV4 {
     OrderV4 {
         owner: address!("0xdddddddddddddddddddddddddddddddddddddddd"),
         evaluable: EvaluableV4 {
@@ -228,6 +259,7 @@ pub(crate) fn get_test_order() -> OrderV4 {
 /// mapping -- a positional mock would return USDC-then-wtAAPL regardless of
 /// which token was actually queried, so a swapped input/output index would go
 /// undetected.
+#[cfg(test)]
 pub(crate) fn seed_get_test_order_token_symbols(cache: &st0x_registry::SymbolCache) {
     cache.preload_symbol(
         address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -248,6 +280,7 @@ pub(crate) fn seed_get_test_order_token_symbols(cache: &st0x_registry::SymbolCac
 /// Only a payload carrying revert *data* satisfies `EvmError::is_revert`, so a
 /// bare `push_failure_msg` is not a substitute: it lands as a transport error
 /// and is classified retryable rather than as a genuine revert.
+#[cfg(test)]
 pub(crate) fn panic_revert_payload() -> alloy::rpc::json_rpc::ErrorPayload {
     let revert_data = format!("0x4e487b71{:064x}", 0x11u8);
     alloy::rpc::json_rpc::ErrorPayload {
@@ -260,6 +293,7 @@ pub(crate) fn panic_revert_payload() -> alloy::rpc::json_rpc::ErrorPayload {
 /// Creates a generic `Log` stub with the supplied log index. This helper is
 /// useful when the concrete value of most fields is irrelevant for the
 /// assertion being performed.
+#[cfg(test)]
 pub(crate) fn create_log(log_index: u64) -> Log {
     Log {
         inner: alloy::primitives::Log {
@@ -280,6 +314,7 @@ pub(crate) fn create_log(log_index: u64) -> Log {
 
 /// Convenience wrapper that returns the log routinely used by the
 /// higher-level tests in `trade::mod` (with log index set to `293`).
+#[cfg(test)]
 pub(crate) fn get_test_log() -> Log {
     create_log(293)
 }
@@ -292,55 +327,57 @@ fn test_database_url() -> String {
 }
 
 /// CQRS pool (sqlx 0.9) and apalis worker pool (sqlx 0.8) over the same DB.
-pub(crate) async fn setup_test_pools() -> (SqlitePool, apalis_sqlite::SqlitePool) {
+pub async fn try_setup_test_pools() -> anyhow::Result<(SqlitePool, apalis_sqlite::SqlitePool)> {
     let database_url = test_database_url();
-    let pool = st0x_config::configure_sqlite_pool(&database_url)
-        .await
-        .unwrap();
+    let pool = st0x_config::configure_sqlite_pool(&database_url).await?;
 
-    sqlx::migrate!()
-        .set_ignore_missing(true)
-        .run(&pool)
-        .await
-        .unwrap();
-    let apalis_pool = crate::conductor::connect_apalis_pool(&database_url)
-        .await
-        .unwrap();
+    sqlx::migrate!().set_ignore_missing(true).run(&pool).await?;
+    let apalis_pool = crate::conductor::connect_apalis_pool(&database_url).await?;
 
-    crate::conductor::setup_apalis_tables(&apalis_pool)
-        .await
-        .unwrap();
+    crate::conductor::setup_apalis_tables(&apalis_pool).await?;
 
-    (pool, apalis_pool)
+    Ok((pool, apalis_pool))
+}
+
+#[cfg(test)]
+pub async fn setup_test_pools() -> (SqlitePool, apalis_sqlite::SqlitePool) {
+    try_setup_test_pools()
+        .await
+        .expect("test database setup must succeed")
 }
 
 /// apalis worker pool (sqlx 0.8) over the same in-memory DB as [`setup_test_db`].
+#[cfg(test)]
 pub(crate) async fn setup_test_apalis_pool() -> apalis_sqlite::SqlitePool {
     setup_test_pools().await.1
 }
 
 /// Centralized test database setup to eliminate duplication across test files.
 /// Creates an in-memory SQLite database with all migrations applied.
-pub(crate) async fn setup_test_db() -> SqlitePool {
+#[cfg(test)]
+pub async fn setup_test_db() -> SqlitePool {
     setup_test_pools().await.0
+}
+
+/// Fallible database fixture constructor for external test crates.
+pub async fn try_setup_test_db() -> anyhow::Result<SqlitePool> {
+    Ok(try_setup_test_pools().await?.0)
 }
 
 /// Persists a typed event directly into the `events` table.
 ///
 /// Deliberate, fixture-only deviation from the "never write the events table
-/// directly" rule: the PnL ledger ingester's input contract is the persisted
-/// event log itself, and its tests need exact control over rowids,
-/// per-aggregate sequences, and cross-stream interleavings that command
-/// choreography cannot express (multi-batch paging, historical event shapes,
-/// a single event whose command would emit siblings). The command path is
-/// covered end-to-end by the registered-reactor and manifest wiring tests,
-/// which seed through `Store::send`. Production code must never do this.
-pub(crate) async fn persist_event<Entity: EventSourced>(
+/// directly" rule: fixtures sometimes need exact persisted states that command
+/// choreography cannot express without invoking external services, including
+/// historical event shapes, cross-stream interleavings, and interrupted
+/// transfers. Production code must never use this helper.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn try_persist_event<Entity: EventSourced>(
     pool: &SqlitePool,
     aggregate_id: &str,
     sequence: i64,
     event: &Entity::Event,
-) {
+) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO events (aggregate_type, aggregate_id, sequence, \
          event_type, event_version, payload, metadata) \
@@ -351,10 +388,23 @@ pub(crate) async fn persist_event<Entity: EventSourced>(
     .bind(sequence)
     .bind(event.event_type())
     .bind(event.event_version())
-    .bind(serde_json::to_string(event).unwrap())
+    .bind(serde_json::to_string(event)?)
     .execute(pool)
-    .await
-    .unwrap();
+    .await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn persist_event<Entity: EventSourced>(
+    pool: &SqlitePool,
+    aggregate_id: &str,
+    sequence: i64,
+    event: &Entity::Event,
+) {
+    try_persist_event::<Entity>(pool, aggregate_id, sequence, event)
+        .await
+        .unwrap();
 }
 
 /// File-backed variant of [`setup_test_db`] with production-shaped pool
@@ -370,6 +420,7 @@ pub(crate) async fn persist_event<Entity: EventSourced>(
 /// Returns the CQRS pool, the apalis worker pool, the database file path
 /// (for opening contending connections), and the tempdir guard keeping
 /// the file alive.
+#[cfg(test)]
 pub(crate) async fn setup_file_backed_test_db(
     busy_timeout: std::time::Duration,
 ) -> (
@@ -407,19 +458,23 @@ pub(crate) async fn setup_file_backed_test_db(
 }
 
 /// Shared constructor for positive share quantities in tests.
-pub(crate) fn positive_shares(value: &str) -> Positive<FractionalShares> {
-    Positive::new(FractionalShares::new(
-        Float::parse(value.to_string()).unwrap(),
-    ))
-    .unwrap()
+pub fn try_positive_shares(value: &str) -> anyhow::Result<Positive<FractionalShares>> {
+    let value = Float::parse(value.to_string())?;
+    Ok(Positive::new(FractionalShares::new(value))?)
+}
+
+#[cfg(test)]
+pub fn positive_shares(value: &str) -> Positive<FractionalShares> {
+    try_positive_shares(value).expect("test shares must be valid and positive")
 }
 
 /// Builder for creating OnchainTrade test instances with sensible defaults.
 /// Reduces duplication in test data setup.
-pub(crate) struct OnchainTradeBuilder {
+pub struct OnchainTradeBuilder {
     trade: OnchainTrade,
 }
 
+#[cfg(test)]
 impl Default for OnchainTradeBuilder {
     fn default() -> Self {
         Self::new()
@@ -427,8 +482,13 @@ impl Default for OnchainTradeBuilder {
 }
 
 impl OnchainTradeBuilder {
-    pub(crate) fn new() -> Self {
-        Self {
+    #[cfg(test)]
+    pub fn new() -> Self {
+        Self::try_new().expect("default onchain trade fixture must be valid")
+    }
+
+    pub fn try_new() -> anyhow::Result<Self> {
+        Ok(Self {
             trade: OnchainTrade {
                 chain: Chain::Base,
                 source: OnChainTradeSource::Raindex,
@@ -436,69 +496,68 @@ impl OnchainTradeBuilder {
                     "0x1111111111111111111111111111111111111111111111111111111111111111"
                 ),
                 log_index: 1,
-                symbol: "wtAAPL"
-                    .parse::<TokenizedSymbol<WrappedTokenizedShares>>()
-                    .unwrap(),
+                symbol: "wtAAPL".parse::<TokenizedSymbol<WrappedTokenizedShares>>()?,
                 equity_token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                amount: FractionalShares::new(Float::parse("1".to_string()).unwrap()),
+                amount: FractionalShares::new(st0x_float_macro::float!(1)),
                 direction: Direction::Buy,
-                price: Usdc::new(Float::parse("150".to_string()).unwrap()).unwrap(),
+                price: Usdc::new(st0x_float_macro::float!(150))?,
                 block_number: Some(1),
                 block_timestamp: Some(Utc::now()),
             },
-        }
+        })
     }
 
     #[must_use]
-    pub(crate) fn with_symbol(mut self, symbol: &str) -> Self {
+    #[cfg(test)]
+    pub fn with_symbol(mut self, symbol: &str) -> Self {
         self.trade.symbol = symbol
             .parse::<TokenizedSymbol<WrappedTokenizedShares>>()
-            .unwrap();
+            .expect("test symbol must parse");
         self
     }
 
     #[must_use]
-    pub(crate) fn with_equity_token(mut self, token: Address) -> Self {
+    pub fn with_equity_token(mut self, token: Address) -> Self {
         self.trade.equity_token = token;
         self
     }
 
     #[must_use]
-    pub(crate) fn with_source(mut self, source: OnChainTradeSource) -> Self {
+    pub fn with_source(mut self, source: OnChainTradeSource) -> Self {
         self.trade.source = source;
         self
     }
 
     #[must_use]
-    pub(crate) fn with_amount(mut self, amount: Float) -> Self {
+    pub fn with_amount(mut self, amount: Float) -> Self {
         self.trade.amount = FractionalShares::new(amount);
         self
     }
 
     #[must_use]
-    pub(crate) fn with_log_index(mut self, index: u64) -> Self {
+    pub fn with_log_index(mut self, index: u64) -> Self {
         self.trade.log_index = index;
         self
     }
 
     #[must_use]
-    pub(crate) fn with_block_number(mut self, block_number: impl IntoOptionalBlockNumber) -> Self {
+    pub fn with_block_number(mut self, block_number: impl IntoOptionalBlockNumber) -> Self {
         self.trade.block_number = block_number.into_optional_block_number();
         self
     }
 
     #[must_use]
-    pub(crate) fn with_block_timestamp(mut self, block_timestamp: Option<DateTime<Utc>>) -> Self {
+    pub fn with_block_timestamp(mut self, block_timestamp: Option<DateTime<Utc>>) -> Self {
         self.trade.block_timestamp = block_timestamp;
         self
     }
 
-    pub(crate) fn build(self) -> OnchainTrade {
+    pub fn build(self) -> OnchainTrade {
         self.trade
     }
 }
 
-pub(crate) trait IntoOptionalBlockNumber {
+pub trait IntoOptionalBlockNumber {
     fn into_optional_block_number(self) -> Option<u64>;
 }
 

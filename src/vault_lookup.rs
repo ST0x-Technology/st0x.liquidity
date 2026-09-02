@@ -8,7 +8,7 @@
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -24,7 +24,7 @@ use crate::vault_registry::{VaultRegistry, VaultRegistryId, VaultRegistryProject
 /// know a token address or trading symbol use this to discover the primary
 /// vault before invoking chain operations.
 #[async_trait]
-pub(crate) trait VaultLookup: Send + Sync {
+pub trait VaultLookup: Send + Sync {
     /// Returns the primary vault id registered for `token`.
     async fn vault_id_for_token(&self, token: Address) -> Result<RaindexVaultId, VaultLookupError>;
 
@@ -33,7 +33,7 @@ pub(crate) trait VaultLookup: Send + Sync {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum VaultLookupError {
+pub enum VaultLookupError {
     #[error("Vault registry not found for aggregate {0}")]
     RegistryNotFound(VaultRegistryId),
     #[error(transparent)]
@@ -51,16 +51,13 @@ pub(crate) enum VaultLookupError {
 
 /// [`VaultLookup`] backed by the live [`VaultRegistry`] projection for a single
 /// orderbook/owner pair.
-pub(crate) struct VaultRegistryLookup {
+pub struct VaultRegistryLookup {
     projection: Arc<VaultRegistryProjection>,
     registry_id: VaultRegistryId,
 }
 
 impl VaultRegistryLookup {
-    pub(crate) fn new(
-        projection: Arc<VaultRegistryProjection>,
-        registry_id: VaultRegistryId,
-    ) -> Self {
+    pub fn new(projection: Arc<VaultRegistryProjection>, registry_id: VaultRegistryId) -> Self {
         Self {
             projection,
             registry_id,
@@ -109,16 +106,16 @@ impl VaultLookup for VaultRegistryLookup {
     }
 }
 
-#[cfg(test)]
-pub(crate) struct MockVaultLookup {
+#[cfg(any(test, feature = "test-support"))]
+pub struct MockVaultLookup {
     vaults: BTreeMap<Address, RaindexVaultId>,
     tokens: BTreeMap<Symbol, Address>,
     default_vault: Option<RaindexVaultId>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl MockVaultLookup {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             vaults: BTreeMap::new(),
             tokens: BTreeMap::new(),
@@ -126,23 +123,33 @@ impl MockVaultLookup {
         }
     }
 
-    pub(crate) fn with_symbol_token(mut self, symbol: Symbol, token: Address) -> Self {
+    #[must_use]
+    pub fn with_symbol_token(mut self, symbol: Symbol, token: Address) -> Self {
         self.tokens.insert(symbol, token);
         self
     }
 
-    pub(crate) fn with_vault(mut self, token: Address, vault_id: RaindexVaultId) -> Self {
+    #[must_use]
+    pub fn with_vault(mut self, token: Address, vault_id: RaindexVaultId) -> Self {
         self.vaults.insert(token, vault_id);
         self
     }
 
-    pub(crate) fn with_default_vault(mut self, vault_id: RaindexVaultId) -> Self {
+    #[must_use]
+    pub fn with_default_vault(mut self, vault_id: RaindexVaultId) -> Self {
         self.default_vault = Some(vault_id);
         self
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+impl Default for MockVaultLookup {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait]
 impl VaultLookup for MockVaultLookup {
     async fn vault_id_for_token(&self, token: Address) -> Result<RaindexVaultId, VaultLookupError> {

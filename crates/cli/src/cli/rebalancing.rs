@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_config::{BrokerCtx, Ctx, OnchainWalletCtx};
-use st0x_event_sorcery::{AggregateError, StoreBuilder};
+use st0x_event_sorcery::StoreBuilder;
 use st0x_evm::{
     Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, USDC_BASE, USDC_ETHEREUM, Wallet,
 };
@@ -22,6 +22,28 @@ use st0x_execution::{
     FractionalShares, Network, Positive, Symbol, TimeInForce,
 };
 use st0x_finance::Usdc;
+use st0x_hedge::operator::api::ResumeResponse;
+use st0x_hedge::operator::bot_gas::BotGasReceiptCostEnqueuer;
+use st0x_hedge::operator::equity_redemption::{
+    EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
+};
+use st0x_hedge::operator::mint_authorization::{ConfiguredMintAuthorizer, VaultModeReader};
+use st0x_hedge::operator::native_gas::GasReadiness;
+use st0x_hedge::operator::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
+use st0x_hedge::operator::rebalancing::to_wrapped_equities;
+use st0x_hedge::operator::rebalancing::usdc::{
+    CrossVenueCashTransfer, UsdcSettlementParams, UsdcTransferError,
+};
+use st0x_hedge::operator::telemetry::TelemetrySender;
+use st0x_hedge::operator::telemetry::broker::InstrumentedAlpacaBroker;
+use st0x_hedge::operator::tokenized_equity_mint::{
+    TokenizedEquityMint, TokenizedEquityMintCommand,
+};
+use st0x_hedge::operator::usdc_rebalance::{
+    RebalanceDirection, ReconcileReason, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
+};
+use st0x_hedge::operator::vault_lookup::{VaultLookup, VaultRegistryLookup};
+use st0x_hedge::operator::vault_registry::{VaultRegistry, VaultRegistryId};
 use st0x_issuance_client::IssuanceClient;
 use st0x_issuance_dto::VaultModeTag;
 use st0x_raindex::{RaindexService, RaindexVaultId};
@@ -33,24 +55,6 @@ use st0x_wrapper::{Wrapper, WrapperService};
 
 use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpressure};
 use super::{AuditReason, TokenizationNetwork, TransferDirection, TransferType};
-use crate::api::ResumeResponse;
-use crate::bot_gas::BotGasReceiptCostEnqueuer;
-use crate::equity_redemption::{
-    DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
-};
-use crate::mint_authorization::{ConfiguredMintAuthorizer, VaultModeReader};
-use crate::native_gas::GasReadiness;
-use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
-use crate::rebalancing::to_wrapped_equities;
-use crate::rebalancing::usdc::{CrossVenueCashTransfer, UsdcSettlementParams, UsdcTransferError};
-use crate::telemetry::TelemetrySender;
-use crate::telemetry::broker::InstrumentedAlpacaBroker;
-use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
-use crate::usdc_rebalance::{
-    RebalanceDirection, ReconcileReason, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
-};
-use crate::vault_lookup::{VaultLookup, VaultRegistryLookup};
-use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
 struct EquityTransferCliServices {
     transfer: CrossVenueEquityTransfer,
@@ -137,15 +141,12 @@ async fn build_equity_transfer_services(
 
     let vault_lookup: Arc<dyn VaultLookup> = Arc::new(VaultRegistryLookup::new(
         vault_registry_projection,
-        VaultRegistryId {
-            orderbook: ctx.chains.sole_trading().orderbook,
-            owner: ctx.vault_owner(),
-        },
+        VaultRegistryId::new(ctx.chains.sole_trading().orderbook, ctx.vault_owner()),
     ));
 
     let raindex = Arc::new(RaindexService::new(
         base_caller,
-        crate::onchain::raindex_contracts(ctx.chains.sole_trading()),
+        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.sole_trading()),
         wallet,
     ));
 
@@ -604,7 +605,7 @@ async fn run_usdc_transfer<Writer: Write>(
 
     let vault_service = Arc::new(RaindexService::new(
         wallet_ctx.base_wallet().clone(),
-        crate::onchain::raindex_contracts(ctx.chains.sole_trading()),
+        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.sole_trading()),
         owner,
     ));
 
@@ -1477,29 +1478,6 @@ fn format_tokenization_request<Writer: Write>(
     Ok(())
 }
 
-/// Adds operator guidance to a rejected recovery command: between the CLI's
-/// state read and the command dispatch, the running bot may have advanced the
-/// aggregate, so on a typed rejection the operator should re-run to see the
-/// current state. Infrastructure failures pass through without the hint.
-fn stale_state_context<Failure: std::error::Error + Send + Sync + 'static>(
-    kind: &str,
-    id: &str,
-    error: AggregateError<Failure>,
-) -> anyhow::Error {
-    match error {
-        rejection @ (AggregateError::UserError(_) | AggregateError::AggregateConflict) => {
-            anyhow::Error::new(rejection).context(format!(
-                "{kind} {id} rejected the failure command. The state may have \
-                 advanced since it was read (is the bot driving this aggregate \
-                 concurrently?) -- re-run to see the current state."
-            ))
-        }
-        infrastructure @ (AggregateError::DatabaseConnectionError(_)
-        | AggregateError::DeserializationError(_)
-        | AggregateError::UnexpectedError(_)) => anyhow::Error::new(infrastructure),
-    }
-}
-
 /// Manually fail a stuck mint or redemption transfer aggregate.
 ///
 /// Loads the aggregate from the event store, determines its current state,
@@ -1512,115 +1490,33 @@ pub(crate) async fn fail_transfer_command<W: Write>(
     id: &str,
     reason: &AuditReason,
 ) -> anyhow::Result<()> {
-    let services = EquityTransferServices::panicking();
+    let transfer_kind = match transfer_type {
+        TransferType::Mint => st0x_hedge::operator::equity_transfer::EquityTransferKind::Mint,
+        TransferType::Redemption => {
+            st0x_hedge::operator::equity_transfer::EquityTransferKind::Redemption
+        }
+    };
+    st0x_hedge::operator::equity_transfer::fail_transfer(pool, transfer_kind, id, reason.as_ref())
+        .await?;
 
     match transfer_type {
-        TransferType::Mint => {
-            let mint_id: IssuerRequestId = id
-                .parse()
-                .map_err(|error| anyhow::anyhow!("Invalid mint id {id:?}: {error}"))?;
-
-            let entity = st0x_event_sorcery::load_entity::<TokenizedEquityMint>(pool, &mint_id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Mint aggregate not found: {id}"))?;
-
-            use TokenizedEquityMint::*;
-            use TokenizedEquityMintCommand::*;
-            let command = match entity {
-                // A mint stuck at MintRequested (requested at the provider but
-                // never accepted) is force-failed via FailAcceptance, which the
-                // aggregate now accepts from MintRequested.
-                MintRequested { .. } | MintAccepted { .. } => FailAcceptance {
-                    reason: reason.to_string(),
-                },
-                TokensReceived { .. } | WrapSubmitted { .. } => FailWrapping {
-                    reason: reason.to_string(),
-                },
-                TokensWrapped { .. } | VaultDepositSubmitted { .. } => FailRaindexDeposit {
-                    reason: reason.to_string(),
-                },
-                DepositedIntoRaindex { .. } => {
-                    anyhow::bail!("Mint {id} already completed (DepositedIntoRaindex)");
-                }
-                Failed { .. } => {
-                    anyhow::bail!("Mint {id} already failed");
-                }
-                Reconciled { .. } => {
-                    anyhow::bail!("Mint {id} already reconciled");
-                }
-            };
-
-            st0x_event_sorcery::send_command::<TokenizedEquityMint>(
-                pool, &mint_id, command, services,
-            )
-            .await
-            .map_err(|error| stale_state_context("Mint", id, error))?;
-
-            writeln!(stdout, "Mint {id} marked as failed")?;
-        }
-
-        TransferType::Redemption => {
-            let redemption_id: RedemptionAggregateId = id
-                .parse()
-                .map_err(|error| anyhow::anyhow!("Invalid redemption ID: {error}"))?;
-
-            let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(pool, &redemption_id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Redemption aggregate not found: {id}"))?;
-
-            use EquityRedemption::*;
-            use EquityRedemptionCommand::*;
-            let command = match entity {
-                VaultWithdrawPending { .. }
-                | VaultWithdrawSubmitted { .. }
-                | WithdrawnFromRaindex { .. }
-                | UnwrapPending { .. }
-                | UnwrapSubmitted { .. }
-                | TokensUnwrapped { .. }
-                | SendPending { .. } => FailTransfer {
-                    reason: reason.to_string(),
-                },
-                // Tokens reached Alpaca's redemption wallet but detection never
-                // fired: force the detection-failure terminal (DetectionFailed
-                // -> Failed), persisting the operator's reason on the event.
-                TokensSent { .. } => FailDetection {
-                    failure: DetectionFailure::Operator {
-                        reason: reason.to_string(),
-                    },
-                },
-                // Alpaca detected the transfer but never completed it: reject
-                // the redemption (RedemptionRejected -> Failed).
-                Pending { .. } => RejectRedemption {
-                    reason: reason.to_string(),
-                },
-                Completed { .. } => {
-                    anyhow::bail!("Redemption {id} already completed");
-                }
-                Failed { .. } => {
-                    anyhow::bail!("Redemption {id} already failed");
-                }
-                Reconciled { .. } => {
-                    anyhow::bail!("Redemption {id} already reconciled");
-                }
-            };
-
-            st0x_event_sorcery::send_command::<EquityRedemption>(
-                pool,
-                &redemption_id,
-                command,
-                services,
-            )
-            .await
-            .map_err(|error| stale_state_context("Redemption", id, error))?;
-
-            writeln!(
-                stdout,
-                "Redemption {id} marked as failed (reason: {reason})"
-            )?;
-        }
+        TransferType::Mint => writeln!(stdout, "Mint {id} marked as failed")?,
+        TransferType::Redemption => writeln!(
+            stdout,
+            "Redemption {id} marked as failed (reason: {reason})"
+        )?,
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+fn stale_state_context<Failure: std::error::Error + Send + Sync + 'static>(
+    kind: &str,
+    id: &str,
+    error: st0x_event_sorcery::AggregateError<Failure>,
+) -> anyhow::Error {
+    st0x_hedge::operator::equity_transfer::stale_state_context_for_test(kind, id, error)
 }
 
 /// Wraps a reqwest send error: a connection failure gets actionable operator
@@ -1733,46 +1629,16 @@ pub(crate) async fn recheck_transfer_command<W: Write>(
     id: &str,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let kind = match transfer_type {
-        TransferType::Mint => "equity_mint",
-        TransferType::Redemption => "equity_redemption",
+    let transfer_kind = match transfer_type {
+        TransferType::Mint => st0x_hedge::operator::equity_transfer::EquityTransferKind::Mint,
+        TransferType::Redemption => {
+            st0x_hedge::operator::equity_transfer::EquityTransferKind::Redemption
+        }
     };
-
-    let url = format!(
-        "http://127.0.0.1:{}/transfers/recheck/{kind}/{id}",
-        ctx.server_port
-    );
+    let url = st0x_hedge::operator::equity_transfer::recheck_url(ctx, transfer_kind, id);
     writeln!(stdout, "Re-checking {transfer_type:?} {id} via {url}")?;
-
-    // Bound the request so the CLI cannot hang indefinitely if the local bot
-    // stalls after accepting the connection.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-    let response = client
-        .post(url.as_str())
-        .send()
-        .await
-        .map_err(|error| connect_error(&url, error))?;
-    let status = response.status();
-    let body = response.text().await?;
-
-    if !status.is_success() {
-        anyhow::bail!("transfer recheck failed ({status}): {body}");
-    }
-
-    // The endpoint returns `{"outcome":"<snake_case>"}`; surface the outcome
-    // name (the operator-facing value documented in docs/cli-ops.md) rather
-    // than the raw JSON envelope, falling back to the body if it can't be parsed.
-    let outcome = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("outcome")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or(body);
+    let outcome =
+        st0x_hedge::operator::equity_transfer::recheck_transfer(ctx, transfer_kind, id).await?;
     writeln!(stdout, "transfer recheck outcome: {outcome}")?;
     Ok(())
 }
@@ -1857,7 +1723,7 @@ mod tests {
         OperationMode, TradingMode,
     };
     use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
-    use st0x_event_sorcery::LifecycleError;
+    use st0x_event_sorcery::{AggregateError, LifecycleError};
     use st0x_evm::Chain;
     #[cfg(feature = "test-support")]
     use st0x_evm::StubWallet;
@@ -1867,18 +1733,28 @@ mod tests {
     };
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
+    use st0x_hedge::operator::equity_redemption::{
+        DetectionFailure, EquityRedemptionError, redemption_aggregate_id,
+    };
+    use st0x_hedge::operator::inventory::ImbalanceThreshold;
+    use st0x_hedge::operator::mint_authorization::StubVaultModeReader;
+    use st0x_hedge::operator::onchain::mock::MockRaindex;
+    use st0x_hedge::operator::test_utils::try_setup_test_db;
+    use st0x_hedge::operator::usdc_rebalance::{
+        ReconcileReason, TransferRef, UsdcRebalanceCommand,
+    };
+    use st0x_hedge::operator::vault_lookup::MockVaultLookup;
     use st0x_tokenization::mock::MockTokenizer;
     use st0x_tokenization::{TokenizerError, issuer_request_id, tokenization_request_id};
     use st0x_wrapper::MockWrapper;
 
     use super::*;
-    use crate::equity_redemption::{EquityRedemptionError, redemption_aggregate_id};
-    use crate::inventory::ImbalanceThreshold;
-    use crate::mint_authorization::StubVaultModeReader;
-    use crate::onchain::mock::MockRaindex;
-    use crate::test_utils::setup_test_db;
-    use crate::usdc_rebalance::{ReconcileReason, TransferRef, UsdcRebalanceCommand};
-    use crate::vault_lookup::MockVaultLookup;
+
+    async fn setup_test_db() -> SqlitePool {
+        try_setup_test_db()
+            .await
+            .expect("test database setup must succeed")
+    }
 
     /// RAI-835: the manual redrive loop must re-invoke `resume` on the same id
     /// after an attestation timeout and drive through to success -- so a single
