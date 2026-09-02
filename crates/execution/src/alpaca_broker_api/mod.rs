@@ -45,7 +45,7 @@ pub use mock_api::{
     MockPositionSnapshot, MockWalletTransferSnapshot, OrderSide, OrderStatus, TEST_ACCOUNT_ID,
     TEST_API_KEY, TEST_API_SECRET, TransferDirection, TransferFlow, TransferStatus,
     WhitelistStatus, friday_close_calendar, half_day_calendar, holiday_eve_calendar,
-    overnight_weeknight_calendar,
+    overnight_weeknight_calendar, sunday_open_calendar,
 };
 mod order;
 mod overnight_eligibility;
