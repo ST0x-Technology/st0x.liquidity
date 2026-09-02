@@ -578,7 +578,10 @@ Alpaca's 24/5 documentation: <https://docs.alpaca.markets/us/docs/245-trading>.
   on the feed. Sandbox credentials authenticate against the sandbox market-data
   host, production credentials against the production host. The feed is
   indicative, not firm: fills can deviate from the quote, which is why
-  reference-to-fill slippage is measured per session.
+  reference-to-fill slippage is measured per session. Every reference-price
+  resolution records the quote's age on
+  `hedge_quote_age_seconds{symbol,source}`. Stale quotes that defer the hedge
+  are included in the distribution; a failed fetch records nothing.
 - **Asset eligibility.** The assets endpoint exposes `overnight_tradable` and
   `overnight_halted`; the halt flag qualifies an otherwise overnight-tradable
   asset. Wire shape (verified against a live sandbox): `fractionable` is a
@@ -592,7 +595,10 @@ Alpaca's 24/5 documentation: <https://docs.alpaca.markets/us/docs/245-trading>.
   is halted, or has missing or stale eligibility data defers with no broker call
   (see [Overnight hedging (24/5)](#overnight-hedging-245)). Alpaca's technical
   sign-off sheet requires the partner to sync assets at least once per day
-  inside the 19:45–20:00 ET window (target 19:55). Fractional orders follow the
+  inside the 19:45–20:00 ET window (target 19:55). A sync run that refreshes
+  every configured symbol sets the `asset_sync_last_success_timestamp` gauge; a
+  partial or failed run leaves the gauge unchanged and counts each failed symbol
+  on `asset_sync_failures_total{symbol}`. Fractional orders follow the
   documented matrix: `fractionable = false` allows whole-share orders only;
   `fractionable = true` with `fractional_eh_enabled = false` allows whole-share
   orders only; both true allows fractional orders. A missing `fractionable`
@@ -829,8 +835,8 @@ placement:
 - An extended-hours buy the position scan drops before it can become a hedge job
   -- because no reference price could be resolved for it, or because the cross
   could not be applied -- is counted on
-  `hedge_scan_skipped_total{symbol,reason}`. The dead-letter counter cannot
-  report a job that never existed, so this is the per-symbol signal for a
+  `hedge_scan_skipped_total{symbol,session,reason}`. The dead-letter counter
+  cannot report a job that never existed, so this is the per-symbol signal for a
   standing delta the scan keeps skipping. A permanent or unclassified failed
   reference-price lookup also pages the operator through the same
   `(symbol, reason)` dedup the hedge dead-letter uses. A transient or
@@ -854,8 +860,15 @@ placement:
   ramp further along, so it crosses wider than the one before it. Both timeout
   fields are required whenever extended-hours broker windows are active; neither
   cadence is an implicit fallback. Every cancel request a maintenance sweep
-  issues increments `hedge_cancellations_requested_total{symbol,reason}`, so the
-  operator can observe each cadence's real rate per cause.
+  issues increments
+  `hedge_cancellations_requested_total{symbol,session,reason}`, so the operator
+  can observe each cadence's real rate per cause.
+- Order and fill metrics carry a `session` label with the values `regular`,
+  `extended`, and `overnight`. The label applies to `hedge_trades_total`,
+  `broker_errors_total`, `hedge_fill_latency_seconds`,
+  `hedge_scan_skipped_total`, and `hedge_cancellations_requested_total`. The
+  label states the session the order targeted. For a cancellation, it states the
+  session of the cancelled order, not the session of the sweep tick.
 - `close_flatten_outcomes_total{symbol,direction,outcome}` records terminal
   broker-state dispatches for close-flatten placements, with `outcome` equal to
   `filled`, `cancelled`, or `failed`. Evaluate attempt fill rate per

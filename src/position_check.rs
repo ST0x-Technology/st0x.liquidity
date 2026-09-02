@@ -34,7 +34,7 @@ use crate::equity_redemption::symbols_with_active_transfers;
 use crate::offchain::order::{
     CancellationReason, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
     PollOrderStatusJobQueue, TerminalPositionFinalization, position_command_for_finalization,
-    recover_submitted_offchain_orders, terminal_position_finalization,
+    recover_submitted_offchain_orders, session_metric_label, terminal_position_finalization,
 };
 use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
 use crate::position::{Position, PositionError};
@@ -173,6 +173,7 @@ impl From<&ReferencePriceError> for HedgeScanSkipReason {
 /// labelled with the real cause instead of one blanket reason.
 pub(crate) fn record_scan_skip(
     symbol: &Symbol,
+    session: MarketSession,
     reason: HedgeScanSkipReason,
     close_flatten_window: Option<CloseFlattenWindow>,
 ) {
@@ -180,6 +181,7 @@ pub(crate) fn record_scan_skip(
     counter!(
         "hedge_scan_skipped_total",
         "symbol" => symbol.to_string(),
+        "session" => session_metric_label(session),
         "reason" => reason
     )
     .increment(1);
@@ -714,7 +716,12 @@ where
             Ok(reference) => reference,
             Err(error) => {
                 let skip_reason = HedgeScanSkipReason::from(&error);
-                record_scan_skip(&order.symbol, skip_reason, close_flatten_window);
+                record_scan_skip(
+                    &order.symbol,
+                    MarketSession::Extended,
+                    skip_reason,
+                    close_flatten_window,
+                );
                 warn!(
                     target: "hedge",
                     symbol = %order.symbol,
@@ -755,6 +762,7 @@ where
             Err(error) => {
                 record_scan_skip(
                     &order.symbol,
+                    MarketSession::Extended,
                     HedgeScanSkipReason::SlippageCalculation,
                     close_flatten_window,
                 );
@@ -812,6 +820,7 @@ where
         ) else {
             record_scan_skip(
                 &order.symbol,
+                MarketSession::Overnight,
                 HedgeScanSkipReason::OvernightIneligible,
                 None,
             );
@@ -836,6 +845,7 @@ where
             Err(error) => {
                 record_scan_skip(
                     &order.symbol,
+                    MarketSession::Overnight,
                     HedgeScanSkipReason::OvernightUnpriceable,
                     None,
                 );
@@ -871,6 +881,7 @@ where
                 Err(error) => {
                     record_scan_skip(
                         &order.symbol,
+                        MarketSession::Overnight,
                         HedgeScanSkipReason::SlippageCalculation,
                         None,
                     );
@@ -1067,6 +1078,7 @@ where
                     counter!(
                         "hedge_cancellations_requested_total",
                         "symbol" => symbol.to_string(),
+                        "session" => session_metric_label(order.market_session()),
                         "reason" => CancellationReason::MarketOpenReplacement.metric_label()
                     )
                     .increment(1);
@@ -1314,6 +1326,7 @@ where
                             counter!(
                                 "hedge_cancellations_requested_total",
                                 "symbol" => symbol.to_string(),
+                                "session" => session_metric_label(order.market_session()),
                                 "reason" => reason.metric_label()
                             )
                             .increment(1);
@@ -2309,8 +2322,9 @@ mod tests {
         let rendered = metrics_handle.render();
         assert!(
             rendered.contains("hedge_cancellations_requested_total{")
-                && rendered.contains("reason=\"overnight_reprice_timeout\""),
-            "the cancel request must be counted with its reason, in:\n{rendered}"
+                && rendered.contains("reason=\"overnight_reprice_timeout\"")
+                && rendered.contains("session=\"overnight\""),
+            "the cancel request must be counted with its reason and session, in:\n{rendered}"
         );
     }
 
@@ -2657,8 +2671,10 @@ mod tests {
         let rendered = metrics_handle.render();
         assert!(
             rendered.contains("hedge_cancellations_requested_total{")
-                && rendered.contains("reason=\"pre_market_open_replacement\""),
-            "the boundary cancel request must be counted with its reason, in:\n{rendered}"
+                && rendered.contains("reason=\"pre_market_open_replacement\"")
+                && rendered.contains("session=\"overnight\""),
+            "the boundary cancel request must be counted with its reason and session, \
+             in:\n{rendered}"
         );
     }
 
@@ -4893,8 +4909,9 @@ mod tests {
         );
         let rendered = metrics_handle.render();
         assert!(
-            rendered.contains("reason=\"overnight_unpriceable\""),
-            "the blocked scan tick must be counted with its cause, in:\n{rendered}"
+            rendered.contains("reason=\"overnight_unpriceable\"")
+                && rendered.contains("session=\"overnight\""),
+            "the blocked scan tick must be counted with its cause and session, in:\n{rendered}"
         );
         assert_eq!(
             notifier.messages(),
@@ -5278,6 +5295,10 @@ mod tests {
         assert!(
             rendered.contains("reason=\"quote_fetch_failed\""),
             "the skip must name the leg that failed, in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("session=\"extended\""),
+            "the skip must name the session it was scanned in, in:\n{rendered}"
         );
         assert!(
             rendered.contains("symbol=\"AAPL\""),
@@ -5735,8 +5756,10 @@ mod tests {
         let rendered = metrics_handle.render();
         assert!(
             rendered.contains("hedge_cancellations_requested_total{")
-                && rendered.contains("reason=\"market_open_replacement\""),
-            "the market-open cancel request must be counted with its reason, in:\n{rendered}"
+                && rendered.contains("reason=\"market_open_replacement\"")
+                && rendered.contains("session=\"extended\""),
+            "the market-open cancel request must be counted with its reason and the \
+             cancelled order's session, in:\n{rendered}"
         );
     }
 
