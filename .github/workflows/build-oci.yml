@@ -18,8 +18,8 @@ name: build-oci
 # liquidity-deployer (master only — the WIF binding lives in t0.devops
 # terraform/production-artifacts/liquidity.tf). PRs get nothing.
 #
-# Coexists with deploy-staging.yaml / deploy-prod.yaml (the DO droplet
-# deploy-rs path) until the staging cutover retires the staging half.
+# This is THE deploy path: the DO droplet world (deploy-rs, os.nix,
+# infra/) was retired after both environments cut over to GCE.
 
 on:
   push:

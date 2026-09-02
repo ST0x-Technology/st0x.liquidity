@@ -7326,91 +7326,6 @@ mod tests {
     }
 
     #[test]
-    fn server_config_toml_is_valid() {
-        let config_str = include_str!("../../../config/prod/st0x-hedge.toml");
-        let config: Config = toml::from_str(config_str).unwrap();
-
-        let base = config
-            .chains
-            .get(&Chain::Base)
-            .and_then(|chain| chain.trading.as_ref())
-            .expect("prod config must describe Base as a trading chain");
-        let global_limit = base.assets.equities.operational_limit.map(Positive::inner);
-
-        let broker = config.broker.expect(
-            "prod config must include [broker.travel_rule] — \
-             Alpaca rejects whitelist requests without it, effective 2026-03-27",
-        );
-
-        broker
-            .counter_trade_slippage_bps
-            .expect("prod config must set [broker].counter_trade_slippage_bps");
-        broker
-            .close_flatten_cross_max_bps
-            .expect("prod config must set [broker].close_flatten_cross_max_bps");
-        broker
-            .extended_hours_reprice_timeout_secs
-            .expect("prod config must set [broker].extended_hours_reprice_timeout_secs");
-        broker
-            .close_flatten_reprice_timeout_secs
-            .expect("prod config must set [broker].close_flatten_reprice_timeout_secs");
-        broker
-            .extended_hours_close_flatten_window_secs
-            .expect("prod config must set [broker].extended_hours_close_flatten_window_secs");
-        broker
-            .travel_rule
-            .expect("prod config must include [broker.travel_rule]")
-            .validated()
-            .unwrap();
-
-        for (symbol, equity) in &base.assets.equities.symbols {
-            if equity.rebalancing == OperationMode::Enabled
-                && let Some(limit) = &equity.operational_limit
-                && let Some(global) = global_limit
-            {
-                assert!(
-                    limit.inner() < global,
-                    "{symbol}: per-asset operational_limit ({}) must be \
-                     stricter than global equities operational_limit ({global}) \
-                     to provide meaningful per-asset safety",
-                    limit.inner()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn staging_config_toml_is_valid() {
-        let config_str = include_str!("../../../config/staging/st0x-hedge.toml");
-        let config: Config = toml::from_str(config_str).unwrap();
-
-        let broker = config
-            .broker
-            .expect("staging config must include the [broker] section");
-
-        broker
-            .counter_trade_slippage_bps
-            .expect("staging config must set [broker].counter_trade_slippage_bps");
-        broker
-            .close_flatten_cross_max_bps
-            .expect("staging config must set [broker].close_flatten_cross_max_bps");
-        broker
-            .extended_hours_reprice_timeout_secs
-            .expect("staging config must set [broker].extended_hours_reprice_timeout_secs");
-        broker
-            .close_flatten_reprice_timeout_secs
-            .expect("staging config must set [broker].close_flatten_reprice_timeout_secs");
-        broker
-            .extended_hours_close_flatten_window_secs
-            .expect("staging config must set [broker].extended_hours_close_flatten_window_secs");
-        broker
-            .travel_rule
-            .expect("staging config must include [broker.travel_rule]")
-            .validated()
-            .unwrap();
-    }
-
-    #[test]
     fn s01_issuer_config_toml_is_valid() {
         let config_str = include_str!("../../../config/s01-issuer.toml");
         let config: Config = toml::from_str(config_str).unwrap();
@@ -7577,7 +7492,7 @@ mod tests {
             .unwrap();
         let config_dir = repo_root.join("config");
 
-        // Walk config/ subdirectories (config/prod/, config/staging/) to
+        // Walk config/ subdirectories to
         // find all .toml files. A flat read_dir misses these because the
         // direct children are directories, not .toml files.
         let mut config_paths: Vec<PathBuf> = Vec::new();
@@ -7602,7 +7517,7 @@ mod tests {
 
         assert!(
             config_paths.len() >= 3,
-            "Expected at least 3 config files (prod, staging, example), \
+            "Expected at least 3 config files (s01-issuer, example, e2e), \
              found {}: {config_paths:?}",
             config_paths.len()
         );

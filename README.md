@@ -246,151 +246,30 @@ metric. Scan-time transient and rate-limited preflight failures instead wait for
 
 ## Deployment
 
-The system runs on a NixOS host on DigitalOcean, managed by deploy-rs. All
-infrastructure is defined declaratively in Nix and Terraform.
+Both environments run on GCE VMs under docker compose, managed by
+[t0.devops](https://github.com/T0Trade/t0.devops)
+(`terraform/staging-liquidity`, `terraform/production-liquidity`). This
+repo builds and ships the OCI images (`.github/workflows/build-oci.yml`:
+flake `packages`, pushed and attested to the central Artifact Registry);
+a master merge rolls staging automatically, production is a digest
+promotion in t0.devops behind a PAM-gated apply. There is exactly one
+runtime config per environment and it lives in t0.devops (config-as-data,
+mounted from Secret Manager); this repo carries only test fixtures
+(`example.config.toml`, `e2e/config.toml`) and the dividend-ops CLI
+config (`config/s01-issuer.toml`, see docs/cli-ops.md).
 
-### Architecture
-
-```
-GitHub Actions (CI/CD)
-  |
-  | deploy-rs over SSH
-  v
-NixOS host (DigitalOcean droplet)
-  ├── st0x-hedge       (systemd, hedging bot)
-  ├── datasette        (systemd, SQLite database explorer)
-  ├── nginx            (dashboard + WebSocket proxy)
-  └── grafana          (metrics visualization)
-```
-
-Services are deployed as independent nix profiles, allowing per-service updates
-and rollbacks without affecting other services.
-
-Before the bot is stopped, activation validates staged config/secrets and, for
-Turnkey wallets, runs a read-only policy coverage check for every startup MAX
-approval. Coverage requires an allow policy whose consensus the authenticated
-API user can satisfy alone and whose target condition provably applies;
-applicable or unprovable denies take precedence. Missing token or wrapper
-coverage fails the deployment with the symbol and contract details while the
-existing bot and installed files remain untouched.
-
-The bot unit exposes a PID-scoped startup signal in its systemd runtime
-directory. A bot deployment succeeds only after Conductor finishes startup
-initialization and every essential runtime task has entered its run loop; an
-early exit or a missing readiness signal fails within five minutes, emits unit
-status and recent journal output in the deploy log, and triggers deploy-rs
-rollback. The first rollout requires deploying the system profile before the
-service profile; service-only deploys verify that prerequisite before stopping
-the current bot. Local server runs omit the systemd ready-file environment and
-use a no-op notifier.
-
-### Key Files
-
-| File                | Purpose                                                |
-| ------------------- | ------------------------------------------------------ |
-| `os.nix`            | NixOS system configuration (services, firewall, users) |
-| `deploy.nix`        | deploy-rs profiles and deployment wrappers             |
-| `rust.nix`          | Nix derivation for Rust binaries                       |
-| `keys.nix`          | SSH public keys and role-based access                  |
-| `infra/secrets.nix` | ragenix secret declarations                            |
-| `secret/*.toml.age` | Encrypted service configs (decrypted at deploy)        |
-| `infra/`            | Terraform for DigitalOcean infrastructure              |
-| `disko.nix`         | Disk partitioning for nixos-anywhere bootstrap         |
-
-### Deploy Commands
-
-```bash
-# Deploy everything (system config + all service binaries)
-nix run .#deployAll
-
-# Deploy only NixOS system configuration (SSH, firewall, systemd units, nginx)
-nix run .#deployNixos
-
-# Deploy a specific service profile
-nix run .#deployService st0x-hedge
-nix run .#deployService datasette
-```
-
-### SSH Access
-
-```bash
-nix run .#remote              # interactive shell
-nix run .#remote -- <command> # run a command
-```
-
-### Rollback
-
-Each service profile maintains a history of deployments. Rollback requires two
-steps: reverting the nix profile, then restarting the affected services (the
-profile switch alone does not trigger a restart).
-
-deploy-rs uses legacy (`nix-env`-style) profiles internally.
-`nix profile
-rollback` is **not compatible** — you must use `nix-env`.
-
-SSH into the host and run:
-
-```bash
-# Roll back the bot profile to previous deployment
-nix-env --profile /nix/var/nix/profiles/per-service/st0x-hedge --rollback
-systemctl restart st0x-hedge
-
-# Roll back the Datasette profile
-nix-env --profile /nix/var/nix/profiles/per-service/datasette --rollback
-systemctl restart datasette
-```
-
-### Secrets Management
-
-Service configs are encrypted with ragenix (age encryption using SSH keys) and
-committed to git as `.age` files. The NixOS host decrypts them at activation
-using its SSH key, mounting cleartext to `/run/agenix/` (tmpfs).
-
-```bash
-# Edit an encrypted config
-nix run .#secret secret/st0x-hedge.toml.age
-
-# Re-encrypt all secrets after key changes
-ragenix --rules ./infra/secrets.nix -r
-```
-
-Key access is managed via roles in `keys.nix`:
-
-- `roles.ssh` - SSH access to the host (operator + CI)
-- `roles.infra` - can decrypt terraform state (operator + CI)
-- `roles.service` - can decrypt service configs (operator + host)
-
-### Infrastructure Provisioning
-
-Infrastructure is managed with Terraform, wrapped in Nix for reproducibility:
-
-```bash
-nix run .#tfInit     # initialize terraform
-nix run .#tfPlan     # preview changes
-nix run .#tfApply    # apply changes
-nix run .#tfDestroy  # tear down infrastructure
-```
-
-Terraform state is encrypted with age and committed to git.
-
-### Bootstrap (One-Time)
-
-For initial setup of a new host, Terraform provisions a DigitalOcean Ubuntu
-droplet. nixos-anywhere then converts it to NixOS over SSH:
-
-```bash
-nix run .#tfApply     # provision Ubuntu droplet
-nix run .#bootstrap   # convert to NixOS (updates host key + rekeys secrets)
-nix run .#deployAll   # first deployment
-```
+The old DigitalOcean/NixOS droplet world (deploy-rs, os.nix, infra/
+Terraform, nixos-anywhere bootstrap) is retired and deleted; the one
+agenix survivor is `secret/s01-issuer.toml.age`, edited with
+`nix run .#secret` against `secret/secrets.nix`.
 
 ### CI/CD
 
 - **CI** (`.github/workflows/ci.yaml`): Builds all packages, runs tests and
   clippy inside nix derivations, and builds the dashboard. Runs for pull request
   activity and pushes to `master`.
-- **CD** (`.github/workflows/cd.yaml`): Deploys to the NixOS host via
-  `nix run .#deployAll`. Runs on push to master.
+- **CD** (`.github/workflows/build-oci.yml`): builds, signs, and pushes the
+  images, then rolls staging. Runs on push to master.
 
 To reproduce CI checks locally, use the same dev shell CI uses:
 
@@ -500,23 +379,15 @@ not a workspace crate.
 ### Infrastructure
 
 ```
-flake.nix                  # Nix flake: packages, devShell, NixOS config
-os.nix                     # NixOS system configuration
-deploy.nix                 # deploy-rs profiles and wrappers
+flake.nix                  # Nix flake: packages, devShells, OCI images
 rust.nix                   # Rust package derivation
-disko.nix                  # Disk partitioning for bootstrap
-keys.nix                   # SSH keys and role-based access
+nix/oci-images.nix         # Bot/dashboard/datasette OCI images for the GCE VMs
+keys.nix                   # age/SSH recipient roster for the s01 secret
 config/
-├── prod/
-│   └── st0x-hedge.toml   # plaintext prod service config
-└── staging/
-    └── st0x-hedge.toml   # plaintext staging service config
-infra/
-├── secrets.nix            # ragenix secret declarations
-└── ...                    # Terraform (DigitalOcean)
+└── s01-issuer.toml        # dividend-ops CLI config (see docs/cli-ops.md)
 secret/
-├── st0x-hedge.toml.age           # encrypted core service secrets
-└── st0x-hedge-pricing.toml.age   # encrypted pricing credential overlay
+├── secrets.nix            # ragenix rules (s01 secret only)
+└── s01-issuer.toml.age    # encrypted dividend-ops CLI secrets
 dashboard/                 # SvelteKit operations dashboard
 .github/workflows/
 ├── ci.yaml                # Build, test, clippy, dashboard
@@ -555,51 +426,9 @@ Pass `-i <path>` to use a different key.
 | `st0x-clippy`    | `nix build .#st0x-clippy`    | Clippy linting      |
 | `st0x-dashboard` | `nix build .#st0x-dashboard` | SvelteKit dashboard |
 
-**Deployment** (requires SSH key for host access and terraform state
-decryption):
-
-| Command                  | Usage                                   | Notes                                         |
-| ------------------------ | --------------------------------------- | --------------------------------------------- |
-| `prodDeployAll`          | `nix run .#prodDeployAll`               | Deploy prod system config + all services      |
-| `prodDeployNixos`        | `nix run .#prodDeployNixos`             | Deploy prod NixOS system config only          |
-| `prodDeployNixosBoot`    | `nix run .#prodDeployNixosBoot`         | Register prod NixOS config for next boot      |
-| `prodDeployService`      | `nix run .#prodDeployService <profile>` | Deploy a single prod service                  |
-| `stagingDeployAll`       | `nix run .#stagingDeployAll`            | Deploy staging system config + all services   |
-| `stagingDeployNixosBoot` | `nix run .#stagingDeployNixosBoot`      | Register staging NixOS config for next boot   |
-| `remote`                 | `nix run .#remote [-- <cmd>]`           | SSH into production host                      |
-| `secret`                 | `nix run .#secret <file.age>`           | Edit an encrypted config, then re-encrypt all |
-| `bootstrap`              | `nix run .#bootstrap`                   | One-time NixOS install on a new host          |
-
-The deploy workflows also expose a `broker-migration` mode for the one-time
-`dbus` to `dbus-broker` migration. Use that mode when a NixOS change must be
-registered for next boot instead of live-switched: it boot-deploys the system
-profile, reboots the host, waits for SSH over Tailscale, verifies `dbus-broker`,
-then runs the normal full deploy to reactivate service profiles. This keeps the
-host on the current NixOS default instead of carrying a permanent override back
-to classic `dbus`.
-
-To run the production migration:
-
-1. Draft the release tag from `master`.
-2. Open the **Deploy to Production** GitHub Actions workflow.
-3. Click **Run workflow**.
-4. Enter the release tag.
-5. Set `mode` to `broker-migration`.
-6. Start the workflow and wait for the final `Deploy all profiles after reboot`
-   step to pass.
-7. Use the default `all` mode for future production deploys.
-
-**Infrastructure** (requires SSH key for terraform state decryption):
-
-| Command      | Usage                  | Notes                             |
-| ------------ | ---------------------- | --------------------------------- |
-| `tfInit`     | `nix run .#tfInit`     | Initialize terraform              |
-| `tfPlan`     | `nix run .#tfPlan`     | Preview infrastructure changes    |
-| `tfApply`    | `nix run .#tfApply`    | Apply planned changes             |
-| `tfDestroy`  | `nix run .#tfDestroy`  | Tear down infrastructure          |
-| `tfEditVars` | `nix run .#tfEditVars` | Edit terraform vars in `$EDITOR`  |
-| `tfRekey`    | `nix run .#tfRekey`    | Re-encrypt terraform state + vars |
-| `resolveIp`  | `nix run .#resolveIp`  | Print the production host IP      |
+**Deployment** happens in t0.devops (see the Deployment section above);
+this repo has no deploy commands. The one operational wrapper left is
+`nix run .#secret <file.age>` for the dividend-ops secret.
 
 ### Dashboard Dependencies
 

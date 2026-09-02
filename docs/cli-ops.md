@@ -121,8 +121,21 @@ by the issuer rather than the market-making wallet:
 s01 dividend-bump -s COIN -q 10
 ```
 
-`s01` defaults to `/run/st0x/s01-issuer.config` and
-`/run/agenix/s01-issuer.toml`; override with `S01_CONFIG`/`S01_SECRETS`.
+The droplet that used to host the `s01` wrapper is retired, so a dividend
+bump now runs from a keyholder's machine: decrypt the secret with your age
+identity and point the CLI at the committed config:
+
+```sh
+nix develop -c secret decrypt s01-issuer.toml   # or: ragenix -d secret/s01-issuer.toml.age -i <key>
+cargo run --bin cli -- \
+  --config config/s01-issuer.toml \
+  --secrets <decrypted-secrets-file> \
+  dividend-bump -s COIN -q 10
+```
+
+(Follow-up: re-home the secret to Secret Manager and mount the issuer
+pair into the GCE bot container so this runs via `docker exec` like
+`stox`.)
 **Always run a dividend bump as the issuer:** a plain `stox dividend-bump` would
 buy, tokenize, and donate from the **market-making** wallet, not the issuer. To
 use `stox` you must pass the issuer `--config`/`--secrets` explicitly.
