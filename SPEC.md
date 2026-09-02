@@ -565,7 +565,12 @@ Alpaca's 24/5 documentation: <https://docs.alpaca.markets/us/docs/245-trading>.
   the next 20:00 ET. Quantities allow at most 9 decimal places and notional
   amounts at most 2 decimal places. The bot submits quantity-sized orders only
   (never notional-sized), and validates the 9-decimal quantity bound before the
-  HTTP call.
+  HTTP call. The bound has two tiers, matching the other order paths: the
+  automated hedging path quantizes an onchain quantity down to 9 decimal places
+  before placement — onchain fills carry 18-decimal dust, and the sub-precision
+  remainder stays on the position as tracked exposure — while a quantity named
+  exactly (a CLI order) is rejected when it exceeds the bound, never silently
+  truncated.
 - **Market data.** Overnight pricing uses Alpaca's indicative quote feed
   (`feed=overnight`, real-time, derived from Blue Ocean data). The delayed
   historical variant (`feed=boats`) is not used for pricing. The feed is a paid

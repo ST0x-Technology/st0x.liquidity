@@ -184,6 +184,59 @@ impl OffchainOrderPlacement {
 /// `PlaceHedge`) still hold `counter_trade_submission_lock` to serialise
 /// placement attempts; startup orphan recovery and the CLI `test-trade` command
 /// run without it, which is safe because no concurrent placement runs there.
+/// Floors an onchain 18-decimal quantity to Alpaca's 9 decimal places for
+/// the automated overnight placement, leaving the sub-precision remainder
+/// on the position as tracked exposure. Truncation failing (a `Float`
+/// error) or collapsing the quantity to zero passes the ORIGINAL value
+/// through instead: the strict overnight constructor then refuses it with
+/// the precise over-precision error, so nothing is ever silently dropped.
+fn quantize_shares_to_broker_precision(
+    shares: Positive<FractionalShares>,
+) -> Positive<FractionalShares> {
+    let quantized = st0x_execution::truncate_to_decimal_places(
+        shares.inner().inner(),
+        st0x_execution::ALPACA_MAX_DECIMAL_PLACES,
+    );
+    match quantized {
+        Ok(Some(floored)) => match Positive::new(FractionalShares::new(floored)) {
+            Ok(quantized_shares) => {
+                if quantized_shares != shares {
+                    debug!(
+                        original = %shares,
+                        quantized = %quantized_shares,
+                        "Quantized overnight hedge quantity to Alpaca's 9 decimal places"
+                    );
+                }
+                quantized_shares
+            }
+            Err(error) => {
+                warn!(
+                    %shares, %error,
+                    "Quantized overnight quantity not positive; passing the original \
+                     through to the strict constructor"
+                );
+                shares
+            }
+        },
+        Ok(None) => {
+            warn!(
+                %shares,
+                "Overnight quantity is entirely below broker precision; passing it \
+                 through to the strict constructor's refusal"
+            );
+            shares
+        }
+        Err(error) => {
+            warn!(
+                %shares, %error,
+                "Overnight quantity truncation failed; passing the original through \
+                 to the strict constructor"
+            );
+            shares
+        }
+    }
+}
+
 pub(crate) async fn place_offchain_order_at_broker(
     store: &Store<OffchainOrder>,
     order_placer: &dyn OrderPlacer,
@@ -265,7 +318,14 @@ pub(crate) async fn place_offchain_order_at_broker(
         } => {
             let limit_order = LimitOrder {
                 symbol,
-                shares,
+                // The automated tier of the overnight precision contract
+                // (SPEC "Order contract"): onchain quantities carry
+                // 18-decimal dust the strict trait would refuse, so the
+                // hedge quantizes down to the broker's 9 decimal places
+                // here and the sub-precision remainder stays on the
+                // position as tracked exposure. The trait itself keeps the
+                // exactly-named tier's refusal for the CLI.
+                shares: quantize_shares_to_broker_precision(shares),
                 direction,
                 limit_price,
                 extended_hours: true,
@@ -3375,6 +3435,7 @@ pub enum OffchainOrderError {
 
 #[cfg(test)]
 mod tests {
+    use rain_math_float::Float;
     use serde_json::json;
 
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, TestStore, replay};
@@ -4219,6 +4280,103 @@ mod tests {
     /// fail-closed contract against it -- enforcement itself is pinned in
     /// the execution crate), and `now` is the placement instant, not the
     /// enqueue instant, so a job that sat queued is judged on current time.
+    #[tokio::test]
+    async fn overnight_placement_quantizes_the_onchain_quantity() {
+        // The automated tier of the overnight precision contract: an
+        // 18-decimal onchain quantity is floored to Alpaca's 9 decimal
+        // places BEFORE the trait call, so the strict trait (which refuses
+        // over-precision for exactly-named CLI quantities) never sees the
+        // dust. The remainder stays on the position as tracked exposure.
+        struct Recording {
+            seen_shares: std::sync::Mutex<Option<Positive<FractionalShares>>>,
+        }
+
+        #[async_trait]
+        impl OrderPlacer for Recording {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("an overnight placement must never fall back to a market order")
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("an overnight placement must go through place_overnight_order")
+            }
+
+            async fn place_overnight_order(
+                &self,
+                order: LimitOrder,
+                _snapshot: Option<&EligibilitySnapshot>,
+                _now: DateTime<Utc>,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                *self.seen_shares.lock().unwrap() = Some(order.shares);
+
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("OVN-QUANTIZED"),
+                    placed_shares: order.shares,
+                    is_extended_hours: true,
+                    limit_price: Some(order.limit_price),
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(CancellationOutcome::Requested)
+            }
+        }
+
+        let pool = crate::test_utils::setup_test_db().await;
+        let (store, _) = StoreBuilder::<OffchainOrder>::new(pool)
+            .build(noop_order_placer())
+            .await
+            .unwrap();
+        let placer = Recording {
+            seen_shares: std::sync::Mutex::new(None),
+        };
+
+        place_offchain_order_at_broker(
+            &store,
+            &placer,
+            &OffchainOrderId::new(),
+            OffchainOrderPlacement::with_kind(
+                Symbol::new("AAPL").unwrap(),
+                Positive::new(FractionalShares::new(
+                    Float::parse("12.499999999999999999".to_string()).unwrap(),
+                ))
+                .unwrap(),
+                Direction::Buy,
+                SupportedExecutor::DryRun,
+                ClientOrderId::from_uuid(Uuid::new_v4()),
+                eligible_overnight_kind(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let seen = placer
+            .seen_shares
+            .lock()
+            .unwrap()
+            .expect("the overnight arm must reach place_overnight_order");
+        assert_eq!(
+            seen,
+            Positive::new(FractionalShares::new(
+                Float::parse("12.499999999".to_string()).unwrap()
+            ))
+            .unwrap(),
+            "the trait must receive the floored 9-decimal quantity"
+        );
+    }
+
     #[tokio::test]
     async fn overnight_placement_forwards_the_anchoring_id_and_kind_snapshot() {
         type SeenPlacement = (LimitOrder, Option<EligibilitySnapshot>, DateTime<Utc>);
