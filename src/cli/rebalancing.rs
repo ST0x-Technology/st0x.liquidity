@@ -39,6 +39,7 @@ use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
 };
 use crate::mint_authorization::{ConfiguredMintAuthorizer, VaultModeReader};
+use crate::native_gas::GasReadiness;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
 use crate::rebalancing::to_wrapped_equities;
 use crate::rebalancing::usdc::{CrossVenueCashTransfer, UsdcSettlementParams, UsdcTransferError};
@@ -54,6 +55,17 @@ use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 struct EquityTransferCliServices {
     transfer: CrossVenueEquityTransfer,
     wallet: Address,
+}
+
+fn gas_readiness(ctx: &Ctx, wallet_ctx: &OnchainWalletCtx) -> anyhow::Result<Arc<GasReadiness>> {
+    let alerts = ctx
+        .alerts
+        .as_ref()
+        .context("rebalancing transfer requires [alerts] gas thresholds")?;
+    let base_wallet = wallet_ctx.base_wallet();
+    let ethereum_wallet = wallet_ctx.ethereum_wallet();
+
+    GasReadiness::from_wallets(alerts, base_wallet, ethereum_wallet)
 }
 
 /// Resolves the redemption wallet address from CLI flag or config.
@@ -101,6 +113,7 @@ async fn build_equity_transfer_services(
     let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, ctx)?;
     let wallet_ctx = ctx.wallet()?;
     let wallet = wallet_ctx.base_wallet().address();
+    let gas_readiness = gas_readiness(ctx, wallet_ctx)?;
     let base_caller = wallet_ctx.base_wallet().clone();
 
     let tokenization_service: Arc<dyn Tokenizer> = Arc::new(AlpacaTokenizationService::new(
@@ -168,7 +181,8 @@ async fn build_equity_transfer_services(
         wallet,
         mint_store,
         redemption_store,
-    );
+    )
+    .with_gas_readiness(gas_readiness);
 
     Ok(EquityTransferCliServices { transfer, wallet })
 }
@@ -595,6 +609,7 @@ async fn run_usdc_transfer<Writer: Write>(
     ));
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let gas_readiness = gas_readiness(ctx, wallet_ctx)?;
 
     let rebalance_manager = CrossVenueCashTransfer::new(
         alpaca_broker,
@@ -620,7 +635,8 @@ async fn run_usdc_transfer<Writer: Write>(
             #[cfg(feature = "test-support")]
             message_transmitter: rebalancing_ctx.message_transmitter,
         },
-    );
+    )
+    .with_gas_readiness(gas_readiness);
 
     writeln!(stdout, "   Transfer may take several minutes...")?;
 

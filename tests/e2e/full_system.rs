@@ -67,7 +67,7 @@ use crate::poll::{
     connect_db, count_events, count_events_of_type, free_port_pair, poll_for_broker_fills,
     poll_for_events, poll_for_events_with_timeout, poll_for_ready, spawn_bot_with_event_channel,
 };
-use crate::rebalancing::assertions::TestWallet;
+use crate::rebalancing::assertions::{TestWallet, test_alerts};
 use crate::test_infra::TestInfra;
 
 /// Builds a `Ctx` with ALL features enabled: hedging, equity rebalancing,
@@ -196,6 +196,7 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
         .bot_gas_valuation(st0x_hedge::BotGasValuationConfig {
             chainlink_feed: chain.mock_chainlink_feed,
         })
+        .alerts(test_alerts())
         .call()
         .map_err(Into::into)
 }
@@ -581,6 +582,11 @@ address = "{owner}"
 
 [bot_gas_valuation]
 chainlink_feed = "{mock_chainlink_feed:#x}"
+
+[alerts]
+low_balance_thresholds = {{ base = "0.000000000000000001", ethereum = "0.000000000000000001" }}
+poll_interval = 1
+realert_interval = 1
 
 [rebalancing]
 transfer_timeout_secs = 1800

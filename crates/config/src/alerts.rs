@@ -7,11 +7,11 @@
 //! carries no delivery-channel settings and no secrets -- it only gates and
 //! tunes the gas monitor.
 //!
-//! Like [`crate::telemetry`], this is an OPTIONAL section in the plaintext
-//! config (`[alerts]`). When absent the loader yields `None` and no gas
-//! monitor is spawned. When present, the section must fully specify every
-//! field -- there are no silent threshold defaults, per the financial-integrity
-//! rule.
+//! In standalone mode this is an optional section in the plaintext config
+//! (`[alerts]`): when absent the loader yields `None` and no gas monitor is
+//! spawned. Rebalancing mode requires it because the same thresholds gate fresh
+//! transfers. When present, the section must fully specify every field -- there
+//! are no silent threshold defaults, per the financial-integrity rule.
 
 use std::collections::BTreeMap;
 

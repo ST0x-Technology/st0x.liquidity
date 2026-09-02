@@ -4,7 +4,7 @@
 //! assertion helpers (`assert_equity_rebalancing_flow`,
 //! `assert_usdc_rebalancing_flow`) used by the rebalancing e2e tests.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 pub(crate) use std::time::Duration;
 
@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 use st0x_bridge::cctp::CctpAttestationMock;
 use st0x_config::{BrokerCtx, Ctx};
 use st0x_config::{CashHedgePolicy, EquityHedgePolicy, HedgedEquities, HedgingAssets};
-use st0x_evm::{Evm, EvmError, Wallet};
+use st0x_evm::{Chain, Evm, EvmError, Wallet};
 use st0x_execution::alpaca_broker_api::{
     AlpacaBrokerMock, OrderSide, OrderStatus, TEST_API_KEY, TEST_API_SECRET, TransferDirection,
     TransferStatus,
@@ -37,6 +37,7 @@ use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol, TimeInForce,
 };
 use st0x_finance::{Positive, Usd};
+use st0x_float_macro::float;
 pub(crate) use st0x_hedge::UsdcRebalancing;
 use st0x_hedge::bindings::IRaindexV6;
 pub(crate) use st0x_hedge::mock_api::REDEMPTION_WALLET;
@@ -57,7 +58,19 @@ pub(crate) use crate::poll::{
     poll_for_hedge_completion, poll_for_snapshot_field, sleep_or_crash, spawn_bot,
 };
 pub(crate) use crate::test_infra::TestInfra;
-use st0x_float_macro::float;
+
+/// Gas thresholds for rebalancing tests. One wei keeps the admission gate
+/// active while accepting the pre-funded Anvil wallets used by the harness.
+pub(crate) fn test_alerts() -> st0x_config::AlertsCtx {
+    st0x_config::AlertsCtx::for_test(
+        BTreeMap::from([
+            (Chain::Base, U256::from(1)),
+            (Chain::Ethereum, U256::from(1)),
+        ]),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    )
+}
 
 /// The hedging table the e2e Ctx builder needs alongside a chain listing:
 /// every listed symbol gets a policy, plus the broker-side cash reserve.
@@ -340,6 +353,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         .bot_gas_valuation(st0x_hedge::BotGasValuationConfig {
             chainlink_feed: chain.mock_chainlink_feed,
         })
+        .alerts(test_alerts())
         .maybe_orchestrator(orchestrator)
         .call()?;
     Ok(ctx)
@@ -443,6 +457,7 @@ where
         .bot_gas_valuation(st0x_hedge::BotGasValuationConfig {
             chainlink_feed: base_chain.mock_chainlink_feed,
         })
+        .alerts(test_alerts())
         .call()
         .map_err(Into::into)
 }

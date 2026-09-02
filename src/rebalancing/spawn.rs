@@ -18,6 +18,7 @@ use super::usdc::{
     CrossVenueCashTransfer, ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcSettlementParams,
 };
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
+use crate::native_gas::GasReadiness;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::UsdcRebalance;
 
@@ -154,6 +155,7 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
         usdc_vault_id: RaindexVaultId,
         usdc: Arc<Store<UsdcRebalance>>,
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
+        gas_readiness: Arc<GasReadiness>,
     ) -> UsdcTransferResumeHandles {
         let usdc = Arc::new(
             CrossVenueCashTransfer::new(
@@ -166,6 +168,7 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
                 usdc_vault_id,
                 &self.settlement,
             )
+            .with_gas_readiness(gas_readiness)
             .with_bot_gas_enqueuer(bot_gas_enqueuer),
         );
 
@@ -517,6 +520,7 @@ mod tests {
             RaindexVaultId(B256::ZERO),
             usdc_store,
             BotGasReceiptCostEnqueuer::Disabled,
+            crate::native_gas::GasReadiness::always_ready_for_test(),
         );
     }
 }

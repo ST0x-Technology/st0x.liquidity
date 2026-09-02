@@ -1061,6 +1061,25 @@ configured `apalis_finished_job_cleanup_interval_secs` cadence. Those rows are
 queue bookkeeping, while trade history lives in CQRS events and projections. The
 cadence is required config and must be non-zero.
 
+## Native-gas admission for transfers
+
+Fresh rebalancing transfers are admitted only after reading the native-token
+balance of every signing wallet their route can use. Equity transfers check the
+Base wallet; USDC transfers check both Base and Ethereum. An unreadable balance
+or a value below the configured `[alerts.low_balance_thresholds]` entry fails
+closed before any CQRS event or fund movement. Equality with the threshold is
+ready. Rebalancing therefore requires `[alerts]` at startup and shares its
+thresholds and polling interval with the gas-balance monitor.
+
+The trigger checks readiness immediately before enqueueing, and the transfer
+manager checks again immediately before creating a fresh aggregate. The second
+check closes the queue-delay race. A refusal keeps or releases the existing
+in-progress guard as appropriate and delayed-redrives at the alert poll cadence
+without consuming normal job retry budgets. Resuming an aggregate that has
+already started skips fresh admission: persisted state may represent funds
+already in flight, so recovery must continue rather than strand them behind a
+new balance check.
+
 ## Error handling in jobs
 
 > **Known issue**: the current design uses `Ok(())` for permanent business

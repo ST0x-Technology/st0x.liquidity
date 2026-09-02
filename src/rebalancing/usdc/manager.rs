@@ -30,6 +30,7 @@ use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
 use super::UsdcTransferError;
 use crate::bot_gas::{BotGasOperationCategory, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCost};
 use crate::inventory::view::alpaca_to_base_usdc_capacity;
+use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::{
     ConversionAmounts, RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand,
@@ -248,6 +249,7 @@ pub(crate) struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, 
     attestation_retry_deadline: Duration,
     required_confirmations: u64,
     reserved_cash: Option<Usd>,
+    gas_readiness: ConfiguredGasReadiness,
     /// Enqueues bot-gas cost recording after CCTP burn/mint confirmations and
     /// the USDC-to-Alpaca wallet transfer succeed (ADR 0017).
     /// Defaults to `Disabled`; production wiring opts in via
@@ -328,8 +330,14 @@ impl<
             attestation_retry_deadline: settlement.attestation_retry_deadline,
             required_confirmations: settlement.required_confirmations,
             reserved_cash: settlement.reserved_cash,
+            gas_readiness: ConfiguredGasReadiness::default(),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         }
+    }
+
+    pub(crate) fn with_gas_readiness(mut self, readiness: Arc<GasReadiness>) -> Self {
+        self.gas_readiness = ConfiguredGasReadiness::Wired(readiness);
+        self
     }
 
     /// Opts this transfer into bot-gas cost recording. Called at the
@@ -1841,6 +1849,10 @@ impl<
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) -> Result<(), UsdcTransferError> {
+        self.gas_readiness
+            .ensure_ready(TransferGasRoute::Usdc)
+            .await?;
+
         info!(target: "rebalance", %amount, "Starting Alpaca to Base rebalance");
 
         // Convert USD to USDC - use the actual received amount for subsequent steps
@@ -2443,6 +2455,10 @@ impl<
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) -> Result<(), UsdcTransferError> {
+        self.gas_readiness
+            .ensure_ready(TransferGasRoute::Usdc)
+            .await?;
+
         info!(target: "rebalance", %amount, "Starting Base to Alpaca rebalance");
 
         let amount_u256 = usdc_to_u256(amount)?;
@@ -5726,6 +5742,64 @@ mod tests {
         assert_eq!(
             usdc_to_u256(amount).unwrap(),
             U256::from(1_000_000_000_000_000_000u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_usdc_directions_refuse_low_ethereum_gas_before_creating_aggregate() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            address!("0x1111111111111111111111111111111111111111"),
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        )
+        .with_gas_readiness(crate::native_gas::GasReadiness::for_test(
+            U256::MAX,
+            U256::from(1_u64),
+            U256::ZERO,
+            U256::from(1_u64),
+        ));
+
+        let alpaca_to_base_id = UsdcRebalanceId(Uuid::new_v4());
+        let alpaca_to_base_error = manager
+            .resume_alpaca_to_base(&alpaca_to_base_id, usdc("100"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            alpaca_to_base_error,
+            UsdcTransferError::GasReadiness(_)
+        ));
+        assert!(
+            cqrs.load(&alpaca_to_base_id).await.unwrap().is_none(),
+            "Alpaca->Base gas refusal must happen before conversion or withdrawal state"
+        );
+
+        let base_to_alpaca_id = UsdcRebalanceId(Uuid::new_v4());
+        let base_to_alpaca_error = manager
+            .resume_base_to_alpaca(&base_to_alpaca_id, usdc("100"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            base_to_alpaca_error,
+            UsdcTransferError::GasReadiness(_)
+        ));
+        assert!(
+            cqrs.load(&base_to_alpaca_id).await.unwrap().is_none(),
+            "Base->Alpaca gas refusal must happen before the vault withdrawal state"
         );
     }
 
@@ -9664,9 +9738,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_base_to_alpaca_from_converting_confirms_from_filled_order() {
+    async fn resume_base_to_alpaca_from_converting_ignores_low_gas_and_confirms_filled_order() {
         let server = MockServer::start();
         let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+        let manager = manager.with_gas_readiness(crate::native_gas::GasReadiness::for_test(
+            U256::ZERO,
+            U256::from(1_u64),
+            U256::ZERO,
+            U256::from(1_u64),
+        ));
 
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc("100");

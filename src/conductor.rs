@@ -74,6 +74,7 @@ use crate::inventory::{
     BroadcastingInventory, Inventory, InventoryProjection, InventorySnapshot, Venue,
 };
 use crate::mint_authorization::{ConfiguredMintAuthorizer, MintAuthorizationService};
+use crate::native_gas::GasReadiness;
 use crate::offchain::order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacer,
     PollOrderStatus, PollOrderStatusJobQueue, TerminalPositionFinalization,
@@ -2061,6 +2062,17 @@ async fn wire_freeze_guard(
     Ok(())
 }
 
+/// Wires the pre-dispatch safety checks used by fresh rebalancing transfers.
+async fn wire_transfer_admission_guards(
+    rebalancing_service: &RebalancingService,
+    gas_readiness: Arc<GasReadiness>,
+    freeze_check: OperationMode,
+    issuance: &IssuanceStatusCtx,
+) -> anyhow::Result<()> {
+    rebalancing_service.set_gas_readiness(gas_readiness).await;
+    wire_freeze_guard(rebalancing_service, freeze_check, issuance).await
+}
+
 /// Builds the rebalancing [`RaindexService`]: writes settle through the shared
 /// inventory, `market_maker_wallet` signs and appears as the operator.
 fn build_rebalancing_raindex_service<Signer: Wallet + Clone>(
@@ -2426,6 +2438,19 @@ fn build_rebalancing_vault_lookup(
     (registry_id, lookup)
 }
 
+fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
+    wallets: &ChainWallets<Signer>,
+    ctx: &Ctx,
+) -> anyhow::Result<Arc<GasReadiness>> {
+    let alerts = ctx
+        .alerts
+        .as_ref()
+        .context("rebalancing requires [alerts] gas thresholds")?;
+    let (EthereumWallet(ethereum_wallet), BaseWallet(base_wallet)) = wallets.clone().into_parts();
+
+    GasReadiness::from_wallets(alerts, &base_wallet, &ethereum_wallet)
+}
+
 fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     redemption_wallet: Address,
@@ -2443,6 +2468,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         let BaseWallet(base_wallet) = wallets.base();
         let market_maker_wallet = base_wallet.address();
+        let gas_readiness = build_transfer_gas_readiness(&wallets, &deps.ctx)?;
 
         // This function only runs under `TradingMode::Rebalancing`, which
         // requires `[wallet]` to be configured (see `CtxError::WalletNotConfigured`),
@@ -2518,8 +2544,9 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             notifier.clone(),
         ));
 
-        wire_freeze_guard(
+        wire_transfer_admission_guards(
             &rebalancing_service,
+            gas_readiness.clone(),
             rebalancing_ctx.freeze_check,
             &deps.ctx.issuance,
         )
@@ -2552,6 +2579,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
                 built.mint.clone(),
                 built.redemption.clone(),
             )
+            .with_gas_readiness(gas_readiness.clone())
             .with_bot_gas_enqueuer(bot_gas_enqueuer.clone())
             .with_mint_authorization(mint_authorization.wiring),
         );
@@ -2613,6 +2641,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             RaindexVaultId(usdc_vault_id),
             built.usdc,
             bot_gas_enqueuer.clone(),
+            gas_readiness,
         );
 
         let deliver_mint_authorization_ctx = Arc::new(DeliverMintAuthorizationCtx {

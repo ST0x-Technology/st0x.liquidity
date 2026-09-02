@@ -57,6 +57,7 @@ mod issuance;
 pub(crate) mod metrics;
 pub mod migration_verification;
 pub mod mint_authorization;
+mod native_gas;
 mod offchain;
 mod onchain;
 mod onchain_trade;

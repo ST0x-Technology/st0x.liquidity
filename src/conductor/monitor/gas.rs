@@ -31,8 +31,6 @@ use std::time::Duration;
 
 use alloy::primitives::utils::format_ether;
 use alloy::primitives::{Address, U256};
-use alloy::providers::Provider;
-use async_trait::async_trait;
 use task_supervisor::{SupervisedTask, TaskResult};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{error, info, warn};
@@ -40,41 +38,7 @@ use tracing::{error, info, warn};
 use st0x_evm::Chain;
 
 use crate::alerts::Notifier;
-
-/// Reads the native balance of an address, abstracted so the monitor's
-/// threshold logic can be driven with canned values in tests instead of a
-/// live RPC provider.
-#[async_trait]
-pub(crate) trait BalanceReader: Send + Sync {
-    async fn native_balance(&self, address: Address) -> Result<U256, BalanceReadError>;
-}
-
-/// Opaque wrapper around the underlying provider's balance-read error. Kept as
-/// a boxed error (rather than a `String`) so the source chain is preserved.
-#[derive(Debug, thiserror::Error)]
-#[error("failed to read native balance")]
-pub(crate) struct BalanceReadError(#[source] Box<dyn std::error::Error + Send + Sync>);
-
-/// [`BalanceReader`] backed by the Alloy [`Provider`] for the monitored chain.
-pub(crate) struct ProviderBalanceReader<Prov> {
-    provider: Prov,
-}
-
-impl<Prov> ProviderBalanceReader<Prov> {
-    pub(crate) fn new(provider: Prov) -> Self {
-        Self { provider }
-    }
-}
-
-#[async_trait]
-impl<Prov: Provider + Send + Sync> BalanceReader for ProviderBalanceReader<Prov> {
-    async fn native_balance(&self, address: Address) -> Result<U256, BalanceReadError> {
-        self.provider
-            .get_balance(address)
-            .await
-            .map_err(|error| BalanceReadError(Box::new(error)))
-    }
-}
+use crate::native_gas::BalanceReader;
 
 /// Tracks whether the balance is currently in the low-alert state, and when the
 /// last alert fired, so repeated low polls don't spam notifications.
@@ -266,7 +230,10 @@ impl SupervisedTask for GasMonitor {
 mod tests {
     use std::sync::Mutex;
 
+    use async_trait::async_trait;
+
     use super::*;
+    use crate::native_gas::BalanceReadError;
 
     /// Notifier that records every message it is asked to deliver, so tests can
     /// assert exactly which alerts fired.

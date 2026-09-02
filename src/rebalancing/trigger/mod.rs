@@ -46,6 +46,7 @@ use crate::inventory::{
     InventoryView, InventoryViewError, Operator, PendingRequestOwnership,
     PendingRequestOwnershipSnapshot, TransferOp, Venue,
 };
+use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
 use crate::offchain::order::OffchainOrderId;
 use crate::position::{Position, PositionEvent};
 use crate::rebalancing::equity::{
@@ -529,6 +530,10 @@ pub(crate) struct RebalancingService {
     /// config, mirroring `set_stores`); `None` only in tests that do not
     /// exercise the gate.
     freeze_status: RwLock<Option<Arc<dyn FreezeStatusReader>>>,
+    /// Fresh-transfer gas admission, attached by the conductor through
+    /// `set_gas_readiness`. `Unwired` is fail-closed in production so a missed
+    /// startup wiring step cannot move funds without checking native gas.
+    gas_readiness: RwLock<ConfiguredGasReadiness>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashMap<Symbol, equity::GuardState>>>,
     /// Symbols the inventory poller flagged with a pending snapshot
     /// divergence. Read here to suppress new equity transfers so a mint or
@@ -685,6 +690,7 @@ impl RebalancingService {
             registry_id,
             inventory,
             freeze_status: RwLock::new(None),
+            gas_readiness: RwLock::new(ConfiguredGasReadiness::default()),
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
             divergence_gate: Arc::default(),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
@@ -737,6 +743,27 @@ impl RebalancingService {
     /// (the reader wraps the issuance client built from config).
     pub(crate) async fn set_freeze_status_reader(&self, reader: Arc<dyn FreezeStatusReader>) {
         *self.freeze_status.write().await = Some(reader);
+    }
+
+    pub(crate) async fn set_gas_readiness(&self, readiness: Arc<GasReadiness>) {
+        *self.gas_readiness.write().await = ConfiguredGasReadiness::Wired(readiness);
+    }
+
+    async fn transfer_gas_is_ready(&self, route: TransferGasRoute) -> bool {
+        let readiness = self.gas_readiness.read().await.clone();
+
+        match readiness.ensure_ready(route).await {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    ?route,
+                    %error,
+                    "Skipped fresh transfer because its signing wallet is not gas-ready"
+                );
+                false
+            }
+        }
     }
 
     /// The divergence gate shared with the inventory poller. The poller
@@ -2973,6 +3000,10 @@ impl RebalancingService {
             return Ok(());
         };
 
+        if !self.transfer_gas_is_ready(TransferGasRoute::Equity).await {
+            return Ok(());
+        }
+
         let operation = match self.build_equity_operation(symbol).await {
             Ok(Some(operation)) => operation,
             Ok(None) => return Ok(()),
@@ -3132,6 +3163,10 @@ impl RebalancingService {
                 "Skipped USDC trigger before dispatch: cash snapshot \
                  divergence detected during operation sizing"
             );
+            return;
+        }
+
+        if !self.transfer_gas_is_ready(TransferGasRoute::Usdc).await {
             return;
         }
 
@@ -7660,6 +7695,77 @@ mod tests {
             "Whitelisted symbol with an imbalance should dispatch a mint job"
         );
         assert_eq!(jobs[0].symbol, symbol);
+    }
+
+    #[tokio::test]
+    async fn low_gas_releases_equity_guard_and_funded_retry_dispatches() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger =
+            make_imbalanced_trigger_with_equities(&symbol, rebalancing_enabled_equities(&["AAPL"]))
+                .await;
+        trigger
+            .set_gas_readiness(crate::native_gas::GasReadiness::for_test(
+                U256::ZERO,
+                U256::from(1_u64),
+                U256::MAX,
+                U256::from(1_u64),
+            ))
+            .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
+            "a low-gas refusal must release the fresh-transfer guard"
+        );
+
+        trigger
+            .set_gas_readiness(crate::native_gas::GasReadiness::always_ready_for_test())
+            .await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            1,
+            "the next trigger cycle must dispatch after the wallet is funded"
+        );
+    }
+
+    #[tokio::test]
+    async fn low_gas_skips_equity_ratio_read() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let wrapper = Arc::new(MockWrapper::new());
+        let trigger = make_trigger_with_inventory_registry_and_wrapper(
+            inventory,
+            &symbol,
+            Arc::clone(&wrapper),
+            test_config(),
+        )
+        .await;
+        trigger
+            .set_gas_readiness(crate::native_gas::GasReadiness::for_test(
+                U256::ZERO,
+                U256::from(1_u64),
+                U256::MAX,
+                U256::from(1_u64),
+            ))
+            .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(
+            wrapper.ratio_calls(),
+            0,
+            "low gas must reject the transfer before its onchain ratio read"
+        );
     }
 
     #[tokio::test]
@@ -22847,6 +22953,42 @@ mod tests {
             count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
             1,
             "releasing the cash gate must restore USDC dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn low_gas_releases_usdc_guard_and_funded_retry_dispatches() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        trigger
+            .set_gas_readiness(crate::native_gas::GasReadiness::for_test(
+                U256::MAX,
+                U256::from(1_u64),
+                U256::ZERO,
+                U256::from(1_u64),
+            ))
+            .await;
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0
+        );
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "a low-gas refusal must release the fresh-transfer guard"
+        );
+
+        trigger
+            .set_gas_readiness(crate::native_gas::GasReadiness::always_ready_for_test())
+            .await;
+        trigger.check_and_trigger_usdc().await;
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1,
+            "the next trigger cycle must dispatch after the wallet is funded"
         );
     }
 

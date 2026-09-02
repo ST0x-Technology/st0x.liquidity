@@ -206,6 +206,20 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
             return Ok(());
         };
 
+        if let Some(delay) = transfer_error.gas_readiness_retry_interval() {
+            warn!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                issuer_request_id = %self.issuer_request_id,
+                ?delay,
+                %transfer_error,
+                "Fresh equity mint refused by gas-readiness check; rescheduling"
+            );
+            let mut job_queue = ctx.job_queue.clone();
+            job_queue.push_with_delay(self.clone(), delay).await?;
+            return Ok(());
+        }
+
         // Bot-gas cost recording is a best-effort accounting write (ADR 0017
         // SS4): classify and redrive it here, BEFORE the PostReceipt/PreReceipt
         // recovery-handoff branching below, regardless of which
@@ -529,6 +543,20 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
             return Ok(());
         };
 
+        if let Some(delay) = error.gas_readiness_retry_interval() {
+            warn!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                aggregate_id = %self.aggregate_id,
+                ?delay,
+                %error,
+                "Fresh equity redemption refused by gas-readiness check; rescheduling"
+            );
+            let mut job_queue = ctx.job_queue.clone();
+            job_queue.push_with_delay(self.clone(), delay).await?;
+            return Ok(());
+        }
+
         // Bot-gas cost recording is best-effort (see `BotGasReceiptCostEnqueuer`'s
         // doc, ADR 0017 SS4): classify and redrive through the shared
         // mechanism rather than consuming the apalis retry budget. The
@@ -553,6 +581,7 @@ mod tests {
     use serde_json::json;
     use st0x_config::{ChainEquityAsset, OperationMode};
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
+    use st0x_evm::Chain;
     use st0x_float_macro::float;
     use st0x_raindex::Raindex;
     use st0x_tokenization::issuer_request_id;
@@ -562,6 +591,7 @@ mod tests {
     use super::*;
     use crate::equity_redemption::{EquityRedemptionError, redemption_aggregate_id};
     use crate::mint_authorization::ConfiguredMintAuthorizer;
+    use crate::native_gas::GasReadinessFailure;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::{EquityTransferServices, MintError};
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
@@ -684,6 +714,66 @@ mod tests {
     /// real push failure, not a synthesized enum variant -- so the test
     /// exercises the same error shape production code hits.
     struct BotGasEnqueueFailureMintResume(TransferEquityToMarketMakingJobQueue);
+
+    struct GasReadinessFailureMintResume(Duration);
+
+    #[async_trait]
+    impl ResumeEquityToMarketMaking for GasReadinessFailureMintResume {
+        async fn resume_equity_to_market_making(
+            &self,
+            _issuer_request_id: &IssuerRequestId,
+            _symbol: &Symbol,
+            _quantity: FractionalShares,
+        ) -> Result<(), MintTransferError> {
+            Err(MintTransferError::PreReceipt(MintError::GasReadiness(
+                GasReadinessFailure::below_threshold_for_test(Chain::Base, self.0),
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn gas_readiness_failure_delayed_redrives_without_releasing_guard() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let retry_interval = Duration::from_secs(17);
+        let mut ctx = test_ctx(Arc::new(GasReadinessFailureMintResume(retry_interval))).await;
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        ctx.job_queue = TransferEquityToMarketMakingJobQueue::new(&apalis_pool);
+        ctx.equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), GuardState::ActiveTransfer { generation: 0 });
+        let job = TransferEquityToMarketMaking {
+            issuer_request_id: issuer_request_id("low-gas"),
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(5)),
+            generation: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let before = chrono::Utc::now().timestamp();
+        Job::perform(&job, &ctx)
+            .await
+            .expect("low gas must delayed-redrive without consuming the apalis retry budget");
+        let after = chrono::Utc::now().timestamp();
+
+        assert_eq!(
+            ctx.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&GuardState::ActiveTransfer { generation: 0 })
+        );
+        let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        let redriven: TransferEquityToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(redriven.issuer_request_id, job.issuer_request_id);
+        assert!(
+            run_at >= before + i64::try_from(retry_interval.as_secs()).unwrap() - 5
+                && run_at <= after + i64::try_from(retry_interval.as_secs()).unwrap() + 5
+        );
+    }
 
     #[async_trait]
     impl ResumeEquityToMarketMaking for BotGasEnqueueFailureMintResume {
@@ -1595,6 +1685,59 @@ mod tests {
     struct RecordingRedemptionResume {
         fail: bool,
         captured: Mutex<Option<(RedemptionAggregateId, Symbol, FractionalShares)>>,
+    }
+
+    struct GasReadinessFailureRedemptionResume(Duration);
+
+    #[async_trait]
+    impl ResumeEquityToHedging for GasReadinessFailureRedemptionResume {
+        async fn resume_equity_to_hedging(
+            &self,
+            _aggregate_id: &RedemptionAggregateId,
+            _symbol: &Symbol,
+            _quantity: FractionalShares,
+        ) -> Result<(), RedemptionError> {
+            Err(RedemptionError::GasReadiness(
+                GasReadinessFailure::below_threshold_for_test(Chain::Base, self.0),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn redemption_gas_readiness_failure_delayed_redrives_without_consuming_budget() {
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let retry_interval = Duration::from_secs(23);
+        let ctx = TransferEquityToHedgingCtx {
+            transfer: Arc::new(GasReadinessFailureRedemptionResume(retry_interval)),
+            job_queue: TransferEquityToHedgingJobQueue::new(&apalis_pool),
+        };
+        let job = TransferEquityToHedging {
+            aggregate_id: redemption_aggregate_id("low-gas"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(10)),
+            backpressure_streak: BackpressureStreak(4),
+        };
+
+        let before = chrono::Utc::now().timestamp();
+        Job::perform(&job, &ctx)
+            .await
+            .expect("low gas must delayed-redrive without consuming the apalis retry budget");
+        let after = chrono::Utc::now().timestamp();
+
+        let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        let redriven: TransferEquityToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(redriven.aggregate_id, job.aggregate_id);
+        assert_eq!(redriven.backpressure_streak, job.backpressure_streak);
+        assert!(
+            run_at >= before + i64::try_from(retry_interval.as_secs()).unwrap() - 5
+                && run_at <= after + i64::try_from(retry_interval.as_secs()).unwrap() + 5
+        );
     }
 
     #[async_trait]

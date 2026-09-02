@@ -30,7 +30,7 @@ use super::job::{
     build_worker_inner,
 };
 use super::monitor::executor_maintenance::ExecutorMaintenance;
-use super::monitor::gas::{GasMonitor, ProviderBalanceReader};
+use super::monitor::gas::GasMonitor;
 use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
 use super::{Conductor, SupervisorStartupTokens};
@@ -49,6 +49,7 @@ use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotId, PollFreshness,
     WalletPollingCtx,
 };
+use crate::native_gas::ProviderBalanceReader;
 use crate::offchain::order::handle_rejection::HandleOrderRejectionCtx;
 use crate::offchain::order::poll_status::PollOrderStatusCtx;
 use crate::offchain::order::reconcile_fill::ReconcileOrderFillCtx;

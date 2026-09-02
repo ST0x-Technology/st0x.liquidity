@@ -67,6 +67,9 @@ use crate::equity_redemption::{
     RedemptionAggregateId,
 };
 use crate::mint_authorization::{ConfiguredMintAuthorizer, VaultModeCheckError, VaultModeReader};
+use crate::native_gas::{
+    ConfiguredGasReadiness, GasReadiness, GasReadinessFailure, TransferGasRoute,
+};
 use crate::tokenized_equity_mint::{
     TOKENIZED_EQUITY_DECIMALS, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
@@ -447,6 +450,8 @@ impl Wrapper for PanickingWrapper {
 
 #[derive(Debug, Error)]
 pub(crate) enum MintError {
+    #[error(transparent)]
+    GasReadiness(#[from] GasReadinessFailure),
     #[error("Aggregate error: {0}")]
     Aggregate(Box<SendError<TokenizedEquityMint>>),
     #[error("Wrapper error: {0}")]
@@ -541,7 +546,8 @@ impl BotGasFailureClassifier for MintError {
     fn is_bot_gas_enqueue_failure(&self) -> bool {
         match self {
             Self::BotGasEnqueue(_) => true,
-            Self::Aggregate(_)
+            Self::GasReadiness(_)
+            | Self::Aggregate(_)
             | Self::Wrapper(_)
             | Self::Raindex(_)
             | Self::VaultLookup(_)
@@ -570,6 +576,15 @@ pub(crate) enum MintTransferError {
     /// Tokens exist in the wallet; guard must stay set for recovery.
     #[error(transparent)]
     PostReceipt(MintError),
+}
+
+impl MintTransferError {
+    pub(crate) fn gas_readiness_retry_interval(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::PreReceipt(MintError::GasReadiness(failure)) => failure.retry_interval(),
+            Self::PreReceipt(_) | Self::PostReceipt(_) => None,
+        }
+    }
 }
 
 impl BotGasFailureClassifier for MintTransferError {
@@ -606,6 +621,8 @@ fn classify_mint_resume_error(
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {
     #[error(transparent)]
+    GasReadiness(#[from] GasReadinessFailure),
+    #[error(transparent)]
     Send(#[from] SendError<EquityRedemption>),
     #[error(transparent)]
     Raindex(#[from] RaindexError),
@@ -629,13 +646,23 @@ pub(crate) enum RedemptionError {
     Rejected,
 }
 
+impl RedemptionError {
+    pub(crate) fn gas_readiness_retry_interval(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::GasReadiness(failure) => failure.retry_interval(),
+            _ => None,
+        }
+    }
+}
+
 impl BotGasFailureClassifier for RedemptionError {
     fn is_bot_gas_enqueue_failure(&self) -> bool {
         match self {
             Self::Send(AggregateError::UserError(LifecycleError::Apply(
                 EquityRedemptionError::BotGasEnqueueFailed(_),
             ))) => true,
-            Self::Send(_)
+            Self::GasReadiness(_)
+            | Self::Send(_)
             | Self::Raindex(_)
             | Self::VaultLookup(_)
             | Self::Alpaca(_)
@@ -689,6 +716,7 @@ pub(crate) struct CrossVenueEquityTransfer {
     /// [`ConfiguredMintAuthorization::Wired`] via
     /// [`Self::with_mint_authorization`].
     mint_authorization: ConfiguredMintAuthorization,
+    gas_readiness: ConfiguredGasReadiness,
 }
 
 /// Whether this transfer can produce and deliver MintAuthV1 recipient
@@ -742,7 +770,13 @@ impl CrossVenueEquityTransfer {
             redemption_store,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
             mint_authorization: ConfiguredMintAuthorization::VaultDirectOnly,
+            gas_readiness: ConfiguredGasReadiness::default(),
         }
+    }
+
+    pub(crate) fn with_gas_readiness(mut self, readiness: Arc<GasReadiness>) -> Self {
+        self.gas_readiness = ConfiguredGasReadiness::Wired(readiness);
+        self
     }
 
     /// Opts this transfer into bot-gas cost recording. Called at the
@@ -1936,6 +1970,12 @@ impl CrossVenueEquityTransfer {
         symbol: &Symbol,
         quantity: FractionalShares,
     ) -> Result<(), MintTransferError> {
+        self.gas_readiness
+            .ensure_ready(TransferGasRoute::Equity)
+            .await
+            .map_err(MintError::from)
+            .map_err(MintTransferError::PreReceipt)?;
+
         debug!(target: "rebalance", %issuer_request_id, wallet = %self.wallet, "Requesting mint");
 
         // Pre-receipt: no tokens exist yet, safe to retry on failure.
@@ -2010,6 +2050,10 @@ impl CrossVenueEquityTransfer {
         symbol: &Symbol,
         quantity: FractionalShares,
     ) -> Result<(), RedemptionError> {
+        self.gas_readiness
+            .ensure_ready(TransferGasRoute::Equity)
+            .await?;
+
         let token = self.vault_lookup.vault_token_for_symbol(symbol).await?;
         let amount = quantity.to_u256_18_decimals()?;
 
@@ -2794,6 +2838,41 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn fresh_mint_refuses_low_base_gas_before_creating_aggregate() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await
+        .with_gas_readiness(crate::native_gas::GasReadiness::for_test(
+            U256::ZERO,
+            U256::from(1_u64),
+            U256::MAX,
+            U256::from(1_u64),
+        ));
+        let id = issuer_request_id("ISS-LOW-GAS");
+
+        let error = transfer
+            .resume_equity_to_market_making(
+                &id,
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(100.0)),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MintTransferError::PreReceipt(MintError::GasReadiness(_))
+        ));
+        assert!(
+            transfer.mint_store.load(&id).await.unwrap().is_none(),
+            "gas refusal must happen before RequestMint creates aggregate state"
+        );
+    }
+
     /// Acceptance criterion: a full mint (RequestMint through
     /// DepositToVault) enqueues exactly one `Wrap` and one `VaultDeposit`
     /// bot-gas job, each carrying the symbol and Base chain.
@@ -3320,13 +3399,19 @@ mod tests {
     /// exists must resume from the persisted state (the crash-recovery path)
     /// rather than re-requesting the mint from Alpaca.
     #[tokio::test]
-    async fn resume_equity_to_market_making_resumes_existing_aggregate() {
+    async fn resume_equity_to_market_making_resumes_existing_aggregate_despite_low_gas() {
         let transfer = create_equity_transfer(
             Arc::new(MockTokenizer::new()),
             Arc::new(MockRaindex::new()),
             Arc::new(MockWrapper::new()),
         )
-        .await;
+        .await
+        .with_gas_readiness(crate::native_gas::GasReadiness::for_test(
+            U256::ZERO,
+            U256::from(1_u64),
+            U256::MAX,
+            U256::from(1_u64),
+        ));
 
         let id = issuer_request_id("ISS-CRASH-RESUME");
         let symbol = Symbol::new("AAPL").unwrap();
@@ -3472,6 +3557,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fresh_redemption_refuses_low_base_gas_before_creating_aggregate() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await
+        .with_gas_readiness(crate::native_gas::GasReadiness::for_test(
+            U256::ZERO,
+            U256::from(1_u64),
+            U256::MAX,
+            U256::from(1_u64),
+        ));
+        let id = redemption_aggregate_id("redemption-low-gas");
+
+        let error = transfer
+            .resume_equity_to_hedging(
+                &id,
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(50)),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, RedemptionError::GasReadiness(_)));
+        assert!(
+            transfer.redemption_store.load(&id).await.unwrap().is_none(),
+            "gas refusal must happen before the Raindex withdrawal creates aggregate state"
+        );
+    }
+
     /// Acceptance criterion: a full redemption (withdraw through the
     /// redemption-wallet send) enqueues exactly one `VaultWithdraw`, one
     /// `Unwrap`, and one `WalletTransfer` bot-gas job, each carrying the
@@ -3602,7 +3719,7 @@ mod tests {
     /// exists must resume from the persisted state (the crash-recovery path)
     /// rather than re-running the vault withdrawal from scratch.
     #[tokio::test]
-    async fn resume_equity_to_hedging_resumes_existing_aggregate() {
+    async fn resume_equity_to_hedging_resumes_existing_aggregate_despite_low_gas() {
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(
             MockTokenizer::new()
                 .with_detection_outcome(MockDetectionOutcome::Detected)
@@ -3613,7 +3730,13 @@ mod tests {
             Arc::new(MockRaindex::new()),
             Arc::new(MockWrapper::new()),
         )
-        .await;
+        .await
+        .with_gas_readiness(crate::native_gas::GasReadiness::for_test(
+            U256::ZERO,
+            U256::from(1_u64),
+            U256::MAX,
+            U256::from(1_u64),
+        ));
 
         let id = redemption_aggregate_id("redeem-crash-resume");
         let symbol = Symbol::new("TEST").unwrap();
