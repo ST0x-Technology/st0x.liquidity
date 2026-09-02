@@ -1,6 +1,6 @@
-//! Token sources for the IAP audience: non-interactive ADC, a fixed
-//! `StaticToken`, and the interactive Google Desktop OAuth flow (loopback +
-//! PKCE) whose refresh token is cached for silent reuse.
+//! Token sources for the IAP audience: a fixed `StaticToken` and the
+//! interactive Google Desktop OAuth flow (loopback + PKCE) whose refresh token
+//! is cached for silent reuse.
 
 use base64::Engine;
 use rand::RngCore;
