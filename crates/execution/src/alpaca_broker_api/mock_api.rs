@@ -14,7 +14,7 @@ use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolEvent;
 use bon::bon;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Days, NaiveDate, Utc};
 use chrono_tz::America::New_York;
 use httpmock::prelude::*;
 use serde_json::{Value, json};
@@ -147,6 +147,9 @@ struct MockOrder {
     /// Set only for orders placed under [`MockMode::RotatingOutcomes`];
     /// overrides the server-wide mode when this order is polled.
     planned_outcome: Option<PlannedOutcome>,
+    /// `Some(n)` while a cancellation is pending: the order keeps its live
+    /// status for `n` more polls, then settles terminal Canceled.
+    pending_cancel_polls_remaining: Option<usize>,
 }
 
 /// A single calendar entry controlling market open/close times.
@@ -154,12 +157,79 @@ struct MockOrder {
 /// Mirrors the real Alpaca calendar payload: `open`/`close` are the regular
 /// trading hours and `session_open`/`session_close` span the full extended
 /// session. All four are required by the `CalendarDay` parser.
-struct CalendarEntry {
+pub struct CalendarEntry {
     pub date: String,
     pub open: String,
     pub close: String,
     pub session_open: String,
     pub session_close: String,
+}
+
+/// A normal trading day: regular 09:30-16:00, full extended span
+/// 04:00-20:00. The building block of the multi-day scenario calendars.
+fn normal_trading_day(date: NaiveDate) -> CalendarEntry {
+    CalendarEntry {
+        date: date.format("%Y-%m-%d").to_string(),
+        open: "09:30".to_string(),
+        close: "16:00".to_string(),
+        session_open: "04:00".to_string(),
+        session_close: "20:00".to_string(),
+    }
+}
+
+/// An early-close trading day (half-day): regular 09:30-13:00, extended
+/// span narrowing to 17:00 the way real half-days do.
+fn early_close_trading_day(date: NaiveDate) -> CalendarEntry {
+    CalendarEntry {
+        date: date.format("%Y-%m-%d").to_string(),
+        open: "09:30".to_string(),
+        close: "13:00".to_string(),
+        session_open: "04:00".to_string(),
+        session_close: "17:00".to_string(),
+    }
+}
+
+/// A Mon-Thu shape anchored on `today` (the effective ET date): today and
+/// tomorrow both trade, so today's evening opens an overnight session and
+/// today's post-close gap classifies OrdinaryOvernight.
+pub fn overnight_weeknight_calendar(today: NaiveDate) -> Vec<CalendarEntry> {
+    vec![
+        normal_trading_day(today),
+        normal_trading_day(today + Days::new(1)),
+    ]
+}
+
+/// A Friday shape anchored on `friday`: the next trading day is the
+/// following Monday, so the post-close gap classifies MultiDayClosure and
+/// Friday's evening stays Closed (no overnight before a long gap).
+pub fn friday_close_calendar(friday: NaiveDate) -> Vec<CalendarEntry> {
+    vec![
+        normal_trading_day(friday),
+        normal_trading_day(friday + Days::new(3)),
+    ]
+}
+
+/// A holiday-eve shape anchored on `eve`: tomorrow is a full holiday and
+/// the day after trades, so the eve's evening stays Closed and its
+/// post-close gap classifies MultiDayClosure.
+pub fn holiday_eve_calendar(eve: NaiveDate) -> Vec<CalendarEntry> {
+    vec![
+        normal_trading_day(eve),
+        normal_trading_day(eve + Days::new(2)),
+    ]
+}
+
+/// A half-day shape anchored on `today` (early 13:00/17:00 close).
+///
+/// When `next_day_trades`, the evening opens overnight at 20:00 as usual
+/// (ordinary half-day); otherwise the next trading day is two days out
+/// (pre-holiday half-day) and the evening stays Closed.
+pub fn half_day_calendar(today: NaiveDate, next_day_trades: bool) -> Vec<CalendarEntry> {
+    let gap_days = if next_day_trades { 1 } else { 2 };
+    vec![
+        early_close_trading_day(today),
+        normal_trading_day(today + Days::new(gap_days)),
+    ]
 }
 
 /// Builds a calendar entry that keeps the regular session open all day.
@@ -264,6 +334,29 @@ struct MockState {
     /// When true, every `feed=overnight` quote request is answered 403 --
     /// models credentials without the overnight feed entitlement.
     overnight_feed_forbidden: bool,
+    /// Transient `feed=overnight` failures: the next N quote requests are
+    /// answered with `overnight_quote_failure_status` before the fixture is
+    /// served again -- mirrors `transient_placement_failures_remaining` for
+    /// the market-data side (429 backpressure, 5xx outages).
+    overnight_quote_failures_remaining: usize,
+    /// HTTP status the transient overnight-quote failures answer with.
+    overnight_quote_failure_status: u16,
+    /// When true, the placement endpoint enforces Alpaca's overnight
+    /// contract on every equity order: type `limit`, time in force `day`,
+    /// `extended_hours: true`. A violation is a 422, the way the real
+    /// venue answers during the overnight session -- so a contract
+    /// regression fails e2e, not only the unit pins.
+    overnight_contract_enforcement: bool,
+    /// When true, a sell placed while another non-terminal sell for the
+    /// same symbol exists is answered with the "open closing position
+    /// orders" 422 -- Alpaca's net-short guard, which a cancel-and-replace
+    /// sell can race until the cancellation settles.
+    consecutive_sell_guard: bool,
+    /// Polls a cancellation stays pending before settling terminal
+    /// Canceled. Zero (the default) settles on the DELETE itself; a
+    /// positive value models the real venue's pending_cancel window,
+    /// during which the order keeps blocking the net-short guard.
+    cancel_settle_polls: usize,
     /// Per-symbol raw `/v1/assets/{symbol}` payload overrides, served
     /// verbatim so tests control exactly which attributes are present or
     /// absent. Symbols without an override get the default payload.
@@ -430,6 +523,11 @@ impl AlpacaBrokerMock {
             activities: Vec::new(),
             overnight_quotes: HashMap::new(),
             overnight_feed_forbidden: false,
+            overnight_quote_failures_remaining: 0,
+            overnight_quote_failure_status: 503,
+            overnight_contract_enforcement: false,
+            consecutive_sell_guard: false,
+            cancel_settle_polls: 0,
             asset_payload_overrides: HashMap::new(),
         }));
 
@@ -470,6 +568,41 @@ impl AlpacaBrokerMock {
     /// modeling credentials without the overnight feed entitlement.
     pub fn set_overnight_feed_forbidden(&self, forbidden: bool) {
         lock(&self.state).overnight_feed_forbidden = forbidden;
+    }
+
+    /// The next `count` `feed=overnight` quote requests answer with `status`
+    /// (429 backpressure, 5xx outage) before the fixture serves again.
+    pub fn set_overnight_quote_failures(&self, count: usize, status: u16) {
+        let mut state = lock(&self.state);
+        state.overnight_quote_failures_remaining = count;
+        state.overnight_quote_failure_status = status;
+    }
+
+    /// When enabled, the placement endpoint enforces Alpaca's overnight
+    /// order contract (limit + day + `extended_hours: true`) on every
+    /// equity order, answering violations with a 422 like the real venue.
+    pub fn set_overnight_contract_enforcement(&self, enforce: bool) {
+        lock(&self.state).overnight_contract_enforcement = enforce;
+    }
+
+    /// When enabled, a sell placed while another non-terminal sell for the
+    /// same symbol exists answers with the "open closing position orders"
+    /// 422 -- Alpaca's net-short guard.
+    pub fn set_consecutive_sell_guard(&self, guard: bool) {
+        lock(&self.state).consecutive_sell_guard = guard;
+    }
+
+    /// Polls a cancellation stays pending before settling terminal
+    /// Canceled. Zero (the default) settles on the DELETE itself; a
+    /// positive value models the real venue's pending_cancel window.
+    pub fn set_cancel_settle_polls(&self, polls: usize) {
+        lock(&self.state).cancel_settle_polls = polls;
+    }
+
+    /// Replaces the calendar wholesale with the given entries; the endpoint
+    /// serves them verbatim (the client filters by date itself).
+    pub fn set_calendar_entries(&self, entries: Vec<CalendarEntry>) {
+        lock(&self.state).calendar_entries = entries;
     }
 
     /// Overrides the raw `/v1/assets/{symbol}` payload for a symbol, served
@@ -917,6 +1050,59 @@ fn register_endpoints(server: &MockServer, state: &Arc<Mutex<MockState>>) {
     register_order_placement_endpoint(server, state);
     register_order_by_client_order_id_endpoint(server, state);
     register_order_status_endpoint(server, state);
+    register_order_cancel_endpoint(server, state);
+}
+
+/// DELETE `/orders/{id}`: a live order flips to `Canceled` (retaining any
+/// partial fill) and answers 204 the way real Alpaca does; a terminal order
+/// answers 422 and an unknown id 404 (the executor maps the 404 to
+/// `CancellationOutcome::OrderNotFound`). Without this route every e2e
+/// cancellation resolved through the 404 path, so the ordinary
+/// cancel-requested -> poller-confirms lifecycle -- and anything keyed on a
+/// mock order actually leaving the live set, like the consecutive-sell
+/// guard -- was unreachable end-to-end.
+fn register_order_cancel_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+    let state = Arc::clone(state);
+    let prefix = format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/orders/");
+
+    server.mock(|when, then| {
+        when.method(DELETE).path_prefix(&prefix);
+        then.respond_with(move |request: &HttpMockRequest| {
+            let path = request.uri().path().to_string();
+            let order_id = path.strip_prefix(&prefix).unwrap_or("").to_string();
+
+            let mut state = lock(&state);
+            let settle_polls = state.cancel_settle_polls;
+            match state.orders.get_mut(&order_id) {
+                Some(order)
+                    if matches!(
+                        order.status,
+                        OrderStatus::New | OrderStatus::PartiallyFilled
+                    ) =>
+                {
+                    if settle_polls == 0 {
+                        order.status = OrderStatus::Canceled;
+                    } else {
+                        // The real venue's pending_cancel window: the order
+                        // stays live (and keeps blocking the net-short
+                        // guard) until the poller has observed it the
+                        // configured number of times.
+                        order.pending_cancel_polls_remaining = Some(settle_polls);
+                    }
+                    drop(state);
+                    json_response(204, &json!({}))
+                }
+                Some(_) => {
+                    drop(state);
+                    json_response(422, &json!({"message": "order is not cancelable"}))
+                }
+                None => {
+                    drop(state);
+                    json_response(404, &json!({"message": "order not found"}))
+                }
+            }
+        });
+    });
 }
 
 fn register_account_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
@@ -1164,13 +1350,27 @@ fn register_market_data_endpoint(server: &MockServer, state: &Arc<Mutex<MockStat
                         let Ok(symbol) = Symbol::new(symbol) else {
                             return json_response(404, &json!({"message": "unknown symbol"}));
                         };
-                        let (forbidden, fixture) = {
-                            let state = lock(&state);
+                        let (forbidden, fixture, transient_failure) = {
+                            let mut state = lock(&state);
+                            let transient_failure =
+                                if state.overnight_quote_failures_remaining > 0 {
+                                    state.overnight_quote_failures_remaining -= 1;
+                                    Some(state.overnight_quote_failure_status)
+                                } else {
+                                    None
+                                };
                             (
                                 state.overnight_feed_forbidden,
                                 state.overnight_quotes.get(&symbol).cloned(),
+                                transient_failure,
                             )
                         };
+                        if let Some(status) = transient_failure {
+                            return json_response(
+                                status,
+                                &json!({"message": "overnight feed unavailable (chaos)"}),
+                            );
+                        }
                         if forbidden {
                             return json_response(
                                 403,
@@ -1367,6 +1567,49 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                 );
             };
 
+            // Overnight contract enforcement: during the overnight session
+            // the real venue only accepts limit day orders with
+            // extended_hours set. Enforced on every equity order while the
+            // knob is on, so a contract regression in the executor fails
+            // e2e instead of only the unit pins.
+            if state.overnight_contract_enforcement {
+                let is_limit = body["type"].as_str() == Some("limit");
+                let is_day = body["time_in_force"].as_str() == Some("day");
+                let extended = body["extended_hours"].as_bool() == Some(true);
+                let priced = body["limit_price"].as_str().is_some();
+                if !(is_limit && is_day && extended && priced) {
+                    drop(state);
+                    return json_response(
+                        422,
+                        &json!({"message": "overnight orders must be limit day orders \
+                                            with extended_hours set"}),
+                    );
+                }
+            }
+
+            // Net-short guard: a sell while another sell for the same symbol
+            // is still open (its cancellation not yet settled) is refused the
+            // way the real venue refuses it.
+            if state.consecutive_sell_guard && side == OrderSide::Sell {
+                let live_sell_exists = state.orders.values().any(|order| {
+                    order.symbol == symbol
+                        && order.side == OrderSide::Sell
+                        && matches!(
+                            order.status,
+                            OrderStatus::New | OrderStatus::PartiallyFilled
+                        )
+                });
+                if live_sell_exists {
+                    drop(state);
+                    return json_response(
+                        422,
+                        &json!({"message": "account is not allowed to short, and would be \
+                                            short by processing this order because of open \
+                                            closing position orders"}),
+                    );
+                }
+            }
+
             // Real Alpaca rejects a re-used `client_order_id` on an active order
             // with a 422 ("client_order_id must be unique") rather than deduping
             // to a 2xx. Mirror that so the executor's recovery path -- look the
@@ -1410,6 +1653,7 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                     filled_price: None,
                     client_order_id: client_order_id.clone(),
                     planned_outcome,
+                    pending_cancel_polls_remaining: None,
                 },
             );
 
@@ -1597,6 +1841,7 @@ fn handle_crypto_order(
             filled_price: Some(fill_price),
             client_order_id: None,
             planned_outcome: None,
+            pending_cancel_polls_remaining: None,
         },
     );
 
@@ -1676,11 +1921,28 @@ fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockSta
                     return json_response(404, &json!({"message": "order not found"}));
                 }
 
+                let mut cancel_pending = false;
                 if let Some(order) = state.orders.get_mut(&order_id) {
                     order.poll_count += 1;
+
+                    // A pending cancellation settles after the configured
+                    // number of polls: the order keeps reporting its live
+                    // status (the real venue's pending_cancel window) and
+                    // only then flips terminal Canceled. While the cancel is
+                    // pending the fill machinery stays suspended -- the real
+                    // venue does not fill an order in pending_cancel.
+                    if let Some(remaining) = order.pending_cancel_polls_remaining {
+                        cancel_pending = true;
+                        if remaining == 0 {
+                            order.status = OrderStatus::Canceled;
+                            order.pending_cancel_polls_remaining = None;
+                        } else {
+                            order.pending_cancel_polls_remaining = Some(remaining - 1);
+                        }
+                    }
                 }
 
-                if let Err(error) = advance_polled_order(&mut state, &order_id) {
+                if !cancel_pending && let Err(error) = advance_polled_order(&mut state, &order_id) {
                     return json_response(500, &json!({"message": error.to_string()}));
                 }
 
@@ -2364,7 +2626,7 @@ mod tests {
     use std::time::Duration;
 
     use alloy::primitives::{Address, U256};
-    use chrono::{NaiveTime, TimeZone, Utc};
+    use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
     use chrono_tz::America::New_York;
     use uuid::Uuid;
 
@@ -2372,7 +2634,8 @@ mod tests {
 
     use super::{
         AlpacaBrokerMock, MockAccount, MockMode, MockPosition, MockState, OrderSide, OrderSizing,
-        TEST_ACCOUNT_ID, TEST_API_KEY, TEST_API_SECRET, format_u256_as_usdc, handle_crypto_order,
+        TEST_ACCOUNT_ID, TEST_API_KEY, TEST_API_SECRET, format_u256_as_usdc, friday_close_calendar,
+        half_day_calendar, handle_crypto_order, holiday_eve_calendar, overnight_weeknight_calendar,
     };
     use crate::alpaca_broker_api::auth::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
@@ -2711,6 +2974,319 @@ mod tests {
     /// simulated PnL report classifies non-zero Alpaca fees instead of
     /// rendering every broker cost bucket as `not_ingested`.
     #[tokio::test]
+    async fn overnight_contract_enforcement_gates_order_shape() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![(symbol, float!(150))])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        mock.set_overnight_contract_enforcement(true);
+
+        let client = reqwest::Client::new();
+        let orders_url = format!(
+            "{}/v1/trading/accounts/{TEST_ACCOUNT_ID}/orders",
+            mock.base_url()
+        );
+
+        // A market-shaped order (no type/tif/extended_hours) violates the
+        // overnight contract and is refused like the real venue refuses it.
+        let rejected = client
+            .post(&orders_url)
+            .json(&serde_json::json!({
+                "symbol": "AAPL",
+                "qty": "1",
+                "side": "buy",
+                "client_order_id": "ovn-market",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status().as_u16(), 422);
+        let body: serde_json::Value = rejected.json().await.unwrap();
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("limit day orders"),
+            "the refusal must name the contract, got: {body}"
+        );
+
+        // The overnight contract shape passes.
+        let accepted = client
+            .post(&orders_url)
+            .json(&serde_json::json!({
+                "symbol": "AAPL",
+                "qty": "1",
+                "side": "buy",
+                "type": "limit",
+                "time_in_force": "day",
+                "extended_hours": true,
+                "limit_price": "150.25",
+                "client_order_id": "ovn-limit",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(accepted.status().as_u16(), 200);
+
+        // Enforcement off: the market-shaped order is accepted again.
+        mock.set_overnight_contract_enforcement(false);
+        let market_ok = client
+            .post(&orders_url)
+            .json(&serde_json::json!({
+                "symbol": "AAPL",
+                "qty": "1",
+                "side": "buy",
+                "client_order_id": "ovn-market-2",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(market_ok.status().as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn consecutive_sell_guard_blocks_until_the_live_sell_cancels() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![(symbol, float!(150))])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        mock.set_consecutive_sell_guard(true);
+
+        let client = reqwest::Client::new();
+        let orders_url = format!(
+            "{}/v1/trading/accounts/{TEST_ACCOUNT_ID}/orders",
+            mock.base_url()
+        );
+
+        let first: serde_json::Value = client
+            .post(&orders_url)
+            .json(&serde_json::json!({
+                "symbol": "AAPL",
+                "qty": "1",
+                "side": "sell",
+                "client_order_id": "sell-1",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let first_id = first["id"].as_str().unwrap().to_string();
+
+        // A second sell while the first is live races the net-short guard.
+        let blocked = client
+            .post(&orders_url)
+            .json(&serde_json::json!({
+                "symbol": "AAPL",
+                "qty": "1",
+                "side": "sell",
+                "client_order_id": "sell-2",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(blocked.status().as_u16(), 422);
+        let body: serde_json::Value = blocked.json().await.unwrap();
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("open closing position orders"),
+            "the guard must use the phrase the ConsecutiveSellPending detector greps, got: {body}"
+        );
+
+        // The cancellation settles; the replacement sell is accepted.
+        let cancelled = client
+            .delete(format!("{orders_url}/{first_id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status().as_u16(), 204);
+
+        let retried = client
+            .post(&orders_url)
+            .json(&serde_json::json!({
+                "symbol": "AAPL",
+                "qty": "1",
+                "side": "sell",
+                "client_order_id": "sell-3",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(retried.status().as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn cancel_settles_only_after_the_configured_polls() {
+        // The real venue's pending_cancel window: the DELETE succeeds, but
+        // the order keeps reporting its live status -- and keeps blocking
+        // the net-short guard -- until the poller has observed it the
+        // configured number of times.
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![(symbol, float!(150))])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        mock.set_consecutive_sell_guard(true);
+        mock.set_cancel_settle_polls(1);
+
+        let client = reqwest::Client::new();
+        let orders_url = format!(
+            "{}/v1/trading/accounts/{TEST_ACCOUNT_ID}/orders",
+            mock.base_url()
+        );
+
+        let first: serde_json::Value = client
+            .post(&orders_url)
+            .json(&serde_json::json!({
+                "symbol": "AAPL",
+                "qty": "1",
+                "side": "sell",
+                "client_order_id": "pending-sell-1",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let first_id = first["id"].as_str().unwrap().to_string();
+
+        let cancelled = client
+            .delete(format!("{orders_url}/{first_id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status().as_u16(), 204);
+
+        // The cancellation has not settled: a replacement sell still races
+        // the guard, exactly the window RAI-1948's ConsecutiveSellPending
+        // classification exists for.
+        let blocked = client
+            .post(&orders_url)
+            .json(&serde_json::json!({
+                "symbol": "AAPL",
+                "qty": "1",
+                "side": "sell",
+                "client_order_id": "pending-sell-2",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(blocked.status().as_u16(), 422);
+
+        // First poll: still live (the pending window), second poll settles.
+        let status_url = format!("{orders_url}/{first_id}");
+        let first_poll: serde_json::Value = client
+            .get(&status_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(first_poll["status"], serde_json::json!("new"));
+        let second_poll: serde_json::Value = client
+            .get(&status_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(second_poll["status"], serde_json::json!("canceled"));
+
+        // Settled: the replacement sell is accepted.
+        let retried = client
+            .post(&orders_url)
+            .json(&serde_json::json!({
+                "symbol": "AAPL",
+                "qty": "1",
+                "side": "sell",
+                "client_order_id": "pending-sell-3",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(retried.status().as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn overnight_quote_failures_answer_then_recover() {
+        let symbol = Symbol::new("RKLB").unwrap();
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        mock.set_overnight_quote(
+            symbol,
+            serde_json::json!({
+                "t": "2026-09-02T01:30:00Z",
+                "bp": "24.10",
+                "ap": "24.30"
+            }),
+        );
+        mock.set_overnight_quote_failures(2, 429);
+
+        let client = reqwest::Client::new();
+        let quote_url = format!(
+            "{}/v2/stocks/RKLB/quotes/latest?feed=overnight",
+            mock.base_url()
+        );
+
+        for _ in 0..2 {
+            let failed = client.get(&quote_url).send().await.unwrap();
+            assert_eq!(failed.status().as_u16(), 429);
+        }
+
+        let recovered = client.get(&quote_url).send().await.unwrap();
+        assert_eq!(recovered.status().as_u16(), 200);
+        let body: serde_json::Value = recovered.json().await.unwrap();
+        assert_eq!(body["quote"]["ap"], serde_json::json!("24.30"));
+    }
+
+    #[test]
+    fn calendar_scenario_constructors_shape_the_gap() {
+        let monday = NaiveDate::from_ymd_opt(2026, 9, 7).unwrap();
+
+        let weeknight = overnight_weeknight_calendar(monday);
+        assert_eq!(weeknight.len(), 2);
+        assert_eq!(weeknight[0].date, "2026-09-07");
+        assert_eq!(weeknight[1].date, "2026-09-08");
+        assert_eq!(weeknight[0].session_close, "20:00");
+
+        let friday = NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+        let friday_entries = friday_close_calendar(friday);
+        assert_eq!(
+            friday_entries[1].date, "2026-09-14",
+            "next trading day is Monday"
+        );
+
+        let eve = NaiveDate::from_ymd_opt(2026, 11, 25).unwrap();
+        let eve_entries = holiday_eve_calendar(eve);
+        assert_eq!(
+            eve_entries[1].date, "2026-11-27",
+            "the holiday itself never trades"
+        );
+
+        let half = NaiveDate::from_ymd_opt(2026, 12, 24).unwrap();
+        let ordinary_half = half_day_calendar(half, true);
+        assert_eq!(ordinary_half[0].close, "13:00");
+        assert_eq!(ordinary_half[0].session_close, "17:00");
+        assert_eq!(ordinary_half[1].date, "2026-12-25");
+        let holiday_half = half_day_calendar(half, false);
+        assert_eq!(holiday_half[1].date, "2026-12-26");
+    }
+
+    #[tokio::test]
     async fn fill_records_a_fee_activity() {
         let symbol = Symbol::new("AAPL").unwrap();
         let mock = AlpacaBrokerMock::start()
@@ -2989,6 +3565,11 @@ mod tests {
             activities: vec![],
             overnight_quotes: HashMap::new(),
             overnight_feed_forbidden: false,
+            overnight_quote_failures_remaining: 0,
+            overnight_quote_failure_status: 503,
+            overnight_contract_enforcement: false,
+            consecutive_sell_guard: false,
+            cancel_settle_polls: 0,
             asset_payload_overrides: HashMap::new(),
         };
 
@@ -3041,6 +3622,11 @@ mod tests {
             activities: vec![],
             overnight_quotes: HashMap::new(),
             overnight_feed_forbidden: false,
+            overnight_quote_failures_remaining: 0,
+            overnight_quote_failure_status: 503,
+            overnight_contract_enforcement: false,
+            consecutive_sell_guard: false,
+            cancel_settle_polls: 0,
             asset_payload_overrides: HashMap::new(),
         };
 
@@ -3100,6 +3686,11 @@ mod tests {
             activities: vec![],
             overnight_quotes: HashMap::new(),
             overnight_feed_forbidden: false,
+            overnight_quote_failures_remaining: 0,
+            overnight_quote_failure_status: 503,
+            overnight_contract_enforcement: false,
+            consecutive_sell_guard: false,
+            cancel_settle_polls: 0,
             asset_payload_overrides: HashMap::new(),
         };
 
@@ -3191,6 +3782,11 @@ mod tests {
             activities: vec![],
             overnight_quotes: HashMap::new(),
             overnight_feed_forbidden: false,
+            overnight_quote_failures_remaining: 0,
+            overnight_quote_failure_status: 503,
+            overnight_contract_enforcement: false,
+            consecutive_sell_guard: false,
+            cancel_settle_polls: 0,
             asset_payload_overrides: HashMap::new(),
         };
 
@@ -3241,6 +3837,11 @@ mod tests {
             activities: vec![],
             overnight_quotes: HashMap::new(),
             overnight_feed_forbidden: false,
+            overnight_quote_failures_remaining: 0,
+            overnight_quote_failure_status: 503,
+            overnight_contract_enforcement: false,
+            consecutive_sell_guard: false,
+            cancel_settle_polls: 0,
             asset_payload_overrides: HashMap::new(),
         };
 
