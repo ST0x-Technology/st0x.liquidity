@@ -41,9 +41,11 @@ mod market_hours;
 mod mock_api;
 #[cfg(feature = "mock")]
 pub use mock_api::{
-    AlpacaBrokerMock, MockMode, MockOrderSnapshot, MockPosition, MockPositionSnapshot,
-    MockWalletTransferSnapshot, OrderSide, OrderStatus, TEST_ACCOUNT_ID, TEST_API_KEY,
-    TEST_API_SECRET, TransferDirection, TransferFlow, TransferStatus, WhitelistStatus,
+    AlpacaBrokerMock, CalendarEntry, MockMode, MockOrderSnapshot, MockPosition,
+    MockPositionSnapshot, MockWalletTransferSnapshot, OrderSide, OrderStatus, TEST_ACCOUNT_ID,
+    TEST_API_KEY, TEST_API_SECRET, TransferDirection, TransferFlow, TransferStatus,
+    WhitelistStatus, friday_close_calendar, half_day_calendar, holiday_eve_calendar,
+    overnight_weeknight_calendar,
 };
 mod order;
 mod overnight_eligibility;
