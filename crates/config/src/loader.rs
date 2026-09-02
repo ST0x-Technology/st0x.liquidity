@@ -234,6 +234,7 @@ struct Config {
     /// Non-secret issuance settings (`base_url`). The issuance `api_key`
     /// stays in the secrets file.
     issuance: Option<IssuanceConfig>,
+    ops_api: Option<OpsApiConfig>,
     /// ETH/USD valuation source for bot-gas cost recording. See
     /// [`Ctx::bot_gas_valuation`] for when this is required.
     bot_gas_valuation: Option<BotGasValuationConfig>,
@@ -352,6 +353,27 @@ impl std::fmt::Debug for IssuanceStatusCtx {
             .field("api_key", &self.api_key)
             .finish()
     }
+}
+
+/// IAP audiences for the role-gated ops API paths.
+///
+/// Each audience names the load balancer backend service that fronts one role
+/// prefix (`terraform/staging-liquidity/ops-api-iap.tf`, published as the
+/// `ops_api_audiences` output). IAP binds the token it mints to the backend
+/// that admitted the caller, so pinning the audience per prefix is what makes
+/// a read-tier token useless against the write path.
+///
+/// Not a secret: these name IAM-gated backends and are worthless without an
+/// identity Google will sign for. Absent from config means the role-gated
+/// routes are not mounted at all, which is the correct posture for any
+/// deployment that has no load balancer in front of it.
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OpsApiConfig {
+    /// Audience of the backend serving `/liquidity-read/*`.
+    pub read_audience: String,
+    /// Audience of the backend serving `/liquidity-write/*`.
+    pub write_audience: String,
 }
 
 /// Combined REST API runtime context assembled from config + secrets.
@@ -728,6 +750,9 @@ pub struct Ctx {
     pub assets: HedgingAssets,
     pub travel_rule: Option<TravelRuleConfig>,
     pub rest_api: Option<RestApiCtx>,
+    /// IAP audiences per ops-API role. `None` leaves the role-gated routes
+    /// unmounted.
+    pub ops_api: Option<OpsApiConfig>,
     pub issuance: IssuanceStatusCtx,
     /// Alpaca redemption wallet from `[chains.<name>.trading].redemption_wallet`.
     /// `Some` when the config includes a `[chains.<name>.trading].redemption_wallet` section.
@@ -1219,6 +1244,7 @@ impl std::fmt::Debug for Ctx {
             .field("travel_rule_configured", &self.travel_rule.is_some())
             .field("redemption_wallet", &self.redemption_wallet)
             .field("rest_api", &self.rest_api)
+            .field("ops_api", &self.ops_api)
             .field("issuance", &self.issuance)
             .field("bot_gas_valuation", &self.bot_gas_valuation)
             .field("orchestrator", &self.orchestrator);
@@ -1340,6 +1366,7 @@ struct ValidatedParts {
     assets: HedgingAssets,
     travel_rule: Option<TravelRuleConfig>,
     rest_api: Option<RestApiCtx>,
+    ops_api: Option<OpsApiConfig>,
     issuance: IssuanceStatusCtx,
     redemption_wallet: Option<Address>,
     bot_gas_valuation: Option<BotGasValuationConfig>,
@@ -1571,6 +1598,29 @@ fn parse_and_validate(
         });
     }
 
+    // The audiences are what keep the read and write tiers apart: each role
+    // prefix's verifier pins the audience IAP minted for that prefix's
+    // backend. Equal (or blank) audiences would make a read-tier assertion
+    // verify on the write path, silently collapsing the tiers, so a config
+    // that says that is refused outright.
+    if let Some(ops_api) = &config.ops_api {
+        if ops_api.read_audience.trim().is_empty() || ops_api.write_audience.trim().is_empty() {
+            return Err(CtxError::OpsApiAudienceBlank);
+        }
+        // The verifier pins the audience byte for byte (jsonwebtoken compares
+        // `aud` exactly), so a copy-pasted trailing space would pass a
+        // trimmed-only validation here and then 401 every real token at
+        // runtime with no startup signal. Refuse padding outright.
+        if ops_api.read_audience.trim() != ops_api.read_audience
+            || ops_api.write_audience.trim() != ops_api.write_audience
+        {
+            return Err(CtxError::OpsApiAudiencePadded);
+        }
+        if ops_api.read_audience == ops_api.write_audience {
+            return Err(CtxError::OpsApiAudiencesEqual);
+        }
+    }
+
     validate_asset_tables(&config.assets, &config.chains)?;
     let polling_intervals = validated_polling_intervals(&config)?;
 
@@ -1733,6 +1783,7 @@ fn parse_and_validate(
             })
             .transpose()?,
         issuance: issuance_ctx(config.issuance, secrets.issuance, &mut startup_notices)?,
+        ops_api: config.ops_api,
         startup_notices,
         redemption_wallet,
         bot_gas_valuation: config.bot_gas_valuation,
@@ -1900,6 +1951,7 @@ impl Ctx {
             assets: parts.assets,
             travel_rule: parts.travel_rule,
             rest_api: parts.rest_api,
+            ops_api: parts.ops_api,
             issuance: parts.issuance,
             redemption_wallet: parts.redemption_wallet,
             bot_gas_valuation: parts.bot_gas_valuation,
@@ -2103,6 +2155,7 @@ impl Ctx {
         execution_threshold_override: Option<ExecutionThreshold>,
         travel_rule: Option<TravelRuleConfig>,
         rest_api: Option<RestApiCtx>,
+        ops_api: Option<OpsApiConfig>,
         #[builder(default = create_test_issuance_ctx())] issuance: IssuanceStatusCtx,
         redemption_wallet: Option<Address>,
         bot_gas_valuation: Option<BotGasValuationConfig>,
@@ -2203,6 +2256,7 @@ impl Ctx {
             assets: hedging,
             travel_rule,
             rest_api,
+            ops_api,
             issuance,
             redemption_wallet,
             bot_gas_valuation,
@@ -2219,6 +2273,22 @@ pub enum CtxError {
     Pricing(#[from] PricingCtxError),
     #[error("log_query_url_template must contain the {{id}} placeholder")]
     LogQueryUrlTemplateMissingIdPlaceholder,
+    #[error(
+        "[ops_api] audiences must not be blank: each role prefix's verifier pins the \
+         audience IAP mints for that prefix's backend, and a blank pin verifies nothing"
+    )]
+    OpsApiAudienceBlank,
+    #[error(
+        "[ops_api] audiences must not carry leading or trailing whitespace: the verifier \
+         pins the audience byte for byte, so a padded value would reject every real IAP \
+         token at runtime instead of failing here"
+    )]
+    OpsApiAudiencePadded,
+    #[error(
+        "[ops_api] read_audience and write_audience must differ: equal audiences let a \
+         read-tier IAP assertion pass the write verifier, collapsing the role tiers"
+    )]
+    OpsApiAudiencesEqual,
     #[error(
         "[broker] type = \"alpaca-broker-api-kms\" requires mode = \"production\": the \
          keyless token mint targets the live authx.alpaca.markets endpoint, so a sandbox or \
@@ -2520,6 +2590,9 @@ impl CtxError {
                 "log_query_url_template missing {id} placeholder"
             }
             Self::LogQueryUrlTemplateNotAUrl { .. } => "log_query_url_template is not a valid URL",
+            Self::OpsApiAudienceBlank => "[ops_api] audience is blank",
+            Self::OpsApiAudiencePadded => "[ops_api] audience has surrounding whitespace",
+            Self::OpsApiAudiencesEqual => "[ops_api] audiences are equal",
         }
     }
 }
@@ -2651,6 +2724,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         assets: HedgingAssets::default(),
         travel_rule: None,
         rest_api: None,
+        ops_api: None,
         issuance: create_test_issuance_ctx(),
         redemption_wallet: None,
         bot_gas_valuation: None,
@@ -4332,6 +4406,81 @@ mod tests {
             matches!(error, CtxError::ServerAndBoardPortsMatch { port: 8080 }),
             "expected ServerAndBoardPortsMatch for equal ports, got: {error:#}"
         );
+    }
+
+    /// Equal audiences would let a read-tier IAP assertion pass the write
+    /// verifier, and a blank audience pins nothing at all -- both are refused
+    /// at load so the collapse cannot reach the verifiers.
+    #[tokio::test]
+    async fn ops_api_audiences_must_differ_and_be_non_blank() {
+        for (read, write, expect) in [
+            (
+                "/projects/1/global/backendServices/11",
+                "/projects/1/global/backendServices/11",
+                "equal",
+            ),
+            ("", "/projects/1/global/backendServices/22", "blank"),
+            ("/projects/1/global/backendServices/11", "  ", "blank"),
+            (
+                "/projects/1/global/backendServices/11",
+                "/projects/1/global/backendServices/22 ",
+                "padded",
+            ),
+        ] {
+            let config = toml_file(&format!(
+                r#"
+                database_url = ":memory:"
+                server_port = 8080
+                board_port = 8081
+                apalis_finished_job_cleanup_interval_secs = 3600
+                inventory_divergence_threshold = 10
+                hedge_order_gate_reconciliation_timeout_secs = 10
+
+                [ops_api]
+                read_audience = "{read}"
+                write_audience = "{write}"
+
+                [chains.base.trading.assets.equities]
+
+                [chains.base]
+                lifecycle = "active"
+                required_confirmations = 3
+
+                [chains.base.trading]
+                orderbook = "0x1111111111111111111111111111111111111111"
+                inventory_mode = "managed"
+                inventory_adapters = []
+                inventory = "0x2222222222222222222222222222222222222222"
+                vault_owner = "0x3333333333333333333333333333333333333333"
+                deployment_block = 1
+                ingestion_cutoff = "safe"
+
+                [chains.ethereum]
+                lifecycle = "active"
+                required_confirmations = 12
+
+                [chains.hyperevm]
+                lifecycle = "observe-only"
+                required_confirmations = 1
+
+                [wallet]
+                kind = "private-key"
+                address = "0x0000000000000000000000000000000000000001"
+            "#
+            ));
+            let secrets = dry_run_secrets_toml();
+            let error = Ctx::load_files(config.path(), secrets.path())
+                .await
+                .unwrap_err();
+
+            let matched = match expect {
+                "equal" => matches!(error, CtxError::OpsApiAudiencesEqual),
+                "blank" => matches!(error, CtxError::OpsApiAudienceBlank),
+                "padded" => matches!(error, CtxError::OpsApiAudiencePadded),
+                other => unreachable!("unknown expectation {other}"),
+            };
+            assert!(matched, "expected {expect} audience error, got: {error:#}");
+        }
     }
 
     #[tokio::test]

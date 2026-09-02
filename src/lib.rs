@@ -51,6 +51,7 @@ pub mod cli;
 mod conductor;
 pub(crate) mod dashboard;
 mod equity_redemption;
+mod iap_auth;
 mod inventory;
 mod issuance;
 pub(crate) mod metrics;
@@ -447,6 +448,25 @@ impl Drop for SessionTaskGuard {
     }
 }
 
+/// Serves a router recording each connection's peer address, so the
+/// loopback-only guard on the operator mutation paths (api.rs
+/// `require_loopback`) can tell the in-container CLI from a caller that came
+/// over the published port. EVERY serve path for the main router must go
+/// through this function: a plain `axum::serve(listener, router)` leaves
+/// `ConnectInfo` unset and the guard fails closed, silently 403ing the CLI's
+/// resume/recheck verbs. `real_listener_supplies_peer_info` in api.rs pins
+/// this wiring with a real socket.
+pub(crate) async fn serve_with_peer_info(
+    listener: TcpListener,
+    router: Router,
+) -> std::io::Result<()> {
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+}
+
 /// Long-running axum HTTP server, supervised so a bind/serve failure
 /// doesn't silently take the API and dashboard down for the rest of
 /// the bot's lifetime.
@@ -479,7 +499,7 @@ impl SupervisedTask for ServerTask {
         let router = self.router.clone();
         self.startup_token
             .clone()
-            .wrap(async move { axum::serve(listener, router).await })
+            .wrap(serve_with_peer_info(listener, router))
             .await?;
         Err("axum server exited unexpectedly".into())
     }
@@ -493,8 +513,11 @@ fn spawn_server_supervisor(
     main_startup_token: startup::StartupToken,
     board_startup_token: startup::StartupToken,
 ) -> SupervisorHandle {
+    // Read before `state` moves into the router below.
+    let ops_api = state.ctx.ops_api.clone();
+
     let main_router = Router::new()
-        .merge(api::routes())
+        .merge(api::routes(ops_api.as_ref()))
         .nest("/api", dashboard::routes())
         .route("/metrics", axum::routing::get(metrics::endpoint))
         .with_state(state);

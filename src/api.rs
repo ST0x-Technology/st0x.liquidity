@@ -8,15 +8,18 @@ use std::time::Duration;
 use alloy::primitives::U256;
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::StatusCode;
+use axum::http::header::{CACHE_CONTROL, HeaderName};
+use axum::middleware::Next;
+use axum::response::Response;
 use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use st0x_config::BrokerCtx;
+use st0x_config::{BrokerCtx, OpsApiConfig};
 use st0x_dto::{
     EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, TradingVenue,
 };
@@ -33,6 +36,7 @@ use crate::dashboard::pnl::{
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
 use crate::dashboard::{TradePage, TradeProtocol, TradeQuery, query_trades};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
+use crate::iap_auth::{IapVerifier, require_iap};
 use crate::performance::equity_timing::load_equity_timings;
 use crate::performance::infra::{load_dependency_stats, load_monitor_telemetry};
 use crate::performance::rebalance::load_rebalance_timings;
@@ -1277,7 +1281,13 @@ struct InterruptedTransfersResponse {
 
 async fn interrupted_transfers(
     State(state): State<AppState>,
-) -> Result<Json<InterruptedTransfersResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<
+    (
+        [(HeaderName, &'static str); 1],
+        Json<InterruptedTransfersResponse>,
+    ),
+    (StatusCode, Json<ErrorResponse>),
+> {
     let mints = crate::tokenized_equity_mint::interrupted_mint_ids(&state.pool)
         .await
         .map_err(|error| {
@@ -1302,10 +1312,13 @@ async fn interrupted_transfers(
             )
         })?;
 
-    Ok(Json(InterruptedTransfersResponse {
-        interrupted_mints: mints.into_iter().map(|id| id.to_string()).collect(),
-        interrupted_redemptions: redemptions.into_iter().map(|id| id.to_string()).collect(),
-    }))
+    Ok((
+        [(CACHE_CONTROL, "no-store")],
+        Json(InterruptedTransfersResponse {
+            interrupted_mints: mints.into_iter().map(|id| id.to_string()).collect(),
+            interrupted_redemptions: redemptions.into_iter().map(|id| id.to_string()).collect(),
+        }),
+    ))
 }
 
 /// Wire contract for `/transfers/resume`, shared with the CLI wrapper so the
@@ -1412,10 +1425,11 @@ struct RecheckResponse {
 /// reactor-wired store; shares `resume_lock` with `/transfers/resume` so the
 /// two cannot race onchain wraps.
 ///
-/// TODO(auth): like `/transfers/resume`, this mutation endpoint is currently
-/// unauthenticated. The `/transfers/*` mutation endpoints need an auth guard
-/// before the listener is exposed beyond the operator network -- tracked as a
-/// follow-up. Until then, deployment must keep the bind address firewalled.
+/// Auth: reachable on two mounts with two different gates. The bare mount is
+/// loopback-only (`require_loopback`) -- the in-container `st0x-cli` path --
+/// and the `/liquidity-write` mount is IAP-verified for operators coming
+/// through the load balancer. No unauthenticated network route to the
+/// mutation endpoints remains.
 async fn recheck_transfer(
     State(state): State<AppState>,
     Path((kind_str, id)): Path<(String, String)>,
@@ -1687,8 +1701,132 @@ async fn performance_infra(
     }))
 }
 
-pub(crate) fn routes() -> Router<AppState> {
+/// The role-gated ops API: the same handlers the dashboard routes use, mounted
+/// under a prefix the load balancer routes to a role-specific IAP backend.
+///
+/// The prefix is the role. The URL map sends `/liquidity-read/*` and
+/// `/liquidity-write/*` to different backend services, each with its own IAP
+/// policy bound to a Workspace group, so who may call which prefix is group
+/// membership. The middleware here re-checks the assertion and pins the
+/// audience per prefix, which is what stops a read-tier token being replayed
+/// against the write path and what refuses a caller who reached the VM from
+/// inside the VPC without passing IAP at all.
+///
+/// Returns nothing when no audiences are configured: a deployment with no load
+/// balancer in front of it must not expose these paths, and unmounting them is
+/// a stronger guarantee than serving a 401.
+fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
+    let Some(ops_api) = ops_api else {
+        return Router::new();
+    };
+
+    // One HTTP client shared by both verifiers (reqwest::Client clones are
+    // Arc clones): both fetch the same Google JWKS document. The timeouts
+    // are load-bearing, not hygiene -- the verifier's refresh slot is held
+    // for the duration of a fetch, so an unbounded request during a Google
+    // outage would pin it. 10s matches the kms_jwt convention.
+    // Static timeouts on the default TLS backend -- build cannot fail here.
+    #[allow(clippy::expect_used)]
+    let jwks_http = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("static client config cannot fail");
+    let read_verifier = Arc::new(IapVerifier::new(
+        &ops_api.read_audience,
+        "read",
+        jwks_http.clone(),
+    ));
+    let write_verifier = Arc::new(IapVerifier::new(
+        &ops_api.write_audience,
+        "write",
+        jwks_http,
+    ));
+
+    let read = Router::new()
+        .route(
+            "/liquidity-read/transfers/interrupted",
+            get(interrupted_transfers),
+        )
+        .layer(axum::middleware::from_fn(move |request, next| {
+            let verifier = Arc::clone(&read_verifier);
+            async move { require_iap(verifier, request, next).await }
+        }));
+
+    // `recheck` re-drives a transfer and completes it if the provider has
+    // settled it, and `resume` re-drives EVERY interrupted transfer: both
+    // move real state and belong to the narrower group. Resume must be here
+    // because the bare mounts below are loopback-only -- without this mount,
+    // bulk resume would have no network route at all and an incident with
+    // SSH unavailable could not recover interrupted transfers.
+    let write = Router::new()
+        .route(
+            "/liquidity-write/transfers/recheck/{kind}/{id}",
+            post(recheck_transfer),
+        )
+        .route("/liquidity-write/transfers/resume", post(resume_transfers))
+        .layer(axum::middleware::from_fn(move |request, next| {
+            let verifier = Arc::clone(&write_verifier);
+            async move { require_iap(verifier, request, next).await }
+        }));
+
+    read.merge(write)
+}
+
+/// Refuses any request whose TCP peer is not loopback.
+///
+/// The `/transfers/*` mutation endpoints exist on their bare paths for exactly
+/// one caller: `st0x-cli` running inside the bot's own container (`docker
+/// exec`), whose resume/recheck verbs delegate to the running server so
+/// recovery dispatches through the in-process reactor. That caller connects to
+/// 127.0.0.1 inside the container's network namespace. Anything arriving over
+/// the published port -- the VPC, an IAP tunnel, the load balancer -- reaches
+/// the container through its bridge interface and carries a non-loopback peer,
+/// so it is refused here and must use the IAP-verified `/liquidity-write`
+/// mount instead. A request with no recorded peer address is refused too:
+/// fail closed rather than guess.
+async fn require_loopback(
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let peer_is_loopback = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .is_some_and(|info| info.0.ip().is_loopback());
+
+    if !peer_is_loopback {
+        warn!(
+            target: "api",
+            path = %request.uri().path(),
+            "Refusing non-loopback caller on an operator-only mutation path"
+        );
+        // Same JSON error shape as the handlers this guard fronts, so ops
+        // tooling parses one contract for the whole route family.
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "operator-only path: use the in-container CLI or the \
+                        /liquidity-write mount"
+                    .to_string(),
+            }),
+        ));
+    }
+
+    Ok(next.run(request).await)
+}
+
+pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
+    // The operator socket: mutation endpoints for the in-container CLI only.
+    // The IAP-gated `/liquidity-write` mount is the network route to the same
+    // handlers.
+    let loopback_only = Router::new()
+        .route("/transfers/resume", post(resume_transfers))
+        .route("/transfers/recheck/{kind}/{id}", post(recheck_transfer))
+        .route_layer(axum::middleware::from_fn(require_loopback));
+
     Router::new()
+        .merge(ops_api_routes(ops_api))
+        .merge(loopback_only)
         .route("/health", get(health))
         .route("/performance/latencies", get(performance_latencies))
         .route("/performance/rebalances", get(performance_rebalances))
@@ -1710,16 +1848,16 @@ pub(crate) fn routes() -> Router<AppState> {
         )
         .route("/orders/raindex", get(raindex_orders))
         .route("/transfers/interrupted", get(interrupted_transfers))
-        .route("/transfers/resume", post(resume_transfers))
-        .route("/transfers/recheck/{kind}/{id}", post(recheck_transfer))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
     use std::sync::Arc;
 
     use alloy::primitives::{Address, TxHash};
     use axum::body::{Body, to_bytes};
+    use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
     use chrono::{NaiveDate, TimeZone};
     use chrono_tz::America::New_York;
@@ -2753,7 +2891,7 @@ mod tests {
     }
 
     fn build_app(state: AppState) -> Router {
-        routes().with_state(state)
+        routes(None).with_state(state)
     }
 
     async fn body_to_string(response: axum::response::Response) -> String {
@@ -4280,6 +4418,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store"
+        );
 
         let body = body_to_string(response).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4298,6 +4443,9 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/transfers/resume")
+                    // The operator socket: tests stand in for the
+                    // in-container CLI, which connects from loopback.
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -4324,6 +4472,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/transfers/recheck/equity_mint/some-id")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -4338,6 +4487,126 @@ mod tests {
             parsed["error"],
             "Recovery not ready yet (conductor still starting)"
         );
+    }
+
+    /// The bare mutation mounts exist for the in-container CLI alone. A
+    /// caller that arrived over the published port carries the bridge
+    /// interface's peer address, and one with no recorded peer at all is
+    /// indistinguishable from that -- both must be refused before the handler
+    /// runs.
+    #[tokio::test]
+    async fn refuses_mutation_paths_to_non_loopback_callers() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        for (peer, label) in [
+            (
+                Some(ConnectInfo(SocketAddr::from(([172, 18, 0, 1], 9)))),
+                "bridge peer",
+            ),
+            (None, "no recorded peer"),
+        ] {
+            let mut request = Request::builder().method("POST").uri("/transfers/resume");
+            if let Some(info) = peer {
+                request = request.extension(info);
+            }
+
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{label}");
+        }
+    }
+
+    /// Pins the production serve wiring: `serve_with_peer_info` must record
+    /// the TCP peer, or the loopback gate fails closed and the in-container
+    /// CLI's recovery verbs 403 in production while every hand-injected
+    /// ConnectInfo test stays green. This is the one test that goes through a
+    /// real socket instead of injecting the extension.
+    #[tokio::test]
+    async fn real_listener_supplies_peer_info_to_the_loopback_gate() {
+        let app = axum::Router::new()
+            .route("/op", axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(require_loopback));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("ephemeral port binds");
+        let addr = listener.local_addr().expect("bound socket has an address");
+        tokio::spawn(crate::serve_with_peer_info(listener, app));
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/op"))
+            .send()
+            .await
+            .expect("server reachable");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+
+    /// `routes(None)` must leave the role prefixes unmounted entirely: a
+    /// deployment with no load balancer serves 404, never a 401 that suggests
+    /// the path exists and wants credentials.
+    #[tokio::test]
+    async fn role_prefixes_are_unmounted_without_ops_api_config() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        for (method, uri) in [
+            ("GET", "/liquidity-read/transfers/interrupted"),
+            ("POST", "/liquidity-write/transfers/recheck/equity_mint/x"),
+            ("POST", "/liquidity-write/transfers/resume"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+    }
+
+    /// With audiences configured the role prefixes ARE mounted, and a request
+    /// without an IAP assertion is refused by the middleware (401), not lost
+    /// to routing (404).
+    #[tokio::test]
+    async fn role_prefixes_demand_iap_when_configured() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let ops_api = st0x_config::OpsApiConfig {
+            read_audience: "/projects/1/global/backendServices/11".to_string(),
+            write_audience: "/projects/1/global/backendServices/22".to_string(),
+        };
+        let app = routes(Some(&ops_api)).with_state(empty_app_state(ctx).await);
+
+        for (method, uri) in [
+            ("GET", "/liquidity-read/transfers/interrupted"),
+            ("POST", "/liquidity-write/transfers/recheck/equity_mint/x"),
+            ("POST", "/liquidity-write/transfers/resume"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
     }
 
     #[test]
