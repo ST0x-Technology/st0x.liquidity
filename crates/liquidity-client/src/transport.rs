@@ -43,7 +43,7 @@ impl std::fmt::Display for TransportError {
             }
             Self::Unauthorized(body) => write!(
                 formatter,
-                "HTTP 401 Unauthorized: the T0 Google identity was missing, expired, or invalid.\nRefresh the T0 login (gcloud auth login) or, in CI, the T0 workload identity, then retry.{}",
+                "HTTP 401 Unauthorized: the T0 Google identity was missing, expired, or invalid.\nRe-run the command and complete the browser sign-in, or delete the cached refresh token, then retry.{}",
                 server_said(body)
             ),
             Self::Forbidden(body) => write!(
@@ -82,13 +82,12 @@ const READ_PREFIX: &str = "/liquidity-read";
 const WRITE_PREFIX: &str = "/liquidity-write";
 
 /// Thin HTTP wrapper over the liquidity bot ops API. Holds no domain logic: it
-/// mints the token for the role, builds the request under the role prefix,
+/// attaches the role's bearer token, builds the request under the role prefix,
 /// sends it, and returns the decoded JSON or a mapped error.
 ///
-/// Reads go to `/liquidity-read/*` with a token minted for the read audience;
-/// writes go to `/liquidity-write/*` with a token minted for the write
-/// audience. IAP admits each prefix per Workspace group and the bot pins the
-/// audience, so a read-audience token presented to the write path is rejected.
+/// Reads go to `/liquidity-read/*` and writes to `/liquidity-write/*`. In the
+/// shipped desktop OAuth flow both roles carry the same token; IAP admits each
+/// prefix by the caller's Workspace group.
 pub struct Client<A> {
     http: reqwest::Client,
     base_url: Url,
