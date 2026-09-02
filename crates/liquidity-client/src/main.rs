@@ -195,9 +195,15 @@ mod tests {
         let (sender, receiver) = channel();
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = Vec::new();
                 let mut buffer = [0u8; 4096];
-                let read = stream.read(&mut buffer).unwrap_or(0);
-                let _ = sender.send(String::from_utf8_lossy(&buffer[..read]).into_owned());
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => request.extend_from_slice(&buffer[..count]),
+                    }
+                }
+                let _ = sender.send(String::from_utf8_lossy(&request).into_owned());
                 let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
                 let _ = stream.write_all(response.as_bytes());
             }
@@ -321,7 +327,12 @@ mod tests {
     #[test]
     fn exit_code_is_1_for_other_failures() {
         assert_eq!(
-            ApiError::Transport(TransportError::Decode("x".to_owned())).exit_code(),
+            ApiError::Transport(TransportError::Decode {
+                source: serde_json::from_str::<serde_json::Value>("x").unwrap_err(),
+                content_type: String::new(),
+                body_prefix: String::new(),
+            })
+            .exit_code(),
             1
         );
         assert_eq!(

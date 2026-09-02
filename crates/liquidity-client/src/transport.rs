@@ -18,7 +18,11 @@ pub enum TransportError {
     /// Any other non-success status.
     Http(StatusCode, String),
     /// A success response whose body was not the expected JSON.
-    Decode(String),
+    Decode {
+        source: serde_json::Error,
+        content_type: String,
+        body_prefix: String,
+    },
     /// The bearer token could not be minted for the request.
     Auth(AuthError),
 }
@@ -58,9 +62,14 @@ impl std::fmt::Display for TransportError {
                     server_said(body)
                 )
             }
-            Self::Decode(detail) => {
-                write!(formatter, "the API response could not be decoded: {detail}")
-            }
+            Self::Decode {
+                source,
+                content_type,
+                body_prefix,
+            } => write!(
+                formatter,
+                "expected JSON but the endpoint returned {content_type} ({source}); this usually means the ops API is not deployed at this path. Body starts: {body_prefix}"
+            ),
             Self::Auth(source) => write!(formatter, "{source}"),
         }
     }
@@ -71,6 +80,7 @@ impl std::error::Error for TransportError {
         match self {
             Self::Transport(_, source) => Some(source),
             Self::Auth(source) => Some(source),
+            Self::Decode { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -197,10 +207,11 @@ impl<A: TokenSource + Sync> Client<A> {
             .map_err(|source| TransportError::Transport(target, source))?;
         if status.is_success() {
             return serde_json::from_str::<serde_json::Value>(&body).map_err(|source| {
-                TransportError::Decode(format!(
-                    "expected JSON but the endpoint returned {content_type} ({source}); this usually means the ops API is not deployed at this path. Body starts: {}",
-                    body_prefix(&body)
-                ))
+                TransportError::Decode {
+                    source,
+                    content_type,
+                    body_prefix: body_prefix(&body),
+                }
             });
         }
         Err(match status {
@@ -368,12 +379,10 @@ mod tests {
         )?;
         let client = fake_client(port)?;
         match client.get("/pnl", &[]).await {
-            Err(TransportError::Unauthorized(message)) => {
-                assert!(
-                    message.contains("https://accounts.google.com/signin"),
-                    "{message}"
-                );
-            }
+            Err(TransportError::Unauthorized(message)) => assert_eq!(
+                message,
+                "IAP redirected to sign-in (status 302 Found, location https://accounts.google.com/signin); the token was missing, expired, or not accepted"
+            ),
             other => panic!("expected Unauthorized, got {other:?}"),
         }
         Ok(())
@@ -427,8 +436,8 @@ mod tests {
         )?;
         let client = fake_client(port)?;
         match client.get("/pnl", &[]).await {
-            Err(TransportError::Decode(message)) => {
-                assert!(message.contains("text/html"), "{message}");
+            Err(TransportError::Decode { content_type, .. }) => {
+                assert_eq!(content_type, "text/html");
             }
             other => panic!("expected Decode, got {other:?}"),
         }

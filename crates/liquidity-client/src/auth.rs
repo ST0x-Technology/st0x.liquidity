@@ -15,6 +15,11 @@ pub enum AuthError {
     Flow(String),
     /// Construction of the HTTP client for the sign-in exchanges failed.
     Client(reqwest::Error),
+    /// The token request to Google failed to send, or its response body could
+    /// not be read.
+    Request(reqwest::Error),
+    /// The token response from Google was not valid JSON.
+    Decode(serde_json::Error),
 }
 
 impl std::fmt::Display for AuthError {
@@ -28,6 +33,13 @@ impl std::fmt::Display for AuthError {
                 formatter,
                 "could not build the HTTP client for the T0 sign-in: {source}"
             ),
+            Self::Request(source) => {
+                write!(formatter, "the token request to Google failed: {source}")
+            }
+            Self::Decode(source) => write!(
+                formatter,
+                "could not decode the token response from Google: {source}"
+            ),
         }
     }
 }
@@ -35,7 +47,8 @@ impl std::fmt::Display for AuthError {
 impl std::error::Error for AuthError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Client(source) => Some(source),
+            Self::Client(source) | Self::Request(source) => Some(source),
+            Self::Decode(source) => Some(source),
             Self::Flow(_) => None,
         }
     }
@@ -203,18 +216,15 @@ async fn post_token(
         .form(form)
         .send()
         .await
-        .map_err(|source| AuthError::Flow(format!("token request failed: {source}")))?;
+        .map_err(AuthError::Request)?;
     let status = response.status();
-    let body = response.text().await.map_err(|source| {
-        AuthError::Flow(format!("could not read the token response: {source}"))
-    })?;
+    let body = response.text().await.map_err(AuthError::Request)?;
     if !status.is_success() {
         return Err(AuthError::Flow(format!(
             "the token endpoint returned {status}: {body}"
         )));
     }
-    serde_json::from_str(&body)
-        .map_err(|source| AuthError::Flow(format!("could not decode the token response: {source}")))
+    serde_json::from_str(&body).map_err(AuthError::Decode)
 }
 
 /// Pulls the `id_token` out of a token response; this JWT is what IAP validates.
@@ -341,8 +351,7 @@ fn store_refresh_token_at(path: &std::path::Path, refresh_token: &str) {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         // Create with owner-only mode from the outset so the token is never
-        // briefly world-readable between creation and a later chmod; re-assert
-        // 0600 to also cover an already-existing file, whose mode open keeps.
+        // briefly world-readable between creation and a later chmod.
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -350,7 +359,15 @@ fn store_refresh_token_at(path: &std::path::Path, refresh_token: &str) {
             .mode(0o600)
             .open(path)
         {
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            // Re-assert 0600 on the open handle to also cover an already-existing
+            // file, whose mode `open` keeps; if it cannot be locked down, skip
+            // caching rather than write the token to a loose-permissioned file.
+            if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+                eprintln!(
+                    "Skipping refresh-token cache: could not set owner-only permissions: {error}"
+                );
+                return;
+            }
             let _ = file.write_all(body.as_bytes());
         }
     }
@@ -532,7 +549,7 @@ mod tests {
             .build()?;
         assert!(matches!(
             refresh_id_token(&http, &endpoint, "cid", "secret", "rtok").await,
-            Err(AuthError::Flow(_))
+            Err(AuthError::Request(_))
         ));
         Ok(())
     }
