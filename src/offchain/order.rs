@@ -780,6 +780,10 @@ pub enum CancellationReason {
     /// Extended-hours limit order stayed live beyond the configured timeout;
     /// cancel it so the next scan can place a fresh marketable limit.
     ExtendedHoursRepriceTimeout,
+    /// Overnight limit order stayed live beyond
+    /// `overnight_reprice_timeout_secs`; cancel it so the next scan can
+    /// place a fresh limit crossed from a current indicative quote.
+    OvernightRepriceTimeout,
     /// Extended-hours limit order predates the long-gap close-flatten window;
     /// cancel it so executable residual exposure can enter the repeated
     /// quote-refresh cycle before the venue closes.
@@ -791,6 +795,20 @@ pub enum CancellationReason {
     /// which cannot distinguish the two -- what it knows is that no local
     /// request reached the event store.
     Unrequested,
+}
+
+impl CancellationReason {
+    /// The `hedge_cancellations_requested_total{reason}` label. One stable
+    /// string per variant, so the sweeps' cadence is observable per cause.
+    pub(crate) const fn metric_label(self) -> &'static str {
+        match self {
+            Self::MarketOpenReplacement => "market_open_replacement",
+            Self::ExtendedHoursRepriceTimeout => "extended_hours_reprice_timeout",
+            Self::OvernightRepriceTimeout => "overnight_reprice_timeout",
+            Self::ExtendedHoursCloseFlatten => "extended_hours_close_flatten",
+            Self::Unrequested => "unrequested",
+        }
+    }
 }
 
 #[async_trait]
