@@ -421,6 +421,12 @@ impl Executor for AlpacaBrokerApi {
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
         let alpaca_limit_price = super::order::AlpacaLimitPrice::try_new(order.limit_price)?;
 
+        // Deliberately NO quantization here: the trait keeps the strict
+        // overnight contract (over-precision is refused, never silently
+        // truncated), because the CLI reaches this same method and its
+        // reject-over-precision UX is pinned. The automated hedging path
+        // quantizes BEFORE calling the trait (the OvernightLimit placement
+        // arm in the hedge crate), which is where "automated" is defined.
         let overnight = OvernightLimitOrder::new(
             order.symbol,
             order.shares,
@@ -1705,6 +1711,50 @@ mod tests {
         order_mock.assert();
         assert!(placement.extended_hours);
         assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
+    }
+
+    #[tokio::test]
+    async fn trait_place_overnight_order_rejects_over_precision_unquantized() {
+        // The trait keeps the strict overnight contract for every caller
+        // that names a quantity exactly (the CLI reaches this method): a
+        // 10-decimal quantity is refused with the precise error and no HTTP
+        // request. The automated hedging path quantizes BEFORE the trait
+        // (the OvernightLimit placement arm), so 18-decimal onchain dust
+        // never reaches this refusal in production.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let order = LimitOrder {
+            symbol: Symbol::new("RKLB").unwrap(),
+            shares: Positive::new(FractionalShares::new(
+                Float::parse("12.499999999999999999".to_string()).unwrap(),
+            ))
+            .unwrap(),
+            direction: Direction::Sell,
+            limit_price: Positive::new(Usd::new(float!(24.15))).unwrap(),
+            extended_hours: false,
+            client_order_id: ClientOrderId::cli(uuid!("4d6d9f40-5434-4f77-89f6-7156e375b739")),
+        };
+        let snapshot = eligible_overnight_snapshot();
+
+        let error =
+            Executor::place_overnight_order(&executor, order, Some(&snapshot), overnight_now())
+                .await
+                .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                AlpacaBrokerApiError::Overnight(OvernightOrderError::QuantityTooPrecise {
+                    max_decimal_places: 9,
+                    ..
+                })
+            ),
+            "expected the strict refusal, got: {error:?}"
+        );
     }
 
     #[tokio::test]

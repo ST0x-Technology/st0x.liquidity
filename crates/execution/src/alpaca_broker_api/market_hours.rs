@@ -62,25 +62,30 @@ where
 }
 
 /// Returns true if the market is currently open for trading.
+///
+/// "Currently" is the session clock (ADR 0021): the real clock everywhere
+/// except `MockAt` mode, whose configured offset shifts exactly these three
+/// outermost stamping sites and nothing below them.
 pub(super) async fn is_market_open(
     client: &AlpacaBrokerApiClient,
 ) -> Result<bool, AlpacaBrokerApiError> {
-    is_market_open_at(client, Utc::now()).await
+    is_market_open_at(client, client.session_clock_now()).await
 }
 
 /// Returns the current market session (regular, extended, overnight, or
-/// closed).
+/// closed) at the session clock (ADR 0021).
 pub(super) async fn market_session(
     client: &AlpacaBrokerApiClient,
 ) -> Result<MarketSession, AlpacaBrokerApiError> {
-    market_session_at(client, Utc::now()).await
+    market_session_at(client, client.session_clock_now()).await
 }
 
-/// Returns the current market session with extended-session close metadata.
+/// Returns the current market session with extended-session close metadata,
+/// at the session clock (ADR 0021).
 pub(super) async fn market_session_status(
     client: &AlpacaBrokerApiClient,
 ) -> Result<MarketSessionStatus, AlpacaBrokerApiError> {
-    market_session_status_at(client, Utc::now()).await
+    market_session_status_at(client, client.session_clock_now()).await
 }
 
 /// Returns the market session at the given time.
@@ -628,6 +633,57 @@ mod tests {
     }
 
     /// Constructs a UTC timestamp corresponding to a specific ET time on a given date.
+    /// The ADR 0021 seam pin: through `MockAt`'s clock offset, every
+    /// session -- Overnight included, both legs -- is reachable at whatever
+    /// real time this test happens to run. Drives the OUTER `market_session`
+    /// wrapper (the only code the seam touches), not the `_at` functions the
+    /// rest of this suite parameterizes directly. Probe instants sit hours
+    /// from every boundary, so sub-second drift between computing the offset
+    /// and stamping the clock cannot flip a classification.
+    #[tokio::test]
+    async fn mock_at_clock_offset_reaches_every_session() {
+        let server = MockServer::start();
+        mock_calendar_window(
+            &server,
+            "2026-09-08",
+            json!([
+                calendar_entry("2026-09-08", "09:30", "16:00", "04:00", "20:00"),
+                trading_day_entry("2026-09-09"),
+            ]),
+        );
+        mock_calendar_window(
+            &server,
+            "2026-09-09",
+            json!([
+                calendar_entry("2026-09-09", "09:30", "16:00", "04:00", "20:00"),
+                trading_day_entry("2026-09-10"),
+            ]),
+        );
+        mock_calendar_window(&server, "2026-09-12", json!([]));
+
+        for (date, hour, minute, expected) in [
+            ("2026-09-08", 15, 0, MarketSession::Regular),
+            ("2026-09-08", 18, 0, MarketSession::Extended),
+            ("2026-09-08", 21, 0, MarketSession::Overnight),
+            ("2026-09-09", 2, 30, MarketSession::Overnight),
+            ("2026-09-12", 12, 0, MarketSession::Closed),
+        ] {
+            let target = et_time_as_utc(date, hour, minute);
+            let offset = (target - Utc::now()).num_seconds();
+            let ctx = create_test_ctx(AlpacaBrokerApiMode::MockAt {
+                base_url: server.base_url(),
+                clock_offset_secs: offset,
+            });
+            let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+            assert_eq!(
+                market_session(&client).await.unwrap(),
+                expected,
+                "session at {date} {hour:02}:{minute:02} ET through the MockAt clock"
+            );
+        }
+    }
+
     fn et_time_as_utc(date: &str, hour: u32, min: u32) -> DateTime<Utc> {
         let naive_date = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
         let naive_time = NaiveTime::from_hms_opt(hour, min, 0).unwrap();

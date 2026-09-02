@@ -81,7 +81,12 @@ pub const ALPACA_MAX_DECIMAL_PLACES: u8 = 9;
 /// Returns `Ok(None)` when truncation would collapse a non-zero value to zero,
 /// indicating the value is below the precision threshold and should be
 /// preserved in inventory rather than submitted to the broker.
-pub(crate) fn truncate_to_decimal_places(
+///
+/// Public because the automated overnight placement path quantizes its
+/// onchain 18-decimal quantities with exactly this primitive before the
+/// strict overnight constructor sees them (SPEC "Order contract": the
+/// automated tier quantizes, the exactly-named tier rejects).
+pub fn truncate_to_decimal_places(
     value: Float,
     max_decimals: u8,
 ) -> Result<Option<Float>, FloatError> {

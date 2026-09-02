@@ -4,6 +4,7 @@
 //! `AlpacaTokenizationMock`, `BaseChain`, `DeployableERC20`, and
 //! `CctpAttestationMock` into a single startup call.
 
+use chrono::TimeZone;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
@@ -356,4 +357,22 @@ async fn start_tokenization_mock<P: Provider + Clone + 'static>(
     debug!("Mint executor started");
 
     Ok(tokenization_service)
+}
+
+/// Seconds to add to the real clock so the session clock (ADR 0021,
+/// `AlpacaBrokerApiMode::MockAt`) lands at the given ET instant. Pair the
+/// same `date` with the mock calendar constructors so session math and
+/// calendar fixtures agree on the effective day (the offset clock's date);
+/// quote and order timestamps stay anchored to the real clock.
+pub fn clock_offset_secs_to_et(date: chrono::NaiveDate, hour: u32, minute: u32) -> i64 {
+    let target = chrono_tz::America::New_York
+        .from_local_datetime(
+            &date
+                .and_hms_opt(hour, minute, 0)
+                .expect("valid wall-clock time"),
+        )
+        .single()
+        .expect("ET instant away from a DST fold is unambiguous")
+        .with_timezone(&chrono::Utc);
+    (target - chrono::Utc::now()).num_seconds()
 }

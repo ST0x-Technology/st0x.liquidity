@@ -47,18 +47,36 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
     /// `Ctx::for_test`). Tests exercising a shared `RaindexInventory` pass
     /// `Managed { inventory }` explicitly.
     inventory_mode_override: Option<InventoryMode>,
+    /// Shifts the session clock by this many seconds (ADR 0021,
+    /// `AlpacaBrokerApiMode::MockAt`). Compute with
+    /// [`crate::test_infra::clock_offset_secs_to_et`]. Only session
+    /// classification reads the shifted clock; quote/order timestamps and
+    /// every cadence stay on the real one.
+    session_clock_offset_secs: Option<i64>,
+    /// Sets the three overnight `[broker]` knobs to e2e defaults (120s
+    /// quote age, 100 bps slippage, 300s reprice cadence). Required
+    /// whenever an asset enables overnight counter-trading.
+    #[builder(default = false)]
+    overnight_knobs: bool,
 ) -> anyhow::Result<Ctx> {
     let broker_url = broker_url_override.map_or_else(
         || broker.base_url(),
         |url| url.to_string().trim_end_matches('/').to_owned(),
     );
+    let mode = match session_clock_offset_secs {
+        None => AlpacaBrokerApiMode::Mock(broker_url),
+        Some(clock_offset_secs) => AlpacaBrokerApiMode::MockAt {
+            base_url: broker_url,
+            clock_offset_secs,
+        },
+    };
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
         auth: st0x_execution::AlpacaBrokerAuth::Basic {
             api_key: TEST_API_KEY.to_owned(),
             api_secret: TEST_API_SECRET.to_owned(),
         },
         account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
-        mode: Some(AlpacaBrokerApiMode::Mock(broker_url)),
+        mode: Some(mode),
         asset_cache_ttl: Duration::from_secs(3600),
         time_in_force: TimeInForce::Day,
         counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
@@ -69,7 +87,7 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         None => chain.endpoint().parse()?,
     };
 
-    Ctx::for_test()
+    let builder = Ctx::for_test()
         .database_url(db_path.display().to_string())
         .rpc_url(rpc_url)
         .orderbook(chain.orderbook)
@@ -79,9 +97,18 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         .order_owner(chain.owner)
         .assets(assets)
         .maybe_execution_threshold_override(execution_threshold_override)
-        .maybe_inventory_mode(inventory_mode_override)
-        .call()
-        .map_err(Into::into)
+        .maybe_inventory_mode(inventory_mode_override);
+
+    if overnight_knobs {
+        builder
+            .overnight_max_quote_age_secs(std::num::NonZeroU64::new(120).expect("120 is nonzero"))
+            .overnight_slippage_bps(100)
+            .overnight_reprice_timeout_secs(std::num::NonZeroU64::new(300).expect("300 is nonzero"))
+            .call()
+            .map_err(Into::into)
+    } else {
+        builder.call().map_err(Into::into)
+    }
 }
 
 /// Polls until the Position projection for `symbol` has `net == 0`,

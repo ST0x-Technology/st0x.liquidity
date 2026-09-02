@@ -40,6 +40,16 @@ pub enum AlpacaBrokerApiMode {
     /// Mock mode for testing (available via `mock` feature or in tests)
     #[cfg(any(test, feature = "mock"))]
     Mock(String),
+    /// Mock mode with the session clock shifted by the given seconds
+    /// (ADR 0021). Programmatic only: no TOML form deserializes to it, and
+    /// tying the offset to mock mode makes shifting the clock against a
+    /// real venue unrepresentable. Only session classification reads the
+    /// shifted clock; every duration-based check stays on the real one.
+    #[cfg(any(test, feature = "mock"))]
+    MockAt {
+        base_url: String,
+        clock_offset_secs: i64,
+    },
 }
 
 impl<'de> Deserialize<'de> for AlpacaBrokerApiMode {
@@ -126,7 +136,21 @@ impl AlpacaBrokerApiMode {
             Self::Sandbox => "https://broker-api.sandbox.alpaca.markets",
             Self::Production => "https://broker-api.alpaca.markets",
             #[cfg(any(test, feature = "mock"))]
-            Self::Mock(url) => url,
+            Self::Mock(url) | Self::MockAt { base_url: url, .. } => url,
+        }
+    }
+
+    /// The clock session classification runs on: the real clock everywhere
+    /// except `MockAt`, which shifts it by the configured offset (ADR 0021).
+    pub(super) fn session_clock_now(&self) -> chrono::DateTime<chrono::Utc> {
+        match self {
+            Self::Sandbox | Self::Production => chrono::Utc::now(),
+            #[cfg(any(test, feature = "mock"))]
+            Self::Mock(_) => chrono::Utc::now(),
+            #[cfg(any(test, feature = "mock"))]
+            Self::MockAt {
+                clock_offset_secs, ..
+            } => chrono::Utc::now() + chrono::Duration::seconds(*clock_offset_secs),
         }
     }
 
@@ -139,7 +163,7 @@ impl AlpacaBrokerApiMode {
             Self::Sandbox => "https://data.sandbox.alpaca.markets",
             Self::Production => "https://data.alpaca.markets",
             #[cfg(any(test, feature = "mock"))]
-            Self::Mock(url) => url,
+            Self::Mock(url) | Self::MockAt { base_url: url, .. } => url,
         }
     }
 
@@ -150,7 +174,9 @@ impl AlpacaBrokerApiMode {
             Self::Sandbox => super::kms_jwt::ALPACA_SANDBOX_TOKEN_URL.to_string(),
             Self::Production => super::kms_jwt::ALPACA_TOKEN_URL.to_string(),
             #[cfg(any(test, feature = "mock"))]
-            Self::Mock(url) => format!("{url}/v1/oauth2/token"),
+            Self::Mock(url) | Self::MockAt { base_url: url, .. } => {
+                format!("{url}/v1/oauth2/token")
+            }
         }
     }
 }
