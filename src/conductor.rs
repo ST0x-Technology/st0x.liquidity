@@ -71,7 +71,7 @@ use crate::equity_redemption::{
     EquityRedemption, interrupted_redemption_ids, symbols_with_stuck_redemptions,
 };
 use crate::inventory::{
-    BroadcastingInventory, Inventory, InventoryProjection, InventorySnapshot, Venue,
+    BroadcastingInventory, Inventory, InventoryProjection, InventorySnapshot, PollFreshness, Venue,
 };
 use crate::mint_authorization::{ConfiguredMintAuthorizer, MintAuthorizationService};
 use crate::native_gas::GasReadiness;
@@ -861,6 +861,11 @@ impl Conductor {
         let notifier: Arc<dyn Notifier> = Arc::new(LogNotifier);
         info!("Operational alerts will be emitted as structured logs");
 
+        // One freshness tracker shared by the inventory poller (writer), the
+        // daily portfolio capture gate, and the rebalancing staleness guard
+        // (readers), so every consumer judges the same per-slot poll clock.
+        let poll_freshness = PollFreshness::new();
+
         // The phase future is boxed like the other startup-phase futures
         // (`Conductor::run` in lib.rs, `spawn_rebalancing_infrastructure`):
         // it holds every rebalancing aggregate, too large to keep inline on
@@ -890,6 +895,7 @@ impl Conductor {
             rebalancing,
             RebalancingDeps {
                 pool: pool.clone(),
+                poll_freshness: poll_freshness.clone(),
                 apalis_pool: apalis_pool.clone(),
                 ctx: ctx.clone(),
                 inventory: inventory.clone(),
@@ -968,6 +974,7 @@ impl Conductor {
 
         let conductor_ctx = builder::ConductorCtx {
             ctx: ctx.clone(),
+            poll_freshness,
             cache,
             provider,
             executor,
@@ -1669,6 +1676,7 @@ struct RebalancingInfrastructure {
 /// Shared infrastructure dependencies needed to spawn rebalancing.
 struct RebalancingDeps {
     pool: SqlitePool,
+    poll_freshness: PollFreshness,
     apalis_pool: apalis_sqlite::SqlitePool,
     ctx: Ctx,
     inventory: Arc<BroadcastingInventory>,
@@ -2451,6 +2459,34 @@ fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
     GasReadiness::from_wallets(alerts, &base_wallet, &ethereum_wallet)
 }
 
+/// Builds the trigger service from the validated rebalancing config plus the
+/// conductor-owned dependencies (the trigger config is the runtime projection
+/// of `RebalancingCtx` onto the trading chain's asset table).
+fn build_rebalancing_service(
+    rebalancing_ctx: &RebalancingCtx,
+    deps: &RebalancingDeps,
+    vault_registry_id: VaultRegistryId,
+    wrapper: Arc<dyn Wrapper>,
+) -> Arc<RebalancingService> {
+    Arc::new(RebalancingService::new(
+        RebalancingServiceConfig {
+            poll_freshness: deps.poll_freshness.clone(),
+            inventory_staleness_bound: rebalancing_ctx.inventory_staleness_bound,
+            equity: rebalancing_ctx.equity,
+            usdc: rebalancing_ctx.usdc,
+            transfer_timeout: rebalancing_ctx.transfer_timeout,
+            assets: deps.ctx.chains.sole_trading().assets.clone(),
+            cash_reserved: deps.ctx.assets.cash.as_ref().map(|cash| cash.reserved),
+        },
+        deps.vault_registry.clone(),
+        vault_registry_id,
+        deps.inventory.clone(),
+        wrapper,
+        deps.schedulers.clone(),
+        deps.notifier.clone(),
+    ))
+}
+
 fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     redemption_wallet: Address,
@@ -2487,7 +2523,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         };
 
         let (vault_registry_id, vault_lookup) =
-            build_rebalancing_vault_lookup(&deps.ctx, deps.vault_registry_projection);
+            build_rebalancing_vault_lookup(&deps.ctx, deps.vault_registry_projection.clone());
 
         let raindex_service =
             build_rebalancing_raindex_service(base_wallet, &deps.ctx, market_maker_wallet);
@@ -2528,21 +2564,8 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         let notifier = deps.notifier.clone();
 
-        let rebalancing_service = Arc::new(RebalancingService::new(
-            RebalancingServiceConfig {
-                equity: rebalancing_ctx.equity,
-                usdc: rebalancing_ctx.usdc,
-                transfer_timeout: rebalancing_ctx.transfer_timeout,
-                assets: deps.ctx.chains.sole_trading().assets.clone(),
-                cash_reserved: deps.ctx.assets.cash.as_ref().map(|cash| cash.reserved),
-            },
-            deps.vault_registry,
-            vault_registry_id,
-            deps.inventory.clone(),
-            wrapper.clone(),
-            deps.schedulers,
-            notifier.clone(),
-        ));
+        let rebalancing_service =
+            build_rebalancing_service(&rebalancing_ctx, &deps, vault_registry_id, wrapper.clone());
 
         wire_transfer_admission_guards(
             &rebalancing_service,
@@ -5063,6 +5086,8 @@ mod tests {
 
         Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                poll_freshness: PollFreshness::always_fresh(),
+                inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
@@ -5770,6 +5795,8 @@ mod tests {
         let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool.clone(), ()));
         let rebalancing_service = RebalancingService::new(
             RebalancingServiceConfig {
+                poll_freshness: PollFreshness::always_fresh(),
+                inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 equity: crate::inventory::ImbalanceThreshold {
                     target: st0x_float_macro::float!(0.5),
@@ -6302,6 +6329,8 @@ mod tests {
         let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool.clone(), ()));
         let rebalancing_service = RebalancingService::new(
             RebalancingServiceConfig {
+                poll_freshness: PollFreshness::always_fresh(),
+                inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 equity: crate::inventory::ImbalanceThreshold {
                     target: st0x_float_macro::float!(0.5),
@@ -6399,6 +6428,8 @@ mod tests {
         let vault_registry2: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool2.clone(), ()));
         let rebalancing_service2 = RebalancingService::new(
             RebalancingServiceConfig {
+                poll_freshness: PollFreshness::always_fresh(),
+                inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 equity: crate::inventory::ImbalanceThreshold {
                     target: st0x_float_macro::float!(0.5),
@@ -10052,6 +10083,8 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                poll_freshness: PollFreshness::always_fresh(),
+                inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
@@ -10172,6 +10205,8 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                poll_freshness: PollFreshness::always_fresh(),
+                inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 equity: threshold,
                 usdc: Some(threshold),
@@ -10290,6 +10325,8 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                poll_freshness: PollFreshness::always_fresh(),
+                inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
@@ -10432,6 +10469,8 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                poll_freshness: PollFreshness::always_fresh(),
+                inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
@@ -10722,6 +10761,7 @@ mod tests {
             None,
             RebalancingDeps {
                 pool: pool.clone(),
+                poll_freshness: PollFreshness::always_fresh(),
                 apalis_pool: apalis_pool.clone(),
                 ctx: ctx.clone(),
                 inventory,
