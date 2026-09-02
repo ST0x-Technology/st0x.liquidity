@@ -3950,8 +3950,19 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_weekday_close_does_not_cancel_order_for_flattening() {
+        // The discriminating twin of
+        // `close_to_extended_hours_close_cancels_pre_window_order_for_flattening`:
+        // the order is backdated identically (901s, predating the would-be
+        // window), the tick sits inside that window, and ONLY the gap
+        // classification differs. The reprice timeout is raised above the
+        // backdating so the flatten sweep is the only candidate canceller --
+        // an order this stale would otherwise be repriced (correctly, and
+        // with its own reason) on an ordinary evening, masking whether the
+        // flatten sweep declined because of the gap.
         let (pool, apalis_pool) = setup_test_pools().await;
-        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        let mut cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        cfg.extended_hours_reprice_timeout_secs = Some(NonZeroU64::new(3_600).unwrap());
+        let now = chrono::Utc::now();
         let (ctx, position) = build_ctx_with_executor(
             pool.clone(),
             apalis_pool,
@@ -3959,9 +3970,7 @@ mod tests {
             Duration::from_secs(60),
             MockExecutor::new()
                 .with_market_session(MarketSession::Extended)
-                .with_extended_session_closes_at(
-                    chrono::Utc::now() + chrono::Duration::seconds(300),
-                )
+                .with_extended_session_closes_at(now + chrono::Duration::seconds(300))
                 .with_post_close_gap(st0x_execution::PostCloseGap::OrdinaryOvernight)
                 .with_order_status(OrderState::Submitted {
                     order_id: ExecutorOrderId::new("broker-eh-1"),
@@ -3980,7 +3989,13 @@ mod tests {
 
         let offchain_order_id = OffchainOrderId::new();
         claim_position(&ctx, &aapl, offchain_order_id).await;
-        record_extended_hours_order(&ctx, &aapl, offchain_order_id).await;
+        record_extended_hours_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            now - chrono::Duration::seconds(901),
+        )
+        .await;
 
         CheckPositions::default().perform(&ctx).await.unwrap();
 
@@ -3999,6 +4014,326 @@ mod tests {
                 }
             ),
             "ordinary weekday close must not activate close flattening, got: {order:?}"
+        );
+    }
+
+    /// The RAI-1953 suppression pin: enabling overnight counter-trading for
+    /// a symbol must not weaken the Friday/holiday protection. Identical to
+    /// `close_to_extended_hours_close_cancels_pre_window_order_for_flattening`
+    /// except the symbol also opts into overnight -- the flatten cancel must
+    /// fire exactly as for an extended-only symbol.
+    #[tokio::test]
+    async fn flatten_cancel_still_fires_for_an_overnight_enabled_symbol() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let mut cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        cfg.assets
+            .equities
+            .symbols
+            .get_mut(&Symbol::new("AAPL").unwrap())
+            .unwrap()
+            .overnight_counter_trading = OperationMode::Enabled;
+        cfg.overnight_max_quote_age_secs = Some(NonZeroU64::new(30).unwrap());
+        cfg.overnight_slippage_bps = Some(100);
+        cfg.overnight_reprice_timeout_secs = Some(NonZeroU64::new(300).unwrap());
+        let now = chrono::Utc::now();
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool,
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Extended)
+                .with_extended_session_closes_at(now + chrono::Duration::seconds(300))
+                .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-eh-1"),
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_extended_hours_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            now - chrono::Duration::seconds(901),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let order = ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        let OffchainOrder::Cancelling { reason, .. } = order else {
+            panic!("the overnight opt-in must not suppress close flattening, got: {order:?}");
+        };
+        assert_eq!(reason, CancellationReason::ExtendedHoursCloseFlatten);
+    }
+
+    /// The RAI-1953 dilution pin: inside a flatten window, a buy for a
+    /// symbol with BOTH session flags on must still route through the
+    /// extended/flatten machinery, never the overnight branch. The overnight
+    /// quote is priced absurdly high ($10,000 ask): if the overnight branch
+    /// stole the buy, its crossed preflight would demand ~$20,200 against
+    /// $250 of cash and block. The extended path preflights the mark's
+    /// ramped cross (at most $104 x 2 = $208), which the cash covers, so the
+    /// hedge enqueues.
+    #[tokio::test]
+    async fn flatten_window_buy_ignores_the_overnight_feed() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let mut cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        cfg.assets
+            .equities
+            .symbols
+            .get_mut(&Symbol::new("AAPL").unwrap())
+            .unwrap()
+            .overnight_counter_trading = OperationMode::Enabled;
+        cfg.overnight_max_quote_age_secs = Some(NonZeroU64::new(30).unwrap());
+        cfg.overnight_slippage_bps = Some(100);
+        cfg.overnight_reprice_timeout_secs = Some(NonZeroU64::new(300).unwrap());
+        let now = chrono::Utc::now();
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Extended)
+            .with_extended_session_closes_at(now + chrono::Duration::seconds(300))
+            .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+            .with_position_mark(Positive::new(Usd::new(float!(100.0))).unwrap())
+            .with_overnight_quote(indicative_quote_at("9999", "10000", now))
+            .with_inventory(Inventory {
+                positions: Vec::new(),
+                usd_balance_cents: 25_000,
+                cash_buying_power_cents: Some(25_000),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            });
+        let (ctx, position) = build_ctx_with_executor(
+            pool,
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            executor,
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Sell,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            1,
+            "the flatten-window buy must preflight the extended reference, not the \
+             overnight quote"
+        );
+        let job_bytes: Vec<u8> =
+            sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE job_type = ?")
+                .bind(hedge_job_type())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        let job: PlaceHedge = serde_json::from_slice(&job_bytes).unwrap();
+        assert_eq!(
+            job.market_session,
+            MarketSession::Extended,
+            "the job must carry the Extended session so placement uses the flatten pricing"
+        );
+    }
+
+    /// The RAI-1953 long-closure sequence, driving the SPEC's unreachability
+    /// argument tick by tick: a Thursday-night overnight order survives into
+    /// Friday, the 04:00 boundary sweep converges it on the FIRST Extended
+    /// tick (hours before any flatten window), the flatten window then finds
+    /// no overnight order and re-hedges the released exposure through the
+    /// extended machinery, and the Closed 20:00 places nothing. Each phase
+    /// rebuilds the ctx over the same pools (the mock session is fixed at
+    /// construction), so every transition doubles as restart coverage.
+    /// Throughout: never two live orders, exactly one replacement hedge.
+    #[tokio::test]
+    async fn thursday_overnight_order_converges_before_the_friday_flatten() {
+        fn friday_cfg() -> Ctx {
+            let mut cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+            cfg.assets
+                .equities
+                .symbols
+                .get_mut(&Symbol::new("AAPL").unwrap())
+                .unwrap()
+                .overnight_counter_trading = OperationMode::Enabled;
+            cfg.overnight_max_quote_age_secs = Some(NonZeroU64::new(30).unwrap());
+            cfg.overnight_slippage_bps = Some(100);
+            cfg.overnight_reprice_timeout_secs = Some(NonZeroU64::new(300).unwrap());
+            cfg
+        }
+
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let now = chrono::Utc::now();
+
+        // Phase 1: Friday pre-market. The extended close is hours away, so
+        // no flatten window is active; the boundary sweep alone converges
+        // the Thursday-night survivor.
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool.clone(),
+            friday_cfg(),
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Extended)
+                .with_extended_session_closes_at(now + chrono::Duration::hours(8))
+                .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-ovn-1"),
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Sell,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_overnight_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            now - chrono::Duration::hours(10),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let order = ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        assert!(
+            matches!(
+                order,
+                OffchainOrder::Cancelling {
+                    reason: CancellationReason::PreMarketOpenReplacement,
+                    ..
+                }
+            ),
+            "the first Friday Extended tick must converge the Thursday survivor, got: {order:?}"
+        );
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            0,
+            "no replacement may exist while the overnight order is still live"
+        );
+
+        // The poller confirms the broker cancellation.
+        ctx.offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::ConfirmCancellation {
+                    filled_shares: FractionalShares::ZERO,
+                    cancelled_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        drop(ctx);
+
+        // Phase 2: the Friday flatten window. No overnight order remains for
+        // it to worry about; the released exposure re-hedges through the
+        // extended/flatten machinery (mark-priced, ramped cross).
+        let (ctx, _) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool.clone(),
+            friday_cfg(),
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Extended)
+                .with_extended_session_closes_at(
+                    chrono::Utc::now() + chrono::Duration::seconds(300),
+                )
+                .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+                .with_position_mark(Positive::new(Usd::new(float!(100.0))).unwrap())
+                .with_inventory(Inventory {
+                    positions: Vec::new(),
+                    usd_balance_cents: 25_000,
+                    cash_buying_power_cents: Some(25_000),
+                    alpaca_usdc: None,
+                    cash_withdrawable_cents: None,
+                }),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let order = ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        assert!(
+            matches!(order, OffchainOrder::Cancelled { .. }),
+            "the overnight order must be terminal before any replacement, got: {order:?}"
+        );
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            1,
+            "the flatten-window scan must re-hedge the released exposure exactly once"
+        );
+        let job_bytes: Vec<u8> =
+            sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE job_type = ?")
+                .bind(hedge_job_type())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        let job: PlaceHedge = serde_json::from_slice(&job_bytes).unwrap();
+        assert_eq!(job.market_session, MarketSession::Extended);
+        drop(ctx);
+
+        // Phase 3: Friday 20:00 classifies Closed -- no overnight session
+        // before a long gap, and the scan places nothing new.
+        let (ctx, _) = build_ctx_with_executor(
+            pool,
+            apalis_pool.clone(),
+            friday_cfg(),
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_closed()
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-ovn-1"),
+                }),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            1,
+            "the Closed Friday evening must not create another hedge"
         );
     }
 
