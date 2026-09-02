@@ -9,7 +9,7 @@ pub(crate) use std::time::Duration;
 use tokio::task::JoinHandle;
 
 pub(crate) use st0x_config::InventoryMode;
-use st0x_config::{BrokerCtx, ChainAssets, Ctx, OnchainWalletCtx};
+use st0x_config::{BrokerCtx, ChainAssets, Ctx, HedgingAssets, OnchainWalletCtx};
 pub(crate) use st0x_event_sorcery::Projection;
 use st0x_evm::Wallet;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_API_KEY, TEST_API_SECRET};
@@ -45,6 +45,10 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
     db_path: &std::path::Path,
     deployment_block: u64,
     assets: ChainAssets,
+    /// How the listed symbols hedge. Omitted by most tests, which get an
+    /// all-disabled policy per symbol from `Ctx::for_test`; overnight
+    /// scenarios pass an overnight-enabled table.
+    hedging: Option<HedgingAssets>,
     execution_threshold_override: Option<st0x_hedge::ExecutionThreshold>,
     /// Override the HTTP RPC URL the bot connects to. Default is
     /// `chain.endpoint()`. Used by chaos tests to route the bot
@@ -58,18 +62,36 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
     /// `Ctx::for_test`). Tests exercising a shared `RaindexInventory` pass
     /// `Managed { inventory }` explicitly.
     inventory_mode_override: Option<InventoryMode>,
+    /// Shifts the session clock by this many seconds (ADR 0021,
+    /// `AlpacaBrokerApiMode::MockAt`). Compute with
+    /// [`crate::test_infra::clock_offset_secs_to_et`]. Only session
+    /// classification reads the shifted clock; quote/order timestamps and
+    /// every cadence stay on the real one.
+    session_clock_offset_secs: Option<i64>,
+    /// Sets the three overnight `[broker]` knobs to e2e defaults (120s
+    /// quote age, 100 bps slippage, 300s reprice cadence). Required
+    /// whenever an asset enables overnight counter-trading.
+    #[builder(default = false)]
+    overnight_knobs: bool,
 ) -> anyhow::Result<Ctx> {
     let broker_url = broker_url_override.map_or_else(
         || broker.base_url(),
         |url| url.to_string().trim_end_matches('/').to_owned(),
     );
+    let mode = match session_clock_offset_secs {
+        None => AlpacaBrokerApiMode::Mock(broker_url),
+        Some(clock_offset_secs) => AlpacaBrokerApiMode::MockAt {
+            base_url: broker_url,
+            clock_offset_secs,
+        },
+    };
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
         auth: st0x_execution::AlpacaBrokerAuth::Basic {
             api_key: TEST_API_KEY.to_owned(),
             api_secret: TEST_API_SECRET.to_owned(),
         },
         account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
-        mode: Some(AlpacaBrokerApiMode::Mock(broker_url)),
+        mode: Some(mode),
         asset_cache_ttl: Duration::from_secs(3600),
         time_in_force: TimeInForce::Day,
         counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
@@ -109,7 +131,7 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         .freeze_check(OperationMode::Disabled)
         .call();
 
-    Ctx::for_test()
+    let builder = Ctx::for_test()
         .database_url(db_path.display().to_string())
         .rpc_url(rpc_url)
         .orderbook(chain.orderbook)
@@ -124,10 +146,20 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         })
         .alerts(crate::rebalancing::assertions::test_alerts())
         .assets(assets)
+        .maybe_hedging(hedging)
         .maybe_execution_threshold_override(execution_threshold_override)
-        .maybe_inventory_mode(inventory_mode_override)
-        .call()
-        .map_err(Into::into)
+        .maybe_inventory_mode(inventory_mode_override);
+
+    if overnight_knobs {
+        builder
+            .overnight_max_quote_age_secs(std::num::NonZeroU64::new(120).expect("120 is nonzero"))
+            .overnight_slippage_bps(100)
+            .overnight_reprice_timeout_secs(std::num::NonZeroU64::new(300).expect("300 is nonzero"))
+            .call()
+            .map_err(Into::into)
+    } else {
+        builder.call().map_err(Into::into)
+    }
 }
 
 pub(crate) async fn poll_for_accumulated_short(
