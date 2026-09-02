@@ -111,6 +111,7 @@ async fn execute(cli: Cli) -> Result<(), Failure> {
         client_secret,
     } = target.auth;
     let token = auth::desktop_id_token(
+        cli.env.cache_slug(),
         &client_id,
         &client_secret,
         target.request_timeout,

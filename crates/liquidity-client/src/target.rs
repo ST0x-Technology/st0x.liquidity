@@ -21,6 +21,15 @@ impl Env {
             Self::Production => "T0_LIQUIDITY_PROD",
         }
     }
+
+    /// Lowercase environment name that keys the refresh-token cache file, so
+    /// each environment's OAuth client keeps its own cached token.
+    pub(crate) fn cache_slug(self) -> &'static str {
+        match self {
+            Self::Staging => "staging",
+            Self::Production => "production",
+        }
+    }
 }
 
 /// How the client authenticates to IAP. Both environments use a Google Desktop

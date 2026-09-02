@@ -68,13 +68,14 @@ const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 /// when present; otherwise a one-time browser sign-in (loopback + PKCE) runs
 /// and its refresh token is cached so later invocations stay silent.
 pub async fn desktop_id_token(
+    env: &str,
     client_id: &str,
     client_secret: &str,
     request_timeout: std::time::Duration,
     connect_timeout: std::time::Duration,
 ) -> Result<String, AuthError> {
     let http = build_http(request_timeout, connect_timeout)?;
-    if let Some(refresh_token) = load_refresh_token()
+    if let Some(refresh_token) = load_refresh_token(env)
         && let Ok(id_token) = refresh_id_token(
             &http,
             TOKEN_ENDPOINT,
@@ -86,7 +87,7 @@ pub async fn desktop_id_token(
     {
         return Ok(id_token);
     }
-    interactive_id_token(&http, client_id, client_secret).await
+    interactive_id_token(&http, env, client_id, client_secret).await
 }
 
 /// Builds the HTTP client for the token exchanges, applying the caller's
@@ -107,6 +108,7 @@ fn build_http(
 /// code for an ID token, and caches the refresh token for silent reuse.
 async fn interactive_id_token(
     http: &reqwest::Client,
+    env: &str,
     client_id: &str,
     client_secret: &str,
 ) -> Result<String, AuthError> {
@@ -163,7 +165,7 @@ async fn interactive_id_token(
         .get("refresh_token")
         .and_then(serde_json::Value::as_str)
     {
-        store_refresh_token(refresh_token);
+        store_refresh_token(env, refresh_token);
     }
     extract_id_token(&token)
 }
@@ -289,9 +291,10 @@ fn code_challenge(verifier: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
-/// Path of the cached refresh token: `$XDG_CONFIG_HOME` (or `~/.config`) under
-/// the client's own directory.
-fn refresh_token_path() -> Option<std::path::PathBuf> {
+/// Path of the cached refresh token for one environment: `$XDG_CONFIG_HOME`
+/// (or `~/.config`) under the client's own directory, keyed by `env` so each
+/// environment's OAuth client keeps its own token.
+fn refresh_token_path(env: &str) -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -299,13 +302,13 @@ fn refresh_token_path() -> Option<std::path::PathBuf> {
         })?;
     Some(
         base.join("st0x-liquidity-client")
-            .join("oauth-staging.json"),
+            .join(format!("oauth-{env}.json")),
     )
 }
 
 /// Reads the cached refresh token, if any.
-fn load_refresh_token() -> Option<String> {
-    load_refresh_token_at(&refresh_token_path()?)
+fn load_refresh_token(env: &str) -> Option<String> {
+    load_refresh_token_at(&refresh_token_path(env)?)
 }
 
 /// Reads the cached refresh token from a specific path.
@@ -320,8 +323,8 @@ fn load_refresh_token_at(path: &std::path::Path) -> Option<String> {
 
 /// Persists the refresh token with owner-only permissions. Best effort: a cache
 /// write failure must not fail the command, only cost the next run a sign-in.
-fn store_refresh_token(refresh_token: &str) {
-    if let Some(path) = refresh_token_path() {
+fn store_refresh_token(env: &str, refresh_token: &str) {
+    if let Some(path) = refresh_token_path(env) {
         store_refresh_token_at(&path, refresh_token);
     }
 }
