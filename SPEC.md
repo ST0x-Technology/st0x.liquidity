@@ -725,11 +725,18 @@ hardcoded weekday or holiday list, classifies the post-close gap as one of:
 Close-flatten mode is one shared policy used by both position scanning and hedge
 placement:
 
-- On the first scan inside the window, any live extended-hours or overnight
-  hedge placed before the window is cancelled so an aggressive replacement can
-  start promptly. Partial fills are reconciled before cancellation; after the
-  broker confirms the cancellation, every remaining broker-executable amount is
-  released back to the position for retry.
+- On the first scan inside the window, any live extended-hours hedge placed
+  before the window is cancelled so an aggressive replacement can start
+  promptly. Partial fills are reconciled before cancellation; after the broker
+  confirms the cancellation, every remaining broker-executable amount is
+  released back to the position for retry. The flatten cancel matches only
+  extended-hours orders on purpose: an overnight-session hedge cannot reach a
+  flatten window. Overnight orders exist only on nights whose next calendar day
+  trades — no overnight session opens before a long gap — and a survivor is
+  converged by the pre-market-open sweep on the first Extended scan after 04:00
+  ET, or failing that by the regular-open sweep at 09:30, hours before any
+  flatten window opens. An overnight matcher here would be dead code with its
+  own bug surface.
 - Every extended-hours hedge resolves its reference through one ordered chain:
   an optional current bid/ask market-data source, then the **position mark**,
   then the emergency delayed quote described below. Buys use the ask when the
