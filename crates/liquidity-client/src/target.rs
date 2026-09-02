@@ -1,9 +1,8 @@
 //! Target resolution: reads each environment's base URL and auth inputs from
 //! the process environment and validates them into a `Target`.
 
-use std::time::Duration;
-
 use anyhow::{Context, Result};
+use std::time::Duration;
 use url::Url;
 
 /// Deployment the client talks to. Selects the IAP-fronted API base URL and the
