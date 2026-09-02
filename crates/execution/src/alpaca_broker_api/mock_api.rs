@@ -199,6 +199,20 @@ pub fn overnight_weeknight_calendar(today: NaiveDate) -> Vec<CalendarEntry> {
     ]
 }
 
+/// A non-trading evening whose next calendar day trades.
+///
+/// The calendar carries only `next_trading_day` (a Monday, typically),
+/// so an evening query on the day before finds no entry for itself and
+/// classifies Overnight from the D+1 predicate alone. Covers both the
+/// ordinary Sunday open and the DST-transition Sunday (US transitions
+/// land on Sundays at 02:00 ET, so no session ever spans a shift -- the
+/// DST-specific fact is classifying the evening correctly under the NEW
+/// UTC offset, which this shape drives when anchored on a transition
+/// date).
+pub fn sunday_open_calendar(next_trading_day: NaiveDate) -> Vec<CalendarEntry> {
+    vec![normal_trading_day(next_trading_day)]
+}
+
 /// A Friday shape anchored on `friday`: the next trading day is the
 /// following Monday, so the post-close gap classifies MultiDayClosure and
 /// Friday's evening stays Closed (no overnight before a long gap).
@@ -1225,7 +1239,7 @@ fn register_calendar_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>
     let state = Arc::clone(state);
     server.mock(|when, then| {
         when.method(GET).path("/v1/calendar");
-        then.respond_with(move |_request: &HttpMockRequest| {
+        then.respond_with(move |request: &HttpMockRequest| {
             let mut state = lock(&state);
 
             if state.calendar_failures_remaining > 0 {
@@ -1237,9 +1251,36 @@ fn register_calendar_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>
                 );
             }
 
+            // Honor the start/end query window the way the real endpoint
+            // does: the client REJECTS responses carrying entries outside
+            // its requested window (a broken-calendar guard), so serving a
+            // multi-day fixture unfiltered would poison every query whose
+            // window covers only part of it. ISO dates compare
+            // lexicographically, so plain string bounds suffice.
+            let uri = request.uri();
+            let query = uri.query().unwrap_or("");
+            let mut window_start: Option<String> = None;
+            let mut window_end: Option<String> = None;
+            for pair in query.split('&') {
+                if let Some(value) = pair.strip_prefix("start=") {
+                    window_start = Some(value.to_string());
+                }
+                if let Some(value) = pair.strip_prefix("end=") {
+                    window_end = Some(value.to_string());
+                }
+            }
+
             let entries: Vec<Value> = state
                 .calendar_entries
                 .iter()
+                .filter(|entry| {
+                    window_start
+                        .as_ref()
+                        .is_none_or(|start| entry.date.as_str() >= start.as_str())
+                        && window_end
+                            .as_ref()
+                            .is_none_or(|end| entry.date.as_str() <= end.as_str())
+                })
                 .map(|entry| {
                     json!({
                         "date": entry.date,
@@ -3283,6 +3324,47 @@ mod tests {
         assert_eq!(recovered.status().as_u16(), 200);
         let body: serde_json::Value = recovered.json().await.unwrap();
         assert_eq!(body["quote"]["ap"], serde_json::json!("24.30"));
+    }
+
+    #[tokio::test]
+    async fn calendar_endpoint_filters_by_the_requested_window() {
+        // The client rejects responses carrying entries outside its query
+        // window, so a multi-day fixture must be served filtered: a
+        // Wednesday query against a [Tuesday, Wednesday] fixture gets only
+        // Wednesday.
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        mock.set_calendar_entries(overnight_weeknight_calendar(
+            NaiveDate::from_ymd_opt(2026, 9, 8).unwrap(),
+        ));
+
+        let client = reqwest::Client::new();
+        let body: serde_json::Value = client
+            .get(format!(
+                "{}/v1/calendar?start=2026-09-09&end=2026-09-10",
+                mock.base_url()
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let dates: Vec<&str> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["date"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            dates,
+            vec!["2026-09-09"],
+            "only entries inside the requested window may be served"
+        );
     }
 
     #[test]

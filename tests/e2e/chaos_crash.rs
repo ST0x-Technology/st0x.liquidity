@@ -534,7 +534,7 @@ async fn crash_mid_accounting_job_recovers_the_fill_after_restart() -> anyhow::R
 /// its acknowledgement is still in flight. Returns on the first recorded
 /// order so a double-submit surfaces via the caller's exact-count
 /// assertion rather than as a misleading poll timeout here.
-async fn poll_for_recorded_broker_order(
+pub(crate) async fn poll_for_recorded_broker_order(
     bot: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
     broker: &st0x_execution::alpaca_broker_api::AlpacaBrokerMock,
 ) {
