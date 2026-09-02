@@ -573,6 +573,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_execution_readiness_returns_none_when_closed_despite_overnight_enabled() {
+        // Friday and pre-holiday 20:00 ET classify as Closed (no overnight
+        // session before a long gap, RAI-1945): the overnight opt-in must
+        // not open a path to placement when the session machinery says the
+        // venue is closed.
+        let pool = setup_test_db().await;
+        let (store, query) = create_test_position_infra(&pool).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        initialize_position_with_fill(
+            &store,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let executor = MockExecutor::new().with_market_closed();
+
+        let result = check_execution_readiness(
+            &executor,
+            &query,
+            &symbol,
+            SupportedExecutor::DryRun,
+            &assets_with_overnight(&symbol, true),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.is_none(),
+            "a Closed session (Friday/pre-holiday 20:00) must defer even for an \
+             overnight-enabled symbol"
+        );
+    }
+
+    #[tokio::test]
     async fn check_execution_readiness_returns_none_in_extended_session_with_only_overnight() {
         let pool = setup_test_db().await;
         let (store, query) = create_test_position_infra(&pool).await;

@@ -296,6 +296,12 @@ where
         if ctx.ctx.assets.any_extended_hours_enabled() || ctx.ctx.assets.any_overnight_enabled() {
             match ctx.executor.market_session().await {
                 Ok(MarketSession::Extended) => {
+                    // Deliberately NOT gated on `any_overnight_enabled()`: a
+                    // full overnight rollback (every symbol flipped back to
+                    // disabled) must still converge the survivors it strands,
+                    // and the sweep makes no broker call when nothing
+                    // matches. Its per-symbol filter scopes the rest.
+                    ctx.request_overnight_session_boundary_cancellations().await;
                     if ctx.ctx.assets.any_extended_hours_enabled() {
                         ctx.request_extended_hours_close_flatten_cancellations(
                             &mut close_flatten_window_cache,
@@ -307,14 +313,15 @@ where
                 }
                 Ok(MarketSession::Regular) => {
                     // Every regular-hours tick: request cancellation of
-                    // still-live extended-hours limit orders so they're
-                    // replaced with market orders. Level-triggered so an order
-                    // that slipped past the session boundary, survived a
-                    // restart, or whose cancellation request failed on a
-                    // previous tick is caught on this one.
-                    if ctx.ctx.assets.any_extended_hours_enabled() {
-                        ctx.request_extended_hours_cancellations().await;
-                    }
+                    // still-live extended-hours and overnight limit orders so
+                    // they're replaced with market orders. Level-triggered so
+                    // an order that slipped past the session boundary,
+                    // survived a restart, or whose cancellation request
+                    // failed on a previous tick is caught on this one.
+                    // Ungated within the arm for the same rollback reasoning
+                    // as the pre-market boundary sweep: the outer gate is
+                    // already the sweep's exact condition.
+                    ctx.request_market_open_cancellations().await;
                 }
                 Ok(MarketSession::Overnight) => {
                     if ctx.ctx.assets.any_overnight_enabled() {
@@ -950,10 +957,11 @@ where
     }
 
     /// While the market is in regular hours, requests broker cancellation of
-    /// any still-live extended-hours limit orders so they can be replaced
-    /// with market orders on a subsequent scan. Only symbols with
-    /// extended-hours counter-trading enabled in the per-asset config are
-    /// swept; orders for disabled symbols are left untouched.
+    /// any still-live extended-hours or overnight limit orders so they can
+    /// be replaced with market orders on a subsequent scan. Only symbols
+    /// with extended-hours or overnight counter-trading enabled in the
+    /// per-asset config are swept; orders for symbols with every session
+    /// flag disabled are left to the ops rollback procedure.
     ///
     /// Level-triggered: the sweep runs on every regular-hours tick rather than
     /// only on an observed session transition. Idempotency comes from the
@@ -970,7 +978,7 @@ where
     /// `Cancelling`); the poller drives it terminal and
     /// [`Self::finalize_terminal_pending_positions`] clears the position on a
     /// later tick.
-    async fn request_extended_hours_cancellations(&self) {
+    async fn request_market_open_cancellations(&self) {
         let all_positions = match self.position_projection.load_all().await {
             Ok(positions) => positions,
             Err(error) => {
@@ -980,7 +988,9 @@ where
         };
 
         for (symbol, position) in &all_positions {
-            if !self.ctx.assets.is_extended_hours_enabled(symbol) {
+            if !(self.ctx.assets.is_extended_hours_enabled(symbol)
+                || self.ctx.assets.is_overnight_enabled(symbol))
+            {
                 continue;
             }
 
@@ -1015,22 +1025,21 @@ where
                 continue;
             }
 
-            // Only live extended-hours orders need cancelling. Terminal orders
-            // are handled by finalize_terminal_pending_positions, and orders
-            // already Cancelling are awaiting the poller's confirmation -- both
-            // are skipped here, which is what makes the every-tick sweep
-            // idempotent. Orders recorded with an Overnight session are
-            // deliberately skipped too: none can exist before the automated
-            // overnight placement path lands, and whether a live overnight
-            // limit at the regular open gets replaced is decided with that
-            // path, not defaulted here.
+            // Only live extended-hours and overnight orders need cancelling:
+            // any limit surviving into regular hours converges to the
+            // regular market-order behavior (SPEC "Session boundaries").
+            // Terminal orders are handled by
+            // finalize_terminal_pending_positions, and orders already
+            // Cancelling are awaiting the poller's confirmation -- both are
+            // skipped here, which is what makes the every-tick sweep
+            // idempotent.
             match &order {
                 OffchainOrder::Submitted {
-                    market_session: MarketSession::Extended,
+                    market_session: MarketSession::Extended | MarketSession::Overnight,
                     ..
                 }
                 | OffchainOrder::PartiallyFilled {
-                    market_session: MarketSession::Extended,
+                    market_session: MarketSession::Extended | MarketSession::Overnight,
                     ..
                 } => {}
                 OffchainOrder::Submitted { .. }
@@ -1163,6 +1172,32 @@ where
             "overnight reprice timeout",
             |symbol| self.ctx.assets.is_overnight_enabled(symbol),
             |order| live_overnight_order_is_stale(order, now, timeout),
+        )
+        .await;
+    }
+
+    /// At/after the 04:00 ET pre-market open, cancels every still-live
+    /// overnight limit order: it is stale by regime, not by age -- the
+    /// indicative feed that priced it no longer governs the venue -- so no
+    /// timeout applies. The released position reprices from the
+    /// extended-hours reference chain on a later scan; cancel-before-replace
+    /// holds because a replacement only places after the poller confirms the
+    /// cancellation and the position releases.
+    ///
+    /// The per-symbol filter accepts either session flag: an overnight-only
+    /// symbol's survivor must still be cancelled (its released exposure then
+    /// waits for a session it may trade in), and a symbol whose overnight
+    /// flag was disabled mid-flight is still converged when its extended
+    /// flag remains on.
+    async fn request_overnight_session_boundary_cancellations(&self) {
+        self.sweep_live_orders_for_cancellation(
+            CancellationReason::PreMarketOpenReplacement,
+            "pre-market open replacement",
+            |symbol| {
+                self.ctx.assets.is_overnight_enabled(symbol)
+                    || self.ctx.assets.is_extended_hours_enabled(symbol)
+            },
+            |order| live_overnight_order_placed_at(order).is_some(),
         )
         .await;
     }
@@ -1574,7 +1609,7 @@ mod tests {
         OrderPlacementResult, PollOrderStatus, ReconcileOrderFillJobQueue,
     };
     use crate::position::{PositionCommand, TradeId};
-    use crate::test_utils::{TEST_POLL_INTERVAL, setup_test_pools};
+    use crate::test_utils::{TEST_POLL_INTERVAL, eligible_overnight_snapshot, setup_test_pools};
 
     async fn build_ctx(
         pool: SqlitePool,
@@ -2194,17 +2229,7 @@ mod tests {
                     client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
                     kind: CounterTradeOrderKind::OvernightLimit {
                         limit_price,
-                        snapshot: st0x_execution::EligibilitySnapshot {
-                            synced_at: chrono::Utc::now(),
-                            details: st0x_execution::AssetDetails {
-                                status: st0x_execution::alpaca_broker_api::AssetStatus::Active,
-                                tradable: true,
-                                fractionable: Some(true),
-                                fractional_eh_enabled: Some(true),
-                                overnight_tradable: Some(true),
-                                overnight_halted: Some(false),
-                            },
-                        },
+                        snapshot: eligible_overnight_snapshot(),
                     },
                     placed_at,
                 },
@@ -2571,6 +2596,782 @@ mod tests {
             reason,
             CancellationReason::MarketOpenReplacement,
             "the sweep must not overwrite an in-flight cancellation's reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_order_is_cancelled_at_the_pre_market_open() {
+        // Only ten seconds old, far inside any reprice cadence: an overnight
+        // limit observed during the Extended session is stale by REGIME, so
+        // the boundary sweep cancels it unconditionally. The overnight_ctx
+        // has extended hours disabled, which also pins that an
+        // overnight-only symbol's survivor is swept.
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = overnight_ctx(&["AAPL"]);
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Extended)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-ovn-1"),
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_overnight_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            chrono::Utc::now() - chrono::Duration::seconds(10),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let order = ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        let OffchainOrder::Cancelling { reason, .. } = order else {
+            panic!("an overnight order past 04:00 must be cancelling, got: {order:?}");
+        };
+        assert_eq!(reason, CancellationReason::PreMarketOpenReplacement);
+
+        let rendered = metrics_handle.render();
+        assert!(
+            rendered.contains("hedge_cancellations_requested_total{")
+                && rendered.contains("reason=\"pre_market_open_replacement\""),
+            "the boundary cancel request must be counted with its reason, in:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_market_boundary_sweep_ignores_extended_session_orders() {
+        // The boundary sweep converges only orders the overnight feed
+        // priced; an extended-hours order during the Extended session is in
+        // its own regime and belongs to the extended cadences.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = overnight_ctx(&["AAPL"]);
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Extended)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-eh-1"),
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_extended_hours_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            chrono::Utc::now() - chrono::Duration::seconds(3_000),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let order = ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        assert!(
+            matches!(order, OffchainOrder::Submitted { .. }),
+            "the pre-market boundary sweep must not touch extended-session orders, got: {order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_survivor_of_a_disabled_symbol_is_converged_at_pre_market() {
+        // Full overnight rollback: the symbol's overnight flag is off again
+        // (dry_run_ctx enables only extended hours) while its overnight
+        // order is still live. The boundary sweep runs ungated and the
+        // per-symbol filter accepts the extended flag, so the stranded
+        // survivor still converges instead of waiting for a manual cancel.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Extended)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-ovn-1"),
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_overnight_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            chrono::Utc::now() - chrono::Duration::seconds(10),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let order = ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        let OffchainOrder::Cancelling { reason, .. } = order else {
+            panic!("a rollback-stranded overnight order must still converge, got: {order:?}");
+        };
+        assert_eq!(reason, CancellationReason::PreMarketOpenReplacement);
+    }
+
+    #[tokio::test]
+    async fn pre_market_cancel_converges_to_an_extended_hours_rehedge() {
+        // The full 04:00 loop the SPEC promises: boundary cancel (tick 1),
+        // the poller's cancellation confirmation, then release and re-hedge
+        // on a later tick -- with the replacement enqueued only after the
+        // original went terminal (cancel-before-replace), carrying the
+        // Extended session so the job prices from the extended-hours chain.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Extended)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-ovn-1"),
+                })
+                .with_inventory(Inventory {
+                    positions: vec![st0x_execution::EquityPosition {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        quantity: FractionalShares::new(float!(10.0)),
+                        market_value: None,
+                    }],
+                    usd_balance_cents: 1_000_000,
+                    cash_buying_power_cents: Some(1_000_000),
+                    alpaca_usdc: None,
+                    cash_withdrawable_cents: None,
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_overnight_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            chrono::Utc::now() - chrono::Duration::seconds(10),
+        )
+        .await;
+
+        // Tick 1: the boundary sweep requests the cancel; the position stays
+        // claimed, so no replacement is enqueued yet.
+        CheckPositions::default().perform(&ctx).await.unwrap();
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            0,
+            "no replacement may exist while the original order is still live"
+        );
+
+        // The poller observes the broker cancellation and confirms it.
+        ctx.offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::ConfirmCancellation {
+                    filled_shares: FractionalShares::ZERO,
+                    cancelled_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Tick 2: finalization releases the position, and the same tick's
+        // scan re-hedges it for the Extended session.
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            1,
+            "the released exposure must be re-hedged on the next scan"
+        );
+        let job_bytes: Vec<u8> =
+            sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE job_type = ?")
+                .bind(hedge_job_type())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        let job: PlaceHedge = serde_json::from_slice(&job_bytes).unwrap();
+        assert_eq!(
+            job.market_session,
+            MarketSession::Extended,
+            "the replacement must carry the Extended session so it prices from the \
+             extended-hours chain, not the overnight feed"
+        );
+    }
+
+    #[tokio::test]
+    async fn regular_tick_converges_a_surviving_overnight_order() {
+        // The 09:30 policy: any limit surviving into regular hours converges
+        // to the regular market-order behavior, overnight orders included.
+        // The overnight_ctx has extended hours disabled, so this also pins
+        // the widened per-symbol filter -- an overnight-only symbol's
+        // survivor must not be skipped by the old extended-hours-only check.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = overnight_ctx(&["AAPL"]);
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Regular)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-ovn-1"),
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_overnight_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            chrono::Utc::now() - chrono::Duration::seconds(10),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let order = ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        let OffchainOrder::Cancelling { reason, .. } = order else {
+            panic!("an overnight order surviving into regular hours must converge, got: {order:?}");
+        };
+        assert_eq!(reason, CancellationReason::MarketOpenReplacement);
+    }
+
+    #[tokio::test]
+    async fn market_open_cancel_converges_to_a_regular_market_order_rehedge() {
+        // The full 09:30 loop for an overnight-only symbol: the sweep
+        // cancels the survivor, the poller confirms, and the next tick
+        // re-hedges the released exposure -- regular-hours readiness gates
+        // only on the `trading` flag, so the overnight-only symbol still
+        // converges to the regular market-order behavior SPEC promises.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = overnight_ctx(&["AAPL"]);
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Regular)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-ovn-1"),
+                })
+                .with_inventory(Inventory {
+                    positions: vec![st0x_execution::EquityPosition {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        quantity: FractionalShares::new(float!(10.0)),
+                        market_value: None,
+                    }],
+                    usd_balance_cents: 1_000_000,
+                    cash_buying_power_cents: Some(1_000_000),
+                    alpaca_usdc: None,
+                    cash_withdrawable_cents: None,
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_overnight_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            chrono::Utc::now() - chrono::Duration::seconds(10),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            0,
+            "no replacement may exist while the original order is still live"
+        );
+
+        ctx.offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::ConfirmCancellation {
+                    filled_shares: FractionalShares::ZERO,
+                    cancelled_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            1,
+            "the released exposure must be re-hedged on the next regular-hours scan"
+        );
+        let job_bytes: Vec<u8> =
+            sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE job_type = ?")
+                .bind(hedge_job_type())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        let job: PlaceHedge = serde_json::from_slice(&job_bytes).unwrap();
+        assert_eq!(
+            job.market_session,
+            MarketSession::Regular,
+            "the replacement must carry the Regular session so it places as a market order"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_auto_cancel_at_2000_converges_to_an_overnight_rehedge() {
+        // The 20:00 entry: Alpaca cancels unfilled day orders at 20:00, and
+        // the bot never assumes it -- the poller observes the broker-side
+        // cancellation (recorded here via MarkUnrequestedCancellation, the
+        // command that observation lands as), the position releases, and the
+        // next Overnight tick re-hedges through the overnight path. Until
+        // the terminal observation arrives, the claim holds and no
+        // replacement exists.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let mut cfg = overnight_ctx(&["AAPL"]);
+        // The surviving day order is an extended-hours limit from the prior
+        // cycle, so the symbol legitimately has both flags on.
+        cfg.assets
+            .equities
+            .symbols
+            .get_mut(&Symbol::new("AAPL").unwrap())
+            .unwrap()
+            .extended_hours_counter_trading = OperationMode::Enabled;
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Overnight)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-eh-1"),
+                })
+                .with_inventory(Inventory {
+                    positions: vec![st0x_execution::EquityPosition {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        quantity: FractionalShares::new(float!(10.0)),
+                        market_value: None,
+                    }],
+                    usd_balance_cents: 1_000_000,
+                    cash_buying_power_cents: Some(1_000_000),
+                    alpaca_usdc: None,
+                    cash_withdrawable_cents: None,
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_extended_hours_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            chrono::Utc::now() - chrono::Duration::seconds(3_000),
+        )
+        .await;
+
+        // Overnight tick while the broker cancellation is still unobserved:
+        // the claim holds, nothing is enqueued, and no sweep touches the
+        // extended-session order.
+        CheckPositions::default().perform(&ctx).await.unwrap();
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            0,
+            "a lagging broker cancellation must delay the overnight hedge, never double it"
+        );
+
+        // The poller observes the broker's 20:00 auto-cancel: no local
+        // cancel request exists, so it lands as an unrequested cancellation.
+        ctx.offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::MarkUnrequestedCancellation {
+                    filled_shares: FractionalShares::ZERO,
+                    cancelled_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Next Overnight tick: finalization releases, the scan re-hedges.
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            1,
+            "released exposure must re-hedge once the auto-cancel is observed"
+        );
+        let job_bytes: Vec<u8> =
+            sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE job_type = ?")
+                .bind(hedge_job_type())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        let job: PlaceHedge = serde_json::from_slice(&job_bytes).unwrap();
+        assert_eq!(
+            job.market_session,
+            MarketSession::Overnight,
+            "the re-hedge must go through the overnight path"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_into_extended_hours_cancels_live_overnight_order() {
+        // Crash-resume across the 04:00 boundary: the process died before
+        // the boundary sweep could run, and the first scan after the restart
+        // observes Extended. The level-triggered sweep needs no remembered
+        // transition -- it converges the survivor from persisted state alone.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = overnight_ctx(&["AAPL"]);
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Extended)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-ovn-1"),
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_overnight_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            chrono::Utc::now() - chrono::Duration::seconds(3_000),
+        )
+        .await;
+
+        // Simulate the restart: a fresh CheckPositionsCtx over the same
+        // persisted state, as the first post-restart tick would have.
+        drop(ctx);
+        let restarted_cfg = overnight_ctx(&["AAPL"]);
+        let (restarted_ctx, _) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool.clone(),
+            restarted_cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Extended)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-ovn-1"),
+                }),
+        )
+        .await;
+
+        CheckPositions::default()
+            .perform(&restarted_ctx)
+            .await
+            .unwrap();
+
+        let order = restarted_ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        assert!(
+            matches!(
+                order,
+                OffchainOrder::Cancelling {
+                    reason: CancellationReason::PreMarketOpenReplacement,
+                    ..
+                }
+            ),
+            "restart catch-up must converge a surviving overnight order, got: {order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_cancel_request_is_retried_on_the_next_tick() {
+        // Level-triggered crash/failure safety: a cancel request that dies at
+        // the broker leaves the order Submitted, and the next tick's sweep
+        // re-derives the same work from persisted state -- no boundary or
+        // cadence decision is lost with the failed call.
+        struct FlakyCancelPlacer {
+            attempts: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl OrderPlacer for FlakyCancelPlacer {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("the sweep must never place orders")
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("the sweep must never place orders")
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err("broker 500 on cancel".into());
+                }
+                Ok(CancellationOutcome::Requested)
+            }
+
+            async fn get_order_status(
+                &self,
+                executor_order_id: &ExecutorOrderId,
+            ) -> Result<st0x_execution::OrderState, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::OrderState::Submitted {
+                    order_id: executor_order_id.clone(),
+                })
+            }
+        }
+
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = overnight_ctx(&["AAPL"]);
+        let placer = Arc::new(FlakyCancelPlacer {
+            attempts: AtomicUsize::new(0),
+        });
+        let (ctx, position) = build_ctx_with_order_placer(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new().with_market_session(MarketSession::Overnight),
+            placer.clone(),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_overnight_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            chrono::Utc::now() - chrono::Duration::seconds(3_000),
+        )
+        .await;
+
+        // Tick 1: the sweep attempts the cancel and the broker call fails;
+        // the order must remain live rather than half-cancelled.
+        CheckPositions::default().perform(&ctx).await.unwrap();
+        assert_eq!(
+            placer.attempts.load(Ordering::SeqCst),
+            1,
+            "the first tick must have attempted the broker cancel"
+        );
+        let order = ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        assert!(
+            matches!(order, OffchainOrder::Submitted { .. }),
+            "a failed cancel request must leave the order Submitted, got: {order:?}"
+        );
+
+        // Tick 2: level-triggered, the sweep re-requests and succeeds.
+        CheckPositions::default().perform(&ctx).await.unwrap();
+        let order = ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        assert!(
+            matches!(
+                order,
+                OffchainOrder::Cancelling {
+                    reason: CancellationReason::OvernightRepriceTimeout,
+                    ..
+                }
+            ),
+            "the next tick must retry the failed cancel request, got: {order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_tick_leaves_overnight_orders_untouched() {
+        // A Closed tick sweeps nothing: no session's limit can be repriced
+        // into a closed venue, and the 20:00 entry relies on the broker's
+        // day-order auto-cancel observed by the poller, not a sweep.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = overnight_ctx(&["AAPL"]);
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_closed()
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-ovn-1"),
+                }),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_overnight_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            chrono::Utc::now() - chrono::Duration::seconds(3_000),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let order = ctx
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("order should exist");
+        assert!(
+            matches!(order, OffchainOrder::Submitted { .. }),
+            "a Closed tick must not cancel a live overnight order, got: {order:?}"
         );
     }
 
