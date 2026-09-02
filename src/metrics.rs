@@ -21,12 +21,13 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
 
     metrics::describe_counter!(
         "hedge_trades_total",
-        "Hedge orders placed, by symbol and direction"
+        "Hedge orders placed, by symbol, direction, and session \
+         (regular/extended/overnight)"
     );
     metrics::describe_histogram!(
         "hedge_fill_latency_seconds",
         metrics::Unit::Seconds,
-        "Wall-clock time from order placement to confirmed fill, by symbol"
+        "Wall-clock time from order placement to confirmed fill, by symbol and session"
     );
     metrics::describe_gauge!(
         "position_shares",
@@ -38,7 +39,7 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
     );
     metrics::describe_counter!(
         "broker_errors_total",
-        "Broker API errors, by symbol and kind"
+        "Broker API errors, by symbol, kind, and the session the order targeted"
     );
     metrics::describe_counter!(
         "close_flatten_attempts_total",
@@ -69,8 +70,15 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
     );
     metrics::describe_counter!(
         "hedge_scan_skipped_total",
-        "Extended-hours buys the position scan dropped because reference-price resolution or \
-         crossing failed before enqueueing a hedge job, by symbol and cause"
+        "Extended-hours and overnight buys the position scan dropped because a session gate, \
+         reference-price resolution, or crossing failed before enqueueing a hedge job, by \
+         symbol, session, and cause"
+    );
+    metrics::describe_counter!(
+        "hedge_cancellations_requested_total",
+        "Cancel requests issued by the maintenance sweeps against live limit orders, by \
+         symbol, session, and reason (reprice timeouts, session-boundary replacements, \
+         close flatten, unrequested)"
     );
     metrics::describe_counter!(
         "hedge_dead_lettered_total",
@@ -133,8 +141,13 @@ mod tests {
     fn rendered_output_surfaces_an_incremented_counter() {
         let handle = setup().expect("setup installs the recorder");
 
-        metrics::counter!("hedge_trades_total", "symbol" => "AAPL", "direction" => "buy")
-            .increment(1);
+        metrics::counter!(
+            "hedge_trades_total",
+            "symbol" => "AAPL",
+            "direction" => "buy",
+            "session" => "regular"
+        )
+        .increment(1);
 
         let rendered = handle.render();
         assert!(
