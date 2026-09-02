@@ -273,6 +273,7 @@ mod tests {
 
         HedgingAssets {
             equities: HedgedEquities {
+                retired_symbols: Vec::new(),
                 symbols: HashMap::from([(
                     symbol.clone(),
                     EquityHedgePolicy {

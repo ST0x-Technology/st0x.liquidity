@@ -28,6 +28,10 @@ hedge_order_gate_reconciliation_timeout_secs = 10
 [pricing]
 ws_url = "ws://st0x-pricing:8080/ws"
 
+# Per-equity hedging policy.
+[assets.equities]
+retired_symbols = []
+
 # On-chain orderbook settings (same Rain Orderbook on Base as the bot).
 [assets.equities.SGOV]
 extended_hours_counter_trading = "disabled"

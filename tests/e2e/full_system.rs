@@ -170,6 +170,7 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
         })
         .hedging(HedgingAssets {
             equities: HedgedEquities {
+                retired_symbols: Vec::new(),
                 symbols: equity_tokens
                     .iter()
                     .map(|(symbol, _, _)| {

@@ -332,7 +332,20 @@ pub(crate) enum UnwrappedEquityRecovery {
 }
 
 impl UnwrappedEquityRecovery {
-    pub(super) fn is_terminal(&self) -> bool {
+    pub(crate) fn symbol(&self) -> &Symbol {
+        match self {
+            Self::Detected { symbol, .. }
+            | Self::DispatchedToMint { symbol, .. }
+            | Self::DispatchedToRedemption { symbol, .. }
+            | Self::OrphanWrapSubmitted { symbol, .. }
+            | Self::OrphanWrapped { symbol, .. }
+            | Self::OrphanDepositSubmitted { symbol, .. }
+            | Self::OrphanDeposited { symbol, .. }
+            | Self::Failed { symbol, .. } => symbol,
+        }
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
         match self {
             Self::DispatchedToMint { .. }
             | Self::DispatchedToRedemption { .. }

@@ -1595,6 +1595,7 @@ mod tests {
 
         HedgingAssets {
             equities: HedgedEquities {
+                retired_symbols: Vec::new(),
                 symbols: std::iter::once((
                     Symbol::new(symbol).unwrap(),
                     EquityHedgePolicy {

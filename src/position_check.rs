@@ -1626,6 +1626,7 @@ mod tests {
 
         let hedging = HedgingAssets {
             equities: HedgedEquities {
+                retired_symbols: Vec::new(),
                 symbols: equity_symbols
                     .keys()
                     .map(|symbol| {

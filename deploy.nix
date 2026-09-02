@@ -86,6 +86,7 @@ let
         stagedSecretPath = "/run/st0x/${name}.secrets.staged";
         validateCommand = "${cfg.profilePath}/bin/validate-config --config ${stagedConfigPath} --secrets ${stagedSecretPath}";
         verifyApprovalsCommand = "${cfg.profilePath}/bin/verify-approvals --config ${stagedConfigPath} --secrets ${stagedSecretPath}";
+        verifyMigrationsCommand = "if [ -f /mnt/data/${name}.db ]; then ${cfg.profilePath}/bin/verify-migrations --db /mnt/data/${name}.db --config ${stagedConfigPath}; else ${cfg.profilePath}/bin/verify-migrations --config ${stagedConfigPath}; fi";
         readinessPrerequisiteCommand = ''
           if ! systemctl show --property Environment --value ${name} 2>/dev/null \
             | grep --fixed-strings --quiet 'ST0X_STARTUP_READY_FILE=${startupReadyFile}'; then
@@ -134,9 +135,10 @@ let
           # embedded migrations plus an aggregate replay check against the
           # copy, never touching the real one. Catches both broken migration
           # SQL and legacy prod events that no longer deserialize under the
-          # code being deployed. Skipped on first deploy, before the DB
-          # exists. Same rollback behavior as validate-config on failure.
-          "if [ -f /mnt/data/${name}.db ]; then ${cfg.profilePath}/bin/verify-migrations --db /mnt/data/${name}.db; fi"
+          # code being deployed. On first deploy, before the DB exists, it
+          # still rejects stale retirement exceptions against empty state.
+          # Same rollback behavior as validate-config on failure.
+          verifyMigrationsCommand
           "(chown st0x:st0x /mnt/data/*.db /mnt/data/*.db-wal /mnt/data/*.db-shm /mnt/data/*.db-journal 2>/dev/null || true)"
           "(chown -R st0x:st0x /mnt/data/logs 2>/dev/null || true)"
           "echo '${gitRev}' > /run/st0x/${name}.git-rev"
@@ -158,6 +160,11 @@ let
             "st0x activation must verify the systemd readiness environment before stopping the service";
           assert lib.assertMsg (builtins.elem verifyApprovalsCommand beforeStopCommands)
             "st0x activation must verify Turnkey approval policies before stopping the service";
+          assert lib.assertMsg (
+            builtins.elem verifyMigrationsCommand afterStopCommands
+            && lib.hasInfix "--config ${stagedConfigPath}" verifyMigrationsCommand
+            && lib.hasInfix "else ${cfg.profilePath}/bin/verify-migrations --config" verifyMigrationsCommand
+          ) "st0x activation must compare durable symbols with the staged candidate config";
           assert lib.assertMsg (
             stopCommand == "systemctl stop ${name}"
           ) "st0x activation must stop the running service successfully before installing candidate files";
