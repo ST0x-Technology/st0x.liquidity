@@ -7411,37 +7411,6 @@ mod tests {
     }
 
     #[test]
-    fn staging_gcp_config_toml_is_valid() {
-        let config_str = include_str!("../../../config/staging-gcp/st0x-hedge.toml");
-        let config: Config = toml::from_str(config_str).unwrap();
-
-        let broker = config
-            .broker
-            .expect("staging-gcp config must include the [broker] section");
-
-        broker
-            .counter_trade_slippage_bps
-            .expect("staging-gcp config must set [broker].counter_trade_slippage_bps");
-        broker
-            .close_flatten_cross_max_bps
-            .expect("staging-gcp config must set [broker].close_flatten_cross_max_bps");
-        broker
-            .extended_hours_reprice_timeout_secs
-            .expect("staging-gcp config must set [broker].extended_hours_reprice_timeout_secs");
-        broker
-            .close_flatten_reprice_timeout_secs
-            .expect("staging-gcp config must set [broker].close_flatten_reprice_timeout_secs");
-        broker.extended_hours_close_flatten_window_secs.expect(
-            "staging-gcp config must set [broker].extended_hours_close_flatten_window_secs",
-        );
-        broker
-            .travel_rule
-            .expect("staging-gcp config must include [broker.travel_rule]")
-            .validated()
-            .unwrap();
-    }
-
-    #[test]
     fn s01_issuer_config_toml_is_valid() {
         let config_str = include_str!("../../../config/s01-issuer.toml");
         let config: Config = toml::from_str(config_str).unwrap();
