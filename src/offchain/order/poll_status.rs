@@ -1655,7 +1655,8 @@ mod tests {
     };
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::test_utils::{
-        OnchainTradeBuilder, TEST_POLL_INTERVAL, setup_file_backed_test_db, setup_test_pools,
+        OnchainTradeBuilder, TEST_POLL_INTERVAL, eligible_overnight_snapshot,
+        setup_file_backed_test_db, setup_test_pools,
     };
 
     struct TestInfra<E: Executor + Clone + Send + Sync + 'static> {
@@ -2413,6 +2414,154 @@ mod tests {
             count_jobs(&infra.apalis_pool, handle_order_rejection_job_type()).await,
             0,
             "Broker-side cancellation must NOT be misclassified as a failure"
+        );
+
+        assert_position_released_without_fill(&infra, &symbol, &order).await;
+    }
+
+    /// Submits an overnight limit order end-to-end through the command path,
+    /// so poll-layer tests can drive an Overnight-session order: the
+    /// overnight sibling of [`submit_offchain_order`].
+    async fn submit_overnight_offchain_order<E: Executor + Clone + Send + Sync + 'static>(
+        infra: &TestInfra<E>,
+        symbol: &Symbol,
+        tokenized_symbol: &str,
+        shares: Positive<FractionalShares>,
+        accepted_executor_order_id: ExecutorOrderId,
+    ) -> OffchainOrderId {
+        let onchain = OnchainTradeBuilder::new()
+            .with_symbol(tokenized_symbol)
+            .with_amount(shares.inner().inner())
+            .build();
+        let trade_id = TradeId {
+            tx_hash: onchain.tx_hash,
+            log_index: onchain.log_index,
+        };
+
+        infra
+            .position
+            .send(
+                symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id,
+                    amount: onchain.amount,
+                    direction: Direction::Buy,
+                    price_usdc: onchain.price.value(),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let offchain_order_id = OffchainOrderId::new();
+
+        infra
+            .position
+            .send(
+                symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let limit_price = Positive::new(Usd::new(float!(195.25))).unwrap();
+        infra
+            .offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::OvernightLimit {
+                        limit_price,
+                        snapshot: eligible_overnight_snapshot(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        infra
+            .offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::MarkAccepted {
+                    executor_order_id: accepted_executor_order_id,
+                    placed_shares: shares,
+                    submitted_at: Utc::now(),
+                    is_extended_hours: true,
+                    limit_price: Some(limit_price),
+                },
+            )
+            .await
+            .unwrap();
+
+        offchain_order_id
+    }
+
+    /// The overnight twin of the manual-cancel recovery above: an
+    /// operator/broker-side cancellation of a live overnight order (no local
+    /// cancel request) must land terminal Cancelled with the Overnight
+    /// session retained, release the position, and never be misclassified
+    /// as a rejection.
+    #[tokio::test]
+    async fn poll_with_cancelled_broker_resolves_an_overnight_order_without_local_request() {
+        let cancelled_at = Utc::now();
+        let executor = MockExecutor::new().with_order_status(OrderState::Cancelled {
+            cancelled_at,
+            order_id: ExecutorOrderId::new("noop"),
+            shares_filled: FractionalShares::ZERO,
+            avg_price: None,
+        });
+        let infra = build_test_infra(executor).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id = submit_overnight_offchain_order(
+            &infra,
+            &symbol,
+            "wtAAPL",
+            shares,
+            ExecutorOrderId::new("TEST:test-accept:2"),
+        )
+        .await;
+        // No CancelOrder command: the local order is still Submitted.
+
+        PollOrderStatus {
+            offchain_order_id: order_id,
+            backpressure_streak: BackpressureStreak::default(),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let order = infra.offchain_order.load(&order_id).await.unwrap().unwrap();
+        let OffchainOrder::Cancelled { market_session, .. } = &order else {
+            panic!(
+                "a broker-confirmed cancellation must become terminal Cancelled even \
+                 without a surviving local cancel request, got: {order:?}"
+            );
+        };
+        assert_eq!(
+            *market_session,
+            st0x_execution::MarketSession::Overnight,
+            "the terminal state must keep the session the accounting attributes it to"
+        );
+        assert_eq!(
+            count_jobs(&infra.apalis_pool, handle_order_rejection_job_type()).await,
+            0,
+            "a broker-side cancellation must NOT be misclassified as a failure"
         );
 
         assert_position_released_without_fill(&infra, &symbol, &order).await;

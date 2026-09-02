@@ -784,6 +784,11 @@ pub enum CancellationReason {
     /// `overnight_reprice_timeout_secs`; cancel it so the next scan can
     /// place a fresh limit crossed from a current indicative quote.
     OvernightRepriceTimeout,
+    /// Overnight limit order observed after the 04:00 ET pre-market open:
+    /// stale by regime, not by age -- the indicative feed that priced it no
+    /// longer governs. Cancel it so the next scan reprices from the
+    /// extended-hours reference chain.
+    PreMarketOpenReplacement,
     /// Extended-hours limit order predates the long-gap close-flatten window;
     /// cancel it so executable residual exposure can enter the repeated
     /// quote-refresh cycle before the venue closes.
@@ -805,6 +810,7 @@ impl CancellationReason {
             Self::MarketOpenReplacement => "market_open_replacement",
             Self::ExtendedHoursRepriceTimeout => "extended_hours_reprice_timeout",
             Self::OvernightRepriceTimeout => "overnight_reprice_timeout",
+            Self::PreMarketOpenReplacement => "pre_market_open_replacement",
             Self::ExtendedHoursCloseFlatten => "extended_hours_close_flatten",
             Self::Unrequested => "unrequested",
         }
@@ -3372,8 +3378,10 @@ mod tests {
     use serde_json::json;
 
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, TestStore, replay};
-    use st0x_execution::{AssetDetails, MockExecutor, alpaca_broker_api::AssetStatus};
+    use st0x_execution::MockExecutor;
     use st0x_float_macro::float;
+
+    use crate::test_utils::eligible_overnight_snapshot;
 
     use super::*;
 
@@ -4002,17 +4010,7 @@ mod tests {
     fn eligible_overnight_kind() -> CounterTradeOrderKind {
         CounterTradeOrderKind::OvernightLimit {
             limit_price: Positive::new(Usd::new(float!(195.25))).unwrap(),
-            snapshot: EligibilitySnapshot {
-                synced_at: Utc::now(),
-                details: AssetDetails {
-                    status: AssetStatus::Active,
-                    tradable: true,
-                    fractionable: Some(true),
-                    fractional_eh_enabled: Some(true),
-                    overnight_tradable: Some(true),
-                    overnight_halted: Some(false),
-                },
-            },
+            snapshot: eligible_overnight_snapshot(),
         }
     }
 
@@ -4332,6 +4330,82 @@ mod tests {
             "the eligibility re-check must be judged at the placement instant, \
              got {now} outside [{before}, {after}]"
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_order_resolves_terminal_cancelled_for_an_overnight_order_the_broker_lost() {
+        // The overnight twin of the broker-404 case: the 04:00 boundary
+        // sweep can race the broker purging the order. The aggregate must
+        // resolve terminally (releasing the position) rather than strand in
+        // Cancelling, and the terminal state must keep the Overnight session
+        // the accounting attributes it to.
+        struct OvernightOrderGone;
+
+        #[async_trait]
+        impl OrderPlacer for OvernightOrderGone {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                unimplemented!("never called: the fixture submits via commands")
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                unimplemented!("never called: the fixture submits via commands")
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(CancellationOutcome::OrderNotFound)
+            }
+
+            async fn get_order_status(
+                &self,
+                executor_order_id: &ExecutorOrderId,
+            ) -> Result<st0x_execution::OrderState, Box<dyn std::error::Error + Send + Sync>>
+            {
+                // Live at the pre-cancel read; it vanishes only when the
+                // DELETE runs.
+                Ok(st0x_execution::OrderState::Submitted {
+                    order_id: executor_order_id.clone(),
+                })
+            }
+        }
+
+        let store = TestStore::<OffchainOrder>::new(Arc::new(OvernightOrderGone));
+        let id = OffchainOrderId::new();
+        place_and_submit_overnight(&store, &id).await;
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::CancelOrder {
+                    reason: CancellationReason::PreMarketOpenReplacement,
+                },
+            )
+            .await
+            .unwrap();
+
+        let inner = store.load(&id).await.unwrap().unwrap();
+        let OffchainOrder::Cancelled {
+            reason,
+            market_session,
+            ..
+        } = &inner
+        else {
+            panic!(
+                "a broker-side 404 on cancel must resolve to terminal Cancelled, got: {inner:?}"
+            );
+        };
+        assert_eq!(*reason, CancellationReason::PreMarketOpenReplacement);
+        assert_eq!(*market_session, MarketSession::Overnight);
     }
 
     #[tokio::test]

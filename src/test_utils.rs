@@ -17,7 +17,10 @@ use std::time::Duration;
 
 use st0x_config::{EquitiesConfig, EquityAssetConfig, OperationMode};
 use st0x_event_sorcery::{DomainEvent, EventSourced};
-use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
+use st0x_execution::{
+    AssetDetails, Direction, EligibilitySnapshot, FractionalShares, Positive, Symbol,
+    alpaca_broker_api::AssetStatus,
+};
 
 use crate::bindings::IRaindexV6::{EvaluableV4, IOV2, OrderV4};
 use crate::onchain::OnchainTrade;
@@ -33,6 +36,23 @@ const MAX_CONCURRENT_TEST_ANVILS: usize = 4;
 /// same value under a "matches such-and-such module" comment that nothing
 /// enforces.
 pub(crate) const TEST_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// A freshly-synced, fully-eligible overnight snapshot: every attribute the
+/// eligibility validator checks is in its permissive state, so tests exercise
+/// the machinery around eligibility rather than the gate itself.
+pub(crate) fn eligible_overnight_snapshot() -> EligibilitySnapshot {
+    EligibilitySnapshot {
+        synced_at: Utc::now(),
+        details: AssetDetails {
+            status: AssetStatus::Active,
+            tradable: true,
+            fractionable: Some(true),
+            fractional_eh_enabled: Some(true),
+            overnight_tradable: Some(true),
+            overnight_halted: Some(false),
+        },
+    }
+}
 
 static ANVIL_PERMITS: LazyLock<(Mutex<usize>, Condvar)> =
     LazyLock::new(|| (Mutex::new(0), Condvar::new()));
