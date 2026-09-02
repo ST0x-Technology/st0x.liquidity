@@ -357,6 +357,12 @@ struct MockState {
     /// positive value models the real venue's pending_cancel window,
     /// during which the order keeps blocking the net-short guard.
     cancel_settle_polls: usize,
+    /// Placement attempts the net-short guard keeps refusing AFTER a
+    /// cancelled sell already reports terminal status: the venue's guard
+    /// clears later than the order status a poller reads, which is the race
+    /// `ConsecutiveSellPending` exists for. Decremented per refused
+    /// attempt, so the retry budget -- not wall time -- bounds the window.
+    consecutive_sell_guard_lag_attempts: usize,
     /// Per-symbol raw `/v1/assets/{symbol}` payload overrides, served
     /// verbatim so tests control exactly which attributes are present or
     /// absent. Symbols without an override get the default payload.
@@ -528,6 +534,7 @@ impl AlpacaBrokerMock {
             overnight_contract_enforcement: false,
             consecutive_sell_guard: false,
             cancel_settle_polls: 0,
+            consecutive_sell_guard_lag_attempts: 0,
             asset_payload_overrides: HashMap::new(),
         }));
 
@@ -597,6 +604,14 @@ impl AlpacaBrokerMock {
     /// positive value models the real venue's pending_cancel window.
     pub fn set_cancel_settle_polls(&self, polls: usize) {
         lock(&self.state).cancel_settle_polls = polls;
+    }
+
+    /// Placement attempts the net-short guard keeps refusing after a
+    /// cancelled sell already reports terminal status -- the venue-side lag
+    /// the `ConsecutiveSellPending` classification exists for. Decremented
+    /// per refused attempt.
+    pub fn set_consecutive_sell_guard_lag_attempts(&self, attempts: usize) {
+        lock(&self.state).consecutive_sell_guard_lag_attempts = attempts;
     }
 
     /// Replaces the calendar wholesale with the given entries; the endpoint
@@ -1599,7 +1614,24 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                             OrderStatus::New | OrderStatus::PartiallyFilled
                         )
                 });
-                if live_sell_exists {
+                // The venue's guard can lag the terminal status a poller
+                // reads: a cancelled same-symbol sell keeps blocking for the
+                // configured number of attempts even though its status
+                // already renders canceled.
+                let guard_lag_blocks = !live_sell_exists
+                    && state.consecutive_sell_guard_lag_attempts > 0
+                    && state.orders.values().any(|order| {
+                        order.symbol == symbol
+                            && order.side == OrderSide::Sell
+                            && matches!(order.status, OrderStatus::Canceled)
+                    });
+                if guard_lag_blocks {
+                    // Burn the lag budget only when the lag is the deciding
+                    // factor -- a refusal a live sell already forced does not
+                    // advance the venue's internal settling.
+                    state.consecutive_sell_guard_lag_attempts -= 1;
+                }
+                if live_sell_exists || guard_lag_blocks {
                     drop(state);
                     return json_response(
                         422,
@@ -3570,6 +3602,7 @@ mod tests {
             overnight_contract_enforcement: false,
             consecutive_sell_guard: false,
             cancel_settle_polls: 0,
+            consecutive_sell_guard_lag_attempts: 0,
             asset_payload_overrides: HashMap::new(),
         };
 
@@ -3627,6 +3660,7 @@ mod tests {
             overnight_contract_enforcement: false,
             consecutive_sell_guard: false,
             cancel_settle_polls: 0,
+            consecutive_sell_guard_lag_attempts: 0,
             asset_payload_overrides: HashMap::new(),
         };
 
@@ -3691,6 +3725,7 @@ mod tests {
             overnight_contract_enforcement: false,
             consecutive_sell_guard: false,
             cancel_settle_polls: 0,
+            consecutive_sell_guard_lag_attempts: 0,
             asset_payload_overrides: HashMap::new(),
         };
 
@@ -3787,6 +3822,7 @@ mod tests {
             overnight_contract_enforcement: false,
             consecutive_sell_guard: false,
             cancel_settle_polls: 0,
+            consecutive_sell_guard_lag_attempts: 0,
             asset_payload_overrides: HashMap::new(),
         };
 
@@ -3842,6 +3878,7 @@ mod tests {
             overnight_contract_enforcement: false,
             consecutive_sell_guard: false,
             cancel_settle_polls: 0,
+            consecutive_sell_guard_lag_attempts: 0,
             asset_payload_overrides: HashMap::new(),
         };
 

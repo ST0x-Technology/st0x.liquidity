@@ -58,6 +58,10 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
     /// whenever an asset enables overnight counter-trading.
     #[builder(default = false)]
     overnight_knobs: bool,
+    /// Overrides the overnight reprice cadence (seconds) so reprice-cycle
+    /// scenarios run in e2e time instead of the 300s production-like
+    /// default. Only meaningful with `overnight_knobs`.
+    overnight_reprice_secs_override: Option<u64>,
 ) -> anyhow::Result<Ctx> {
     let broker_url = broker_url_override.map_or_else(
         || broker.base_url(),
@@ -100,10 +104,13 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         .maybe_inventory_mode(inventory_mode_override);
 
     if overnight_knobs {
+        let reprice_secs = overnight_reprice_secs_override.unwrap_or(300).max(1);
         builder
             .overnight_max_quote_age_secs(std::num::NonZeroU64::new(120).expect("120 is nonzero"))
             .overnight_slippage_bps(100)
-            .overnight_reprice_timeout_secs(std::num::NonZeroU64::new(300).expect("300 is nonzero"))
+            .overnight_reprice_timeout_secs(
+                std::num::NonZeroU64::new(reprice_secs).expect("clamped to nonzero"),
+            )
             .call()
             .map_err(Into::into)
     } else {
