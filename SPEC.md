@@ -101,6 +101,22 @@ and the system proves market fit.
 
 Automated rebalancing is Alpaca Broker API based.
 
+##### Chain Roles: Primary, Watched, Transport
+
+Every chain the bot touches is declared under `[chains.<name>]` with a
+`lifecycle` (`disabled`, `observe-only`, `prefunded`, `active`). A chain whose
+config carries a `[chains.<name>.trading]` table is a **watched** chain: the bot
+runs a fill watcher against its order book and accounts its fills. Exactly one
+watched chain must set `primary = true` on that table -- the **primary** chain
+is where trading, rebalancing triggers, and the cash vaults live (Base). Zero or
+multiple primary claimants fail startup with a named error. Chains without a
+trading table are **transport** chains (RPC + confirmations only, e.g. Ethereum
+while it only carries CCTP transfers). Watch settings are per chain: poll
+interval, ingestion cutoff, asset tables with per-chain enable/disable flags.
+Startup verifies every watched chain (chain-id identity, cutoff support) and any
+failure is fatal; degraded per-chain startup is deferred to the chain-disable
+work.
+
 ##### Shared-Inventory Settlement
 
 Rebalancing deposits and withdrawals do not necessarily settle on the Rain
@@ -264,14 +280,18 @@ excellent async ecosystem for handling concurrent trading flows.
 #### Raindex Event Monitor
 
 - Continuous HTTP `eth_getLogs` polling over a single transport -- no WebSocket.
-  Every `order_fill_poll_interval` seconds the monitor enqueues a backfill range
-  covering the blocks since the persisted checkpoint, capped at the configured
-  ingestion cutoff block (must be explicitly configured; recommended value:
-  `safe`, i.e. `eth_getBlockByNumber("safe")`); the backfill worker fetches the
-  `Clear` and `TakeOrder` logs for the arbitrageur's owner address and advances
-  the checkpoint only on success. `required_confirmations` governs
-  transaction-submission paths only and does not affect fill ingestion. The
-  cutoff tag is configured via `ingestion_cutoff` (required field):
+  One monitor instance runs per watched chain, each with its own provider,
+  per-chain poll interval (`order_fill_poll_interval_secs`, required on every
+  watched chain's trading table; no global default), checkpoint keyed
+  `(chain, orderbook)`, and scan queue -- one chain's backlog or outage never
+  blocks another chain's ingestion. Every poll interval the monitor enqueues a
+  backfill range covering the blocks since the persisted checkpoint, capped at
+  the configured ingestion cutoff block (must be explicitly configured;
+  recommended value: `safe`, i.e. `eth_getBlockByNumber("safe")`); the backfill
+  worker fetches the `Clear` and `TakeOrder` logs for the arbitrageur's owner
+  address and advances the checkpoint only on success. `required_confirmations`
+  governs transaction-submission paths only and does not affect fill ingestion.
+  The cutoff tag is configured via `ingestion_cutoff` (required field):
   - **`safe` (recommended):** On OP Stack chains like Base, `safe` is the latest
     L2 block whose sequencer batch has been posted to L1 (not yet L1-finalized).
     Cuts hedging lag from ~20 min to ~seconds. Tradeoff: a sufficiently deep L1
@@ -288,6 +308,16 @@ excellent async ecosystem for handling concurrent trading flows.
   - **`finalized`:** Uses `eth_getBlockByNumber("finalized")` (Casper FFG). Full
     reorg protection but ~20 min hedging lag on Base. First-class cross-chain
     reorg handling is tracked separately in the Reorg protection project.
+  - **`confirmations` (depth via `ingestion_cutoff_confirmations`, required with
+    this mode):** the cutoff is the already-fetched chain tip minus N, computed
+    without an extra RPC round trip; used where consensus tags are unsuitable or
+    unavailable (Ethereum mainnet watches at N=12 for lower latency than `safe`
+    at a fixed, understood depth; HyperEVM has no tags at all). The quiet-skew
+    tolerance for a backwards-moving cutoff is capped at
+    `min(SAFE_CUTOFF_QUIET_SKEW, N)` on confirmations chains, so a regression
+    deeper than the safety depth is never silently skipped. Same
+    no-reversal-path tradeoff as `safe`; deep-reorg response lives in the Reorg
+    protection project and gates non-Base go-lives.
 - WebSocket `.watch()` filter polling and `eth_subscribe`/`subscribe_logs` are
   deliberately rejected: on a load-balanced RPC, filters live on a single
   backend node so most polls are round-robined to nodes returning `-32601`, and
@@ -1197,11 +1227,14 @@ event position).
   authentication
 - Graceful shutdown handling to complete in-flight trades before stopping
 - Per-asset market enable/disable: individual equity markets can be disabled via
-  the `enabled` flag in the equity config. Disabled assets accumulate position
-  changes but do not trigger counter-trades or rebalancing operations. When
-  re-enabled (`enabled = true`), the system resumes both executing accumulated
-  counter-trade positions and evaluating rebalancing triggers for any resulting
-  inventory imbalances (same semantics as market close/open behavior)
+  the `enabled` flag in the equity config, per chain. Disabled assets accumulate
+  position changes but do not trigger counter-trades or rebalancing operations.
+  When re-enabled (`enabled = true`), the system resumes both executing
+  accumulated counter-trade positions and evaluating rebalancing triggers for
+  any resulting inventory imbalances (same semantics as market close/open
+  behavior). A fill landing on a disabled asset raises a deduplicated critical
+  operational alert (once per process per symbol): the delta exposure it
+  accumulates is deliberate, but never silent
 
 ### Infrastructure and Deployment
 
