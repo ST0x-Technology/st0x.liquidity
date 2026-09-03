@@ -590,6 +590,12 @@ fn map_mint_error(
     }
 }
 
+/// Bounds for tokenization API requests, mirroring the broker API client.
+/// An endpoint that accepts the connection and never responds would
+/// otherwise park the calling job's `perform` future with no error.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Client for Alpaca's tokenization API and redemption transfers.
 struct AlpacaTokenizationClient<W: Wallet> {
     http_client: Client,
@@ -611,7 +617,10 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         redemption_wallet: Option<Address>,
     ) -> Result<Self, AlpacaTokenizationError> {
         Ok(Self {
-            http_client: Client::new(),
+            http_client: Client::builder()
+                .connect_timeout(HTTP_CONNECT_TIMEOUT)
+                .timeout(HTTP_REQUEST_TIMEOUT)
+                .build()?,
             base_url,
             account_id,
             auth: AuthRuntime::build(auth)?,
