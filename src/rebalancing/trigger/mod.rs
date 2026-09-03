@@ -513,6 +513,13 @@ enum EquitySettlementOutcome {
     DeferredToSnapshot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZombieJobKillOutcome {
+    Killed,
+    NoLongerInFlight,
+    StillInFlight,
+}
+
 /// Service that folds CQRS events into rebalancing state and
 /// schedules follow-up imbalance checks. Also serves as the apalis
 /// `Ctx` for the rebalancing-check workers.
@@ -3324,35 +3331,44 @@ impl RebalancingService {
 
             // Zombie: aggregate is terminal but the Jobs row is still retryable.
             // Kill it so apalis cannot re-drive it and this guard clears.
-            if Self::kill_zombie_job(pool, &row_id).await? {
-                info!(
-                    target: "rebalance",
-                    %row_id,
-                    %aggregate_id,
-                    "Killed zombie USDC Jobs row (aggregate already terminal)"
-                );
-                // Loop: re-query to find the next candidate row.
-            } else {
-                // Apalis grabbed the row between our terminal check and the kill. It will
-                // re-run the job, but the aggregate is already terminal so no second
-                // transfer can occur (the state machine rejects re-processing); the row
-                // reaches a terminal status either way.
-                return Ok(Some((row_id, age_secs)));
+            match Self::kill_zombie_job(pool, &row_id).await? {
+                ZombieJobKillOutcome::Killed => {
+                    info!(
+                        target: "rebalance",
+                        %row_id,
+                        %aggregate_id,
+                        "Killed zombie USDC Jobs row (aggregate already terminal)"
+                    );
+                }
+                ZombieJobKillOutcome::NoLongerInFlight => {
+                    debug!(
+                        target: "rebalance",
+                        %row_id,
+                        %aggregate_id,
+                        "Zombie USDC Jobs row was terminalized concurrently"
+                    );
+                }
+                ZombieJobKillOutcome::StillInFlight => {
+                    return Ok(Some((row_id, age_secs)));
+                }
             }
+
+            // The zombie was killed here or terminalized concurrently. Re-query
+            // so another genuinely live row still blocks the enqueue.
         }
     }
 
     /// Terminates a zombie apalis Jobs row by setting its status to `Killed`.
     ///
     /// The conditional predicate (`AND status='Failed' AND attempts <
-    /// max_attempts`) makes this a no-op if apalis grabbed the row between
-    /// our aggregate-terminal check and this call. Returns `true` when the
-    /// kill landed, `false` when it was a no-op (apalis already owns the
-    /// row and will run the job, which no-ops on the terminal aggregate).
+    /// max_attempts`) makes this a no-op if another worker changes the row
+    /// between the aggregate-terminal check and this call. After a no-op,
+    /// re-reads the Jobs table to distinguish an already-terminalized row from
+    /// one apalis still owns.
     async fn kill_zombie_job(
         pool: &apalis_sqlite::SqlitePool,
         job_id: &str,
-    ) -> Result<bool, sqlx_apalis::Error> {
+    ) -> Result<ZombieJobKillOutcome, sqlx_apalis::Error> {
         let result = sqlx_apalis::query(
             "UPDATE Jobs SET status='Killed', done_at=strftime('%s','now') \
              WHERE id=? AND status='Failed' AND attempts < max_attempts",
@@ -3360,7 +3376,26 @@ impl RebalancingService {
         .bind(job_id)
         .execute(pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+
+        if result.rows_affected() == 1 {
+            return Ok(ZombieJobKillOutcome::Killed);
+        }
+
+        let still_in_flight: bool = sqlx_apalis::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM Jobs \
+             WHERE id=? \
+             AND (status IN ('Pending', 'Queued', 'Running') \
+                  OR (status = 'Failed' AND attempts < max_attempts)))",
+        )
+        .bind(job_id)
+        .fetch_one(pool)
+        .await?;
+
+        Ok(if still_in_flight {
+            ZombieJobKillOutcome::StillInFlight
+        } else {
+            ZombieJobKillOutcome::NoLongerInFlight
+        })
     }
 
     /// Enqueues a [`TransferUsdcToHedging`] apalis job for a Base->Alpaca
@@ -3730,22 +3765,32 @@ impl RebalancingService {
             }
 
             // Zombie: aggregate is terminal; kill the row.
-            if Self::kill_zombie_job(pool, &row_id).await? {
-                info!(
-                    target: "rebalance",
-                    %row_id,
-                    %symbol,
-                    %aggregate_id,
-                    "Killed zombie equity Jobs row (aggregate already terminal)"
-                );
-                // Loop: re-query to find the next candidate row.
-            } else {
-                // Apalis grabbed the row between our terminal check and the kill. It will
-                // re-run the job, but the aggregate is already terminal so no second
-                // transfer can occur (the state machine rejects re-processing); the row
-                // reaches a terminal status either way.
-                return Ok(Some((row_id, age_secs)));
+            match Self::kill_zombie_job(pool, &row_id).await? {
+                ZombieJobKillOutcome::Killed => {
+                    info!(
+                        target: "rebalance",
+                        %row_id,
+                        %symbol,
+                        %aggregate_id,
+                        "Killed zombie equity Jobs row (aggregate already terminal)"
+                    );
+                }
+                ZombieJobKillOutcome::NoLongerInFlight => {
+                    debug!(
+                        target: "rebalance",
+                        %row_id,
+                        %symbol,
+                        %aggregate_id,
+                        "Zombie equity Jobs row was terminalized concurrently"
+                    );
+                }
+                ZombieJobKillOutcome::StillInFlight => {
+                    return Ok(Some((row_id, age_secs)));
+                }
             }
+
+            // The zombie was killed here or terminalized concurrently. Re-query
+            // so another genuinely live row still blocks the enqueue.
         }
     }
 
@@ -14412,6 +14457,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zombie_kill_race_loser_does_not_block_enqueue() {
+        let aggregate_pool = crate::test_utils::setup_test_db().await;
+        let usdc_store = test_store::<UsdcRebalance>(aggregate_pool.clone(), ());
+        let zombie_id = UsdcRebalanceId(Uuid::new_v4());
+        seed_terminal_usdc_aggregate(&usdc_store, &zombie_id).await;
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: zombie_id,
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        let job_queue_pool = service.transfer_usdc_to_hedging_queue.pool();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', done_at = strftime('%s', 'now'), attempts = 1 \
+             WHERE job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .execute(job_queue_pool)
+        .await
+        .unwrap();
+
+        // Simulate another worker winning the conditional zombie-kill update.
+        // The trigger terminalizes the row, then ignores this worker's outer
+        // update so `rows_affected()` is zero exactly as it is for the loser of
+        // the production race.
+        sqlx_apalis::query(
+            "CREATE TRIGGER simulate_concurrent_zombie_kill \
+             BEFORE UPDATE OF status ON Jobs \
+             WHEN OLD.status = 'Failed' AND NEW.status = 'Killed' \
+             BEGIN \
+                 UPDATE Jobs SET status = 'Killed', done_at = strftime('%s', 'now') \
+                 WHERE id = OLD.id; \
+                 SELECT RAISE(IGNORE); \
+             END",
+        )
+        .execute(job_queue_pool)
+        .await
+        .unwrap();
+
+        attach_stores(&service, aggregate_pool, usdc_store).await;
+
+        let enqueued = service
+            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .await;
+
+        assert!(
+            enqueued,
+            "a zombie already killed by another worker must not suppress a new transfer"
+        );
+    }
+
+    #[tokio::test]
     async fn zombie_killed_then_genuine_pending_row_still_blocks() {
         // A Failed zombie row (terminal aggregate, older run_at) is killed on the
         // first guard loop iteration, but a genuine Pending row with a non-terminal
@@ -14488,7 +14593,7 @@ mod tests {
     async fn kill_zombie_job_is_noop_when_row_not_failed_retryable() {
         // kill_zombie_job's WHERE clause requires status='Failed' AND attempts <
         // max_attempts. A row in any other state (e.g. Running) must be left
-        // untouched and the function must return false.
+        // untouched and classified as still in flight.
         let service = make_trigger_with_inventory(InventoryView::default()).await;
 
         service
@@ -14515,14 +14620,14 @@ mod tests {
             .await
             .unwrap();
 
-        let killed = RebalancingService::kill_zombie_job(
+        let outcome = RebalancingService::kill_zombie_job(
             service.transfer_usdc_to_hedging_queue.pool(),
             &row_id,
         )
         .await
         .unwrap();
 
-        assert!(!killed, "kill_zombie_job must be a no-op for a Running row");
+        assert_eq!(outcome, ZombieJobKillOutcome::StillInFlight);
 
         let status: String =
             sqlx_apalis::query_scalar("SELECT status FROM Jobs WHERE job_type = ?")
