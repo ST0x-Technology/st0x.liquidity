@@ -483,6 +483,7 @@ where
         &self,
     ) -> Result<Option<VaultRegistry>, InventoryPollingError<Exe::Error>> {
         let vault_registry_id = VaultRegistryId {
+            chain: self.trading_chain,
             orderbook: self.snapshot_id.orderbook,
             owner: self.vault_owner,
         };
@@ -2858,6 +2859,7 @@ mod tests {
     ) {
         let store = test_store::<VaultRegistry>(pool.clone(), ());
         let vault_registry_id = VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook,
             owner: order_owner,
         };
@@ -2884,6 +2886,7 @@ mod tests {
     ) {
         let store = test_store::<VaultRegistry>(pool.clone(), ());
         let vault_registry_id = VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook,
             owner: order_owner,
         };

@@ -1272,9 +1272,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("failed to reach RPC endpoint at startup"),
+            error.to_string().contains("RPC endpoint at startup"),
             "expected startup RPC probe failure, got: {error:#}"
         );
     }
@@ -1306,9 +1304,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("failed to reach RPC endpoint at startup"),
+            error.to_string().contains("RPC endpoint at startup"),
             "expected startup RPC probe failure, got: {error:#}"
         );
     }

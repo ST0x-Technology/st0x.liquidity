@@ -2230,6 +2230,7 @@ async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::E
     discover_vaults_for_trade(&trade1.trade_event, &trade1.trade, &context).await?;
 
     let vault_agg_id = VaultRegistryId {
+        chain: st0x_evm::Chain::Base,
         orderbook: orderbook.orderbook_addr,
         owner: orderbook.owner,
     }

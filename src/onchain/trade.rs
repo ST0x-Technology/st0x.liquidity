@@ -290,10 +290,11 @@ async fn fetch_inventory_token_decimals<E: Evm>(
 async fn resolve_inventory_token_symbol<E: Evm>(
     cache: &SymbolCache,
     evm: &E,
+    chain: Chain,
     token: Address,
 ) -> Result<String, OnChainError> {
     cache
-        .resolve_symbol(evm, token)
+        .resolve_symbol(evm, chain, token)
         .await
         .map_err(|source| classify_inventory_token_introspection_error(source, token))
 }
@@ -363,8 +364,8 @@ impl OnchainTrade {
         let onchain_output_amount = Float::from_raw(fill.output_amount);
 
         let (onchain_input_symbol, onchain_output_symbol) = tokio::try_join!(
-            cache.resolve_symbol(evm, input.token),
-            cache.resolve_symbol(evm, output.token),
+            cache.resolve_symbol(evm, chain, input.token),
+            cache.resolve_symbol(evm, chain, output.token),
         )?;
 
         // Use centralized TradeDetails::try_from_io to extract all trade data consistently
@@ -440,8 +441,8 @@ impl OnchainTrade {
         // (decimals does not depend on the resolved symbol), so all four run
         // in a single concurrent batch rather than two sequential waves.
         let (input_symbol, output_symbol, deposit_decimals, withdraw_decimals) = tokio::try_join!(
-            resolve_inventory_token_symbol(cache, evm, trade.deposit.token),
-            resolve_inventory_token_symbol(cache, evm, trade.withdraw.token),
+            resolve_inventory_token_symbol(cache, evm, chain, trade.deposit.token),
+            resolve_inventory_token_symbol(cache, evm, chain, trade.withdraw.token),
             fetch_inventory_token_decimals(evm, trade.deposit.token),
             fetch_inventory_token_decimals(evm, trade.withdraw.token),
         )?;
@@ -1006,6 +1007,14 @@ mod tests {
     use st0x_registry::SymbolCache;
 
     use super::*;
+
+    /// Preloads a symbol under every chain the fixtures run on, so tests
+    /// exercising either Base- or Ethereum-flavored parsing hit the cache.
+    fn preload_on_all_chains(cache: &SymbolCache, token: Address, symbol: &str) {
+        for chain in [Chain::Base, Chain::Ethereum] {
+            cache.preload_symbol(chain, token, symbol);
+        }
+    }
     use crate::bindings::IRaindexV6;
     use crate::test_utils::{
         get_test_order, panic_revert_payload, seed_get_test_order_token_symbols,
@@ -1353,8 +1362,8 @@ mod tests {
         let bot_operator = address!("0x679df30b30ac2947aa3143490add6717af81dcc3");
 
         let cache = SymbolCache::default();
-        cache.preload_symbol(REAL_USDC_BASE, "USDC");
-        cache.preload_symbol(REAL_WTCOIN_BASE, "wtCOIN");
+        preload_on_all_chains(&cache, REAL_USDC_BASE, "USDC");
+        preload_on_all_chains(&cache, REAL_WTCOIN_BASE, "wtCOIN");
 
         let tx_hash =
             fixed_bytes!("0xe13a11de734768f08a9c1ef66e8de3bcb9072f8cdabce9f1d819e1ae9909d4b9");
@@ -1936,8 +1945,8 @@ mod tests {
         withdraw_decimals: u8,
     ) -> Result<Option<OnchainTrade>, OnChainError> {
         let cache = SymbolCache::default();
-        cache.preload_symbol(INVENTORY_USDC, "USDC");
-        cache.preload_symbol(INVENTORY_EQUITY, "wtAAPL");
+        preload_on_all_chains(&cache, INVENTORY_USDC, "USDC");
+        preload_on_all_chains(&cache, INVENTORY_EQUITY, "wtAAPL");
         let assets = assets_config_with_equity("AAPL", INVENTORY_EQUITY);
 
         let asserter = Asserter::new();
@@ -2002,8 +2011,8 @@ mod tests {
     #[tokio::test]
     async fn missing_inventory_log_block_number_uses_receipt_block_number() {
         let cache = SymbolCache::default();
-        cache.preload_symbol(INVENTORY_USDC, "USDC");
-        cache.preload_symbol(INVENTORY_EQUITY, "wtAAPL");
+        preload_on_all_chains(&cache, INVENTORY_USDC, "USDC");
+        preload_on_all_chains(&cache, INVENTORY_EQUITY, "wtAAPL");
         let assets = assets_config_with_equity("AAPL", INVENTORY_EQUITY);
         let mut log = crate::test_utils::create_log(7);
         log.block_number = None;
@@ -2081,8 +2090,8 @@ mod tests {
         let spoof_usdc = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
         let cache = SymbolCache::default();
-        cache.preload_symbol(spoof_usdc, "USDC");
-        cache.preload_symbol(INVENTORY_EQUITY, "wtAAPL");
+        preload_on_all_chains(&cache, spoof_usdc, "USDC");
+        preload_on_all_chains(&cache, INVENTORY_EQUITY, "wtAAPL");
         let assets = assets_config_with_equity("AAPL", INVENTORY_EQUITY);
 
         let asserter = Asserter::new();
@@ -2129,8 +2138,8 @@ mod tests {
         let spoof_equity = address!("0xbadbadbadbadbadbadbadbadbadbadbadbadbad0");
 
         let cache = SymbolCache::default();
-        cache.preload_symbol(REAL_USDC_BASE, "USDC");
-        cache.preload_symbol(spoof_equity, "wtCOIN");
+        preload_on_all_chains(&cache, REAL_USDC_BASE, "USDC");
+        preload_on_all_chains(&cache, spoof_equity, "wtCOIN");
         let assets = assets_config_with_equity("COIN", REAL_WTCOIN_BASE);
 
         let asserter = Asserter::new();
@@ -2222,8 +2231,8 @@ mod tests {
         // sent 0.034172366621067031 wtCOIN (withdraw), i.e. it sold equity
         // onchain, so it must hedge Sell (USDC on the deposit side).
         let cache = SymbolCache::default();
-        cache.preload_symbol(REAL_USDC_BASE, "USDC");
-        cache.preload_symbol(REAL_WTCOIN_BASE, "wtCOIN");
+        preload_on_all_chains(&cache, REAL_USDC_BASE, "USDC");
+        preload_on_all_chains(&cache, REAL_WTCOIN_BASE, "wtCOIN");
 
         let tx_hash =
             fixed_bytes!("0xe13a11de734768f08a9c1ef66e8de3bcb9072f8cdabce9f1d819e1ae9909d4b9");
@@ -2299,8 +2308,8 @@ mod tests {
         // must hedge Buy (equity on the deposit side, mirroring the
         // happy-path unit test above).
         let cache = SymbolCache::default();
-        cache.preload_symbol(REAL_USDC_BASE, "USDC");
-        cache.preload_symbol(REAL_WTCOIN_BASE, "wtCOIN");
+        preload_on_all_chains(&cache, REAL_USDC_BASE, "USDC");
+        preload_on_all_chains(&cache, REAL_WTCOIN_BASE, "wtCOIN");
 
         let tx_hash =
             fixed_bytes!("0x9ee8e401a6f12227df1a30a236b60ac83c72b2b1eb610d83cf292ae789eb0805");
@@ -2432,7 +2441,7 @@ mod tests {
         }
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
 
-        let error = resolve_inventory_token_symbol(&cache, &evm, INVENTORY_EQUITY)
+        let error = resolve_inventory_token_symbol(&cache, &evm, Chain::Base, INVENTORY_EQUITY)
             .await
             .unwrap_err();
 
@@ -2455,7 +2464,7 @@ mod tests {
         }
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
 
-        let error = resolve_inventory_token_symbol(&cache, &evm, INVENTORY_EQUITY)
+        let error = resolve_inventory_token_symbol(&cache, &evm, Chain::Base, INVENTORY_EQUITY)
             .await
             .unwrap_err();
 

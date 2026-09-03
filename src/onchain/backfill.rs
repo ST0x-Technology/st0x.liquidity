@@ -270,15 +270,17 @@ where
     }
 
     async fn perform(&self, ctx: &AccountantCtx<Node, Exec>) -> Result<Self::Output, Self::Error> {
-        let evm_ctx = ctx
-            .ctx
+        // Both the chain's config AND its provider come from the per-chain
+        // accounting entry: scanning one chain's blocks through another
+        // chain's RPC would silently read the wrong ledger.
+        let chain_ctx = ctx
             .chains
-            .watch(self.chain)
+            .get(&self.chain)
             .ok_or(OnChainError::UnwatchedChain { chain: self.chain })?;
 
         backfill_range(
-            ctx.evm.provider(),
-            evm_ctx,
+            chain_ctx.evm.provider(),
+            &chain_ctx.trading,
             BotOperator(ctx.ctx.order_owner()),
             &ctx.pool,
             self.from_block,

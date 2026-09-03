@@ -1175,13 +1175,11 @@ mod tests {
         );
     }
 
-    /// The registry structurally admits a second watched chain, but the
-    /// capability gate still refuses it until the per-chain watcher code
-    /// exists and grants `FillIngestion`/`Hedging` for that chain: the
-    /// config layer must never claim a capability the code does not have.
-    /// (The acceptance counterpart lands with the capability grant.)
+    /// With the watcher + accounting code landed, the capability grant admits
+    /// Ethereum as a watched chain: exactly one primary, the non-primary in
+    /// the secondary map, reachable via `watched()`/`watch()`.
     #[test]
-    fn second_watched_chain_is_still_refused_by_the_capability_gate() {
+    fn registry_accepts_a_second_watched_chain_with_one_primary() {
         let configs = BTreeMap::from([
             (Chain::Base, chain_config(Some(trading_config_toml()))),
             (
@@ -1190,12 +1188,19 @@ mod tests {
             ),
         ]);
 
-        let error =
-            ChainRegistry::new(&configs, secrets_for(&[Chain::Base, Chain::Ethereum])).unwrap_err();
+        let registry =
+            ChainRegistry::new(&configs, secrets_for(&[Chain::Base, Chain::Ethereum])).unwrap();
 
-        assert!(
-            matches!(error, ChainRegistryError::Enablement(_)),
-            "got: {error}"
+        assert_eq!(registry.primary().chain, Chain::Base);
+        let watched: Vec<Chain> = registry.watched().map(|chain| chain.chain).collect();
+        assert_eq!(watched, vec![Chain::Base, Chain::Ethereum]);
+        assert_eq!(
+            registry.watch(Chain::Ethereum).map(|chain| chain.chain),
+            Some(Chain::Ethereum)
+        );
+        assert_eq!(
+            registry.rpc_url(Chain::Ethereum),
+            Some(&Url::parse("http://ethereum.test:8545").unwrap())
         );
     }
 
