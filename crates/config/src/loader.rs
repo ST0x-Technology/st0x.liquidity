@@ -1574,24 +1574,30 @@ fn validated_polling_intervals(config: &Config) -> Result<PollingIntervals, CtxE
     Ok(intervals)
 }
 
-/// Single validation path shared by [`Ctx::load_files`] and
-/// [`Ctx::validate_files`]. All config/secrets business-rule checks live
-/// here — neither caller duplicates validation logic.
-fn parse_and_validate(
-    config_str: &str,
-    config_path: &Path,
-    secrets_str: &str,
-    secrets_path: &Path,
-) -> Result<ValidatedParts, CtxError> {
-    let config: Config = toml::from_str(config_str).map_err(|source| CtxError::ConfigToml {
-        path: config_path.to_path_buf(),
-        source,
-    })?;
-    let secrets: Secrets = toml::from_str(secrets_str).map_err(|source| CtxError::SecretsToml {
-        path: secrets_path.to_path_buf(),
-        source,
-    })?;
+/// What [`validate_config`] built on the way through, handed back so
+/// [`parse_and_validate`] reuses it instead of rebuilding it (and drifting
+/// from it).
+struct ValidatedConfigParts {
+    polling_intervals: PollingIntervals,
+    alerts: Option<AlertsCtx>,
+    log_query_url_template: Option<LogQueryUrlTemplate>,
+    travel_rule: Option<TravelRuleConfig>,
+}
 
+/// Every business rule the plaintext config can be judged against on its own,
+/// with no secrets file in hand.
+///
+/// [`parse_and_validate`] runs this before it looks at the secrets half, so
+/// `validate-config` without `--secrets` and the real boot path apply one
+/// shared set of rules: a config this accepts cannot fail startup on any of
+/// them. What stays behind in [`parse_and_validate`] is what genuinely needs
+/// the other file -- broker credentials and the broker type they still carry,
+/// per-chain RPC endpoints, wallet keys, pricing and issuance API keys.
+fn validate_config(
+    config: &Config,
+    config_path: &Path,
+    startup_notices: &mut Vec<StartupNotice>,
+) -> Result<ValidatedConfigParts, CtxError> {
     if config.server_port == config.board_port {
         return Err(CtxError::ServerAndBoardPortsMatch {
             port: config.server_port,
@@ -1622,12 +1628,109 @@ fn parse_and_validate(
     }
 
     validate_asset_tables(&config.assets, &config.chains)?;
-    let polling_intervals = validated_polling_intervals(&config)?;
+    let polling_intervals = validated_polling_intervals(config)?;
+    let trading_table = ChainRegistry::validate_configs(&config.chains)?;
+    let log_query_url_template = config
+        .log_query_url_template
+        .clone()
+        .map(LogQueryUrlTemplate::parse)
+        .transpose()?;
+    let alerts = AlertsCtx::new(config.alerts.clone(), startup_notices)?;
+
+    if let Some(rebalancing) = &config.rebalancing {
+        RebalancingCtx::new(rebalancing)?;
+
+        let minimum = *crate::ALPACA_TO_BASE_MINIMUM_TRANSFER;
+
+        for chain_config in config.chains.values() {
+            let Some(cash) = chain_config
+                .trading
+                .as_ref()
+                .and_then(|trading| trading.assets.cash.as_ref())
+            else {
+                continue;
+            };
+
+            if cash.rebalancing == OperationMode::Enabled
+                && let Some(cash_limit) = &cash.operational_limit
+                && cash_limit.inner().lt(&minimum)?
+            {
+                return Err(CtxError::CashOperationalLimitBelowMinimumTransfer {
+                    configured: cash_limit.inner(),
+                    minimum,
+                });
+            }
+        }
+
+        if trading_table.redemption_wallet.is_none() {
+            return Err(CtxError::MissingTokenization);
+        }
+
+        // See `Ctx::bot_gas_valuation` doc for why this is required only in
+        // Rebalancing mode.
+        if config.bot_gas_valuation.is_none() {
+            return Err(CtxError::MissingBotGasValuation);
+        }
+
+        if alerts.is_none() {
+            return Err(CtxError::MissingAlertsForRebalancing);
+        }
+    }
+
+    // Deserialized here rather than only alongside the wallet secrets, so a
+    // `[wallet]` table missing its `kind` or `address` is caught by the
+    // config-only pass too.
+    if let Some(wallet_config) = &config.wallet {
+        WalletMeta::deserialize(wallet_config.clone()).map_err(|source| CtxError::ConfigToml {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
+    }
+
+    let travel_rule = config
+        .broker
+        .as_ref()
+        .and_then(|broker_config| broker_config.travel_rule.clone())
+        .map(TravelRuleConfig::validated)
+        .transpose()?;
+
+    Ok(ValidatedConfigParts {
+        polling_intervals,
+        alerts,
+        log_query_url_template,
+        travel_rule,
+    })
+}
+
+/// Single validation path shared by [`Ctx::load_files`] and
+/// [`Ctx::validate_files`]. All config/secrets business-rule checks live
+/// here — neither caller duplicates validation logic.
+fn parse_and_validate(
+    config_str: &str,
+    config_path: &Path,
+    secrets_str: &str,
+    secrets_path: &Path,
+) -> Result<ValidatedParts, CtxError> {
+    let config: Config = toml::from_str(config_str).map_err(|source| CtxError::ConfigToml {
+        path: config_path.to_path_buf(),
+        source,
+    })?;
+    let secrets: Secrets = toml::from_str(secrets_str).map_err(|source| CtxError::SecretsToml {
+        path: secrets_path.to_path_buf(),
+        source,
+    })?;
 
     // Collected instead of warn!ed: no tracing subscriber exists yet (the
     // binaries build theirs from the parsed Ctx), so a warn! here would
     // dispatch to NoSubscriber and vanish. See `StartupNotice`.
     let mut startup_notices = Vec::new();
+
+    let ValidatedConfigParts {
+        polling_intervals,
+        alerts,
+        log_query_url_template,
+        travel_rule,
+    } = validate_config(&config, config_path, &mut startup_notices)?;
 
     let broker = resolve_broker(config.broker.as_ref(), secrets.broker, &mut startup_notices)?;
     let telemetry = config.telemetry.map(TelemetryCtx::from);
@@ -1640,7 +1743,6 @@ fn parse_and_validate(
         ));
     }
 
-    let alerts = AlertsCtx::new(config.alerts, &mut startup_notices)?;
     let pricing = PricingCtx::assemble(
         config.pricing,
         secrets.pricing,
@@ -1657,33 +1759,14 @@ fn parse_and_validate(
     let (wallet_inputs, wallet_meta) =
         validate_wallet_inputs(config.wallet, secrets.wallet, &chains, config_path)?;
 
+    // Everything else `[rebalancing]` demands is a config-only rule and lives
+    // in `validate_config`; only the broker type it requires needs the
+    // secrets file.
     let trading_mode = match config.rebalancing {
         Some(rebalancing_config) => {
             let BrokerCtx::AlpacaBrokerApi(_) = &broker else {
                 return Err(RebalancingCtxError::NotAlpacaBroker.into());
             };
-
-            let minimum = *crate::ALPACA_TO_BASE_MINIMUM_TRANSFER;
-
-            for chain_config in config.chains.values() {
-                let Some(cash) = chain_config
-                    .trading
-                    .as_ref()
-                    .and_then(|trading| trading.assets.cash.as_ref())
-                else {
-                    continue;
-                };
-
-                if cash.rebalancing == OperationMode::Enabled
-                    && let Some(cash_limit) = &cash.operational_limit
-                    && cash_limit.inner().lt(&minimum)?
-                {
-                    return Err(CtxError::CashOperationalLimitBelowMinimumTransfer {
-                        configured: cash_limit.inner(),
-                        minimum,
-                    });
-                }
-            }
 
             TradingMode::Rebalancing(Box::new(RebalancingCtx::new(&rebalancing_config)?))
         }
@@ -1691,30 +1774,8 @@ fn parse_and_validate(
     };
 
     let redemption_wallet = chains.sole_trading().redemption_wallet;
-
-    if matches!(trading_mode, TradingMode::Rebalancing(_)) && redemption_wallet.is_none() {
-        return Err(CtxError::MissingTokenization);
-    }
-
-    // See `Ctx::bot_gas_valuation` doc for why this is required only in
-    // Rebalancing mode.
-    if matches!(trading_mode, TradingMode::Rebalancing(_)) && config.bot_gas_valuation.is_none() {
-        return Err(CtxError::MissingBotGasValuation);
-    }
-
-    match (&trading_mode, &alerts) {
-        (TradingMode::Rebalancing(_), None) => {
-            return Err(CtxError::MissingAlertsForRebalancing);
-        }
-        (TradingMode::Rebalancing(_), Some(_)) | (TradingMode::Standalone, _) => {}
-    }
-
     let log_level = config.log_level.unwrap_or(LogLevel::Debug);
     let log_format = config.log_format.unwrap_or(LogFormat::Text);
-    let log_query_url_template = config
-        .log_query_url_template
-        .map(LogQueryUrlTemplate::parse)
-        .transpose()?;
 
     let ExtendedHoursBrokerWindows {
         reprice_timeout_secs: extended_hours_reprice_timeout_secs,
@@ -1723,11 +1784,9 @@ fn parse_and_validate(
         close_flatten_cross_max_bps,
     } = extended_hours_broker_windows(&broker, config.broker.as_ref(), &config.assets)?;
 
-    let travel_rule = config
-        .broker
-        .as_ref()
-        .and_then(|broker_config| broker_config.travel_rule.as_ref());
-
+    // Whether the beneficiary is REQUIRED is the one travel-rule question the
+    // config cannot answer alone; `validate_config` already checked the value
+    // itself.
     let broker_requires_travel_rule = match &broker {
         BrokerCtx::AlpacaBrokerApi(_) => true,
         BrokerCtx::DryRun => false,
@@ -1736,12 +1795,6 @@ fn parse_and_validate(
     if broker_requires_travel_rule && travel_rule.is_none() {
         return Err(CtxError::MissingTravelRule);
     }
-
-    let travel_rule = config
-        .broker
-        .and_then(|broker_config| broker_config.travel_rule)
-        .map(TravelRuleConfig::validated)
-        .transpose()?;
 
     Ok(ValidatedParts {
         database_url: config.database_url,
@@ -1990,6 +2043,36 @@ impl Ctx {
             })?;
         let parts = parse_and_validate(&config_str, config_path, &secrets_str, secrets_path)?;
         Ok(parts.startup_notices)
+    }
+
+    /// Validates the plaintext config file on its own, with no secrets file.
+    ///
+    /// Runs the `validate_config` half of [`validate_files`](Self::validate_files) --
+    /// the same function the boot path runs, so a rule broken here breaks
+    /// startup too. What it cannot judge is anything the secrets file
+    /// supplies: broker credentials (and the broker type the deprecated
+    /// secrets `[broker]` table may still carry), per-chain `rpc_url`s, wallet
+    /// keys, pricing and issuance API keys. Those stay for the deploy-time
+    /// [`validate_files`](Self::validate_files) gate.
+    ///
+    /// This is what lets CI check every config the repository ships on each
+    /// pull request: it needs no secret, no network, no clock.
+    pub fn validate_config_file(config_path: &Path) -> Result<Vec<StartupNotice>, CtxError> {
+        let config_str =
+            std::fs::read_to_string(config_path).map_err(|source| CtxError::ConfigIo {
+                path: config_path.to_path_buf(),
+                source,
+            })?;
+        let config: Config =
+            toml::from_str(&config_str).map_err(|source| CtxError::ConfigToml {
+                path: config_path.to_path_buf(),
+                source,
+            })?;
+
+        let mut startup_notices = Vec::new();
+        validate_config(&config, config_path, &mut startup_notices)?;
+
+        Ok(startup_notices)
     }
 
     /// Emits the notices collected during parsing. Call once, right after
@@ -5446,6 +5529,17 @@ mod tests {
             mode = "enabled"
             target = "0.5"
             deviation = "0.3"
+
+            [alerts]
+            poll_interval = 300
+            realert_interval = 3600
+
+            [alerts.low_balance_thresholds]
+            base = "0.05"
+            ethereum = "0.01"
+
+            [bot_gas_valuation]
+            chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
         "#,
         );
 
@@ -5536,6 +5630,17 @@ mod tests {
             mode = "enabled"
             target = "0.5"
             deviation = "0.3"
+
+            [alerts]
+            poll_interval = 300
+            realert_interval = 3600
+
+            [alerts.low_balance_thresholds]
+            base = "0.05"
+            ethereum = "0.01"
+
+            [bot_gas_valuation]
+            chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
         "#,
         );
 
@@ -7902,6 +8007,63 @@ mod tests {
                 panic!("Invalid config {path:?}: {error}");
             });
         }
+    }
+
+    /// The check CI leans on: every config the repository ships has to pass
+    /// the secrets-free validator on every pull request, so a config edit is
+    /// judged where it is made instead of at the next deploy.
+    #[test]
+    fn every_repo_config_passes_config_only_validation() {
+        for path in repo_config_paths() {
+            Ctx::validate_config_file(&path).unwrap_or_else(|error| {
+                panic!("{path:?} fails config validation: {error}");
+            });
+        }
+    }
+
+    #[test]
+    fn validate_config_file_rejects_an_unknown_key() {
+        let config_str = format!(
+            "{}\nnot_a_real_setting = 1\n",
+            std::fs::read_to_string(example_config_toml()).unwrap()
+        );
+        let config = toml_file(&config_str);
+
+        let error = Ctx::validate_config_file(config.path()).unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::ConfigToml { .. }),
+            "expected ConfigToml, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_file_rejects_a_config_only_business_rule() {
+        let config_str = std::fs::read_to_string(example_config_toml())
+            .unwrap()
+            .replace("board_port = 8081", "board_port = 8080");
+        let config = toml_file(&config_str);
+
+        let error = Ctx::validate_config_file(config.path()).unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::ServerAndBoardPortsMatch { port: 8080 }),
+            "expected ServerAndBoardPortsMatch, got {error:?}"
+        );
+    }
+
+    /// The secrets half stays the deploy gate's job: without `--secrets` the
+    /// validator must not invent a verdict about credentials it never read.
+    #[test]
+    fn validate_config_file_ignores_the_secrets_half() {
+        let notices = Ctx::validate_config_file(example_config_toml()).unwrap();
+
+        assert!(
+            !notices
+                .iter()
+                .any(|notice| notice.message.contains("secrets file")),
+            "config-only validation reported on the secrets file: {notices:?}"
+        );
     }
 
     /// `parse_and_validate` rejects a config with `[rebalancing]` but no
