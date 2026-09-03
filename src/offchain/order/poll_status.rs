@@ -2487,6 +2487,7 @@ mod tests {
                     kind: crate::offchain::order::CounterTradeOrderKind::OvernightLimit {
                         limit_price,
                         snapshot: eligible_overnight_snapshot(),
+                        reference_price: None,
                     },
                 },
             )
@@ -5777,6 +5778,7 @@ mod tests {
             submitted_at: Utc::now(),
             market_session: st0x_execution::MarketSession::Extended,
             close_flatten,
+            reference_price: None,
         }
     }
 

@@ -4221,6 +4221,7 @@ mod tests {
             cancel_requested_at: block_timestamp,
             market_session: st0x_execution::MarketSession::Regular,
             close_flatten: false,
+            reference_price: None,
         };
 
         let mut stdout = Vec::new();
