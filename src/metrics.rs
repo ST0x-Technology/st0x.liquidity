@@ -80,6 +80,23 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
          symbol, session, and reason (reprice timeouts, session-boundary replacements, \
          close flatten, unrequested)"
     );
+    metrics::describe_histogram!(
+        "hedge_quote_age_seconds",
+        metrics::Unit::Seconds,
+        "Age of the indicative overnight quote at reference-price resolution, by symbol and \
+         source. Stale quotes that defer the hedge are included, so the distribution shows \
+         the feed lag placements actually see; only failed fetches record nothing"
+    );
+    metrics::describe_gauge!(
+        "asset_sync_last_success_timestamp",
+        "Unix timestamp of the last asset-eligibility sync run that refreshed every \
+         configured symbol; a partial or failed run leaves it unchanged"
+    );
+    metrics::describe_counter!(
+        "asset_sync_failures_total",
+        "Asset-eligibility sync failures, by symbol: one increment per failed symbol per \
+         sync run"
+    );
     metrics::describe_counter!(
         "hedge_dead_lettered_total",
         "Hedge attempts this process gave up on, by symbol and reason: a permanent or \
