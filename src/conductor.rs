@@ -14679,6 +14679,7 @@ mod tests {
             placed_at: Utc::now(),
             market_session: st0x_execution::MarketSession::Regular,
             close_flatten: false,
+            reference_price: None,
         };
 
         let error =
@@ -15630,6 +15631,7 @@ mod tests {
             cancel_requested_at: Utc::now(),
             market_session: st0x_execution::MarketSession::Regular,
             close_flatten: false,
+            reference_price: None,
         };
 
         let result = dispatch_post_place_state(Some(cancelling), &symbol, &cqrs, offchain_order_id)

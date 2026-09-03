@@ -87,6 +87,18 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
          source. Stale quotes that defer the hedge are included, so the distribution shows \
          the feed lag placements actually see; only failed fetches record nothing"
     );
+    metrics::describe_histogram!(
+        "hedge_reference_to_limit_bps",
+        "Signed basis-point distance from the reference price to the submitted limit, by \
+         symbol and session; positive is adverse (a buy limit above the reference, a sell \
+         limit below it). Recorded per successful placement of a limit-kind hedge"
+    );
+    metrics::describe_histogram!(
+        "hedge_reference_to_fill_slippage_bps",
+        "Signed basis-point distance from the placement-time reference price to the fill \
+         price, by symbol and session; positive is adverse. Orders without a persisted \
+         reference (market orders, legacy orders) record nothing"
+    );
     metrics::describe_gauge!(
         "asset_sync_last_success_timestamp",
         "Unix timestamp of the last asset-eligibility sync run that refreshed every \
