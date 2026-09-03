@@ -2023,16 +2023,14 @@ mod tests {
     use alloy::primitives::{Address, TxHash, address};
     use chrono::Utc;
     use clap::{CommandFactory, Parser};
-    use url::Url;
 
     use st0x_config::ChainRegistry;
     use st0x_config::ExecutionThreshold;
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
-    use st0x_config::{BrokerCtx, ChainAssets, LogFormat, LogLevel, TradingMode};
-    use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
+    use st0x_config::{BrokerCtx, LogFormat, LogLevel, TradingMode};
+    use st0x_config::{IngestionCutoff, InventoryMode, TradingChain};
     use st0x_event_sorcery::StoreBuilder;
-    use st0x_evm::Chain;
     use st0x_float_macro::float;
     use st0x_tokenization::IssuerRequestId;
     use st0x_tokenization::mock::MockTokenizer;
@@ -2075,21 +2073,16 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            chains: ChainRegistry::single_trading_chain(TradingChain {
-                redemption_wallet: None,
-                assets: ChainAssets::default(),
-                chain: Chain::Base,
-                inventory_adapters: InventoryAdapters::default(),
-                rpc_url: Url::parse("http://localhost:8545").unwrap(),
-                orderbook: address!("0x1234567890123456789012345678901234567890"),
-                inventory: InventoryMode::Managed {
-                    inventory: address!("0x1234567890123456789012345678901234567890"),
-                },
-                vault_owner: Address::ZERO,
-                deployment_block: 1,
-                required_confirmations: 0,
-                ingestion_cutoff: IngestionCutoff::Safe,
-            }),
+            chains: ChainRegistry::single_trading_chain(
+                TradingChain::test()
+                    .orderbook(address!("0x1234567890123456789012345678901234567890"))
+                    .inventory(InventoryMode::Managed {
+                        inventory: address!("0x1234567890123456789012345678901234567890"),
+                    })
+                    .vault_owner(Address::ZERO)
+                    .deployment_block(1)
+                    .call(),
+            ),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,

@@ -593,16 +593,11 @@ pub(crate) async fn probe_cutoff_block_support<P: Provider>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use alloy::rpc::types::{Block, Transaction};
     use serde_json::Value;
     use sqlx::{ConnectOptions, SqlitePool};
-
-    use st0x_config::ChainAssets;
-    use st0x_config::{InventoryAdapters, InventoryMode};
-    use st0x_evm::Chain;
 
     use super::*;
     use crate::test_utils::setup_test_pools;
@@ -696,21 +691,10 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let backfill_queue = BackfillJobQueue::new(&apalis_pool);
 
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block,
-            required_confirmations: 0,
-            ingestion_cutoff,
-        };
+        let evm_ctx = TradingChain::test()
+            .deployment_block(deployment_block)
+            .ingestion_cutoff(ingestion_cutoff)
+            .call();
 
         let monitor = OrderFillMonitor::new(
             evm_ctx.clone(),
@@ -1279,21 +1263,7 @@ mod tests {
         let (pool, apalis_pool, db_path, _dir) =
             crate::test_utils::setup_file_backed_test_db(Duration::from_millis(250)).await;
         let backfill_queue = BackfillJobQueue::new(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         // One chain-tip + cutoff-block response pair per poll_once call.
         let asserter = Asserter::new();
