@@ -1082,14 +1082,8 @@ enum TransferRecoveryCommand {
     },
     ResumeInterruptedTransfers,
     ReconcileUsdcTransfer {
-        /// Raw operator-supplied `--id` from `transfer reconcile --kind usdc`,
-        /// parsed into a `Uuid` in the handler so a malformed id surfaces a
-        /// clear operator error.
-        id: String,
-        /// Raw operator-supplied `--reason` from `transfer reconcile --kind
-        /// usdc`, parsed into [`ReconcileReasonArg`] in the handler so an
-        /// unknown value surfaces a clear error.
-        reason: AuditReason,
+        id: Uuid,
+        reason: ReconcileReasonArg,
     },
     FailUsdcTransfer {
         id: Uuid,
@@ -1164,6 +1158,12 @@ enum ProviderCommand {
     AlpacaTokenizationRequests,
 }
 
+/// Execution path selected after command-specific argument validation.
+enum CommandRoute {
+    Simple(SimpleCommand),
+    Provider(ProviderCommand),
+}
+
 /// Rejects argument combinations clap cannot express conditionally: the
 /// equity bulk-resume takes no per-id filter, so a supplied `--id` or
 /// `--direction` signals the operator probably meant `--kind usdc` and must
@@ -1207,9 +1207,9 @@ async fn run_command_with_writers<W: Write + Send>(
     stdout: &mut W,
 ) -> anyhow::Result<()> {
     validate_command(&command)?;
-    match classify_command(command) {
-        Ok(simple) => run_simple_command(simple, &ctx, pool, stdout).await?,
-        Err(provider_cmd) => {
+    match classify_command(command)? {
+        CommandRoute::Simple(simple) => run_simple_command(simple, &ctx, pool, stdout).await?,
+        CommandRoute::Provider(provider_cmd) => {
             let order_placer = trading::create_order_placer(&ctx, pool);
             run_provider_command(provider_cmd, &ctx, pool, stdout, order_placer).await?;
         }
@@ -1223,15 +1223,15 @@ async fn run_command_with_writers<W: Write + Send>(
 // dispatch. Kept as a single match (per the repo's "don't split simple-but-long
 // matches" rule) rather than fragmented into per-group helpers.
 #[allow(clippy::too_many_lines)]
-fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand> {
-    match command {
+fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
+    Ok(match command {
         Commands::Buy {
             symbol,
             quantity,
             time_in_force,
             limit_price,
             extended_hours,
-        } => Ok(SimpleCommand::Buy {
+        } => CommandRoute::Simple(SimpleCommand::Buy {
             symbol,
             quantity,
             time_in_force,
@@ -1244,21 +1244,21 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             time_in_force,
             limit_price,
             extended_hours,
-        } => Ok(SimpleCommand::Sell {
+        } => CommandRoute::Simple(SimpleCommand::Sell {
             symbol,
             quantity,
             time_in_force,
             limit_price,
             extended_hours,
         }),
-        Commands::Cancel { order_id } => Ok(SimpleCommand::Cancel { order_id }),
+        Commands::Cancel { order_id } => CommandRoute::Simple(SimpleCommand::Cancel { order_id }),
         Commands::TransferEquity {
             direction,
             symbol,
             quantity,
             issuer_request_id,
             redemption_wallet,
-        } => Ok(SimpleCommand::TransferEquity {
+        } => CommandRoute::Simple(SimpleCommand::TransferEquity {
             direction,
             symbol,
             quantity,
@@ -1270,7 +1270,7 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             quantity,
             network,
             registry,
-        } => Ok(SimpleCommand::WrapEquity {
+        } => CommandRoute::Simple(SimpleCommand::WrapEquity {
             symbol,
             quantity,
             network,
@@ -1281,48 +1281,60 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             quantity,
             network,
             registry,
-        } => Ok(SimpleCommand::UnwrapEquity {
+        } => CommandRoute::Simple(SimpleCommand::UnwrapEquity {
             symbol,
             quantity,
             network,
             registry,
         }),
         Commands::DonateEquity { symbol, quantity } => {
-            Ok(SimpleCommand::DonateEquity { symbol, quantity })
+            CommandRoute::Simple(SimpleCommand::DonateEquity { symbol, quantity })
         }
-        Commands::AlpacaDeposit { amount } => Ok(SimpleCommand::AlpacaDeposit { amount }),
+        Commands::AlpacaDeposit { amount } => {
+            CommandRoute::Simple(SimpleCommand::AlpacaDeposit { amount })
+        }
         Commands::AlpacaWithdraw { amount, to_address } => {
-            Ok(SimpleCommand::AlpacaWithdraw { amount, to_address })
+            CommandRoute::Simple(SimpleCommand::AlpacaWithdraw { amount, to_address })
         }
-        Commands::AlpacaWhitelist { address } => Ok(SimpleCommand::AlpacaWhitelist { address }),
-        Commands::AlpacaWhitelistList => Ok(SimpleCommand::AlpacaWhitelistList),
+        Commands::AlpacaWhitelist { address } => {
+            CommandRoute::Simple(SimpleCommand::AlpacaWhitelist { address })
+        }
+        Commands::AlpacaWhitelistList => CommandRoute::Simple(SimpleCommand::AlpacaWhitelistList),
         Commands::AlpacaWhitelistPatchTravelRule => {
-            Ok(SimpleCommand::AlpacaWhitelistPatchTravelRule)
+            CommandRoute::Simple(SimpleCommand::AlpacaWhitelistPatchTravelRule)
         }
-        Commands::AlpacaUnwhitelist { address } => Ok(SimpleCommand::AlpacaUnwhitelist { address }),
-        Commands::AlpacaTransfers { pending } => Ok(SimpleCommand::AlpacaTransfers { pending }),
+        Commands::AlpacaUnwhitelist { address } => {
+            CommandRoute::Simple(SimpleCommand::AlpacaUnwhitelist { address })
+        }
+        Commands::AlpacaTransfers { pending } => {
+            CommandRoute::Simple(SimpleCommand::AlpacaTransfers { pending })
+        }
         Commands::AlpacaConvert { direction, amount } => {
-            Ok(SimpleCommand::AlpacaConvert { direction, amount })
+            CommandRoute::Simple(SimpleCommand::AlpacaConvert { direction, amount })
         }
         Commands::AlpacaJournal {
             destination,
             symbol,
             quantity,
-        } => Ok(SimpleCommand::AlpacaJournal {
+        } => CommandRoute::Simple(SimpleCommand::AlpacaJournal {
             destination,
             symbol,
             quantity,
         }),
-        Commands::AlpacaTokenizationRequests => Err(ProviderCommand::AlpacaTokenizationRequests),
-        Commands::ProcessTx { tx_hash } => Err(ProviderCommand::ProcessTx { tx_hash }),
+        Commands::AlpacaTokenizationRequests => {
+            CommandRoute::Provider(ProviderCommand::AlpacaTokenizationRequests)
+        }
+        Commands::ProcessTx { tx_hash } => {
+            CommandRoute::Provider(ProviderCommand::ProcessTx { tx_hash })
+        }
         Commands::TransferUsdc { direction, amount } => {
-            Err(ProviderCommand::TransferUsdc { direction, amount })
+            CommandRoute::Provider(ProviderCommand::TransferUsdc { direction, amount })
         }
         Commands::VaultDeposit {
             amount,
             token,
             vault_id,
-        } => Ok(SimpleCommand::VaultDeposit {
+        } => CommandRoute::Simple(SimpleCommand::VaultDeposit {
             amount,
             token,
             vault_id,
@@ -1331,23 +1343,27 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             amount,
             token,
             vault_id,
-        } => Ok(SimpleCommand::VaultWithdraw {
+        } => CommandRoute::Simple(SimpleCommand::VaultWithdraw {
             amount,
             token,
             vault_id,
         }),
-        Commands::VaultWithdrawUsdc { amount } => Ok(SimpleCommand::VaultWithdrawUsdc { amount }),
-        Commands::CctpBridge { amount, all, from } => {
-            Err(ProviderCommand::CctpBridge { amount, all, from })
+        Commands::VaultWithdrawUsdc { amount } => {
+            CommandRoute::Simple(SimpleCommand::VaultWithdrawUsdc { amount })
         }
-        Commands::ResetAllowance { chain } => Err(ProviderCommand::ResetAllowance { chain }),
+        Commands::CctpBridge { amount, all, from } => {
+            CommandRoute::Provider(ProviderCommand::CctpBridge { amount, all, from })
+        }
+        Commands::ResetAllowance { chain } => {
+            CommandRoute::Provider(ProviderCommand::ResetAllowance { chain })
+        }
         Commands::AlpacaTokenize {
             symbol,
             quantity,
             recipient,
             network,
             token,
-        } => Err(ProviderCommand::AlpacaTokenize {
+        } => CommandRoute::Provider(ProviderCommand::AlpacaTokenize {
             symbol,
             quantity,
             recipient,
@@ -1360,7 +1376,7 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             redemption_wallet,
             network,
             token,
-        } => Err(ProviderCommand::AlpacaRedeem {
+        } => CommandRoute::Provider(ProviderCommand::AlpacaRedeem {
             symbol,
             quantity,
             redemption_wallet,
@@ -1368,14 +1384,20 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             token,
         }),
         Commands::DividendBump { symbol, quantity } => {
-            Err(ProviderCommand::DividendBump { symbol, quantity })
+            CommandRoute::Provider(ProviderCommand::DividendBump { symbol, quantity })
         }
-        Commands::OrderStatus { order_id } => Ok(SimpleCommand::OrderStatus { order_id }),
-        Commands::Position { command } => Ok(SimpleCommand::Position { command }),
-        Commands::PortfolioSnapshot { command } => Ok(SimpleCommand::PortfolioSnapshot { command }),
-        Commands::FailUsdcTransfer { id, reason } => Ok(SimpleCommand::Transfer {
-            command: TransferRecoveryCommand::FailUsdcTransfer { id, reason },
-        }),
+        Commands::OrderStatus { order_id } => {
+            CommandRoute::Simple(SimpleCommand::OrderStatus { order_id })
+        }
+        Commands::Position { command } => CommandRoute::Simple(SimpleCommand::Position { command }),
+        Commands::PortfolioSnapshot { command } => {
+            CommandRoute::Simple(SimpleCommand::PortfolioSnapshot { command })
+        }
+        Commands::FailUsdcTransfer { id, reason } => {
+            CommandRoute::Simple(SimpleCommand::Transfer {
+                command: TransferRecoveryCommand::FailUsdcTransfer { id, reason },
+            })
+        }
         Commands::Transfer { command } => match command {
             // `--kind equity` resumes all interrupted equity transfers via the bot
             // REST API. `--kind usdc` re-drives a single USDC transfer; `id` and
@@ -1383,14 +1405,14 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             TransferCommand::Resume {
                 kind: TransferResumeKind::Equity,
                 ..
-            } => Ok(SimpleCommand::Transfer {
+            } => CommandRoute::Simple(SimpleCommand::Transfer {
                 command: TransferRecoveryCommand::ResumeInterruptedTransfers,
             }),
             TransferCommand::Resume {
                 kind: TransferResumeKind::Usdc,
                 id: Some(id),
                 direction: Some(direction),
-            } => Err(ProviderCommand::ResumeUsdcTransfer { id, direction }),
+            } => CommandRoute::Provider(ProviderCommand::ResumeUsdcTransfer { id, direction }),
             TransferCommand::Resume {
                 kind: TransferResumeKind::Usdc,
                 ..
@@ -1402,21 +1424,28 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
                 // invoking classify directly must pass clap-parsed input.
                 unreachable!("clap `required_if_eq(\"kind\",\"usdc\")` guarantees id and direction")
             }
-            // Classification stays pure (routing only): the usdc id/reason are
-            // parsed and validated in the handler so a bad value surfaces a clear
-            // operator error rather than a panic here.
             TransferCommand::Reconcile { kind, id, reason } => match kind {
-                ReconcileKind::Usdc => Ok(SimpleCommand::Transfer {
-                    command: TransferRecoveryCommand::ReconcileUsdcTransfer { id, reason },
-                }),
-                ReconcileKind::Mint => Ok(SimpleCommand::Transfer {
+                ReconcileKind::Usdc => {
+                    let id = id.parse::<Uuid>().map_err(|error| {
+                        let context =
+                            format!("transfer reconcile --kind usdc: malformed --id {id:?}");
+
+                        anyhow::Error::new(error).context(context)
+                    })?;
+                    let reason = parse_usdc_reconcile_reason(reason.as_ref())?;
+
+                    CommandRoute::Simple(SimpleCommand::Transfer {
+                        command: TransferRecoveryCommand::ReconcileUsdcTransfer { id, reason },
+                    })
+                }
+                ReconcileKind::Mint => CommandRoute::Simple(SimpleCommand::Transfer {
                     command: TransferRecoveryCommand::ReconcileEquityTransfer {
                         transfer_type: TransferType::Mint,
                         id,
                         reason,
                     },
                 }),
-                ReconcileKind::Redemption => Ok(SimpleCommand::Transfer {
+                ReconcileKind::Redemption => CommandRoute::Simple(SimpleCommand::Transfer {
                     command: TransferRecoveryCommand::ReconcileEquityTransfer {
                         transfer_type: TransferType::Redemption,
                         id,
@@ -1424,38 +1453,44 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
                     },
                 }),
             },
-            TransferCommand::Fail { kind, id, reason } => Ok(SimpleCommand::Transfer {
-                command: TransferRecoveryCommand::FailTransfer {
-                    transfer_type: kind,
-                    id,
-                    reason,
-                },
-            }),
-            TransferCommand::Recheck { kind, id } => Ok(SimpleCommand::Transfer {
-                command: TransferRecoveryCommand::RecheckTransfer {
-                    transfer_type: kind,
-                    id,
-                },
-            }),
+            TransferCommand::Fail { kind, id, reason } => {
+                CommandRoute::Simple(SimpleCommand::Transfer {
+                    command: TransferRecoveryCommand::FailTransfer {
+                        transfer_type: kind,
+                        id,
+                        reason,
+                    },
+                })
+            }
+            TransferCommand::Recheck { kind, id } => {
+                CommandRoute::Simple(SimpleCommand::Transfer {
+                    command: TransferRecoveryCommand::RecheckTransfer {
+                        transfer_type: kind,
+                        id,
+                    },
+                })
+            }
         },
         Commands::View { command } => match command {
             ViewCommand::Rebuild { aggregate, id, all } => {
-                Ok(SimpleCommand::RebuildView { aggregate, id, all })
+                CommandRoute::Simple(SimpleCommand::RebuildView { aggregate, id, all })
             }
         },
         Commands::Cctp { command } => match command {
             CctpCommand::CompleteMint {
                 burn_tx,
                 source_chain,
-            } => Err(ProviderCommand::CctpRecover {
+            } => CommandRoute::Provider(ProviderCommand::CctpRecover {
                 burn_tx,
                 source_chain,
             }),
         },
-        Commands::ClearPendingBurn { id, reason } => Ok(SimpleCommand::Transfer {
-            command: TransferRecoveryCommand::ClearPendingBurn { id, reason },
-        }),
-    }
+        Commands::ClearPendingBurn { id, reason } => {
+            CommandRoute::Simple(SimpleCommand::Transfer {
+                command: TransferRecoveryCommand::ClearPendingBurn { id, reason },
+            })
+        }
+    })
 }
 
 async fn run_simple_command<W: Write>(
@@ -1652,12 +1687,6 @@ async fn run_transfer_command<W: Write>(
             rebalancing::resume_interrupted_transfers_command(stdout, ctx).await
         }
         TransferRecoveryCommand::ReconcileUsdcTransfer { id, reason } => {
-            let id = id.parse::<Uuid>().map_err(|error| {
-                anyhow::anyhow!("transfer reconcile --kind usdc: invalid id {id:?}: {error}")
-            })?;
-            // `AuditReason` rejects blanks at the CLI boundary. This secondary
-            // parse also constrains USDC reconciliation to its fixed vocabulary.
-            let reason = parse_usdc_reconcile_reason(reason.as_ref())?;
             let result =
                 rebalancing::reconcile_usdc_transfer_command(stdout, id, reason.into(), pool).await;
             finish_with_log_query_url(stdout, ctx, &id.to_string(), result)
@@ -2030,6 +2059,13 @@ mod tests {
             .expect("test database setup must succeed")
     }
 
+    fn classified_route(command: Commands) -> Result<SimpleCommand, ProviderCommand> {
+        match classify_command(command).expect("test command should classify successfully") {
+            CommandRoute::Simple(command) => Ok(command),
+            CommandRoute::Provider(command) => Err(command),
+        }
+    }
+
     fn create_test_ctx() -> Ctx {
         Ctx {
             database_url: ":memory:".to_string(),
@@ -2309,7 +2345,7 @@ mod tests {
             registry: Some(std::path::PathBuf::from("token-lists/ethereum.json")),
         };
 
-        match classify_command(command) {
+        match classified_route(command) {
             Ok(SimpleCommand::UnwrapEquity {
                 network, registry, ..
             }) => {
@@ -2339,7 +2375,7 @@ mod tests {
             extended_hours: false,
         };
 
-        match classify_command(command) {
+        match classified_route(command) {
             Ok(SimpleCommand::Buy { .. }) => {}
             Ok(_) => panic!("expected buy simple command"),
             Err(
@@ -2363,7 +2399,7 @@ mod tests {
             tx_hash: TxHash::ZERO,
         };
 
-        match classify_command(command) {
+        match classified_route(command) {
             Err(ProviderCommand::ProcessTx { .. }) => {}
             Err(
                 ProviderCommand::TransferUsdc { .. }
@@ -2389,7 +2425,7 @@ mod tests {
             reason: "test reason".parse().unwrap(),
         };
 
-        match classify_command(command) {
+        match classified_route(command) {
             Ok(SimpleCommand::Transfer {
                 command: TransferRecoveryCommand::FailUsdcTransfer { .. },
             }) => {}
@@ -2535,7 +2571,7 @@ mod tests {
             reason: "test reason".to_string(),
         };
 
-        match classify_command(command) {
+        match classified_route(command) {
             Ok(SimpleCommand::Transfer {
                 command: TransferRecoveryCommand::ClearPendingBurn { .. },
             }) => {}
@@ -2697,7 +2733,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            classify_command(cli.command),
+            classified_route(cli.command),
             Ok(SimpleCommand::PortfolioSnapshot {
                 command: PortfolioSnapshotRecoveryCommand::Set { .. }
             })
@@ -2740,7 +2776,7 @@ mod tests {
         ])
         .unwrap();
 
-        match classify_command(cli.command) {
+        match classified_route(cli.command) {
             Ok(SimpleCommand::Position {
                 command:
                     PositionRecoveryCommand::Set {
@@ -2778,7 +2814,7 @@ mod tests {
         ])
         .unwrap();
 
-        match classify_command(long.command) {
+        match classified_route(long.command) {
             Ok(SimpleCommand::Position {
                 command:
                     PositionRecoveryCommand::Set {
@@ -2802,7 +2838,7 @@ mod tests {
         ])
         .unwrap();
 
-        match classify_command(short.command) {
+        match classified_route(short.command) {
             Ok(SimpleCommand::Position {
                 command:
                     PositionRecoveryCommand::Set {
@@ -2888,7 +2924,7 @@ mod tests {
             },
         };
 
-        match classify_command(command) {
+        match classified_route(command) {
             Ok(SimpleCommand::Position {
                 command:
                     PositionRecoveryCommand::ReleaseHedge {
@@ -3218,7 +3254,7 @@ mod tests {
         ])
         .unwrap();
 
-        match classify_command(cli.command) {
+        match classified_route(cli.command) {
             Err(ProviderCommand::ResumeUsdcTransfer {
                 id: parsed_id,
                 direction,
@@ -3246,7 +3282,7 @@ mod tests {
         ])
         .unwrap();
 
-        match classify_command(cli.command) {
+        match classified_route(cli.command) {
             Err(ProviderCommand::ResumeUsdcTransfer {
                 id: parsed_id,
                 direction,
@@ -3298,7 +3334,7 @@ mod tests {
             },
         };
 
-        let _ = classify_command(command);
+        let _ = classified_route(command);
     }
 
     #[test]
@@ -3317,7 +3353,7 @@ mod tests {
         ])
         .unwrap();
 
-        match classify_command(cli.command) {
+        match classified_route(cli.command) {
             Ok(SimpleCommand::Transfer {
                 command:
                     TransferRecoveryCommand::ReconcileUsdcTransfer {
@@ -3325,8 +3361,8 @@ mod tests {
                         reason,
                     },
             }) => {
-                assert_eq!(parsed_id, id.to_string());
-                assert_eq!(reason.as_ref(), "deposit-credited-offline");
+                assert_eq!(parsed_id, id);
+                assert!(matches!(reason, ReconcileReasonArg::DepositCreditedOffline));
             }
             _ => panic!("expected reconcile usdc simple command"),
         }
@@ -3347,7 +3383,7 @@ mod tests {
         ])
         .unwrap();
 
-        match classify_command(cli.command) {
+        match classified_route(cli.command) {
             Ok(SimpleCommand::Transfer {
                 command:
                     TransferRecoveryCommand::ReconcileEquityTransfer {
@@ -3379,7 +3415,7 @@ mod tests {
         ])
         .unwrap();
 
-        match classify_command(cli.command) {
+        match classified_route(cli.command) {
             Ok(SimpleCommand::Transfer {
                 command:
                     TransferRecoveryCommand::ReconcileEquityTransfer {
@@ -3398,10 +3434,54 @@ mod tests {
 
     #[test]
     fn transfer_reconcile_usdc_rejects_unknown_reason() {
-        let error = parse_usdc_reconcile_reason("bogus-reason").unwrap_err();
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "reconcile",
+            "--kind",
+            "usdc",
+            "--id",
+            &Uuid::from_u128(77).to_string(),
+            "--reason",
+            "bogus-reason",
+        ])
+        .unwrap();
+
+        let Err(error) = classify_command(cli.command) else {
+            panic!("unknown usdc reconcile reason must fail during classification");
+        };
+        assert_eq!(
+            error.to_string(),
+            "transfer reconcile --kind usdc: unknown --reason \"bogus-reason\" \
+             (expected `funds-moved-manually` or `deposit-credited-offline`)"
+        );
+    }
+
+    #[test]
+    fn transfer_reconcile_usdc_rejects_malformed_id_during_classification() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "reconcile",
+            "--kind",
+            "usdc",
+            "--id",
+            "not-a-uuid",
+            "--reason",
+            "funds-moved-manually",
+        ])
+        .unwrap();
+
+        let Err(error) = classify_command(cli.command) else {
+            panic!("malformed usdc reconcile id must fail during classification");
+        };
         assert!(
-            error.to_string().contains("unknown --reason"),
-            "unknown usdc reconcile reason must surface a clear error, got: {error}"
+            error.to_string().contains("malformed --id"),
+            "malformed usdc reconcile id must surface a clear error, got: {error}"
+        );
+        assert!(
+            error.downcast_ref::<uuid::Error>().is_some(),
+            "malformed usdc reconcile id must retain the UUID parse error as its source"
         );
     }
 
@@ -3450,7 +3530,7 @@ mod tests {
         ])
         .unwrap();
 
-        match classify_command(cli.command) {
+        match classified_route(cli.command) {
             Ok(SimpleCommand::Transfer {
                 command:
                     TransferRecoveryCommand::FailTransfer {
@@ -3480,7 +3560,7 @@ mod tests {
         ])
         .unwrap();
 
-        match classify_command(cli.command) {
+        match classified_route(cli.command) {
             Ok(SimpleCommand::Transfer {
                 command: TransferRecoveryCommand::RecheckTransfer { transfer_type, id },
             }) => {
@@ -3504,7 +3584,7 @@ mod tests {
         ])
         .unwrap();
 
-        match classify_command(cli.command) {
+        match classified_route(cli.command) {
             Ok(SimpleCommand::RebuildView { aggregate, id, all }) => {
                 assert!(matches!(aggregate, AggregateView::Position));
                 assert_eq!(id.as_deref(), Some("AAPL"));
@@ -3527,7 +3607,7 @@ mod tests {
         ])
         .unwrap();
 
-        match classify_command(cli.command) {
+        match classified_route(cli.command) {
             Err(ProviderCommand::CctpRecover {
                 burn_tx,
                 source_chain,
@@ -3555,7 +3635,7 @@ mod tests {
         ])
         .unwrap();
 
-        match classify_command(cli.command) {
+        match classified_route(cli.command) {
             Ok(SimpleCommand::Position {
                 command:
                     PositionRecoveryCommand::ReleaseHedge {
@@ -3651,7 +3731,7 @@ mod tests {
             Cli::try_parse_from(["st0x-cli", "transfer", "resume", "--kind", "equity"]).unwrap();
         validate_command(&clean.command).unwrap();
         assert!(matches!(
-            classify_command(clean.command),
+            classified_route(clean.command),
             Ok(SimpleCommand::Transfer {
                 command: TransferRecoveryCommand::ResumeInterruptedTransfers
             })
@@ -3724,7 +3804,7 @@ mod tests {
             "st0x-cli", "transfer", "fail", "--type", "mint", "--id", "ISS001", "--reason", "stuck",
         ])
         .unwrap();
-        match classify_command(long.command) {
+        match classified_route(long.command) {
             Ok(SimpleCommand::Transfer {
                 command: TransferRecoveryCommand::FailTransfer { transfer_type, .. },
             }) => {
@@ -3737,7 +3817,7 @@ mod tests {
             "st0x-cli", "transfer", "fail", "-t", "mint", "--id", "ISS001", "-r", "stuck",
         ])
         .unwrap();
-        match classify_command(short.command) {
+        match classified_route(short.command) {
             Ok(SimpleCommand::Transfer {
                 command: TransferRecoveryCommand::FailTransfer { transfer_type, .. },
             }) => {
@@ -3762,7 +3842,7 @@ mod tests {
             "redemption-1",
         ])
         .unwrap();
-        match classify_command(long.command) {
+        match classified_route(long.command) {
             Ok(SimpleCommand::Transfer {
                 command: TransferRecoveryCommand::RecheckTransfer { transfer_type, .. },
             }) => {
@@ -3781,7 +3861,7 @@ mod tests {
             "redemption-1",
         ])
         .unwrap();
-        match classify_command(short.command) {
+        match classified_route(short.command) {
             Ok(SimpleCommand::Transfer {
                 command: TransferRecoveryCommand::RecheckTransfer { transfer_type, .. },
             }) => {
