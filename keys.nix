@@ -1,11 +1,8 @@
 rec {
-  # Tailscale MagicDNS hostnames per environment. Referenced by
-  # infra/default.nix (local tooling) and the deploy workflows.
-  tailscaleHost = {
-    prod = "st0x-liquidity-nixos";
-    staging = "st0x-liquidity-staging";
-  };
-
+  # DROPLET-WORLD RESIDUE, kept only as the age recipient roster for
+  # secret/secrets.nix (the s01 dividend-ops secret). The host keys below
+  # belonged to the retired DO droplets; they stay listed so the existing
+  # ciphertext remains valid, and drop out at the next rekey.
   keys = {
     # purpose: dev/ops
     juan = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHHNeV3nfiJS0QE2JoW3d0dRw1j6OVKl7rXor24XHvsd";
