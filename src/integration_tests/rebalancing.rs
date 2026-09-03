@@ -199,6 +199,8 @@ async fn discover_deterministic_tx_hash(
 
 fn test_trigger_config() -> RebalancingServiceConfig {
     RebalancingServiceConfig {
+        poll_freshness: PollFreshness::always_fresh(),
+        inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
         equity: ImbalanceThreshold {
             target: float!(0.5),
@@ -1558,6 +1560,8 @@ async fn usdc_none_disables_usdc_rebalancing() {
 
     let trigger = RebalancingService::new(
         RebalancingServiceConfig {
+            poll_freshness: PollFreshness::always_fresh(),
+            inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             usdc: None,
             ..test_trigger_config()
@@ -1775,6 +1779,8 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     };
 
     let config = RebalancingServiceConfig {
+        poll_freshness: PollFreshness::always_fresh(),
+        inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
         equity: ImbalanceThreshold {
             target: float!(0.5),
@@ -1905,6 +1911,8 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         }),
     };
     let config = RebalancingServiceConfig {
+        poll_freshness: PollFreshness::always_fresh(),
+        inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
         equity: ImbalanceThreshold {
             target: float!(0.5),
@@ -1999,6 +2007,8 @@ async fn threshold_config_controls_trigger_sensitivity() {
         .await;
 
         let wide_config = RebalancingServiceConfig {
+            poll_freshness: PollFreshness::always_fresh(),
+            inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             equity: ImbalanceThreshold {
                 target: float!(0.5),
@@ -2060,6 +2070,8 @@ async fn threshold_config_controls_trigger_sensitivity() {
         .await;
 
         let tight_config = RebalancingServiceConfig {
+            poll_freshness: PollFreshness::always_fresh(),
+            inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             equity: ImbalanceThreshold {
                 target: float!(0.5),

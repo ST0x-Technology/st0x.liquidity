@@ -127,6 +127,9 @@ pub(crate) enum ConductorSpawnError {
 /// Everything needed to construct a running [`Conductor`].
 pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) ctx: Ctx,
+    /// Shared freshness tracker (see the creation site in `Conductor::start`):
+    /// the poller built here stamps it; the rebalancing guard reads it.
+    pub(crate) poll_freshness: PollFreshness,
     pub(crate) cache: SymbolCache,
     pub(crate) provider: Prov,
     pub(crate) executor: Exec,
@@ -297,10 +300,11 @@ where
     let wallet_polling_enabled = wallet_polling.is_some();
     let tokenizer = context.tokenizer;
 
-    // Constructed once and cloned into both the live poller and the daily
-    // capture job's ctx below, so `freshness_gap` (write.rs) sees exactly
-    // what this poller has stamped this run.
-    let poll_freshness = PollFreshness::new();
+    // Shared instance from `Conductor::start`: cloned into the live poller
+    // and the daily capture job's ctx below, so `freshness_gap` (write.rs)
+    // and the rebalancing staleness guard see exactly what this poller has
+    // stamped this run.
+    let poll_freshness = context.poll_freshness.clone();
 
     let mut polling_service = InventoryPollingService::new(
         poll_freshness.clone(),

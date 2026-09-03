@@ -51,6 +51,11 @@ type FreshnessMap = HashMap<PortfolioLocation, LocationFreshness>;
 /// timestamps.
 struct Inner {
     map: Mutex<FreshnessMap>,
+    /// Test-only escape hatch: when set, every slot reads as observed just
+    /// now, so fixtures that are not exercising staleness do not have to
+    /// seed each slot by hand.
+    #[cfg(test)]
+    assume_fresh: bool,
 }
 
 /// Tracks the most recent successful-poll timestamp for each
@@ -64,6 +69,15 @@ struct Inner {
 #[derive(Clone)]
 pub(crate) struct PollFreshness(Arc<Inner>);
 
+impl std::fmt::Debug for PollFreshness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PollFreshness")
+            .field("observed_slots", &self.lock().len())
+            .finish()
+    }
+}
+
 impl PollFreshness {
     /// An empty tracker: every slot reads un-observed until [`Self::observe`]
     /// marks it, which is exactly what makes the freshness signal
@@ -72,7 +86,53 @@ impl PollFreshness {
     pub(crate) fn new() -> Self {
         Self(Arc::new(Inner {
             map: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            assume_fresh: false,
         }))
+    }
+
+    /// Test fixture: a tracker on which every slot always reads as observed
+    /// just now. For tests that are not about staleness.
+    #[cfg(test)]
+    pub(crate) fn always_fresh() -> Self {
+        Self(Arc::new(Inner {
+            map: Mutex::new(HashMap::new()),
+            assume_fresh: true,
+        }))
+    }
+
+    /// Test fixture: writes an explicit observation timestamp.
+    #[cfg(test)]
+    pub(crate) fn set_observed(
+        &self,
+        location: PortfolioLocation,
+        asset: PortfolioAsset,
+        observed_at: DateTime<Utc>,
+    ) {
+        self.lock()
+            .entry(location)
+            .or_default()
+            .insert(asset, observed_at);
+    }
+
+    /// When `(location, asset)` was last observed by a successful poll in
+    /// THIS process run; `None` if never. Unlike [`Self::observed_since`]
+    /// this is run-scoped on purpose: the rebalancing staleness guard wants
+    /// "how old is the newest successful read", not a day-scoped gate.
+    pub(crate) fn last_observed(
+        &self,
+        location: PortfolioLocation,
+        asset: &PortfolioAsset,
+    ) -> Option<DateTime<Utc>> {
+        #[cfg(test)]
+        if self.0.assume_fresh {
+            return Some(Utc::now());
+        }
+
+        self.lock()
+            .get(&location)
+            .and_then(|assets| assets.get(asset))
+            .copied()
     }
 
     /// Marks `(location, asset)` as observed by a successful poll just now.

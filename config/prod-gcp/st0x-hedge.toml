@@ -258,6 +258,9 @@ chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 
 [rebalancing]
 transfer_timeout_secs = 1800
+# Skip a chain's rebalancing evaluations when its inventory snapshot is
+# older than this bound (or absent, e.g. right after a restart).
+inventory_staleness_bound_secs = 300
 transfer_attempt_timeout_secs = 3600
 attestation_retry_deadline_secs = 86400
 max_burn_revert_redrives = 5

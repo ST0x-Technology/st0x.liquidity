@@ -4606,6 +4606,7 @@ mod tests {
             extended_hours_close_flatten_window_secs = 900
             [rebalancing]
             transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
@@ -4874,6 +4875,7 @@ mod tests {
             required_confirmations = 1
             [rebalancing]
             transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
@@ -5430,6 +5432,7 @@ mod tests {
             extended_hours_close_flatten_window_secs = 900
             [rebalancing]
             transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
@@ -5519,6 +5522,7 @@ mod tests {
             beneficiary_entity_name = "Test Corp"
             [rebalancing]
             transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
@@ -5621,6 +5625,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
@@ -5731,6 +5736,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
@@ -7527,6 +7533,7 @@ mod tests {
             required_confirmations = 1
             [rebalancing]
             transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5

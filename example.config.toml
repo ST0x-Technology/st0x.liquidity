@@ -214,6 +214,9 @@ chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 # Transfer timeout in seconds before stuck inflight state is tombstoned and cleared.
 # 1800 = 30 minutes.
 transfer_timeout_secs = 1800
+# Skip a chain's rebalancing evaluations when its inventory snapshot is
+# older than this bound (or absent, e.g. right after a restart).
+inventory_staleness_bound_secs = 300
 # Per-attempt wall-clock bound for a single Base->Alpaca transfer job attempt.
 # A hung RPC inside the transfer is aborted after this so the attempt fails and
 # retries instead of wedging forever. Must exceed the worst-case single resume

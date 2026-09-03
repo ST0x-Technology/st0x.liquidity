@@ -186,6 +186,7 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
 
 #[cfg(test)]
 mod tests {
+    use crate::inventory::PollFreshness;
     use alloy::network::Ethereum;
     use alloy::node_bindings::Anvil;
     use alloy::primitives::{B256, U256, address, b256};
@@ -347,6 +348,8 @@ mod tests {
         let ctx = make_ctx();
 
         let trigger_config = RebalancingServiceConfig {
+            poll_freshness: PollFreshness::always_fresh(),
+            inventory_staleness_bound: std::time::Duration::from_secs(300),
             cash_reserved: None,
             equity: ctx.equity,
             usdc: ctx.usdc,
@@ -363,6 +366,8 @@ mod tests {
         let ctx = make_ctx();
 
         let trigger_config = RebalancingServiceConfig {
+            poll_freshness: PollFreshness::always_fresh(),
+            inventory_staleness_bound: std::time::Duration::from_secs(300),
             cash_reserved: None,
             equity: ctx.equity,
             usdc: ctx.usdc,

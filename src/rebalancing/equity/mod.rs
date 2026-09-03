@@ -2079,6 +2079,7 @@ impl CrossVenueEquityTransfer {
 
 #[cfg(test)]
 mod tests {
+    use crate::inventory::PollFreshness;
     use alloy::primitives::{Address, B256, address};
     use chrono::Utc;
     use sqlx::SqlitePool;
@@ -2260,6 +2261,8 @@ mod tests {
 
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                poll_freshness: PollFreshness::always_fresh(),
+                inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
@@ -2406,6 +2409,8 @@ mod tests {
 
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                poll_freshness: PollFreshness::always_fresh(),
+                inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
@@ -2730,6 +2735,8 @@ mod tests {
 
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                poll_freshness: PollFreshness::always_fresh(),
+                inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 equity: ImbalanceThreshold {
                     target: float!(0.5),

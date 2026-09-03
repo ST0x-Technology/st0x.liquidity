@@ -167,6 +167,7 @@ impl QueryManifest {
 
 #[cfg(test)]
 mod tests {
+    use crate::inventory::PollFreshness;
     use alloy::primitives::{Address, TxHash, fixed_bytes};
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -201,6 +202,8 @@ mod tests {
 
     fn test_trigger_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {
+            poll_freshness: PollFreshness::always_fresh(),
+            inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             equity: ImbalanceThreshold {
                 target: float!(0.5),

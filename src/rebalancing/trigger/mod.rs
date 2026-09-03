@@ -45,7 +45,8 @@ use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
     BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryDivergenceGate, InventoryError,
     InventoryView, InventoryViewError, Operator, PendingRequestOwnership,
-    PendingRequestOwnershipSnapshot, TransferOp, Venue,
+    PendingRequestOwnershipSnapshot, PollFreshness, PortfolioAsset, PortfolioLocation, TransferOp,
+    Venue,
 };
 use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
 use crate::offchain::order::OffchainOrderId;
@@ -157,7 +158,15 @@ pub(crate) enum TokenAddressError {
 /// Configuration for the rebalancing trigger (runtime).
 #[derive(Debug, Clone)]
 pub(crate) struct RebalancingServiceConfig {
+    /// Freshness source for the cross-chain staleness rule: last successful
+    /// poll per slot, updated by the poller on every successful fetch, so a
+    /// quiet (unchanged) book still reads fresh. See `freshness.rs` module
+    /// doc for why the snapshot aggregate's own stamps cannot serve here.
+    pub(crate) poll_freshness: PollFreshness,
     pub(crate) equity: ImbalanceThreshold,
+    /// Bound on the age of a chain's inventory snapshot before that chain's
+    /// imbalance evaluations are skipped as stale.
+    pub(crate) inventory_staleness_bound: Duration,
     pub(crate) usdc: Option<ImbalanceThreshold>,
     pub(crate) transfer_timeout: Duration,
     pub(crate) assets: ChainAssets,
@@ -179,6 +188,60 @@ impl RebalancingServiceConfig {
             .get(symbol)
             .is_some_and(|config| config.rebalancing == OperationMode::Enabled)
     }
+}
+
+/// Why a chain's snapshot fails the cross-chain staleness rule.
+#[derive(Clone, Copy)]
+enum StaleSnapshot {
+    /// The slot was never confirmed by a snapshot -- e.g. right after a
+    /// restart -- which is conservatively stale until the first poll lands.
+    NeverPolled,
+    AgedOut {
+        age_secs: i64,
+    },
+    /// The stamp lies in the future -- clock skew or corrupt data; either
+    /// way the timestamp cannot vouch for freshness, so fail conservative.
+    FutureStamp {
+        skew_secs: i64,
+    },
+}
+
+impl std::fmt::Display for StaleSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NeverPolled => write!(formatter, "never polled"),
+            Self::AgedOut { age_secs } => write!(formatter, "age {age_secs}s"),
+            Self::FutureStamp { skew_secs } => {
+                write!(formatter, "stamp {skew_secs}s in the future")
+            }
+        }
+    }
+}
+
+/// Cross-chain staleness rule: `None` when the snapshot is fresh enough to
+/// size an operation, otherwise why it is stale.
+fn stale_snapshot_age(fetched_at: Option<DateTime<Utc>>, bound: Duration) -> Option<StaleSnapshot> {
+    let Some(at) = fetched_at else {
+        return Some(StaleSnapshot::NeverPolled);
+    };
+
+    let age = Utc::now().signed_duration_since(at);
+    // A negative age (to_std fails) means the stamp is in the future: clock
+    // skew or corruption. A skewed clock cannot vouch for freshness, so fail
+    // conservative; this self-heals once the wall clock passes the stamp or
+    // the next poll rewrites it.
+    age.to_std().map_or_else(
+        |_| {
+            Some(StaleSnapshot::FutureStamp {
+                skew_secs: -age.num_seconds(),
+            })
+        },
+        |elapsed| {
+            (elapsed > bound).then(|| StaleSnapshot::AgedOut {
+                age_secs: age.num_seconds(),
+            })
+        },
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3012,6 +3075,32 @@ impl RebalancingService {
             return Ok(());
         }
 
+        // Cross-chain staleness rule: never size an operation off a chain
+        // whose onchain balance was not recently confirmed by a successful
+        // poll. Freshness comes from PollFreshness, which the poller stamps
+        // on every successful fetch, so an unchanged (event-suppressed) book
+        // still reads fresh; the snapshot aggregate's own stamps freeze on
+        // quiet books (see freshness.rs module doc).
+        let chain = self.inventory.read().await.trading_chain();
+        let last_polled = self.config.poll_freshness.last_observed(
+            PortfolioLocation::MarketMaking(chain),
+            &PortfolioAsset::Equity(symbol.clone()),
+        );
+        if let Some(staleness) =
+            stale_snapshot_age(last_polled, self.config.inventory_staleness_bound)
+        {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                %chain,
+                %staleness,
+                bound_secs = self.config.inventory_staleness_bound.as_secs(),
+                "Skipped equity trigger: the chain's onchain inventory \
+                 poll is stale"
+            );
+            return Ok(());
+        }
+
         let Some(guard) = self.try_claim_equity_guard_for_transfer(symbol) else {
             debug!(target: "rebalance", %symbol, "Skipped equity trigger: already in progress");
             return Ok(());
@@ -3149,6 +3238,29 @@ impl RebalancingService {
                 target: "rebalance",
                 "Skipped USDC trigger: cash balance is restart-tainted \
                  pending broker re-base"
+            );
+            return;
+        }
+
+        // Cross-chain staleness rule, mirroring the equity trigger: the
+        // bridge must not be sized off a chain with no recent successful
+        // USDC poll (PollFreshness, not snapshot stamps: a static USDC
+        // balance emits no events, yet stays fresh while polled).
+        let chain = self.inventory.read().await.trading_chain();
+        let last_polled = self.config.poll_freshness.last_observed(
+            PortfolioLocation::MarketMaking(chain),
+            &PortfolioAsset::Usdc,
+        );
+        if let Some(staleness) =
+            stale_snapshot_age(last_polled, self.config.inventory_staleness_bound)
+        {
+            warn!(
+                target: "rebalance",
+                %chain,
+                %staleness,
+                bound_secs = self.config.inventory_staleness_bound.as_secs(),
+                "Skipped USDC trigger: the chain's onchain USDC poll is \
+                 stale"
             );
             return;
         }
@@ -5663,6 +5775,8 @@ mod tests {
 
     fn test_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {
+            poll_freshness: PollFreshness::always_fresh(),
+            inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             equity: ImbalanceThreshold {
                 target: float!(0.5),
@@ -5686,6 +5800,8 @@ mod tests {
 
     fn test_config_with_timeout(timeout: Duration) -> RebalancingServiceConfig {
         RebalancingServiceConfig {
+            poll_freshness: PollFreshness::always_fresh(),
+            inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             transfer_timeout: timeout,
             ..test_config()
@@ -5950,6 +6066,8 @@ mod tests {
     /// Builds a `RebalancingService` with `wrapped_equity_recovery = Enabled` for `symbol`.
     async fn make_trigger_with_recovery_enabled(symbol: &Symbol) -> Arc<RebalancingService> {
         let config = RebalancingServiceConfig {
+            poll_freshness: PollFreshness::always_fresh(),
+            inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             assets: ChainAssets {
                 equities: ChainEquities {
@@ -7611,6 +7729,8 @@ mod tests {
 
         let trigger = RebalancingService::new(
             RebalancingServiceConfig {
+                poll_freshness: PollFreshness::always_fresh(),
+                inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 equity: test_config().equity,
                 usdc: None,
@@ -7651,6 +7771,15 @@ mod tests {
         symbol: &Symbol,
         equities: ChainEquities,
     ) -> Arc<RebalancingService> {
+        make_imbalanced_trigger_with_freshness(symbol, equities, PollFreshness::always_fresh())
+            .await
+    }
+
+    async fn make_imbalanced_trigger_with_freshness(
+        symbol: &Symbol,
+        equities: ChainEquities,
+        poll_freshness: PollFreshness,
+    ) -> Arc<RebalancingService> {
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
@@ -7667,6 +7796,8 @@ mod tests {
             .unwrap();
 
         let config = RebalancingServiceConfig {
+            poll_freshness,
+            inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             assets: ChainAssets {
                 equities,
@@ -7751,6 +7882,116 @@ mod tests {
             "Whitelisted symbol with an imbalance should dispatch a mint job"
         );
         assert_eq!(jobs[0].symbol, symbol);
+    }
+
+    /// Cross-chain staleness rule: an equity evaluation must not run off a
+    /// chain whose last successful poll is older than the configured bound.
+    /// `whitelisted_symbol_passes_equity_trigger` is the always-fresh
+    /// positive control.
+    #[tokio::test]
+    async fn stale_onchain_poll_skips_equity_trigger() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let freshness = PollFreshness::new();
+        freshness.set_observed(
+            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioAsset::Equity(symbol.clone()),
+            Utc::now() - chrono::Duration::seconds(301),
+        );
+        let trigger = make_imbalanced_trigger_with_freshness(
+            &symbol,
+            rebalancing_enabled_equities(&["AAPL"]),
+            freshness,
+        )
+        .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "a stale onchain poll must not size an equity operation"
+        );
+    }
+
+    /// The quiet-book regression: a balance that never changes emits no
+    /// snapshot events, but as long as the poller keeps reading it the
+    /// freshness source keeps moving and the trigger must still run. Guarding
+    /// on the snapshot aggregate's own stamps deadlocked here: the rebalance
+    /// is the only thing that would have changed the balance.
+    #[tokio::test]
+    async fn quiet_book_with_fresh_polls_is_not_skipped_as_stale() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let freshness = PollFreshness::new();
+        freshness.set_observed(
+            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioAsset::Equity(symbol.clone()),
+            Utc::now(),
+        );
+        let trigger = make_imbalanced_trigger_with_freshness(
+            &symbol,
+            rebalancing_enabled_equities(&["AAPL"]),
+            freshness,
+        )
+        .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(
+            take_pending_equity_mint_jobs(&trigger).await.len(),
+            1,
+            "a freshly polled (if unchanged) book must dispatch"
+        );
+    }
+
+    /// A poll observation in the future (clock skew or corrupt data) cannot
+    /// vouch for freshness: the guard must fail conservative rather than
+    /// treat the unparseable age as fresh.
+    #[tokio::test]
+    async fn future_stamped_onchain_poll_skips_equity_trigger() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let freshness = PollFreshness::new();
+        freshness.set_observed(
+            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioAsset::Equity(symbol.clone()),
+            Utc::now() + chrono::Duration::seconds(120),
+        );
+        let trigger = make_imbalanced_trigger_with_freshness(
+            &symbol,
+            rebalancing_enabled_equities(&["AAPL"]),
+            freshness,
+        )
+        .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "a future-stamped observation must be treated as stale, not fresh"
+        );
+    }
+
+    /// Restart is conservatively stale: the freshness map is empty until the
+    /// first successful poll of THIS process run, so no evaluation runs off
+    /// hydrated state alone.
+    #[tokio::test]
+    async fn never_polled_slot_skips_equity_trigger() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_imbalanced_trigger_with_freshness(
+            &symbol,
+            rebalancing_enabled_equities(&["AAPL"]),
+            PollFreshness::new(),
+        )
+        .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "a never-polled slot must be conservatively stale until the \
+             first successful poll of this run"
+        );
     }
 
     #[tokio::test]
@@ -19805,6 +20046,8 @@ mod tests {
         let schedulers = RebalancingSchedulers::new(&apalis_pool);
         let trigger = RebalancingService::new(
             RebalancingServiceConfig {
+                poll_freshness: PollFreshness::always_fresh(),
+                inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
@@ -23132,6 +23375,68 @@ mod tests {
             busy,
             Some(EquityReconcileBusy::Transfer),
             "the active mint must survive the skipped recovery"
+        );
+    }
+
+    /// The cash twin of the equity staleness tests: a stale (or never-polled)
+    /// onchain USDC snapshot must suppress USDC dispatch; a re-stamped fresh
+    /// slot restores it.
+    #[tokio::test]
+    async fn stale_onchain_usdc_poll_skips_usdc_trigger() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let freshness = PollFreshness::new();
+        freshness.set_observed(
+            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioAsset::Usdc,
+            Utc::now() - chrono::Duration::seconds(301),
+        );
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            RebalancingServiceConfig {
+                poll_freshness: freshness.clone(),
+                ..test_config()
+            },
+        )
+        .await;
+
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "a stale onchain USDC snapshot must not size a bridge transfer"
+        );
+
+        freshness.set_observed(
+            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioAsset::Usdc,
+            Utc::now(),
+        );
+
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1,
+            "a fresh snapshot stamp must restore USDC dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn never_polled_onchain_usdc_slot_skips_usdc_trigger() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let trigger = make_trigger_with_inventory_config(
+            inventory,
+            RebalancingServiceConfig {
+                poll_freshness: PollFreshness::new(),
+                ..test_config()
+            },
+        )
+        .await;
+
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "a never-polled USDC slot must be conservatively stale"
         );
     }
 
