@@ -58,7 +58,7 @@ use crate::offchain::order::{
     HandleOrderRejection, HandleOrderRejectionJobQueue, OffchainOrder, PollOrderStatus,
     PollOrderStatusJobQueue, ReconcileOrderFill, ReconcileOrderFillJobQueue,
 };
-use crate::onchain::backfill::{BackfillJobQueue, BackfillRange};
+use crate::onchain::backfill::{BackfillQueues, BackfillRange};
 use crate::onchain_trade::OnChainTrade;
 use crate::portfolio_snapshot::{
     PortfolioSnapshot, PortfolioSnapshotCtx, PortfolioSnapshotJob, PortfolioSnapshotJobQueue,
@@ -111,6 +111,14 @@ pub(crate) struct CqrsFrameworks {
 
 #[derive(Debug, Error)]
 pub(crate) enum ConductorSpawnError {
+    #[error(
+        "watched chain {chain} has no {what} wired; the provider, queue, and \
+         token maps must all be derived from the same chain registry"
+    )]
+    MissingWatchWiring {
+        chain: st0x_evm::Chain,
+        what: &'static str,
+    },
     #[error(transparent)]
     CloseFlattenWindow(#[from] chrono::OutOfRangeError),
     #[error(transparent)]
@@ -127,6 +135,10 @@ pub(crate) enum ConductorSpawnError {
 /// Everything needed to construct a running [`Conductor`].
 pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) ctx: Ctx,
+    /// Providers for watched, non-primary chains (the primary's fill watcher
+    /// reuses `provider`). Keyed by chain; derived from the same registry as
+    /// the queue and token maps.
+    pub(crate) watch_providers: std::collections::BTreeMap<st0x_evm::Chain, Prov>,
     /// Shared freshness tracker (see the creation site in `Conductor::start`):
     /// the poller built here stamps it; the rebalancing guard reads it.
     pub(crate) poll_freshness: PollFreshness,
@@ -215,7 +227,7 @@ fn configured_inventory_vaults(ctx: &Ctx) -> ConfiguredInventoryVaults {
 pub(crate) fn spawn<Prov, Exec>(
     context: ConductorCtx<Prov, Exec>,
     job_queue: DexTradeAccountingJobQueue,
-    backfill_queue: BackfillJobQueue,
+    backfill_queue: BackfillQueues,
     dashboard_trade_delivery_queue: DashboardTradeDeliveryJobQueue,
     dashboard_trade_delivery_ctx: Arc<DashboardTradeDeliveryCtx>,
     dashboard_trade_handoff_monitor: DashboardTradeHandoffMonitor,
@@ -507,21 +519,13 @@ where
     let apalis_shutdown_token_for_struct = apalis_shutdown_token.clone();
 
     let SupervisorStartupTokens {
-        order_fill_monitor: order_fill_startup,
+        order_fill_monitors: mut order_fill_startup_tokens,
         inventory_monitor: inventory_startup,
         dashboard_trade_handoff_monitor: dashboard_trade_handoff_startup,
         executor_maintenance: executor_maintenance_startup,
         base_gas_monitor: base_gas_monitor_startup,
         ethereum_gas_monitor: ethereum_gas_monitor_startup,
     } = context.supervisor_startup;
-
-    let order_fill_monitor = OrderFillMonitor::new(
-        context.ctx.chains.primary().clone(),
-        backfill_queue.clone(),
-        context.pool,
-        context.provider,
-        context.ctx.chains.primary().order_fill_poll_interval,
-    );
 
     // Fail-fast: exit if any supervised task dies, relying on systemd restart for recovery.
     // In test builds, use aggressive timeouts so a transient RPC failure doesn't
@@ -531,14 +535,62 @@ where
         .with_max_restart_attempts(if is_test { 2 } else { 10 })
         .with_max_backoff_exponent(if is_test { 2 } else { 8 })
         .with_base_restart_delay(std::time::Duration::from_secs(1))
-        .with_dead_tasks_threshold(Some(0.0))
-        .with_task(
-            "order-fill-monitor",
-            StartupTask {
-                task: order_fill_monitor,
-                token: order_fill_startup,
+        .with_dead_tasks_threshold(Some(0.0));
+
+    // One fill watcher per watched chain, each with its own provider, poll
+    // interval, namespaced scan queue, and readiness token. The primary
+    // reuses the conductor's main provider; secondaries take theirs from
+    // `watch_providers` (absent entries are a startup bug: the token map,
+    // queue map, and provider map are all derived from the same registry).
+    let mut watch_providers = context.watch_providers;
+    let primary_chain = context.ctx.chains.primary().chain;
+    let watched_chains: Vec<st0x_config::TradingChain> =
+        context.ctx.chains.watched().cloned().collect();
+    for watched in watched_chains {
+        let chain = watched.chain;
+        let provider = if chain == primary_chain {
+            context.provider.clone()
+        } else {
+            watch_providers
+                .remove(&chain)
+                .ok_or(ConductorSpawnError::MissingWatchWiring {
+                    chain,
+                    what: "provider",
+                })?
+        };
+        let queue = backfill_queue
+            .for_chain(chain)
+            .ok_or(ConductorSpawnError::MissingWatchWiring {
+                chain,
+                what: "backfill queue",
+            })?
+            .clone();
+        let token = order_fill_startup_tokens.remove(&chain).ok_or(
+            ConductorSpawnError::MissingWatchWiring {
+                chain,
+                what: "startup token",
             },
-        )
+        )?;
+
+        let poll_interval = watched.order_fill_poll_interval;
+        let monitor = OrderFillMonitor::new(
+            watched,
+            queue,
+            context.pool.clone(),
+            provider,
+            poll_interval,
+        );
+
+        supervisor_builder = supervisor_builder.with_task(
+            &format!("order-fill-monitor-{chain}"),
+            StartupTask {
+                task: monitor,
+                token,
+            },
+        );
+    }
+
+    let mut supervisor_builder = supervisor_builder
         .with_task(
             "inventory-monitor",
             StartupTask {
@@ -676,7 +728,7 @@ where
     seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
     job_queue: DexTradeAccountingJobQueue,
     hedge_queue: HedgeJobQueue,
-    backfill_queue: BackfillJobQueue,
+    backfill_queue: BackfillQueues,
     dashboard_trade_delivery_queue: DashboardTradeDeliveryJobQueue,
     dashboard_trade_delivery_ctx: Arc<DashboardTradeDeliveryCtx>,
     poll_status_queue: PollOrderStatusJobQueue,
@@ -826,7 +878,31 @@ where
         let accountant_ctx_for_backfill = accountant_ctx.clone();
 
         tokio::spawn(startup_token.wrap(async move {
-            let monitor = Monitor::new()
+            // Supervised: an incomplete backfill can omit onchain trades. One
+            // worker per watched chain, each on its own namespaced queue, so
+            // one chain's scan backlog never occupies another chain's worker.
+            let mut monitor = Monitor::new();
+            for (worker_chain, chain_queue) in backfill_queue.iter() {
+                let chain_queue = chain_queue.clone();
+                let worker_chain = *worker_chain;
+                let accountant_ctx_for_backfill = accountant_ctx_for_backfill.clone();
+                let failure_notify_for_backfill = failure_notify_for_backfill.clone();
+                #[cfg(any(test, feature = "test-support"))]
+                let failure_injector_for_backfill = failure_injector_for_backfill.clone();
+                monitor = monitor.register(move |index| {
+                    build_supervised_worker!(
+                        ::<AccountantCtx<Prov, Exec>, BackfillRange>,
+                        format_args!("{worker_chain}-{index}"),
+                        chain_queue.clone(),
+                        accountant_ctx_for_backfill.clone(),
+                        failure_notify_for_backfill.clone(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        failure_injector_for_backfill.clone(),
+                    )
+                });
+            }
+
+            let monitor = monitor
                 .should_restart(|_ctx, _error, _attempt| false)
                 .register(move |index| {
                     // Supervised: losing trade accounting compromises hedging state.
@@ -862,18 +938,6 @@ where
                         failure_notify_for_hedge.clone(),
                         #[cfg(any(test, feature = "test-support"))]
                         failure_injector_for_hedge.clone(),
-                    )
-                })
-                .register(move |index| {
-                    // Supervised: an incomplete backfill can omit onchain trades.
-                    build_supervised_worker!(
-                        ::<AccountantCtx<Prov, Exec>, BackfillRange>,
-                        index,
-                        backfill_queue.clone(),
-                        accountant_ctx_for_backfill.clone(),
-                        failure_notify_for_backfill.clone(),
-                        #[cfg(any(test, feature = "test-support"))]
-                        failure_injector_for_backfill.clone(),
                     )
                 })
                 .register(move |index| {

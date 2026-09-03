@@ -51,6 +51,8 @@ pub fn raindex_contracts(
 /// Provides error mapping between layers while maintaining separation of concerns.
 #[derive(Debug, thiserror::Error)]
 pub enum OnChainError {
+    #[error("job addressed to chain {chain}, which no watched chain matches")]
+    UnwatchedChain { chain: st0x_evm::Chain },
     #[error("Trade validation error: {0}")]
     Validation(#[from] TradeValidationError),
     #[error("Database persistence error: {0}")]

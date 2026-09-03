@@ -23,7 +23,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_config::TradingChain;
-use st0x_evm::Evm;
+use st0x_evm::{Chain, Evm};
 use st0x_execution::Executor;
 
 use super::OnChainError;
@@ -156,6 +156,65 @@ pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clon
 /// Persistent job queue for backfill jobs.
 pub(crate) type BackfillJobQueue = crate::conductor::job::JobQueue<BackfillRange>;
 
+/// One namespaced backfill queue per watched chain. A chain's scan backlog,
+/// in-flight rows, and orphan recovery are invisible to every other chain's
+/// queue and workers, so one chain's long catch-up cannot freeze another's
+/// ingestion through the monitor's overlap guard.
+#[derive(Clone)]
+pub(crate) struct BackfillQueues(std::collections::BTreeMap<Chain, BackfillJobQueue>);
+
+impl BackfillQueues {
+    /// Builds one namespaced queue per watched chain in `chains`.
+    pub(crate) fn new(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        chains: &st0x_config::ChainRegistry,
+    ) -> Self {
+        Self(
+            chains
+                .watched()
+                .map(|watched| {
+                    (
+                        watched.chain,
+                        BackfillJobQueue::new_namespaced(apalis_pool, watched.chain.as_str()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// The queue for `chain`; `None` when the chain is not watched.
+    pub(crate) fn for_chain(&self, chain: Chain) -> Option<&BackfillJobQueue> {
+        self.0.get(&chain)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&Chain, &BackfillJobQueue)> {
+        self.0.iter()
+    }
+
+    /// Re-labels durable rows written before per-chain queues existed: their
+    /// `job_type` is the bare task type name, which no namespaced queue reads,
+    /// so without this they would sit stranded until the retention sweep
+    /// DELETED them -- each one an ingested block range never scanned. All
+    /// legacy rows belong to Base by definition. Runs at startup, after the
+    /// apalis tables exist and before any worker spawns; idempotent.
+    pub(crate) async fn relabel_legacy_rows(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+    ) -> Result<u64, apalis_sqlite::SqlxError> {
+        let legacy = std::any::type_name::<BackfillRange>();
+        let namespaced = format!("{legacy}@{}", Chain::Base);
+        let result = sqlx_apalis::query(
+            "UPDATE Jobs SET job_type = ? \
+             WHERE job_type = ? AND status NOT IN ('Done', 'Failed', 'Killed')",
+        )
+        .bind(namespaced)
+        .bind(legacy)
+        .execute(apalis_pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+}
+
 /// Apalis job that backfills missed `ClearV3` / `TakeOrderV3` orderbook fills
 /// and `OperatorDeposit` / `OperatorWithdraw` inventory settlements between
 /// `from_block` and `to_block` (inclusive).
@@ -172,6 +231,10 @@ pub(crate) type BackfillJobQueue = crate::conductor::job::JobQueue<BackfillRange
 /// provide defense in depth if that assumption breaks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct BackfillRange {
+    /// The chain this range scans. Defaulted only for in-flight apalis
+    /// payloads enqueued before per-chain watchers.
+    #[serde(default = "crate::onchain::legacy_chain")]
+    pub(crate) chain: Chain,
     pub(crate) from_block: u64,
     pub(crate) to_block: u64,
 }
@@ -201,15 +264,21 @@ where
 
     fn label(&self) -> Label {
         Label::new(format!(
-            "BackfillRange:{}:{}",
-            self.from_block, self.to_block
+            "BackfillRange:{}:{}:{}",
+            self.chain, self.from_block, self.to_block
         ))
     }
 
     async fn perform(&self, ctx: &AccountantCtx<Node, Exec>) -> Result<Self::Output, Self::Error> {
+        let evm_ctx = ctx
+            .ctx
+            .chains
+            .watch(self.chain)
+            .ok_or(OnChainError::UnwatchedChain { chain: self.chain })?;
+
         backfill_range(
             ctx.evm.provider(),
-            ctx.ctx.chains.primary(),
+            evm_ctx,
             BotOperator(ctx.ctx.order_owner()),
             &ctx.pool,
             self.from_block,
@@ -262,8 +331,10 @@ pub(crate) async fn load_backfill_checkpoint(
     evm_ctx: &TradingChain,
 ) -> Result<Option<u64>, OnChainError> {
     let row = sqlx::query_as::<_, (i64,)>(
-        "SELECT last_processed_block FROM backfill_checkpoints WHERE orderbook = ?",
+        "SELECT last_processed_block FROM backfill_checkpoints \
+         WHERE chain = ? AND orderbook = ?",
     )
+    .bind(evm_ctx.chain.to_string())
     .bind(evm_ctx.orderbook.to_string())
     .fetch_optional(pool)
     .await?;
@@ -281,15 +352,16 @@ pub(crate) async fn save_backfill_checkpoint(
     let last_processed_block = i64::try_from(last_processed_block)?;
 
     sqlx::query(
-        "INSERT INTO backfill_checkpoints (orderbook, last_processed_block) \
-         VALUES (?, ?) \
-         ON CONFLICT(orderbook) DO UPDATE SET \
+        "INSERT INTO backfill_checkpoints (chain, orderbook, last_processed_block) \
+         VALUES (?, ?, ?) \
+         ON CONFLICT(chain, orderbook) DO UPDATE SET \
          last_processed_block = MAX( \
              excluded.last_processed_block, \
              backfill_checkpoints.last_processed_block \
          ), \
          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
     )
+    .bind(evm_ctx.chain.to_string())
     .bind(evm_ctx.orderbook.to_string())
     .bind(last_processed_block)
     .execute(pool)
@@ -814,6 +886,103 @@ mod tests {
 
     use super::*;
     use crate::bindings::IRaindexV6;
+
+    /// Each watched chain advances its own checkpoint row: writing one
+    /// chain's checkpoint neither clobbers nor reads through to another's.
+    #[tokio::test]
+    async fn checkpoints_are_scoped_per_chain() {
+        let pool = setup_test_db().await;
+        let base = TradingChain::test().deployment_block(1).call();
+        let ethereum = TradingChain::test()
+            .chain(Chain::Ethereum)
+            .orderbook(alloy::primitives::Address::repeat_byte(0x22))
+            .deployment_block(1)
+            .call();
+
+        save_backfill_checkpoint(&pool, &base, 100).await.unwrap();
+        save_backfill_checkpoint(&pool, &ethereum, 7).await.unwrap();
+
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &base).await.unwrap(),
+            Some(100)
+        );
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &ethereum).await.unwrap(),
+            Some(7)
+        );
+
+        // The monotonic MAX guard holds per (chain, orderbook).
+        save_backfill_checkpoint(&pool, &base, 50).await.unwrap();
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &base).await.unwrap(),
+            Some(100),
+            "a backwards write must not rewind the checkpoint"
+        );
+    }
+
+    /// Rows enqueued by a pre-per-chain binary carry the bare type name as
+    /// their job_type; startup adopts them into Base's namespaced queue so
+    /// they are neither stranded nor retention-deleted.
+    #[tokio::test]
+    async fn legacy_backfill_rows_are_adopted_into_the_base_queue() {
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let mut legacy_queue = BackfillJobQueue::new(&apalis_pool);
+        legacy_queue
+            .push(BackfillRange {
+                chain: Chain::Base,
+                from_block: 1,
+                to_block: 2,
+            })
+            .await
+            .unwrap();
+
+        let adopted = BackfillQueues::relabel_legacy_rows(&apalis_pool)
+            .await
+            .unwrap();
+        assert_eq!(adopted, 1);
+
+        let namespaced = BackfillJobQueue::new_namespaced(&apalis_pool, Chain::Base.as_str());
+        assert!(
+            namespaced.has_in_flight().await.unwrap(),
+            "the adopted row must be visible to the namespaced queue"
+        );
+
+        let legacy_view = BackfillJobQueue::new(&apalis_pool);
+        assert!(
+            !legacy_view.has_in_flight().await.unwrap(),
+            "no row may remain under the bare type name"
+        );
+    }
+
+    /// Namespaced queues of the same task type are mutually invisible: one
+    /// chain's in-flight rows and orphan recovery never touch another's.
+    #[tokio::test]
+    async fn namespaced_queues_are_mutually_invisible() {
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let mut base_queue = BackfillJobQueue::new_namespaced(&apalis_pool, Chain::Base.as_str());
+        let ethereum_queue =
+            BackfillJobQueue::new_namespaced(&apalis_pool, Chain::Ethereum.as_str());
+
+        base_queue
+            .push(BackfillRange {
+                chain: Chain::Base,
+                from_block: 1,
+                to_block: 2,
+            })
+            .await
+            .unwrap();
+
+        assert!(base_queue.has_in_flight().await.unwrap());
+        assert!(
+            !ethereum_queue.has_in_flight().await.unwrap(),
+            "another chain's rows must not read as in flight"
+        );
+        assert_eq!(
+            ethereum_queue.requeue_orphaned().await.unwrap(),
+            0,
+            "orphan recovery must not adopt another chain's rows"
+        );
+    }
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_pools};
 
     /// A bot-operator address distinct from every event operator seeded in
