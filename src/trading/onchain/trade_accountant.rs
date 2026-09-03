@@ -2234,6 +2234,7 @@ mod tests {
                     placed_at: chrono::Utc::now(),
                     market_session: st0x_execution::MarketSession::Regular,
                     close_flatten: false,
+                    reference_price: None,
                 },
             },
         ];

@@ -869,6 +869,14 @@ placement:
   `hedge_scan_skipped_total`, and `hedge_cancellations_requested_total`. The
   label states the session the order targeted. For a cancellation, it states the
   session of the cancelled order, not the session of the sweep tick.
+- Every limit-kind placement persists its pre-slippage reference price on the
+  `Placed` event, next to the audit-only limit price. Two histograms measure
+  price distances from it, both signed so that positive is adverse:
+  `hedge_reference_to_limit_bps{symbol,session}` records the realized
+  reference-to-limit cross at placement, and
+  `hedge_reference_to_fill_slippage_bps{symbol,session}` records the
+  reference-to-fill distance when the fill completes. Market orders and orders
+  that predate the persisted reference record no distance samples.
 - `close_flatten_outcomes_total{symbol,direction,outcome}` records terminal
   broker-state dispatches for close-flatten placements, with `outcome` equal to
   `filled`, `cancelled`, or `failed`. Evaluate attempt fill rate per

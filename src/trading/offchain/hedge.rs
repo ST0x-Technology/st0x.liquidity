@@ -453,6 +453,7 @@ async fn select_order_kind_for_current_session(
             Ok(Some(CounterTradeOrderKind::ExtendedHoursLimit {
                 limit_price,
                 close_flatten: close_flatten_active,
+                reference_price: Some(reference.price),
             }))
         }
     }
@@ -921,6 +922,7 @@ async fn select_overnight_order_kind(
     Ok(Some(CounterTradeOrderKind::OvernightLimit {
         limit_price,
         snapshot,
+        reference_price: Some(reference.price),
     }))
 }
 
@@ -4011,6 +4013,7 @@ mod tests {
             placed_at: chrono::Utc::now(),
             market_session: MarketSession::Regular,
             close_flatten: false,
+            reference_price: None,
         };
 
         let error =
@@ -4056,6 +4059,7 @@ mod tests {
             submitted_at: chrono::Utc::now(),
             market_session: MarketSession::Regular,
             close_flatten: false,
+            reference_price: None,
         };
 
         // First call: no live poll job yet, so the guard is a no-op and the
@@ -5016,6 +5020,7 @@ mod tests {
                     kind: CounterTradeOrderKind::ExtendedHoursLimit {
                         limit_price: Positive::new(Usd::new(float!(101.00))).unwrap(),
                         close_flatten: false,
+                        reference_price: None,
                     },
                 },
             )
@@ -5162,6 +5167,7 @@ mod tests {
         let CounterTradeOrderKind::ExtendedHoursLimit {
             limit_price,
             close_flatten,
+            ..
         } = selected_kind
         else {
             panic!("close flatten must select an extended-hours limit");
@@ -5267,6 +5273,7 @@ mod tests {
         let CounterTradeOrderKind::ExtendedHoursLimit {
             limit_price,
             close_flatten,
+            ..
         } = kind
         else {
             panic!("close flatten must select an extended-hours limit");
@@ -6507,12 +6514,18 @@ mod tests {
         let Some(CounterTradeOrderKind::OvernightLimit {
             limit_price,
             snapshot,
+            reference_price,
         }) = kind
         else {
             panic!("expected an overnight limit, got {kind:?}");
         };
         assert_eq!(limit_price, usd("24.67"));
         assert_eq!(snapshot.details, eligible_details());
+        assert_eq!(
+            reference_price,
+            Some(usd("24.30")),
+            "the pre-slippage indicative ask must ride the kind for the audit trail"
+        );
     }
 
     #[tokio::test]
@@ -7136,6 +7149,7 @@ mod tests {
                     kind: CounterTradeOrderKind::ExtendedHoursLimit {
                         limit_price: Positive::new(Usd::new(float!(101.00))).unwrap(),
                         close_flatten: false,
+                        reference_price: None,
                     },
                 },
             )

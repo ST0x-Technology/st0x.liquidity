@@ -292,6 +292,19 @@ pub(crate) async fn place_offchain_order_at_broker(
         Direction::Sell => "sell",
     };
     let session_label = session_metric_label(kind.market_session());
+    let reference_to_limit = match &kind {
+        CounterTradeOrderKind::Market => None,
+        CounterTradeOrderKind::ExtendedHoursLimit {
+            limit_price,
+            reference_price,
+            ..
+        }
+        | CounterTradeOrderKind::OvernightLimit {
+            limit_price,
+            reference_price,
+            ..
+        } => reference_price.map(|reference| (reference, *limit_price)),
+    };
 
     let placement = match kind {
         CounterTradeOrderKind::Market => {
@@ -317,6 +330,7 @@ pub(crate) async fn place_offchain_order_at_broker(
         CounterTradeOrderKind::OvernightLimit {
             limit_price,
             snapshot,
+            reference_price: _,
         } => {
             let limit_order = LimitOrder {
                 symbol,
@@ -344,6 +358,16 @@ pub(crate) async fn place_offchain_order_at_broker(
     };
     let outcome = match placement {
         Ok(result) => {
+            if let Some((reference, limit)) = reference_to_limit {
+                record_adverse_bps(
+                    "hedge_reference_to_limit_bps",
+                    reference,
+                    limit.inner(),
+                    direction,
+                    &symbol_label,
+                    session_label,
+                );
+            }
             counter!(
                 "hedge_trades_total",
                 "symbol" => symbol_label,
@@ -495,6 +519,101 @@ pub(crate) const fn session_metric_label(session: MarketSession) -> &'static str
     }
 }
 
+/// Records the signed basis-point distance from `reference` to `executed`
+/// on `metric`, oriented so positive is adverse: a buy executing above the
+/// reference and a sell executing below it both record positive.
+///
+/// f64 precision: Prometheus histograms are natively f64, so lossless
+/// export is not possible. Monitoring-only, like the `position_shares`
+/// gauge; all financial accounting keeps the lossless Float arithmetic.
+fn record_adverse_bps(
+    metric: &'static str,
+    reference: Positive<Usd>,
+    executed: Usd,
+    direction: Direction,
+    symbol_label: &str,
+    session_label: &'static str,
+) {
+    let parsed = (
+        reference.inner().to_string().parse::<f64>(),
+        executed.to_string().parse::<f64>(),
+    );
+    let (Ok(reference), Ok(executed)) = parsed else {
+        warn!(
+            symbol = symbol_label,
+            metric, "bps sample skipped: could not parse prices as f64"
+        );
+        return;
+    };
+
+    // `reference` is positive by construction (`Positive<Usd>`), so the
+    // division cannot blow up.
+    let raw = (executed - reference) / reference * 10_000.0;
+    let adverse = match direction {
+        Direction::Buy => raw,
+        Direction::Sell => -raw,
+    };
+
+    histogram!(
+        metric,
+        "symbol" => symbol_label.to_string(),
+        "session" => session_label
+    )
+    .record(adverse);
+}
+
+/// Records a completed fill's observability samples: the wall-clock
+/// placement-to-fill latency and, when the placement persisted a reference
+/// price, the reference-to-fill slippage. Metric-only -- never affects the
+/// state transition.
+fn record_fill_metrics(
+    symbol: &Symbol,
+    placed_at: DateTime<Utc>,
+    market_session: MarketSession,
+    direction: Direction,
+    reference_price: Option<Positive<Usd>>,
+    price: Usd,
+    filled_at: DateTime<Utc>,
+) {
+    // A negative delta can only come from clock skew (never a real
+    // latency), so `to_std()` rejects it and the sample is skipped rather
+    // than recorded as a bogus value -- logged so the skew is not silently
+    // swallowed.
+    match (filled_at - placed_at).to_std() {
+        Ok(latency) => {
+            histogram!(
+                "hedge_fill_latency_seconds",
+                "symbol" => symbol.to_string(),
+                "session" => session_metric_label(market_session)
+            )
+            .record(latency.as_secs_f64());
+        }
+        Err(error) => {
+            debug!(
+                %symbol, %error,
+                "Skipping hedge_fill_latency sample: fill precedes placement (clock skew)"
+            );
+        }
+    }
+
+    if let Some(reference) = reference_price {
+        record_adverse_bps(
+            "hedge_reference_to_fill_slippage_bps",
+            reference,
+            price,
+            direction,
+            &symbol.to_string(),
+            session_metric_label(market_session),
+        );
+    } else {
+        debug!(
+            %symbol,
+            "Fill-slippage sample skipped: the order predates the \
+             persisted reference price (or was a market order)"
+        );
+    }
+}
+
 fn market_session_from_extended(is_extended_hours: bool) -> MarketSession {
     if is_extended_hours {
         MarketSession::Extended
@@ -535,13 +654,18 @@ fn placed_event(
     placed_at: DateTime<Utc>,
 ) -> OffchainOrderEvent {
     let requested_market_session = kind.market_session();
-    let (limit_price, close_flatten) = match kind {
+    let (limit_price, close_flatten, reference_price) = match kind {
         CounterTradeOrderKind::ExtendedHoursLimit {
             limit_price,
             close_flatten,
-        } => (Some(*limit_price), *close_flatten),
-        CounterTradeOrderKind::OvernightLimit { limit_price, .. } => (Some(*limit_price), false),
-        CounterTradeOrderKind::Market => (None, false),
+            reference_price,
+        } => (Some(*limit_price), *close_flatten, *reference_price),
+        CounterTradeOrderKind::OvernightLimit {
+            limit_price,
+            reference_price,
+            ..
+        } => (Some(*limit_price), false, *reference_price),
+        CounterTradeOrderKind::Market => (None, false, None),
     };
 
     OffchainOrderEvent::Placed {
@@ -554,6 +678,7 @@ fn placed_event(
         limit_price,
         client_order_id: Some(client_order_id.clone()),
         close_flatten,
+        reference_price,
     }
 }
 
@@ -589,6 +714,11 @@ pub enum OffchainOrder {
         market_session: MarketSession,
         #[serde(default)]
         close_flatten: bool,
+        /// The pre-slippage reference this order's limit was crossed from.
+        /// Audit-only pass-through to the terminal fill-slippage metric;
+        /// `None` for market orders and pre-existing snapshots/events.
+        #[serde(default)]
+        reference_price: Option<Positive<Usd>>,
     },
     /// `shares` carries the broker-accepted quantity for orders placed after the
     /// durable-job extraction (built from `OffchainOrderEvent::Accepted`'s
@@ -615,6 +745,8 @@ pub enum OffchainOrder {
         market_session: MarketSession,
         #[serde(default)]
         close_flatten: bool,
+        #[serde(default)]
+        reference_price: Option<Positive<Usd>>,
     },
     PartiallyFilled {
         symbol: Symbol,
@@ -637,6 +769,8 @@ pub enum OffchainOrder {
         market_session: MarketSession,
         #[serde(default)]
         close_flatten: bool,
+        #[serde(default)]
+        reference_price: Option<Positive<Usd>>,
     },
     Cancelling {
         symbol: Symbol,
@@ -660,6 +794,8 @@ pub enum OffchainOrder {
         market_session: MarketSession,
         #[serde(default)]
         close_flatten: bool,
+        #[serde(default)]
+        reference_price: Option<Positive<Usd>>,
     },
     Filled {
         symbol: Symbol,
@@ -747,11 +883,13 @@ fn originate_offchain_order(event: &OffchainOrderEvent) -> Option<OffchainOrder>
             limit_price: _,
             client_order_id: _,
             close_flatten,
+            reference_price,
         } => Some(OffchainOrder::Pending {
             symbol: symbol.clone(),
             shares: *shares,
             direction: *direction,
             executor: *executor,
+            reference_price: *reference_price,
             placed_at: *placed_at,
             market_session: *market_session,
             close_flatten: *close_flatten,
@@ -928,6 +1066,7 @@ impl EventSourced for OffchainOrder {
                     placed_at,
                     market_session,
                     close_flatten,
+                    reference_price,
                 } = entity
                 else {
                     return Ok(None);
@@ -944,6 +1083,7 @@ impl EventSourced for OffchainOrder {
                     submitted_at: *submitted_at,
                     market_session: *market_session,
                     close_flatten: *close_flatten,
+                    reference_price: *reference_price,
                 }))
             }
 
@@ -961,6 +1101,7 @@ impl EventSourced for OffchainOrder {
                     executor,
                     placed_at,
                     close_flatten,
+                    reference_price,
                     ..
                 } = entity
                 else {
@@ -981,6 +1122,7 @@ impl EventSourced for OffchainOrder {
                     submitted_at: *submitted_at,
                     market_session: *market_session,
                     close_flatten: *close_flatten,
+                    reference_price: *reference_price,
                 }))
             }
 
@@ -1189,41 +1331,35 @@ impl EventSourced for OffchainOrder {
                     symbol,
                     placed_at,
                     market_session,
+                    direction,
+                    reference_price,
                     ..
                 }
                 | Self::PartiallyFilled {
                     symbol,
                     placed_at,
                     market_session,
+                    direction,
+                    reference_price,
                     ..
                 }
                 | Self::Cancelling {
                     symbol,
                     placed_at,
                     market_session,
+                    direction,
+                    reference_price,
                     ..
                 } => {
-                    // Wall-clock placement-to-fill latency. A negative delta can
-                    // only come from clock skew (never a real latency), so
-                    // `to_std()` rejects it and the sample is skipped rather than
-                    // recorded as a bogus value -- logged so the skew is not
-                    // silently swallowed.
-                    match (filled_at - *placed_at).to_std() {
-                        Ok(latency) => {
-                            histogram!(
-                                "hedge_fill_latency_seconds",
-                                "symbol" => symbol.to_string(),
-                                "session" => session_metric_label(*market_session)
-                            )
-                            .record(latency.as_secs_f64());
-                        }
-                        Err(error) => {
-                            debug!(
-                                %symbol, %error,
-                                "Skipping hedge_fill_latency sample: fill precedes placement (clock skew)"
-                            );
-                        }
-                    }
+                    record_fill_metrics(
+                        symbol,
+                        *placed_at,
+                        *market_session,
+                        *direction,
+                        *reference_price,
+                        price,
+                        filled_at,
+                    );
 
                     Ok(vec![OffchainOrderEvent::Filled { price, filled_at }])
                 }
@@ -1485,6 +1621,7 @@ fn evolve_partially_filled(
             submitted_at,
             market_session,
             close_flatten,
+            reference_price,
         }
         | OffchainOrder::PartiallyFilled {
             symbol,
@@ -1497,6 +1634,7 @@ fn evolve_partially_filled(
             submitted_at,
             market_session,
             close_flatten,
+            reference_price,
             ..
         } => Some(OffchainOrder::PartiallyFilled {
             symbol: symbol.clone(),
@@ -1512,6 +1650,7 @@ fn evolve_partially_filled(
             partially_filled_at,
             market_session: *market_session,
             close_flatten: *close_flatten,
+            reference_price: *reference_price,
         }),
         OffchainOrder::Cancelling {
             symbol,
@@ -1526,6 +1665,7 @@ fn evolve_partially_filled(
             cancel_requested_at,
             market_session,
             close_flatten,
+            reference_price,
             ..
         } => Some(OffchainOrder::Cancelling {
             symbol: symbol.clone(),
@@ -1545,6 +1685,7 @@ fn evolve_partially_filled(
             cancel_requested_at: *cancel_requested_at,
             market_session: *market_session,
             close_flatten: *close_flatten,
+            reference_price: *reference_price,
         }),
         OffchainOrder::Pending { .. }
         | OffchainOrder::Filled { .. }
@@ -1570,6 +1711,7 @@ fn evolve_cancel_requested(
             submitted_at,
             market_session,
             close_flatten,
+            reference_price,
         } => Some(OffchainOrder::Cancelling {
             symbol: symbol.clone(),
             shares: *shares,
@@ -1584,6 +1726,7 @@ fn evolve_cancel_requested(
             cancel_requested_at,
             market_session: *market_session,
             close_flatten: *close_flatten,
+            reference_price: *reference_price,
         }),
         OffchainOrder::PartiallyFilled {
             symbol,
@@ -1599,6 +1742,7 @@ fn evolve_cancel_requested(
             partially_filled_at,
             market_session,
             close_flatten,
+            reference_price,
             ..
         } => Some(OffchainOrder::Cancelling {
             symbol: symbol.clone(),
@@ -1618,6 +1762,7 @@ fn evolve_cancel_requested(
             cancel_requested_at,
             market_session: *market_session,
             close_flatten: *close_flatten,
+            reference_price: *reference_price,
         }),
         OffchainOrder::Pending { .. }
         | OffchainOrder::Cancelling { .. }
@@ -3132,6 +3277,11 @@ pub enum CounterTradeOrderKind {
     ExtendedHoursLimit {
         limit_price: Positive<Usd>,
         close_flatten: bool,
+        /// The reference price the limit was crossed from, before slippage.
+        /// Audit-only: threaded onto the `Placed` event so realized slippage
+        /// is measurable against it; `None` never blocks a placement.
+        #[serde(default)]
+        reference_price: Option<Positive<Usd>>,
     },
     /// No `close_flatten`: close flattening is an extended-session-close
     /// concept and a non-concept for overnight. Carries the eligibility
@@ -3141,6 +3291,9 @@ pub enum CounterTradeOrderKind {
     OvernightLimit {
         limit_price: Positive<Usd>,
         snapshot: EligibilitySnapshot,
+        /// Same audit-only contract as the extended-hours variant.
+        #[serde(default)]
+        reference_price: Option<Positive<Usd>>,
     },
 }
 
@@ -3282,6 +3435,12 @@ pub enum OffchainOrderEvent {
         /// to the flatten window. `false` for events predating this field.
         #[serde(default)]
         close_flatten: bool,
+        /// The reference price the limit was crossed from, before slippage
+        /// (`None` for market orders and events predating this field).
+        /// Audit-only, like `limit_price`, but also seeds the pre-terminal
+        /// entity states so realized fill slippage is measurable against it.
+        #[serde(default)]
+        reference_price: Option<Positive<Usd>>,
     },
     /// Legacy broker-acceptance event. Predates the durable-job extraction,
     /// where `Place` did the broker call inline and emitted this alongside
@@ -3665,6 +3824,7 @@ mod tests {
                     kind: CounterTradeOrderKind::ExtendedHoursLimit {
                         limit_price: Positive::new(Usd::new(float!(100))).unwrap(),
                         close_flatten: true,
+                        reference_price: None,
                     },
                 },
             )
@@ -3747,6 +3907,7 @@ mod tests {
                     kind: CounterTradeOrderKind::ExtendedHoursLimit {
                         limit_price: Positive::new(Usd::new(float!(100))).unwrap(),
                         close_flatten: false,
+                        reference_price: None,
                     },
                 },
             )
@@ -3768,6 +3929,7 @@ mod tests {
             limit_price: Some(Positive::new(Usd::new(float!(195.25))).unwrap()),
             client_order_id: Some(ClientOrderId::from_uuid(uuid::Uuid::new_v4())),
             close_flatten: true,
+            reference_price: Some(Positive::new(Usd::new(float!(195.00))).unwrap()),
         };
 
         // The submitted terms are recorded on the event for audit.
@@ -3780,6 +3942,10 @@ mod tests {
             !value["Placed"]["client_order_id"].is_null(),
             "client_order_id must be recorded on the Placed event"
         );
+        assert!(
+            !value["Placed"]["reference_price"].is_null(),
+            "reference_price must be recorded on the Placed event"
+        );
 
         // Events persisted before these fields existed (no keys) deserialize
         // with the fields defaulted to None rather than failing.
@@ -3787,6 +3953,7 @@ mod tests {
         placed.remove("limit_price");
         placed.remove("client_order_id");
         placed.remove("close_flatten");
+        placed.remove("reference_price");
         let legacy: OffchainOrderEvent = serde_json::from_value(value).unwrap();
         assert!(
             matches!(
@@ -3795,6 +3962,7 @@ mod tests {
                     limit_price: None,
                     client_order_id: None,
                     close_flatten: false,
+                    reference_price: None,
                     ..
                 }
             ),
@@ -3870,6 +4038,7 @@ mod tests {
             limit_price: Some(Positive::new(Usd::new(float!(195.25))).unwrap()),
             client_order_id: Some(ClientOrderId::from_uuid(uuid::Uuid::new_v4())),
             close_flatten: false,
+            reference_price: None,
         }
     }
 
@@ -3935,6 +4104,7 @@ mod tests {
             placed_at: Utc::now(),
             market_session,
             close_flatten: false,
+            reference_price: None,
         }
     }
 
@@ -4013,6 +4183,7 @@ mod tests {
                 limit_price: None,
                 client_order_id: None,
                 close_flatten: false,
+                reference_price: None,
             },
             OffchainOrderEvent::Accepted {
                 executor_order_id: ExecutorOrderId::new("OVN-1"),
@@ -4115,6 +4286,7 @@ mod tests {
         CounterTradeOrderKind::OvernightLimit {
             limit_price: Positive::new(Usd::new(float!(195.25))).unwrap(),
             snapshot: eligible_overnight_snapshot(),
+            reference_price: Some(Positive::new(Usd::new(float!(195.00))).unwrap()),
         }
     }
 
@@ -4486,6 +4658,7 @@ mod tests {
         let CounterTradeOrderKind::OvernightLimit {
             limit_price: kind_limit_price,
             snapshot: kind_snapshot,
+            ..
         } = kind.clone()
         else {
             unreachable!("eligible_overnight_kind builds an OvernightLimit");
@@ -5290,6 +5463,7 @@ mod tests {
             submitted_at,
             market_session: MarketSession::Extended,
             close_flatten: false,
+            reference_price: None,
         };
 
         let mut legacy_payload = serde_json::to_value(submitted).unwrap();
@@ -5330,6 +5504,7 @@ mod tests {
             placed_at,
             market_session: MarketSession::Extended,
             close_flatten: true,
+            reference_price: None,
         };
         let cancelling = OffchainOrder::Cancelling {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -5345,6 +5520,7 @@ mod tests {
             cancel_requested_at: placed_at,
             market_session: MarketSession::Extended,
             close_flatten: true,
+            reference_price: None,
         };
         let partially_filled = OffchainOrder::PartiallyFilled {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -5360,6 +5536,7 @@ mod tests {
             partially_filled_at: placed_at,
             market_session: MarketSession::Extended,
             close_flatten: true,
+            reference_price: None,
         };
 
         for (variant, state) in [
@@ -5368,11 +5545,15 @@ mod tests {
             ("Cancelling", cancelling),
         ] {
             let mut legacy_payload = serde_json::to_value(state).unwrap();
-            legacy_payload
+            let variant_object = legacy_payload
                 .get_mut(variant)
                 .and_then(serde_json::Value::as_object_mut)
-                .expect("variant serializes as an object")
+                .expect("variant serializes as an object");
+            variant_object
                 .remove("close_flatten")
+                .expect("the field must be present before it is stripped");
+            variant_object
+                .remove("reference_price")
                 .expect("the field must be present before it is stripped");
 
             let replayed: OffchainOrder = serde_json::from_value(legacy_payload).unwrap();
@@ -5380,6 +5561,12 @@ mod tests {
                 !replayed.close_flatten(),
                 "{variant} snapshot without close_flatten must replay as not attributed, \
                  got: {replayed:?}"
+            );
+            let reserialized = serde_json::to_value(&replayed).unwrap();
+            assert_eq!(
+                reserialized[variant]["reference_price"],
+                serde_json::Value::Null,
+                "{variant} snapshot without reference_price must replay with None"
             );
         }
     }
@@ -5577,6 +5764,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn adverse_bps_signs_buys_and_sells_toward_positive_when_worse() {
+        // The shared sign convention both distance histograms rely on:
+        // positive means the execution was worse than the reference. A buy
+        // 1% above and a sell 1% below must both record +100 bps.
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let reference = Positive::new(Usd::new(float!(100))).unwrap();
+
+        record_adverse_bps(
+            "hedge_reference_to_limit_bps",
+            reference,
+            Usd::new(float!(101)),
+            Direction::Buy,
+            "SIGNBUY",
+            "regular",
+        );
+        record_adverse_bps(
+            "hedge_reference_to_limit_bps",
+            reference,
+            Usd::new(float!(99)),
+            Direction::Sell,
+            "SIGNSELL",
+            "regular",
+        );
+
+        let rendered = handle.render();
+        for symbol in ["SIGNBUY", "SIGNSELL"] {
+            let prefix = format!("hedge_reference_to_limit_bps_sum{{symbol=\"{symbol}\"");
+            let sum_line = rendered
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("no sum series for {symbol} in:\n{rendered}"));
+            let (_, value) = sum_line.rsplit_once(' ').expect("malformed sample line");
+            let bps: f64 = value.parse().expect("sum must be a float");
+            assert!(
+                (bps - 100.0).abs() < 1e-6,
+                "{symbol} must record +100 adverse bps, got {bps} in:\n{rendered}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn overnight_placement_labels_hedge_trades_with_the_session() {
         let handle = crate::metrics::setup().expect("install Prometheus recorder");
@@ -5589,6 +5817,13 @@ mod tests {
             rendered.contains("hedge_trades_total{") && rendered.contains("session=\"overnight\""),
             "an overnight placement must increment hedge_trades_total with \
              session=overnight, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "hedge_reference_to_limit_bps_count{symbol=\"AAPL\",session=\"overnight\"} 1"
+            ),
+            "a limit-kind placement with a reference must record one \
+             reference-to-limit sample, got:\n{rendered}"
         );
     }
 
@@ -5618,6 +5853,13 @@ mod tests {
             "an overnight fill must record its latency sample with \
              session=overnight, got:\n{rendered}"
         );
+        assert!(
+            rendered.contains(
+                "hedge_reference_to_fill_slippage_bps_count{symbol=\"AAPL\",session=\"overnight\"} 1"
+            ),
+            "a fill on an order with a persisted reference must record one \
+             fill-slippage sample, got:\n{rendered}"
+        );
     }
 
     #[tokio::test]
@@ -5628,6 +5870,7 @@ mod tests {
             CounterTradeOrderKind::ExtendedHoursLimit {
                 limit_price: Positive::new(Usd::new(float!(195.25))).unwrap(),
                 close_flatten: false,
+                reference_price: None,
             },
         )
         .await;
@@ -5674,6 +5917,7 @@ mod tests {
             CounterTradeOrderKind::ExtendedHoursLimit {
                 limit_price: Positive::new(Usd::new(float!(195.25))).unwrap(),
                 close_flatten: false,
+                reference_price: None,
             },
         )
         .await;
@@ -6434,6 +6678,11 @@ mod tests {
             ),
             "completing a fill must record exactly one hedge_fill_latency_seconds sample \
              labelled with the order's session, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("hedge_reference_to_fill_slippage_bps_count{"),
+            "a market order has no reference price, so no fill-slippage sample may be \
+             recorded, got:\n{rendered}"
         );
     }
 
@@ -7420,6 +7669,7 @@ mod tests {
             placed_at: Utc::now(),
             market_session: MarketSession::Regular,
             close_flatten: false,
+            reference_price: None,
         };
 
         let err = pending
@@ -7496,6 +7746,7 @@ mod tests {
             limit_price: None,
             client_order_id: None,
             close_flatten: false,
+            reference_price: None,
         };
 
         // Strip the post-upgrade keys to reconstruct the exact payload shape
@@ -7587,6 +7838,7 @@ mod tests {
                 limit_price: None,
                 client_order_id: None,
                 close_flatten: false,
+                reference_price: None,
             },
             OffchainOrderEvent::Submitted {
                 executor_order_id: ExecutorOrderId::new("broker-cancelled"),
