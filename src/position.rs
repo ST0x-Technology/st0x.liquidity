@@ -17,6 +17,7 @@ use tracing::{debug, info, warn};
 
 use st0x_config::ExecutionThreshold;
 use st0x_event_sorcery::{DomainEvent, EventSourced, Projection, ProjectionError, Table};
+use st0x_evm::Chain;
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, HasZero, OrderFailureTerminality, Positive,
     SupportedExecutor, Symbol,
@@ -201,7 +202,7 @@ impl EventSourced for Position {
 
     const AGGREGATE_TYPE: &'static str = "Position";
     const PROJECTION: Table = Table("position_view");
-    const SCHEMA_VERSION: u64 = 7;
+    const SCHEMA_VERSION: u64 = 8;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use PositionEvent::*;
@@ -1553,13 +1554,17 @@ impl Eq for PositionEvent {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TradeId {
+    /// Defaulted only for in-flight apalis job payloads that predate the
+    /// chain-qualified identity; stored events were migrated to carry it.
+    #[serde(default = "crate::onchain::legacy_chain")]
+    pub chain: Chain,
     pub tx_hash: TxHash,
     pub log_index: u64,
 }
 
 impl std::fmt::Display for TradeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.tx_hash, self.log_index)
+        write!(f, "{}:{}:{}", self.chain, self.tx_hash, self.log_index)
     }
 }
 
@@ -1959,6 +1964,39 @@ mod tests {
     }
 
     #[test]
+    fn legacy_trade_id_payload_without_chain_deserializes_as_base() {
+        // Stored Position fill events were migrated to carry the chain; this
+        // default exists solely for in-flight apalis payloads predating the
+        // deploy, and must read as Base.
+        let legacy = r#"{
+            "tx_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "log_index": 5
+        }"#;
+
+        let trade_id: TradeId = serde_json::from_str(legacy).unwrap();
+
+        assert_eq!(trade_id.chain, Chain::Base);
+        assert_eq!(
+            trade_id.to_string(),
+            "base:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:5"
+        );
+    }
+
+    #[test]
+    fn trade_id_display_qualifies_the_chain() {
+        let trade_id = TradeId {
+            chain: Chain::Ethereum,
+            tx_hash: TxHash::repeat_byte(0xaa),
+            log_index: 5,
+        };
+
+        assert_eq!(
+            trade_id.to_string(),
+            "ethereum:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:5"
+        );
+    }
+
+    #[test]
     fn broker_evidence_terminal_releases_the_anchor() {
         assert_eq!(
             AnchorDisposition::from_broker_terminality(Some(OrderFailureTerminality::Terminal)),
@@ -1997,6 +2035,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 threshold: one_share_threshold(),
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -2039,6 +2078,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 threshold,
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -2080,6 +2120,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 threshold: one_share_threshold(),
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -2114,6 +2155,7 @@ mod tests {
     async fn duplicate_acknowledge_on_chain_fill_is_rejected() {
         let threshold = one_share_threshold();
         let trade_id = TradeId {
+            chain: Chain::Base,
             tx_hash: TxHash::random(),
             log_index: 1,
         };
@@ -2169,10 +2211,12 @@ mod tests {
     async fn out_of_order_redrive_rejected_by_pending_set() {
         let threshold = one_share_threshold();
         let trade_a = TradeId {
+            chain: Chain::Base,
             tx_hash: TxHash::random(),
             log_index: 1,
         };
         let trade_b = TradeId {
+            chain: Chain::Base,
             tx_hash: TxHash::random(),
             log_index: 2,
         };
@@ -2253,6 +2297,7 @@ mod tests {
             },
             PositionEvent::OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -2265,6 +2310,7 @@ mod tests {
             },
             PositionEvent::OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 2,
                 },
@@ -2295,10 +2341,12 @@ mod tests {
     fn replay_applied_settled_pairs_converge_to_inflight_tail() {
         let now = Utc::now();
         let trade_a = TradeId {
+            chain: Chain::Base,
             tx_hash: TxHash::random(),
             log_index: 1,
         };
         let trade_b = TradeId {
+            chain: Chain::Base,
             tx_hash: TxHash::random(),
             log_index: 2,
         };
@@ -2355,6 +2403,7 @@ mod tests {
     async fn settle_emits_settled_when_member() {
         let threshold = one_share_threshold();
         let trade_id = TradeId {
+            chain: Chain::Base,
             tx_hash: TxHash::random(),
             log_index: 1,
         };
@@ -2409,6 +2458,7 @@ mod tests {
             }])
             .when(PositionCommand::SettleOnChainFill {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 99,
                 },
@@ -2435,6 +2485,7 @@ mod tests {
                 },
                 PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -2447,6 +2498,7 @@ mod tests {
                 },
                 PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 2,
                     },
@@ -2489,6 +2541,7 @@ mod tests {
                 },
                 PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -2535,6 +2588,7 @@ mod tests {
                 },
                 PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -2576,6 +2630,7 @@ mod tests {
                 },
                 PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -2628,6 +2683,7 @@ mod tests {
                 },
                 PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -2678,6 +2734,7 @@ mod tests {
                 },
                 PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -2726,6 +2783,7 @@ mod tests {
                 },
                 PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -2806,6 +2864,7 @@ mod tests {
             },
             PositionEvent::OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -2922,6 +2981,7 @@ mod tests {
                 },
                 PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -2976,6 +3036,7 @@ mod tests {
                 },
                 PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -3029,6 +3090,7 @@ mod tests {
             },
             PositionEvent::OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -3083,6 +3145,7 @@ mod tests {
             },
             PositionEvent::OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -3125,6 +3188,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: one_share_threshold(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -3282,6 +3346,7 @@ mod tests {
                 },
                 PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -3333,6 +3398,7 @@ mod tests {
                 },
                 PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -3375,6 +3441,7 @@ mod tests {
             },
             PositionEvent::OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -3428,6 +3495,7 @@ mod tests {
             },
             PositionEvent::OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -3483,6 +3551,7 @@ mod tests {
             },
             OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -3543,6 +3612,7 @@ mod tests {
             },
             OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -3616,6 +3686,7 @@ mod tests {
             },
             OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -3686,6 +3757,7 @@ mod tests {
             },
             OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -3764,6 +3836,7 @@ mod tests {
             },
             OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -3837,6 +3910,7 @@ mod tests {
             },
             PositionEvent::OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -3917,6 +3991,7 @@ mod tests {
             },
             PositionEvent::OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -3957,6 +4032,7 @@ mod tests {
             },
             PositionEvent::OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -4008,6 +4084,7 @@ mod tests {
             },
             PositionEvent::OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -4103,6 +4180,7 @@ mod tests {
             },
             PositionEvent::OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -4162,6 +4240,7 @@ mod tests {
             },
             PositionEvent::OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -4212,6 +4291,7 @@ mod tests {
             },
             PositionEvent::OnChainOrderFilled {
                 trade_id: TradeId {
+                    chain: Chain::Base,
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
@@ -4252,6 +4332,7 @@ mod tests {
     fn non_genesis_event_on_uninitialized_fails() {
         let error = replay::<Position>(vec![PositionEvent::OnChainOrderFilled {
             trade_id: TradeId {
+                chain: Chain::Base,
                 tx_hash: TxHash::random(),
                 log_index: 0,
             },
@@ -4285,6 +4366,7 @@ mod tests {
         let seen_at = block_timestamp + chrono::Duration::seconds(5);
         let event = PositionEvent::OnChainOrderFilled {
             trade_id: TradeId {
+                chain: Chain::Base,
                 tx_hash: TxHash::random(),
                 log_index: 0,
             },
@@ -4672,6 +4754,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: one_share_threshold(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },

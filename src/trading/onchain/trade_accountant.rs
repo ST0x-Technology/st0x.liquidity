@@ -132,6 +132,7 @@ where
 
             TakeOrderV3(take_event) => {
                 OnchainTrade::try_from_take_order_if_target_owner(
+                    ctx.ctx.chains.sole_trading().chain,
                     &ctx.cache,
                     &ctx.evm,
                     *take_event.clone(),
@@ -147,6 +148,7 @@ where
                 // `try_from_inventory_trade` uses the log's block number and
                 // fetches receipt metadata only if that number is absent.
                 OnchainTrade::try_from_inventory_trade(
+                    ctx.ctx.chains.sole_trading().chain,
                     &ctx.cache,
                     &ctx.evm,
                     &ctx.ctx.chains.sole_trading().assets,
@@ -434,6 +436,7 @@ async fn persist_skipped_fill(
 ) {
     if let Err(persist_error) = record_skipped_fill(
         pool,
+        trade_event.chain,
         trade_event.tx_hash,
         trade_event.log_index,
         trade_event.event.kind(),
@@ -789,6 +792,7 @@ mod tests {
     use crate::test_utils::{
         TEST_POLL_INTERVAL, get_test_log, get_test_order, panic_revert_payload, setup_test_pools,
     };
+    use st0x_evm::Chain;
 
     /// Builds the CQRS stores, job queue, and `AccountantCtx` shared by every
     /// `perform()` test in this module -- callers supply only what actually
@@ -883,7 +887,7 @@ mod tests {
         }));
 
         AccountForDexTrade {
-            trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            trade: EmittedOnChain::from_log(Chain::Base, event, &log).unwrap(),
             backpressure_streak: BackpressureStreak::default(),
         }
     }
@@ -959,7 +963,7 @@ mod tests {
         let log = get_test_log();
         let event = RaindexTradeEvent::TakeOrderV3(Box::new(take_event));
         let job = AccountForDexTrade {
-            trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            trade: EmittedOnChain::from_log(Chain::Base, event, &log).unwrap(),
             backpressure_streak: BackpressureStreak::default(),
         };
 
@@ -1041,7 +1045,7 @@ mod tests {
 
         let event = RaindexTradeEvent::ClearV3(Box::new(clear_event));
         let job = AccountForDexTrade {
-            trade: EmittedOnChain::from_log(event, &clear_log).unwrap(),
+            trade: EmittedOnChain::from_log(Chain::Base, event, &clear_log).unwrap(),
             backpressure_streak: BackpressureStreak::default(),
         };
 
@@ -1152,7 +1156,7 @@ mod tests {
         let log = get_test_log();
         let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
         let job = AccountForDexTrade {
-            trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            trade: EmittedOnChain::from_log(Chain::Base, event, &log).unwrap(),
             backpressure_streak: BackpressureStreak::default(),
         };
 
@@ -1224,7 +1228,7 @@ mod tests {
         let log = get_test_log();
         let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
         let job = AccountForDexTrade {
-            trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            trade: EmittedOnChain::from_log(Chain::Base, event, &log).unwrap(),
             backpressure_streak: BackpressureStreak::default(),
         };
 
@@ -1294,7 +1298,7 @@ mod tests {
         let log = get_test_log();
         let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
         let job = AccountForDexTrade {
-            trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            trade: EmittedOnChain::from_log(Chain::Base, event, &log).unwrap(),
             backpressure_streak: BackpressureStreak::default(),
         };
 
@@ -1374,7 +1378,7 @@ mod tests {
         let log = get_test_log();
         let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
         let job = AccountForDexTrade {
-            trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            trade: EmittedOnChain::from_log(Chain::Base, event, &log).unwrap(),
             backpressure_streak: BackpressureStreak::default(),
         };
 
@@ -1467,7 +1471,7 @@ mod tests {
 
         let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
         let job = AccountForDexTrade {
-            trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            trade: EmittedOnChain::from_log(Chain::Base, event, &log).unwrap(),
             backpressure_streak: BackpressureStreak::default(),
         };
 
@@ -1707,7 +1711,7 @@ mod tests {
 
         let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
         let job = AccountForDexTrade {
-            trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            trade: EmittedOnChain::from_log(Chain::Base, event, &log).unwrap(),
             backpressure_streak: BackpressureStreak::default(),
         };
 
@@ -1837,7 +1841,7 @@ mod tests {
 
         let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
         let job = AccountForDexTrade {
-            trade: EmittedOnChain::from_log(event, &log).unwrap(),
+            trade: EmittedOnChain::from_log(Chain::Base, event, &log).unwrap(),
             backpressure_streak: BackpressureStreak::default(),
         };
 
@@ -1968,7 +1972,7 @@ mod tests {
             deposit,
             withdraw: withdraw.clone(),
         }));
-        let emitted = EmittedOnChain::from_log(event, &get_test_log()).unwrap();
+        let emitted = EmittedOnChain::from_log(Chain::Base, event, &get_test_log()).unwrap();
 
         let reconstructed = reconstruct_log(
             RaindexContracts {

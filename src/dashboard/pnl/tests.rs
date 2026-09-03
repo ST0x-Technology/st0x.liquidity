@@ -541,6 +541,7 @@ fn onchain_fill_event(
 ) -> PositionEvent {
     PositionEvent::OnChainOrderFilled {
         trade_id: TradeId {
+            chain: Chain::Base,
             tx_hash: TxHash::random(),
             log_index: 0,
         },

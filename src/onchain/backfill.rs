@@ -719,7 +719,7 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         .chain(inventory_trade_events)
         .sorted_by_key(|(_, log)| (log.block_number, log.log_index))
         .filter_map(|(event, log)| {
-            EmittedOnChain::<RaindexTradeEvent>::from_log(event, &log)
+            EmittedOnChain::<RaindexTradeEvent>::from_log(evm_ctx.chain, event, &log)
                 .inspect_err(
                     |error| warn!(target: "orderbook", %error, "Failed to extract block inclusion metadata during backfill"),
                 )
@@ -734,7 +734,7 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         // event type, so ingestion volume is observable even before any hedge is
         // placed downstream. This counts enqueue attempts, not unique fills: a
         // backfill replay re-enqueues already-processed events (the pipeline
-        // dedupes on (tx_hash, log_index)). `kind()` yields
+        // dedupes on (chain, tx_hash, log_index)). `kind()` yields
         // "ClearV3"/"TakeOrderV3"/"InventoryTrade".
         counter!("onchain_events_total", "event_type" => trade_event.event.kind()).increment(1);
         job_queue
@@ -1614,10 +1614,12 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
+        // A non-Base chain, so the chain-propagation assertion below fails if
+        // enqueueing hard-codes `Chain::Base` instead of the configured chain.
         let evm_ctx = TradingChain {
             redemption_wallet: None,
             assets: ChainAssets::default(),
-            chain: Chain::Base,
+            chain: Chain::Ethereum,
             inventory_adapters: InventoryAdapters::default(),
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1698,6 +1700,14 @@ mod tests {
             "Jobs must be enqueued in chronological (block, log_index) \
              order despite the node serving them reversed"
         );
+
+        for job in &jobs {
+            assert_eq!(
+                job.trade.chain,
+                Chain::Ethereum,
+                "every enqueued fill must carry the configured chain"
+            );
+        }
 
         // The 30 enqueued jobs map one-to-one onto the 30 distinct input logs:
         // no two logs collapsed onto a shared (tx_hash, log_index) key and --

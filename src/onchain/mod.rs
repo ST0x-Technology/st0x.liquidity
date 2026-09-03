@@ -15,6 +15,14 @@ use st0x_execution::{
 
 use crate::position::{Position, PositionError};
 
+/// The single pre-multichain compatibility contract: every payload persisted
+/// before chains were tracked -- fill events, in-flight jobs, inventory
+/// snapshots, hydrated views -- happened on Base, the only chain that
+/// existed. Serde defaults for legacy data all resolve through here.
+pub(crate) fn legacy_chain() -> st0x_evm::Chain {
+    st0x_evm::Chain::Base
+}
+
 pub(crate) mod accumulator;
 pub(crate) mod approvals;
 pub(crate) mod backfill;

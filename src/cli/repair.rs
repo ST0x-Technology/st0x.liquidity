@@ -574,6 +574,7 @@ mod tests {
     use alloy::primitives::TxHash;
 
     use st0x_config::ExecutionThreshold;
+    use st0x_evm::Chain;
     use st0x_execution::{ClientOrderId, Direction, ExecutorOrderId, FractionalShares};
     use st0x_finance::{Positive, Usd};
     use st0x_float_macro::float;
@@ -939,6 +940,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 0,
                     },
@@ -1904,6 +1906,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 0,
                     },
@@ -1984,6 +1987,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 0,
                     },

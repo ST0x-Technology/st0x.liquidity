@@ -5556,6 +5556,7 @@ mod tests {
     use st0x_event_sorcery::{
         EntityList, Never, Reactor, ReactorHarness, TestStore, deps, send_command, test_store,
     };
+    use st0x_evm::Chain;
     use st0x_execution::{
         AlpacaTransferId, ClientOrderId, Direction, ExecutorOrderId, HasZero, Positive,
         SupportedExecutor,
@@ -7994,6 +7995,7 @@ mod tests {
     ) -> PositionEvent {
         PositionEvent::OnChainOrderFilled {
             trade_id: TradeId {
+                chain: Chain::Base,
                 tx_hash: TxHash::random(),
                 log_index: 0,
             },
@@ -8013,6 +8015,7 @@ mod tests {
     ) -> PositionEvent {
         PositionEvent::OnChainOrderFilled {
             trade_id: TradeId {
+                chain: Chain::Base,
                 tx_hash: TxHash::random(),
                 log_index: 0,
             },
@@ -24421,6 +24424,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -24591,6 +24595,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -24826,6 +24831,7 @@ mod tests {
                     symbol: pending_symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },
@@ -24860,6 +24866,7 @@ mod tests {
                     symbol: clear_symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 2,
                     },
@@ -25880,6 +25887,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::random(),
                         log_index: 1,
                     },

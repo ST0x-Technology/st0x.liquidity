@@ -11,6 +11,8 @@ use alloy::primitives::TxHash;
 use chrono::Utc;
 use sqlx::SqlitePool;
 
+use st0x_evm::Chain;
+
 /// Why the accountant skipped a fill instead of hedging it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SkipReason {
@@ -52,17 +54,19 @@ pub(crate) enum SkippedFillError {
 }
 
 /// Persist a fill the accountant skipped, for manual reconciliation. Idempotent
-/// on `(tx_hash, log_index)` -- the fill identity -- so a backfill re-scan that
+/// on `(chain, tx_hash, log_index)` -- the fill identity -- so a backfill re-scan that
 /// re-processes the same fill records a single row rather than duplicating it on
 /// every pass.
 pub(crate) async fn record_skipped_fill(
     pool: &SqlitePool,
+    chain: Chain,
     tx_hash: TxHash,
     log_index: u64,
     event_type: &str,
     reason: SkipReason,
     detail: &str,
 ) -> Result<(), SkippedFillError> {
+    let chain = chain.to_string();
     let tx_hash = tx_hash.to_string();
     let log_index =
         i64::try_from(log_index).map_err(|_| SkippedFillError::LogIndexOutOfRange { log_index })?;
@@ -71,9 +75,10 @@ pub(crate) async fn record_skipped_fill(
 
     sqlx::query!(
         "INSERT INTO skipped_fills \
-         (tx_hash, log_index, event_type, reason, detail, skipped_at) \
-         VALUES (?, ?, ?, ?, ?, ?) \
-         ON CONFLICT (tx_hash, log_index) DO NOTHING",
+         (chain, tx_hash, log_index, event_type, reason, detail, skipped_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (chain, tx_hash, log_index) DO NOTHING",
+        chain,
         tx_hash,
         log_index,
         event_type,
@@ -128,6 +133,7 @@ mod tests {
 
         record_skipped_fill(
             &pool,
+            Chain::Base,
             tx_hash,
             7,
             "ClearV3",
@@ -153,6 +159,7 @@ mod tests {
 
         record_skipped_fill(
             &pool,
+            Chain::Base,
             tx_hash,
             7,
             "ClearV3",
@@ -164,6 +171,7 @@ mod tests {
         // Re-scan of the same (tx_hash, log_index) must not add a second row.
         record_skipped_fill(
             &pool,
+            Chain::Base,
             tx_hash,
             7,
             "ClearV3",
@@ -187,6 +195,7 @@ mod tests {
 
         record_skipped_fill(
             &pool,
+            Chain::Base,
             tx_hash,
             7,
             "ClearV3",
@@ -197,6 +206,7 @@ mod tests {
         .unwrap();
         record_skipped_fill(
             &pool,
+            Chain::Base,
             tx_hash,
             8,
             "TakeOrderV3",

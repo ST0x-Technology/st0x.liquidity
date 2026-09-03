@@ -123,10 +123,10 @@ impl HedgeLatencyProjection {
     }
 
     /// Records a new onchain fill in `hedge_fill`, keyed by the originating
-    /// fill's `(tx_hash, log_index)`. `ON CONFLICT(tx_hash, log_index) DO
-    /// NOTHING` makes redelivery idempotent: a replayed Position event cannot
-    /// insert a duplicate row, so fill counts and the uncovered pool (recomputed
-    /// from this table on read) stay accurate.
+    /// fill's `(chain, tx_hash, log_index)`. `ON CONFLICT(chain, tx_hash,
+    /// log_index) DO NOTHING` makes redelivery idempotent: a replayed Position
+    /// event cannot insert a duplicate row, so fill counts and the uncovered
+    /// pool (recomputed from this table on read) stay accurate.
     async fn on_chain_fill(
         &self,
         symbol: &Symbol,
@@ -136,10 +136,11 @@ impl HedgeLatencyProjection {
     ) -> Result<(), ProjectionError> {
         let log_index = i64::try_from(trade_id.log_index)?;
         let updated = sqlx::query(
-            "INSERT INTO hedge_fill (symbol, tx_hash, log_index, block_timestamp, seen_at) \
-             VALUES (?, ?, ?, ?, ?) \
-             ON CONFLICT(tx_hash, log_index) DO NOTHING",
+            "INSERT INTO hedge_fill (chain, symbol, tx_hash, log_index, block_timestamp, seen_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(chain, tx_hash, log_index) DO NOTHING",
         )
+        .bind(trade_id.chain.to_string())
         .bind(symbol.to_string())
         .bind(trade_id.tx_hash.to_string())
         .bind(log_index)
@@ -395,6 +396,7 @@ mod tests {
     use chrono::Duration;
 
     use st0x_event_sorcery::ReactorHarness;
+    use st0x_evm::Chain;
     use st0x_execution::{Direction, FractionalShares};
     use st0x_float_macro::float;
 
@@ -729,10 +731,10 @@ mod tests {
         );
     }
 
-    /// A redelivered `OnChainOrderFilled` for the SAME `(tx_hash, log_index)` is
-    /// a no-op: the `UNIQUE(tx_hash, log_index)` constraint plus `ON CONFLICT DO
-    /// NOTHING` keeps exactly one `hedge_fill` row, so the fill is not
-    /// double-counted and open exposure is unchanged.
+    /// A redelivered `OnChainOrderFilled` for the SAME `(chain, tx_hash,
+    /// log_index)` is a no-op: the `UNIQUE(chain, tx_hash, log_index)`
+    /// constraint plus `ON CONFLICT DO NOTHING` keeps exactly one `hedge_fill`
+    /// row, so the fill is not double-counted and open exposure is unchanged.
     #[tokio::test]
     async fn duplicate_onchain_fill_is_idempotent() {
         let pool = setup_test_db().await;
@@ -741,6 +743,7 @@ mod tests {
         // A single fill event with a fixed identity, delivered twice.
         let fill = PositionEvent::OnChainOrderFilled {
             trade_id: TradeId {
+                chain: Chain::Base,
                 tx_hash: TxHash::repeat_byte(0xAB),
                 log_index: 7,
             },
@@ -773,6 +776,60 @@ mod tests {
         let open = report[0].open_exposure.as_ref().unwrap();
         assert_eq!(open.fill_count, 1);
         assert_eq!(open.oldest_block_timestamp, timestamp(0));
+    }
+
+    /// The same `(tx_hash, log_index)` arriving on another chain is a distinct
+    /// fill: the dedup key is `(chain, tx_hash, log_index)`, so both rows
+    /// survive while redelivery within each chain stays idempotent.
+    #[tokio::test]
+    async fn same_identity_on_another_chain_is_a_distinct_fill() {
+        let pool = setup_test_db().await;
+        let harness = ReactorHarness::new(HedgeLatencyProjection::new(pool.clone()));
+
+        let fill_on = |chain| PositionEvent::OnChainOrderFilled {
+            trade_id: TradeId {
+                chain,
+                tx_hash: TxHash::repeat_byte(0xAB),
+                log_index: 7,
+            },
+            amount: FractionalShares::new(float!(1)),
+            direction: Direction::Buy,
+            price_usdc: float!(150),
+            block_timestamp: timestamp(0),
+            block_number: None,
+            seen_at: timestamp(1),
+        };
+
+        harness
+            .receive::<Position>(symbol(), fill_on(Chain::Base))
+            .await
+            .unwrap();
+        harness
+            .receive::<Position>(symbol(), fill_on(Chain::Ethereum))
+            .await
+            .unwrap();
+
+        // Redeliver both; per-chain idempotency must still hold.
+        harness
+            .receive::<Position>(symbol(), fill_on(Chain::Base))
+            .await
+            .unwrap();
+        harness
+            .receive::<Position>(symbol(), fill_on(Chain::Ethereum))
+            .await
+            .unwrap();
+
+        let (fill_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM hedge_fill")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(fill_count, 2);
+
+        let report = load_hedge_performance(&pool, &ReportRange::all_time())
+            .await
+            .unwrap();
+        assert_eq!(report[0].fills.len(), 2);
+        assert_eq!(report[0].open_exposure.as_ref().unwrap().fill_count, 2);
     }
 
     /// A redelivered `OffChainOrderPlaced` for an already-placed cycle is a

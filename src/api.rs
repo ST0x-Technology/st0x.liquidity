@@ -1938,6 +1938,7 @@ mod tests {
     };
     use st0x_dto::{Trade, TradeOutcome, TradingVenue};
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
+    use st0x_evm::Chain;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
         DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutorOrderId, Positive,
@@ -2410,6 +2411,7 @@ mod tests {
         let pool = state.pool.clone();
         let now = Utc::now();
         let id = OnChainTradeId {
+            chain: Chain::Base,
             tx_hash: TxHash::ZERO,
             log_index: 194,
         };
@@ -3087,6 +3089,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: TxHash::with_last_byte(1),
                         log_index: 0,
                     },
@@ -3313,8 +3316,8 @@ mod tests {
         // and one open-exposure entry.
         let timestamp = now.to_rfc3339();
         sqlx::query(
-            "INSERT INTO hedge_fill (symbol, tx_hash, log_index, block_timestamp, seen_at) \
-             VALUES ('AAPL', '0x01', 0, $1, $1)",
+            "INSERT INTO hedge_fill (chain, symbol, tx_hash, log_index, block_timestamp, seen_at) \
+             VALUES ('base', 'AAPL', '0x01', 0, $1, $1)",
         )
         .bind(&timestamp)
         .execute(&state.pool)
@@ -3806,6 +3809,7 @@ mod tests {
                 st0x_execution::Symbol::new("AAPL").unwrap(),
                 PositionEvent::OnChainOrderFilled {
                     trade_id: TradeId {
+                        chain: Chain::Base,
                         tx_hash: alloy::primitives::TxHash::random(),
                         log_index: 1,
                     },
