@@ -345,7 +345,12 @@ pub(super) async fn check_imbalance_and_build_operation(
 ) -> Result<Option<TriggeredOperation>, EquityTriggerError> {
     let imbalance = {
         let inventory = inventory.read().await;
-        inventory.check_equity_imbalance(symbol, threshold, vault_ratio)?
+        inventory.check_equity_imbalance(
+            symbol,
+            inventory.trading_chain(),
+            threshold,
+            vault_ratio,
+        )?
     };
 
     let Some(imbalance) = imbalance else {
@@ -552,6 +557,7 @@ mod tests {
     use tokio::sync::broadcast;
 
     use st0x_dto::Statement;
+    use st0x_evm::Chain;
     use st0x_execution::FractionalShares;
     use st0x_float_macro::float;
     use st0x_wrapper::RATIO_ONE;
@@ -1100,7 +1106,7 @@ mod tests {
         // The leftover (0.000000000579587147) should still be there.
         let remaining_imbalance = {
             let view = inventory.read().await;
-            view.check_equity_imbalance(&symbol, &threshold, &one_to_one_ratio())
+            view.check_equity_imbalance(&symbol, Chain::Base, &threshold, &one_to_one_ratio())
         };
 
         // The leftover is tiny, so it won't exceed the deviation threshold alone.

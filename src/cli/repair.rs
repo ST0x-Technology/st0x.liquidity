@@ -18,6 +18,7 @@ use st0x_float_serde::format_float;
 
 use super::{AuditReason, PortfolioSnapshotRecoveryCommand};
 use crate::conductor::configured_equity_symbols;
+use crate::inventory::PortfolioLocation;
 use crate::offchain::order::{
     OffchainOrder, OffchainOrderCommand, OffchainOrderError, OffchainOrderId, OrderPlacementResult,
     OrderPlacer,
@@ -66,11 +67,15 @@ pub(super) async fn set_portfolio_snapshot_mark_command<W: Write>(
     // reintroduce it. Rows at those locations exist only when nonzero: the
     // capture drops the empty ones.
     if !configured_equity_symbols(ctx).contains(&symbol) {
+        let market_making = PortfolioLocation::MarketMaking(ctx.chains.sole_trading().chain);
         let unconverted: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM portfolio_snapshot              WHERE et_day = ? AND asset = ?              AND location IN ('market_making', 'base_wallet_wrapped')",
+            "SELECT COUNT(*) FROM portfolio_snapshot \
+             WHERE et_day = ? AND asset = ? AND location IN (?, ?)",
         )
         .bind(day.to_string())
         .bind(symbol.to_string())
+        .bind(market_making.to_string())
+        .bind(PortfolioLocation::BaseWalletWrapped.to_string())
         .fetch_one(pool)
         .await
         .context("failed to check for unconverted wrapped-equity rows")?;
@@ -609,7 +614,10 @@ mod tests {
             pool,
             day,
             symbol,
-            &[PortfolioLocation::MarketMaking, PortfolioLocation::Hedging],
+            &[
+                PortfolioLocation::MarketMaking(Chain::Base),
+                PortfolioLocation::Hedging,
+            ],
         )
         .await;
     }
@@ -780,6 +788,53 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(marked, 0, "a refused repair must not price any row");
+    }
+
+    /// The guard derives the market-making location from the configured
+    /// trading chain: a snapshot captured on a non-Base chain persists
+    /// `market_making:<chain>` rows, and a guard hardcoded to
+    /// `market_making:base` would miss them and let the repair price vault
+    /// shares as underlying.
+    #[tokio::test]
+    async fn portfolio_snapshot_repair_refuses_wrapped_rows_on_a_non_base_trading_chain() {
+        let pool = setup_test_db().await;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let symbol = Symbol::new("QSEP").unwrap();
+        seed_missing_portfolio_marks_at(
+            &pool,
+            day,
+            &symbol,
+            &[
+                PortfolioLocation::MarketMaking(Chain::Ethereum),
+                PortfolioLocation::Hedging,
+            ],
+        )
+        .await;
+
+        let mut ctx = ctx_with_equities(&["AAPL"]);
+        ctx.chains.sole_trading_mut().chain = Chain::Ethereum;
+        let error = set_portfolio_snapshot_mark_command(
+            &mut Vec::new(),
+            &pool,
+            PortfolioSnapshotRecoveryCommand::Set {
+                day,
+                symbol: symbol.clone(),
+                usd_mark: Positive::new(float!(150)).unwrap(),
+                observed_at: Utc.with_ymd_and_hms(2026, 7, 17, 20, 0, 0).unwrap(),
+                source: "Nasdaq historical close".parse().unwrap(),
+                reason: "repair missing mark".parse().unwrap(),
+            },
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("vault shares, not underlying shares"),
+            "wrapped rows on the configured non-Base chain must refuse; got: {error}"
+        );
     }
 
     #[tokio::test]

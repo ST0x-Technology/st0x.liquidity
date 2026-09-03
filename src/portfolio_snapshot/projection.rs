@@ -213,13 +213,13 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use sqlx::Row;
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
+    use st0x_evm::Chain;
     use st0x_float_macro::float;
 
+    use super::*;
     use crate::inventory::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
     use crate::portfolio_snapshot::{PortfolioBalanceRowWithMark, PortfolioSnapshotId};
     use crate::test_utils::setup_test_db;
-
-    use super::*;
 
     fn captured_at() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 20, 4, 5, 0).unwrap()
@@ -276,7 +276,7 @@ mod tests {
                 PortfolioSnapshotEvent::Captured {
                     captured_at: captured_at(),
                     rows: vec![
-                        row(PortfolioLocation::MarketMaking, 100, Some(1)),
+                        row(PortfolioLocation::MarketMaking(Chain::Base), 100, Some(1)),
                         row(PortfolioLocation::Hedging, 200, Some(1)),
                     ],
                 },
@@ -298,7 +298,7 @@ mod tests {
                 id,
                 PortfolioSnapshotEvent::Captured {
                     captured_at: captured_at(),
-                    rows: vec![row(PortfolioLocation::MarketMaking, 100, None)],
+                    rows: vec![row(PortfolioLocation::MarketMaking(Chain::Base), 100, None)],
                 },
             )
             .await
@@ -323,7 +323,7 @@ mod tests {
         let event = PortfolioSnapshotEvent::Captured {
             captured_at: captured_at(),
             rows: vec![
-                row(PortfolioLocation::MarketMaking, 100, Some(1)),
+                row(PortfolioLocation::MarketMaking(Chain::Base), 100, Some(1)),
                 row(PortfolioLocation::Hedging, 200, Some(1)),
             ],
         };
@@ -337,7 +337,11 @@ mod tests {
                 id,
                 PortfolioSnapshotEvent::Captured {
                     captured_at: captured_at(),
-                    rows: vec![row(PortfolioLocation::MarketMaking, 100, Some(1))],
+                    rows: vec![row(
+                        PortfolioLocation::MarketMaking(Chain::Base),
+                        100,
+                        Some(1),
+                    )],
                 },
             )
             .await
@@ -351,7 +355,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(locations, vec!["market_making"]);
+        assert_eq!(locations, vec!["market_making:base"]);
     }
 
     #[tokio::test]
@@ -365,7 +369,7 @@ mod tests {
                 PortfolioSnapshotEvent::Captured {
                     captured_at: captured_at(),
                     rows: vec![
-                        equity_row(PortfolioLocation::MarketMaking),
+                        equity_row(PortfolioLocation::MarketMaking(Chain::Base)),
                         equity_row(PortfolioLocation::Hedging),
                     ],
                 },
@@ -417,7 +421,7 @@ mod tests {
                 super::super::PortfolioSnapshotCommand::Capture {
                     captured_at: captured_at(),
                     rows: vec![
-                        equity_row(PortfolioLocation::MarketMaking),
+                        equity_row(PortfolioLocation::MarketMaking(Chain::Base)),
                         equity_row(PortfolioLocation::Hedging),
                     ],
                 },

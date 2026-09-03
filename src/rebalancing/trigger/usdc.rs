@@ -351,7 +351,11 @@ pub(super) async fn check_imbalance_and_build_operation(
     let decision = {
         let inventory = inventory.read().await;
         let imbalance = inventory
-            .check_usdc_imbalance_with_gross_offchain(threshold, reserved)
+            .check_usdc_imbalance_with_gross_offchain(
+                inventory.trading_chain(),
+                threshold,
+                reserved,
+            )
             .map_err(|error| {
                 warn!(
                     target: "rebalance",
@@ -1090,10 +1094,12 @@ impl RebalancingService {
         let source_venue = tracking.source_venue();
         let initiated_amount = tracking.initiated_amount;
         let now = Utc::now();
-        let update = Box::new(move |inventory| {
+        let update = Box::new(move |inventory, chain| {
             let cancelled =
-                Inventory::transfer(source_venue, TransferOp::Cancel, initiated_amount)(inventory)?;
-            Inventory::with_last_rebalancing(now)(cancelled)
+                Inventory::transfer(source_venue, TransferOp::Cancel, initiated_amount)(
+                    inventory, chain,
+                )?;
+            Inventory::with_last_rebalancing(now)(cancelled, chain)
         });
 
         let mut inventory = self.inventory.write().await;
@@ -1173,12 +1179,12 @@ impl RebalancingService {
         }
 
         let now = Utc::now();
-        let update = Box::new(move |inventory| {
+        let update = Box::new(move |inventory, chain| {
             let settled =
                 Inventory::settle_transfer(source_venue, initiated_amount, settled_amount)(
-                    inventory,
+                    inventory, chain,
                 )?;
-            Inventory::with_last_rebalancing(now)(settled)
+            Inventory::with_last_rebalancing(now)(settled, chain)
         });
 
         let mut inventory = self.inventory.write().await;
@@ -1367,6 +1373,7 @@ mod tests {
     use uuid::Uuid;
 
     use st0x_dto::Statement;
+    use st0x_evm::Chain;
     use st0x_execution::ClientOrderId;
     use st0x_float_macro::float;
 
@@ -1500,6 +1507,34 @@ mod tests {
                 amount: Usdc::new(float!(200))
             }),
             "Expected AlpacaToBase with amount == 200, got {result:?}"
+        );
+    }
+
+    /// The imbalance check must read the configured trading chain's USDC
+    /// slot, not `Chain::Base`: with the balance stored under Ethereum, a
+    /// Base-hardcoded read would see no onchain venue and skip with
+    /// `NoImbalance` instead of computing the excess.
+    #[tokio::test]
+    async fn imbalance_check_reads_the_configured_trading_chain_slot() {
+        let inventory = InventoryView::for_trading_chain(Chain::Ethereum)
+            .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+            .with_withdrawable_cash_cents(50_000);
+
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
+        let threshold = ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+
+        assert_eq!(
+            result,
+            Ok(UsdcRebalanceOperation::AlpacaToBase {
+                amount: Usdc::new(float!(200))
+            }),
+            "the Ethereum trading chain's slot must drive the imbalance, got {result:?}"
         );
     }
 

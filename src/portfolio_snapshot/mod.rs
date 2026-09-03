@@ -454,17 +454,17 @@ mod tests {
     use serde_json::json;
 
     use st0x_event_sorcery::{LifecycleError, TestHarness, replay};
+    use st0x_evm::Chain;
     use st0x_execution::Symbol;
     use st0x_float_macro::float;
 
-    use crate::inventory::{PortfolioAsset, PortfolioLocation};
-
     use super::*;
+    use crate::inventory::{PortfolioAsset, PortfolioLocation};
 
     fn test_row(symbol_available: i64) -> PortfolioBalanceRowWithMark {
         PortfolioBalanceRowWithMark {
             row: PortfolioBalanceRow {
-                location: PortfolioLocation::MarketMaking,
+                location: PortfolioLocation::MarketMaking(Chain::Base),
                 asset: PortfolioAsset::Usdc,
                 available: float!(&symbol_available.to_string()),
                 inflight: float!(0),
@@ -477,7 +477,7 @@ mod tests {
     fn equity_row(symbol: &str) -> PortfolioBalanceRowWithMark {
         PortfolioBalanceRowWithMark {
             row: PortfolioBalanceRow {
-                location: PortfolioLocation::MarketMaking,
+                location: PortfolioLocation::MarketMaking(Chain::Base),
                 asset: PortfolioAsset::Equity(Symbol::new(symbol).unwrap()),
                 available: float!(10),
                 inflight: float!(0),
@@ -657,7 +657,7 @@ mod tests {
         let mark_captured_at = Utc.with_ymd_and_hms(2026, 7, 20, 4, 5, 0).unwrap();
         let row = PortfolioBalanceRowWithMark {
             row: PortfolioBalanceRow {
-                location: PortfolioLocation::MarketMaking,
+                location: PortfolioLocation::MarketMaking(Chain::Base),
                 asset: PortfolioAsset::Equity(Symbol::new("AAPL").unwrap()),
                 available: float!(0),
                 inflight: float!(0),
@@ -671,7 +671,7 @@ mod tests {
         assert_eq!(
             encoded,
             json!({
-                "location": "MarketMaking",
+                "location": {"MarketMaking": "base"},
                 "asset": {"Equity": "AAPL"},
                 "available":
                     "0x0000000000000000000000000000000000000000000000000000000000000000",

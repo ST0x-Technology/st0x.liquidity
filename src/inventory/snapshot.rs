@@ -17,6 +17,7 @@ use thiserror::Error;
 use super::BroadcastingInventory;
 
 use st0x_event_sorcery::{CompactionPolicy, DomainEvent, EventSourced, Never, Nil};
+use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Usdc;
 
@@ -68,21 +69,24 @@ impl FromStr for InventorySnapshotId {
 /// State tracking the latest inventory snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InventorySnapshot {
-    /// Latest onchain equity balances by symbol
-    pub(crate) onchain_equity: BTreeMap<Symbol, FractionalShares>,
+    /// Latest onchain equity balances, per chain then symbol. The stored
+    /// snapshot was migrated to this per-chain shape (single "base" entry);
+    /// this aggregate is CompactAfterSnapshot, so the state must keep
+    /// deserializing and SCHEMA_VERSION can never be bumped.
+    pub(crate) onchain_equity: BTreeMap<Chain, BTreeMap<Symbol, FractionalShares>>,
     #[serde(default)]
-    pub(crate) onchain_equity_fetched_at: Option<DateTime<Utc>>,
-    /// Block the latest onchain equity read was pinned to. Persisted so
-    /// hydration restores the view's block watermark across restarts.
+    pub(crate) onchain_equity_fetched_at: BTreeMap<Chain, DateTime<Utc>>,
+    /// Block each chain's latest onchain equity read was pinned to. Persisted
+    /// so hydration restores the view's block watermark across restarts.
     #[serde(default)]
-    pub(crate) onchain_equity_block: Option<u64>,
-    /// Latest onchain USDC balance
-    pub(crate) onchain_usdc: Option<Usdc>,
+    pub(crate) onchain_equity_block: BTreeMap<Chain, u64>,
+    /// Latest onchain USDC balance per chain
+    pub(crate) onchain_usdc: BTreeMap<Chain, Usdc>,
     #[serde(default)]
-    pub(crate) onchain_usdc_fetched_at: Option<DateTime<Utc>>,
-    /// Block the latest onchain USDC read was pinned to.
+    pub(crate) onchain_usdc_fetched_at: BTreeMap<Chain, DateTime<Utc>>,
+    /// Block each chain's latest onchain USDC read was pinned to.
     #[serde(default)]
-    pub(crate) onchain_usdc_block: Option<u64>,
+    pub(crate) onchain_usdc_block: BTreeMap<Chain, u64>,
     /// Latest offchain equity positions by symbol
     pub(crate) offchain_equity: BTreeMap<Symbol, FractionalShares>,
     #[serde(default)]
@@ -149,11 +153,11 @@ impl EventSourced for InventorySnapshot {
     fn originate(event: &Self::Event) -> Option<Self> {
         let mut snapshot = Self {
             onchain_equity: BTreeMap::new(),
-            onchain_equity_fetched_at: None,
-            onchain_equity_block: None,
-            onchain_usdc: None,
-            onchain_usdc_fetched_at: None,
-            onchain_usdc_block: None,
+            onchain_equity_fetched_at: BTreeMap::new(),
+            onchain_equity_block: BTreeMap::new(),
+            onchain_usdc: BTreeMap::new(),
+            onchain_usdc_fetched_at: BTreeMap::new(),
+            onchain_usdc_block: BTreeMap::new(),
             offchain_equity: BTreeMap::new(),
             offchain_equity_fetched_at: None,
             offchain_usd_cents: None,
@@ -189,19 +193,23 @@ impl EventSourced for InventorySnapshot {
         let now = Utc::now();
         Ok(vec![match command {
             OnchainEquity {
+                chain,
                 balances,
                 block_number,
                 fetched_at,
             } => InventorySnapshotEvent::OnchainEquity {
+                chain,
                 balances,
                 fetched_at,
                 block_number,
             },
             OnchainUsdc {
+                chain,
                 usdc_balance,
                 block_number,
                 fetched_at,
             } => InventorySnapshotEvent::OnchainUsdc {
+                chain,
                 usdc_balance,
                 fetched_at,
                 block_number,
@@ -310,28 +318,41 @@ impl EventSourced for InventorySnapshot {
             // netted to zero, and their deltas cancel in the view too, so a
             // stale block watermark cannot leave the balance wrong.
             OnchainEquity {
+                chain,
                 balances,
                 block_number,
                 fetched_at,
             } => {
-                if self.onchain_equity == balances {
+                // Per-chain comparison: one chain's poll must never be
+                // compared against (or suppress) another chain's balances.
+                // A never-polled chain equals an empty read: a snapshot is
+                // the complete venue picture, so emitting the first empty
+                // poll would zero every tracked symbol on that chain.
+                let unchanged = self
+                    .onchain_equity
+                    .get(&chain)
+                    .map_or(balances.is_empty(), |current| *current == balances);
+                if unchanged {
                     return Ok(vec![]);
                 }
                 Ok(vec![InventorySnapshotEvent::OnchainEquity {
+                    chain,
                     balances,
                     fetched_at,
                     block_number,
                 }])
             }
             OnchainUsdc {
+                chain,
                 usdc_balance,
                 block_number,
                 fetched_at,
             } => {
-                if self.onchain_usdc == Some(usdc_balance) {
+                if self.onchain_usdc.get(&chain) == Some(&usdc_balance) {
                     return Ok(vec![]);
                 }
                 Ok(vec![InventorySnapshotEvent::OnchainUsdc {
+                    chain,
                     usdc_balance,
                     fetched_at,
                     block_number,
@@ -531,24 +552,28 @@ impl InventorySnapshot {
     fn each_hydration_event(&self, mut emit: impl FnMut(InventorySnapshotEvent)) {
         let fetched_at = self.last_updated;
 
-        if let Some(fetched_at) = self.onchain_equity_fetched_at
-            && !self.onchain_equity.is_empty()
-        {
-            emit(InventorySnapshotEvent::OnchainEquity {
-                balances: self.onchain_equity.clone(),
-                fetched_at,
-                block_number: self.onchain_equity_block,
-            });
+        for (chain, chain_fetched_at) in &self.onchain_equity_fetched_at {
+            if let Some(balances) = self.onchain_equity.get(chain)
+                && !balances.is_empty()
+            {
+                emit(InventorySnapshotEvent::OnchainEquity {
+                    chain: *chain,
+                    balances: balances.clone(),
+                    fetched_at: *chain_fetched_at,
+                    block_number: self.onchain_equity_block.get(chain).copied(),
+                });
+            }
         }
 
-        if let (Some(usdc_balance), Some(fetched_at)) =
-            (self.onchain_usdc, self.onchain_usdc_fetched_at)
-        {
-            emit(InventorySnapshotEvent::OnchainUsdc {
-                usdc_balance,
-                fetched_at,
-                block_number: self.onchain_usdc_block,
-            });
+        for (chain, usdc_balance) in &self.onchain_usdc {
+            if let Some(chain_fetched_at) = self.onchain_usdc_fetched_at.get(chain) {
+                emit(InventorySnapshotEvent::OnchainUsdc {
+                    chain: *chain,
+                    usdc_balance: *usdc_balance,
+                    fetched_at: *chain_fetched_at,
+                    block_number: self.onchain_usdc_block.get(chain).copied(),
+                });
+            }
         }
 
         if let Some(fetched_at) = self.offchain_equity_fetched_at
@@ -638,28 +663,38 @@ impl InventorySnapshot {
 
         match event {
             InventorySnapshotEvent::OnchainEquity {
+                chain,
                 balances,
                 fetched_at,
                 block_number,
             } if self
                 .onchain_equity_fetched_at
-                .is_none_or(|current| *fetched_at >= current) =>
+                .get(chain)
+                .is_none_or(|current| fetched_at >= current) =>
             {
-                self.onchain_equity = balances.clone();
-                self.onchain_equity_fetched_at = Some(*fetched_at);
-                self.onchain_equity_block = *block_number;
+                self.onchain_equity.insert(*chain, balances.clone());
+                self.onchain_equity_fetched_at.insert(*chain, *fetched_at);
+                match block_number {
+                    Some(block) => self.onchain_equity_block.insert(*chain, *block),
+                    None => self.onchain_equity_block.remove(chain),
+                };
             }
             InventorySnapshotEvent::OnchainUsdc {
+                chain,
                 usdc_balance,
                 fetched_at,
                 block_number,
             } if self
                 .onchain_usdc_fetched_at
-                .is_none_or(|current| *fetched_at >= current) =>
+                .get(chain)
+                .is_none_or(|current| fetched_at >= current) =>
             {
-                self.onchain_usdc = Some(*usdc_balance);
-                self.onchain_usdc_fetched_at = Some(*fetched_at);
-                self.onchain_usdc_block = *block_number;
+                self.onchain_usdc.insert(*chain, *usdc_balance);
+                self.onchain_usdc_fetched_at.insert(*chain, *fetched_at);
+                match block_number {
+                    Some(block) => self.onchain_usdc_block.insert(*chain, *block),
+                    None => self.onchain_usdc_block.remove(chain),
+                };
             }
             InventorySnapshotEvent::OffchainEquity {
                 positions,
@@ -763,6 +798,7 @@ impl InventorySnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum InventorySnapshotCommand {
     OnchainEquity {
+        chain: Chain,
         balances: BTreeMap<Symbol, FractionalShares>,
         /// Time the onchain cycle began selecting its pinned block.
         fetched_at: DateTime<Utc>,
@@ -773,6 +809,7 @@ pub(crate) enum InventorySnapshotCommand {
         block_number: Option<u64>,
     },
     OnchainUsdc {
+        chain: Chain,
         usdc_balance: Usdc,
         /// Time the onchain cycle began selecting its pinned block.
         fetched_at: DateTime<Utc>,
@@ -874,6 +911,11 @@ pub(crate) enum InventorySnapshotCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum InventorySnapshotEvent {
     OnchainEquity {
+        /// Defaulted for events persisted before the chain dimension: the
+        /// compaction policy erases events fast, but a pre-deploy tail can
+        /// still replay once.
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         balances: BTreeMap<Symbol, FractionalShares>,
         fetched_at: DateTime<Utc>,
         /// Block the `vaultBalance2` reads were pinned to. `None` for events
@@ -885,6 +927,8 @@ pub(crate) enum InventorySnapshotEvent {
     },
     #[serde(alias = "OnchainCash")]
     OnchainUsdc {
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         usdc_balance: Usdc,
         fetched_at: DateTime<Utc>,
         /// Block the `vaultBalance2` reads were pinned to. `None` for events
@@ -1095,6 +1139,7 @@ mod tests {
         let events = TestHarness::<InventorySnapshot>::with(())
             .given_no_previous_events()
             .when(InventorySnapshotCommand::OnchainEquity {
+                chain: Chain::Base,
                 balances: balances.clone(),
                 fetched_at,
                 block_number: None,
@@ -1105,6 +1150,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: event_balances,
                 fetched_at: event_fetched_at,
                 block_number: _,
@@ -1124,11 +1170,13 @@ mod tests {
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given(vec![InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance: Usdc::from_str("1000").unwrap(),
                 fetched_at: Utc::now(),
                 block_number: None,
             }])
             .when(InventorySnapshotCommand::OnchainEquity {
+                chain: Chain::Base,
                 balances: balances.clone(),
                 fetched_at,
                 block_number: None,
@@ -1139,6 +1187,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: event_balances,
                 fetched_at: event_fetched_at,
                 block_number: _,
@@ -1158,6 +1207,7 @@ mod tests {
         let events = TestHarness::<InventorySnapshot>::with(())
             .given_no_previous_events()
             .when(InventorySnapshotCommand::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance,
                 fetched_at,
                 block_number: None,
@@ -1168,6 +1218,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance: event_balance,
                 fetched_at: event_fetched_at,
                 block_number: _,
@@ -1186,11 +1237,13 @@ mod tests {
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given(vec![InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance: Usdc::from_str("5000").unwrap(),
                 fetched_at: fetched_at - chrono::Duration::seconds(5),
                 block_number: Some(41),
             }])
             .when(InventorySnapshotCommand::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance,
                 fetched_at,
                 block_number: Some(42),
@@ -1200,6 +1253,7 @@ mod tests {
 
         let [
             InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance: event_balance,
                 fetched_at: event_fetched_at,
                 block_number,
@@ -1299,11 +1353,13 @@ mod tests {
         let cases = vec![
             (
                 vec![InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Base,
                     balances: balances.clone(),
                     fetched_at,
                     block_number: None,
                 }],
                 InventorySnapshotCommand::OnchainEquity {
+                    chain: Chain::Base,
                     balances,
                     fetched_at,
                     block_number: None,
@@ -1311,11 +1367,13 @@ mod tests {
             ),
             (
                 vec![InventorySnapshotEvent::OnchainUsdc {
+                    chain: Chain::Base,
                     usdc_balance,
                     fetched_at,
                     block_number: None,
                 }],
                 InventorySnapshotCommand::OnchainUsdc {
+                    chain: Chain::Base,
                     usdc_balance,
                     fetched_at,
                     block_number: None,
@@ -1365,11 +1423,13 @@ mod tests {
 
         let snapshot = replay::<InventorySnapshot>(vec![
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: balances.clone(),
                 fetched_at: Utc::now(),
                 block_number: None,
             },
             InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance: usdc,
                 fetched_at: Utc::now(),
                 block_number: None,
@@ -1378,8 +1438,213 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(snapshot.onchain_equity, balances);
-        assert_eq!(snapshot.onchain_usdc, Some(usdc));
+        assert_eq!(
+            snapshot.onchain_equity,
+            BTreeMap::from([(Chain::Base, balances)])
+        );
+        assert_eq!(snapshot.onchain_usdc, BTreeMap::from([(Chain::Base, usdc)]));
+    }
+
+    /// Two chains polling alternately must each retain their own balances:
+    /// suppression compares per chain, never across chains.
+    #[tokio::test]
+    async fn alternating_chain_polls_do_not_clobber_or_suppress_each_other() {
+        let mut base_balances = BTreeMap::new();
+        base_balances.insert(test_symbol("AAPL"), test_shares(100));
+        let mut ethereum_balances = BTreeMap::new();
+        ethereum_balances.insert(test_symbol("AAPL"), test_shares(40));
+
+        let snapshot = replay::<InventorySnapshot>(vec![
+            InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
+                balances: base_balances.clone(),
+                fetched_at: Utc::now(),
+                block_number: None,
+            },
+            InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Ethereum,
+                balances: ethereum_balances.clone(),
+                fetched_at: Utc::now(),
+                block_number: None,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            snapshot.onchain_equity,
+            BTreeMap::from([
+                (Chain::Base, base_balances.clone()),
+                (Chain::Ethereum, ethereum_balances)
+            ])
+        );
+
+        // An unchanged repoll on one chain still suppresses.
+        let commands = snapshot
+            .transition(
+                InventorySnapshotCommand::OnchainEquity {
+                    chain: Chain::Base,
+                    balances: base_balances,
+                    fetched_at: Utc::now(),
+                    block_number: Some(7),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(commands, vec![]);
+    }
+
+    /// On a live aggregate, the first poll of a never-seen chain returning
+    /// empty balances must be suppressed, exactly as an empty repoll of an
+    /// empty map was before the per-chain split: a missing chain slot and an
+    /// empty read describe the same (empty) venue picture.
+    #[tokio::test]
+    async fn first_empty_poll_for_a_chain_emits_nothing() {
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::OffchainEquity {
+                positions: BTreeMap::from([(test_symbol("AAPL"), test_shares(5))]),
+                fetched_at: Utc::now(),
+            }])
+            .when(InventorySnapshotCommand::OnchainEquity {
+                chain: Chain::Base,
+                balances: BTreeMap::new(),
+                fetched_at: Utc::now(),
+                block_number: Some(3),
+            })
+            .await
+            .events();
+
+        assert!(events.is_empty(), "first empty poll emitted event");
+    }
+
+    /// A pre-migration snapshot state (single-chain shape) run through the
+    /// repair migration deserializes and hydrates into the base slot.
+    #[test]
+    fn migrated_legacy_state_lands_in_the_base_slot() {
+        let legacy = serde_json::json!({
+            "Live": {
+                "onchain_equity": {"AAPL": test_shares(100)},
+                "onchain_equity_fetched_at": "2026-01-01T00:00:00Z",
+                "onchain_equity_block": 4242,
+                "onchain_usdc": Usdc::from_str("5000").unwrap(),
+                "onchain_usdc_fetched_at": "2026-01-01T00:00:00Z",
+                "onchain_usdc_block": 4242,
+                "offchain_equity": {},
+                "offchain_usd_cents": null,
+                "offchain_cash_buying_power_cents": null,
+                "ethereum_usdc": null,
+                "base_wallet_usdc": null,
+                "base_wallet_unwrapped_equity": {},
+                "base_wallet_wrapped_equity": {},
+                "inflight_mints": {},
+                "inflight_redemptions": {},
+                "last_updated": "2026-01-01T00:00:00Z"
+            }
+        });
+
+        // The same conversions the repair migration applies, expressed on the
+        // JSON value (kept in lockstep with 20260901142908 by the assertions
+        // below, which parse the result under the current state type).
+        let mut migrated = legacy;
+        let live = migrated.get_mut("Live").unwrap();
+        for field in [
+            "onchain_equity",
+            "onchain_equity_fetched_at",
+            "onchain_equity_block",
+            "onchain_usdc",
+            "onchain_usdc_fetched_at",
+            "onchain_usdc_block",
+        ] {
+            let old = live[field].clone();
+            // Mirrors the SQL: null or a never-polled empty map becomes {},
+            // never a phantom {"base": {}} entry.
+            live[field] = if old.is_null() || old == serde_json::json!({}) {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({ "base": old })
+            };
+        }
+
+        let state: InventorySnapshot = serde_json::from_value(migrated["Live"].clone()).unwrap();
+
+        assert_eq!(
+            state.onchain_equity[&Chain::Base][&test_symbol("AAPL")],
+            test_shares(100)
+        );
+        assert_eq!(
+            state.onchain_usdc[&Chain::Base],
+            Usdc::from_str("5000").unwrap()
+        );
+        assert_eq!(state.onchain_equity_block[&Chain::Base], 4242);
+
+        let events = state.hydration_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
+                ..
+            }
+        )));
+    }
+
+    /// A legacy snapshot whose equity was never polled (empty map, null
+    /// fetched_at) must migrate without a phantom "base" entry: all three
+    /// per-chain equity maps agree the chain is absent.
+    #[test]
+    fn never_polled_legacy_equity_migrates_without_a_phantom_base_entry() {
+        let legacy = serde_json::json!({
+            "Live": {
+                "onchain_equity": {},
+                "onchain_equity_fetched_at": null,
+                "onchain_equity_block": null,
+                "onchain_usdc": null,
+                "onchain_usdc_fetched_at": null,
+                "onchain_usdc_block": null,
+                "offchain_equity": {},
+                "offchain_usd_cents": null,
+                "offchain_cash_buying_power_cents": null,
+                "ethereum_usdc": null,
+                "base_wallet_usdc": null,
+                "base_wallet_unwrapped_equity": {},
+                "base_wallet_wrapped_equity": {},
+                "inflight_mints": {},
+                "inflight_redemptions": {},
+                "last_updated": "2026-01-01T00:00:00Z"
+            }
+        });
+
+        let mut migrated = legacy;
+        let live = migrated.get_mut("Live").unwrap();
+        for field in [
+            "onchain_equity",
+            "onchain_equity_fetched_at",
+            "onchain_equity_block",
+            "onchain_usdc",
+            "onchain_usdc_fetched_at",
+            "onchain_usdc_block",
+        ] {
+            let old = live[field].clone();
+            live[field] = if old.is_null() || old == serde_json::json!({}) {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({ "base": old })
+            };
+        }
+
+        assert_eq!(live["onchain_equity"], serde_json::json!({}));
+
+        let state: InventorySnapshot = serde_json::from_value(migrated["Live"].clone()).unwrap();
+        assert!(state.onchain_equity.is_empty());
+        assert!(state.onchain_equity_fetched_at.is_empty());
+        assert!(state.onchain_equity_block.is_empty());
+        assert!(
+            !state
+                .hydration_events()
+                .iter()
+                .any(|event| matches!(event, InventorySnapshotEvent::OnchainEquity { .. })),
+            "a never-polled chain must not hydrate a phantom equity event"
+        );
     }
 
     #[test]
@@ -1392,11 +1657,13 @@ mod tests {
 
         let snapshot = replay::<InventorySnapshot>(vec![
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: first_balances,
                 fetched_at: Utc::now(),
                 block_number: None,
             },
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: second_balances.clone(),
                 fetched_at: Utc::now(),
                 block_number: None,
@@ -1405,8 +1672,11 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(snapshot.onchain_equity, second_balances);
-        assert!(!snapshot.onchain_equity.contains_key(&test_symbol("AAPL")));
+        assert_eq!(
+            snapshot.onchain_equity,
+            BTreeMap::from([(Chain::Base, second_balances)])
+        );
+        assert!(!snapshot.onchain_equity[&Chain::Base].contains_key(&test_symbol("AAPL")));
     }
 
     #[test]
@@ -1420,11 +1690,13 @@ mod tests {
 
         let snapshot = replay::<InventorySnapshot>(vec![
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: newer_balances.clone(),
                 fetched_at: newer_at,
                 block_number: None,
             },
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: older_balances,
                 fetched_at: older_at,
                 block_number: None,
@@ -1433,7 +1705,10 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(snapshot.onchain_equity, newer_balances);
+        assert_eq!(
+            snapshot.onchain_equity,
+            BTreeMap::from([(Chain::Base, newer_balances)])
+        );
     }
 
     #[tokio::test]
@@ -1464,6 +1739,7 @@ mod tests {
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given(vec![InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance: Usdc::from_str("1000").unwrap(),
                 fetched_at: Utc::now(),
                 block_number: None,
@@ -2113,6 +2389,7 @@ mod tests {
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given(vec![InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance: Usdc::from_str("1000").unwrap(),
                 fetched_at: Utc::now(),
                 block_number: None,
@@ -2171,11 +2448,11 @@ mod tests {
     fn hydration_events_empty_snapshot_produces_no_events() {
         let snapshot = InventorySnapshot {
             onchain_equity: BTreeMap::new(),
-            onchain_equity_fetched_at: None,
-            onchain_equity_block: None,
-            onchain_usdc: None,
-            onchain_usdc_fetched_at: None,
-            onchain_usdc_block: None,
+            onchain_equity_fetched_at: BTreeMap::new(),
+            onchain_equity_block: BTreeMap::new(),
+            onchain_usdc: BTreeMap::new(),
+            onchain_usdc_fetched_at: BTreeMap::new(),
+            onchain_usdc_block: BTreeMap::new(),
             offchain_equity: BTreeMap::new(),
             offchain_equity_fetched_at: None,
             offchain_usd_cents: None,
@@ -2206,12 +2483,12 @@ mod tests {
         inflight_mints.insert(test_symbol("TSLA"), test_shares(50));
 
         let original = InventorySnapshot {
-            onchain_equity: onchain_equity.clone(),
-            onchain_equity_fetched_at: Some(now),
-            onchain_equity_block: Some(4_242),
-            onchain_usdc: Some(Usdc::from_str("5000").unwrap()),
-            onchain_usdc_fetched_at: Some(now),
-            onchain_usdc_block: Some(4_242),
+            onchain_equity: BTreeMap::from([(Chain::Base, onchain_equity.clone())]),
+            onchain_equity_fetched_at: BTreeMap::from([(Chain::Base, now)]),
+            onchain_equity_block: BTreeMap::from([(Chain::Base, 4_242)]),
+            onchain_usdc: BTreeMap::from([(Chain::Base, Usdc::from_str("5000").unwrap())]),
+            onchain_usdc_fetched_at: BTreeMap::from([(Chain::Base, now)]),
+            onchain_usdc_block: BTreeMap::from([(Chain::Base, 4_242)]),
             offchain_equity: BTreeMap::new(),
             offchain_equity_fetched_at: None,
             offchain_usd_cents: Some(42_00),
@@ -2266,6 +2543,7 @@ mod tests {
     #[test]
     fn onchain_snapshot_event_block_field_roundtrips_and_tolerates_legacy() {
         let event = InventorySnapshotEvent::OnchainUsdc {
+            chain: Chain::Base,
             usdc_balance: Usdc::from_str("5000").unwrap(),
             fetched_at: Utc::now(),
             block_number: Some(4_242),
@@ -2361,11 +2639,13 @@ mod tests {
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given(vec![InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance,
                 fetched_at: Utc::now(),
                 block_number: Some(100),
             }])
             .when(InventorySnapshotCommand::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance,
                 fetched_at: Utc::now(),
                 block_number: Some(200),
@@ -2394,6 +2674,7 @@ mod tests {
             .unwrap()
             .unwrap();
         snapshot.apply_event(&InventorySnapshotEvent::OnchainUsdc {
+            chain: Chain::Base,
             usdc_balance: Usdc::from_str("1000").unwrap(),
             fetched_at: later_balance_fetched_at,
             block_number: None,

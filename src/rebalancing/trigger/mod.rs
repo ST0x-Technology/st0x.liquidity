@@ -25,6 +25,7 @@ use st0x_config::{ChainAssets, OperationMode};
 use st0x_event_sorcery::{
     AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, Store, deps,
 };
+use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Positive, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, Usdc};
 use st0x_tokenization::{IssuerRequestId, TokenizationRequestId};
@@ -604,6 +605,7 @@ pub(crate) struct RebalancingService {
 type EquityInventoryUpdate = Box<
     dyn FnOnce(
             Inventory<FractionalShares>,
+            Chain,
         ) -> Result<
             Inventory<FractionalShares>,
             crate::inventory::InventoryError<FractionalShares>,
@@ -1735,24 +1737,30 @@ impl RebalancingService {
 
         let updated = match &event {
             OnchainEquity {
+                chain,
                 balances,
                 block_number,
                 ..
             } => inventory.clone().apply_equity_snapshot(
                 Venue::MarketMaking,
+                *chain,
                 balances.iter(),
                 fetched_at,
                 *block_number,
                 now,
             ),
 
-            OffchainEquity { positions, .. } => inventory.clone().apply_equity_snapshot(
-                Venue::Hedging,
-                positions.iter(),
-                fetched_at,
-                None,
-                now,
-            ),
+            OffchainEquity { positions, .. } => {
+                let trading_chain = inventory.trading_chain();
+                inventory.clone().apply_equity_snapshot(
+                    Venue::Hedging,
+                    trading_chain,
+                    positions.iter(),
+                    fetched_at,
+                    None,
+                    now,
+                )
+            }
 
             // The reconcile arms validate busyness themselves under the
             // write lock, so the generic apply path is the correct route
@@ -2232,6 +2240,7 @@ impl Reactor for RebalancingService {
                 let timestamp = event.timestamp();
                 let (equity_update, usdc_update, offchain_order_id) = match &event {
                     OnChainOrderFilled {
+                        trade_id,
                         amount,
                         direction,
                         price_usdc,
@@ -2253,9 +2262,9 @@ impl Reactor for RebalancingService {
                         {
                             let mut inventory = self.inventory.write().await;
                             let apply_equity_leg = !inventory
-                                .onchain_fill_absorbed_by_equity_snapshot(&symbol, *block_number);
+                                .onchain_fill_absorbed_by_equity_snapshot(&symbol, trade_id.chain, *block_number);
                             let apply_usdc_leg =
-                                !inventory.onchain_fill_absorbed_by_usdc_snapshot(*block_number);
+                                !inventory.onchain_fill_absorbed_by_usdc_snapshot(trade_id.chain, *block_number);
 
                             if !apply_equity_leg || !apply_usdc_leg {
                                 info!(
@@ -2640,9 +2649,10 @@ impl RebalancingService {
         quantity: FractionalShares,
     ) -> EquityInventoryUpdate {
         let now = Utc::now();
-        Box::new(move |inventory| {
-            let cancelled = Inventory::transfer(venue, TransferOp::Cancel, quantity)(inventory)?;
-            Inventory::with_last_rebalancing(now)(cancelled)
+        Box::new(move |inventory, chain| {
+            let cancelled =
+                Inventory::transfer(venue, TransferOp::Cancel, quantity)(inventory, chain)?;
+            Inventory::with_last_rebalancing(now)(cancelled, chain)
         })
     }
 
@@ -2651,10 +2661,10 @@ impl RebalancingService {
         quantity: FractionalShares,
     ) -> EquityInventoryUpdate {
         let now = Utc::now();
-        Box::new(move |inventory| {
+        Box::new(move |inventory, chain| {
             let transferred =
-                Inventory::transfer(venue, TransferOp::Complete, quantity)(inventory)?;
-            Inventory::with_last_rebalancing(now)(transferred)
+                Inventory::transfer(venue, TransferOp::Complete, quantity)(inventory, chain)?;
+            Inventory::with_last_rebalancing(now)(transferred, chain)
         })
     }
 
@@ -8558,6 +8568,7 @@ mod tests {
                 owner: TEST_ORDER_OWNER,
             },
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(50))]),
                 fetched_at: snapshot_at,
                 block_number: None,
@@ -8602,6 +8613,7 @@ mod tests {
                 owner: TEST_ORDER_OWNER,
             },
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(80))]),
                 fetched_at: newer_snapshot_at,
                 block_number: None,
@@ -8617,6 +8629,7 @@ mod tests {
                 owner: TEST_ORDER_OWNER,
             },
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(10))]),
                 fetched_at: older_snapshot_at,
                 block_number: None,
@@ -8707,6 +8720,7 @@ mod tests {
                 owner: TEST_ORDER_OWNER,
             },
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(50))]),
                 fetched_at: snapshot_at,
                 block_number: None,
@@ -8810,6 +8824,7 @@ mod tests {
                 owner: TEST_ORDER_OWNER,
             },
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(100))]),
                 fetched_at: snapshot_at,
                 block_number: None,
@@ -9943,6 +9958,7 @@ mod tests {
             trigger.clone(),
             snapshot_id.clone(),
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(60))]),
                 fetched_at: Utc::now(),
                 block_number: Some(100),
@@ -9954,6 +9970,7 @@ mod tests {
             trigger.clone(),
             snapshot_id,
             InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance: usdc(8500),
                 fetched_at: Utc::now(),
                 block_number: Some(100),
@@ -10007,6 +10024,7 @@ mod tests {
             trigger.clone(),
             snapshot_id.clone(),
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(60))]),
                 fetched_at: Utc::now(),
                 block_number: Some(100),
@@ -10018,6 +10036,7 @@ mod tests {
             trigger.clone(),
             snapshot_id,
             InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance: usdc(8500),
                 fetched_at: Utc::now(),
                 block_number: Some(100),
@@ -10068,6 +10087,7 @@ mod tests {
             trigger.clone(),
             snapshot_id,
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(60))]),
                 fetched_at: Utc::now(),
                 block_number: Some(100),
@@ -10116,6 +10136,7 @@ mod tests {
             trigger.clone(),
             snapshot_id,
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(60))]),
                 fetched_at: Utc::now(),
                 block_number: None,
@@ -10167,6 +10188,7 @@ mod tests {
             trigger.clone(),
             snapshot_id.clone(),
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(60))]),
                 fetched_at: Utc::now(),
                 block_number: Some(100),
@@ -10178,6 +10200,7 @@ mod tests {
             trigger.clone(),
             snapshot_id,
             InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance: usdc(10000),
                 fetched_at: Utc::now(),
                 block_number: Some(90),
@@ -10308,6 +10331,7 @@ mod tests {
             reactor.clone(),
             id.clone(),
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances,
                 fetched_at: Utc::now(),
                 block_number: None,
@@ -10704,6 +10728,78 @@ mod tests {
             "terminal deposit should not leave onchain USDC inflight behind"
         );
         drop(inventory);
+    }
+
+    /// Terminal settlement must credit the configured trading chain's
+    /// onchain slot: with inventory keyed under Ethereum, a Base-hardcoded
+    /// credit would leave the Ethereum slot at its seeded balance.
+    #[tokio::test]
+    async fn terminal_deposit_credits_the_configured_trading_chain_slot() {
+        let inventory =
+            InventoryView::for_trading_chain(Chain::Ethereum).with_usdc(usdc(100), usdc(900));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(500)),
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_bridged_with_amounts(usdc(499), usdc(1)),
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap();
+
+        assert_usdc_inventory_balances(&trigger, usdc(599), Usdc::ZERO, usdc(400), Usdc::ZERO)
+            .await;
+    }
+
+    /// Cancelling a failed onchain-sourced rebalance must release and credit
+    /// back the configured trading chain's slot. The mid-flight assertion
+    /// pins the debit to the Ethereum slot; the final one pins the
+    /// cancel's release and credit-back to the same slot.
+    #[tokio::test]
+    async fn terminal_cancel_releases_the_configured_trading_chain_slot() {
+        let inventory =
+            InventoryView::for_trading_chain(Chain::Ethereum).with_usdc(usdc(900), usdc(100));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+            )
+            .await
+            .unwrap();
+
+        assert_usdc_inventory_balances(&trigger, usdc(500), usdc(400), usdc(100), Usdc::ZERO).await;
+
+        harness
+            .receive::<UsdcRebalance>(id, make_usdc_withdrawal_failed())
+            .await
+            .unwrap();
+
+        assert_usdc_inventory_balances(&trigger, usdc(900), Usdc::ZERO, usdc(100), Usdc::ZERO)
+            .await;
     }
 
     #[tokio::test]
@@ -12015,6 +12111,7 @@ mod tests {
             reactor.clone(),
             id.clone(),
             InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
                 usdc_balance: usdc(900),
                 fetched_at: Utc::now(),
                 block_number: None,
@@ -20368,6 +20465,7 @@ mod tests {
         balances.insert(symbol.clone(), shares(100)); // 100 shares onchain
 
         let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            chain: Chain::Base,
             balances,
             fetched_at: Utc::now(),
             block_number: None,
@@ -20437,6 +20535,7 @@ mod tests {
         balances.insert(symbol.clone(), shares(100));
 
         let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            chain: Chain::Base,
             balances,
             fetched_at: Utc::now(),
             block_number: None,
@@ -20517,6 +20616,7 @@ mod tests {
         balances.insert(symbol.clone(), shares(100));
 
         let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            chain: Chain::Base,
             balances,
             fetched_at: Utc::now(),
             block_number: None,
@@ -20584,6 +20684,7 @@ mod tests {
             reactor.clone(),
             id.clone(),
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances,
                 fetched_at: Utc::now(),
                 block_number: None,
@@ -21218,6 +21319,7 @@ mod tests {
             reactor.clone(),
             id,
             InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
                 balances,
                 fetched_at: Utc::now(),
                 block_number: None,
@@ -24186,6 +24288,7 @@ mod tests {
             .on_snapshot_recovery(
                 error,
                 InventorySnapshotEvent::OnchainUsdc {
+                    chain: Chain::Base,
                     usdc_balance: usdc(500),
                     fetched_at: Utc::now(),
                     block_number: None,
