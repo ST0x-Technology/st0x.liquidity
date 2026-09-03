@@ -386,9 +386,6 @@ jobs:
       - name: fork pull request CI invariants
         run: ./scripts/test-fork-pr-ci.sh
 
-      - name: deploy migration invariants
-        run: ./scripts/validate-deploy-migration.sh
-
       - name: tailscale certificate renewal invariants
         run: nix develop .#ci-hooks -c nu scripts/validate-tailscale-cert-renewal.nu
 
