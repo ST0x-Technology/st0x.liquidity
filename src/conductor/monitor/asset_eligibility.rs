@@ -20,10 +20,11 @@
 //! defer until a sync succeeds.
 
 use chrono::Utc;
+use metrics::{counter, gauge};
 use std::sync::Arc;
 use std::time::Duration;
 use task_supervisor::{SupervisedTask, TaskResult};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, EligibilitySnapshots, Symbol, TryIntoExecutor,
@@ -74,11 +75,34 @@ impl SupervisedTask for AssetEligibilityMonitor {
 impl AssetEligibilityMonitor {
     async fn sync_and_alert(&self, broker: &AlpacaBrokerApi) {
         match sync_eligibility(broker, &self.symbols, &self.store).await {
-            Ok(()) => info!(
-                symbols = self.symbols.len(),
-                "Asset eligibility sync completed"
-            ),
+            Ok(()) => {
+                // Set only on a zero-failure run: a partial sync leaves the
+                // gauge at the last run that refreshed every configured
+                // symbol. u32 holds unix seconds until 2106 and converts to
+                // f64 losslessly.
+                match u32::try_from(Utc::now().timestamp()) {
+                    Ok(unix_seconds) => {
+                        gauge!("asset_sync_last_success_timestamp").set(f64::from(unix_seconds));
+                    }
+                    Err(error) => warn!(
+                        %error,
+                        "asset_sync_last_success_timestamp gauge skipped: timestamp \
+                         outside the u32 range"
+                    ),
+                }
+                info!(
+                    symbols = self.symbols.len(),
+                    "Asset eligibility sync completed"
+                );
+            }
             Err(sync_error) => {
+                for (symbol, _) in &sync_error.failures {
+                    counter!(
+                        "asset_sync_failures_total",
+                        "symbol" => symbol.to_string()
+                    )
+                    .increment(1);
+                }
                 error!(
                     ?sync_error,
                     "Asset eligibility sync failed; overnight placements fail closed \
@@ -178,6 +202,7 @@ mod tests {
 
     #[tokio::test]
     async fn successful_sync_records_snapshots_and_sends_no_alert() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
         let server = MockServer::start_async().await;
         mock_account(&server);
         server.mock(|when, then| {
@@ -206,10 +231,20 @@ mod tests {
             Some(true)
         );
         assert_eq!(*notifier.messages.lock().unwrap(), Vec::<String>::new());
+        let rendered = metrics_handle.render();
+        assert!(
+            rendered.contains("asset_sync_last_success_timestamp"),
+            "a zero-failure sync must set the last-success gauge, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("asset_sync_failures_total{"),
+            "a zero-failure sync must not count any failure, got:\n{rendered}"
+        );
     }
 
     #[tokio::test]
     async fn failed_sync_alerts_through_the_notifier() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
         let server = MockServer::start_async().await;
         mock_account(&server);
         server.mock(|when, then| {
@@ -228,6 +263,15 @@ mod tests {
                 "Overnight asset-eligibility sync failed: eligibility sync failed for 1 symbol(s)"
                     .to_string()
             ]
+        );
+        let rendered = metrics_handle.render();
+        assert!(
+            rendered.contains("asset_sync_failures_total{symbol=\"AAPL\"} 1"),
+            "each failed symbol must be counted once per run, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("asset_sync_last_success_timestamp"),
+            "a failed sync must leave the last-success gauge unset, got:\n{rendered}"
         );
     }
 }
