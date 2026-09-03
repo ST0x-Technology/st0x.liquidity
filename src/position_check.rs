@@ -360,13 +360,7 @@ where
 
         let eligible: Vec<Symbol> = all_positions
             .iter()
-            .filter(|(symbol, _)| {
-                self.ctx
-                    .chains
-                    .sole_trading()
-                    .assets
-                    .is_trading_enabled(symbol)
-            })
+            .filter(|(symbol, _)| self.ctx.chains.primary().assets.is_trading_enabled(symbol))
             .filter(|(symbol, _)| {
                 if active_transfers.contains(symbol) {
                     debug!(%symbol, "Skipping hedge: equity transfer in progress");
@@ -396,7 +390,7 @@ where
             &self.position_projection,
             symbol,
             self.executor.to_supported_executor(),
-            &self.ctx.chains.sole_trading().assets,
+            &self.ctx.chains.primary().assets,
             &self.ctx.assets,
             true,
         )
@@ -1657,7 +1651,7 @@ mod tests {
 
         // The listing lives on the trading chain; the hedging table above only
         // says how those symbols hedge, not that they trade anywhere.
-        ctx.chains.sole_trading_mut().assets.equities.symbols = equity_symbols;
+        ctx.chains.primary_mut().assets.equities.symbols = equity_symbols;
         ctx
     }
 

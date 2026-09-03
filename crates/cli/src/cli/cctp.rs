@@ -241,7 +241,7 @@ pub(super) async fn reset_allowance_command<Registry: IntoErrorRegistry, Writer:
 /// would zero an allowance nothing holds while the real spender on the
 /// requested chain stays approved.
 fn orderbook_spender(registry: &ChainRegistry, requested: Chain) -> anyhow::Result<Address> {
-    let trading = registry.sole_trading();
+    let trading = registry.primary();
     if trading.chain != requested {
         anyhow::bail!(
             "reset-allowance targets the orderbook, which only exists on the trading chain \
@@ -295,7 +295,6 @@ mod tests {
             inventory_poll_interval: 60,
             inventory_divergence_threshold: std::num::NonZeroU32::MIN,
             hedge_order_gate_reconciliation_timeout_secs: std::num::NonZeroU64::MIN,
-            order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: std::num::NonZeroU64::new(300),
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,

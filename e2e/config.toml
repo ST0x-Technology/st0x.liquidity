@@ -40,6 +40,12 @@ inventory_adapters = []
 vault_owner = "0x3333333333333333333333333333333333333333"
 deployment_block = 1
 ingestion_cutoff = "safe"
+# Seconds between fill-watch poll cycles on this chain (required; was the
+# global order_fill_poll_interval with a hidden default of 5).
+order_fill_poll_interval_secs = 5
+# Exactly one watched chain is the primary: trading, rebalancing triggers,
+# and the cash vaults live here.
+primary = true
 
 # Ethereum is a cash-corridor endpoint only: the bot holds USDC and signs
 # there, but runs no orderbook and ingests no fills, so it has no [trading]
