@@ -12,6 +12,7 @@ members = [
   "crates/raindex",
   "crates/registry",
   "crates/tokenization",
+  "crates/liquidity-client",
   "crates/wrapper",
 ]
 resolver = "2"

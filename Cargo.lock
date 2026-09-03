@@ -478,7 +478,7 @@ dependencies = [
  "futures-utils-wasm",
  "lru",
  "parking_lot",
- "pin-project 1.1.12",
+ "pin-project 1.1.13",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -547,7 +547,7 @@ dependencies = [
  "alloy-transport-ipc",
  "alloy-transport-ws",
  "futures",
- "pin-project 1.1.12",
+ "pin-project 1.1.13",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -919,7 +919,7 @@ dependencies = [
  "bytes",
  "futures",
  "interprocess",
- "pin-project 1.1.12",
+ "pin-project 1.1.13",
  "serde",
  "serde_json",
  "tokio",
@@ -1049,7 +1049,7 @@ checksum = "7780d1e7082500a4fdb463b0a6fc1c00e4012cd9b2af101c26fcabbb2f390f2c"
 dependencies = [
  "apalis-core",
  "futures-util",
- "pin-project 1.1.12",
+ "pin-project 1.1.13",
  "thiserror 2.0.18",
  "tower",
  "tracing",
@@ -1115,7 +1115,7 @@ dependencies = [
  "futures-sink",
  "futures-timer",
  "futures-util",
- "pin-project 1.1.12",
+ "pin-project 1.1.13",
  "serde",
  "thiserror 2.0.18",
  "tower-layer",
@@ -1159,7 +1159,7 @@ dependencies = [
  "apalis-sql",
  "futures",
  "log",
- "pin-project 1.1.12",
+ "pin-project 1.1.13",
  "serde",
  "serde_json",
  "sqlx 0.8.6",
@@ -5054,11 +5054,11 @@ dependencies = [
 
 [[package]]
 name = "pin-project"
-version = "1.1.12"
+version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbf0d9e68100b3a7989b4901972f265cd542e560a3a8a724e1e20322f4d06ce9"
+checksum = "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924"
 dependencies = [
- "pin-project-internal 1.1.12",
+ "pin-project-internal 1.1.13",
 ]
 
 [[package]]
@@ -5074,9 +5074,9 @@ dependencies = [
 
 [[package]]
 name = "pin-project-internal"
-version = "1.1.12"
+version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a990e22f43e84855daf260dded30524ef4a9021cc7541c26540500a50b624389"
+checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7469,6 +7469,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "st0x-liquidity-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "serde_json",
+ "serial_test",
+ "sha2 0.10.9",
+ "temp-env",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "st0x-pricing-types"
 version = "0.4.0"
 source = "git+https://github.com/ST0x-Technology/st0x.pricing-types?tag=v0.4.0#c2cc945e607d27eff01e521e22f3c63824a09520"
@@ -8162,7 +8179,7 @@ dependencies = [
  "hyper-timeout",
  "hyper-util",
  "percent-encoding",
- "pin-project 1.1.12",
+ "pin-project 1.1.13",
  "prost 0.13.5",
  "rustls-native-certs",
  "socket2 0.5.10",

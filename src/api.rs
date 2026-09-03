@@ -1778,10 +1778,42 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
     ));
 
     let read = Router::new()
+        .route("/liquidity-read/health", get(health))
+        .route("/liquidity-read/pnl", get(pnl))
+        .route("/liquidity-read/logs", get(logs))
+        .route("/liquidity-read/orders/pending", get(pending_orders))
+        .route("/liquidity-read/orders/raindex", get(raindex_orders))
+        .route("/liquidity-read/trades", get(trades))
+        .route(
+            "/liquidity-read/trades/{venue}/{aggregate_id}/events",
+            get(trade_events),
+        )
+        .route("/liquidity-read/transfers", get(transfers_endpoint))
+        .route(
+            "/liquidity-read/transfers/{kind}/{aggregate_id}/events",
+            get(transfer_events),
+        )
         .route(
             "/liquidity-read/transfers/interrupted",
             get(interrupted_transfers),
         )
+        .route(
+            "/liquidity-read/performance/latencies",
+            get(performance_latencies),
+        )
+        .route(
+            "/liquidity-read/performance/rebalances",
+            get(performance_rebalances),
+        )
+        .route(
+            "/liquidity-read/performance/equity-rebalances",
+            get(performance_equity_rebalances),
+        )
+        .route(
+            "/liquidity-read/performance/reliability",
+            get(performance_reliability),
+        )
+        .route("/liquidity-read/performance/infra", get(performance_infra))
         .layer(axum::middleware::from_fn(move |request, next| {
             let verifier = Arc::clone(&read_verifier);
             async move { require_iap(verifier, request, next).await }
@@ -4623,6 +4655,8 @@ mod tests {
 
         for (method, uri) in [
             ("GET", "/liquidity-read/transfers/interrupted"),
+            ("GET", "/liquidity-read/pnl"),
+            ("GET", "/liquidity-read/health"),
             ("POST", "/liquidity-write/transfers/recheck/equity_mint/x"),
             ("POST", "/liquidity-write/transfers/resume"),
         ] {
@@ -4655,6 +4689,8 @@ mod tests {
 
         for (method, uri) in [
             ("GET", "/liquidity-read/transfers/interrupted"),
+            ("GET", "/liquidity-read/pnl"),
+            ("GET", "/liquidity-read/health"),
             ("POST", "/liquidity-write/transfers/recheck/equity_mint/x"),
             ("POST", "/liquidity-write/transfers/resume"),
         ] {

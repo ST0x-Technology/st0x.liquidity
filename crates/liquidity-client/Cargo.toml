@@ -1,0 +1,24 @@
+[package]
+name = "st0x-liquidity-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+tokio.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+serial_test.workspace = true
+temp-env.workspace = true
+
+[lints]
+workspace = true
