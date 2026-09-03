@@ -15,13 +15,15 @@ use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
+use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use st0x_config::{BrokerCtx, OpsApiConfig};
 use st0x_dto::{
-    EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, TradingVenue,
+    EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, Trade,
+    TradingVenue,
 };
 use st0x_execution::Symbol;
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
@@ -143,12 +145,52 @@ struct StuckTransferInfo {
     reason: StuckReason,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TradeResponse {
-    entries: Vec<serde_json::Value>,
+    trades: Vec<Trade>,
+    trade_protocol: TradeProtocol,
     total: usize,
     has_more: bool,
+}
+
+impl Serialize for TradeResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut response = serializer.serialize_struct("TradeResponse", 3)?;
+        response.serialize_field(
+            "entries",
+            &ProtocolTrades {
+                trades: &self.trades,
+                trade_protocol: self.trade_protocol,
+            },
+        )?;
+        response.serialize_field("total", &self.total)?;
+        response.serialize_field("hasMore", &self.has_more)?;
+        response.end()
+    }
+}
+
+struct ProtocolTrades<'a> {
+    trades: &'a [Trade],
+    trade_protocol: TradeProtocol,
+}
+
+impl Serialize for ProtocolTrades<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut entries = serializer.serialize_seq(Some(self.trades.len()))?;
+        for trade in self.trades {
+            entries
+                .serialize_element(&self.trade_protocol.entry(trade))
+                .inspect_err(
+                    |error| warn!(target: "dashboard", %error, "Failed to serialize trade history"),
+                )?;
+        }
+        entries.end()
+    }
 }
 
 async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
@@ -660,17 +702,9 @@ async fn trades(
         total,
         has_more,
     } = page;
-    let entries = trades
-        .iter()
-        .map(|trade| query.trade_protocol.serialize_trade(trade))
-        .collect::<Result<Vec<_>, _>>()
-        .inspect_err(
-            |error| warn!(target: "dashboard", ?error, "Failed to serialize trade history"),
-        )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
     Ok(Json(TradeResponse {
-        entries,
+        trades,
+        trade_protocol: query.trade_protocol,
         total,
         has_more,
     }))
@@ -1870,14 +1904,14 @@ mod tests {
     use st0x_config::{
         BrokerCtx, Ctx, ExecutionThreshold, RestApiCtx, create_test_ctx_with_order_owner,
     };
-    use st0x_dto::TradeOutcome;
+    use st0x_dto::{Trade, TradeOutcome, TradingVenue};
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
         DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutorOrderId, Positive,
         SupportedExecutor, Symbol, TimeInForce,
     };
-    use st0x_finance::Usd;
+    use st0x_finance::{FractionalShares, Usd};
     use st0x_float_macro::float;
     use st0x_tokenization::{
         MintVerificationError, TokenizerError, issuer_request_id, tokenization_request_id,
@@ -2049,6 +2083,40 @@ mod tests {
         assert_eq!(parsed.submitted_at.as_deref(), Some("2026-01-01T00:00:01Z"));
         assert_eq!(parsed.shares_filled.as_deref(), Some("0.5"));
         assert_eq!(parsed.avg_price.as_deref(), Some("195.25"));
+    }
+
+    #[test]
+    fn trade_response_preserves_each_protocol_wire_shape() {
+        let trade = Trade {
+            id: "adapter-fill".to_string(),
+            occurred_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            venue: TradingVenue::Bebop,
+            direction: Direction::Buy,
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            outcome: TradeOutcome::Filled,
+        };
+
+        for (trade_protocol, expected_venue) in [
+            (TradeProtocol::LegacyFills, "raindex"),
+            (TradeProtocol::TerminalOutcomesV1, "raindex"),
+            (TradeProtocol::TerminalOutcomesV2, "raindex"),
+            (TradeProtocol::TerminalOutcomesV3, "bebop"),
+        ] {
+            let wire = serde_json::to_value(TradeResponse {
+                trades: vec![trade.clone()],
+                trade_protocol,
+                total: 1,
+                has_more: false,
+            })
+            .unwrap();
+
+            assert_eq!(wire["entries"][0]["venue"], expected_venue);
+            assert_eq!(wire["entries"][0]["filledAt"], "2026-01-01T00:00:00Z");
+            assert_eq!(wire["entries"][0]["outcome"]["status"], "filled");
+            assert_eq!(wire["total"], 1);
+            assert_eq!(wire["hasMore"], false);
+        }
     }
 
     #[tokio::test]

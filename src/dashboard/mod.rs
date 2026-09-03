@@ -7,13 +7,16 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use futures_util::sink::SinkExt;
 use futures_util::stream::{SplitSink, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use tracing::{info, trace, warn};
 
 use st0x_config::{ExecutionThreshold, OperationMode};
-use st0x_dto::{CurrentState, Statement, Trade, TradeOutcome, TransferWarning};
+use st0x_dto::{
+    CurrentState, LegacyCompatibleTrade, Statement, TerminalOutcomesV1Trade, Trade, TradeOutcome,
+    TransferWarning,
+};
 use st0x_event_sorcery::{load_all_ids, load_entity};
 use st0x_finance::Positive;
 
@@ -30,6 +33,15 @@ pub(crate) use event::{
     DashboardTradeHandoffMonitor, DeliverDashboardTrade,
 };
 pub(crate) use trade_loader::{TradePage, TradeQuery, query_trades};
+
+/// Borrowed trade representation selected by the dashboard protocol.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(crate) enum TradeEntry<'a> {
+    LegacyCompatible(LegacyCompatibleTrade<'a>),
+    TerminalOutcomesV1(TerminalOutcomesV1Trade<'a>),
+    Canonical(&'a Trade),
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,17 +117,19 @@ impl TradeProtocol {
         self,
         trade: &Trade,
     ) -> Result<serde_json::Value, serde_json::Error> {
-        let (mut wire, legacy_venue) = match self {
-            Self::LegacyFills | Self::TerminalOutcomesV2 => (serde_json::to_value(trade)?, true),
-            Self::TerminalOutcomesV1 => (serde_json::to_value(trade.terminal_outcomes_v1())?, true),
-            Self::TerminalOutcomesV3 => (serde_json::to_value(trade)?, false),
-        };
+        serde_json::to_value(self.entry(trade))
+    }
 
-        if legacy_venue {
-            wire["venue"] = serde_json::to_value(trade.venue.legacy_compatible())?;
+    pub(crate) const fn entry(self, trade: &Trade) -> TradeEntry<'_> {
+        match self {
+            Self::LegacyFills | Self::TerminalOutcomesV2 => {
+                TradeEntry::LegacyCompatible(trade.legacy_compatible())
+            }
+            Self::TerminalOutcomesV1 => {
+                TradeEntry::TerminalOutcomesV1(trade.legacy_terminal_outcomes_v1())
+            }
+            Self::TerminalOutcomesV3 => TradeEntry::Canonical(trade),
         }
-
-        Ok(wire)
     }
 }
 

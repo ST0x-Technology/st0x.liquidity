@@ -423,20 +423,49 @@ impl Serialize for Trade {
     where
         S: Serializer,
     {
-        let is_filled = matches!(self.outcome, TradeOutcome::Filled);
-        let mut trade = serializer.serialize_struct("Trade", 7 + usize::from(is_filled))?;
-        trade.serialize_field("id", &self.id)?;
-        trade.serialize_field("occurredAt", &self.occurred_at)?;
-        if is_filled {
-            trade.serialize_field("filledAt", &self.occurred_at)?;
-        }
-        trade.serialize_field("venue", &self.venue)?;
-        trade.serialize_field("direction", &self.direction)?;
-        trade.serialize_field("symbol", &self.symbol)?;
-        trade.serialize_field("shares", &self.shares)?;
-        trade.serialize_field("outcome", &self.outcome)?;
-        trade.end()
+        serialize_canonical_trade(self, self.venue, serializer)
     }
+}
+
+/// Canonical trade representation with adapter-specific onchain venues
+/// collapsed for dashboard protocols that predate venue attribution.
+pub struct LegacyCompatibleTrade<'a> {
+    trade: &'a Trade,
+}
+
+impl Serialize for LegacyCompatibleTrade<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serialize_canonical_trade(self.trade, self.trade.venue.legacy_compatible(), serializer)
+    }
+}
+
+fn serialize_canonical_trade<S>(
+    value: &Trade,
+    venue: TradingVenue,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let is_filled = match &value.outcome {
+        TradeOutcome::Filled => true,
+        TradeOutcome::Failed { .. } | TradeOutcome::Cancelled { .. } => false,
+    };
+    let mut trade = serializer.serialize_struct("Trade", 7 + usize::from(is_filled))?;
+    trade.serialize_field("id", &value.id)?;
+    trade.serialize_field("occurredAt", &value.occurred_at)?;
+    if is_filled {
+        trade.serialize_field("filledAt", &value.occurred_at)?;
+    }
+    trade.serialize_field("venue", &venue)?;
+    trade.serialize_field("direction", &value.direction)?;
+    trade.serialize_field("symbol", &value.symbol)?;
+    trade.serialize_field("shares", &value.shares)?;
+    trade.serialize_field("outcome", &value.outcome)?;
+    trade.end()
 }
 
 /// Stable `terminal_outcomes_v1` representation.
@@ -447,6 +476,7 @@ impl Serialize for Trade {
 /// nullable fields from [`TradeOutcome`].
 pub struct TerminalOutcomesV1Trade<'a> {
     trade: &'a Trade,
+    venue: TradingVenue,
 }
 
 #[derive(Serialize)]
@@ -476,7 +506,7 @@ impl Serialize for TerminalOutcomesV1Trade<'_> {
             ..
         } = &self.trade.outcome
         else {
-            return self.trade.serialize(serializer);
+            return serialize_canonical_trade(self.trade, self.venue, serializer);
         };
 
         // When acceptance provenance is unknown, v1 has no way to express
@@ -518,7 +548,7 @@ impl Serialize for TerminalOutcomesV1Trade<'_> {
         let mut trade = serializer.serialize_struct("Trade", 7)?;
         trade.serialize_field("id", &self.trade.id)?;
         trade.serialize_field("occurredAt", &self.trade.occurred_at)?;
-        trade.serialize_field("venue", &self.trade.venue)?;
+        trade.serialize_field("venue", &self.venue)?;
         trade.serialize_field("direction", &self.trade.direction)?;
         trade.serialize_field("symbol", &self.trade.symbol)?;
         trade.serialize_field("shares", &shares)?;
@@ -543,10 +573,30 @@ pub struct LegacyTrade {
 }
 
 impl Trade {
+    /// Returns the canonical trade shape with a venue compatible with
+    /// dashboard protocols that predate adapter attribution.
+    #[must_use]
+    pub const fn legacy_compatible(&self) -> LegacyCompatibleTrade<'_> {
+        LegacyCompatibleTrade { trade: self }
+    }
+
     /// Returns the stable terminal-outcomes v1 wire representation.
     #[must_use]
     pub const fn terminal_outcomes_v1(&self) -> TerminalOutcomesV1Trade<'_> {
-        TerminalOutcomesV1Trade { trade: self }
+        TerminalOutcomesV1Trade {
+            trade: self,
+            venue: self.venue,
+        }
+    }
+
+    /// Returns the stable terminal-outcomes v1 shape with a venue compatible
+    /// with dashboard protocols that predate adapter attribution.
+    #[must_use]
+    pub const fn legacy_terminal_outcomes_v1(&self) -> TerminalOutcomesV1Trade<'_> {
+        TerminalOutcomesV1Trade {
+            trade: self,
+            venue: self.venue.legacy_compatible(),
+        }
     }
 
     /// Returns the pre-terminal-outcome representation for filled trades.
@@ -1139,6 +1189,39 @@ mod tests {
         assert_eq!(wire["outcome"]["remainingShares"], "2");
         assert_eq!(wire["outcome"]["excessShares"], "0");
         assert!(wire["outcome"].get("acceptedShares").is_none());
+    }
+
+    #[test]
+    fn legacy_trade_adapters_collapse_adapter_venues() {
+        let filled = Trade {
+            id: "adapter-fill".to_string(),
+            occurred_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            venue: TradingVenue::Bebop,
+            direction: Direction::Buy,
+            symbol: Symbol::new("SPCX").unwrap(),
+            shares: positive_shares("1"),
+            outcome: TradeOutcome::Filled,
+        };
+        let failed = Trade {
+            outcome: TradeOutcome::Failed {
+                error: "placement rejected".to_string(),
+                accepted_shares: None,
+                filled_shares: None,
+                remaining_shares: None,
+                excess_shares: None,
+            },
+            ..filled.clone()
+        };
+
+        let canonical = serde_json::to_value(&filled).unwrap();
+        let legacy_filled = serde_json::to_value(filled.legacy_compatible()).unwrap();
+        let canonical_failed = serde_json::to_value(failed.terminal_outcomes_v1()).unwrap();
+        let legacy_failed = serde_json::to_value(failed.legacy_terminal_outcomes_v1()).unwrap();
+
+        assert_eq!(canonical["venue"], "bebop");
+        assert_eq!(legacy_filled["venue"], "raindex");
+        assert_eq!(canonical_failed["venue"], "bebop");
+        assert_eq!(legacy_failed["venue"], "raindex");
     }
 
     #[test]
