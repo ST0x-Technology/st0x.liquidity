@@ -6,14 +6,16 @@
 --
 -- The UNIQUE(orderbook) shadow index preserves one release of rollback: a
 -- rolled-back (pre-per-chain) binary upserts with ON CONFLICT(orderbook),
--- which needs a unique constraint on that column to resolve. It also forbids
--- two chains sharing an orderbook address (deterministic deploys make that
--- real), so it MUST be dropped before a second chain is ever watched: the
--- cleanup migration ships together with the capability grant that first
--- admits a non-Base watched chain, keeping rollback protection exactly as
--- long as the deployment is single-chain.
+-- which needs a unique constraint on that column to resolve, and omits the
+-- chain column, which needs the DEFAULT to pass NOT NULL before the conflict
+-- clause runs. Both rollback affordances also forbid or fake a second chain
+-- (the index rejects two chains sharing an orderbook address, which
+-- deterministic deploys make real), so they MUST go before a second chain is
+-- ever watched: the cleanup migration ships together with the capability
+-- grant that first admits a non-Base watched chain, keeping rollback
+-- protection exactly as long as the deployment is single-chain.
 CREATE TABLE backfill_checkpoints_new (
-    chain TEXT NOT NULL,
+    chain TEXT NOT NULL DEFAULT 'base',
     orderbook TEXT NOT NULL,
     last_processed_block INTEGER NOT NULL CHECK (last_processed_block >= 0),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
