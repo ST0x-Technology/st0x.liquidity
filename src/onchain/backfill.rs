@@ -209,7 +209,7 @@ where
     async fn perform(&self, ctx: &AccountantCtx<Node, Exec>) -> Result<Self::Output, Self::Error> {
         backfill_range(
             ctx.evm.provider(),
-            ctx.ctx.chains.sole_trading(),
+            ctx.ctx.chains.primary(),
             BotOperator(ctx.ctx.order_owner()),
             &ctx.pool,
             self.from_block,

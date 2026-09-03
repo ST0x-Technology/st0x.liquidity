@@ -145,7 +145,7 @@ pub(super) async fn donate_equity_command<Writer: Write>(
     let owner = base_wallet.address();
     let wrapper = WrapperService::new(
         base_wallet,
-        to_wrapped_equities(&ctx.chains.sole_trading().assets.equities.symbols),
+        to_wrapped_equities(&ctx.chains.primary().assets.equities.symbols),
     );
 
     donate_equity_with_wrapper(stdout, &wrapper, owner, symbol, quantity).await
@@ -215,7 +215,7 @@ fn wrap_context(
 
     let equities = match (network, registry) {
         (TokenizationNetwork::Base, None) => {
-            to_wrapped_equities(&ctx.chains.sole_trading().assets.equities.symbols)
+            to_wrapped_equities(&ctx.chains.primary().assets.equities.symbols)
         }
         (TokenizationNetwork::Base, Some(_)) => anyhow::bail!(
             "--registry only applies to non Base networks: Base resolves \
@@ -292,7 +292,6 @@ mod tests {
             inventory_poll_interval: 60,
             inventory_divergence_threshold: std::num::NonZeroU32::MIN,
             hedge_order_gate_reconciliation_timeout_secs: std::num::NonZeroU64::MIN,
-            order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: std::num::NonZeroU64::new(300),
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,

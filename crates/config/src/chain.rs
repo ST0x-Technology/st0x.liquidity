@@ -21,8 +21,7 @@ use crate::enablement::{ChainEnablementError, ChainLifecycle, check_enablement};
 ///
 /// The cutoff caps what the fill monitor treats as safe to ingest. Tags differ
 /// in their reorg-safety guarantees and their distance behind the chain tip.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngestionCutoff {
     /// OP-Stack `safe` block: the latest L2 block whose sequencer batch has
     /// been posted to L1. Not yet L1-finalized (Casper FFG). Cuts hedging lag
@@ -36,6 +35,23 @@ pub enum IngestionCutoff {
     /// L1-finalized block (Casper FFG). Full reorg protection but ~20 min
     /// hedging lag on Base. Use when strict reorg protection is required.
     Finalized,
+    /// A fixed depth behind the chain tip: the cutoff is the already-fetched
+    /// tip minus this many blocks, with no extra RPC round trip. For chains
+    /// where consensus tags are unsuitable or unavailable (Ethereum mainnet
+    /// watches at 12; HyperEVM has no tags at all).
+    Confirmations(u64),
+}
+
+/// The config-file discriminant for [`IngestionCutoff`]. `confirmations`
+/// additionally requires `ingestion_cutoff_confirmations`; the pairing is
+/// validated with named errors when the chain is built (same pattern as
+/// [`InventoryModeTag`] + `inventory`).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestionCutoffTag {
+    Safe,
+    Finalized,
+    Confirmations,
 }
 
 impl std::fmt::Display for IngestionCutoff {
@@ -43,6 +59,7 @@ impl std::fmt::Display for IngestionCutoff {
         match self {
             Self::Safe => f.write_str("safe"),
             Self::Finalized => f.write_str("finalized"),
+            Self::Confirmations(depth) => write!(f, "confirmations({depth})"),
         }
     }
 }
@@ -170,6 +187,20 @@ pub enum ChainConfigError {
          one operator cannot identify multiple venues"
     )]
     DuplicateInventoryAdapterOperator { operator: Address },
+    #[error(
+        "[chains.<name>] ingestion_cutoff = \"confirmations\" requires \
+         ingestion_cutoff_confirmations, but none was configured"
+    )]
+    ConfirmationsWithoutDepth,
+    #[error(
+        "[chains.<name>] ingestion_cutoff_confirmations is only valid with \
+         ingestion_cutoff = \"confirmations\", but the cutoff is \"{tag:?}\""
+    )]
+    DepthWithoutConfirmations { tag: IngestionCutoffTag },
+    #[error("[chains.<name>] ingestion_cutoff_confirmations must be non-zero")]
+    ZeroConfirmationDepth,
+    #[error("[chains.<name>] order_fill_poll_interval_secs must be non-zero")]
+    ZeroOrderFillPollInterval,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,7 +250,17 @@ pub struct TradingConfig {
     /// than silently assume an owner.
     pub vault_owner: Address,
     pub deployment_block: u64,
-    pub ingestion_cutoff: IngestionCutoff,
+    pub ingestion_cutoff: IngestionCutoffTag,
+    /// Depth for `ingestion_cutoff = "confirmations"`. Required with that
+    /// mode and forbidden with the tag-based modes; must be non-zero.
+    pub ingestion_cutoff_confirmations: Option<u64>,
+    /// Seconds between fill-watch poll cycles on this chain. Required (no
+    /// silent default) and non-zero; each watched chain polls independently.
+    pub order_fill_poll_interval_secs: u64,
+    /// Marks THE primary chain: where trading, rebalancing triggers, and the
+    /// cash vaults live. Exactly one watched chain must set it.
+    #[serde(default)]
+    pub primary: bool,
     /// Alpaca's issuer wallet on this chain -- ERC-20 transfers for redemption
     /// go here. Per chain because a redemption delivers tokens that exist on
     /// one chain, so sending to another chain's issuer address burns them.
@@ -248,6 +289,25 @@ impl TradingConfig {
                 Ok(InventoryMode::Managed { inventory })
             }
             (InventoryModeTag::Managed, None) => Err(ChainConfigError::ManagedWithoutInventory),
+        }
+    }
+
+    /// Resolves the cutoff tag + optional depth into an [`IngestionCutoff`],
+    /// failing fast on the contradictory combinations.
+    fn resolve_ingestion_cutoff(&self) -> Result<IngestionCutoff, ChainConfigError> {
+        match (self.ingestion_cutoff, self.ingestion_cutoff_confirmations) {
+            (IngestionCutoffTag::Safe, None) => Ok(IngestionCutoff::Safe),
+            (IngestionCutoffTag::Finalized, None) => Ok(IngestionCutoff::Finalized),
+            (IngestionCutoffTag::Confirmations, Some(0)) => {
+                Err(ChainConfigError::ZeroConfirmationDepth)
+            }
+            (IngestionCutoffTag::Confirmations, Some(depth)) => {
+                Ok(IngestionCutoff::Confirmations(depth))
+            }
+            (IngestionCutoffTag::Confirmations, None) => {
+                Err(ChainConfigError::ConfirmationsWithoutDepth)
+            }
+            (tag, Some(_)) => Err(ChainConfigError::DepthWithoutConfirmations { tag }),
         }
     }
 
@@ -312,6 +372,8 @@ pub struct TradingChain {
     pub vault_owner: Address,
     pub deployment_block: u64,
     pub ingestion_cutoff: IngestionCutoff,
+    /// Seconds between fill-watch poll cycles on this chain.
+    pub order_fill_poll_interval: std::time::Duration,
     pub redemption_wallet: Option<Address>,
     pub assets: ChainAssets,
 }
@@ -339,6 +401,8 @@ impl TradingChain {
         #[builder(default = alloy::primitives::Address::repeat_byte(0x11))] vault_owner: Address,
         #[builder(default = 0)] deployment_block: u64,
         #[builder(default = IngestionCutoff::Safe)] ingestion_cutoff: IngestionCutoff,
+        #[builder(default = std::time::Duration::from_secs(1))]
+        order_fill_poll_interval: std::time::Duration,
         redemption_wallet: Option<Address>,
         #[builder(default)] assets: ChainAssets,
     ) -> Self {
@@ -352,6 +416,7 @@ impl TradingChain {
             vault_owner,
             deployment_block,
             ingestion_cutoff,
+            order_fill_poll_interval,
             redemption_wallet,
             assets,
         }
@@ -370,6 +435,7 @@ impl std::fmt::Debug for TradingChain {
             .field("vault_owner", &self.vault_owner)
             .field("deployment_block", &self.deployment_block)
             .field("ingestion_cutoff", &self.ingestion_cutoff)
+            .field("order_fill_poll_interval", &self.order_fill_poll_interval)
             .field("redemption_wallet", &self.redemption_wallet)
             .field("assets", &self.assets)
             .finish()
@@ -385,6 +451,10 @@ impl TradingChain {
     ) -> Result<Self, ChainConfigError> {
         trading.validate_inventory_adapters()?;
 
+        if trading.order_fill_poll_interval_secs == 0 {
+            return Err(ChainConfigError::ZeroOrderFillPollInterval);
+        }
+
         Ok(Self {
             chain,
             rpc_url,
@@ -394,7 +464,10 @@ impl TradingChain {
             inventory_adapters: trading.inventory_adapters.clone(),
             vault_owner: trading.vault_owner,
             deployment_block: trading.deployment_block,
-            ingestion_cutoff: trading.ingestion_cutoff,
+            ingestion_cutoff: trading.resolve_ingestion_cutoff()?,
+            order_fill_poll_interval: std::time::Duration::from_secs(
+                trading.order_fill_poll_interval_secs,
+            ),
             redemption_wallet: trading.redemption_wallet,
             assets: trading.assets.clone(),
         })
@@ -419,12 +492,15 @@ impl TradingChain {
 /// with no RPC, or holding an RPC for a chain with no addresses, are both
 /// states where fund routing is undefined.
 ///
-/// The trading chain is its own field rather than an entry in the map, so
-/// "exactly one trading chain" holds by construction instead of being
-/// re-checked by every reader.
+/// The primary chain is its own field rather than an entry in a map, so
+/// "exactly one primary" holds by construction instead of being re-checked
+/// by every reader; watch-only chains live in `secondary`.
 #[derive(Clone, Debug)]
 pub struct ChainRegistry {
-    trading: TradingChain,
+    primary: TradingChain,
+    /// Watched, non-primary chains: fills are ingested and hedged, but
+    /// trading, rebalancing triggers, and cash vaults stay on the primary.
+    secondary: BTreeMap<Chain, TradingChain>,
     transport: BTreeMap<Chain, ChainCtx>,
 }
 
@@ -444,6 +520,14 @@ pub enum ChainRegistryError {
     )]
     NoTradingChain,
     #[error(
+        "{} chains configure a [trading] table ({}) but none sets primary = true; \
+         exactly one watched chain must be the primary (trading, rebalancing, \
+         cash vaults)",
+        chains.len(),
+        chains.iter().map(|chain| chain.as_str()).collect::<Vec<_>>().join(", ")
+    )]
+    NoPrimaryChain { chains: Vec<Chain> },
+    #[error(
         "[chains.{chain}] is configured but the secrets file has no [chains.{chain}] \
          entry supplying its rpc_url"
     )]
@@ -455,13 +539,11 @@ pub enum ChainRegistryError {
     )]
     UnconfiguredSecrets { chain: Chain },
     #[error(
-        "{} chains configure a [trading] table ({}), but this build drives a single \
-         fill watcher: the chains beyond the first would be fully described and never \
-         watched, so their fills would go unhedged",
+        "{} chains claim primary = true ({}); exactly one chain can be the primary",
         chains.len(),
         chains.iter().map(|chain| chain.as_str()).collect::<Vec<_>>().join(", ")
     )]
-    MultipleTradingChains { chains: Vec<Chain> },
+    MultiplePrimaryChains { chains: Vec<Chain> },
     #[error(transparent)]
     Entry(#[from] ChainConfigError),
     #[error(transparent)]
@@ -472,19 +554,17 @@ pub enum ChainRegistryError {
 struct EnabledChains<'config> {
     /// Every chain whose lifecycle is not `disabled`, trading one included.
     enabled: BTreeMap<Chain, &'config ChainConfig>,
-    trading_chain: Chain,
+    primary_chain: Chain,
     chain_config: &'config ChainConfig,
     trading_table: &'config TradingConfig,
 }
 
-/// Drops the disabled chains, picks the sole trading chain, and checks that
-/// every surviving chain carries the capabilities its lifecycle needs.
+/// Drops the disabled chains, picks the primary trading chain, and checks
+/// that every surviving chain carries the capabilities its lifecycle needs.
 ///
-/// Refuses more than one trading chain: the config shape admits several, but
-/// the runtime still drives a single fill watcher, so a second one would be
-/// fully described and never read. Failing here is what keeps that gap from
-/// presenting as silently unhedged exposure. Transport-only entries are
-/// unlimited -- nothing watches them by design.
+/// Exactly one trading chain must claim `primary = true`; the rest are
+/// watch-only secondaries. Transport-only entries are unlimited -- nothing
+/// watches them by design.
 fn enabled_chains(
     configs: &BTreeMap<Chain, ChainConfig>,
 ) -> Result<EnabledChains<'_>, ChainRegistryError> {
@@ -514,11 +594,24 @@ fn enabled_chains(
         })
         .collect();
 
-    let (trading_chain, chain_config, trading_table) = match trading_chains.as_slice() {
-        [] => return Err(ChainRegistryError::NoTradingChain),
+    if trading_chains.is_empty() {
+        return Err(ChainRegistryError::NoTradingChain);
+    }
+
+    let primaries: Vec<(Chain, &ChainConfig, &TradingConfig)> = trading_chains
+        .iter()
+        .filter(|(_, _, trading)| trading.primary)
+        .copied()
+        .collect();
+    let (primary_chain, chain_config, trading_table) = match primaries.as_slice() {
+        [] => {
+            return Err(ChainRegistryError::NoPrimaryChain {
+                chains: trading_chains.iter().map(|(chain, _, _)| *chain).collect(),
+            });
+        }
         [only] => *only,
         many => {
-            return Err(ChainRegistryError::MultipleTradingChains {
+            return Err(ChainRegistryError::MultiplePrimaryChains {
                 chains: many.iter().map(|(chain, _, _)| *chain).collect(),
             });
         }
@@ -535,7 +628,7 @@ fn enabled_chains(
 
     Ok(EnabledChains {
         enabled,
-        trading_chain,
+        primary_chain,
         chain_config,
         trading_table,
     })
@@ -555,7 +648,7 @@ impl ChainRegistry {
     ) -> Result<Self, ChainRegistryError> {
         let EnabledChains {
             enabled: configs,
-            trading_chain,
+            primary_chain,
             chain_config,
             trading_table,
         } = enabled_chains(configs)?;
@@ -567,38 +660,53 @@ impl ChainRegistry {
                 .map(|entry| entry.rpc_url)
         };
 
-        let trading = TradingChain::new(
-            trading_chain,
+        let primary = TradingChain::new(
+            primary_chain,
             chain_config,
             trading_table,
-            take_rpc_url(trading_chain)?,
+            take_rpc_url(primary_chain)?,
         )?;
 
+        let mut secondary = BTreeMap::new();
         let mut transport = BTreeMap::new();
         for (chain, config) in &configs {
-            if *chain == trading_chain {
+            if *chain == primary_chain {
                 continue;
             }
 
-            transport.insert(
-                *chain,
-                ChainCtx {
-                    chain: *chain,
-                    rpc_url: take_rpc_url(*chain)?,
-                    required_confirmations: config.required_confirmations,
-                },
-            );
+            match &config.trading {
+                Some(trading) => {
+                    secondary.insert(
+                        *chain,
+                        TradingChain::new(*chain, config, trading, take_rpc_url(*chain)?)?,
+                    );
+                }
+                None => {
+                    transport.insert(
+                        *chain,
+                        ChainCtx {
+                            chain: *chain,
+                            rpc_url: take_rpc_url(*chain)?,
+                            required_confirmations: config.required_confirmations,
+                        },
+                    );
+                }
+            }
         }
 
         if let Some(chain) = secrets.keys().next() {
             return Err(ChainRegistryError::UnconfiguredSecrets { chain: *chain });
         }
 
-        Ok(Self { trading, transport })
+        Ok(Self {
+            primary,
+            secondary,
+            transport,
+        })
     }
 
     /// Runs every `[chains.<name>]` check that reads the config file alone,
-    /// and hands back the sole trading chain's table so the caller can keep
+    /// and hands back the primary chain's table so the caller can keep
     /// validating against it.
     ///
     /// [`Self::new`] performs these same checks plus the config/secrets
@@ -616,29 +724,42 @@ impl ChainRegistry {
         Ok(trading_table)
     }
 
-    /// The single chain this build trades on.
-    ///
-    /// Every call site is a place that still assumes one trading chain, so
-    /// this is also the list of what per-chain fill watchers have to reach.
-    pub fn sole_trading(&self) -> &TradingChain {
-        &self.trading
+    /// THE primary chain: where trading, rebalancing triggers, and the cash
+    /// vaults live. Watch-only chains are reached via [`Self::watched`].
+    pub fn primary(&self) -> &TradingChain {
+        &self.primary
+    }
+
+    /// Every watched chain (primary first, then secondaries): the chains a
+    /// fill watcher runs against.
+    pub fn watched(&self) -> impl Iterator<Item = &TradingChain> {
+        std::iter::once(&self.primary).chain(self.secondary.values())
+    }
+
+    /// The watched chain with this id, if any.
+    pub fn watch(&self, chain: Chain) -> Option<&TradingChain> {
+        if self.primary.chain == chain {
+            return Some(&self.primary);
+        }
+        self.secondary.get(&chain)
     }
 
     /// Mutable access to the trading chain, so a fixture can vary one field
     /// (a settlement mode, an unreachable RPC) without rebuilding the registry.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn sole_trading_mut(&mut self) -> &mut TradingChain {
-        &mut self.trading
+    pub fn primary_mut(&mut self) -> &mut TradingChain {
+        &mut self.primary
     }
 
-    /// A registry holding one trading chain and nothing else.
+    /// A registry holding one primary chain and nothing else.
     ///
     /// Test and fixture construction only: production registries come from
     /// [`Self::new`], which is what enforces the config/secrets pairing.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn single_trading_chain(trading: TradingChain) -> Self {
+    pub fn single_trading_chain(primary: TradingChain) -> Self {
         Self {
-            trading,
+            primary,
+            secondary: BTreeMap::new(),
             transport: BTreeMap::new(),
         }
     }
@@ -646,8 +767,8 @@ impl ChainRegistry {
     /// The RPC endpoint configured for `chain`, whether it trades or only
     /// carries cash. `None` when the chain has no `[chains.<name>]` entry.
     pub fn rpc_url(&self, chain: Chain) -> Option<&Url> {
-        if self.trading.chain == chain {
-            return Some(&self.trading.rpc_url);
+        if let Some(watched) = self.watch(chain) {
+            return Some(&watched.rpc_url);
         }
 
         self.transport.get(&chain).map(|entry| &entry.rpc_url)
@@ -657,8 +778,8 @@ impl ChainRegistry {
     /// has no `[chains.<name>]` entry. Per chain because the depth encodes one
     /// chain's reorg behaviour; a global value cannot be right for all.
     pub fn required_confirmations(&self, chain: Chain) -> Option<u64> {
-        if self.trading.chain == chain {
-            return Some(self.trading.required_confirmations);
+        if let Some(watched) = self.watch(chain) {
+            return Some(watched.required_confirmations);
         }
 
         self.transport
@@ -677,7 +798,70 @@ mod tests {
 
     #[derive(Debug, Deserialize)]
     struct CutoffWrapper {
-        ingestion_cutoff: IngestionCutoff,
+        ingestion_cutoff: IngestionCutoffTag,
+    }
+
+    /// The confirmations mode needs its companion depth and produces the
+    /// arithmetic variant; each contradictory pairing fails with its named
+    /// error.
+    #[test]
+    fn confirmations_cutoff_resolution() {
+        let with = |tag, depth| TradingConfig {
+            ingestion_cutoff: tag,
+            ingestion_cutoff_confirmations: depth,
+            ..primary_trading_config_toml(true)
+        };
+
+        assert_eq!(
+            with(IngestionCutoffTag::Confirmations, Some(12))
+                .resolve_ingestion_cutoff()
+                .unwrap(),
+            IngestionCutoff::Confirmations(12)
+        );
+        assert!(matches!(
+            with(IngestionCutoffTag::Confirmations, None)
+                .resolve_ingestion_cutoff()
+                .unwrap_err(),
+            ChainConfigError::ConfirmationsWithoutDepth
+        ));
+        assert!(matches!(
+            with(IngestionCutoffTag::Safe, Some(12))
+                .resolve_ingestion_cutoff()
+                .unwrap_err(),
+            ChainConfigError::DepthWithoutConfirmations {
+                tag: IngestionCutoffTag::Safe
+            }
+        ));
+        assert!(matches!(
+            with(IngestionCutoffTag::Confirmations, Some(0))
+                .resolve_ingestion_cutoff()
+                .unwrap_err(),
+            ChainConfigError::ZeroConfirmationDepth
+        ));
+    }
+
+    /// The TOML shape: mode string plus separate depth key.
+    #[test]
+    fn confirmations_cutoff_toml_round_trip() {
+        let config: TradingConfig = toml::from_str(
+            "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+             inventory_mode = \"legacy\"\n\
+             inventory_adapters = []\n\
+             vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
+             deployment_block = 1\n\
+             order_fill_poll_interval_secs = 12\n\
+             primary = false\n\
+             ingestion_cutoff = \"confirmations\"\n\
+             ingestion_cutoff_confirmations = 12",
+        )
+        .unwrap();
+
+        assert_eq!(config.ingestion_cutoff, IngestionCutoffTag::Confirmations);
+        assert_eq!(config.ingestion_cutoff_confirmations, Some(12));
+        assert_eq!(
+            config.resolve_ingestion_cutoff().unwrap(),
+            IngestionCutoff::Confirmations(12)
+        );
     }
 
     fn dummy_rpc_url() -> Url {
@@ -696,9 +880,14 @@ mod tests {
 
     #[test]
     fn ingestion_cutoff_deserializes_safe() {
-        let wrapper: CutoffWrapper = toml::from_str("ingestion_cutoff = \"safe\"").unwrap();
+        let wrapper: CutoffWrapper = toml::from_str(
+            "ingestion_cutoff = \"safe\"\n\
+             order_fill_poll_interval_secs = 1\n\
+             primary = true",
+        )
+        .unwrap();
 
-        assert_eq!(wrapper.ingestion_cutoff, IngestionCutoff::Safe);
+        assert_eq!(wrapper.ingestion_cutoff, IngestionCutoffTag::Safe);
     }
 
     #[test]
@@ -712,7 +901,9 @@ mod tests {
              inventory_adapters = []\n\
              inventory = \"0x2222222222222222222222222222222222222222\"\n\
              deployment_block = 1\n\
-             ingestion_cutoff = \"safe\"",
+             ingestion_cutoff = \"safe\"\n\
+             order_fill_poll_interval_secs = 1\n\
+             primary = true",
         );
 
         let error = result.unwrap_err();
@@ -730,7 +921,9 @@ mod tests {
              inventory = \"0x2222222222222222222222222222222222222222\"\n\
              vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
-             ingestion_cutoff = \"safe\"",
+             ingestion_cutoff = \"safe\"\n\
+             order_fill_poll_interval_secs = 1\n\
+             primary = true",
         );
 
         let error = result.unwrap_err();
@@ -752,7 +945,9 @@ mod tests {
              inventory = \"0x2222222222222222222222222222222222222222\"\n\
              vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
-             ingestion_cutoff = \"safe\"",
+             ingestion_cutoff = \"safe\"\n\
+             order_fill_poll_interval_secs = 1\n\
+             primary = true",
         )
         .unwrap();
 
@@ -794,7 +989,9 @@ mod tests {
              inventory = \"0x2222222222222222222222222222222222222222\"\n\
              vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
-             ingestion_cutoff = \"safe\"",
+             ingestion_cutoff = \"safe\"\n\
+             order_fill_poll_interval_secs = 1\n\
+             primary = true",
         )
         .unwrap_err();
 
@@ -818,7 +1015,9 @@ mod tests {
              inventory = \"0x2222222222222222222222222222222222222222\"\n\
              vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
-             ingestion_cutoff = \"safe\"",
+             ingestion_cutoff = \"safe\"\n\
+             order_fill_poll_interval_secs = 1\n\
+             primary = true",
         )
         .unwrap();
 
@@ -844,7 +1043,9 @@ mod tests {
              ]\n\
              vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
-             ingestion_cutoff = \"safe\"",
+             ingestion_cutoff = \"safe\"\n\
+             order_fill_poll_interval_secs = 1\n\
+             primary = true",
         )
         .unwrap();
 
@@ -858,14 +1059,20 @@ mod tests {
     }
 
     fn trading_config_toml() -> TradingConfig {
-        toml::from_str(
+        primary_trading_config_toml(true)
+    }
+
+    fn primary_trading_config_toml(primary: bool) -> TradingConfig {
+        toml::from_str(&format!(
             "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
              inventory_mode = \"legacy\"\n\
              inventory_adapters = []\n\
              vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
-             ingestion_cutoff = \"safe\"",
-        )
+             order_fill_poll_interval_secs = 1\n\
+             primary = {primary}\n\
+             ingestion_cutoff = \"safe\""
+        ))
         .unwrap()
     }
 
@@ -965,10 +1172,53 @@ mod tests {
         );
     }
 
-    /// The one refusal that keeps unhedged exposure out of production: a second
-    /// trading chain would be fully described and never watched.
+    /// The registry structurally admits a second watched chain, but the
+    /// capability gate still refuses it until the per-chain watcher code
+    /// exists and grants `FillIngestion`/`Hedging` for that chain: the
+    /// config layer must never claim a capability the code does not have.
+    /// (The acceptance counterpart lands with the capability grant.)
     #[test]
-    fn registry_rejects_a_second_trading_chain() {
+    fn second_watched_chain_is_still_refused_by_the_capability_gate() {
+        let configs = BTreeMap::from([
+            (Chain::Base, chain_config(Some(trading_config_toml()))),
+            (
+                Chain::Ethereum,
+                chain_config(Some(primary_trading_config_toml(false))),
+            ),
+        ]);
+
+        let error =
+            ChainRegistry::new(&configs, secrets_for(&[Chain::Base, Chain::Ethereum])).unwrap_err();
+
+        assert!(
+            matches!(error, ChainRegistryError::Enablement(_)),
+            "got: {error}"
+        );
+    }
+
+    /// `watched()`/`watch()` on a single-primary registry: the primary is the
+    /// sole watched chain and lookups by other ids miss.
+    #[test]
+    fn watched_iterates_the_primary_when_no_secondary_exists() {
+        let configs = BTreeMap::from([(Chain::Base, chain_config(Some(trading_config_toml())))]);
+        let registry = ChainRegistry::new(&configs, secrets_for(&[Chain::Base])).unwrap();
+
+        let watched: Vec<Chain> = registry.watched().map(|chain| chain.chain).collect();
+        assert_eq!(watched, vec![Chain::Base]);
+        assert_eq!(
+            registry.watch(Chain::Base).map(|chain| chain.chain),
+            Some(Chain::Base)
+        );
+        assert_eq!(
+            registry.watch(Chain::Ethereum).map(|chain| chain.chain),
+            None
+        );
+    }
+
+    /// Two primary claimants are a config contradiction, refused with the
+    /// full claimant list.
+    #[test]
+    fn registry_rejects_two_primary_claimants() {
         let configs = BTreeMap::from([
             (Chain::Base, chain_config(Some(trading_config_toml()))),
             (Chain::Ethereum, chain_config(Some(trading_config_toml()))),
@@ -980,8 +1230,28 @@ mod tests {
         assert!(
             matches!(
                 error,
-                ChainRegistryError::MultipleTradingChains { ref chains }
+                ChainRegistryError::MultiplePrimaryChains { ref chains }
                     if chains == &vec![Chain::Base, Chain::Ethereum]
+            ),
+            "got: {error}"
+        );
+    }
+
+    /// Watched chains with no primary claimant fail with a named error: the
+    /// bot cannot guess where trading and the cash vaults live.
+    #[test]
+    fn registry_rejects_watched_chains_with_no_primary() {
+        let configs = BTreeMap::from([(
+            Chain::Base,
+            chain_config(Some(primary_trading_config_toml(false))),
+        )]);
+
+        let error = ChainRegistry::new(&configs, secrets_for(&[Chain::Base])).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                ChainRegistryError::NoPrimaryChain { ref chains } if chains == &vec![Chain::Base]
             ),
             "got: {error}"
         );
@@ -1035,7 +1305,7 @@ mod tests {
         let registry =
             ChainRegistry::new(&configs, secrets_for(&[Chain::Base, Chain::Ethereum])).unwrap();
 
-        assert_eq!(registry.sole_trading().chain, Chain::Base);
+        assert_eq!(registry.primary().chain, Chain::Base);
         assert_eq!(
             registry.rpc_url(Chain::Base),
             Some(&rpc_url_for(Chain::Base)),
@@ -1081,7 +1351,7 @@ mod tests {
             ChainRegistry::new(&configs, secrets_for(&[Chain::Base, Chain::Ethereum])).unwrap();
 
         assert_eq!(
-            registry.sole_trading().required_confirmations,
+            registry.primary().required_confirmations,
             3,
             "the trading chain's depth comes from its outer chain entry"
         );
@@ -1107,6 +1377,8 @@ mod tests {
              vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
              ingestion_cutoff = \"safe\"\n\
+             order_fill_poll_interval_secs = 7\n\
+             primary = true\n\
              redemption_wallet = \"0x4444444444444444444444444444444444444444\"\n\
              [assets.equities.COIN]\n\
              tokenized_equity = \"0x6666666666666666666666666666666666666666\"\n\
@@ -1164,7 +1436,9 @@ mod tests {
              inventory_adapters = []\n\
              vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
-             ingestion_cutoff = \"safe\"",
+             ingestion_cutoff = \"safe\"\n\
+             order_fill_poll_interval_secs = 1\n\
+             primary = true",
         )
         .unwrap();
 
@@ -1186,7 +1460,9 @@ mod tests {
              inventory = \"0x2222222222222222222222222222222222222222\"\n\
              vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
-             ingestion_cutoff = \"safe\"",
+             ingestion_cutoff = \"safe\"\n\
+             order_fill_poll_interval_secs = 1\n\
+             primary = true",
         )
         .unwrap();
 
@@ -1209,7 +1485,9 @@ mod tests {
              inventory_adapters = []\n\
              vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
              deployment_block = 1\n\
-             ingestion_cutoff = \"safe\"",
+             ingestion_cutoff = \"safe\"\n\
+             order_fill_poll_interval_secs = 1\n\
+             primary = true",
         )
         .unwrap();
 
@@ -1227,7 +1505,7 @@ mod tests {
     fn ingestion_cutoff_deserializes_finalized() {
         let wrapper: CutoffWrapper = toml::from_str("ingestion_cutoff = \"finalized\"").unwrap();
 
-        assert_eq!(wrapper.ingestion_cutoff, IngestionCutoff::Finalized);
+        assert_eq!(wrapper.ingestion_cutoff, IngestionCutoffTag::Finalized);
     }
 
     #[test]

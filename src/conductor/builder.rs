@@ -168,18 +168,14 @@ struct ConfiguredInventoryVaults {
 /// snapshot-mark repair so the two cannot drift on what "configured" means.
 pub fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
     ctx.chains
-        .sole_trading()
+        .primary()
         .assets
         .equities
         .symbols
         .keys()
         .filter(|symbol| {
-            ctx.chains.sole_trading().assets.is_trading_enabled(symbol)
-                || ctx
-                    .chains
-                    .sole_trading()
-                    .assets
-                    .is_rebalancing_enabled(symbol)
+            ctx.chains.primary().assets.is_trading_enabled(symbol)
+                || ctx.chains.primary().assets.is_rebalancing_enabled(symbol)
         })
         .cloned()
         .collect()
@@ -189,7 +185,7 @@ fn configured_inventory_vaults(ctx: &Ctx) -> ConfiguredInventoryVaults {
     let equity_symbols = configured_equity_symbols(ctx);
 
     let mut equity_vaults: BTreeMap<Address, BTreeSet<B256>> = BTreeMap::new();
-    for equity_config in ctx.chains.sole_trading().assets.equities.symbols.values() {
+    for equity_config in ctx.chains.primary().assets.equities.symbols.values() {
         equity_vaults
             .entry(equity_config.tokenized_equity_derivative)
             .or_default()
@@ -198,7 +194,7 @@ fn configured_inventory_vaults(ctx: &Ctx) -> ConfiguredInventoryVaults {
 
     let usdc_vaults = ctx
         .chains
-        .sole_trading()
+        .primary()
         .assets
         .cash
         .as_ref()
@@ -269,7 +265,7 @@ where
     let evm = ReadOnlyEvm::new(context.provider.clone());
     let raindex_service = Arc::new(RaindexService::new(
         evm,
-        crate::onchain::raindex_contracts(context.ctx.chains.sole_trading()),
+        crate::onchain::raindex_contracts(context.ctx.chains.primary()),
         order_owner,
     ));
 
@@ -282,7 +278,7 @@ where
         .map_or(Usd::ZERO, Positive::inner);
 
     let snapshot_id = InventorySnapshotId {
-        orderbook: context.ctx.chains.sole_trading().orderbook,
+        orderbook: context.ctx.chains.primary().orderbook,
         owner: order_owner,
     };
 
@@ -311,7 +307,7 @@ where
         raindex_service,
         context.executor.clone(),
         context.frameworks.vault_registry.clone(),
-        context.ctx.chains.sole_trading().chain,
+        context.ctx.chains.primary().chain,
         snapshot_id,
         context.ctx.vault_owner(),
         context.frameworks.snapshot,
@@ -462,13 +458,13 @@ where
     });
 
     let portfolio_snapshot_ctx = Arc::new(PortfolioSnapshotCtx {
-        trading_chain: context.ctx.chains.sole_trading().chain,
+        trading_chain: context.ctx.chains.primary().chain,
         inventory: context.inventory.clone(),
         position_projection: context.frameworks.position_projection.clone(),
         portfolio_snapshot: context.frameworks.portfolio_snapshot.clone(),
         wrapper: context.wrapper.clone(),
         configured_equity_symbols,
-        usdc_tracking_enabled: context.ctx.chains.sole_trading().assets.cash.is_some(),
+        usdc_tracking_enabled: context.ctx.chains.primary().assets.cash.is_some(),
         wallet_polling_enabled,
         poll_freshness,
         notifier,
@@ -483,7 +479,7 @@ where
         offchain_order: context.frameworks.offchain_order,
         order_placer,
         execution_threshold: context.execution_threshold,
-        assets: context.ctx.chains.sole_trading().assets.clone(),
+        assets: context.ctx.chains.primary().assets.clone(),
         hedging: context.ctx.assets.clone(),
         counter_trade_submission_lock,
         close_flatten_policy,
@@ -496,7 +492,7 @@ where
     let maintenance_interval = context.executor.maintenance_interval();
 
     let accountant_ctx = Arc::new(AccountantCtx {
-        contracts: crate::onchain::raindex_contracts(context.ctx.chains.sole_trading()),
+        contracts: crate::onchain::raindex_contracts(context.ctx.chains.primary()),
         ctx: context.ctx.clone(),
         cache: context.cache,
         evm: ReadOnlyEvm::new(context.provider.clone()),
@@ -520,11 +516,11 @@ where
     } = context.supervisor_startup;
 
     let order_fill_monitor = OrderFillMonitor::new(
-        context.ctx.chains.sole_trading().clone(),
+        context.ctx.chains.primary().clone(),
         backfill_queue.clone(),
         context.pool,
         context.provider,
-        std::time::Duration::from_secs(context.ctx.order_fill_poll_interval),
+        context.ctx.chains.primary().order_fill_poll_interval,
     );
 
     // Fail-fast: exit if any supervised task dies, relying on systemd restart for recovery.
@@ -1535,7 +1531,7 @@ mod tests {
         // inventory vault discovery: a symbol with both switches off must not
         // count, and either switch alone must.
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.chains.sole_trading_mut().assets = ChainAssets {
+        ctx.chains.primary_mut().assets = ChainAssets {
             equities: ChainEquities {
                 operational_limit: None,
                 symbols: HashMap::from([

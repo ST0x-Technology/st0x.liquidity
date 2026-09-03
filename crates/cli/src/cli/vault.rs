@@ -75,18 +75,14 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
     writeln!(
         stdout,
         "   Inventory: {}",
-        ctx.chains.sole_trading().inventory_address()
+        ctx.chains.primary().inventory_address()
     )?;
-    writeln!(
-        stdout,
-        "   Orderbook: {}",
-        ctx.chains.sole_trading().orderbook
-    )?;
+    writeln!(stdout, "   Orderbook: {}", ctx.chains.primary().orderbook)?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
     let raindex_service = RaindexService::new(
         wallet_ctx.base_wallet().clone(),
-        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.sole_trading()),
+        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.primary()),
         sender_address,
     );
 
@@ -137,18 +133,14 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
     writeln!(
         stdout,
         "   Inventory: {}",
-        ctx.chains.sole_trading().inventory_address()
+        ctx.chains.primary().inventory_address()
     )?;
-    writeln!(
-        stdout,
-        "   Orderbook: {}",
-        ctx.chains.sole_trading().orderbook
-    )?;
+    writeln!(stdout, "   Orderbook: {}", ctx.chains.primary().orderbook)?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
     let raindex_service = RaindexService::new(
         wallet_ctx.base_wallet().clone(),
-        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.sole_trading()),
+        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.primary()),
         sender_address,
     );
 
@@ -175,17 +167,11 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
 ) -> anyhow::Result<()> {
     ctx.wallet()?;
 
-    let cash = ctx
-        .chains
-        .sole_trading()
-        .assets
-        .cash
-        .as_ref()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
-            )
-        })?;
+    let cash = ctx.chains.primary().assets.cash.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+        )
+    })?;
 
     let vault_id = cash.vault_ids.first().copied().ok_or_else(|| {
         anyhow::anyhow!(
@@ -259,7 +245,6 @@ mod tests {
             inventory_poll_interval: 60,
             inventory_divergence_threshold: std::num::NonZeroU32::MIN,
             hedge_order_gate_reconciliation_timeout_secs: std::num::NonZeroU64::MIN,
-            order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: std::num::NonZeroU64::new(300),
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
@@ -315,7 +300,6 @@ mod tests {
             inventory_poll_interval: 60,
             inventory_divergence_threshold: std::num::NonZeroU32::MIN,
             hedge_order_gate_reconciliation_timeout_secs: std::num::NonZeroU64::MIN,
-            order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: std::num::NonZeroU64::new(300),
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,

@@ -136,17 +136,17 @@ async fn build_equity_transfer_services(
 
     let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
         base_caller.clone(),
-        to_wrapped_equities(&ctx.chains.sole_trading().assets.equities.symbols),
+        to_wrapped_equities(&ctx.chains.primary().assets.equities.symbols),
     ));
 
     let vault_lookup: Arc<dyn VaultLookup> = Arc::new(VaultRegistryLookup::new(
         vault_registry_projection,
-        VaultRegistryId::new(ctx.chains.sole_trading().orderbook, ctx.vault_owner()),
+        VaultRegistryId::new(ctx.chains.primary().orderbook, ctx.vault_owner()),
     ));
 
     let raindex = Arc::new(RaindexService::new(
         base_caller,
-        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.sole_trading()),
+        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.primary()),
         wallet,
     ));
 
@@ -532,17 +532,11 @@ async fn run_usdc_transfer<Writer: Write>(
 
     let wallet_ctx = ctx.wallet()?;
 
-    let cash = ctx
-        .chains
-        .sole_trading()
-        .assets
-        .cash
-        .as_ref()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
-            )
-        })?;
+    let cash = ctx.chains.primary().assets.cash.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+        )
+    })?;
 
     let usdc_vault_id = cash.vault_ids.first().copied().ok_or_else(|| {
         anyhow::anyhow!(
@@ -605,7 +599,7 @@ async fn run_usdc_transfer<Writer: Write>(
 
     let vault_service = Arc::new(RaindexService::new(
         wallet_ctx.base_wallet().clone(),
-        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.sole_trading()),
+        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.primary()),
         owner,
     ));
 
@@ -622,7 +616,7 @@ async fn run_usdc_transfer<Writer: Write>(
         RaindexVaultId(usdc_vault_id),
         &UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
-            required_confirmations: ctx.chains.sole_trading().required_confirmations,
+            required_confirmations: ctx.chains.primary().required_confirmations,
             reserved_cash: ctx
                 .assets
                 .cash
@@ -1145,7 +1139,7 @@ fn resolve_tokenization_token(
     match network {
         TokenizationNetwork::Base => ctx
             .chains
-            .sole_trading()
+            .primary()
             .assets
             .tokenized_equity(symbol)
             .ok_or_else(|| {
@@ -2157,7 +2151,6 @@ mod tests {
             inventory_poll_interval: 60,
             inventory_divergence_threshold: std::num::NonZeroU32::MIN,
             hedge_order_gate_reconciliation_timeout_secs: std::num::NonZeroU64::MIN,
-            order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: std::num::NonZeroU64::new(300),
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
@@ -2241,7 +2234,6 @@ mod tests {
             inventory_poll_interval: 60,
             inventory_divergence_threshold: std::num::NonZeroU32::MIN,
             hedge_order_gate_reconciliation_timeout_secs: std::num::NonZeroU64::MIN,
-            order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: std::num::NonZeroU64::new(300),
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
@@ -2548,7 +2540,7 @@ mod tests {
     #[tokio::test]
     async fn test_transfer_usdc_requires_wallet_config() {
         let mut ctx = create_alpaca_ctx_without_rebalancing();
-        ctx.chains.sole_trading_mut().assets.cash = Some(ChainCashAsset {
+        ctx.chains.primary_mut().assets.cash = Some(ChainCashAsset {
             vault_ids: vec![b256!(
                 "0x00000000000000000000000000000000000000000000000000000000000000ab"
             )],
@@ -3861,27 +3853,22 @@ mod tests {
     fn tokenized_equity_resolves_from_config() {
         let mut ctx = create_ctx_without_rebalancing();
         let token = address!("0x626757e6f50675d17fcad312e82f989ae7a23d38");
-        ctx.chains
-            .sole_trading_mut()
-            .assets
-            .equities
-            .symbols
-            .insert(
-                Symbol::new("COIN").unwrap(),
-                ChainEquityAsset {
-                    tokenized_equity: token,
-                    tokenized_equity_derivative: Address::ZERO,
-                    vault_ids: Vec::new(),
-                    trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Disabled,
-                    wrapped_equity_recovery: OperationMode::Disabled,
-                    operational_limit: None,
-                },
-            );
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            Symbol::new("COIN").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: token,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
 
         assert_eq!(
             ctx.chains
-                .sole_trading()
+                .primary()
                 .assets
                 .tokenized_equity(&Symbol::new("COIN").unwrap()),
             Some(token),
@@ -3889,7 +3876,7 @@ mod tests {
         );
         assert_eq!(
             ctx.chains
-                .sole_trading()
+                .primary()
                 .assets
                 .tokenized_equity(&Symbol::new("AAPL").unwrap()),
             None,

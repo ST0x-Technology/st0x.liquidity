@@ -1945,7 +1945,7 @@ async fn run_provider_command<W: Write + Send>(
     stdout: &mut W,
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
-    let provider = ProviderBuilder::new().connect_http(ctx.chains.sole_trading().rpc_url.clone());
+    let provider = ProviderBuilder::new().connect_http(ctx.chains.primary().rpc_url.clone());
 
     match command {
         ProviderCommand::ProcessTx { tx_hash } => {
@@ -2089,7 +2089,6 @@ mod tests {
             inventory_poll_interval: 60,
             inventory_divergence_threshold: std::num::NonZeroU32::MIN,
             hedge_order_gate_reconciliation_timeout_secs: std::num::NonZeroU64::MIN,
-            order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: std::num::NonZeroU64::new(300),
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
@@ -3973,6 +3972,8 @@ mod tests {
                 vault_owner = "0x3333333333333333333333333333333333333333"
                 deployment_block = 1
                 ingestion_cutoff = "safe"
+                order_fill_poll_interval_secs = 1
+                primary = true
 
                 [chains.ethereum]
                 lifecycle = "active"
@@ -4033,17 +4034,14 @@ mod tests {
 
         assert!(matches!(command, Commands::Buy { .. }));
         assert_eq!(ctx.database_url, ":memory:");
-        assert_eq!(ctx.chains.sole_trading().required_confirmations, 3);
+        assert_eq!(ctx.chains.primary().required_confirmations, 3);
         assert_eq!(
-            ctx.chains.sole_trading().inventory,
+            ctx.chains.primary().inventory,
             InventoryMode::Managed {
                 inventory: address!("0x2222222222222222222222222222222222222222"),
             },
         );
-        assert_eq!(
-            ctx.chains.sole_trading().ingestion_cutoff,
-            IngestionCutoff::Safe
-        );
+        assert_eq!(ctx.chains.primary().ingestion_cutoff, IngestionCutoff::Safe);
         assert!(matches!(ctx.broker, BrokerCtx::DryRun));
     }
 }

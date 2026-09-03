@@ -280,13 +280,37 @@ enum PollOutcome {
 /// any cutoff < checkpoint is a meaningful regression worth a warning.
 const SAFE_CUTOFF_QUIET_SKEW: u64 = 32;
 
-/// Converts the configured ingestion cutoff to the alloy `BlockNumberOrTag`
-/// used in RPC calls. Factored out so adding a new `IngestionCutoff` variant
-/// produces a single compile error rather than two.
-fn cutoff_block_tag(cutoff: IngestionCutoff) -> BlockNumberOrTag {
-    match cutoff {
+/// Resolves the configured ingestion cutoff to a block number, given the
+/// chain tip this tick already fetched. Tag-based cutoffs cost one RPC read
+/// (only the node knows which block is safe/finalized); `Confirmations` is
+/// pure arithmetic on the tip, so tip and cutoff always come from the same
+/// node's view. `None` means the cutoff is not yet available (tag not
+/// exposed, or a chain younger than the confirmation depth): callers reuse
+/// the existing no-cutoff branches. Factored out so a new [`IngestionCutoff`]
+/// variant produces a single compile error rather than several.
+async fn resolve_cutoff_block<P: Provider>(
+    provider: &P,
+    cutoff: IngestionCutoff,
+    chain_tip: u64,
+) -> Result<Option<u64>, RpcError<TransportErrorKind>> {
+    let tag = match cutoff {
         IngestionCutoff::Safe => BlockNumberOrTag::Safe,
         IngestionCutoff::Finalized => BlockNumberOrTag::Finalized,
+        IngestionCutoff::Confirmations(depth) => return Ok(chain_tip.checked_sub(depth)),
+    };
+
+    latest_cutoff_block(provider, tag).await
+}
+
+/// The quiet-skew tolerance for a backwards-moving cutoff, per cutoff mode.
+/// `None` disables the quiet band (any regression pauses ingestion with a
+/// warning). For `Confirmations(depth)` the band is capped at the depth: a
+/// regression deeper than the safety margin is never quietly skipped.
+fn cutoff_quiet_skew(cutoff: IngestionCutoff) -> Option<u64> {
+    match cutoff {
+        IngestionCutoff::Safe => Some(SAFE_CUTOFF_QUIET_SKEW),
+        IngestionCutoff::Finalized => None,
+        IngestionCutoff::Confirmations(depth) => Some(SAFE_CUTOFF_QUIET_SKEW.min(depth)),
     }
 }
 
@@ -298,15 +322,14 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
         &mut self,
         sampled_at: DateTime<Utc>,
     ) -> Result<PollOutcome, OrderFillMonitorError> {
-        let cutoff_tag = cutoff_block_tag(self.evm_ctx.ingestion_cutoff);
-
         // Read the chain tip and latest cutoff block up front, before the
         // overlap guard, so the block-lag sample is recorded even while a
         // backfill is still in flight -- a long catch-up (or a stuck backfill)
         // is exactly when growing lag must stay observable. The cutoff block
         // read here is also the ingestion boundary used below.
         let chain_tip = self.provider.get_block_number().await?;
-        let cutoff_opt = latest_cutoff_block(&self.provider, cutoff_tag).await?;
+        let cutoff_opt =
+            resolve_cutoff_block(&self.provider, self.evm_ctx.ingestion_cutoff, chain_tip).await?;
 
         // Block-lag telemetry is best-effort: a failed sample must never fail
         // the poll. Lag is measured against the cutoff block -- the real
@@ -423,12 +446,9 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
             // via the shared warn! below and pause ingestion.
             Some(checkpoint) if checkpoint > cutoff_block => {
                 let regression = checkpoint - cutoff_block;
-                let is_safe = match self.evm_ctx.ingestion_cutoff {
-                    IngestionCutoff::Safe => true,
-                    IngestionCutoff::Finalized => false,
-                };
+                let quiet_band = cutoff_quiet_skew(self.evm_ctx.ingestion_cutoff);
 
-                if is_safe && regression <= SAFE_CUTOFF_QUIET_SKEW {
+                if quiet_band.is_some_and(|band| regression <= band) {
                     // Safe cutoff stepped backwards within the quiet-skew
                     // window. May be benign cross-backend RPC skew or a small
                     // reorg. Ingestion skips this tick; the regressed range is
@@ -560,9 +580,7 @@ pub(crate) async fn probe_cutoff_block_support<P: Provider>(
     chain_tip: u64,
     cutoff: IngestionCutoff,
 ) -> Result<CutoffProbe, CutoffProbeError> {
-    let tag = cutoff_block_tag(cutoff);
-
-    let Some(cutoff_block) = latest_cutoff_block(provider, tag).await? else {
+    let Some(cutoff_block) = resolve_cutoff_block(provider, cutoff, chain_tip).await? else {
         warn!(
             target: "orderbook",
             %cutoff,
@@ -578,7 +596,9 @@ pub(crate) async fn probe_cutoff_block_support<P: Provider>(
     // legitimately reach or slightly exceed the tip (fast sequencer batching),
     // so this check would false-positive on startup.
     let check_aliasing = match cutoff {
-        IngestionCutoff::Safe => false,
+        // Safe can legitimately reach the tip; Confirmations is derived from
+        // the tip by construction, so there is nothing to alias.
+        IngestionCutoff::Safe | IngestionCutoff::Confirmations(_) => false,
         IngestionCutoff::Finalized => true,
     };
     if check_aliasing && cutoff_block >= chain_tip {
@@ -1542,6 +1562,66 @@ mod tests {
             ),
             i64::MAX.unsigned_abs()
         );
+    }
+
+    #[tokio::test]
+    async fn confirmations_cutoff_is_tip_minus_depth_with_no_rpc_read() {
+        // The empty Asserter proves no RPC call is made: any request would
+        // panic on a missing queued response.
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let cutoff = resolve_cutoff_block(&provider, IngestionCutoff::Confirmations(12), 100)
+            .await
+            .unwrap();
+
+        assert_eq!(cutoff, Some(88));
+    }
+
+    #[tokio::test]
+    async fn confirmations_cutoff_on_a_young_chain_is_not_yet_available() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let cutoff = resolve_cutoff_block(&provider, IngestionCutoff::Confirmations(12), 7)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cutoff, None,
+            "tip below the depth must reuse the no-cutoff branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_a_confirmations_cutoff_without_reading_a_tag() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let probe = probe_cutoff_block_support(&provider, 110, IngestionCutoff::Confirmations(12))
+            .await
+            .unwrap();
+
+        assert_eq!(probe, CutoffProbe::Supported);
+    }
+
+    /// The quiet band never exceeds the confirmation depth: a regression
+    /// deeper than the safety margin must not be silently skipped.
+    #[test]
+    fn confirmations_quiet_band_is_capped_at_the_depth() {
+        assert_eq!(
+            cutoff_quiet_skew(IngestionCutoff::Confirmations(12)),
+            Some(12)
+        );
+        assert_eq!(
+            cutoff_quiet_skew(IngestionCutoff::Confirmations(100)),
+            Some(SAFE_CUTOFF_QUIET_SKEW)
+        );
+        assert_eq!(
+            cutoff_quiet_skew(IngestionCutoff::Safe),
+            Some(SAFE_CUTOFF_QUIET_SKEW)
+        );
+        assert_eq!(cutoff_quiet_skew(IngestionCutoff::Finalized), None);
     }
 
     #[tokio::test]

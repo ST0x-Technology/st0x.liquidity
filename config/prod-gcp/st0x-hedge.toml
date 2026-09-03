@@ -219,6 +219,12 @@ deployment_block = 49746968
 # Use the OP-Stack safe block as the fill-ingestion cutoff. This cuts hedging
 # lag from ~20 min (finalized) to ~seconds. See example.config.toml for tradeoffs.
 ingestion_cutoff = "safe"
+# Seconds between fill-watch poll cycles on this chain (required; was the
+# global order_fill_poll_interval with a hidden default of 5).
+order_fill_poll_interval_secs = 5
+# Exactly one watched chain is the primary: trading, rebalancing triggers,
+# and the cash vaults live here.
+primary = true
 # Alpaca's issuer wallet on this chain -- ERC-20 transfers for redemption go
 # here. Per chain: a redemption delivers tokens that exist on one chain, so
 # sending them to another chain's issuer address would burn them.

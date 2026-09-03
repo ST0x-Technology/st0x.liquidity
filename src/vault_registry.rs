@@ -575,13 +575,9 @@ impl SeedVaultRegistryCtx {
         vault_registry: Arc<Store<VaultRegistry>>,
         ctx: &Ctx,
     ) -> Result<Self, Box<CtxError>> {
-        for (symbol, equity_config) in &ctx.chains.sole_trading().assets.equities.symbols {
+        for (symbol, equity_config) in &ctx.chains.primary().assets.equities.symbols {
             if equity_config.vault_ids.is_empty()
-                && ctx
-                    .chains
-                    .sole_trading()
-                    .assets
-                    .is_rebalancing_enabled(symbol)
+                && ctx.chains.primary().assets.is_rebalancing_enabled(symbol)
             {
                 return Err(Box::new(CtxError::MissingEquityVaultId {
                     symbol: symbol.clone(),
@@ -590,13 +586,13 @@ impl SeedVaultRegistryCtx {
         }
 
         let id = VaultRegistryId {
-            orderbook: ctx.chains.sole_trading().orderbook,
+            orderbook: ctx.chains.primary().orderbook,
             owner: ctx.vault_owner(),
         };
 
         let equity_seeds = ctx
             .chains
-            .sole_trading()
+            .primary()
             .assets
             .equities
             .symbols
@@ -615,7 +611,7 @@ impl SeedVaultRegistryCtx {
 
         let equity_primary_seeds = ctx
             .chains
-            .sole_trading()
+            .primary()
             .assets
             .equities
             .symbols
@@ -635,7 +631,7 @@ impl SeedVaultRegistryCtx {
 
         let usdc_vault_ids = ctx
             .chains
-            .sole_trading()
+            .primary()
             .assets
             .cash
             .as_ref()
@@ -644,7 +640,7 @@ impl SeedVaultRegistryCtx {
 
         let usdc_primary_vault_id = ctx
             .chains
-            .sole_trading()
+            .primary()
             .assets
             .cash
             .as_ref()
@@ -1545,7 +1541,7 @@ mod tests {
         );
 
         let mut ctx = create_test_ctx_with_order_owner(TEST_OWNER);
-        ctx.chains.sole_trading_mut().assets = ChainAssets {
+        ctx.chains.primary_mut().assets = ChainAssets {
             equities: ChainEquities {
                 operational_limit: None,
                 symbols,
@@ -1610,7 +1606,7 @@ mod tests {
         );
 
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.chains.sole_trading_mut().assets = ChainAssets {
+        ctx.chains.primary_mut().assets = ChainAssets {
             equities: ChainEquities {
                 operational_limit: None,
                 symbols,
@@ -1668,7 +1664,7 @@ mod tests {
         let mut updated_ctx = ctx_with_seeded_assets();
         updated_ctx
             .chains
-            .sole_trading_mut()
+            .primary_mut()
             .assets
             .equities
             .symbols
@@ -1706,7 +1702,7 @@ mod tests {
         let mut updated_ctx = ctx_with_seeded_assets();
         updated_ctx
             .chains
-            .sole_trading_mut()
+            .primary_mut()
             .assets
             .cash
             .as_mut()

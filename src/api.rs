@@ -1712,14 +1712,10 @@ async fn performance_infra(
     // than paying both round-trips in series.
     let (monitor, dependencies) = tokio::try_join!(
         async {
-            load_monitor_telemetry(
-                &state.pool,
-                &range,
-                state.ctx.chains.sole_trading().orderbook,
-            )
-            .await
-            .inspect_err(|error| error!(%error, "Failed to load monitor telemetry"))
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+            load_monitor_telemetry(&state.pool, &range, state.ctx.chains.primary().orderbook)
+                .await
+                .inspect_err(|error| error!(%error, "Failed to load monitor telemetry"))
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
         },
         async {
             load_dependency_stats(&state.pool, &range)
@@ -1985,7 +1981,7 @@ mod tests {
                 sender,
             )),
             equity_prices: crate::dashboard::equity_price::EquityPriceStore::new(
-                &ctx.chains.sole_trading().assets,
+                &ctx.chains.primary().assets,
             ),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
@@ -3508,7 +3504,7 @@ mod tests {
     #[tokio::test]
     async fn performance_infra_reports_seeded_telemetry() {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let orderbook = ctx.chains.sole_trading().orderbook;
+        let orderbook = ctx.chains.primary().orderbook;
         let state = empty_app_state(ctx).await;
         let now = chrono::Utc::now();
 
