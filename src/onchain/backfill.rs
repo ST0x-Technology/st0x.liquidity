@@ -920,6 +920,37 @@ mod tests {
         );
     }
 
+    /// A rolled-back (pre-per-chain) binary upserts without a chain column,
+    /// resolving on the orderbook alone. The shadow index only buys a rollback
+    /// window if that exact statement still lands on the Base row.
+    #[tokio::test]
+    async fn pre_per_chain_upsert_still_advances_the_base_checkpoint() {
+        let pool = setup_test_db().await;
+        let base = TradingChain::test().deployment_block(1).call();
+        save_backfill_checkpoint(&pool, &base, 100).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO backfill_checkpoints (orderbook, last_processed_block) \
+             VALUES (?, ?) \
+             ON CONFLICT(orderbook) DO UPDATE SET \
+             last_processed_block = MAX( \
+                 excluded.last_processed_block, \
+                 backfill_checkpoints.last_processed_block \
+             ), \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        )
+        .bind(base.orderbook.to_string())
+        .bind(250_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &base).await.unwrap(),
+            Some(250)
+        );
+    }
+
     /// Rows enqueued by a pre-per-chain binary carry the bare type name as
     /// their job_type; startup adopts them into Base's namespaced queue so
     /// they are neither stranded nor retention-deleted.
