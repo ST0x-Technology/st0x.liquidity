@@ -877,6 +877,12 @@ placement:
   `hedge_reference_to_fill_slippage_bps{symbol,session}` records the
   reference-to-fill distance when the fill completes. Market orders and orders
   that predate the persisted reference record no distance samples.
+- `position_exposure_age_seconds{symbol}` is a gauge with the age of the
+  symbol's oldest onchain fill that no hedge placement covers yet. Every
+  position scan refreshes it for every known symbol, including symbols with
+  trading disabled. The value is 0 when every fill is hedged or in flight. The
+  gauge reads the same uncovered-fill replay as the performance report's
+  open-exposure pool, so the two views always agree.
 - `close_flatten_outcomes_total{symbol,direction,outcome}` records terminal
   broker-state dispatches for close-flatten placements, with `outcome` equal to
   `filled`, `cancelled`, or `failed`. Evaluate attempt fill rate per

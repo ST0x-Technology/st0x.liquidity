@@ -100,6 +100,13 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
          reference (market orders, legacy orders) record nothing"
     );
     metrics::describe_gauge!(
+        "position_exposure_age_seconds",
+        metrics::Unit::Seconds,
+        "Age of the symbol's oldest onchain fill that no hedge placement covers yet, \
+         refreshed by every position scan; 0 when everything is hedged or in flight. \
+         Same replay as the performance report's open-exposure pool"
+    );
+    metrics::describe_gauge!(
         "asset_sync_last_success_timestamp",
         "Unix timestamp of the last asset-eligibility sync run that refreshed every \
          configured symbol; a partial or failed run leaves it unchanged"

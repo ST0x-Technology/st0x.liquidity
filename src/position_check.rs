@@ -12,7 +12,7 @@ use std::time::Duration;
 use apalis::prelude::Status;
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
-use metrics::counter;
+use metrics::{counter, gauge};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
@@ -37,6 +37,7 @@ use crate::offchain::order::{
     recover_submitted_offchain_orders, session_metric_label, terminal_position_finalization,
 };
 use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
+use crate::performance::oldest_unhedged_fill_timestamp;
 use crate::position::{Position, PositionError};
 use crate::trading::offchain::close_flatten::{
     CloseFlattenCrossRamp, CloseFlattenPolicy, CloseFlattenWindow, preflight_skip_reason_label,
@@ -194,6 +195,40 @@ pub(crate) fn record_scan_skip(
         )
         .increment(1);
     }
+}
+
+/// Refreshes the `position_exposure_age_seconds` gauge for one symbol from
+/// the hedge-latency read model: the age of the oldest fill no hedge
+/// placement covers yet, and 0 once everything is hedged or in flight, so a
+/// cleared symbol never shows a stale age. A read-model failure logs and
+/// leaves the gauge untouched rather than faking a value.
+async fn record_exposure_age(pool: &SqlitePool, symbol: &Symbol, now: DateTime<Utc>) {
+    let oldest = match oldest_unhedged_fill_timestamp(pool, symbol).await {
+        Ok(oldest) => oldest,
+        Err(error) => {
+            warn!(
+                %symbol, %error,
+                "position_exposure_age_seconds gauge skipped: could not replay \
+                 the uncovered-fill pool"
+            );
+            return;
+        }
+    };
+
+    // Same skew clamp as the fill-latency sample: a fill stamped ahead of
+    // our clock is age zero, never a negative or wrapped value.
+    let age_seconds = oldest.map_or(0.0, |oldest| {
+        (now - oldest)
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_secs_f64()
+    });
+
+    gauge!(
+        "position_exposure_age_seconds",
+        "symbol" => symbol.to_string()
+    )
+    .set(age_seconds);
 }
 
 fn should_page_reference_price_failure(
@@ -409,6 +444,13 @@ where
 
         let all_positions = self.position_projection.load_all().await?;
         let active_transfers = symbols_with_active_transfers(&self.pool).await?;
+
+        // Every known symbol, not just trading-enabled ones: exposure on a
+        // disabled symbol never clears through the scan, which is exactly
+        // when the operator needs the age to keep climbing.
+        for (symbol, _) in &all_positions {
+            record_exposure_age(&self.pool, symbol, Utc::now()).await;
+        }
 
         let eligible: Vec<Symbol> = all_positions
             .iter()
@@ -5880,6 +5922,85 @@ mod tests {
                 }
             ),
             "with extended hours disabled the cancel pass must not touch the order, got: {order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_records_exposure_age_for_an_unhedged_fill() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
+        let (ctx, position) =
+            build_ctx(pool.clone(), apalis_pool, cfg, Duration::from_secs(60)).await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        // An uncovered fill 300 seconds old, straight into the reactor's
+        // durable table -- the read-model replay is what the gauge consumes.
+        let landed_at = (chrono::Utc::now() - chrono::Duration::seconds(300)).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO hedge_fill (symbol, tx_hash, log_index, block_timestamp, seen_at) \
+             VALUES (?, ?, 1, ?, ?)",
+        )
+        .bind("AAPL")
+        .bind("0xexposure")
+        .bind(&landed_at)
+        .bind(&landed_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let rendered = metrics_handle.render();
+        let sample = rendered
+            .lines()
+            .find(|line| line.starts_with("position_exposure_age_seconds{symbol=\"AAPL\"}"))
+            .unwrap_or_else(|| panic!("no exposure-age series for AAPL in:\n{rendered}"));
+        let (_, value) = sample.rsplit_once(' ').expect("malformed sample line");
+        let age: f64 = value.parse().expect("gauge must be a float");
+        assert!(
+            (250.0..400.0).contains(&age),
+            "the gauge must carry the uncovered fill's ~300s age, got {age} in:\n{rendered}"
+        );
+    }
+
+    #[allow(clippy::float_cmp)]
+    #[tokio::test]
+    async fn scan_resets_exposure_age_to_zero_when_nothing_is_uncovered() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
+        let (ctx, position) = build_ctx(pool, apalis_pool, cfg, Duration::from_secs(60)).await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let rendered = metrics_handle.render();
+        let sample = rendered
+            .lines()
+            .find(|line| line.starts_with("position_exposure_age_seconds{symbol=\"AAPL\"}"))
+            .unwrap_or_else(|| panic!("no exposure-age series for AAPL in:\n{rendered}"));
+        let (_, value) = sample.rsplit_once(' ').expect("malformed sample line");
+        let age: f64 = value.parse().expect("gauge must be a float");
+        assert_eq!(
+            age, 0.0,
+            "a symbol with no uncovered fills must read 0, in:\n{rendered}"
         );
     }
 

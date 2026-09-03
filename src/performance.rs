@@ -378,6 +378,22 @@ fn parse_uncovered_fill(
     })
 }
 
+/// The instant the symbol's oldest currently-unhedged fill landed onchain,
+/// `None` when every fill is hedged or covered by an in-flight placement.
+///
+/// The `CheckPositions` scan's exposure-age gauge reads this. It is the same
+/// replay the performance report's open-exposure pool uses
+/// ([`report::OpenExposure`]), so the gauge and the `/performance/latencies`
+/// view can never disagree about when exposure appeared.
+pub(crate) async fn oldest_unhedged_fill_timestamp(
+    pool: &SqlitePool,
+    symbol: &Symbol,
+) -> Result<Option<DateTime<Utc>>, PerformanceError> {
+    let uncovered = uncovered_fills(pool, symbol).await?;
+
+    Ok(uncovered.into_iter().map(|fill| fill.block_timestamp).min())
+}
+
 /// Computes the current uncovered fill set for a symbol PURELY from the durable,
 /// append-only tables `hedge_fill`, `hedge_cycle`, and `hedge_attribution_reset`.
 ///
