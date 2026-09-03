@@ -1,0 +1,11 @@
+-- Why a second migration: 20260903112053 kept a rollback window to the
+-- pre-per-chain binary so it could deploy on its own; this one closes that
+-- window in the same change that first makes a second chain configurable,
+-- which is the first point the schema must allow one.
+--
+-- Ships together with the capability grant that first admits a non-Base
+-- watched chain: the rollback shadow index (20260903112053) forbids two
+-- chains sharing an orderbook address, which deterministic deployments make
+-- real. Dropping it ends the pre-per-chain binary's rollback window for the
+-- checkpoint table (restore from backup applies from here on).
+DROP INDEX idx_backfill_checkpoints_orderbook_rollback;

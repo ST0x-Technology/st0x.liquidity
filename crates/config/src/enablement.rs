@@ -108,7 +108,15 @@ pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
             CashRebalancing,
             GasValuation,
         ]),
-        Chain::Ethereum => BTreeSet::from([WalletSigning, CashRebalancing, GasValuation]),
+        // FillIngestion + Hedging granted with the per-chain watcher and
+        // chain-aware accounting code (RAI-2079); rebalancing stays Base-only.
+        Chain::Ethereum => BTreeSet::from([
+            FillIngestion,
+            Hedging,
+            WalletSigning,
+            CashRebalancing,
+            GasValuation,
+        ]),
         Chain::HyperEvm => BTreeSet::from([WalletSigning]),
     }
 }
@@ -263,6 +271,7 @@ pub fn check_enablement(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assets::ChainEquityAsset;
 
     #[test]
     fn lifecycle_names_are_pinned_literals() {
@@ -335,20 +344,38 @@ mod tests {
     }
 
     #[test]
-    fn ethereum_may_hold_funds_but_not_trade() {
+    fn ethereum_may_hold_funds_and_watch_fills_but_not_rebalance_equity() {
         check_enablement(Chain::Ethereum, ChainLifecycle::Active, false, None).unwrap();
 
-        let error =
-            check_enablement(Chain::Ethereum, ChainLifecycle::Prefunded, true, None).unwrap_err();
+        // Per-chain watchers + chain-aware accounting granted FillIngestion
+        // and Hedging, so a trading Ethereum passes...
+        check_enablement(Chain::Ethereum, ChainLifecycle::Prefunded, true, None).unwrap();
+
+        // ...but equity rebalancing stays Base-only: an Ethereum asset
+        // flagged for rebalancing is still refused.
+        let mut assets = ChainAssets::default();
+        assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: alloy::primitives::Address::repeat_byte(0x11),
+                tokenized_equity_derivative: alloy::primitives::Address::ZERO,
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+        let error = check_enablement(Chain::Ethereum, ChainLifecycle::Active, true, Some(&assets))
+            .unwrap_err();
 
         let ChainEnablementError::MissingCapabilities { missing, .. } = error else {
             panic!("expected MissingCapabilities, got: {error:?}")
         };
-
         assert_eq!(
             missing.into_inner(),
-            vec![ChainCapability::FillIngestion, ChainCapability::Hedging],
-            "Ethereum has no orderbook wiring"
+            vec![ChainCapability::EquityRebalancing],
+            "equity rebalancing wiring is still Base-only"
         );
     }
 

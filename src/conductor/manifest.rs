@@ -237,6 +237,7 @@ mod tests {
             test_trigger_config(),
             vault_registry,
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: Address::ZERO,
                 owner: Address::ZERO,
             },
@@ -307,6 +308,7 @@ mod tests {
             test_trigger_config(),
             vault_registry,
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: Address::ZERO,
                 owner: Address::ZERO,
             },
@@ -395,7 +397,11 @@ mod tests {
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
         vault_registry
             .send(
-                &VaultRegistryId { orderbook, owner },
+                &VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook,
+                    owner,
+                },
                 VaultRegistryCommand::SeedEquityVaultFromConfig {
                     token,
                     vault_id: fixed_bytes!(
@@ -442,7 +448,11 @@ mod tests {
         let rebalancing_service = Arc::new(RebalancingService::new(
             test_trigger_config(),
             vault_registry,
-            VaultRegistryId { orderbook, owner },
+            VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
+                orderbook,
+                owner,
+            },
             inventory,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),

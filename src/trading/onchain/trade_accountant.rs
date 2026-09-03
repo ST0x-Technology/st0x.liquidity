@@ -11,19 +11,21 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
-use st0x_config::Ctx;
+use st0x_config::{Ctx, TradingChain};
 use st0x_event_sorcery::{SendError, Store};
-use st0x_evm::ReadOnlyEvm;
+use st0x_evm::{Chain, ReadOnlyEvm};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
-use st0x_execution::{ExecutionError, Executor, Permanence};
+use st0x_execution::{ExecutionError, Executor, Permanence, Symbol};
 use st0x_raindex::RaindexContracts;
 use st0x_registry::{SymbolCache, get_symbol_lock};
 
 use super::inclusion::EmittedOnChain;
 use super::skipped_fill::{SkipReason, record_skipped_fill};
+use crate::alerts::Notifier;
 use crate::conductor::job::{
     BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureOutcome, BackpressureStreak, Job, JobQueue, Label,
     advance_backpressure, apply_backpressure_step, find_backpressure, find_permanence,
@@ -64,21 +66,37 @@ pub struct AccountForDexTrade {
     pub(crate) backpressure_streak: BackpressureStreak,
 }
 
-/// Bundles the shared dependencies needed by the trade accounting job.
-pub(crate) struct AccountantCtx<Node, Exec> {
-    pub(crate) ctx: Ctx,
-    pub(crate) cache: SymbolCache,
-    /// Orderbook and shared `RaindexInventory` addresses -- the latter is the
-    /// source contract for `InventoryTrade` events
+/// The chain-scoped half of trade accounting: everything that must resolve
+/// against the chain a fill actually happened on. Resolving any of these
+/// from another chain silently mis-processes the fill (a wrong `vault_owner`
+/// owner-filters every fill out; wrong contracts reconstruct wrong logs).
+pub(crate) struct ChainAccounting<Node> {
+    pub(crate) trading: TradingChain,
+    /// Orderbook and shared `RaindexInventory` addresses on this chain --
+    /// the latter is the source contract for `InventoryTrade` events
     /// (`OperatorDeposit`/`OperatorWithdraw`). Used to reconstruct the
     /// emitting log's address for downstream processing.
     pub(crate) contracts: RaindexContracts,
     pub(crate) evm: ReadOnlyEvm<Node>,
+}
+
+/// Bundles the shared dependencies needed by the trade accounting job.
+pub(crate) struct AccountantCtx<Node, Exec> {
+    pub(crate) ctx: Ctx,
+    pub(crate) cache: SymbolCache,
+    /// One [`ChainAccounting`] per watched chain; jobs resolve theirs from
+    /// the fill payload's chain.
+    pub(crate) chains: std::collections::BTreeMap<Chain, ChainAccounting<Node>>,
     pub(crate) cqrs: TradeProcessingCqrs,
     pub(crate) vault_registry: Arc<Store<VaultRegistry>>,
     pub(crate) executor: Exec,
     pub(crate) pool: SqlitePool,
     pub(crate) job_queue: DexTradeAccountingJobQueue,
+    pub(crate) notifier: Arc<dyn Notifier>,
+    /// Symbols already paged for accumulating fills while disabled, so an
+    /// ongoing stream of such fills pages once per process, not per fill
+    /// (same cadence as hedge dead-letter alerts). A restart re-pages.
+    pub(crate) disabled_asset_alerts: Arc<std::sync::Mutex<HashSet<Symbol>>>,
 }
 
 impl<Node, Exec> Job<AccountantCtx<Node, Exec>> for AccountForDexTrade
@@ -100,68 +118,35 @@ where
     fn label(&self) -> Label {
         let EmittedOnChain {
             event,
+            chain,
             block_number,
             log_index,
             ..
         } = &self.trade;
 
-        Label::new(format!("{}:{block_number}:{log_index}", event.kind()))
+        Label::new(format!(
+            "{}:{chain}:{block_number}:{log_index}",
+            event.kind()
+        ))
     }
 
     #[allow(clippy::cognitive_complexity)]
     async fn perform(&self, ctx: &AccountantCtx<Node, Exec>) -> Result<Self::Output, Self::Error> {
-        use RaindexTradeEvent::{ClearV3, InventoryTrade, TakeOrderV3};
-
         let trade_event = &self.trade;
-        // The Raindex order/vault owner -- the inventory contract post-migration,
-        // the bot EOA before it. Used to match ClearV3/TakeOrderV3 fills to our
-        // orders and to scope vault discovery.
-        let order_owner = ctx.ctx.vault_owner();
-        let reconstructed_log = reconstruct_log(ctx.contracts, trade_event);
+        let chain_ctx = ctx.chains.get(&trade_event.chain).ok_or_else(|| {
+            TradeAccountingError::OnChain(OnChainError::UnwatchedChain {
+                chain: trade_event.chain,
+            })
+        })?;
+        // The Raindex order/vault owner ON THE FILL'S CHAIN -- the inventory
+        // contract post-migration, the bot EOA before it. Used to match
+        // ClearV3/TakeOrderV3 fills to our orders and to scope vault
+        // discovery; the wrong chain's owner silently filters every fill out.
+        let order_owner = chain_ctx.trading.vault_owner;
+        let reconstructed_log = reconstruct_log(chain_ctx.contracts, trade_event);
 
-        let trade_result = match &trade_event.event {
-            ClearV3(clear_event) => {
-                OnchainTrade::try_from_clear_v3(
-                    ctx.ctx.chains.primary(),
-                    &ctx.cache,
-                    &ctx.evm,
-                    *clear_event.clone(),
-                    reconstructed_log,
-                    order_owner,
-                )
-                .await
-            }
-
-            TakeOrderV3(take_event) => {
-                OnchainTrade::try_from_take_order_if_target_owner(
-                    ctx.ctx.chains.primary().chain,
-                    &ctx.cache,
-                    &ctx.evm,
-                    *take_event.clone(),
-                    reconstructed_log,
-                    order_owner,
-                )
-                .await
-            }
-
-            InventoryTrade(inv) => {
-                // No pre-fetched receipt here (this event may be reconstructed
-                // from a stored backfill log, not a fresh RPC round-trip).
-                // `try_from_inventory_trade` uses the log's block number and
-                // fetches receipt metadata only if that number is absent.
-                OnchainTrade::try_from_inventory_trade(
-                    ctx.ctx.chains.primary().chain,
-                    &ctx.cache,
-                    &ctx.evm,
-                    &ctx.ctx.chains.primary().assets,
-                    &ctx.ctx.chains.primary().inventory_adapters,
-                    inv.as_ref(),
-                    reconstructed_log,
-                    None,
-                )
-                .await
-            }
-        };
+        let trade_result =
+            decode_trade_event(chain_ctx, &ctx.cache, trade_event, reconstructed_log).await;
 
         let onchain_trade = match trade_result {
             Ok(trade) => trade,
@@ -309,7 +294,7 @@ where
 
         let vault_discovery_ctx = VaultDiscoveryCtx {
             vault_registry: &ctx.vault_registry,
-            orderbook: ctx.contracts.orderbook,
+            orderbook: chain_ctx.contracts.orderbook,
             order_owner,
         };
 
@@ -328,12 +313,20 @@ where
         let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
         let _guard = symbol_lock.lock().await;
 
-        let trading_enabled = ctx
-            .ctx
-            .chains
-            .primary()
+        let trading_enabled = chain_ctx
+            .trading
             .assets
             .is_trading_enabled(trade.symbol.base());
+
+        if !trading_enabled {
+            self.alert_disabled_asset_fill(
+                &ctx.notifier,
+                &ctx.disabled_asset_alerts,
+                &trade,
+                chain_ctx.trading.chain,
+            )
+            .await;
+        }
 
         match process_queued_trade(
             &ctx.executor,
@@ -454,6 +447,105 @@ async fn persist_skipped_fill(
             log_index = trade_event.log_index,
             "Failed to persist skipped fill for reconciliation"
         );
+    }
+}
+
+impl AccountForDexTrade {
+    /// Critical, deduplicated alert for a fill landing on a disabled asset:
+    /// the accumulated delta is deliberate (the flag is the per-symbol hedge
+    /// kill switch) but must never be silent exposure. Once per process per
+    /// symbol; delivery failure releases the reservation so the next fill
+    /// re-attempts.
+    async fn alert_disabled_asset_fill(
+        &self,
+        notifier: &Arc<dyn Notifier>,
+        alerted_symbols: &std::sync::Mutex<HashSet<Symbol>>,
+        trade: &OnchainTrade,
+        chain: Chain,
+    ) {
+        let newly_reserved = {
+            let mut alerted = match alerted_symbols.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            alerted.insert(trade.symbol.base().clone())
+        };
+        if !newly_reserved {
+            return;
+        }
+
+        let message = format!(
+            "Fill on DISABLED asset {} (chain {chain}, tx {}): recorded and \
+             accumulating unhedged until the asset is re-enabled",
+            trade.symbol.base(),
+            self.trade.tx_hash,
+        );
+        error!(target: "hedge", %message, "Disabled-asset fill");
+        if let Err(error) = notifier.notify(&message).await {
+            warn!(target: "hedge", ?error, "Disabled-asset alert delivery failed");
+            let mut alerted = match alerted_symbols.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            alerted.remove(trade.symbol.base());
+        }
+    }
+}
+
+/// Decodes a raw Raindex event into an [`OnchainTrade`] against ITS chain's
+/// contracts, cache, and asset tables.
+async fn decode_trade_event<Node: Provider + Clone + 'static>(
+    chain_ctx: &ChainAccounting<Node>,
+    cache: &SymbolCache,
+    trade_event: &EmittedOnChain<RaindexTradeEvent>,
+    reconstructed_log: Log,
+) -> Result<Option<OnchainTrade>, OnChainError> {
+    use RaindexTradeEvent::{ClearV3, InventoryTrade, TakeOrderV3};
+
+    let order_owner = chain_ctx.trading.vault_owner;
+
+    match &trade_event.event {
+        ClearV3(clear_event) => {
+            OnchainTrade::try_from_clear_v3(
+                &chain_ctx.trading,
+                cache,
+                &chain_ctx.evm,
+                *clear_event.clone(),
+                reconstructed_log,
+                order_owner,
+            )
+            .await
+        }
+
+        TakeOrderV3(take_event) => {
+            OnchainTrade::try_from_take_order_if_target_owner(
+                chain_ctx.trading.chain,
+                cache,
+                &chain_ctx.evm,
+                *take_event.clone(),
+                reconstructed_log,
+                order_owner,
+            )
+            .await
+        }
+
+        InventoryTrade(inv) => {
+            // No pre-fetched receipt here (this event may be reconstructed
+            // from a stored backfill log, not a fresh RPC round-trip).
+            // `try_from_inventory_trade` uses the log's block number and
+            // fetches receipt metadata only if that number is absent.
+            OnchainTrade::try_from_inventory_trade(
+                chain_ctx.trading.chain,
+                cache,
+                &chain_ctx.evm,
+                &chain_ctx.trading.assets,
+                &chain_ctx.trading.inventory_adapters,
+                inv.as_ref(),
+                reconstructed_log,
+                None,
+            )
+            .await
+        }
     }
 }
 
@@ -859,17 +951,105 @@ mod tests {
 
         let job_queue = DexTradeAccountingJobQueue::new(apalis_pool);
 
+        let chains = std::collections::BTreeMap::from([(
+            ctx.chains.primary().chain,
+            ChainAccounting {
+                trading: ctx.chains.primary().clone(),
+                contracts: crate::onchain::raindex_contracts(ctx.chains.primary()),
+                evm: st0x_evm::ReadOnlyEvm::new(provider),
+            },
+        )]);
+
         AccountantCtx {
-            contracts: crate::onchain::raindex_contracts(ctx.chains.primary()),
+            chains,
             ctx,
             cache,
-            evm: st0x_evm::ReadOnlyEvm::new(provider),
             cqrs,
+            notifier: Arc::new(crate::alerts::LogNotifier),
+            disabled_asset_alerts: Arc::new(std::sync::Mutex::new(HashSet::new())),
             vault_registry,
             executor,
             pool,
             job_queue,
         }
+    }
+
+    /// The disabled-asset alert fires once per process per symbol; a second
+    /// fill on the same symbol stays silent, and a delivery failure releases
+    /// the reservation so the next fill re-pages.
+    #[tokio::test]
+    async fn disabled_asset_alert_pages_once_per_symbol() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
+        let mut ctx = build_test_accountant_ctx(
+            pool,
+            &apalis_pool,
+            create_test_ctx_with_order_owner(Address::ZERO),
+            SymbolCache::default(),
+            provider,
+            executor,
+            ExecutionThreshold::whole_share(),
+        )
+        .await;
+        ctx.notifier = notifier.clone();
+
+        let job = test_job();
+        let trade = crate::test_utils::OnchainTradeBuilder::new().build();
+
+        let notifier_arc: Arc<dyn Notifier> = notifier.clone();
+        job.alert_disabled_asset_fill(
+            &notifier_arc,
+            &ctx.disabled_asset_alerts,
+            &trade,
+            Chain::Base,
+        )
+        .await;
+        job.alert_disabled_asset_fill(
+            &notifier_arc,
+            &ctx.disabled_asset_alerts,
+            &trade,
+            Chain::Base,
+        )
+        .await;
+
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "the second fill on the same disabled symbol must not re-page"
+        );
+        assert!(notifier.messages()[0].contains("DISABLED"));
+    }
+
+    /// A job stamped with a chain no watched entry covers fails loudly
+    /// instead of silently accounting against the wrong chain's contracts.
+    #[tokio::test]
+    async fn fill_on_unwatched_chain_is_refused() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let ctx = build_test_accountant_ctx(
+            pool,
+            &apalis_pool,
+            create_test_ctx_with_order_owner(Address::ZERO),
+            SymbolCache::default(),
+            provider,
+            executor,
+            ExecutionThreshold::whole_share(),
+        )
+        .await;
+
+        let mut job = test_job();
+        job.trade.chain = Chain::HyperEvm;
+
+        let error = job.perform(&ctx).await.unwrap_err();
+        assert!(matches!(
+            error,
+            TradeAccountingError::OnChain(OnChainError::UnwatchedChain {
+                chain: Chain::HyperEvm
+            })
+        ));
     }
 
     fn test_job() -> AccountForDexTrade {
@@ -901,7 +1081,7 @@ mod tests {
             <AccountForDexTrade as Job<AccountantCtx<RootProvider, MockExecutor>>>::label(&job);
 
         let label_str = label.to_string();
-        assert_eq!(label_str, "ClearV3:12345:293");
+        assert_eq!(label_str, "ClearV3:base:12345:293");
     }
 
     #[tokio::test]
@@ -1513,8 +1693,8 @@ mod tests {
         };
 
         let cache = SymbolCache::default();
-        cache.preload_symbol(usdc_token, "USDC");
-        cache.preload_symbol(equity_token, "wtCOIN");
+        cache.preload_symbol(st0x_evm::Chain::Base, usdc_token, "USDC");
+        cache.preload_symbol(st0x_evm::Chain::Base, equity_token, "wtCOIN");
 
         let accountant_ctx = build_test_accountant_ctx(
             pool.clone(),
@@ -1746,8 +1926,8 @@ mod tests {
         };
 
         let cache = SymbolCache::default();
-        cache.preload_symbol(usdc_token, "USDC");
-        cache.preload_symbol(equity_token, "wtCOIN");
+        cache.preload_symbol(st0x_evm::Chain::Base, usdc_token, "USDC");
+        cache.preload_symbol(st0x_evm::Chain::Base, equity_token, "wtCOIN");
 
         let accountant_ctx = build_test_accountant_ctx(
             pool.clone(),
@@ -1883,8 +2063,8 @@ mod tests {
         };
 
         let cache = SymbolCache::default();
-        cache.preload_symbol(equity_token, "wtCOIN");
-        cache.preload_symbol(usdc_token, "USDC");
+        cache.preload_symbol(st0x_evm::Chain::Base, equity_token, "wtCOIN");
+        cache.preload_symbol(st0x_evm::Chain::Base, usdc_token, "USDC");
 
         let accountant_ctx = build_test_accountant_ctx(
             pool.clone(),

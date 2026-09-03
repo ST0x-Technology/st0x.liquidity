@@ -728,6 +728,7 @@ mod tests {
             .await
             .unwrap();
         let id = VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook: Address::repeat_byte(0x11),
             owner: Address::repeat_byte(0x22),
         };

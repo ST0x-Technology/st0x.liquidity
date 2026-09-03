@@ -2276,6 +2276,7 @@ mod tests {
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: address!("0x0000000000000000000000000000000000000001"),
                 owner: address!("0x0000000000000000000000000000000000000002"),
             },
@@ -2424,6 +2425,7 @@ mod tests {
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: address!("0x0000000000000000000000000000000000000001"),
                 owner: address!("0x0000000000000000000000000000000000000002"),
             },
@@ -2750,6 +2752,7 @@ mod tests {
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: address!("0x0000000000000000000000000000000000000001"),
                 owner: address!("0x0000000000000000000000000000000000000002"),
             },

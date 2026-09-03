@@ -141,7 +141,11 @@ async fn build_equity_transfer_services(
 
     let vault_lookup: Arc<dyn VaultLookup> = Arc::new(VaultRegistryLookup::new(
         vault_registry_projection,
-        VaultRegistryId::new(ctx.chains.primary().orderbook, ctx.vault_owner()),
+        VaultRegistryId::new(
+            ctx.chains.primary().chain,
+            ctx.chains.primary().orderbook,
+            ctx.vault_owner(),
+        ),
     ));
 
     let raindex = Arc::new(RaindexService::new(

@@ -35,6 +35,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use url::Url;
 
 use st0x_config::{
     BrokerCtx, ChainAssets, Ctx, CtxError, ExecutionThreshold, HedgingAssets, InventoryMode,
@@ -741,13 +742,48 @@ type HttpProvider = FillProvider<
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The watched chains beyond the primary: the ones needing their own
+/// providers, watchers, and accounting entries.
+fn watched_secondaries(ctx: &Ctx) -> Vec<TradingChain> {
+    ctx.chains
+        .watched()
+        .filter(|watched| watched.chain != ctx.chains.primary().chain)
+        .cloned()
+        .collect()
+}
+
+/// An HTTP provider whose transport is wrapped by the telemetry layer (every
+/// JSON-RPC call from any handle is timed) and bounded by the RPC timeouts,
+/// so a hung endpoint surfaces as an error instead of a silent park.
+fn bounded_http_provider(
+    rpc_url: &Url,
+    telemetry: &TelemetrySender,
+) -> anyhow::Result<HttpProvider> {
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(RPC_CONNECT_TIMEOUT)
+        .timeout(RPC_REQUEST_TIMEOUT)
+        .build()
+        .context("Failed to build the chain RPC HTTP client")?;
+    // Same heuristic ClientBuilder::http applies, so local nodes keep
+    // alloy's faster polling defaults.
+    let is_local = alloy::transports::utils::guess_local_url(rpc_url.as_str());
+    let transport = alloy::transports::http::Http::with_client(http_client, rpc_url.clone());
+    let rpc_client = ClientBuilder::default()
+        .layer(RpcTelemetryLayer::new(telemetry.clone()))
+        .transport(transport, is_local);
+
+    Ok(ProviderBuilder::new().connect_client(rpc_client))
+}
+
 async fn setup_instrumentation<E>(
     executor_ctx: impl TryIntoExecutor<Executor = E>,
     trading_chain: &TradingChain,
+    watched_secondaries: &[TradingChain],
     pool: SqlitePool,
 ) -> anyhow::Result<(
     InstrumentedExecutor<E>,
     HttpProvider,
+    BTreeMap<Chain, HttpProvider>,
     JoinHandle<()>,
     TelemetrySender,
 )>
@@ -762,33 +798,34 @@ where
     let executor =
         InstrumentedExecutor::new(executor_ctx.try_into_executor().await?, telemetry.clone());
 
-    // Single HTTP transport: drives continuous eth_getLogs fill polling
-    // (via the OrderFillMonitor + backfill worker) and all read-only
-    // contract calls. No WebSocket -- see `monitor::order_fills`. The
-    // telemetry layer wraps the transport itself, so every JSON-RPC call
-    // from any provider handle is timed. The request timeout bounds a hung
-    // endpoint so a dead read becomes an error instead of a silent park.
-    let http_client = reqwest::Client::builder()
-        .connect_timeout(RPC_CONNECT_TIMEOUT)
-        .timeout(RPC_REQUEST_TIMEOUT)
-        .build()
-        .context("Failed to build the trading chain RPC HTTP client")?;
-    // Same heuristic ClientBuilder::http applies, so local nodes keep
-    // alloy's faster polling defaults.
-    let is_local = alloy::transports::utils::guess_local_url(trading_chain.rpc_url.as_str());
-    let transport =
-        alloy::transports::http::Http::with_client(http_client, trading_chain.rpc_url.clone());
-    let rpc_client = ClientBuilder::default()
-        .layer(RpcTelemetryLayer::new(telemetry.clone()))
-        .transport(transport, is_local);
-    let provider = ProviderBuilder::new().connect_client(rpc_client);
+    // Single HTTP transport per chain: drives continuous eth_getLogs fill
+    // polling (via the OrderFillMonitor + backfill worker) and all read-only
+    // contract calls. No WebSocket -- see `monitor::order_fills`.
+    let provider = bounded_http_provider(&trading_chain.rpc_url, &telemetry)?;
+
+    // One provider per watched non-primary chain, bounded and timed exactly
+    // like the primary's: a hung secondary RPC must fail its own watcher,
+    // not park it.
+    let watch_providers = watched_secondaries
+        .iter()
+        .map(|watched| {
+            bounded_http_provider(&watched.rpc_url, &telemetry)
+                .map(|provider| (watched.chain, provider))
+        })
+        .collect::<anyhow::Result<BTreeMap<Chain, HttpProvider>>>()?;
 
     // Spawn the writer before returning the sender: the executor, RPC layer,
     // and the returned sender each hold a clone. When all three are dropped,
     // the channel closes and the writer task exits cleanly.
     let telemetry_writer = spawn_dependency_call_writer(pool, telemetry_receiver);
 
-    Ok((executor, provider, telemetry_writer, telemetry))
+    Ok((
+        executor,
+        provider,
+        watch_providers,
+        telemetry_writer,
+        telemetry,
+    ))
 }
 
 /// Resolves the rebalancing configuration, which is optional.
@@ -864,10 +901,16 @@ impl Conductor {
         TradeAccountingError: From<E::Error>,
         crate::offchain::order::JobError: From<E::Error>,
     {
-        let (executor, provider, telemetry_writer, telemetry) =
-            setup_instrumentation(executor_ctx, ctx.chains.primary(), pool.clone()).await?;
+        let (executor, provider, watch_providers, telemetry_writer, telemetry) =
+            setup_instrumentation(
+                executor_ctx,
+                ctx.chains.primary(),
+                &watched_secondaries(&ctx),
+                pool.clone(),
+            )
+            .await?;
 
-        startup_smoke_checks(&executor, &provider, &ctx).await?;
+        startup_smoke_checks(&executor, &provider, &watch_providers, &ctx).await?;
         let cache = SymbolCache::default();
 
         let (job_queue, backfill_queues, dashboard_delivery, schedulers) =
@@ -1012,7 +1055,7 @@ impl Conductor {
 
         let conductor_ctx = builder::ConductorCtx {
             ctx: ctx.clone(),
-            watch_providers: BTreeMap::new(),
+            watch_providers,
             poll_freshness,
             cache,
             provider,
@@ -2184,32 +2227,53 @@ async fn confirm_transport_chain_ids(ctx: &Ctx) -> anyhow::Result<()> {
 /// The broker account itself is verified during executor construction
 /// (`try_from_ctx` refuses an inactive account); the clock read here is the
 /// explicit round-trip proving the session works, not just the credentials.
-async fn startup_smoke_checks<E, P>(executor: &E, provider: &P, ctx: &Ctx) -> anyhow::Result<()>
+async fn startup_smoke_checks<E, P>(
+    executor: &E,
+    provider: &P,
+    watch_providers: &BTreeMap<Chain, P>,
+    ctx: &Ctx,
+) -> anyhow::Result<()>
 where
     E: Executor,
     P: Provider + Clone + 'static,
 {
-    let trading_chain = ctx.chains.primary();
+    // Every watched chain is probed and any failure is fatal (signed-off:
+    // fail-loud beats a green /health hiding a dead chain; degraded start
+    // arrives with chain-disable). The primary uses the main provider;
+    // secondaries their own.
+    for watched in ctx.chains.watched() {
+        let chain_provider = if watched.chain == ctx.chains.primary().chain {
+            provider
+        } else {
+            watch_providers
+                .get(&watched.chain)
+                .with_context(|| format!("no provider wired for watched chain {}", watched.chain))?
+        };
 
-    // The HTTP transport connects lazily, so reach the RPC once to fail fast
-    // on a misconfigured or unreachable endpoint rather than only surfacing
-    // it as repeated poll-loop retries.
-    let chain_tip = provider
-        .get_block_number()
-        .await
-        .context("failed to reach RPC endpoint at startup")?;
+        // The HTTP transport connects lazily, so reach the RPC once to fail
+        // fast on a misconfigured or unreachable endpoint rather than only
+        // surfacing it as repeated poll-loop retries.
+        let chain_tip = chain_provider.get_block_number().await.with_context(|| {
+            format!(
+                "failed to reach {}'s RPC endpoint at startup",
+                watched.chain
+            )
+        })?;
 
-    confirm_chain_id(provider, trading_chain.chain).await?;
+        confirm_chain_id(chain_provider, watched.chain).await?;
 
-    // A null response is allowed through (cold start); an error or a detected
-    // `finalized`-aliasing-to-`latest` fails startup before the fill monitor
-    // starts polling.
-    match probe_cutoff_block_support(provider, chain_tip, trading_chain.ingestion_cutoff)
-        .await
-        .context("RPC endpoint cannot serve the configured cutoff block tag at startup")?
-    {
-        CutoffProbe::Supported | CutoffProbe::NotYetAvailable => {}
+        // A null response is allowed through (cold start); an error or a
+        // detected `finalized`-aliasing-to-`latest` fails startup before the
+        // fill monitor starts polling.
+        match probe_cutoff_block_support(chain_provider, chain_tip, watched.ingestion_cutoff)
+            .await
+            .context("RPC endpoint cannot serve the configured cutoff block tag at startup")?
+        {
+            CutoffProbe::Supported | CutoffProbe::NotYetAvailable => {}
+        }
     }
+
+    let trading_chain = ctx.chains.primary();
 
     confirm_transport_chain_ids(ctx).await?;
 
@@ -2473,6 +2537,7 @@ fn build_rebalancing_vault_lookup(
     // The (orderbook, vault-owner) pair keys both the vault-registry lookup
     // and the rebalancing service's registry reads.
     let registry_id = VaultRegistryId {
+        chain: ctx.chains.primary().chain,
         orderbook: ctx.chains.primary().orderbook,
         owner: ctx.vault_owner(),
     };
@@ -3370,6 +3435,7 @@ pub(crate) async fn discover_vaults_for_trade(
         .filter(|vault| vault.owner == context.order_owner);
 
     let vault_registry_id = VaultRegistryId {
+        chain: trade_event.chain,
         orderbook: context.orderbook,
         owner: context.order_owner,
     };
@@ -5141,6 +5207,7 @@ mod tests {
             },
             vault_registry,
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: Address::ZERO,
                 owner: Address::ZERO,
             },
@@ -5850,6 +5917,7 @@ mod tests {
             },
             vault_registry,
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: alloy::primitives::Address::ZERO,
                 owner: alloy::primitives::Address::ZERO,
             },
@@ -6386,6 +6454,7 @@ mod tests {
             },
             vault_registry,
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: alloy::primitives::Address::ZERO,
                 owner: alloy::primitives::Address::ZERO,
             },
@@ -6485,6 +6554,7 @@ mod tests {
             },
             vault_registry2,
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: alloy::primitives::Address::ZERO,
                 owner: alloy::primitives::Address::ZERO,
             },
@@ -7098,6 +7168,7 @@ mod tests {
 
     async fn load_vault_registry(vault_registry: &Store<VaultRegistry>) -> Option<VaultRegistry> {
         let registry_id = VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook: TEST_ORDERBOOK,
             owner: ORDER_OWNER,
         };
@@ -10098,6 +10169,7 @@ mod tests {
         vault_registry
             .send(
                 &VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
                     orderbook,
                     owner: order_owner,
                 },
@@ -10141,6 +10213,7 @@ mod tests {
             },
             vault_registry,
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook,
                 owner: order_owner,
             },
@@ -10257,6 +10330,7 @@ mod tests {
             },
             vault_registry,
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook,
                 owner: order_owner,
             },
@@ -10383,6 +10457,7 @@ mod tests {
             },
             vault_registry,
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook,
                 owner: order_owner,
             },
@@ -10458,6 +10533,7 @@ mod tests {
         vault_registry
             .send(
                 &VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
                     orderbook,
                     owner: order_owner,
                 },
@@ -10527,6 +10603,7 @@ mod tests {
             },
             vault_registry,
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook,
                 owner: order_owner,
             },
