@@ -785,15 +785,30 @@ async fn overnight_replacement_sell_survives_the_net_short_guard_race() -> anyho
     Ok(())
 }
 
-/// Overnight-enabled assets that also enable extended hours, for the
-/// session-transition restart where the relaunched bot must re-hedge
-/// through the extended chain.
-fn both_sessions_enabled(mut assets: AssetsConfig) -> AssetsConfig {
-    for config in assets.equities.symbols.values_mut() {
-        config.overnight_counter_trading = OperationMode::Enabled;
-        config.extended_hours_counter_trading = OperationMode::Enabled;
+/// An overnight-enabled hedging policy that also enables extended hours,
+/// for the session-transition restart where the relaunched bot must
+/// re-hedge through the extended chain.
+fn both_sessions_enabled(assets: &ChainAssets) -> HedgingAssets {
+    HedgingAssets {
+        equities: HedgedEquities {
+            retired_symbols: Vec::new(),
+            symbols: assets
+                .equities
+                .symbols
+                .keys()
+                .map(|symbol| {
+                    (
+                        symbol.clone(),
+                        EquityHedgePolicy {
+                            extended_hours_counter_trading: OperationMode::Enabled,
+                            overnight_counter_trading: OperationMode::Enabled,
+                        },
+                    )
+                })
+                .collect(),
+        },
+        cash: None,
     }
-    assets
 }
 
 /// Restart window 1: killed while the placement acknowledgement is in
@@ -822,7 +837,8 @@ async fn overnight_crash_mid_placement_adopts_on_restart() -> anyhow::Result<()>
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(overnight_enabled(infra.assets_config()))
+        .assets(infra.assets_config())
+        .hedging(overnight_enabled(&infra.assets_config()))
         .session_clock_offset_secs(offset)
         .overnight_knobs(true)
         .broker_url_override(latency.endpoint.clone())
@@ -873,7 +889,8 @@ async fn overnight_crash_mid_placement_adopts_on_restart() -> anyhow::Result<()>
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(overnight_enabled(infra.assets_config()))
+        .assets(infra.assets_config())
+        .hedging(overnight_enabled(&infra.assets_config()))
         .session_clock_offset_secs(offset)
         .overnight_knobs(true)
         .call()?;
@@ -914,7 +931,8 @@ async fn overnight_crash_while_submitted_resumes_polling() -> anyhow::Result<()>
             .broker(&infra.broker_service)
             .db_path(&infra.db_path)
             .deployment_block(current_block)
-            .assets(overnight_enabled(infra.assets_config()))
+            .assets(infra.assets_config())
+            .hedging(overnight_enabled(&infra.assets_config()))
             .session_clock_offset_secs(offset)
             .overnight_knobs(true)
             .call()
@@ -977,7 +995,8 @@ async fn overnight_crash_while_cancelling_confirms_on_restart() -> anyhow::Resul
             .broker(&infra.broker_service)
             .db_path(&infra.db_path)
             .deployment_block(current_block)
-            .assets(overnight_enabled(infra.assets_config()))
+            .assets(infra.assets_config())
+            .hedging(overnight_enabled(&infra.assets_config()))
             .session_clock_offset_secs(offset)
             .overnight_knobs(true)
             .overnight_reprice_secs_override(3)
@@ -1056,7 +1075,8 @@ async fn overnight_crash_across_the_0400_transition_converges() -> anyhow::Resul
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(both_sessions_enabled(infra.assets_config()))
+        .assets(infra.assets_config())
+        .hedging(both_sessions_enabled(&infra.assets_config()))
         .session_clock_offset_secs(overnight_offset)
         .overnight_knobs(true)
         .call()?;
@@ -1091,7 +1111,8 @@ async fn overnight_crash_across_the_0400_transition_converges() -> anyhow::Resul
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(both_sessions_enabled(infra.assets_config()))
+        .assets(infra.assets_config())
+        .hedging(both_sessions_enabled(&infra.assets_config()))
         .session_clock_offset_secs(morning_offset)
         .overnight_knobs(true)
         .call()?;
@@ -1170,7 +1191,8 @@ async fn assert_evening_hedges_overnight(
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(overnight_enabled(infra.assets_config()))
+        .assets(infra.assets_config())
+        .hedging(overnight_enabled(&infra.assets_config()))
         .session_clock_offset_secs(offset)
         .overnight_knobs(true)
         .call()?;
@@ -1209,7 +1231,8 @@ async fn assert_evening_places_nothing(
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
         .deployment_block(current_block)
-        .assets(overnight_enabled(infra.assets_config()))
+        .assets(infra.assets_config())
+        .hedging(overnight_enabled(&infra.assets_config()))
         .session_clock_offset_secs(offset)
         .overnight_knobs(true)
         .call()?;
@@ -1267,7 +1290,8 @@ async fn overnight_2000_entry_rehedges_after_the_broker_auto_cancel() -> anyhow:
             .broker(&infra.broker_service)
             .db_path(&infra.db_path)
             .deployment_block(current_block)
-            .assets(both_sessions_enabled(infra.assets_config()))
+            .assets(infra.assets_config())
+            .hedging(both_sessions_enabled(&infra.assets_config()))
             .session_clock_offset_secs(offset)
             .overnight_knobs(true)
             .call()
@@ -1359,7 +1383,8 @@ async fn overnight_survivor_converges_to_a_market_order_at_0930() -> anyhow::Res
             .broker(&infra.broker_service)
             .db_path(&infra.db_path)
             .deployment_block(current_block)
-            .assets(overnight_enabled(infra.assets_config()))
+            .assets(infra.assets_config())
+            .hedging(overnight_enabled(&infra.assets_config()))
             .session_clock_offset_secs(offset)
             .overnight_knobs(true)
             .call()
