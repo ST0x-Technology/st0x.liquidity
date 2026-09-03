@@ -1709,7 +1709,6 @@ mod tests {
     use alloy::primitives::{Address, B256, address, b256};
     use chrono::Utc;
     use rain_math_float::Float;
-    use url::Url;
     use uuid::uuid;
 
     use st0x_bridge::cctp::CctpError;
@@ -1722,9 +1721,8 @@ mod tests {
         ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, LogFormat, LogLevel,
         OperationMode, TradingMode,
     };
-    use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
+    use st0x_config::{InventoryMode, TradingChain};
     use st0x_event_sorcery::{AggregateError, LifecycleError};
-    use st0x_evm::Chain;
     #[cfg(feature = "test-support")]
     use st0x_evm::StubWallet;
     use st0x_execution::{
@@ -2143,21 +2141,16 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            chains: ChainRegistry::single_trading_chain(TradingChain {
-                redemption_wallet: None,
-                assets: ChainAssets::default(),
-                chain: Chain::Base,
-                inventory_adapters: InventoryAdapters::default(),
-                rpc_url: Url::parse("http://localhost:8545").unwrap(),
-                orderbook: address!("0x1234567890123456789012345678901234567890"),
-                inventory: InventoryMode::Managed {
-                    inventory: address!("0x1234567890123456789012345678901234567890"),
-                },
-                vault_owner: Address::ZERO,
-                deployment_block: 1,
-                required_confirmations: 0,
-                ingestion_cutoff: IngestionCutoff::Safe,
-            }),
+            chains: ChainRegistry::single_trading_chain(
+                TradingChain::test()
+                    .orderbook(address!("0x1234567890123456789012345678901234567890"))
+                    .inventory(InventoryMode::Managed {
+                        inventory: address!("0x1234567890123456789012345678901234567890"),
+                    })
+                    .vault_owner(Address::ZERO)
+                    .deployment_block(1)
+                    .call(),
+            ),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
@@ -2228,24 +2221,20 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            chains: ChainRegistry::single_trading_chain(TradingChain {
-                redemption_wallet: None,
-                assets: ChainAssets {
-                    equities: ChainEquities::default(),
-                    cash,
-                },
-                chain: Chain::Base,
-                inventory_adapters: InventoryAdapters::default(),
-                rpc_url: Url::parse("http://localhost:8545").unwrap(),
-                orderbook: address!("0x1234567890123456789012345678901234567890"),
-                inventory: InventoryMode::Managed {
-                    inventory: address!("0x1234567890123456789012345678901234567890"),
-                },
-                vault_owner: Address::ZERO,
-                deployment_block: 1,
-                required_confirmations: 0,
-                ingestion_cutoff: IngestionCutoff::Safe,
-            }),
+            chains: ChainRegistry::single_trading_chain(
+                TradingChain::test()
+                    .orderbook(address!("0x1234567890123456789012345678901234567890"))
+                    .inventory(InventoryMode::Managed {
+                        inventory: address!("0x1234567890123456789012345678901234567890"),
+                    })
+                    .vault_owner(Address::ZERO)
+                    .deployment_block(1)
+                    .assets(ChainAssets {
+                        equities: ChainEquities::default(),
+                        cash,
+                    })
+                    .call(),
+            ),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,

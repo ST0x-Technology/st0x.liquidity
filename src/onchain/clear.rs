@@ -253,10 +253,7 @@ mod tests {
     use alloy::rpc::types::Log;
     use rain_math_float::Float;
     use serde_json::json;
-    use url::Url;
 
-    use st0x_config::ChainAssets;
-    use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode};
     use st0x_evm::Chain;
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{Direction, FractionalShares};
@@ -275,21 +272,10 @@ mod tests {
     /// A non-Base chain, so a conversion path that hard-codes `Chain::Base`
     /// fails the chain-propagation assertions below.
     fn create_test_ctx() -> TradingChain {
-        TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Ethereum,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        }
+        TradingChain::test()
+            .chain(Chain::Ethereum)
+            .deployment_block(1)
+            .call()
     }
 
     fn create_clear_event(

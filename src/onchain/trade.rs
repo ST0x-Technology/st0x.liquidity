@@ -995,7 +995,7 @@ mod tests {
     use rain_math_float::Float;
 
     use st0x_config::{
-        ChainEquities, ChainEquityAsset, IngestionCutoff, InventoryAdapter, InventoryAdapterVenue,
+        ChainEquities, ChainEquityAsset, InventoryAdapter, InventoryAdapterVenue,
         InventoryAdapters, InventoryMode, OperationMode, TradingChain,
     };
     use st0x_evm::Chain;
@@ -1223,21 +1223,13 @@ mod tests {
         asserter.push_success(&serde_json::Value::Null);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
-        let ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: "http://localhost:8545".parse().unwrap(),
-            orderbook: Address::ZERO,
-            inventory: InventoryMode::Managed {
+        let ctx = TradingChain::test()
+            .orderbook(Address::ZERO)
+            .inventory(InventoryMode::Managed {
                 inventory: Address::ZERO,
-            },
-            vault_owner: Address::ZERO,
-            deployment_block: 0,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+            })
+            .vault_owner(Address::ZERO)
+            .call();
 
         let tx_hash =
             fixed_bytes!("0x4444444444444444444444444444444444444444444444444444444444444444");
@@ -1323,21 +1315,13 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
         seed_get_test_order_token_symbols(&cache);
-        let ctx = TradingChain {
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: "http://localhost:8545".parse().unwrap(),
-            orderbook,
-            inventory: InventoryMode::Managed {
+        let ctx = TradingChain::test()
+            .orderbook(orderbook)
+            .inventory(InventoryMode::Managed {
                 inventory: Address::ZERO,
-            },
-            vault_owner: order_owner,
-            deployment_block: 0,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-        };
+            })
+            .vault_owner(order_owner)
+            .call();
 
         let trade = OnchainTrade::try_from_tx_hash(
             tx_hash,
@@ -1441,19 +1425,15 @@ mod tests {
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtCOIN
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: inventory_adapters(InventoryAdapterVenue::Bebop, venue_operator),
-            rpc_url: "http://localhost:8545".parse().unwrap(),
-            orderbook,
-            inventory: InventoryMode::Managed { inventory },
-            vault_owner: inventory,
-            deployment_block: 0,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let ctx = TradingChain::test()
+            .orderbook(orderbook)
+            .inventory(InventoryMode::Managed { inventory })
+            .inventory_adapters(inventory_adapters(
+                InventoryAdapterVenue::Bebop,
+                venue_operator,
+            ))
+            .vault_owner(inventory)
+            .call();
         let ctx = TradingChain {
             assets: assets_config_with_equity("COIN", REAL_WTCOIN_BASE),
             ..ctx
@@ -1584,19 +1564,11 @@ mod tests {
         asserter.push_success(&receipt); // get_transaction_receipt
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: "http://localhost:8545".parse().unwrap(),
-            orderbook,
-            inventory: InventoryMode::Managed { inventory },
-            vault_owner: inventory,
-            deployment_block: 0,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let ctx = TradingChain::test()
+            .orderbook(orderbook)
+            .inventory(InventoryMode::Managed { inventory })
+            .vault_owner(inventory)
+            .call();
 
         let trade = OnchainTrade::try_from_tx_hash(
             tx_hash,
@@ -1696,19 +1668,11 @@ mod tests {
         asserter.push_success(&receipt); // get_transaction_receipt
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: "http://localhost:8545".parse().unwrap(),
-            orderbook,
-            inventory: InventoryMode::Managed { inventory },
-            vault_owner: inventory,
-            deployment_block: 0,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let ctx = TradingChain::test()
+            .orderbook(orderbook)
+            .inventory(InventoryMode::Managed { inventory })
+            .vault_owner(inventory)
+            .call();
 
         let trade = OnchainTrade::try_from_tx_hash(
             tx_hash,

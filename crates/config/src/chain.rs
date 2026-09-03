@@ -316,6 +316,48 @@ pub struct TradingChain {
     pub assets: ChainAssets,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[bon::bon]
+impl TradingChain {
+    /// Test fixture builder: every field defaults to the common test shape
+    /// (Base, localhost RPC, 0x11.. addresses, managed inventory, safe
+    /// cutoff), so fixtures state only the fields their test depends on and
+    /// new required fields sweep through one place.
+    #[builder]
+    pub fn test(
+        #[builder(default = Chain::Base)] chain: Chain,
+        #[builder(default = url::Url::parse("http://localhost:8545")
+            .unwrap_or_else(|_| unreachable!("hard-coded test RPC URL is valid")))]
+        rpc_url: url::Url,
+        #[builder(default = 0)] required_confirmations: u64,
+        #[builder(default = alloy::primitives::Address::repeat_byte(0x11))] orderbook: Address,
+        #[builder(default = InventoryMode::Managed {
+            inventory: alloy::primitives::Address::repeat_byte(0x11),
+        })]
+        inventory: InventoryMode,
+        #[builder(default)] inventory_adapters: InventoryAdapters,
+        #[builder(default = alloy::primitives::Address::repeat_byte(0x11))] vault_owner: Address,
+        #[builder(default = 0)] deployment_block: u64,
+        #[builder(default = IngestionCutoff::Safe)] ingestion_cutoff: IngestionCutoff,
+        redemption_wallet: Option<Address>,
+        #[builder(default)] assets: ChainAssets,
+    ) -> Self {
+        Self {
+            chain,
+            rpc_url,
+            required_confirmations,
+            orderbook,
+            inventory,
+            inventory_adapters,
+            vault_owner,
+            deployment_block,
+            ingestion_cutoff,
+            redemption_wallet,
+            assets,
+        }
+    }
+}
+
 impl std::fmt::Debug for TradingChain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TradingChain")

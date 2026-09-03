@@ -246,15 +246,13 @@ fn wrap_context(
 mod tests {
     use alloy::primitives::Address;
     use std::io::Write as _;
-    use url::Url;
 
     use st0x_config::ChainRegistry;
     use st0x_config::ExecutionThreshold;
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
-    use st0x_config::{BrokerCtx, ChainAssets, Ctx, LogFormat, LogLevel, TradingMode};
-    use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
-    use st0x_evm::Chain;
+    use st0x_config::{BrokerCtx, Ctx, LogFormat, LogLevel, TradingMode};
+    use st0x_config::{InventoryMode, TradingChain};
     use st0x_execution::{FractionalShares, Positive, Symbol};
     use st0x_hedge::operator::test_utils::try_positive_shares;
     use st0x_wrapper::MockWrapper;
@@ -278,21 +276,16 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            chains: ChainRegistry::single_trading_chain(TradingChain {
-                redemption_wallet: None,
-                assets: ChainAssets::default(),
-                chain: Chain::Base,
-                inventory_adapters: InventoryAdapters::default(),
-                rpc_url: Url::parse("http://localhost:8545").unwrap(),
-                orderbook: Address::random(),
-                inventory: InventoryMode::Managed {
-                    inventory: Address::random(),
-                },
-                vault_owner: Address::ZERO,
-                deployment_block: 1,
-                required_confirmations: 0,
-                ingestion_cutoff: IngestionCutoff::Safe,
-            }),
+            chains: ChainRegistry::single_trading_chain(
+                TradingChain::test()
+                    .orderbook(Address::random())
+                    .inventory(InventoryMode::Managed {
+                        inventory: Address::random(),
+                    })
+                    .vault_owner(Address::ZERO)
+                    .deployment_block(1)
+                    .call(),
+            ),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
