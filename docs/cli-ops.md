@@ -121,9 +121,9 @@ by the issuer rather than the market-making wallet:
 s01 dividend-bump -s COIN -q 10
 ```
 
-The droplet that used to host the `s01` wrapper is retired, so a dividend
-bump now runs from a keyholder's machine: decrypt the secret with your age
-identity and point the CLI at the committed config:
+The droplet that used to host the `s01` wrapper is retired, so a dividend bump
+now runs from a keyholder's machine: decrypt the secret with your age identity
+and point the CLI at the committed config:
 
 ```sh
 nix develop -c secret decrypt s01-issuer.toml   # or: ragenix -d secret/s01-issuer.toml.age -i <key>
@@ -133,12 +133,11 @@ cargo run --bin cli -- \
   dividend-bump -s COIN -q 10
 ```
 
-(Follow-up: re-home the secret to Secret Manager and mount the issuer
-pair into the GCE bot container so this runs via `docker exec` like
-`stox`.)
-**Always run a dividend bump as the issuer:** a plain `stox dividend-bump` would
-buy, tokenize, and donate from the **market-making** wallet, not the issuer. To
-use `stox` you must pass the issuer `--config`/`--secrets` explicitly.
+(Follow-up: re-home the secret to Secret Manager and mount the issuer pair into
+the GCE bot container so this runs via `docker exec` like `stox`.) **Always run
+a dividend bump as the issuer:** a plain `stox dividend-bump` would buy,
+tokenize, and donate from the **market-making** wallet, not the issuer. To use
+`stox` you must pass the issuer `--config`/`--secrets` explicitly.
 
 The command buys 10 COIN offchain and waits for the fill, tokenizes the exact
 quantity Alpaca reports as filled, then donates that same quantity into the

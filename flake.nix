@@ -78,9 +78,6 @@
       st0x-deploy,
       ...
     }:
-    let
-      inherit (rainix.inputs.nixpkgs) lib;
-    in
     flake-utils.lib.eachDefaultSystem (
       system:
       let

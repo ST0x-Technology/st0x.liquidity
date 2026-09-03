@@ -275,20 +275,19 @@ metric. Scan-time transient and rate-limited preflight failures instead wait for
 
 Both environments run on GCE VMs under docker compose, managed by
 [t0.devops](https://github.com/T0Trade/t0.devops)
-(`terraform/staging-liquidity`, `terraform/production-liquidity`). This
-repo builds and ships the OCI images (`.github/workflows/build-oci.yml`:
-flake `packages`, pushed and attested to the central Artifact Registry);
-a master merge rolls staging automatically, production is a digest
-promotion in t0.devops behind a PAM-gated apply. There is exactly one
-runtime config per environment and it lives in t0.devops (config-as-data,
-mounted from Secret Manager); this repo carries only test fixtures
-(`example.config.toml`, `e2e/config.toml`) and the dividend-ops CLI
-config (`config/s01-issuer.toml`, see docs/cli-ops.md).
+(`terraform/staging-liquidity`, `terraform/production-liquidity`). This repo
+builds and ships the OCI images (`.github/workflows/build-oci.yml`: flake
+`packages`, pushed and attested to the central Artifact Registry); a master
+merge rolls staging automatically, production is a digest promotion in t0.devops
+behind a PAM-gated apply. There is exactly one runtime config per environment
+and it lives in t0.devops (config-as-data, mounted from Secret Manager); this
+repo carries only test fixtures (`example.config.toml`, `e2e/config.toml`) and
+the dividend-ops CLI config (`config/s01-issuer.toml`, see docs/cli-ops.md).
 
-The old DigitalOcean/NixOS droplet world (deploy-rs, os.nix, infra/
-Terraform, nixos-anywhere bootstrap) is retired and deleted; the one
-agenix survivor is `secret/s01-issuer.toml.age`, edited with
-`nix run .#secret` against `secret/secrets.nix`.
+The old DigitalOcean/NixOS droplet world (deploy-rs, os.nix, infra/ Terraform,
+nixos-anywhere bootstrap) is retired and deleted; the one agenix survivor is
+`secret/s01-issuer.toml.age`, edited with `nix run .#secret` against
+`secret/secrets.nix`.
 
 ### CI/CD
 
@@ -453,8 +452,8 @@ Pass `-i <path>` to use a different key.
 | `st0x-clippy`    | `nix build .#st0x-clippy`    | Clippy linting      |
 | `st0x-dashboard` | `nix build .#st0x-dashboard` | SvelteKit dashboard |
 
-**Deployment** happens in t0.devops (see the Deployment section above);
-this repo has no deploy commands. The one operational wrapper left is
+**Deployment** happens in t0.devops (see the Deployment section above); this
+repo has no deploy commands. The one operational wrapper left is
 `nix run .#secret <file.age>` for the dividend-ops secret.
 
 ### Dashboard Dependencies
