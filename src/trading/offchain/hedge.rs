@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::U256;
-use metrics::counter;
+use metrics::{counter, histogram};
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use st0x_float_macro::float;
@@ -987,6 +987,17 @@ pub(crate) async fn resolve_overnight_reference_price(
     let age = (now - indicative.at)
         .to_std()
         .unwrap_or(std::time::Duration::ZERO);
+
+    // Recorded before the staleness gate on purpose: a distribution that
+    // censored the stale tail would hide exactly the feed lag that makes
+    // placements defer.
+    histogram!(
+        "hedge_quote_age_seconds",
+        "symbol" => symbol.to_string(),
+        "source" => ReferencePriceSource::OvernightQuote.metric_label()
+    )
+    .record(age.as_secs_f64());
+
     if age > max_quote_age {
         return Err(OvernightReferenceError::Stale {
             age,
@@ -6270,6 +6281,7 @@ mod tests {
 
     #[tokio::test]
     async fn overnight_reference_defers_on_a_stale_quote() {
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
         let now = chrono::Utc::now();
         let stale_at = now - chrono::Duration::seconds(45);
         let placer = crate::offchain::order::ExecutorOrderPlacer(
@@ -6292,6 +6304,14 @@ mod tests {
             ),
             "expected the exact staleness, got {error:?}"
         );
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                "hedge_quote_age_seconds_count{symbol=\"RKLB\",source=\"overnight_quote\"} 1"
+            ),
+            "a stale quote must still record its age sample -- the stale tail is the \
+             point of the distribution, got:\n{rendered}"
+        );
     }
 
     #[tokio::test]
@@ -6299,6 +6319,7 @@ mod tests {
         // A quote stamped slightly in the future (broker clock skew) has
         // age zero, never a huge unsigned wrap -- the same clamp the
         // executor-side validator applies.
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
         let now = chrono::Utc::now();
         let future_at = now + chrono::Duration::seconds(5);
         let placer = crate::offchain::order::ExecutorOrderPlacer(
@@ -6317,12 +6338,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(reference.price, usd("24.30"));
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                "hedge_quote_age_seconds_count{symbol=\"RKLB\",source=\"overnight_quote\"} 1"
+            ),
+            "a successful resolution must record one quote-age sample, got:\n{rendered}"
+        );
     }
 
     #[tokio::test]
     async fn overnight_reference_defers_when_the_quote_fetch_fails() {
         // No fallback chain: a failed overnight quote fetch defers the
         // hedge rather than pricing from a mark or delayed print.
+        let handle = crate::metrics::setup().expect("install Prometheus recorder");
         let placer = crate::offchain::order::ExecutorOrderPlacer(MockExecutor::new());
         let symbol = Symbol::new("RKLB").unwrap();
 
@@ -6339,6 +6368,11 @@ mod tests {
         assert!(
             matches!(error, OvernightReferenceError::QuoteFetch(_)),
             "expected QuoteFetch, got {error:?}"
+        );
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("hedge_quote_age_seconds_count{"),
+            "a failed fetch has no quote to age -- nothing may be recorded, got:\n{rendered}"
         );
     }
 
