@@ -521,7 +521,8 @@ async fn ingest_position(
         | PositionEvent::OnChainFillApplied { .. }
         | PositionEvent::OnChainFillSettled { .. }
         | PositionEvent::OffChainOrderFailed { .. }
-        | PositionEvent::OffChainOrderCancelled { .. } => {}
+        | PositionEvent::OffChainOrderCancelled { .. }
+        | PositionEvent::ReorgSettled { .. } => {}
     }
 
     Ok(())
