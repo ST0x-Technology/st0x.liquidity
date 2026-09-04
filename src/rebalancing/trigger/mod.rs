@@ -5821,6 +5821,7 @@ mod tests {
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
@@ -5865,6 +5866,7 @@ mod tests {
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
@@ -5921,6 +5923,7 @@ mod tests {
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
@@ -5977,6 +5980,7 @@ mod tests {
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
@@ -6100,6 +6104,7 @@ mod tests {
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
@@ -7739,6 +7744,7 @@ mod tests {
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
@@ -8328,6 +8334,7 @@ mod tests {
     async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) {
         let store = test_store::<VaultRegistry>(pool.clone(), ());
         let vault_registry_id = VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
         };
@@ -8373,6 +8380,7 @@ mod tests {
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
@@ -8613,6 +8621,7 @@ mod tests {
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
@@ -8686,6 +8695,7 @@ mod tests {
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
@@ -20059,6 +20069,7 @@ mod tests {
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
@@ -20458,6 +20469,7 @@ mod tests {
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: Address::ZERO,
                 owner: Address::ZERO,
             },
@@ -20687,6 +20699,7 @@ mod tests {
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
@@ -20758,6 +20771,7 @@ mod tests {
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
@@ -20839,6 +20853,7 @@ mod tests {
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
@@ -20904,6 +20919,7 @@ mod tests {
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
@@ -26126,6 +26142,7 @@ mod tests {
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
@@ -26209,6 +26226,7 @@ mod tests {
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },

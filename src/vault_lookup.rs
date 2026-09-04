@@ -201,6 +201,7 @@ mod tests {
         store
             .send(
                 &VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
                     orderbook: TEST_ORDERBOOK,
                     owner: TEST_OWNER,
                 },
@@ -216,6 +217,7 @@ mod tests {
         VaultRegistryLookup::new(
             projection,
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_OWNER,
             },
@@ -230,6 +232,7 @@ mod tests {
             .await
             .unwrap();
         let registry_id = VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook: TEST_ORDERBOOK,
             owner: TEST_OWNER,
         };
@@ -259,6 +262,7 @@ mod tests {
         let lookup = VaultRegistryLookup::new(
             projection,
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_OWNER,
             },
@@ -289,6 +293,7 @@ mod tests {
             .await
             .unwrap();
         let registry_id = VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook: TEST_ORDERBOOK,
             owner: TEST_OWNER,
         };
@@ -313,6 +318,7 @@ mod tests {
         let lookup = VaultRegistryLookup::new(
             projection,
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_OWNER,
             },
@@ -369,6 +375,7 @@ mod tests {
         let lookup = VaultRegistryLookup::new(
             projection,
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_OWNER,
             },

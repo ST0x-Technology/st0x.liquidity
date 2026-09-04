@@ -117,7 +117,9 @@ default chain, or is removed. Zero or multiple primary claimants fail startup
 with a named error. Chains without a trading table are **transport** chains
 (RPC + confirmations only, e.g. Ethereum while it only carries CCTP transfers).
 Watch settings are per chain: poll interval, ingestion cutoff, asset tables with
-per-chain enable/disable flags.
+per-chain enable/disable flags. Startup verifies every watched chain (chain-id
+identity, cutoff support) and any failure is fatal; degraded per-chain startup
+is deferred to the chain-disable work.
 
 ##### Shared-Inventory Settlement
 
@@ -1234,7 +1236,9 @@ event position).
   or rebalancing operations. When re-enabled (`trading = "enabled"`), the system
   resumes both executing accumulated counter-trade positions and evaluating
   rebalancing triggers for any resulting inventory imbalances (same semantics as
-  market close/open behavior)
+  market close/open behavior). A fill landing on a disabled asset raises a
+  deduplicated critical operational alert (once per process per symbol): the
+  delta exposure it accumulates is deliberate, but never silent
 
 ### Infrastructure and Deployment
 

@@ -2760,7 +2760,6 @@ mod tests {
             offchain_order: offchain_order_store,
             order_placer,
             execution_threshold: ExecutionThreshold::whole_share(),
-            assets: ChainAssets::default(),
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
             close_flatten_policy:
                 st0x_hedge::operator::trading::offchain::close_flatten::CloseFlattenPolicy::from_secs(900).unwrap(),
@@ -2802,6 +2801,7 @@ mod tests {
             &trade_event,
             onchain_trade,
             &cqrs,
+            &ChainAssets::default(),
             true,
         )
         .await
