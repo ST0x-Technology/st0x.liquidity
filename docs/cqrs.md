@@ -164,6 +164,15 @@ executing (events not yet persisted), a `load()` sees the pre-transition state;
 once the command's events persist -- momentarily before `send()` returns and
 releases the lock -- a concurrent `load()` already observes them.
 
+Events constructed inside a command handler are not durable until the handler
+returns successfully and `Store::send()` persists the returned event vector. A
+handler must therefore not construct an intent event, await an external side
+effect, and assume that the earlier event protects the side effect: an error or
+crash during the await discards the whole vector. Persist intent with one
+command, then perform the external side effect from a later command. Recovery
+after that boundary must reconcile by the persisted external identity rather
+than blindly repeat an operation whose outcome can be unknown.
+
 ## Reading State via Projections
 
 Production code reads entity state through `Projection`, never by loading
@@ -807,3 +816,15 @@ assert!(matches!(
     Err(LifecycleError::Apply(MyError::SpecificVariant))
 ));
 ```
+
+### Command identity and provider idempotency
+
+`Store::send(id, command)` uses `id` for persistence and locking, but
+`EventSourced::initialize` and `transition` receive only the command and
+services. They cannot independently compare a command's request ID with the
+store key. Callers must pass the same ID to both. Mint intents also persist that
+ID in `MintRequested`, so subsequent submit/reconcile commands reject a
+different ID before provider lookup or submission. Legacy mint events have no
+stored ID; they remain replayable and use the caller's aggregate ID with an
+explicit warning. Snapshot schema version 6 ensures replay retains the new
+field.

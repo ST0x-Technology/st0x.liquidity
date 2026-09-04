@@ -33,6 +33,15 @@
 | Type that must exist in all builds but is | Always compiled; methods gated with |
 | only functional in tests                  | `#[cfg(feature = "test-support")]`  |
 
+### CLI test feature selection
+
+CLI test runs need `--all-features` (or explicit `--features test-support`). Its
+dev dependencies enable `st0x-hedge/test-support`, which also enables the extra
+test-only CCTP context fields. Without the CLI's own `test-support` feature, its
+initializers omit those fields and fail compilation. For a focused CLI test use
+`cargo nextest run -p st0x-cli --all-features -E 'test(name)'`, matching CI's
+feature selection.
+
 ### Common pitfall: dead code warnings
 
 A `pub` method gated on `cfg(any(test, feature = "test-support"))` will trigger

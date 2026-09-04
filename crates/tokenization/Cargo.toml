@@ -24,6 +24,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+url.workspace = true
 uuid.workspace = true
 
 st0x-evm.workspace = true
@@ -32,6 +33,7 @@ st0x-float-serde.workspace = true
 
 [dev-dependencies]
 httpmock.workspace = true
+proptest.workspace = true
 st0x-evm = { workspace = true, features = [
   "mock",
   "test-support",

@@ -13,7 +13,7 @@
 //!     Failed          Failed          Failed           Failed
 //! ```
 //!
-//! - `MintRequested` can be rejected by Alpaca during `RequestMint`
+//! - `MintRequested` can be rejected by Alpaca during `SubmitMintRequest`
 //! - `MintAccepted` can fail via `Poll` (rejection/timeout/error)
 //! - `DepositedIntoRaindex` and `Failed` are terminal states
 //!
@@ -23,7 +23,7 @@
 //!
 //! 1. **Request**: System initiates mint request with symbol,
 //!    quantity, and destination wallet
-//! 2. **Acceptance**: Alpaca responds with `issuer_request_id` and
+//! 2. **Acceptance**: Alpaca echoes `client_request_id` and returns
 //!    `tokenization_request_id`
 //! 3. **Transfer**: Alpaca executes onchain transfer, system detects
 //!    transaction
@@ -50,7 +50,10 @@ use st0x_dto::{EquityMintOperation, EquityMintStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Id;
-use st0x_tokenization::{IssuerRequestId, TokenizationRequestId, TokenizationRequestStatus};
+use st0x_tokenization::{
+    ClientRequestId, IssuerRequestId, TokenizationRequest, TokenizationRequestId,
+    TokenizationRequestStatus, TokenizationRequestType,
+};
 
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
@@ -99,6 +102,32 @@ pub enum TokenizedEquityMintError {
     /// by DomainError).
     #[error("Mint request failed: {error_message}")]
     RequestFailed { error_message: String },
+    #[error("Provider request type mismatch: expected mint, returned {actual_request_type:?}")]
+    ProviderRequestTypeMismatch {
+        actual_request_type: Option<TokenizationRequestType>,
+    },
+    #[error("Provider client request id mismatch: expected {expected}, returned {actual:?}")]
+    ProviderClientRequestIdMismatch {
+        expected: IssuerRequestId,
+        actual: Option<ClientRequestId>,
+    },
+    #[error("Mint command request id mismatch: expected {expected}, received {actual}")]
+    CommandRequestIdMismatch {
+        expected: IssuerRequestId,
+        actual: IssuerRequestId,
+    },
+    #[error("Provider symbol mismatch: expected {expected}, returned {actual}")]
+    ProviderSymbolMismatch { expected: Symbol, actual: Symbol },
+    #[error("Provider quantity mismatch: expected {expected}, returned {actual}")]
+    ProviderQuantityMismatch {
+        expected: FractionalShares,
+        actual: FractionalShares,
+    },
+    #[error("Provider wallet mismatch: expected {expected}, returned {actual:?}")]
+    ProviderWalletMismatch {
+        expected: Address,
+        actual: Option<Address>,
+    },
     /// Completed mint response missing tx_hash
     #[error("Missing tx_hash in completed mint response")]
     MissingTxHash,
@@ -173,6 +202,64 @@ impl PartialEq for TokenizedEquityMintError {
                 Self::AuthorizationSigningFailed { error_message: b },
             )
             | (Self::Float(a), Self::Float(b)) => a == b,
+            (
+                Self::ProviderRequestTypeMismatch {
+                    actual_request_type: a,
+                },
+                Self::ProviderRequestTypeMismatch {
+                    actual_request_type: b,
+                },
+            ) => a == b,
+            (
+                Self::ProviderClientRequestIdMismatch {
+                    expected: expected_a,
+                    actual: actual_a,
+                },
+                Self::ProviderClientRequestIdMismatch {
+                    expected: expected_b,
+                    actual: actual_b,
+                },
+            ) => expected_a == expected_b && actual_a == actual_b,
+            (
+                Self::CommandRequestIdMismatch {
+                    expected: expected_a,
+                    actual: actual_a,
+                },
+                Self::CommandRequestIdMismatch {
+                    expected: expected_b,
+                    actual: actual_b,
+                },
+            ) => expected_a == expected_b && actual_a == actual_b,
+            (
+                Self::ProviderSymbolMismatch {
+                    expected: expected_a,
+                    actual: actual_a,
+                },
+                Self::ProviderSymbolMismatch {
+                    expected: expected_b,
+                    actual: actual_b,
+                },
+            ) => expected_a == expected_b && actual_a == actual_b,
+            (
+                Self::ProviderQuantityMismatch {
+                    expected: expected_a,
+                    actual: actual_a,
+                },
+                Self::ProviderQuantityMismatch {
+                    expected: expected_b,
+                    actual: actual_b,
+                },
+            ) => expected_a == expected_b && actual_a == actual_b,
+            (
+                Self::ProviderWalletMismatch {
+                    expected: expected_a,
+                    actual: actual_a,
+                },
+                Self::ProviderWalletMismatch {
+                    expected: expected_b,
+                    actual: actual_b,
+                },
+            ) => expected_a == expected_b && actual_a == actual_b,
             (Self::VaultLookupFailed(a), Self::VaultLookupFailed(b))
             | (
                 Self::MissingTokenSymbol { expected_symbol: a },
@@ -207,15 +294,7 @@ impl From<FloatError> for TokenizedEquityMintError {
 /// Commands for the TokenizedEquityMint aggregate.
 #[derive(Debug, Clone)]
 pub enum TokenizedEquityMintCommand {
-    /// Request tokenization from Alpaca and poll until tokens arrive or failure.
-    ///
-    /// Flow: MintRequested -> MintAccepted -> TokensReceived (success)
-    ///                     or MintRejected (immediate failure)
-    ///                     or MintAcceptanceFailed (failure after acceptance)
-    /// Calls `request_mint()` on the tokenizer service.
-    ///
-    /// Emits MintRequested + MintAccepted (success)
-    ///     or MintRequested + MintRejected (immediate rejection)
+    /// Persist mint intent without calling the external provider.
     RequestMint {
         issuer_request_id: IssuerRequestId,
         symbol: Symbol,
@@ -232,6 +311,21 @@ pub enum TokenizedEquityMintCommand {
         quantity: Float,
         wallet: Address,
         requested_at: DateTime<Utc>,
+    },
+    /// Submit a freshly persisted mint intent to the provider exactly once.
+    SubmitMintRequest {
+        issuer_request_id: IssuerRequestId,
+    },
+    /// Test/fixture-only submission with an explicit acceptance timestamp.
+    #[cfg(any(test, feature = "test-support"))]
+    SubmitMintRequestAt {
+        issuer_request_id: IssuerRequestId,
+        accepted_at: DateTime<Utc>,
+    },
+    /// Resume a persisted mint intent by provider lookup. A no-match result
+    /// replays the request with its original client identity and idempotency key.
+    ReconcileMintRequest {
+        issuer_request_id: IssuerRequestId,
     },
     /// Calls `poll_mint_until_complete()` on the tokenizer service.
     ///
@@ -349,9 +443,17 @@ pub enum TokenizedEquityMintCommand {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+enum MintProviderAction {
+    Submit,
+    Reconcile,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TokenizedEquityMintEvent {
     MintRequested {
+        #[serde(default)]
+        issuer_request_id: Option<IssuerRequestId>,
         symbol: Symbol,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
@@ -489,19 +591,22 @@ impl PartialEq for TokenizedEquityMintEvent {
         match (self, other) {
             (
                 Self::MintRequested {
+                    issuer_request_id: id_a,
                     symbol: sym_a,
                     quantity: qty_a,
                     wallet: wal_a,
                     requested_at: req_a,
                 },
                 Self::MintRequested {
+                    issuer_request_id: id_b,
                     symbol: sym_b,
                     quantity: qty_b,
                     wallet: wal_b,
                     requested_at: req_b,
                 },
             ) => {
-                sym_a == sym_b
+                id_a == id_b
+                    && sym_a == sym_b
                     && qty_a.eq(*qty_b).unwrap_or(false)
                     && wal_a == wal_b
                     && req_a == req_b
@@ -774,6 +879,8 @@ pub enum MintAuthorizationProgress {
 pub enum TokenizedEquityMint {
     /// Mint request initiated with symbol, quantity, and destination wallet
     MintRequested {
+        #[serde(default)]
+        issuer_request_id: Option<IssuerRequestId>,
         symbol: Symbol,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
@@ -959,19 +1066,22 @@ impl PartialEq for TokenizedEquityMint {
         match (self, other) {
             (
                 Self::MintRequested {
+                    issuer_request_id: id_a,
                     symbol: sym_a,
                     quantity: qty_a,
                     wallet: wal_a,
                     requested_at: req_a,
                 },
                 Self::MintRequested {
+                    issuer_request_id: id_b,
                     symbol: sym_b,
                     quantity: qty_b,
                     wallet: wal_b,
                     requested_at: req_b,
                 },
             ) => {
-                sym_a == sym_b
+                id_a == id_b
+                    && sym_a == sym_b
                     && qty_a.eq(*qty_b).unwrap_or(false)
                     && wal_a == wal_b
                     && req_a == req_b
@@ -1501,6 +1611,7 @@ pub(crate) async fn interrupted_mint_ids(
             AND last_ev.sequence = latest.max_seq \
          WHERE last_ev.aggregate_type = 'TokenizedEquityMint' \
            AND last_ev.event_type IN ( \
+               'TokenizedEquityMintEvent::MintRequested', \
                'TokenizedEquityMintEvent::MintAccepted', \
                'TokenizedEquityMintEvent::MintAuthorizationSigned', \
                'TokenizedEquityMintEvent::MintAuthorizationDelivered', \
@@ -1593,17 +1704,21 @@ impl EventSourced for TokenizedEquityMint {
     // orchestrator-mode recipient authorizations (RAI-1243). Additive only;
     // bumped to clear stale snapshots (existing events replay unchanged --
     // the field is `#[serde(default)]`).
-    const SCHEMA_VERSION: u64 = 5;
+    // v6 invalidates snapshots so replay retains the optional request identity
+    // in MintRequested. Events written before v6 deserialize with no identity.
+    const SCHEMA_VERSION: u64 = 6;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use TokenizedEquityMintEvent::*;
         match event {
             MintRequested {
+                issuer_request_id,
                 symbol,
                 quantity,
                 wallet,
                 requested_at,
             } => Some(Self::MintRequested {
+                issuer_request_id: issuer_request_id.clone(),
                 symbol: symbol.clone(),
                 quantity: *quantity,
                 wallet: *wallet,
@@ -1668,6 +1783,7 @@ impl EventSourced for TokenizedEquityMint {
                     quantity,
                     wallet,
                     requested_at,
+                    ..
                 } = entity
                 else {
                     return Ok(None);
@@ -2068,7 +2184,7 @@ impl EventSourced for TokenizedEquityMint {
 
     async fn initialize(
         command: Self::Command,
-        services: &Self::Services,
+        _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use TokenizedEquityMintEvent::*;
 
@@ -2102,61 +2218,13 @@ impl EventSourced for TokenizedEquityMint {
             "Initiating mint request"
         );
 
-        let mint_requested = MintRequested {
-            symbol: symbol.clone(),
+        Ok(vec![MintRequested {
+            issuer_request_id: Some(issuer_request_id),
+            symbol,
             quantity,
             wallet,
             requested_at: now,
-        };
-
-        let alpaca_request = match services
-            .tokenizer
-            .request_mint(
-                symbol,
-                FractionalShares::new(quantity),
-                wallet,
-                issuer_request_id.clone(),
-            )
-            .await
-        {
-            Ok(req) => req,
-            Err(error) => {
-                return Err(TokenizedEquityMintError::RequestFailed {
-                    error_message: error.to_string(),
-                });
-            }
-        };
-
-        if matches!(alpaca_request.status, TokenizationRequestStatus::Rejected) {
-            warn!(
-                target: "tokenization",
-                symbol = %alpaca_request.underlying_symbol,
-                "Mint request rejected by Alpaca"
-            );
-            return Ok(vec![
-                mint_requested,
-                MintRejected {
-                    reason: "Rejected by Alpaca".to_string(),
-                    rejected_at: now,
-                },
-            ]);
-        }
-
-        info!(
-            target: "tokenization",
-            symbol = %alpaca_request.underlying_symbol,
-            request_id = %alpaca_request.id,
-            "Mint request accepted by Alpaca"
-        );
-
-        Ok(vec![
-            mint_requested,
-            MintAccepted {
-                issuer_request_id,
-                tokenization_request_id: alpaca_request.id,
-                accepted_at: now,
-            },
-        ])
+        }])
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2173,6 +2241,40 @@ impl EventSourced for TokenizedEquityMint {
             #[cfg(any(test, feature = "test-support"))]
             TokenizedEquityMintCommand::RequestMintAt { .. } => {
                 Err(TokenizedEquityMintError::AlreadyInProgress)
+            }
+
+            TokenizedEquityMintCommand::SubmitMintRequest { issuer_request_id } => {
+                self.transition_mint_provider_request(
+                    services,
+                    issuer_request_id,
+                    MintProviderAction::Submit,
+                    None,
+                )
+                .await
+            }
+
+            #[cfg(any(test, feature = "test-support"))]
+            TokenizedEquityMintCommand::SubmitMintRequestAt {
+                issuer_request_id,
+                accepted_at,
+            } => {
+                self.transition_mint_provider_request(
+                    services,
+                    issuer_request_id,
+                    MintProviderAction::Submit,
+                    Some(accepted_at),
+                )
+                .await
+            }
+
+            TokenizedEquityMintCommand::ReconcileMintRequest { issuer_request_id } => {
+                self.transition_mint_provider_request(
+                    services,
+                    issuer_request_id,
+                    MintProviderAction::Reconcile,
+                    None,
+                )
+                .await
             }
 
             TokenizedEquityMintCommand::Poll => self.transition_poll(services, None).await,
@@ -2365,6 +2467,213 @@ impl EventSourced for TokenizedEquityMint {
 }
 
 impl TokenizedEquityMint {
+    async fn transition_mint_provider_request(
+        &self,
+        services: &EquityTransferServices,
+        issuer_request_id: IssuerRequestId,
+        action: MintProviderAction,
+        override_accepted_at: Option<DateTime<Utc>>,
+    ) -> Result<Vec<TokenizedEquityMintEvent>, TokenizedEquityMintError> {
+        use TokenizedEquityMintEvent::{MintAccepted, MintRejected};
+
+        let (persisted_request_id, symbol, quantity, wallet) = match self {
+            Self::MintRequested {
+                issuer_request_id,
+                symbol,
+                quantity,
+                wallet,
+                ..
+            } => (issuer_request_id, symbol, quantity, wallet),
+            Self::MintAccepted { .. }
+            | Self::TokensReceived { .. }
+            | Self::WrapSubmitted { .. }
+            | Self::TokensWrapped { .. }
+            | Self::VaultDepositSubmitted { .. } => {
+                return Err(TokenizedEquityMintError::AlreadyInProgress);
+            }
+            Self::DepositedIntoRaindex { .. } => {
+                return Err(TokenizedEquityMintError::AlreadyCompleted);
+            }
+            Self::Failed { .. } => return Err(TokenizedEquityMintError::AlreadyFailed),
+            Self::Reconciled { .. } => {
+                return Err(TokenizedEquityMintError::AlreadyReconciled);
+            }
+        };
+
+        let issuer_request_id = match persisted_request_id {
+            Some(expected) if expected != &issuer_request_id => {
+                return Err(TokenizedEquityMintError::CommandRequestIdMismatch {
+                    expected: expected.clone(),
+                    actual: issuer_request_id,
+                });
+            }
+            Some(expected) => expected.clone(),
+            None => {
+                warn!(
+                    target: "tokenization",
+                    %issuer_request_id,
+                    "Legacy mint intent has no stored request id; using the aggregate owner's command id"
+                );
+                issuer_request_id
+            }
+        };
+
+        let (provider_request, submitted) = match action {
+            MintProviderAction::Submit => (
+                services
+                    .tokenizer
+                    .request_mint(
+                        symbol.clone(),
+                        FractionalShares::new(*quantity),
+                        *wallet,
+                        issuer_request_id.clone(),
+                    )
+                    .await,
+                true,
+            ),
+            MintProviderAction::Reconcile => match services
+                .tokenizer
+                .find_mint_by_issuer_request_id(&issuer_request_id)
+                .await
+            {
+                Ok(Some(request)) => (Ok(request), false),
+                Ok(None) => {
+                    warn!(
+                        target: "tokenization",
+                        %issuer_request_id,
+                        %symbol,
+                        "Provider lookup found no mint; replaying the request with its idempotency key"
+                    );
+                    (
+                        services
+                            .tokenizer
+                            .request_mint(
+                                symbol.clone(),
+                                FractionalShares::new(*quantity),
+                                *wallet,
+                                issuer_request_id.clone(),
+                            )
+                            .await,
+                        true,
+                    )
+                }
+                Err(error) => (Err(error), false),
+            },
+        };
+
+        let provider_request = match provider_request {
+            Ok(request) => request,
+            Err(error) => {
+                if submitted && error.is_definitive_mint_rejection() {
+                    warn!(
+                        target: "tokenization",
+                        %issuer_request_id,
+                        %symbol,
+                        %error,
+                        "Mint request definitively rejected by provider"
+                    );
+                    return Ok(vec![MintRejected {
+                        reason: error.to_string(),
+                        rejected_at: Utc::now(),
+                    }]);
+                }
+
+                return Err(TokenizedEquityMintError::RequestFailed {
+                    error_message: error.to_string(),
+                });
+            }
+        };
+
+        Self::validate_provider_request(
+            &provider_request,
+            &issuer_request_id,
+            symbol,
+            FractionalShares::new(*quantity),
+            *wallet,
+        )?;
+
+        match provider_request.status {
+            TokenizationRequestStatus::Pending | TokenizationRequestStatus::Completed => {
+                info!(
+                    target: "tokenization",
+                    %issuer_request_id,
+                    %symbol,
+                    request_id = %provider_request.id,
+                    "Mint request accepted by provider"
+                );
+                Ok(vec![MintAccepted {
+                    issuer_request_id,
+                    tokenization_request_id: provider_request.id,
+                    accepted_at: override_accepted_at.unwrap_or_else(Utc::now),
+                }])
+            }
+            TokenizationRequestStatus::Rejected => {
+                warn!(
+                    target: "tokenization",
+                    %issuer_request_id,
+                    %symbol,
+                    "Mint request rejected by provider"
+                );
+                Ok(vec![MintRejected {
+                    reason: "Rejected by provider".to_string(),
+                    rejected_at: Utc::now(),
+                }])
+            }
+        }
+    }
+
+    fn validate_provider_request(
+        request: &TokenizationRequest,
+        issuer_request_id: &IssuerRequestId,
+        symbol: &Symbol,
+        quantity: FractionalShares,
+        wallet: Address,
+    ) -> Result<(), TokenizedEquityMintError> {
+        match request.r#type {
+            Some(TokenizationRequestType::Redeem) => {
+                return Err(TokenizedEquityMintError::ProviderRequestTypeMismatch {
+                    actual_request_type: request.r#type,
+                });
+            }
+            Some(TokenizationRequestType::Mint) => {}
+            None => {
+                warn!(
+                    target: "tokenization",
+                    request_id = %request.id,
+                    %issuer_request_id,
+                    "Matched provider mint request omitted its request type"
+                );
+            }
+        }
+        let expected_client_request_id = ClientRequestId::from(issuer_request_id);
+        if request.client_request_id.as_ref() != Some(&expected_client_request_id) {
+            return Err(TokenizedEquityMintError::ProviderClientRequestIdMismatch {
+                expected: issuer_request_id.clone(),
+                actual: request.client_request_id.clone(),
+            });
+        }
+        if &request.underlying_symbol != symbol {
+            return Err(TokenizedEquityMintError::ProviderSymbolMismatch {
+                expected: symbol.clone(),
+                actual: request.underlying_symbol.clone(),
+            });
+        }
+        if request.quantity != quantity {
+            return Err(TokenizedEquityMintError::ProviderQuantityMismatch {
+                expected: quantity,
+                actual: request.quantity,
+            });
+        }
+        if request.wallet.is_some_and(|actual| actual != wallet) {
+            return Err(TokenizedEquityMintError::ProviderWalletMismatch {
+                expected: wallet,
+                actual: request.wallet,
+            });
+        }
+
+        Ok(())
+    }
+
     /// Human-readable state label for logs: `Debug` on the aggregate dumps
     /// every field, and `std::mem::discriminant` prints an opaque token
     /// that does not identify the state.
@@ -2746,13 +3055,173 @@ mod tests {
         }
     }
 
+    async fn request_and_submit(store: &TestStore<TokenizedEquityMint>, id: &IssuerRequestId) {
+        store.send(id, mint_command()).await.unwrap();
+        store
+            .send(
+                id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    fn provider_mint_request(
+        id: &IssuerRequestId,
+        status: TokenizationRequestStatus,
+    ) -> TokenizationRequest {
+        let mut request = TokenizationRequest::mock(status);
+        request.r#type = Some(TokenizationRequestType::Mint);
+        request.underlying_symbol = Symbol::new("AAPL").unwrap();
+        request.quantity = FractionalShares::new(float!(10));
+        request.wallet = Some(Address::ZERO);
+        request.client_request_id = Some(ClientRequestId::from(id));
+        request
+    }
+
+    #[test]
+    fn provider_request_missing_echoed_identity_is_rejected() {
+        let id = issuer_request_id("ISS001");
+        let mut request = provider_mint_request(&id, TokenizationRequestStatus::Pending);
+        request.client_request_id = None;
+
+        let result = TokenizedEquityMint::validate_provider_request(
+            &request,
+            &id,
+            &Symbol::new("AAPL").unwrap(),
+            FractionalShares::new(float!(10)),
+            Address::ZERO,
+        );
+
+        assert!(matches!(result,
+            Err(TokenizedEquityMintError::ProviderClientRequestIdMismatch {
+                expected, actual: None,
+            }) if expected == id
+        ));
+    }
+
+    #[test]
+    fn provider_request_validation_rejects_each_identity_mismatch() {
+        let id = issuer_request_id("ISS001");
+        let request = provider_mint_request(&id, TokenizationRequestStatus::Pending);
+
+        let mut wrong_type = request.clone();
+        wrong_type.r#type = Some(TokenizationRequestType::Redeem);
+        assert!(matches!(
+            TokenizedEquityMint::validate_provider_request(
+                &wrong_type,
+                &id,
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(10)),
+                Address::ZERO,
+            ),
+            Err(TokenizedEquityMintError::ProviderRequestTypeMismatch { .. })
+        ));
+
+        let mut wrong_issuer = request.clone();
+        wrong_issuer.client_request_id = Some(ClientRequestId::from(&issuer_request_id("OTHER")));
+        assert!(matches!(
+            TokenizedEquityMint::validate_provider_request(
+                &wrong_issuer,
+                &id,
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(10)),
+                Address::ZERO,
+            ),
+            Err(TokenizedEquityMintError::ProviderClientRequestIdMismatch { .. })
+        ));
+
+        let mut wrong_symbol = request.clone();
+        wrong_symbol.underlying_symbol = Symbol::new("TSLA").unwrap();
+        assert!(matches!(
+            TokenizedEquityMint::validate_provider_request(
+                &wrong_symbol,
+                &id,
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(10)),
+                Address::ZERO,
+            ),
+            Err(TokenizedEquityMintError::ProviderSymbolMismatch { .. })
+        ));
+
+        let mut wrong_quantity = request.clone();
+        wrong_quantity.quantity = FractionalShares::new(float!(11));
+        assert!(matches!(
+            TokenizedEquityMint::validate_provider_request(
+                &wrong_quantity,
+                &id,
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(10)),
+                Address::ZERO,
+            ),
+            Err(TokenizedEquityMintError::ProviderQuantityMismatch { .. })
+        ));
+
+        let mut wrong_wallet = request;
+        wrong_wallet.wallet = Some(Address::repeat_byte(1));
+        assert!(matches!(
+            TokenizedEquityMint::validate_provider_request(
+                &wrong_wallet,
+                &id,
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(10)),
+                Address::ZERO,
+            ),
+            Err(TokenizedEquityMintError::ProviderWalletMismatch { .. })
+        ));
+
+        let mut omitted_wallet = provider_mint_request(&id, TokenizationRequestStatus::Pending);
+        omitted_wallet.wallet = None;
+        TokenizedEquityMint::validate_provider_request(
+            &omitted_wallet,
+            &id,
+            &Symbol::new("AAPL").unwrap(),
+            FractionalShares::new(float!(10)),
+            Address::ZERO,
+        )
+        .unwrap();
+    }
+
     fn mint_requested_event() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRequested {
+            issuer_request_id: None,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             wallet: Address::random(),
             requested_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn mint_requested_wire_format_preserves_request_identity() {
+        let event = TokenizedEquityMintEvent::MintRequested {
+            issuer_request_id: Some(IssuerRequestId(
+                "11111111-2222-4333-8444-555555555555".parse().unwrap(),
+            )),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: float!(100.5),
+            wallet: "0x0000000000000000000000000000000000000001"
+                .parse()
+                .unwrap(),
+            requested_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+        };
+        let expected = serde_json::json!({
+            "MintRequested": {
+                "issuer_request_id": "11111111-2222-4333-8444-555555555555",
+                "symbol": "AAPL",
+                "quantity": "100.5",
+                "wallet": "0x0000000000000000000000000000000000000001",
+                "requested_at": "2026-01-01T00:00:00Z"
+            }
+        });
+
+        assert_eq!(serde_json::to_value(&event).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<TokenizedEquityMintEvent>(expected).unwrap(),
+            event
+        );
     }
 
     fn mint_accepted_event() -> TokenizedEquityMintEvent {
@@ -2823,28 +3292,407 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_emits_requested_and_accepted() {
-        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+    async fn provider_commands_reject_identity_mismatch_before_side_effects() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let services = EquityTransferServices {
+            tokenizer: tokenizer.clone(),
+            ..mint_services(MockTokenizer::new())
+        };
+        let store = TestStore::<TokenizedEquityMint>::new(services);
+        let id = issuer_request_id("ISS001");
+        let other = issuer_request_id("different-mint");
+        store.send(&id, mint_command()).await.unwrap();
+
+        for command in [
+            TokenizedEquityMintCommand::SubmitMintRequest {
+                issuer_request_id: other.clone(),
+            },
+            TokenizedEquityMintCommand::ReconcileMintRequest {
+                issuer_request_id: other.clone(),
+            },
+        ] {
+            let error = store.send(&id, command).await.unwrap_err();
+            assert!(matches!(error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    TokenizedEquityMintError::CommandRequestIdMismatch { expected, actual }
+                )) if expected == id && actual == other
+            ));
+        }
+
+        assert_eq!(tokenizer.mint_request_call_count(), 0);
+        assert_eq!(tokenizer.mint_lookup_call_count(), 0);
+        assert!(matches!(store.load(&id).await.unwrap().unwrap(),
+            TokenizedEquityMint::MintRequested { issuer_request_id: Some(persisted), .. }
+                if persisted == id
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_intent_without_identity_remains_recoverable() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let services = EquityTransferServices {
+            tokenizer: tokenizer.clone(),
+            ..mint_services(MockTokenizer::new())
+        };
+        let event = serde_json::from_str(&mint_requested_payload("AAPL")).unwrap();
+        let state = TokenizedEquityMint::originate(&event).unwrap();
+        assert!(matches!(
+            &state,
+            TokenizedEquityMint::MintRequested {
+                issuer_request_id: None,
+                ..
+            }
+        ));
+        let id = issuer_request_id("legacy-mint");
+
+        let events = state
+            .transition(
+                TokenizedEquityMintCommand::ReconcileMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+                &services,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tokenizer.mint_lookup_call_count(), 1);
+        assert_eq!(tokenizer.mint_request_call_count(), 1);
+        assert!(
+            matches!(&events[0], TokenizedEquityMintEvent::MintAccepted {
+            issuer_request_id, ..
+        } if issuer_request_id == &id)
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_persists_intent_without_calling_provider() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let services = EquityTransferServices {
+            tokenizer: tokenizer.clone(),
+            ..mint_services(MockTokenizer::new())
+        };
+        let events = TestHarness::<TokenizedEquityMint>::with(services)
             .given_no_previous_events()
             .when(mint_command())
             .await
             .events();
 
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         assert!(
             matches!(&events[0], TokenizedEquityMintEvent::MintRequested { symbol, .. } if symbol == &Symbol::new("AAPL").unwrap()),
             "Expected MintRequested, got: {:?}",
             events[0]
         );
-        assert!(
-            matches!(
-                &events[1],
-                TokenizedEquityMintEvent::MintAccepted { issuer_request_id, .. }
-                    if *issuer_request_id == st0x_tokenization::issuer_request_id("ISS001")
-            ),
-            "Expected MintAccepted with ISS001, got: {:?}",
-            events[1]
+        assert_eq!(tokenizer.mint_request_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn first_submission_advances_requested_intent_once() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let services = EquityTransferServices {
+            tokenizer: tokenizer.clone(),
+            ..mint_services(MockTokenizer::new())
+        };
+        let store = TestStore::<TokenizedEquityMint>::new(services);
+        let id = issuer_request_id("ISS001");
+
+        request_and_submit(&store, &id).await;
+        let error = store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(tokenizer.mint_request_call_count(), 1);
+        assert!(matches!(
+            error,
+            AggregateError::UserError(LifecycleError::Apply(
+                TokenizedEquityMintError::AlreadyInProgress
+            ))
+        ));
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(matches!(entity, TokenizedEquityMint::MintAccepted { .. }));
+    }
+
+    #[tokio::test]
+    async fn uncertain_first_submission_preserves_requested_intent() {
+        let tokenizer = Arc::new(
+            MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::ApiError),
         );
+        let services = EquityTransferServices {
+            tokenizer,
+            ..mint_services(MockTokenizer::new())
+        };
+        let store = TestStore::<TokenizedEquityMint>::new(services);
+        let id = issuer_request_id("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+        let error = store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AggregateError::UserError(LifecycleError::Apply(
+                TokenizedEquityMintError::RequestFailed { .. }
+            ))
+        ));
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(matches!(entity, TokenizedEquityMint::MintRequested { .. }));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_adopts_matching_request_without_resubmission() {
+        let id = issuer_request_id("ISS001");
+        let request = provider_mint_request(&id, TokenizationRequestStatus::Pending);
+        let tokenizer = Arc::new(MockTokenizer::new().with_pending_requests(vec![request]));
+        let services = EquityTransferServices {
+            tokenizer: tokenizer.clone(),
+            ..mint_services(MockTokenizer::new())
+        };
+        let store = TestStore::<TokenizedEquityMint>::new(services);
+
+        store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::ReconcileMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tokenizer.mint_lookup_call_count(), 1);
+        assert_eq!(tokenizer.mint_request_call_count(), 0);
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(matches!(entity, TokenizedEquityMint::MintAccepted { .. }));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_adopts_matching_completed_request_without_resubmission() {
+        let id = issuer_request_id("ISS001");
+        let request = provider_mint_request(&id, TokenizationRequestStatus::Completed);
+        let tokenizer = Arc::new(MockTokenizer::new().with_pending_requests(vec![request]));
+        let services = EquityTransferServices {
+            tokenizer: tokenizer.clone(),
+            ..mint_services(MockTokenizer::new())
+        };
+        let store = TestStore::<TokenizedEquityMint>::new(services);
+
+        store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::ReconcileMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tokenizer.mint_lookup_call_count(), 1);
+        assert_eq!(tokenizer.mint_request_call_count(), 0);
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(matches!(entity, TokenizedEquityMint::MintAccepted { .. }));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_replays_history_without_type() {
+        let id = issuer_request_id("ISS001");
+        let mut request = provider_mint_request(&id, TokenizationRequestStatus::Pending);
+        request.r#type = None;
+        TokenizedEquityMint::validate_provider_request(
+            &request,
+            &id,
+            &Symbol::new("AAPL").unwrap(),
+            FractionalShares::new(float!(10)),
+            Address::ZERO,
+        )
+        .unwrap();
+        let tokenizer = Arc::new(MockTokenizer::new().with_pending_requests(vec![request]));
+        let services = EquityTransferServices {
+            tokenizer: tokenizer.clone(),
+            ..mint_services(MockTokenizer::new())
+        };
+        let store = TestStore::<TokenizedEquityMint>::new(services);
+
+        store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::ReconcileMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tokenizer.mint_lookup_call_count(), 1);
+        assert_eq!(tokenizer.mint_request_call_count(), 1);
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(matches!(entity, TokenizedEquityMint::MintAccepted { .. }));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_records_matching_rejection_without_resubmission() {
+        let id = issuer_request_id("ISS001");
+        let request = provider_mint_request(&id, TokenizationRequestStatus::Rejected);
+        let tokenizer = Arc::new(MockTokenizer::new().with_pending_requests(vec![request]));
+        let services = EquityTransferServices {
+            tokenizer: tokenizer.clone(),
+            ..mint_services(MockTokenizer::new())
+        };
+        let store = TestStore::<TokenizedEquityMint>::new(services);
+
+        store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::ReconcileMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tokenizer.mint_request_call_count(), 0);
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(matches!(entity, TokenizedEquityMint::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_rejects_mismatched_provider_identity() {
+        let id = issuer_request_id("ISS001");
+        let mut request = provider_mint_request(&id, TokenizationRequestStatus::Completed);
+        request.underlying_symbol = Symbol::new("TSLA").unwrap();
+        let tokenizer = MockTokenizer::new().with_pending_requests(vec![request]);
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
+
+        store.send(&id, mint_command()).await.unwrap();
+        let error = store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::ReconcileMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AggregateError::UserError(LifecycleError::Apply(
+                TokenizedEquityMintError::ProviderSymbolMismatch { .. }
+            ))
+        ));
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(matches!(entity, TokenizedEquityMint::MintRequested { .. }));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_without_match_replays_idempotent_submission() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let services = EquityTransferServices {
+            tokenizer: tokenizer.clone(),
+            ..mint_services(MockTokenizer::new())
+        };
+        let store = TestStore::<TokenizedEquityMint>::new(services);
+        let id = issuer_request_id("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::ReconcileMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tokenizer.mint_lookup_call_count(), 1);
+        assert_eq!(tokenizer.mint_request_call_count(), 1);
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(matches!(entity, TokenizedEquityMint::MintAccepted { .. }));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_lookup_error_preserves_requested_intent() {
+        let tokenizer = Arc::new(MockTokenizer::new().with_mint_lookup_failure());
+        let services = EquityTransferServices {
+            tokenizer: tokenizer.clone(),
+            ..mint_services(MockTokenizer::new())
+        };
+        let store = TestStore::<TokenizedEquityMint>::new(services);
+        let id = issuer_request_id("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+        let error = store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::ReconcileMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AggregateError::UserError(LifecycleError::Apply(
+                TokenizedEquityMintError::RequestFailed { .. }
+            ))
+        ));
+
+        assert_eq!(tokenizer.mint_lookup_call_count(), 1);
+        assert_eq!(tokenizer.mint_request_call_count(), 0);
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(matches!(entity, TokenizedEquityMint::MintRequested { .. }));
+    }
+
+    #[tokio::test]
+    async fn definitive_reconciliation_lookup_error_preserves_requested_intent() {
+        let tokenizer = Arc::new(MockTokenizer::new().with_definitive_mint_lookup_failure());
+        let services = EquityTransferServices {
+            tokenizer: tokenizer.clone(),
+            ..mint_services(MockTokenizer::new())
+        };
+        let store = TestStore::<TokenizedEquityMint>::new(services);
+        let id = issuer_request_id("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+        let error = store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::ReconcileMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AggregateError::UserError(LifecycleError::Apply(
+                TokenizedEquityMintError::RequestFailed { .. }
+            ))
+        ));
+
+        assert_eq!(tokenizer.mint_lookup_call_count(), 1);
+        assert_eq!(tokenizer.mint_request_call_count(), 0);
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(matches!(entity, TokenizedEquityMint::MintRequested { .. }));
     }
 
     #[tokio::test]
@@ -2852,7 +3700,7 @@ mod tests {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
 
         let id = issuer_request_id("ISS001");
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
         store
             .send(&id, TokenizedEquityMintCommand::Poll)
             .await
@@ -2872,7 +3720,7 @@ mod tests {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
 
         let id = issuer_request_id("ISS001");
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
         store
             .send(&id, TokenizedEquityMintCommand::Poll)
             .await
@@ -2898,7 +3746,7 @@ mod tests {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
         let id = issuer_request_id("ISS001");
 
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
         let error = store
             .send(&id, TokenizedEquityMintCommand::Poll)
             .await
@@ -2931,7 +3779,7 @@ mod tests {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
         let id = issuer_request_id("ISS001");
 
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
         let error = store
             .send(&id, TokenizedEquityMintCommand::Poll)
             .await
@@ -2962,7 +3810,7 @@ mod tests {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
         let id = issuer_request_id("ISS001");
 
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
         store
             .send(&id, TokenizedEquityMintCommand::Poll)
             .await
@@ -3002,6 +3850,7 @@ mod tests {
     #[test]
     fn test_evolve_tokens_received_rejects_wrong_state() {
         let requested = TokenizedEquityMint::MintRequested {
+            issuer_request_id: None,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             wallet: Address::random(),
@@ -3084,6 +3933,7 @@ mod tests {
     #[test]
     fn test_evolve_rejects_mint_requested_on_existing_state() {
         let requested = TokenizedEquityMint::MintRequested {
+            issuer_request_id: None,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             wallet: Address::random(),
@@ -3091,6 +3941,7 @@ mod tests {
         };
 
         let event = TokenizedEquityMintEvent::MintRequested {
+            issuer_request_id: None,
             symbol: Symbol::new("GOOG").unwrap(),
             quantity: float!(50),
             wallet: Address::random(),
@@ -3182,7 +4033,7 @@ mod tests {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
         let id = issuer_request_id("ISS001");
 
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
 
         let entity = store.load(&id).await.unwrap().unwrap();
         assert!(
@@ -3192,13 +4043,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn definitive_submission_error_persists_rejection_without_retry() {
+        let tokenizer = Arc::new(
+            MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::DefinitiveError),
+        );
+        let services = EquityTransferServices {
+            tokenizer: tokenizer.clone(),
+            ..mint_services(MockTokenizer::new())
+        };
+        let store = TestStore::<TokenizedEquityMint>::new(services);
+        let id = issuer_request_id("ISS001");
+
+        request_and_submit(&store, &id).await;
+
+        assert_eq!(tokenizer.mint_request_call_count(), 1);
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(matches!(entity, TokenizedEquityMint::Failed { .. }));
+    }
+
+    #[tokio::test]
     async fn request_mint_api_error_returns_error() {
         let tokenizer =
             MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::ApiError);
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
         let id = issuer_request_id("ISS001");
 
-        let error = store.send(&id, mint_command()).await.unwrap_err();
+        store.send(&id, mint_command()).await.unwrap();
+        let error = store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap_err();
         assert!(
             matches!(
                 error,
@@ -3216,7 +4095,7 @@ mod tests {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
         let id = issuer_request_id("ISS001");
 
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
         store
             .send(&id, TokenizedEquityMintCommand::Poll)
             .await
@@ -3235,7 +4114,7 @@ mod tests {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
         let id = issuer_request_id("ISS001");
 
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
         store
             .send(&id, TokenizedEquityMintCommand::Poll)
             .await
@@ -3249,7 +4128,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_mint_passes_issuer_request_id_to_tokenizer() {
+    async fn submit_mint_passes_internal_request_id_to_tokenizer() {
         let tokenizer: Arc<MockTokenizer> = Arc::new(MockTokenizer::new());
         let store = TestStore::<TokenizedEquityMint>::new(EquityTransferServices {
             tokenizer: Arc::clone(&tokenizer) as Arc<dyn Tokenizer>,
@@ -3261,7 +4140,7 @@ mod tests {
         });
         let id = issuer_request_id("ISS001");
 
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
 
         let recorded_id = tokenizer.last_issuer_request_id().unwrap();
         assert_eq!(recorded_id, issuer_request_id("ISS001"));
@@ -3270,6 +4149,7 @@ mod tests {
     #[test]
     fn reject_mint_evolves_from_requested_to_failed() {
         let requested = TokenizedEquityMint::MintRequested {
+            issuer_request_id: None,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(10),
             wallet: Address::random(),
@@ -3327,7 +4207,7 @@ mod tests {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
         let id = issuer_request_id("ISS001");
 
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
         store
             .send(&id, TokenizedEquityMintCommand::Poll)
             .await
@@ -3356,7 +4236,7 @@ mod tests {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
         let id = issuer_request_id("ISS001");
 
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
         store
             .send(&id, TokenizedEquityMintCommand::Poll)
             .await
@@ -3485,7 +4365,7 @@ mod tests {
             .await
             .events();
 
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         let TokenizedEquityMintEvent::MintRequested {
             requested_at: event_requested_at,
             ..
@@ -3494,15 +4374,6 @@ mod tests {
             panic!("Expected MintRequested, got: {:?}", events[0]);
         };
         assert_eq!(*event_requested_at, requested_at);
-
-        let TokenizedEquityMintEvent::MintAccepted {
-            accepted_at: event_accepted_at,
-            ..
-        } = &events[1]
-        else {
-            panic!("Expected MintAccepted, got: {:?}", events[1]);
-        };
-        assert_eq!(*event_accepted_at, requested_at);
     }
 
     #[tokio::test]
@@ -3548,6 +4419,24 @@ mod tests {
 
         let result = interrupted_mint_ids(&pool).await.unwrap();
         assert_eq!(result, vec![mint_accepted_id]);
+    }
+
+    #[tokio::test]
+    async fn interrupted_mint_ids_includes_requested_intent() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let id = issuer_request_id("mint-requested");
+        insert_event(
+            &pool,
+            &id.to_string(),
+            0,
+            "TokenizedEquityMintEvent::MintRequested",
+            &mint_requested_payload("AAPL"),
+        )
+        .await;
+
+        let result = interrupted_mint_ids(&pool).await.unwrap();
+
+        assert_eq!(result, vec![id]);
     }
 
     /// Raw persisted payload for `MintAuthorizationSigned`, pinning the hex
@@ -3791,7 +4680,7 @@ mod tests {
             MockTokenizer::new(),
         ));
         let id = issuer_request_id("ISS001");
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
 
         store
             .send(
@@ -3827,7 +4716,7 @@ mod tests {
             MockTokenizer::new(),
         ));
         let id = issuer_request_id("ISS001");
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
 
         let sign_command = TokenizedEquityMintCommand::SignMintAuthorization {
             token: Address::repeat_byte(0x11),
@@ -3881,6 +4770,15 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            store
+                .send(
+                    &id,
+                    TokenizedEquityMintCommand::SubmitMintRequest {
+                        issuer_request_id: id.clone(),
+                    },
+                )
+                .await
+                .unwrap();
             store.send(&id, sign_command.clone()).await.unwrap();
 
             let entity = store.load(&id).await.unwrap().unwrap();
@@ -3903,7 +4801,7 @@ mod tests {
     async fn signing_with_disabled_authorizer_fails_loudly() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
         let id = issuer_request_id("ISS001");
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
 
         let error = store
             .send(
@@ -3932,7 +4830,7 @@ mod tests {
             MockTokenizer::new(),
         ));
         let id = issuer_request_id("ISS001");
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
         store
             .send(
                 &id,
@@ -3986,6 +4884,15 @@ mod tests {
         );
         let id = issuer_request_id("ISS001");
         store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
         store
             .send(
                 &id,
@@ -4100,7 +5007,7 @@ mod tests {
             MockTokenizer::new(),
         ));
         let id = issuer_request_id("ISS001");
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
 
         let error = store
             .send(
@@ -4190,6 +5097,7 @@ mod tests {
         let later = now + chrono::Duration::seconds(60);
 
         let requested = TokenizedEquityMint::MintRequested {
+            issuer_request_id: None,
             symbol: symbol.clone(),
             quantity: float!(10),
             wallet: Address::ZERO,
@@ -4493,7 +5401,7 @@ mod tests {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
         let id = issuer_request_id("ISS001");
 
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
 
         store
             .send(
@@ -4585,7 +5493,7 @@ mod tests {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
         let id = issuer_request_id("ISS001");
 
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
         store
             .send(&id, TokenizedEquityMintCommand::Poll)
             .await
@@ -4613,7 +5521,7 @@ mod tests {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
         let id = issuer_request_id("ISS001");
 
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
         store
             .send(&id, TokenizedEquityMintCommand::Poll)
             .await
@@ -4653,7 +5561,7 @@ mod tests {
         let id = issuer_request_id("ISS001");
 
         // MintAccepted state -- FailWrapping requires TokensReceived
-        store.send(&id, mint_command()).await.unwrap();
+        request_and_submit(&store, &id).await;
 
         let result = store
             .send(
@@ -4907,6 +5815,7 @@ mod tests {
 
         assert!(
             !TokenizedEquityMint::MintRequested {
+                issuer_request_id: None,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 wallet: Address::ZERO,

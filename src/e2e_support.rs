@@ -53,6 +53,7 @@ pub async fn seed_mint_at_tokens_wrapped(
     let now = Utc::now();
     let events = [
         TokenizedEquityMintEvent::MintRequested {
+            issuer_request_id: None,
             symbol: symbol.clone(),
             quantity,
             wallet,

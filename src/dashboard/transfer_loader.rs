@@ -479,6 +479,7 @@ mod tests {
             1,
             "TokenizedEquityMintEvent::MintRequested",
             serde_json::to_value(TokenizedEquityMintEvent::MintRequested {
+                issuer_request_id: None,
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: float!(10),
                 wallet: Address::ZERO,
@@ -496,6 +497,7 @@ mod tests {
             1,
             "TokenizedEquityMintEvent::MintRequested",
             serde_json::to_value(TokenizedEquityMintEvent::MintRequested {
+                issuer_request_id: None,
                 symbol: Symbol::new("TSLA").unwrap(),
                 quantity: float!(5),
                 wallet: Address::ZERO,

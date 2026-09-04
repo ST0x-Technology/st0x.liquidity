@@ -26,7 +26,7 @@ use st0x_evm::{
 use st0x_execution::{Executor, FractionalShares, InventoryResult, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, UsdToCentsError, Usdc};
 use st0x_raindex::{RaindexError, RaindexService, RaindexVaultId};
-use st0x_tokenization::{IssuerRequestId, TokenizationRequestId};
+use st0x_tokenization::{ClientRequestId, TokenizationRequestId};
 use st0x_tokenization::{TokenizationRequestType, Tokenizer, TokenizerError};
 
 use super::BroadcastingInventory;
@@ -60,7 +60,7 @@ where
 /// Active bot-owned tokenization provider request identifiers.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PendingRequestOwnershipSnapshot {
-    pub(crate) mint_issuers: HashSet<IssuerRequestId>,
+    pub(crate) mint_issuers: HashSet<ClientRequestId>,
     pub(crate) mint_tokenizations: HashSet<TokenizationRequestId>,
     pub(crate) redemption_tokenizations: HashSet<TokenizationRequestId>,
     pub(crate) redemption_txs: HashSet<TxHash>,
@@ -1671,7 +1671,7 @@ where
         let is_owned = match request.r#type {
             Some(TokenizationRequestType::Mint) => {
                 request
-                    .issuer_request_id
+                    .client_request_id
                     .as_ref()
                     .is_some_and(|id| ownership.mint_issuers.contains(id))
                     || ownership.mint_tokenizations.contains(&request.id)
@@ -1717,6 +1717,7 @@ where
                 warn!(
                     target: "inventory",
                     request_id = %request.id,
+                    client_request_id = ?request.client_request_id,
                     issuer_request_id = ?request.issuer_request_id,
                     request_type = ?request.r#type,
                     symbol = %request.underlying_symbol,
@@ -1925,6 +1926,7 @@ mod tests {
                 mint_issuers: mint_issuer_request_ids
                     .into_iter()
                     .map(issuer_request_id)
+                    .map(|id| ClientRequestId::from(&id))
                     .collect(),
                 mint_tokenizations: mint_tokenization_request_ids
                     .into_iter()
@@ -4739,6 +4741,7 @@ mod tests {
             underlying_symbol: test_symbol(symbol),
             quantity: test_shares(quantity),
             wallet: None,
+            client_request_id: None,
             issuer_request_id: None,
             tx_hash: None,
             token_symbol: None,
@@ -4761,24 +4764,12 @@ mod tests {
             underlying_symbol: test_symbol(symbol),
             quantity: test_shares(quantity),
             wallet,
+            client_request_id: None,
             issuer_request_id: None,
             tx_hash: None,
             token_symbol: None,
             fees: None,
             created_at: Utc::now(),
-        }
-    }
-
-    fn mock_pending_request_with_issuer_id(
-        request_type: st0x_tokenization::TokenizationRequestType,
-        symbol: &str,
-        quantity: i64,
-        issuer_id_label: &str,
-        wallet: Option<Address>,
-    ) -> st0x_tokenization::TokenizationRequest {
-        st0x_tokenization::TokenizationRequest {
-            issuer_request_id: Some(issuer_request_id(issuer_id_label)),
-            ..mock_pending_request_with_wallet(request_type, symbol, quantity, wallet)
         }
     }
 
@@ -5135,7 +5126,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_inflight_equity_includes_owned_mint_by_issuer_request_id() {
+    async fn poll_inflight_equity_includes_only_matching_mint_client_id() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
         let raindex_service = create_test_raindex_service(provider.clone());
@@ -5143,19 +5134,24 @@ mod tests {
 
         let tokenizer = Arc::new(
             st0x_tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
-                mock_pending_request_with_issuer_id(
-                    st0x_tokenization::TokenizationRequestType::Mint,
-                    "AAPL",
-                    10,
-                    "owned-issuer-request",
-                    Some(order_owner),
-                ),
-                mock_pending_request_with_wallet(
-                    st0x_tokenization::TokenizationRequestType::Mint,
-                    "AAPL",
-                    20,
-                    Some(order_owner),
-                ),
+                st0x_tokenization::TokenizationRequest {
+                    client_request_id: Some(ClientRequestId::from(&issuer_request_id(
+                        "owned-issuer-request",
+                    ))),
+                    issuer_request_id: Some(issuer_request_id("provider-issuer-request")),
+                    ..mock_pending_request(TokenizationRequestType::Mint, "AAPL", 10)
+                },
+                st0x_tokenization::TokenizationRequest {
+                    issuer_request_id: Some(issuer_request_id("owned-issuer-request")),
+                    ..mock_pending_request(TokenizationRequestType::Mint, "AAPL", 20)
+                },
+                st0x_tokenization::TokenizationRequest {
+                    client_request_id: Some(ClientRequestId::from(&issuer_request_id(
+                        "other-client-request",
+                    ))),
+                    issuer_request_id: Some(issuer_request_id("owned-issuer-request")),
+                    ..mock_pending_request(TokenizationRequestType::Mint, "AAPL", 30)
+                },
             ]),
         );
 

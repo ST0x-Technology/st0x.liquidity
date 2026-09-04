@@ -871,6 +871,7 @@ mod tests {
         );
 
         let open_mint = TokenizedEquityMint::MintRequested {
+            issuer_request_id: None,
             symbol: symbol.clone(),
             quantity: float!(1),
             wallet: Address::ZERO,
