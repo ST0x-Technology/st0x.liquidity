@@ -507,7 +507,7 @@ async fn requeue_wired_transfer_orphans(
 
 async fn requeue_startup_orphans(
     schedulers: &RebalancingSchedulers,
-    backfill_queue: &BackfillQueues,
+    backfill_queues: &BackfillQueues,
     usdc_to_hedging_ctx: Option<&Arc<TransferUsdcToHedgingCtx>>,
     usdc_to_market_making_ctx: Option<&Arc<TransferUsdcToMarketMakingCtx>>,
     equity_to_market_making_ctx: Option<&Arc<TransferEquityToMarketMakingCtx>>,
@@ -521,7 +521,7 @@ async fn requeue_startup_orphans(
         equity_to_hedging_ctx,
     )
     .await?;
-    requeue_backfill_orphans(backfill_queue).await
+    requeue_backfill_orphans(backfill_queues).await
 }
 
 /// Borrowed dependencies for [`finish_startup_recovery`]. Bundled into a
@@ -531,7 +531,7 @@ async fn requeue_startup_orphans(
 /// inventory.
 struct StartupRecoveryDeps<'startup> {
     schedulers: &'startup RebalancingSchedulers,
-    backfill_queue: &'startup BackfillQueues,
+    backfill_queues: &'startup BackfillQueues,
     usdc_to_hedging_ctx: Option<&'startup Arc<TransferUsdcToHedgingCtx>>,
     usdc_to_market_making_ctx: Option<&'startup Arc<TransferUsdcToMarketMakingCtx>>,
     equity_to_market_making_ctx: Option<&'startup Arc<TransferEquityToMarketMakingCtx>>,
@@ -553,7 +553,7 @@ struct StartupRecoveryDeps<'startup> {
 async fn finish_startup_recovery(deps: StartupRecoveryDeps<'_>) -> anyhow::Result<()> {
     requeue_startup_orphans(
         deps.schedulers,
-        deps.backfill_queue,
+        deps.backfill_queues,
         deps.usdc_to_hedging_ctx,
         deps.usdc_to_market_making_ctx,
         deps.equity_to_market_making_ctx,
@@ -870,7 +870,7 @@ impl Conductor {
         startup_smoke_checks(&executor, &provider, &ctx).await?;
         let cache = SymbolCache::default();
 
-        let (job_queue, backfill_queue, dashboard_delivery, schedulers) =
+        let (job_queue, backfill_queues, dashboard_delivery, schedulers) =
             setup_apalis_queues(&pool, &apalis_pool, event_sender, &ctx.chains).await?;
 
         let onchain_trade =
@@ -946,7 +946,7 @@ impl Conductor {
                 notifier: notifier.clone(),
                 record_bot_gas_receipt_cost_queue: record_bot_gas_receipt_cost_queue.clone(),
             },
-            &backfill_queue,
+            &backfill_queues,
             record_bot_gas_receipt_cost_ctx.as_ref(),
         ))
         .await?;
@@ -1044,7 +1044,7 @@ impl Conductor {
         let conductor = builder::spawn()
             .context(conductor_ctx)
             .job_queue(job_queue)
-            .backfill_queue(backfill_queue)
+            .backfill_queues(backfill_queues)
             .dashboard_trade_delivery_queue(dashboard_delivery.queue)
             .dashboard_trade_delivery_ctx(dashboard_delivery.ctx)
             .dashboard_trade_handoff_monitor(dashboard_delivery.handoff_monitor)
@@ -1781,7 +1781,7 @@ impl PositionAndRebalancing {
     async fn setup_with_recovery(
         rebalancing: Option<RebalancingCtx>,
         deps: RebalancingDeps,
-        backfill_queue: &BackfillQueues,
+        backfill_queues: &BackfillQueues,
         record_bot_gas_receipt_cost_ctx: Option<&Arc<RecordBotGasReceiptCostCtx>>,
     ) -> anyhow::Result<Self> {
         // Cloned out before `deps` is consumed by `setup`: recovery must run
@@ -1795,7 +1795,7 @@ impl PositionAndRebalancing {
 
         finish_startup_recovery(StartupRecoveryDeps {
             schedulers: &schedulers,
-            backfill_queue,
+            backfill_queues,
             usdc_to_hedging_ctx: assembled.transfer_usdc_to_hedging_ctx.as_ref(),
             usdc_to_market_making_ctx: assembled.transfer_usdc_to_market_making_ctx.as_ref(),
             equity_to_market_making_ctx: assembled.transfer_equity_to_market_making_ctx.as_ref(),
