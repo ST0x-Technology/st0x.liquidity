@@ -36,9 +36,10 @@ pub enum IngestionCutoff {
     /// hedging lag on Base. Use when strict reorg protection is required.
     Finalized,
     /// A fixed depth behind the chain tip: the cutoff is the already-fetched
-    /// tip minus this many blocks, with no extra RPC round trip. For chains
-    /// where consensus tags are unsuitable or unavailable (Ethereum mainnet
-    /// watches at 12; HyperEVM has no tags at all).
+    /// tip minus this many blocks, with no extra RPC round trip. A latency
+    /// choice where the tags lag too far (Ethereum mainnet watches at 12
+    /// instead of `safe`'s ~13 min), and the fallback for a chain whose tags
+    /// are absent or degenerate (to be probed on HyperEVM).
     Confirmations(u64),
 }
 
@@ -257,8 +258,9 @@ pub struct TradingConfig {
     /// Seconds between fill-watch poll cycles on this chain. Required (no
     /// silent default) and non-zero; each watched chain polls independently.
     pub order_fill_poll_interval_secs: u64,
-    /// Marks THE primary chain: where trading, rebalancing triggers, and the
-    /// cash vaults live. Exactly one watched chain must set it.
+    /// Marks THE primary chain: the one whose inventory the bot polls and
+    /// rebalances automatically. Fills are hedged on every watched chain.
+    /// Exactly one must set it.
     #[serde(default)]
     pub primary: bool,
     /// Alpaca's issuer wallet on this chain -- ERC-20 transfers for redemption
@@ -498,8 +500,8 @@ impl TradingChain {
 #[derive(Clone, Debug)]
 pub struct ChainRegistry {
     primary: TradingChain,
-    /// Watched, non-primary chains: fills are ingested and hedged, but
-    /// trading, rebalancing triggers, and cash vaults stay on the primary.
+    /// Watched, non-primary chains: fills are ingested and hedged, but their
+    /// inventory is not polled or rebalanced; that stays on the primary.
     secondary: BTreeMap<Chain, TradingChain>,
     transport: BTreeMap<Chain, ChainCtx>,
 }
@@ -724,8 +726,9 @@ impl ChainRegistry {
         Ok(trading_table)
     }
 
-    /// THE primary chain: where trading, rebalancing triggers, and the cash
-    /// vaults live. Watch-only chains are reached via [`Self::watched`].
+    /// THE primary chain: the one whose inventory the bot polls and rebalances
+    /// automatically. Every watched chain (this one included) is reached via
+    /// [`Self::watched`].
     pub fn primary(&self) -> &TradingChain {
         &self.primary
     }

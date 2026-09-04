@@ -101,21 +101,25 @@ and the system proves market fit.
 
 Automated rebalancing is Alpaca Broker API based.
 
-##### Chain Roles: Primary, Watched, Transport
+##### Chain Roles: Watched (Primary or Secondary) and Transport
 
 Every chain the bot touches is declared under `[chains.<name>]` with a
 `lifecycle` (`disabled`, `observe-only`, `prefunded`, `active`). A chain whose
 config carries a `[chains.<name>.trading]` table is a **watched** chain: the bot
 runs a fill watcher against its order book and accounts its fills. Exactly one
 watched chain must set `primary = true` on that table -- the **primary** chain
-is where trading, rebalancing triggers, and the cash vaults live (Base). Zero or
-multiple primary claimants fail startup with a named error. Chains without a
-trading table are **transport** chains (RPC + confirmations only, e.g. Ethereum
-while it only carries CCTP transfers). Watch settings are per chain: poll
-interval, ingestion cutoff, asset tables with per-chain enable/disable flags.
-Startup verifies every watched chain (chain-id identity, cutoff support) and any
-failure is fatal; degraded per-chain startup is deferred to the chain-disable
-work.
+is the chain whose inventory the bot polls and rebalances automatically (Base);
+fills are hedged on every watched chain. The distinction exists so that fill
+watching can go multi-chain before inventory management does: it names the chain
+the still-single-chain paths use. Once inventory polling and rebalancing are per
+chain (global rebalancer, USDC corridors), `primary` shrinks to the operator's
+default chain, or is removed. Zero or multiple primary claimants fail startup
+with a named error. Chains without a trading table are **transport** chains
+(RPC + confirmations only, e.g. Ethereum while it only carries CCTP transfers).
+Watch settings are per chain: poll interval, ingestion cutoff, asset tables with
+per-chain enable/disable flags. Startup verifies every watched chain (chain-id
+identity, cutoff support) and any failure is fatal; degraded per-chain startup
+is deferred to the chain-disable work.
 
 ##### Shared-Inventory Settlement
 
@@ -310,14 +314,14 @@ excellent async ecosystem for handling concurrent trading flows.
     reorg handling is tracked separately in the Reorg protection project.
   - **`confirmations` (depth via `ingestion_cutoff_confirmations`, required with
     this mode):** the cutoff is the already-fetched chain tip minus N, computed
-    without an extra RPC round trip; used where consensus tags are unsuitable or
-    unavailable (Ethereum mainnet watches at N=12 for lower latency than `safe`
-    at a fixed, understood depth; HyperEVM has no tags at all). The quiet-skew
-    tolerance for a backwards-moving cutoff is capped at
-    `min(SAFE_CUTOFF_QUIET_SKEW, N)` on confirmations chains, so a regression
-    deeper than the safety depth is never silently skipped. Same
-    no-reversal-path tradeoff as `safe`; deep-reorg response lives in the Reorg
-    protection project and gates non-Base go-lives.
+    without an extra RPC round trip. A latency choice where the tags lag too far
+    (Ethereum mainnet watches at N=12 instead of `safe`'s ~13 min, at a fixed,
+    understood depth), and the fallback for a chain whose tags are absent or
+    degenerate (to be probed on HyperEVM). The quiet-skew tolerance for a
+    backwards-moving cutoff is capped at `min(SAFE_CUTOFF_QUIET_SKEW, N)` on
+    confirmations chains, so a regression deeper than the safety depth is never
+    silently skipped. Same no-reversal-path tradeoff as `safe`; deep-reorg
+    response lives in the Reorg protection project and gates non-Base go-lives.
 - WebSocket `.watch()` filter polling and `eth_subscribe`/`subscribe_logs` are
   deliberately rejected: on a load-balanced RPC, filters live on a single
   backend node so most polls are round-robined to nodes returning `-32601`, and
