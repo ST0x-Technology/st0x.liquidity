@@ -1210,6 +1210,43 @@ This section specifies infrastructure, deployment, and secrets management.
 Alternative approaches (Ansible, Kamal) were evaluated and documented in commit
 `5ede2d47465d3621b351c73c9c1af33d20a7c879`.
 
+#### Config validation
+
+The config TOMLs the bot runs on are baked into the OCI image from this
+repository's `config/` directory and selected at run time by the compose file's
+`--config` flag. A config edit that only the deployed service can judge is a
+config edit whose first check is a bot that will not boot, which is what the
+`validate-config` binary exists to prevent.
+
+`validate-config --config <path> [--secrets <path>]` runs the boot path's
+validation and exits 0 or 1, writing a plain-text report to stdout and the
+failure with its cause chain to stderr. It starts no server, opens no database,
+and reaches no external service in either mode.
+
+The two modes differ only in how much of the input they have:
+
+- **With `--secrets`** it applies every rule, the config/secrets cross-checks
+  included: broker credentials and the type they resolve to, each chain's
+  `rpc_url`, wallet keys, and the pricing and issuance API keys. This is the
+  deploy gate described below, run against the staged candidate files while the
+  old process is still serving.
+- **Without `--secrets`** it applies every rule the config file can be judged
+  against alone: its schema (an unknown key is a failure, never a silently
+  ignored line), the port, chain, asset-table and `[rebalancing]` cross-field
+  rules, and each value the config carries on its own. It requires no secret, no
+  network, and no clock.
+
+Both modes run one shared implementation, so the secrets-free mode is a strict
+subset of the deploy gate rather than a parallel set of rules: a config it
+accepts cannot fail startup on any rule it checked, and a config it rejects
+would have failed the deploy gate too.
+
+That subset is what makes the check affordable in continuous integration, which
+validates every config the repository ships -- `config/**/*.toml`,
+`example.config.toml`, and `e2e/config.toml` -- on every pull request. Configs
+are discovered by walking `config/`, so a new environment directory is covered
+the day it is added rather than the day someone remembers to list it.
+
 #### Tools
 
 - **Terraform**: Provisions DigitalOcean infrastructure (droplet, volume,

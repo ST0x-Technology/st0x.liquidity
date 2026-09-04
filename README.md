@@ -132,6 +132,33 @@ than skipping the chain:
 
 Current broker support is limited to `alpaca-broker-api` and `dry-run`.
 
+#### Validating a config
+
+`validate-config` runs the startup validation without starting the server or
+reaching any external service:
+
+```bash
+# Config half only -- no secrets, no network, no clock.
+cargo run --bin validate-config -- --config config/prod/st0x-hedge.toml
+
+# Everything the deploy gate checks, including the config/secrets cross-checks.
+cargo run --bin validate-config -- --config path/to/config.toml --secrets path/to/secrets.toml
+```
+
+Without `--secrets` it judges the config file alone: schema (unknown keys are
+rejected), the port, chain, asset and `[rebalancing]` cross-field rules, and
+every value the config carries on its own. What it cannot see is what the
+secrets file supplies -- broker credentials, per-chain `rpc_url`s, wallet keys,
+pricing and issuance API keys -- which stays the deploy gate's job. Both modes
+run the same checks the bot runs at boot, so a rule broken here breaks startup.
+
+Because the secrets-free mode needs nothing but the file, CI validates every
+config the repository ships (`config/**/*.toml`, `example.config.toml`,
+`e2e/config.toml`) on every pull request, via the
+`every_repo_config_passes_config_only_validation` test in `st0x-config`. A
+config edit is therefore caught in the pull request that makes it, rather than
+by a deployed service refusing to boot.
+
 ```bash
 cargo run --bin server -- --config path/to/config.toml --secrets path/to/secrets.toml
 ```

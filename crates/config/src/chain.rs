@@ -426,6 +426,79 @@ pub enum ChainRegistryError {
     Enablement(#[from] ChainEnablementError),
 }
 
+/// The chains [`enabled_chains`] kept, plus the one that trades.
+struct EnabledChains<'config> {
+    /// Every chain whose lifecycle is not `disabled`, trading one included.
+    enabled: BTreeMap<Chain, &'config ChainConfig>,
+    trading_chain: Chain,
+    chain_config: &'config ChainConfig,
+    trading_table: &'config TradingConfig,
+}
+
+/// Drops the disabled chains, picks the sole trading chain, and checks that
+/// every surviving chain carries the capabilities its lifecycle needs.
+///
+/// Refuses more than one trading chain: the config shape admits several, but
+/// the runtime still drives a single fill watcher, so a second one would be
+/// fully described and never read. Failing here is what keeps that gap from
+/// presenting as silently unhedged exposure. Transport-only entries are
+/// unlimited -- nothing watches them by design.
+fn enabled_chains(
+    configs: &BTreeMap<Chain, ChainConfig>,
+) -> Result<EnabledChains<'_>, ChainRegistryError> {
+    if configs.is_empty() {
+        return Err(ChainRegistryError::NoChains);
+    }
+
+    // A disabled chain is not constructed at all, so it needs no secrets
+    // entry and contributes nothing to the checks below.
+    let enabled: BTreeMap<Chain, &ChainConfig> = configs
+        .iter()
+        .filter(|(_, config)| config.lifecycle != ChainLifecycle::Disabled)
+        .map(|(chain, config)| (*chain, config))
+        .collect();
+
+    if enabled.is_empty() {
+        return Err(ChainRegistryError::NoEnabledChains);
+    }
+
+    let trading_chains: Vec<(Chain, &ChainConfig, &TradingConfig)> = enabled
+        .iter()
+        .filter_map(|(chain, config)| {
+            config
+                .trading
+                .as_ref()
+                .map(|trading| (*chain, *config, trading))
+        })
+        .collect();
+
+    let (trading_chain, chain_config, trading_table) = match trading_chains.as_slice() {
+        [] => return Err(ChainRegistryError::NoTradingChain),
+        [only] => *only,
+        many => {
+            return Err(ChainRegistryError::MultipleTradingChains {
+                chains: many.iter().map(|(chain, _, _)| *chain).collect(),
+            });
+        }
+    };
+
+    for (chain, config) in &enabled {
+        check_enablement(
+            *chain,
+            config.lifecycle,
+            config.trading.is_some(),
+            config.trading.as_ref().map(|trading| &trading.assets),
+        )?;
+    }
+
+    Ok(EnabledChains {
+        enabled,
+        trading_chain,
+        chain_config,
+        trading_table,
+    })
+}
+
 impl ChainRegistry {
     /// Pairs each configured chain with its secrets entry.
     ///
@@ -438,50 +511,12 @@ impl ChainRegistry {
         configs: &BTreeMap<Chain, ChainConfig>,
         mut secrets: BTreeMap<Chain, ChainSecrets>,
     ) -> Result<Self, ChainRegistryError> {
-        if configs.is_empty() {
-            return Err(ChainRegistryError::NoChains);
-        }
-
-        // A disabled chain is not constructed at all, so it needs no secrets
-        // entry and contributes nothing to the checks below.
-        let configs: BTreeMap<Chain, &ChainConfig> = configs
-            .iter()
-            .filter(|(_, config)| config.lifecycle != ChainLifecycle::Disabled)
-            .map(|(chain, config)| (*chain, config))
-            .collect();
-
-        if configs.is_empty() {
-            return Err(ChainRegistryError::NoEnabledChains);
-        }
-
-        let trading_chains: Vec<(Chain, &ChainConfig, &TradingConfig)> = configs
-            .iter()
-            .filter_map(|(chain, config)| {
-                config
-                    .trading
-                    .as_ref()
-                    .map(|trading| (*chain, *config, trading))
-            })
-            .collect();
-
-        let (trading_chain, chain_config, trading_table) = match trading_chains.as_slice() {
-            [] => return Err(ChainRegistryError::NoTradingChain),
-            [only] => *only,
-            many => {
-                return Err(ChainRegistryError::MultipleTradingChains {
-                    chains: many.iter().map(|(chain, _, _)| *chain).collect(),
-                });
-            }
-        };
-
-        for (chain, config) in &configs {
-            check_enablement(
-                *chain,
-                config.lifecycle,
-                config.trading.is_some(),
-                config.trading.as_ref().map(|trading| &trading.assets),
-            )?;
-        }
+        let EnabledChains {
+            enabled: configs,
+            trading_chain,
+            chain_config,
+            trading_table,
+        } = enabled_chains(configs)?;
 
         let mut take_rpc_url = |chain: Chain| {
             secrets
@@ -518,6 +553,25 @@ impl ChainRegistry {
         }
 
         Ok(Self { trading, transport })
+    }
+
+    /// Runs every `[chains.<name>]` check that reads the config file alone,
+    /// and hands back the sole trading chain's table so the caller can keep
+    /// validating against it.
+    ///
+    /// [`Self::new`] performs these same checks plus the config/secrets
+    /// pairing (each chain's `rpc_url`), which is why the secrets-free
+    /// `validate-config` path calls this one instead: a chain table that
+    /// fails here fails startup too, whatever the secrets file holds.
+    pub fn validate_configs(
+        configs: &BTreeMap<Chain, ChainConfig>,
+    ) -> Result<&TradingConfig, ChainRegistryError> {
+        let EnabledChains { trading_table, .. } = enabled_chains(configs)?;
+
+        trading_table.validate_inventory_adapters()?;
+        trading_table.resolve_inventory_mode()?;
+
+        Ok(trading_table)
     }
 
     /// The single chain this build trades on.
