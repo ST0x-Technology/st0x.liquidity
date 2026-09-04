@@ -46,7 +46,7 @@ use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceEvent};
 /// mismatch against the persisted `pnl_ledger_checkpoint.ledger_version`
 /// truncates every ledger table and resets the checkpoint to zero, making
 /// rebuild the same code path as first-deploy backfill.
-pub(crate) const LEDGER_VERSION: i64 = 1;
+pub(crate) const LEDGER_VERSION: i64 = 2;
 
 /// Rows fetched per entity per ingest batch. Bounds peak memory during
 /// backfill; each batch's rows and checkpoint advance commit atomically, so
@@ -81,6 +81,12 @@ pub(crate) enum PnlLedgerError {
     Float(#[from] rain_math_float::FloatError),
     #[error("onchain fill log_index does not fit in i64")]
     LogIndex(#[from] std::num::TryFromIntError),
+    #[error("reorged onchain fill {trade_id} has no active PnL ledger row")]
+    MissingReorgFill { trade_id: String },
+    #[error("reorged onchain fill {trade_id} has {matches} active PnL ledger rows")]
+    AmbiguousReorgFill { trade_id: String, matches: usize },
+    #[error("reorged onchain fill {trade_id} does not match its active PnL ledger row")]
+    ReorgFillMismatch { trade_id: String },
     #[error(transparent)]
     InvalidBotGasCost(#[from] crate::bot_gas::BotGasReceiptCostError),
 }
@@ -163,6 +169,9 @@ impl PnlLedger {
             "PnL ledger version changed; truncating for full rebuild"
         );
         let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM pnl_onchain_reorg")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM pnl_onchain_fill")
             .execute(&mut *tx)
             .await?;
@@ -379,6 +388,66 @@ async fn ingest_position(
             .bind(direction_text(direction))
             .bind(format_float(&price_usdc)?)
             .bind(canonical_timestamp(&block_timestamp))
+            .execute(&mut **tx)
+            .await?;
+        }
+        PositionEvent::Reorged {
+            trade_id,
+            amount,
+            direction,
+            reorged_at,
+            ..
+        } => {
+            let trade_id_text = trade_id.to_string();
+            let active_rows: Vec<(i64, String, String)> = sqlx::query_as(
+                "SELECT fill.event_rowid, fill.shares, fill.direction \
+                 FROM pnl_onchain_fill AS fill \
+                 WHERE fill.symbol = ?1 AND fill.tx_hash = ?2 AND fill.log_index = ?3 \
+                   AND fill.event_rowid < ?4 \
+                   AND NOT EXISTS (\
+                       SELECT 1 FROM pnl_onchain_reorg AS reorg \
+                       WHERE reorg.original_fill_event_rowid = fill.event_rowid\
+                   ) \
+                 ORDER BY fill.event_rowid",
+            )
+            .bind(symbol.to_string())
+            .bind(trade_id.tx_hash.to_string())
+            .bind(i64::try_from(trade_id.log_index)?)
+            .bind(rowid)
+            .fetch_all(&mut **tx)
+            .await?;
+
+            let [(original_fill_event_rowid, stored_shares, stored_direction)] =
+                active_rows.as_slice()
+            else {
+                return Err(match active_rows.len() {
+                    0 => PnlLedgerError::MissingReorgFill {
+                        trade_id: trade_id_text,
+                    },
+                    matches => PnlLedgerError::AmbiguousReorgFill {
+                        trade_id: trade_id_text,
+                        matches,
+                    },
+                });
+            };
+
+            if stored_shares != &format_float(&amount.inner())?
+                || stored_direction != direction_text(direction)
+            {
+                return Err(PnlLedgerError::ReorgFillMismatch {
+                    trade_id: trade_id_text,
+                });
+            }
+
+            sqlx::query(
+                "INSERT INTO pnl_onchain_reorg \
+                 (event_rowid, original_fill_event_rowid, reorged_at) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(event_rowid) DO NOTHING",
+            )
+            .bind(rowid)
+            .bind(original_fill_event_rowid)
+            .bind(canonical_timestamp(&reorged_at))
             .execute(&mut **tx)
             .await?;
         }
@@ -688,6 +757,19 @@ mod tests {
         }
     }
 
+    fn reorged_fill(log_index: u64, minute: u32) -> PositionEvent {
+        PositionEvent::Reorged {
+            trade_id: TradeId {
+                tx_hash: TxHash::repeat_byte(0xab),
+                log_index,
+            },
+            amount: FractionalShares::new(float!(0.5)),
+            direction: Direction::Buy,
+            reorg_depth: 1,
+            reorged_at: timestamp(minute),
+        }
+    }
+
     fn gas_cost() -> crate::bot_gas::BotGasReceiptCost {
         crate::bot_gas::BotGasReceiptCost {
             chain: Chain::Base,
@@ -896,6 +978,73 @@ mod tests {
 
         assert_eq!(first_head, second_head);
         assert_eq!(count(&pool, "pnl_onchain_fill").await, 1);
+    }
+
+    #[tokio::test]
+    async fn reorg_keeps_the_original_fill_and_appends_one_idempotent_marker() {
+        let pool = setup_test_db().await;
+        persist_event::<Position>(&pool, "AAPL", 1, &onchain_fill(7, 0)).await;
+        persist_event::<Position>(&pool, "AAPL", 2, &reorged_fill(7, 2)).await;
+
+        let ledger = PnlLedger::new(pool.clone());
+        let first_head = ledger.catch_up().await.unwrap();
+        let second_head = ledger.catch_up().await.unwrap();
+
+        assert_eq!(first_head, second_head);
+        assert_eq!(count(&pool, "pnl_onchain_fill").await, 1);
+        assert_eq!(count(&pool, "pnl_onchain_reorg").await, 1);
+
+        let (fill_rowid, reorg_rowid, original_fill_rowid): (i64, i64, i64) = sqlx::query_as(
+            "SELECT fill.event_rowid, reorg.event_rowid, reorg.original_fill_event_rowid \
+             FROM pnl_onchain_fill AS fill \
+             JOIN pnl_onchain_reorg AS reorg \
+               ON reorg.original_fill_event_rowid = fill.event_rowid",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(original_fill_rowid, fill_rowid);
+        assert!(reorg_rowid > fill_rowid);
+        assert_eq!(ledger.checkpoint().await.unwrap(), reorg_rowid);
+    }
+
+    #[tokio::test]
+    async fn reorg_with_mismatched_amount_fails_without_advancing_checkpoint() {
+        let pool = setup_test_db().await;
+        persist_event::<Position>(&pool, "AAPL", 1, &onchain_fill(7, 0)).await;
+        let mut reorg = reorged_fill(7, 2);
+        let PositionEvent::Reorged { amount, .. } = &mut reorg else {
+            unreachable!();
+        };
+        *amount = FractionalShares::new(float!(0.75));
+        persist_event::<Position>(&pool, "AAPL", 2, &reorg).await;
+
+        let ledger = PnlLedger::new(pool.clone());
+        let error = ledger.catch_up().await.unwrap_err();
+
+        assert!(matches!(error, PnlLedgerError::ReorgFillMismatch { .. }));
+        assert_eq!(ledger.checkpoint().await.unwrap(), 0);
+        assert_eq!(count(&pool, "pnl_onchain_fill").await, 0);
+        assert_eq!(count(&pool, "pnl_onchain_reorg").await, 0);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_reorg_target_fails_without_advancing_checkpoint() {
+        let pool = setup_test_db().await;
+        persist_event::<Position>(&pool, "AAPL", 1, &onchain_fill(7, 0)).await;
+        persist_event::<Position>(&pool, "AAPL", 2, &onchain_fill(7, 1)).await;
+        persist_event::<Position>(&pool, "AAPL", 3, &reorged_fill(7, 2)).await;
+
+        let ledger = PnlLedger::new(pool.clone());
+        let error = ledger.catch_up().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            PnlLedgerError::AmbiguousReorgFill { matches: 2, .. }
+        ));
+        assert_eq!(ledger.checkpoint().await.unwrap(), 0);
+        assert_eq!(count(&pool, "pnl_onchain_fill").await, 0);
+        assert_eq!(count(&pool, "pnl_onchain_reorg").await, 0);
     }
 
     /// Interleaved multi-entity history ingested with a batch size smaller
