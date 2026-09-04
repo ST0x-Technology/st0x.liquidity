@@ -5,7 +5,7 @@
 //! ready symbol becomes an independent [`PlaceHedge`] job, so a transient
 //! failure for one symbol does not affect others.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,8 +21,8 @@ use tracing::{debug, error, warn};
 use st0x_config::Ctx;
 use st0x_event_sorcery::{AggregateError, LifecycleError, Projection, Store};
 use st0x_execution::{
-    ClientOrderId, CounterTradePreflight, Direction, Executor, MarketOrder, MarketSession,
-    Permanence, SupportedExecutor, Symbol,
+    ClientOrderId, CounterTradePreflight, Direction, EligibilitySnapshots, Executor, MarketOrder,
+    MarketSession, Permanence, SupportedExecutor, Symbol,
 };
 
 use crate::alerts::Notifier;
@@ -44,7 +44,7 @@ use crate::trading::offchain::close_flatten::{
 };
 use crate::trading::offchain::hedge::{
     HedgeJobQueue, OvernightReferenceError, PlaceHedge, ReferencePriceError,
-    TransientFailureStreak, alert_dead_letter, apply_slippage, operator_alert_message,
+    TransientFailureStreak, apply_slippage, operator_alert_message, page_operator_once,
     resolve_extended_hours_reference_price, resolve_overnight_reference_price,
 };
 use crate::trading::onchain::trade_accountant::{DeadLetterReason, SymbolScopedReason};
@@ -98,6 +98,63 @@ pub(crate) struct CheckPositionsCtx<E: Executor + Clone + Send + Sync + 'static>
     /// standing delta, so they must not page twice, and the release performed
     /// when one of the symbol's hedges reaches the broker must clear both.
     pub(crate) alerted_dead_letters: Arc<Mutex<HashSet<(Symbol, DeadLetterReason)>>>,
+    /// Per-asset eligibility snapshots from the daily sync, read by the
+    /// pending-halted-order alert. The same shared store the hedge path
+    /// validates placements against.
+    pub(crate) overnight_eligibility: EligibilitySnapshots,
+    /// The scan's own operator-page dedup set, deliberately separate from
+    /// `alerted_dead_letters`: these conditions are not abandoned hedges, and
+    /// each trigger clears its key when its condition clears rather than
+    /// when a hedge reaches the broker.
+    pub(crate) operator_alerts: Arc<Mutex<HashSet<(Symbol, OperatorAlertReason)>>>,
+    /// Consecutive scans each symbol's overnight buy deferred on a stale or
+    /// missing indicative reference. Feeds the stale-quote alert; reset by
+    /// the first successful resolution.
+    pub(crate) stale_quote_defer_streaks: Arc<Mutex<HashMap<Symbol, u32>>>,
+    /// Reprice-timeout cancellations per symbol within the current overnight
+    /// session. Feeds the repeated-repricing alert; cleared on any
+    /// non-overnight tick, which is what scopes it to one session instance.
+    pub(crate) overnight_reprice_counts: Arc<Mutex<HashMap<Symbol, u32>>>,
+}
+
+/// Why the position scan paged the operator, outside the dead-letter path:
+/// the hedge is not abandoned, but a condition needs a human. One dedup key
+/// per `(symbol, reason)`; each trigger removes its key when the condition
+/// clears, so a recurrence pages again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum OperatorAlertReason {
+    /// The overnight reference stayed stale or missing across the configured
+    /// number of consecutive scans while exposure waited.
+    StaleQuotePersistent,
+    /// A live overnight order sits on a halted asset past the configured age.
+    HaltedOrderPending,
+    /// One symbol's overnight reprice cancellations exceeded the configured
+    /// count within one session.
+    RepricingExcessive,
+    /// A symbol's unhedged exposure is older than the configured maximum.
+    ExposureAgeExceeded,
+}
+
+impl OperatorAlertReason {
+    pub(crate) const fn metric_label(self) -> &'static str {
+        match self {
+            Self::StaleQuotePersistent => "stale_quote_persistent",
+            Self::HaltedOrderPending => "halted_order_pending",
+            Self::RepricingExcessive => "repricing_excessive",
+            Self::ExposureAgeExceeded => "exposure_age_exceeded",
+        }
+    }
+
+    /// The runbook section with the response, mirroring
+    /// `DeadLetterReason::runbook_anchor`.
+    pub(crate) const fn runbook_anchor(self) -> &'static str {
+        match self {
+            Self::StaleQuotePersistent => "quote-inspection",
+            Self::HaltedOrderPending => "pending-halted-orders",
+            Self::RepricingExcessive => "open-order-inspection",
+            Self::ExposureAgeExceeded => "stale-exposure",
+        }
+    }
 }
 
 /// Errors surfaced by [`CheckPositions::perform`].
@@ -202,7 +259,11 @@ pub(crate) fn record_scan_skip(
 /// placement covers yet, and 0 once everything is hedged or in flight, so a
 /// cleared symbol never shows a stale age. A read-model failure logs and
 /// leaves the gauge untouched rather than faking a value.
-async fn record_exposure_age(pool: &SqlitePool, symbol: &Symbol, now: DateTime<Utc>) {
+async fn record_exposure_age(
+    pool: &SqlitePool,
+    symbol: &Symbol,
+    now: DateTime<Utc>,
+) -> Option<std::time::Duration> {
     let oldest = match oldest_unhedged_fill_timestamp(pool, symbol).await {
         Ok(oldest) => oldest,
         Err(error) => {
@@ -211,24 +272,23 @@ async fn record_exposure_age(pool: &SqlitePool, symbol: &Symbol, now: DateTime<U
                 "position_exposure_age_seconds gauge skipped: could not replay \
                  the uncovered-fill pool"
             );
-            return;
+            return None;
         }
     };
 
     // Same skew clamp as the fill-latency sample: a fill stamped ahead of
     // our clock is age zero, never a negative or wrapped value.
-    let age_seconds = oldest.map_or(0.0, |oldest| {
-        (now - oldest)
-            .to_std()
-            .unwrap_or(std::time::Duration::ZERO)
-            .as_secs_f64()
+    let age = oldest.map_or(std::time::Duration::ZERO, |oldest| {
+        (now - oldest).to_std().unwrap_or(std::time::Duration::ZERO)
     });
 
     gauge!(
         "position_exposure_age_seconds",
         "symbol" => symbol.to_string()
     )
-    .set(age_seconds);
+    .set(age.as_secs_f64());
+
+    Some(age)
 }
 
 fn should_page_reference_price_failure(
@@ -322,7 +382,8 @@ where
         // Enqueue unrelated ready hedges before broker-backed cancellation
         // maintenance. A slow cancellation must not extend the exposure window
         // for another symbol that is already ready to hedge.
-        ctx.scan_and_enqueue(&mut close_flatten_window_cache)
+        let exposure_ages = ctx
+            .scan_and_enqueue(&mut close_flatten_window_cache)
             .await?;
 
         // Each arm gates its sweeps on the session family that owns them:
@@ -332,44 +393,12 @@ where
         // and waste a round trip every tick (and vice versa).
         if ctx.ctx.assets.any_extended_hours_enabled() || ctx.ctx.assets.any_overnight_enabled() {
             match ctx.executor.market_session().await {
-                Ok(MarketSession::Extended) => {
-                    // Deliberately NOT gated on `any_overnight_enabled()`: a
-                    // full overnight rollback (every symbol flipped back to
-                    // disabled) must still converge the survivors it strands,
-                    // and the sweep makes no broker call when nothing
-                    // matches. Its per-symbol filter scopes the rest.
-                    ctx.request_overnight_session_boundary_cancellations().await;
-                    if ctx.ctx.assets.any_extended_hours_enabled() {
-                        ctx.request_extended_hours_close_flatten_cancellations(
-                            &mut close_flatten_window_cache,
-                        )
+                Ok(session) => {
+                    ctx.alert_exposure_age_breaches(session, &exposure_ages)
                         .await;
-                        ctx.request_extended_hours_reprice_timeout_cancellations()
-                            .await;
-                    }
+                    ctx.run_session_sweeps(session, &mut close_flatten_window_cache)
+                        .await;
                 }
-                Ok(MarketSession::Regular) => {
-                    // Every regular-hours tick: request cancellation of
-                    // still-live extended-hours and overnight limit orders so
-                    // they're replaced with market orders. Level-triggered so
-                    // an order that slipped past the session boundary,
-                    // survived a restart, or whose cancellation request
-                    // failed on a previous tick is caught on this one.
-                    // Ungated within the arm for the same rollback reasoning
-                    // as the pre-market boundary sweep: the outer gate is
-                    // already the sweep's exact condition.
-                    ctx.request_market_open_cancellations().await;
-                }
-                Ok(MarketSession::Overnight) => {
-                    if ctx.ctx.assets.any_overnight_enabled() {
-                        ctx.request_overnight_reprice_timeout_cancellations().await;
-                    }
-                }
-                // A Closed tick has nothing to sweep: no session's limit
-                // orders can be repriced into a closed venue, and the 20:00
-                // entry into Overnight relies on the broker's day-order
-                // auto-cancel observed by the status poller, not on a sweep.
-                Ok(MarketSession::Closed) => {}
                 Err(error) => {
                     warn!("Failed to check market session for order cancellation: {error}");
                 }
@@ -387,7 +416,7 @@ where
     async fn scan_and_enqueue(
         &self,
         close_flatten_window_cache: &mut CloseFlattenWindowCache,
-    ) -> Result<(), CheckPositionsError> {
+    ) -> Result<Vec<(Symbol, std::time::Duration)>, CheckPositionsError> {
         // Reconcile placements stuck between broker acceptance and the outcome
         // commit (ADR 0014). `is_ready_for_execution` skips pending-claimed
         // positions, so the main scan never re-drives these; this periodic sweep
@@ -448,8 +477,11 @@ where
         // Every known symbol, not just trading-enabled ones: exposure on a
         // disabled symbol never clears through the scan, which is exactly
         // when the operator needs the age to keep climbing.
+        let mut exposure_ages = Vec::with_capacity(all_positions.len());
         for (symbol, _) in &all_positions {
-            record_exposure_age(&self.pool, symbol, Utc::now()).await;
+            if let Some(age) = record_exposure_age(&self.pool, symbol, Utc::now()).await {
+                exposure_ages.push((symbol.clone(), age));
+            }
         }
 
         let eligible: Vec<Symbol> = all_positions
@@ -471,7 +503,7 @@ where
                 .await;
         }
 
-        Ok(())
+        Ok(exposure_ages)
     }
 
     async fn check_and_enqueue_symbol(
@@ -739,7 +771,7 @@ where
     /// counted with its own cause on `hedge_scan_skipped_total`, since the job
     /// that carries the dead-letter counter is never enqueued for it. A
     /// non-retryable reference-price failure additionally pages the operator
-    /// through the hedge job's own `alert_dead_letter`, under the
+    /// through the hedge job's own `page_operator_once`, under the
     /// `(symbol, reason)` key that job would have used. Transient and
     /// rate-limited failures wait for the next scan instead of creating a
     /// dead-letter page on their first observation.
@@ -774,7 +806,7 @@ where
                     &error,
                     self.executor.to_supported_executor(),
                 ) {
-                    alert_dead_letter(
+                    page_operator_once(
                         self.notifier.as_ref(),
                         &self.alerted_dead_letters,
                         &order.symbol,
@@ -820,7 +852,7 @@ where
                 );
                 let reason =
                     DeadLetterReason::SymbolScoped(SymbolScopedReason::SlippageCalculation);
-                alert_dead_letter(
+                page_operator_once(
                     self.notifier.as_ref(),
                     &self.alerted_dead_letters,
                     &order.symbol,
@@ -895,7 +927,10 @@ where
         )
         .await
         {
-            Ok(reference) => reference,
+            Ok(reference) => {
+                self.clear_overnight_reference_defer(&order.symbol).await;
+                reference
+            }
             Err(error) => {
                 record_scan_skip(
                     &order.symbol,
@@ -910,7 +945,7 @@ where
                     "Skipping hedge enqueue: no indicative reference price to preflight against"
                 );
                 if should_page_overnight_reference_failure(&error) {
-                    alert_dead_letter(
+                    page_operator_once(
                         self.notifier.as_ref(),
                         &self.alerted_dead_letters,
                         &order.symbol,
@@ -928,6 +963,12 @@ where
                         ),
                     )
                     .await;
+                } else {
+                    // Only the silent defers feed the persistence streak: a
+                    // non-retryable failure paged just above, and paging the
+                    // same outage again after N scans under a second reason
+                    // would be noise, not signal.
+                    self.note_overnight_reference_defer(&order.symbol).await;
                 }
                 return Ok(None);
             }
@@ -1023,6 +1064,313 @@ where
                 | OffchainOrder::Cancelling { .. } => {}
             }
         }
+    }
+
+    /// The session-scoped maintenance sweeps, split from `perform` so the
+    /// resolved session can also feed the session-agnostic alerts. Arms keep
+    /// their pre-existing gating comments and behavior.
+    async fn run_session_sweeps(
+        &self,
+        session: MarketSession,
+        close_flatten_window_cache: &mut CloseFlattenWindowCache,
+    ) {
+        match session {
+            MarketSession::Extended => {
+                self.reset_overnight_session_scoped_alerts().await;
+                // Deliberately NOT gated on `any_overnight_enabled()`: a
+                // full overnight rollback (every symbol flipped back to
+                // disabled) must still converge the survivors it strands,
+                // and the sweep makes no broker call when nothing
+                // matches. Its per-symbol filter scopes the rest.
+                self.request_overnight_session_boundary_cancellations()
+                    .await;
+                if self.ctx.assets.any_extended_hours_enabled() {
+                    self.request_extended_hours_close_flatten_cancellations(
+                        close_flatten_window_cache,
+                    )
+                    .await;
+                    self.request_extended_hours_reprice_timeout_cancellations()
+                        .await;
+                }
+            }
+            MarketSession::Regular => {
+                self.reset_overnight_session_scoped_alerts().await;
+                // Every regular-hours tick: request cancellation of
+                // still-live extended-hours and overnight limit orders so
+                // they're replaced with market orders. Level-triggered so
+                // an order that slipped past the session boundary,
+                // survived a restart, or whose cancellation request
+                // failed on a previous tick is caught on this one.
+                // Ungated within the arm for the same rollback reasoning
+                // as the pre-market boundary sweep: the outer gate is
+                // already the sweep's exact condition.
+                self.request_market_open_cancellations().await;
+            }
+            MarketSession::Overnight => {
+                if self.ctx.assets.any_overnight_enabled() {
+                    self.request_overnight_reprice_timeout_cancellations().await;
+                    self.alert_pending_halted_overnight_orders().await;
+                }
+            }
+            // A Closed tick has nothing to sweep: no session's limit
+            // orders can be repriced into a closed venue, and the 20:00
+            // entry into Overnight relies on the broker's day-order
+            // auto-cancel observed by the status poller, not on a sweep.
+            MarketSession::Closed => {
+                self.reset_overnight_session_scoped_alerts().await;
+            }
+        }
+    }
+
+    /// Clears the per-session overnight alert state on any non-overnight
+    /// tick. Overnight sessions are separated by non-overnight periods, so
+    /// this is what scopes the reprice count (and its page) to one session
+    /// instance.
+    async fn reset_overnight_session_scoped_alerts(&self) {
+        self.overnight_reprice_counts.lock().await.clear();
+        self.operator_alerts
+            .lock()
+            .await
+            .retain(|(_, reason)| *reason != OperatorAlertReason::RepricingExcessive);
+    }
+
+    /// Pages when a symbol's unhedged exposure outlives the configured
+    /// maximum, and releases the page as soon as the age drops back under
+    /// it, so the next breach pages again.
+    async fn alert_exposure_age_breaches(
+        &self,
+        session: MarketSession,
+        exposure_ages: &[(Symbol, std::time::Duration)],
+    ) {
+        let Some(thresholds) = self.ctx.overnight_alert_thresholds else {
+            return;
+        };
+        let max_age = std::time::Duration::from_secs(thresholds.max_exposure_age_secs.get());
+
+        for (symbol, age) in exposure_ages {
+            if *age > max_age {
+                let reason = OperatorAlertReason::ExposureAgeExceeded;
+                page_operator_once(
+                    self.notifier.as_ref(),
+                    &self.operator_alerts,
+                    symbol,
+                    reason,
+                    &operator_alert_message(
+                        symbol,
+                        session,
+                        None,
+                        reason.metric_label(),
+                        &format!(
+                            "unhedged exposure is {}s old, past the configured maximum \
+                             of {}s; the scan has not been able to hedge it away.",
+                            age.as_secs(),
+                            max_age.as_secs()
+                        ),
+                        reason.runbook_anchor(),
+                    ),
+                )
+                .await;
+            } else {
+                self.operator_alerts
+                    .lock()
+                    .await
+                    .remove(&(symbol.clone(), OperatorAlertReason::ExposureAgeExceeded));
+            }
+        }
+    }
+
+    /// Pages when a live overnight order sits on an asset whose latest
+    /// eligibility snapshot reports it halted, once the order's age passes
+    /// the configured bound. Releases when the condition clears (the order
+    /// went terminal, or the halt lifted), so a later recurrence pages
+    /// again. Alpaca holds such orders pending rather than rejecting them,
+    /// which is exactly why a human has to decide between waiting and
+    /// cancelling.
+    async fn alert_pending_halted_overnight_orders(&self) {
+        let Some(thresholds) = self.ctx.overnight_alert_thresholds else {
+            return;
+        };
+        // A configured bound above i64::MAX seconds (292 billion years) is
+        // not a real threshold; clamping keeps the comparison meaningful
+        // without a fallible path for an unreachable case.
+        let max_age = chrono::Duration::seconds(
+            i64::try_from(thresholds.halted_order_alert_secs.get()).unwrap_or(i64::MAX),
+        );
+
+        let all_positions = match self.position_projection.load_all().await {
+            Ok(positions) => positions,
+            Err(error) => {
+                warn!(%error, "Failed to load positions for the halted-order alert");
+                return;
+            }
+        };
+
+        for (symbol, position) in all_positions {
+            let Some(offchain_order_id) = position.pending_offchain_order_id else {
+                self.release_operator_alert(&symbol, OperatorAlertReason::HaltedOrderPending)
+                    .await;
+                continue;
+            };
+            let order = match self.offchain_order.load(&offchain_order_id).await {
+                Ok(Some(order)) => order,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(
+                        %symbol, %offchain_order_id, %error,
+                        "Failed to load order for the halted-order alert; next tick retries"
+                    );
+                    continue;
+                }
+            };
+
+            let (placed_at, executor_order_id) = match &order {
+                OffchainOrder::Submitted {
+                    market_session: MarketSession::Overnight,
+                    placed_at,
+                    executor_order_id,
+                    ..
+                }
+                | OffchainOrder::PartiallyFilled {
+                    market_session: MarketSession::Overnight,
+                    placed_at,
+                    executor_order_id,
+                    ..
+                } => (*placed_at, executor_order_id.clone()),
+                _ => {
+                    self.release_operator_alert(&symbol, OperatorAlertReason::HaltedOrderPending)
+                        .await;
+                    continue;
+                }
+            };
+
+            let halted = self
+                .overnight_eligibility
+                .get(&symbol)
+                .is_some_and(|snapshot| snapshot.details.overnight_halted == Some(true));
+            if !halted || Utc::now() - placed_at <= max_age {
+                self.release_operator_alert(&symbol, OperatorAlertReason::HaltedOrderPending)
+                    .await;
+                continue;
+            }
+
+            let reason = OperatorAlertReason::HaltedOrderPending;
+            page_operator_once(
+                self.notifier.as_ref(),
+                &self.operator_alerts,
+                &symbol,
+                reason,
+                &operator_alert_message(
+                    &symbol,
+                    MarketSession::Overnight,
+                    Some(executor_order_id.as_ref()),
+                    reason.metric_label(),
+                    "a live overnight order has sat on a halted asset past the \
+                     configured age; decide between waiting for the halt to lift \
+                     and cancelling the order.",
+                    reason.runbook_anchor(),
+                ),
+            )
+            .await;
+        }
+    }
+
+    /// Notes one overnight reprice-timeout cancellation for the symbol and
+    /// pages once the per-session count passes the configured bound.
+    async fn note_overnight_reprice_cancellation(
+        &self,
+        symbol: &Symbol,
+        offchain_order_id: OffchainOrderId,
+    ) {
+        let Some(thresholds) = self.ctx.overnight_alert_thresholds else {
+            return;
+        };
+
+        let count = *self
+            .overnight_reprice_counts
+            .lock()
+            .await
+            .entry(symbol.clone())
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        if count < thresholds.reprice_alert_count.get() {
+            return;
+        }
+
+        let reason = OperatorAlertReason::RepricingExcessive;
+        page_operator_once(
+            self.notifier.as_ref(),
+            &self.operator_alerts,
+            symbol,
+            reason,
+            &operator_alert_message(
+                symbol,
+                MarketSession::Overnight,
+                Some(&offchain_order_id.to_string()),
+                reason.metric_label(),
+                &format!(
+                    "reprice cancellations for this symbol reached {count} within one \
+                     overnight session; the limit keeps missing and the spread may be \
+                     unworkable.",
+                ),
+                reason.runbook_anchor(),
+            ),
+        )
+        .await;
+    }
+
+    /// Notes one deferred overnight reference resolution (stale or failed
+    /// quote) for a buy the scan is holding back, and pages once the
+    /// consecutive-defer streak passes the configured bound.
+    async fn note_overnight_reference_defer(&self, symbol: &Symbol) {
+        let Some(thresholds) = self.ctx.overnight_alert_thresholds else {
+            return;
+        };
+
+        let streak = *self
+            .stale_quote_defer_streaks
+            .lock()
+            .await
+            .entry(symbol.clone())
+            .and_modify(|streak| *streak += 1)
+            .or_insert(1);
+        if streak < thresholds.stale_quote_alert_scans.get() {
+            return;
+        }
+
+        let reason = OperatorAlertReason::StaleQuotePersistent;
+        page_operator_once(
+            self.notifier.as_ref(),
+            &self.operator_alerts,
+            symbol,
+            reason,
+            &operator_alert_message(
+                symbol,
+                MarketSession::Overnight,
+                None,
+                reason.metric_label(),
+                &format!(
+                    "the overnight indicative reference has been stale or missing for \
+                     {streak} consecutive scans while exposure waits.",
+                ),
+                reason.runbook_anchor(),
+            ),
+        )
+        .await;
+    }
+
+    /// Resets the stale-quote streak and releases its page: the reference
+    /// resolved, so the condition cleared and a recurrence must page again.
+    async fn clear_overnight_reference_defer(&self, symbol: &Symbol) {
+        self.stale_quote_defer_streaks.lock().await.remove(symbol);
+        self.release_operator_alert(symbol, OperatorAlertReason::StaleQuotePersistent)
+            .await;
+    }
+
+    async fn release_operator_alert(&self, symbol: &Symbol, reason: OperatorAlertReason) {
+        self.operator_alerts
+            .lock()
+            .await
+            .remove(&(symbol.clone(), reason));
     }
 
     /// While the market is in regular hours, requests broker cancellation of
@@ -1388,6 +1736,14 @@ where
                                 "reason" => reason.metric_label()
                             )
                             .increment(1);
+
+                            if reason == CancellationReason::OvernightRepriceTimeout {
+                                self.note_overnight_reprice_cancellation(
+                                    &symbol,
+                                    offchain_order_id,
+                                )
+                                .await;
+                            }
                         }
                         Err(error) => {
                             warn!(
@@ -1652,7 +2008,7 @@ mod tests {
     use reqwest::StatusCode;
     use sqlx::SqlitePool;
     use std::collections::HashMap;
-    use std::num::NonZeroU64;
+    use std::num::{NonZeroU32, NonZeroU64};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1660,7 +2016,7 @@ mod tests {
 
     use st0x_config::{
         AssetsConfig, EquitiesConfig, EquityAssetConfig, ExecutionThreshold, OperationMode,
-        create_test_ctx_with_order_owner,
+        OvernightAlertThresholds, create_test_ctx_with_order_owner,
     };
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::{
@@ -1763,6 +2119,10 @@ mod tests {
             poll_interval: TEST_POLL_INTERVAL,
             notifier: Arc::new(NoopNotifier),
             alerted_dead_letters: Arc::new(Mutex::new(HashSet::new())),
+            overnight_eligibility: EligibilitySnapshots::default(),
+            operator_alerts: Arc::new(Mutex::new(HashSet::new())),
+            stale_quote_defer_streaks: Arc::new(Mutex::new(HashMap::new())),
+            overnight_reprice_counts: Arc::new(Mutex::new(HashMap::new())),
         };
 
         (ctx, position)
@@ -2077,6 +2437,10 @@ mod tests {
             poll_interval: TEST_POLL_INTERVAL,
             notifier: Arc::new(NoopNotifier),
             alerted_dead_letters: Arc::new(Mutex::new(HashSet::new())),
+            overnight_eligibility: EligibilitySnapshots::default(),
+            operator_alerts: Arc::new(Mutex::new(HashSet::new())),
+            stale_quote_defer_streaks: Arc::new(Mutex::new(HashMap::new())),
+            overnight_reprice_counts: Arc::new(Mutex::new(HashMap::new())),
         };
 
         CheckPositions {}.perform(&ctx).await.unwrap();
@@ -4808,6 +5172,373 @@ mod tests {
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ))
         }
+    }
+
+    /// `overnight_ctx` with the four alert thresholds armed at values the
+    /// trigger tests exercise: page on the 2nd stale scan, a 60s halted-order
+    /// bound, page on the 1st reprice cancellation, a 100s exposure bound.
+    fn armed_overnight_ctx(symbols: &[&str]) -> Ctx {
+        Ctx {
+            overnight_alert_thresholds: Some(OvernightAlertThresholds {
+                stale_quote_alert_scans: NonZeroU32::new(2).unwrap(),
+                halted_order_alert_secs: NonZeroU64::new(60).unwrap(),
+                reprice_alert_count: NonZeroU32::new(1).unwrap(),
+                max_exposure_age_secs: NonZeroU64::new(100).unwrap(),
+            }),
+            ..overnight_ctx(symbols)
+        }
+    }
+
+    fn halted_overnight_snapshot() -> st0x_execution::EligibilitySnapshot {
+        let mut snapshot = eligible_overnight_snapshot();
+        snapshot.details.overnight_halted = Some(true);
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn persistent_stale_quote_pages_on_the_configured_scan_and_dedupes() {
+        // Threshold: 2 consecutive stale-defer scans. The 1st scan must stay
+        // silent, the 2nd must page, the 3rd must not page again.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = armed_overnight_ctx(&["AAPL"]);
+        let stale_at = chrono::Utc::now() - chrono::Duration::seconds(120);
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Overnight)
+            .with_overnight_quote(indicative_quote_at("99.50", "100.00", stale_at));
+        let (mut ctx, position) =
+            build_ctx_with_executor(pool, apalis_pool, cfg, Duration::from_secs(60), executor)
+                .await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        ctx.notifier = notifier.clone();
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Sell,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+        assert_eq!(
+            notifier.messages(),
+            Vec::<String>::new(),
+            "one stale scan is below the threshold and must not page"
+        );
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+        let expected_page = "Hedge alert [symbol=AAPL session=overnight order=none \
+             reason=stale_quote_persistent]: the overnight indicative reference has been \
+             stale or missing for 2 consecutive scans while exposure waits. Operator \
+             action: docs/overnight-runbook.md#quote-inspection"
+            .to_string();
+        assert_eq!(notifier.messages(), vec![expected_page.clone()]);
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+        assert_eq!(
+            notifier.messages(),
+            vec![expected_page],
+            "the page must dedupe while the condition persists"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_quote_clears_the_stale_streak_and_releases_the_page() {
+        // Pre-seed the streak and the latched page, then run one scan with a
+        // fresh quote: the successful resolution must reset both, so a later
+        // recurrence starts a new streak and pages again.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = armed_overnight_ctx(&["AAPL"]);
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Overnight)
+            .with_overnight_quote(indicative_quote_at("99.50", "100.00", chrono::Utc::now()))
+            .with_inventory(Inventory {
+                positions: Vec::new(),
+                usd_balance_cents: 20_200,
+                cash_buying_power_cents: Some(20_200),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            });
+        let (ctx, position) =
+            build_ctx_with_executor(pool, apalis_pool, cfg, Duration::from_secs(60), executor)
+                .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Sell,
+        )
+        .await;
+        ctx.stale_quote_defer_streaks
+            .lock()
+            .await
+            .insert(aapl.clone(), 5);
+        ctx.operator_alerts
+            .lock()
+            .await
+            .insert((aapl.clone(), OperatorAlertReason::StaleQuotePersistent));
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            ctx.stale_quote_defer_streaks.lock().await.get(&aapl),
+            None,
+            "a successful resolution must reset the defer streak"
+        );
+        assert!(
+            !ctx.operator_alerts
+                .lock()
+                .await
+                .contains(&(aapl, OperatorAlertReason::StaleQuotePersistent)),
+            "a successful resolution must release the latched page"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_halted_pending_overnight_order_pages_and_releases_when_the_halt_lifts() {
+        // placed_at sits between the halted-order bound (60s) and the reprice
+        // timeout (300s), so the reprice sweep leaves the order alone and the
+        // halted-order alert is what fires.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = armed_overnight_ctx(&["AAPL"]);
+        let (mut ctx, position) = build_ctx_with_executor(
+            pool,
+            apalis_pool,
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Overnight)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-ovn-1"),
+                }),
+        )
+        .await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        ctx.notifier = notifier.clone();
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_overnight_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            chrono::Utc::now() - chrono::Duration::seconds(100),
+        )
+        .await;
+        ctx.overnight_eligibility
+            .record(aapl.clone(), halted_overnight_snapshot());
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let expected_page = "Hedge alert [symbol=AAPL session=overnight order=broker-ovn-1 \
+             reason=halted_order_pending]: a live overnight order has sat on a halted \
+             asset past the configured age; decide between waiting for the halt to lift \
+             and cancelling the order. Operator action: \
+             docs/overnight-runbook.md#pending-halted-orders"
+            .to_string();
+        assert_eq!(notifier.messages(), vec![expected_page.clone()]);
+
+        // Still halted next tick: deduped.
+        CheckPositions::default().perform(&ctx).await.unwrap();
+        assert_eq!(notifier.messages(), vec![expected_page]);
+
+        // The halt lifts: the latched page must release so a re-halt pages
+        // again.
+        ctx.overnight_eligibility
+            .record(aapl.clone(), eligible_overnight_snapshot());
+        CheckPositions::default().perform(&ctx).await.unwrap();
+        assert!(
+            !ctx.operator_alerts
+                .lock()
+                .await
+                .contains(&(aapl, OperatorAlertReason::HaltedOrderPending)),
+            "a lifted halt must release the latched page"
+        );
+    }
+
+    #[tokio::test]
+    async fn excessive_repricing_pages_with_the_order_id() {
+        // Threshold: 1 reprice cancellation. The stale overnight order is
+        // cancelled on the first Overnight tick, which reaches the count and
+        // must page naming the cancelled order.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = armed_overnight_ctx(&["AAPL"]);
+        let (mut ctx, position) = build_ctx_with_executor(
+            pool,
+            apalis_pool,
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new()
+                .with_market_session(MarketSession::Overnight)
+                .with_order_status(OrderState::Submitted {
+                    order_id: ExecutorOrderId::new("broker-ovn-1"),
+                }),
+        )
+        .await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        ctx.notifier = notifier.clone();
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+        let offchain_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, offchain_order_id).await;
+        record_overnight_order_at(
+            &ctx,
+            &aapl,
+            offchain_order_id,
+            chrono::Utc::now() - chrono::Duration::seconds(301),
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            notifier.messages(),
+            vec![format!(
+                "Hedge alert [symbol=AAPL session=overnight order={offchain_order_id} \
+                 reason=repricing_excessive]: reprice cancellations for this symbol \
+                 reached 1 within one overnight session; the limit keeps missing and \
+                 the spread may be unworkable. Operator action: \
+                 docs/overnight-runbook.md#open-order-inspection"
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_overnight_tick_resets_the_reprice_count_and_page() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = armed_overnight_ctx(&["AAPL"]);
+        let (ctx, _position) = build_ctx_with_executor(
+            pool,
+            apalis_pool,
+            cfg,
+            Duration::from_secs(60),
+            regular_session_executor(),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        ctx.overnight_reprice_counts
+            .lock()
+            .await
+            .insert(aapl.clone(), 7);
+        ctx.operator_alerts
+            .lock()
+            .await
+            .insert((aapl.clone(), OperatorAlertReason::RepricingExcessive));
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert!(
+            ctx.overnight_reprice_counts.lock().await.is_empty(),
+            "a non-overnight tick must clear the per-session reprice counts"
+        );
+        assert!(
+            !ctx.operator_alerts
+                .lock()
+                .await
+                .contains(&(aapl, OperatorAlertReason::RepricingExcessive)),
+            "a non-overnight tick must release the per-session reprice page"
+        );
+    }
+
+    #[tokio::test]
+    async fn exposure_older_than_the_bound_pages_and_releases_when_hedged() {
+        // Threshold: 100s. A 300s-old uncovered fill must page; covering it
+        // with a filled hedge cycle must release the page on the next tick.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = armed_overnight_ctx(&["AAPL"]);
+        let executor = MockExecutor::new().with_market_session(MarketSession::Overnight);
+        let (mut ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool,
+            cfg,
+            Duration::from_secs(60),
+            executor,
+        )
+        .await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        ctx.notifier = notifier.clone();
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+        let landed_at = (chrono::Utc::now() - chrono::Duration::seconds(300)).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO hedge_fill (symbol, tx_hash, log_index, block_timestamp, seen_at) \
+             VALUES (?, ?, 1, ?, ?)",
+        )
+        .bind("AAPL")
+        .bind("0xexposure-alert")
+        .bind(&landed_at)
+        .bind(&landed_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let paged = notifier.messages();
+        assert_eq!(paged.len(), 1, "exactly one page expected, got: {paged:?}");
+        assert!(
+            paged[0].starts_with(
+                "Hedge alert [symbol=AAPL session=overnight order=none \
+                 reason=exposure_age_exceeded]: unhedged exposure is "
+            ) && paged[0].ends_with(
+                "s old, past the configured maximum of 100s; the scan has not been able \
+                 to hedge it away. Operator action: docs/overnight-runbook.md#stale-exposure"
+            ),
+            "the exposure page must follow the contract, got: {}",
+            paged[0]
+        );
+
+        // Cover the fill: the age drops to zero and the page must release.
+        let placed_at = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO hedge_cycle (offchain_order_id, symbol, placed_at, covered_count, \
+             covered_earliest_block_timestamp, covered_latest_seen_at, filled_at) \
+             VALUES (?, ?, ?, 1, ?, ?, ?)",
+        )
+        .bind(OffchainOrderId::new().to_string())
+        .bind("AAPL")
+        .bind(&placed_at)
+        .bind(&landed_at)
+        .bind(&landed_at)
+        .bind(&placed_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+        assert!(
+            !ctx.operator_alerts
+                .lock()
+                .await
+                .contains(&(aapl, OperatorAlertReason::ExposureAgeExceeded)),
+            "hedged-away exposure must release the latched page"
+        );
     }
 
     fn indicative_quote_at(

@@ -453,6 +453,14 @@ where
         poll_interval,
         notifier: notifier.clone(),
         alerted_dead_letters,
+        overnight_eligibility: context.overnight_eligibility.clone(),
+        operator_alerts: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        stale_quote_defer_streaks: Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        overnight_reprice_counts: Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
     });
 
     let portfolio_snapshot_ctx = Arc::new(PortfolioSnapshotCtx {
