@@ -363,6 +363,9 @@ async fn ingest_position(
             block_number: _,
             seen_at: _,
         } => {
+            // `chain` must be bound: the column's DEFAULT 'base' exists only to
+            // backfill pre-multichain rows, and an unbound insert would silently
+            // file a non-Base fill under Base.
             sqlx::query(
                 "INSERT INTO pnl_onchain_fill \
                  (event_rowid, symbol, chain, tx_hash, log_index, shares, direction, price_usd, \
