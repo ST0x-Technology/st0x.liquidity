@@ -7736,6 +7736,29 @@ mod tests {
     }
 
     #[test]
+    fn production_configs_have_the_same_inventory_adapters() {
+        let config: Config =
+            toml::from_str(include_str!("../../../config/prod/st0x-hedge.toml")).unwrap();
+        let gcp_config: Config =
+            toml::from_str(include_str!("../../../config/prod-gcp/st0x-hedge.toml")).unwrap();
+
+        let adapters = &config
+            .chains
+            .get(&Chain::Base)
+            .and_then(|chain| chain.trading.as_ref())
+            .expect("prod config must describe Base as a trading chain")
+            .inventory_adapters;
+        let gcp_adapters = &gcp_config
+            .chains
+            .get(&Chain::Base)
+            .and_then(|chain| chain.trading.as_ref())
+            .expect("prod-gcp config must describe Base as a trading chain")
+            .inventory_adapters;
+
+        assert_eq!(gcp_adapters, adapters);
+    }
+
+    #[test]
     fn staging_config_toml_is_valid() {
         let config_str = include_str!("../../../config/staging/st0x-hedge.toml");
         let config: Config = toml::from_str(config_str).unwrap();
