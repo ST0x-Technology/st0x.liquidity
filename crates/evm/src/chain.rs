@@ -7,7 +7,10 @@
 use std::fmt;
 use std::str::FromStr;
 
+use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
+
+use crate::tokens::{USDC_BASE, USDC_ETHEREUM};
 
 /// An EVM chain the bot acts on.
 ///
@@ -40,6 +43,17 @@ impl Chain {
             Self::Base => 8453,
             Self::Ethereum => 1,
             Self::HyperEvm => 999,
+        }
+    }
+
+    /// The canonical USDC contract on this chain, or `None` where it is not
+    /// yet pinned in this crate. Callers on a fill path must refuse rather
+    /// than fall back to another chain's address: USDC differs per chain.
+    pub const fn usdc(self) -> Option<Address> {
+        match self {
+            Self::Base => Some(USDC_BASE),
+            Self::Ethereum => Some(USDC_ETHEREUM),
+            Self::HyperEvm => None,
         }
     }
 

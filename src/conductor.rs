@@ -86,13 +86,13 @@ use crate::offchain::order::{
 };
 #[cfg(test)]
 use crate::offchain::order::{OffchainOrderCommand, noop_order_placer};
-use crate::onchain::OnchainTrade;
 #[cfg(test)]
 use crate::onchain::accumulator::check_all_positions;
 use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
 use crate::onchain::approvals::{build_approval_targets, grant_startup_approvals};
 use crate::onchain::backfill::BackfillQueues;
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
+use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
 use crate::onchain_trade::{
     OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId, OnChainTradeSource,
     SourceAttributionDecision,
@@ -3405,7 +3405,7 @@ async fn build_position_cqrs(
 /// and registers vaults owned by the specified order_owner.
 ///
 /// Vaults are classified as:
-/// - USDC vault: token == USDC_BASE
+/// - USDC vault: token == the fill chain's canonical USDC
 /// - Equity vault: token matches the trade's symbol (via cache lookup)
 pub(crate) async fn discover_vaults_for_trade(
     trade_event: &EmittedOnChain<RaindexTradeEvent>,
@@ -3439,11 +3439,18 @@ pub(crate) async fn discover_vaults_for_trade(
         orderbook: context.orderbook,
         owner: context.order_owner,
     };
+    let usdc = trade_event
+        .chain
+        .usdc()
+        .ok_or(TradeValidationError::UsdcUnknownOnChain {
+            chain: trade_event.chain,
+        })
+        .map_err(OnChainError::from)?;
 
     for owned_vault in our_vaults {
         let vault = owned_vault.vault;
 
-        let command = if vault.token == USDC_BASE {
+        let command = if vault.token == usdc {
             VaultRegistryCommand::DiscoverUsdcVault {
                 vault_id: vault.vault_id,
                 discovered_in: tx_hash,
@@ -3459,7 +3466,7 @@ pub(crate) async fn discover_vaults_for_trade(
             debug!(
                 vault_id = %vault.vault_id,
                 token = %vault.token,
-                usdc = %USDC_BASE,
+                %usdc,
                 expected_equity_token = %expected_equity_token,
                 "Vault token does not match USDC or expected equity token, skipping"
             );
