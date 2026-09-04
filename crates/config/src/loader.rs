@@ -482,6 +482,21 @@ struct BrokerConfig {
     /// Reprice cadence (seconds) for unfilled overnight limits. Same
     /// requiredness gate as the quote-age knob.
     overnight_reprice_timeout_secs: Option<u64>,
+    /// First of the four operator-alert threshold knobs, which share one
+    /// presence contract: all four or none, and all four become required
+    /// once any asset enables overnight counter-trading. This one:
+    /// consecutive scans deferring on a stale/missing overnight quote
+    /// before paging.
+    overnight_stale_quote_alert_scans: Option<u32>,
+    /// Age (seconds) a live overnight order on a halted asset may reach
+    /// before paging. Same contract as the stale-quote knob.
+    overnight_halted_order_alert_secs: Option<u64>,
+    /// Cancel/reprice count for one symbol within one overnight session
+    /// beyond which the operator is paged. Same contract as above.
+    overnight_reprice_alert_count: Option<u32>,
+    /// Maximum tolerated age (seconds) of unhedged exposure before paging.
+    /// Same contract as above.
+    overnight_max_exposure_age_secs: Option<u64>,
     travel_rule: Option<TravelRuleConfig>,
     close_flatten_cross_max_bps: Option<u16>,
 }
@@ -569,6 +584,50 @@ impl BrokerConfig {
                 }
             })
             .transpose()
+    }
+
+    /// The overnight operator-alert thresholds: `None` only when all four
+    /// knobs are absent; a partial set is a config error so a typo cannot
+    /// silently disarm one alert; zero is rejected everywhere (a zero
+    /// threshold would page on every scan or never).
+    fn overnight_alert_thresholds(&self) -> Result<Option<OvernightAlertThresholds>, CtxError> {
+        let fields = (
+            self.overnight_stale_quote_alert_scans,
+            self.overnight_halted_order_alert_secs,
+            self.overnight_reprice_alert_count,
+            self.overnight_max_exposure_age_secs,
+        );
+
+        let (stale_scans, halted_secs, reprice_count, exposure_secs) = match fields {
+            (None, None, None, None) => return Ok(None),
+            (Some(stale_scans), Some(halted_secs), Some(reprice_count), Some(exposure_secs)) => {
+                (stale_scans, halted_secs, reprice_count, exposure_secs)
+            }
+            _ => return Err(CtxError::PartialOvernightAlertThresholds),
+        };
+
+        Ok(Some(OvernightAlertThresholds {
+            stale_quote_alert_scans: NonZeroU32::new(stale_scans).ok_or(
+                CtxError::OvernightAlertThresholdZero {
+                    field: "overnight_stale_quote_alert_scans",
+                },
+            )?,
+            halted_order_alert_secs: NonZeroU64::new(halted_secs).ok_or(
+                CtxError::OvernightAlertThresholdZero {
+                    field: "overnight_halted_order_alert_secs",
+                },
+            )?,
+            reprice_alert_count: NonZeroU32::new(reprice_count).ok_or(
+                CtxError::OvernightAlertThresholdZero {
+                    field: "overnight_reprice_alert_count",
+                },
+            )?,
+            max_exposure_age_secs: NonZeroU64::new(exposure_secs).ok_or(
+                CtxError::OvernightAlertThresholdZero {
+                    field: "overnight_max_exposure_age_secs",
+                },
+            )?,
+        }))
     }
 
     fn overnight_reprice_timeout(&self) -> Result<Option<NonZeroU64>, CtxError> {
@@ -803,6 +862,10 @@ pub struct Ctx {
     /// Reprice cadence for unfilled overnight limits. Same presence
     /// contract as `overnight_max_quote_age_secs`.
     pub overnight_reprice_timeout_secs: Option<NonZeroU64>,
+    /// Operator-alert thresholds for the overnight session. Same presence
+    /// contract as `overnight_max_quote_age_secs`; the inner struct is
+    /// all-or-nothing, so no individual alert can be silently disarmed.
+    pub overnight_alert_thresholds: Option<OvernightAlertThresholds>,
     /// Maximum age (seconds) for a close-flatten limit hedge before it is
     /// cancelled and repriced further along the widening cross ramp.
     pub close_flatten_reprice_timeout_secs: u64,
@@ -1361,6 +1424,10 @@ impl std::fmt::Debug for Ctx {
                 &self.overnight_reprice_timeout_secs,
             )
             .field(
+                "overnight_alert_thresholds",
+                &self.overnight_alert_thresholds,
+            )
+            .field(
                 "close_flatten_reprice_timeout_secs",
                 &self.close_flatten_reprice_timeout_secs,
             )
@@ -1499,6 +1566,7 @@ struct ValidatedParts {
     overnight_max_quote_age_secs: Option<NonZeroU64>,
     overnight_slippage_bps: Option<u16>,
     overnight_reprice_timeout_secs: Option<NonZeroU64>,
+    overnight_alert_thresholds: Option<OvernightAlertThresholds>,
     close_flatten_reprice_timeout_secs: u64,
     extended_hours_close_flatten_window_secs: u64,
     close_flatten_cross_max_bps: u16,
@@ -1978,6 +2046,7 @@ fn parse_and_validate(
         overnight_max_quote_age_secs: overnight.max_quote_age_secs,
         overnight_slippage_bps: overnight.slippage_bps,
         overnight_reprice_timeout_secs: overnight.reprice_timeout_secs,
+        overnight_alert_thresholds: overnight.alert_thresholds,
         close_flatten_reprice_timeout_secs,
         extended_hours_close_flatten_window_secs,
         close_flatten_cross_max_bps,
@@ -2046,6 +2115,28 @@ fn extended_hours_broker_windows(
     })
 }
 
+/// Operator-alert thresholds for the overnight session.
+///
+/// One struct rather than four independent options: the knobs share
+/// one presence contract (all four or none, and all four required
+/// once any asset enables overnight counter-trading), so a partially-armed
+/// alert set is unrepresentable in a loaded [`Ctx`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OvernightAlertThresholds {
+    /// Consecutive scans a symbol may defer on a stale or missing overnight
+    /// quote while exposure waits before the operator is paged.
+    pub stale_quote_alert_scans: NonZeroU32,
+    /// Age (seconds) a live overnight order on a halted asset may reach
+    /// before the operator is paged.
+    pub halted_order_alert_secs: NonZeroU64,
+    /// Cancel/reprice count for one symbol within one overnight session
+    /// beyond which the operator is paged.
+    pub reprice_alert_count: NonZeroU32,
+    /// Maximum tolerated age (seconds) of unhedged exposure before the
+    /// operator is paged.
+    pub max_exposure_age_secs: NonZeroU64,
+}
+
 /// The overnight operational bounds. Every field is `Some` when some
 /// asset enables overnight counter-trading (the gate below enforces it),
 /// and passes through whatever was configured otherwise -- provided
@@ -2055,6 +2146,7 @@ struct OvernightBrokerConfig {
     max_quote_age_secs: Option<NonZeroU64>,
     slippage_bps: Option<u16>,
     reprice_timeout_secs: Option<NonZeroU64>,
+    alert_thresholds: Option<OvernightAlertThresholds>,
 }
 
 fn overnight_broker_config(
@@ -2073,6 +2165,10 @@ fn overnight_broker_config(
         .map(BrokerConfig::overnight_reprice_timeout)
         .transpose()?
         .flatten();
+    let alert_thresholds = broker_config
+        .map(BrokerConfig::overnight_alert_thresholds)
+        .transpose()?
+        .flatten();
 
     if assets.any_overnight_enabled() {
         if max_quote_age_secs.is_none() {
@@ -2084,12 +2180,16 @@ fn overnight_broker_config(
         if reprice_timeout_secs.is_none() {
             return Err(CtxError::MissingOvernightRepriceTimeout);
         }
+        if alert_thresholds.is_none() {
+            return Err(CtxError::MissingOvernightAlertThresholds);
+        }
     }
 
     Ok(OvernightBrokerConfig {
         max_quote_age_secs,
         slippage_bps,
         reprice_timeout_secs,
+        alert_thresholds,
     })
 }
 
@@ -2196,6 +2296,7 @@ impl Ctx {
             overnight_max_quote_age_secs: parts.overnight_max_quote_age_secs,
             overnight_slippage_bps: parts.overnight_slippage_bps,
             overnight_reprice_timeout_secs: parts.overnight_reprice_timeout_secs,
+            overnight_alert_thresholds: parts.overnight_alert_thresholds,
             close_flatten_reprice_timeout_secs: parts.close_flatten_reprice_timeout_secs,
             extended_hours_close_flatten_window_secs: parts
                 .extended_hours_close_flatten_window_secs,
@@ -2445,6 +2546,9 @@ impl Ctx {
         overnight_max_quote_age_secs: Option<NonZeroU64>,
         overnight_slippage_bps: Option<u16>,
         overnight_reprice_timeout_secs: Option<NonZeroU64>,
+        /// Overnight operator-alert thresholds, `None` by default like the
+        /// other overnight knobs.
+        overnight_alert_thresholds: Option<OvernightAlertThresholds>,
         /// What the trading chain lists.
         assets: crate::ChainAssets,
         /// How those symbols hedge. Omitted by most fixtures, which care about
@@ -2541,6 +2645,7 @@ impl Ctx {
             overnight_max_quote_age_secs,
             overnight_slippage_bps,
             overnight_reprice_timeout_secs,
+            overnight_alert_thresholds,
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,
@@ -2742,6 +2847,20 @@ pub enum CtxError {
     )]
     OvernightRepriceTimeoutOutOfRange { configured: u64, max: u64 },
     #[error(
+        "[broker] the four overnight alert thresholds \
+         (overnight_stale_quote_alert_scans, overnight_halted_order_alert_secs, \
+         overnight_reprice_alert_count, overnight_max_exposure_age_secs) are required \
+         when any asset enables overnight_counter_trading"
+    )]
+    MissingOvernightAlertThresholds,
+    #[error(
+        "[broker] the overnight alert thresholds must be configured all together or \
+         not at all; a partial set would silently disarm the missing alerts"
+    )]
+    PartialOvernightAlertThresholds,
+    #[error("[broker] {field} must be nonzero: a zero threshold would page on every scan")]
+    OvernightAlertThresholdZero { field: &'static str },
+    #[error(
         "[broker] close_flatten_reprice_timeout_secs is required when using \
          Alpaca Broker API"
     )]
@@ -2940,6 +3059,9 @@ impl CtxError {
             Self::OvernightRepriceTimeoutOutOfRange { .. } => {
                 "overnight_reprice_timeout_secs out of range"
             }
+            Self::MissingOvernightAlertThresholds => "missing overnight alert thresholds",
+            Self::PartialOvernightAlertThresholds => "partial overnight alert thresholds",
+            Self::OvernightAlertThresholdZero { .. } => "overnight alert threshold zero",
             Self::ZeroPollingInterval { .. } => "zero polling interval",
             Self::ServerAndBoardPortsMatch { .. } => "server_port and board_port must differ",
             Self::FloatComparison(_) => "float comparison failed",
@@ -3130,6 +3252,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         overnight_max_quote_age_secs: None,
         overnight_slippage_bps: None,
         overnight_reprice_timeout_secs: None,
+        overnight_alert_thresholds: None,
         close_flatten_reprice_timeout_secs: 60,
         extended_hours_close_flatten_window_secs: 900,
         close_flatten_cross_max_bps: 400,
@@ -4737,12 +4860,22 @@ mod tests {
         );
     }
 
+    /// The four alert-threshold lines every fully-armed overnight config
+    /// carries, matching the values asserted in
+    /// `overnight_knobs_reach_the_ctx`.
+    const ALERT_THRESHOLD_LINES: &str = "overnight_stale_quote_alert_scans = 5\n\
+         overnight_halted_order_alert_secs = 900\n\
+         overnight_reprice_alert_count = 10\n\
+         overnight_max_exposure_age_secs = 1800";
+
     #[tokio::test]
     async fn overnight_knobs_reach_the_ctx() {
         let config = overnight_knobs_config_toml(
             "enabled",
-            "overnight_max_quote_age_secs = 30\novernight_slippage_bps = 150\n\
-             overnight_reprice_timeout_secs = 120",
+            &format!(
+                "overnight_max_quote_age_secs = 30\novernight_slippage_bps = 150\n\
+                 overnight_reprice_timeout_secs = 120\n{ALERT_THRESHOLD_LINES}"
+            ),
         );
         let secrets = alpaca_pricing_secrets_toml();
 
@@ -4753,6 +4886,76 @@ mod tests {
         assert_eq!(ctx.overnight_max_quote_age_secs, NonZeroU64::new(30));
         assert_eq!(ctx.overnight_slippage_bps, Some(150));
         assert_eq!(ctx.overnight_reprice_timeout_secs, NonZeroU64::new(120));
+        assert_eq!(
+            ctx.overnight_alert_thresholds,
+            Some(OvernightAlertThresholds {
+                stale_quote_alert_scans: NonZeroU32::new(5).unwrap(),
+                halted_order_alert_secs: NonZeroU64::new(900).unwrap(),
+                reprice_alert_count: NonZeroU32::new(10).unwrap(),
+                max_exposure_age_secs: NonZeroU64::new(1800).unwrap(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn overnight_enabled_requires_alert_thresholds() {
+        let config = overnight_knobs_config_toml(
+            "enabled",
+            "overnight_max_quote_age_secs = 30\novernight_slippage_bps = 150\n\
+             overnight_reprice_timeout_secs = 120",
+        );
+        let secrets = alpaca_pricing_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::MissingOvernightAlertThresholds),
+            "expected MissingOvernightAlertThresholds, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_overnight_alert_thresholds_fail_even_while_disabled() {
+        // A typo'd or half-written alert set must fail at deploy time, not
+        // silently disarm the missing alerts until the first enablement.
+        let config =
+            overnight_knobs_config_toml("disabled", "overnight_stale_quote_alert_scans = 5");
+        let secrets = alpaca_pricing_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::PartialOvernightAlertThresholds),
+            "expected PartialOvernightAlertThresholds, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_overnight_alert_threshold_is_rejected_even_while_disabled() {
+        let lines = ALERT_THRESHOLD_LINES.replace(
+            "overnight_reprice_alert_count = 10",
+            "overnight_reprice_alert_count = 0",
+        );
+        let config = overnight_knobs_config_toml("disabled", &lines);
+        let secrets = alpaca_pricing_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::OvernightAlertThresholdZero {
+                    field: "overnight_reprice_alert_count"
+                }
+            ),
+            "expected OvernightAlertThresholdZero for the reprice count, got {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -7554,6 +7757,10 @@ mod tests {
             overnight_max_quote_age_secs: None,
             overnight_slippage_bps: None,
             overnight_reprice_timeout_secs: None,
+            overnight_stale_quote_alert_scans: None,
+            overnight_halted_order_alert_secs: None,
+            overnight_reprice_alert_count: None,
+            overnight_max_exposure_age_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -7587,6 +7794,10 @@ mod tests {
             overnight_max_quote_age_secs: None,
             overnight_slippage_bps: None,
             overnight_reprice_timeout_secs: None,
+            overnight_stale_quote_alert_scans: None,
+            overnight_halted_order_alert_secs: None,
+            overnight_reprice_alert_count: None,
+            overnight_max_exposure_age_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -7617,6 +7828,10 @@ mod tests {
             overnight_max_quote_age_secs: None,
             overnight_slippage_bps: None,
             overnight_reprice_timeout_secs: None,
+            overnight_stale_quote_alert_scans: None,
+            overnight_halted_order_alert_secs: None,
+            overnight_reprice_alert_count: None,
+            overnight_max_exposure_age_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -7642,6 +7857,10 @@ mod tests {
             overnight_max_quote_age_secs: None,
             overnight_slippage_bps: None,
             overnight_reprice_timeout_secs: None,
+            overnight_stale_quote_alert_scans: None,
+            overnight_halted_order_alert_secs: None,
+            overnight_reprice_alert_count: None,
+            overnight_max_exposure_age_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -7675,6 +7894,10 @@ mod tests {
             overnight_max_quote_age_secs: None,
             overnight_slippage_bps: None,
             overnight_reprice_timeout_secs: None,
+            overnight_stale_quote_alert_scans: None,
+            overnight_halted_order_alert_secs: None,
+            overnight_reprice_alert_count: None,
+            overnight_max_exposure_age_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -7712,6 +7935,10 @@ mod tests {
             overnight_max_quote_age_secs: None,
             overnight_slippage_bps: None,
             overnight_reprice_timeout_secs: None,
+            overnight_stale_quote_alert_scans: None,
+            overnight_halted_order_alert_secs: None,
+            overnight_reprice_alert_count: None,
+            overnight_max_exposure_age_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -9773,6 +10000,10 @@ mod tests {
             overnight_max_quote_age_secs: None,
             overnight_slippage_bps: None,
             overnight_reprice_timeout_secs: None,
+            overnight_stale_quote_alert_scans: None,
+            overnight_halted_order_alert_secs: None,
+            overnight_reprice_alert_count: None,
+            overnight_max_exposure_age_secs: None,
             close_flatten_reprice_timeout_secs: None,
             extended_hours_close_flatten_window_secs: None,
             travel_rule: None,
@@ -10695,6 +10926,10 @@ mod tests {
             overnight_max_quote_age_secs = 30
             overnight_slippage_bps = 150
             overnight_reprice_timeout_secs = 120
+            overnight_stale_quote_alert_scans = 5
+            overnight_halted_order_alert_secs = 900
+            overnight_reprice_alert_count = 10
+            overnight_max_exposure_age_secs = 1800
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Entity"
