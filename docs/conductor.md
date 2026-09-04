@@ -648,6 +648,12 @@ WorkerBuilder::new(name)
   exhaustion, reaches the worker's terminal path. This is a backstop: the
   primary defense is that every external HTTP client (trading RPC transport,
   broker, tokenization, bridge, Turnkey) carries its own request timeout.
+  `PERFORM_TIMEOUT` is an `Option`, and several money-moving jobs set `None` to
+  opt out entirely: dropping their future mid-phase (e.g. after an on-chain send
+  broadcasts but before the aggregate persists it) would double-drive real money
+  on retry, so they rely on their own phase-aware deadlines instead. A new `Job`
+  impl must decide this deliberately -- grep the impls that set `None` for the
+  current opt-outs and their reasons.
 - **No circuit breaker (RAI-1495).** Supervised workers do NOT install Apalis'
   `CircuitBreakerService` layer -- neither does `build_best_effort_worker!`,
   which never had one. Previously `build_supervised_worker!` did

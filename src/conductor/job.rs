@@ -559,8 +559,8 @@ where
     /// perform-level bound because its handler has a phase that is unsafe to
     /// interrupt (dropping the future mid-phase would strand or double-drive
     /// real money); such a job relies on its own phase-aware deadlines and on
-    /// the bounded HTTP transports instead. `TransferUsdcToMarketMaking` is the
-    /// current `None`.
+    /// the bounded HTTP transports instead. Grep the impls that set `None` for
+    /// the current opt-outs and their per-job reasons.
     const PERFORM_TIMEOUT: Option<Duration>;
 
     /// Identifier for this job type in the e2e [`FailureInjector`].
@@ -2022,12 +2022,15 @@ mod tests {
     }
 
     /// A `None` `PERFORM_TIMEOUT` must make `perform_bounded` await the handler
-    /// directly with no bound: dropping the future mid-flight is exactly what
-    /// the opt-out exists to prevent. Proven by the call never returning while
-    /// the handler is pending -- the outer test timeout is what fires, not
-    /// `perform_bounded`. A regression that re-imposed a bound would instead
-    /// resolve the call to a `PerformTimeout` error before the outer deadline.
-    #[tokio::test]
+    /// directly with no bound. `UnboundedHangJob::perform` never resolves, so
+    /// with `None` the only timer is the outer deadline and it fires; if a
+    /// regression restored `Some(DEFAULT_PERFORM_TIMEOUT)`, `perform_bounded`
+    /// would resolve to a `PerformTimeout` at 30 min instead. The outer
+    /// deadline is set ABOVE `DEFAULT_PERFORM_TIMEOUT` precisely so those two
+    /// cases diverge; `start_paused` auto-advances the clock while the runtime
+    /// is idle, so this costs no wall-clock time. A shorter outer deadline
+    /// would fire first in both cases and pass even under the regression.
+    #[tokio::test(start_paused = true)]
     async fn perform_bounded_does_not_bound_a_none_timeout_job() {
         let bounded = perform_bounded(
             &UnboundedHangJob,
@@ -2037,7 +2040,8 @@ mod tests {
             false,
         );
 
-        let bounded_result = tokio::time::timeout(Duration::from_millis(200), bounded).await;
+        let bounded_result =
+            tokio::time::timeout(DEFAULT_PERFORM_TIMEOUT + Duration::from_secs(60), bounded).await;
 
         let Err(_elapsed) = &bounded_result else {
             panic!(
