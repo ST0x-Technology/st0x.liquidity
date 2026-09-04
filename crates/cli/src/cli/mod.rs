@@ -3072,7 +3072,7 @@ mod tests {
         // the exact event shapes/sequence the live system would produce.
         // Submit after persisting intent so the stream contains both
         // `MintRequested` and `MintAccepted`.
-        let store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .build(EquityTransferServices {
                 raindex: Arc::new(MockRaindex::new()),
                 vault_lookup: Arc::new(MockVaultLookup::new()),

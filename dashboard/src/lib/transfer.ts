@@ -1,4 +1,5 @@
 import type { TransferOperation } from './api/TransferOperation'
+import type { TransferWarning } from './api/TransferWarning'
 import type { UsdcBridgeDirection } from './api/UsdcBridgeDirection'
 import { formatDecimal } from './decimal'
 import { formatBalance } from './format'
@@ -10,6 +11,31 @@ import { formatBalance } from './format'
 /// extracts the union from the real binding rather than importing a phantom
 /// `api/TransferCategory` file that `st0x-dto` never generates.
 export type TransferCategory = TransferOperation['kind']
+
+export const transferWarningText = (warning: TransferWarning): string => {
+  switch (warning.kind) {
+    case 'mint_category_unavailable':
+      return 'Mint transfer data is unavailable.'
+    case 'redemption_category_unavailable':
+      return 'Redemption transfer data is unavailable.'
+    case 'bridge_category_unavailable':
+      return 'USDC bridge data is unavailable.'
+    case 'trade_history_unavailable':
+      return 'Trade history is unavailable; transfer links may be incomplete.'
+    case 'mint_replay_failed':
+      return `Mint ${warning.id} could not be loaded.`
+    case 'redemption_replay_failed':
+      return `Redemption ${warning.id} could not be loaded.`
+    case 'bridge_replay_failed':
+      return `USDC bridge ${warning.id} could not be loaded.`
+    case 'mint_lifecycle_failed':
+      return `Mint ${warning.id} has an invalid lifecycle.`
+    case 'redemption_lifecycle_failed':
+      return `Redemption ${warning.id} has an invalid lifecycle.`
+    case 'bridge_lifecycle_failed':
+      return `USDC bridge ${warning.id} has an invalid lifecycle.`
+  }
+}
 
 export type StatusStyle = {
   text: string

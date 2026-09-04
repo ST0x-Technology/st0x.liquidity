@@ -2368,16 +2368,17 @@ mod tests {
 
         // Reactor-wired stores -- the production wiring that dispatches committed
         // events to the reactor's `on_mint`.
-        let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+        let (mint_store, _mint_projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(service.clone())
             .build(mock_services())
             .await
             .unwrap();
-        let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .with(service.clone())
-            .build(mock_services())
-            .await
-            .unwrap();
+        let (redemption_store, _redemption_projection) =
+            StoreBuilder::<EquityRedemption>::new(pool.clone())
+                .with(service.clone())
+                .build(mock_services())
+                .await
+                .unwrap();
         service
             .set_stores(
                 mint_store.clone(),
@@ -2515,16 +2516,17 @@ mod tests {
             Arc::new(crate::alerts::LogNotifier),
         ));
 
-        let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+        let (mint_store, _mint_projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(service.clone())
             .build(mock_services())
             .await
             .unwrap();
-        let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .with(service.clone())
-            .build(mock_services())
-            .await
-            .unwrap();
+        let (redemption_store, _redemption_projection) =
+            StoreBuilder::<EquityRedemption>::new(pool.clone())
+                .with(service.clone())
+                .build(mock_services())
+                .await
+                .unwrap();
         service
             .set_stores(
                 mint_store.clone(),
@@ -2896,16 +2898,17 @@ mod tests {
             Arc::new(crate::alerts::LogNotifier),
         ));
 
-        let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+        let (mint_store, _mint_projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(service.clone())
             .build(mock_services())
             .await
             .unwrap();
-        let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .with(service.clone())
-            .build(mock_services())
-            .await
-            .unwrap();
+        let (redemption_store, _redemption_projection) =
+            StoreBuilder::<EquityRedemption>::new(pool.clone())
+                .with(service.clone())
+                .build(mock_services())
+                .await
+                .unwrap();
         service
             .set_stores(
                 mint_store.clone(),

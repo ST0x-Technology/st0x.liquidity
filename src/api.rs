@@ -1,5 +1,6 @@
 //! HTTP API endpoints for health checks, log retrieval, and order status.
 
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -35,7 +36,9 @@ use crate::dashboard::pnl::{
     PnlError, PnlQuery, PnlResponse, acquire_pnl_report_permit, build_pnl_report_with_permit,
     validate_pnl_snapshot_rowid,
 };
-use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
+use crate::dashboard::transfer_loader::{
+    InvalidTransferKind, TransferHistoryQuery, TransferKind, query_transfer_history,
+};
 use crate::dashboard::{TradePage, TradeProtocol, TradeQuery, query_trades};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
 use crate::iap_auth::{IapVerifier, require_iap};
@@ -65,6 +68,8 @@ fn parse_transfer_kind_filter(value: &str) -> Result<Vec<TransferKind>, InvalidT
 static STARTED_AT: LazyLock<DateTime<Utc>> = LazyLock::new(Utc::now);
 const DEFAULT_RAINDEX_ORDERS_PAGE_SIZE: u32 = 50;
 const MAX_RAINDEX_ORDERS_PAGE_SIZE: u32 = 100;
+/// Bounds the rows SQLite may need to sort and skip for one history request.
+const MAX_TRANSFER_HISTORY_OFFSET: usize = 10_000;
 
 /// Upper bound on ERROR/WARN log entries aggregated per reliability report.
 const MAX_RELIABILITY_LOG_ENTRIES: usize = 50_000;
@@ -677,8 +682,8 @@ async fn trades(
     let limit = query.limit.unwrap_or(100).min(500);
     let offset = query.offset.unwrap_or(0);
 
-    let since_dt = parse_trade_filter_time(query.since.as_deref(), "since")?;
-    let until_dt = parse_trade_filter_time(query.until.as_deref(), "until")?;
+    let since_dt = parse_filter_time(query.since.as_deref(), "since")?;
+    let until_dt = parse_filter_time(query.until.as_deref(), "until")?;
     let venues = parse_trade_venues(query.venue.as_deref())?;
     let symbols = parse_trade_symbols(query.symbol.as_deref())?;
 
@@ -711,7 +716,7 @@ async fn trades(
     }))
 }
 
-fn parse_trade_filter_time(
+fn parse_filter_time(
     value: Option<&str>,
     parameter: &'static str,
 ) -> Result<Option<DateTime<Utc>>, StatusCode> {
@@ -721,7 +726,7 @@ fn parse_trade_filter_time(
             DateTime::parse_from_rfc3339(value)
                 .map(|timestamp| timestamp.with_timezone(&Utc))
                 .inspect_err(|error| {
-                    warn!(target: "dashboard", %error, %parameter, %value, "Invalid trade-history timestamp filter");
+                    warn!(target: "dashboard", %error, %parameter, %value, "Invalid timestamp filter");
                 })
                 .map_err(|_| StatusCode::BAD_REQUEST)
         })
@@ -771,27 +776,20 @@ struct TransfersQuery {
     until: Option<String>,
 }
 
-/// Paginated transfer history using event-sourced aggregate replay.
-///
-/// Replays transfer aggregates to produce proper DTO statuses, then
-/// applies time-range filtering and pagination.
+/// Paginated transfer history backed by aggregate projections.
 async fn transfers_endpoint(
     State(state): State<AppState>,
     Query(query): Query<TransfersQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let limit = query.limit.unwrap_or(100).min(500);
+    let limit =
+        NonZeroUsize::new(query.limit.unwrap_or(100).min(500)).ok_or(StatusCode::BAD_REQUEST)?;
     let offset = query.offset.unwrap_or(0);
+    if offset > MAX_TRANSFER_HISTORY_OFFSET {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
-    let since_dt = query.since.as_deref().and_then(|val| {
-        DateTime::parse_from_rfc3339(val)
-            .ok()
-            .map(|dt| dt.with_timezone(&Utc))
-    });
-    let until_dt = query.until.as_deref().and_then(|val| {
-        DateTime::parse_from_rfc3339(val)
-            .ok()
-            .map(|dt| dt.with_timezone(&Utc))
-    });
+    let since_dt = parse_filter_time(query.since.as_deref(), "since")?;
+    let until_dt = parse_filter_time(query.until.as_deref(), "until")?;
 
     let kind_filter = match query.kind.as_deref().filter(|val| !val.is_empty()) {
         Some(value) => Some(parse_transfer_kind_filter(value).map_err(|error| {
@@ -801,44 +799,24 @@ async fn transfers_endpoint(
         None => None,
     };
 
-    let loaded = crate::dashboard::transfer_loader::load_all_transfer_operations(
+    let page = query_transfer_history(
         &state.pool,
-        kind_filter.as_deref(),
+        &TransferHistoryQuery {
+            limit,
+            offset,
+            kinds: kind_filter,
+            since: since_dt,
+            until: until_dt,
+        },
     )
-    .await;
+    .await
+    .map_err(|error| {
+        tracing::error!(target: "dashboard", %error, "Failed to query transfer history");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    let mut operations = loaded.operations;
-
-    // Filter by time range
-    if since_dt.is_some() || until_dt.is_some() {
-        operations.retain(|op| {
-            let started = op.started_at();
-
-            if let Some(ref since) = since_dt
-                && started < *since
-            {
-                return false;
-            }
-
-            if let Some(ref until) = until_dt
-                && started > *until
-            {
-                return false;
-            }
-
-            true
-        });
-    }
-
-    // Sort newest first
-    operations.sort_by_key(|op| std::cmp::Reverse(op.started_at()));
-
-    let filtered_total = operations.len();
-    let start = offset.min(filtered_total);
-    let end = filtered_total.min(offset + limit);
-    let has_more = end < filtered_total;
-
-    let entries: Vec<serde_json::Value> = operations[start..end]
+    let entries: Vec<serde_json::Value> = page
+        .operations
         .iter()
         .map(serde_json::to_value)
         .collect::<Result<_, _>>()
@@ -853,13 +831,13 @@ async fn transfers_endpoint(
 
     let mut response = serde_json::json!({
         "entries": entries,
-        "total": filtered_total,
-        "hasMore": has_more,
+        "total": page.total,
+        "hasMore": page.has_more,
     });
 
-    if !loaded.warnings.is_empty() {
+    if !page.warnings.is_empty() {
         response["warnings"] =
-            serde_json::to_value(&loaded.warnings).unwrap_or_else(|_| serde_json::json!([]));
+            serde_json::to_value(&page.warnings).unwrap_or_else(|_| serde_json::json!([]));
     }
 
     Ok(Json(response))
@@ -2585,6 +2563,65 @@ mod tests {
         assert_eq!(body["entries"], serde_json::json!([]));
         assert_eq!(body["total"], 0);
         assert_eq!(body["hasMore"], false);
+    }
+
+    #[tokio::test]
+    async fn transfer_history_rejects_offsets_above_the_result_window() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let app = build_app(state);
+
+        for (offset, expected) in [
+            (MAX_TRANSFER_HISTORY_OFFSET, StatusCode::OK),
+            (MAX_TRANSFER_HISTORY_OFFSET + 1, StatusCode::BAD_REQUEST),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/transfers?offset={offset}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), expected, "offset: {offset}");
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_history_rejects_zero_page_size() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let response = build_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/transfers?limit=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn transfer_history_rejects_malformed_time_bounds() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let app = build_app(state);
+
+        for uri in [
+            "/transfers?since=not-a-timestamp",
+            "/transfers?until=not-a-timestamp",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "URI: {uri}");
+        }
     }
 
     #[tokio::test]
