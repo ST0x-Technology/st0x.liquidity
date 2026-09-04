@@ -394,11 +394,6 @@ in
             target = ".#${nodeName}.system";
           };
 
-          "${env}DeployNixosBoot" = mkDeployScript "${env}-deploy-nixos-boot" {
-            extraDeployFlags = "--boot";
-            target = ".#${nodeName}.system";
-          };
-
           "${env}DeployService" = mkDeployScript "${env}-deploy-service" {
             prelude = ''
               profile="''${1:?usage: ${env}-deploy-service <profile>}"
@@ -406,8 +401,6 @@ in
             '';
             target = ''.#${nodeName}."$profile"'';
           };
-
-          "${env}DeployAll" = mkDeployScript "${env}-deploy-all" { target = ".#${nodeName}"; };
         };
 
     in
