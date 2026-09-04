@@ -50,22 +50,10 @@
       inputs.crane.follows = "crane";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    deploy-rs.url = "github:serokell/deploy-rs";
-    deploy-rs.inputs.nixpkgs.follows = "nixpkgs";
-
     bun2nix.url = "github:nix-community/bun2nix/2.0.8";
     bun2nix.inputs.nixpkgs.follows = "nixpkgs";
 
     crane.url = "github:ipetkov/crane";
-
-    disko.url = "github:nix-community/disko";
-    disko.inputs.nixpkgs.follows = "nixpkgs";
-
-    nixos-anywhere = {
-      url = "github:nix-community/nixos-anywhere";
-      inputs.nixos-stable.follows = "nixpkgs";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
 
     st0x-deploy = {
       type = "git";
@@ -86,93 +74,11 @@
       raindex-governance,
       forge-std,
       ragenix,
-      deploy-rs,
-      disko,
-      nixos-anywhere,
       crane,
       st0x-deploy,
       ...
     }:
-    let
-      inherit (import ./keys.nix) keys;
-      inherit (rainix.inputs.nixpkgs) lib;
-      environments = {
-        prod = {
-          nodeName = "st0x-liquidity";
-          volumeName = "st0x-liquidity-data";
-          hostKey = keys.host-prod;
-          # Still on the rainlang.xyz tailnet; migrates to st0x.io last, after
-          # staging is validated on tail6094d7.ts.net.
-          tailscaleMagicDnsName = "st0x-liquidity-nixos.taile5cf8a.ts.net";
-        };
-        staging = {
-          nodeName = "st0x-liquidity-staging";
-          volumeName = "st0x-liquidity-staging-data";
-          hostKey = keys.host-staging;
-          # Migrated to the st0x.io tailnet (tail6094d7.ts.net) so telemetry can
-          # reach the st0x-observability GCP VM.
-          tailscaleMagicDnsName = "st0x-liquidity-staging.tail6094d7.ts.net";
-        };
-      };
-      envNames = builtins.attrNames environments;
-      deployment = import ./deploy.nix {
-        inherit
-          lib
-          deploy-rs
-          self
-          environments
-          ;
-      };
-    in
-    {
-      nixosConfigurations =
-        let
-          mkNixos =
-            { environment, modules }:
-            lib.nixosSystem {
-              system = "x86_64-linux";
-              specialArgs = {
-                inherit environment;
-                inherit (environments.${environment}) volumeName tailscaleMagicDnsName;
-                inherit (self.packages.x86_64-linux) st0x-cli;
-              };
-              modules = [ disko.nixosModules.disko ] ++ modules;
-            };
-
-          full =
-            env:
-            mkNixos {
-              environment = env;
-              modules = [
-                ragenix.nixosModules.default
-                ./os.nix
-              ];
-            };
-
-          bootstrap =
-            env:
-            mkNixos {
-              environment = env;
-              modules = [ ./bootstrap.nix ];
-            };
-
-        in
-        builtins.listToAttrs (
-          builtins.concatMap (env: [
-            {
-              name = environments.${env}.nodeName;
-              value = full env;
-            }
-            {
-              name = "${environments.${env}.nodeName}-bootstrap";
-              value = bootstrap env;
-            }
-          ]) envNames
-        );
-
-      deploy = deployment.config;
-    }
-    // flake-utils.lib.eachDefaultSystem (
+    flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = import rainix.inputs.nixpkgs {
@@ -187,33 +93,8 @@
 
         bun2nix = inputs.bun2nix.packages.${system}.default;
         ragenixPkg = ragenix.packages.${system}.default;
-        nixosAnywherePkg = nixos-anywhere.packages.${system}.default;
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
-
-        infraPkgs = import ./infra {
-          inherit
-            pkgs
-            ragenix
-            system
-            ;
-          environments = envNames;
-        };
-        rekeySecrets = ''ragenix --rules ./secret/secrets.nix -i "$identity" -r'';
-
-        deployScripts =
-          (import ./deploy.nix {
-            inherit
-              lib
-              deploy-rs
-              self
-              environments
-              ;
-          }).mkDeployScripts
-            {
-              inherit pkgs infraPkgs;
-              localSystem = system;
-            };
 
         inherit
           (import ./nix/mk-abi.nix {
@@ -487,36 +368,6 @@
                 '';
               };
 
-              bootstrap = pkgs.writeShellApplication {
-                name = "bootstrap-nixos";
-                runtimeInputs = infraPkgs.buildInputs ++ [
-                  nixosAnywherePkg
-                  pkgs.gnused
-                ];
-                text = ''
-                  env="''${1:?usage: bootstrap <prod|staging>}"
-                  shift
-
-                  case "$env" in
-                    ${builtins.concatStringsSep "\n" (
-                      map (env: ''
-                        ${env})
-                          flake_config="${environments.${env}.nodeName}-bootstrap"
-                          host_key_field="host-${env}" ;;'') envNames
-                    )}
-                    *)
-                      echo "ERROR: unknown environment '$env'" >&2
-                      exit 1 ;;
-                  esac
-
-                  ${infraPkgs.parseIdentity}
-
-                  export env flake_config host_key_field identity
-
-                  exec ${./scripts/bootstrap.sh} "$@"
-                '';
-              };
-
               secret = pkgs.writeShellApplication {
                 name = "secret";
                 runtimeInputs = [
@@ -529,83 +380,9 @@
                 '';
               };
 
-              rekey = pkgs.writeShellApplication {
-                name = "rekey";
-                runtimeInputs = [ ragenixPkg ];
-                text = ''
-                  ${infraPkgs.parseIdentity}
-                  exec ${rekeySecrets}
-                '';
-              };
             };
-
-            # Per-environment `<env>-verify-migrations`: pulls a consistent
-            # snapshot via `<env>-db-snapshot` (infra/default.nix), then runs
-            # this build's `verify-migrations` binary against it. Lives here
-            # rather than in infra/default.nix because it needs `rust.st0x-liquidity`
-            # (the compiled binary), which that module doesn't have access to.
-            verifyMigrationsPkgs = builtins.listToAttrs (
-              map (env: {
-                name = "${env}VerifyMigrations";
-                value = pkgs.writeShellApplication {
-                  name = "${env}-verify-migrations";
-                  runtimeInputs = [ rust.st0x-liquidity ];
-                  text = ''
-                    local_snapshot="$(${infraPkgs.packages.${env + "DbSnapshot"}}/bin/${env}-db-snapshot "$@")"
-                    echo "Verifying migrations against $local_snapshot..." >&2
-                    exec verify-migrations --db "$local_snapshot" --config ${./config/${env}/st0x-hedge.toml}
-                  '';
-                };
-              }) envNames
-            );
           in
-          rainixPkgs // infraPkgs.packages // deployScripts // abis // others // verifyMigrationsPkgs;
-
-        checks.parse-identity-cleanup = pkgs.runCommand "parse-identity-cleanup-test" { } ''
-          ${infraPkgs.parseIdentity}
-          _cleanup_identity
-          _identity_tmpfile="$(mktemp)"
-          _cleanup_identity
-          test ! -e "$_identity_tmpfile"
-          _identity_tmpfile="$(mktemp -d)"
-          if _cleanup_identity; then
-            echo "_cleanup_identity unexpectedly succeeded" >&2
-            exit 1
-          fi
-          rmdir "$_identity_tmpfile"
-          touch $out
-        '';
-
-        checks.deploy-activation-syntax =
-          let
-            activationScriptFiles = lib.flatten (
-              lib.mapAttrsToList (
-                env: scripts:
-                lib.mapAttrsToList (name: script: pkgs.writeText "${env}-${name}-activation" script) scripts
-              ) deployment.activationScripts
-            );
-          in
-          pkgs.runCommand "deploy-activation-syntax-test" { } ''
-            for script in ${lib.escapeShellArgs (map toString activationScriptFiles)}; do
-              ${pkgs.bash}/bin/bash -n "$script"
-            done
-            touch $out
-          '';
-
-        checks.cli-activation-skips-config-validation =
-          let
-            enabledServices = (import ./services.nix { inherit lib; }).enabled;
-            cliNames = builtins.attrNames (lib.filterAttrs (_: cfg: cfg.kind == "cli") enabledServices);
-            cliActivationScripts = lib.flatten (
-              map (env: map (name: deployment.activationScripts.${env}.${name}) cliNames) envNames
-            );
-          in
-          assert lib.assertMsg (builtins.all (
-            script: !(lib.hasInfix "validate-config" script)
-          ) cliActivationScripts) "CLI activation must not run the full service config validator";
-          pkgs.runCommand "cli-activation-skips-config-validation-test" { } ''
-            touch $out
-          '';
+          rainixPkgs // abis // others;
 
         formatter = pkgs.nixfmt-rfc-style;
 
@@ -660,7 +437,6 @@
                     cargo-nextest
                     ragenixPkg
                     packages.secret
-                    packages.rekey
                     packages.ci
                     # foundry exposes anvil for cargo tests that spawn a local
                     # EVM (e.g. cctp + hedging e2e). Pinned rainix doesn't ship
@@ -668,8 +444,6 @@
                     # the default shell mirrors the ci-backend shell.
                     foundryBin
                   ]
-                  ++ builtins.attrValues infraPkgs.packages
-                  ++ builtins.attrValues deployScripts
                   ++ rustShell.buildInputs;
               }
               // abiEnv

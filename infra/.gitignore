@@ -1,7 +1,0 @@
-*.tfstate
-*.tfstate.backup
-terraform.tfvars
-tfplan
-.terraform/
-.remote-*
-!*.age
