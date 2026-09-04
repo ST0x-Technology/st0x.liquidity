@@ -12,11 +12,11 @@ use crate::onchain::OnChainError;
 use crate::position::Position;
 
 #[derive(Debug, Clone)]
-pub(crate) struct ExecutionCtx {
-    pub(crate) symbol: Symbol,
-    pub(crate) direction: Direction,
-    pub(crate) shares: Positive<FractionalShares>,
-    pub(crate) executor: SupportedExecutor,
+pub struct ExecutionCtx {
+    pub symbol: Symbol,
+    pub direction: Direction,
+    pub shares: Positive<FractionalShares>,
+    pub executor: SupportedExecutor,
     pub(crate) market_session: MarketSession,
 }
 
@@ -27,7 +27,7 @@ pub(crate) struct ExecutionCtx {
 /// and the asset is enabled. The Position aggregate already tracks pending
 /// executions -- `is_ready_for_execution` returns `None` if one is already
 /// in flight.
-pub(crate) async fn check_execution_readiness<E: Executor>(
+pub async fn check_execution_readiness<E: Executor>(
     executor: &E,
     position_projection: &Projection<Position>,
     symbol: &Symbol,

@@ -3,6 +3,7 @@
 use alloy::primitives::Address;
 use alloy::providers::RootProvider;
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::sync::Arc;
 use tracing::info;
 
@@ -32,9 +33,9 @@ pub(crate) enum SpawnRebalancerError {
 }
 
 /// Adapts the config-layer equity asset map to the narrow per-symbol token pairs
-/// [`WrapperService`] needs, keeping `st0x-wrapper` independent of `st0x-config`.
-pub(crate) fn to_wrapped_equities(
-    equities: &HashMap<Symbol, ChainEquityAsset>,
+/// `WrapperService` needs, keeping `st0x-wrapper` independent of `st0x-config`.
+pub fn to_wrapped_equities<S: BuildHasher>(
+    equities: &HashMap<Symbol, ChainEquityAsset, S>,
 ) -> HashMap<Symbol, WrappedEquity> {
     equities
         .iter()

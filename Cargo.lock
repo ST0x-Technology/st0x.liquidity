@@ -7195,6 +7195,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "st0x-cli"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "alloy-primitives",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "event-sorcery",
+ "httpmock",
+ "rain-math-float",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sqlx 0.9.0",
+ "st0x-bridge",
+ "st0x-config",
+ "st0x-evm",
+ "st0x-execution",
+ "st0x-finance",
+ "st0x-float-macro",
+ "st0x-float-serde",
+ "st0x-hedge",
+ "st0x-issuance-client",
+ "st0x-issuance-dto",
+ "st0x-raindex",
+ "st0x-registry",
+ "st0x-tokenization",
+ "st0x-wrapper",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-test",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "st0x-config"
 version = "0.1.0"
 dependencies = [

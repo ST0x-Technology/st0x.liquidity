@@ -13,7 +13,8 @@ pub(crate) use job::{
     TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
     TransferUsdcToMarketMakingJobQueue,
 };
-pub(crate) use manager::{CrossVenueCashTransfer, UsdcSettlementParams, u256_to_usdc};
+pub(crate) use manager::u256_to_usdc;
+pub use manager::{CrossVenueCashTransfer, UsdcSettlementParams};
 
 use std::time::Duration;
 
@@ -36,7 +37,7 @@ use crate::native_gas::GasReadinessFailure;
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceId};
 
 #[derive(Debug, Error)]
-pub(crate) enum UsdcTransferError {
+pub enum UsdcTransferError {
     #[error(transparent)]
     GasReadiness(#[from] GasReadinessFailure),
     #[error("Alpaca wallet error: {0}")]
@@ -52,7 +53,7 @@ pub(crate) enum UsdcTransferError {
     /// notifier), so a blanket conversion would let any unrelated queue-push
     /// failure in this module classify the same way and loop silently instead
     /// of paging. Mirrors `MintError::BotGasEnqueue` in
-    /// [`crate::rebalancing::equity`].
+    /// `crate::rebalancing::equity`.
     #[error("Failed to enqueue bot-gas receipt cost recording: {0}")]
     BotGasEnqueue(crate::conductor::job::QueuePushError),
     /// Emitted by the two-phase burn path (`burn_recording_pending`) when the

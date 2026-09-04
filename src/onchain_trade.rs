@@ -26,11 +26,20 @@ use st0x_execution::Symbol;
 use st0x_finance::{FractionalShares, NotPositive, Positive};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-
-pub(crate) struct OnChainTradeId {
+pub struct OnChainTradeId {
     pub(crate) chain: Chain,
     pub(crate) tx_hash: TxHash,
     pub(crate) log_index: u64,
+}
+
+impl OnChainTradeId {
+    pub fn new(chain: Chain, tx_hash: TxHash, log_index: u64) -> Self {
+        Self {
+            chain,
+            tx_hash,
+            log_index,
+        }
+    }
 }
 
 impl std::fmt::Display for OnChainTradeId {
@@ -40,7 +49,7 @@ impl std::fmt::Display for OnChainTradeId {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum ParseOnChainTradeIdError {
+pub enum ParseOnChainTradeIdError {
     #[error("expected 'chain:tx_hash:log_index', got '{id_provided}'")]
     MissingDelimiter { id_provided: String },
     #[error("invalid chain: {0}")]
@@ -78,7 +87,7 @@ impl FromStr for OnChainTradeId {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct OnChainTrade {
+pub struct OnChainTrade {
     #[serde(default = "legacy_source")]
     pub(crate) source: OnChainTradeSource,
     pub(crate) symbol: Symbol,
@@ -294,8 +303,12 @@ impl OnChainTrade {
     /// Whether the `Position` aggregate has acknowledged this fill --
     /// the condition under which the trade-accounting dedupe treats the
     /// trade as fully processed.
-    pub(crate) fn is_acknowledged(&self) -> bool {
+    pub fn is_acknowledged(&self) -> bool {
         self.acknowledged_at.is_some()
+    }
+
+    pub fn source(&self) -> OnChainTradeSource {
+        self.source
     }
 
     pub(crate) fn try_into_trade(
@@ -315,13 +328,13 @@ impl OnChainTrade {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum InventoryVenue {
+pub enum InventoryVenue {
     Bebop,
     UniswapV4,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum OnChainTradeSource {
+pub enum OnChainTradeSource {
     /// Filled event persisted before source attribution existed. Displays as
     /// Raindex until a chain-backed repair appends `SourceAttributed`.
     Legacy,
@@ -404,7 +417,7 @@ fn log_unrecognized_inventory_source(source: OnChainTradeSource) {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum OnChainTradeError {
+pub enum OnChainTradeError {
     #[error("Cannot update trade that hasn't been filled yet")]
     NotFilled,
     #[error("Trade has already been filled")]
@@ -420,7 +433,7 @@ pub(crate) enum OnChainTradeError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum OnChainTradeCommand {
+pub enum OnChainTradeCommand {
     Witness {
         source: OnChainTradeSource,
         symbol: Symbol,
@@ -471,7 +484,7 @@ pub(crate) enum OnChainTradeCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum OnChainTradeEvent {
+pub enum OnChainTradeEvent {
     Filled {
         #[serde(default = "legacy_source")]
         source: OnChainTradeSource,
@@ -604,7 +617,7 @@ pub(crate) struct Enrichment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct PythPrice {
+pub struct PythPrice {
     pub(crate) value: String,
     pub(crate) expo: i32,
     pub(crate) conf: String,

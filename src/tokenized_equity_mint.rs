@@ -62,7 +62,7 @@ use crate::rebalancing::equity::EquityTransferServices;
 /// These errors enforce state machine constraints and prevent
 /// invalid transitions.
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
-pub(crate) enum TokenizedEquityMintError {
+pub enum TokenizedEquityMintError {
     /// Command sent to a non-existent aggregate (must use RequestMint to initialize)
     #[error("Aggregate not initialized: use RequestMint to start a new mint")]
     NotInitialized,
@@ -206,7 +206,7 @@ impl From<FloatError> for TokenizedEquityMintError {
 
 /// Commands for the TokenizedEquityMint aggregate.
 #[derive(Debug, Clone)]
-pub(crate) enum TokenizedEquityMintCommand {
+pub enum TokenizedEquityMintCommand {
     /// Request tokenization from Alpaca and poll until tokens arrive or failure.
     ///
     /// Flow: MintRequested -> MintAccepted -> TokensReceived (success)
@@ -350,7 +350,7 @@ pub(crate) enum TokenizedEquityMintCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum TokenizedEquityMintEvent {
+pub enum TokenizedEquityMintEvent {
     MintRequested {
         symbol: Symbol,
         #[serde(
@@ -754,7 +754,7 @@ impl DomainEvent for TokenizedEquityMintEvent {
 /// arrive: from `TokensReceived` on, the authorization has served its
 /// purpose (issuance minted with it) and is no longer actionable.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum MintAuthorizationProgress {
+pub enum MintAuthorizationProgress {
     /// No authorization signed -- vault-direct mint, or signing has not
     /// happened yet.
     #[default]
@@ -771,7 +771,7 @@ pub(crate) enum MintAuthorizationProgress {
 /// states unrepresentable. Each variant contains exactly the data
 /// valid for that state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum TokenizedEquityMint {
+pub enum TokenizedEquityMint {
     /// Mint request initiated with symbol, quantity, and destination wallet
     MintRequested {
         symbol: Symbol,

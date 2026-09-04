@@ -22,7 +22,7 @@ pub(crate) trait BalanceReader: Send + Sync {
 /// Preserves the provider error behind a stable balance-read boundary.
 #[derive(Debug, thiserror::Error)]
 #[error("failed to read native balance")]
-pub(crate) struct BalanceReadError(#[source] pub(crate) Box<dyn std::error::Error + Send + Sync>);
+pub struct BalanceReadError(#[source] pub(crate) Box<dyn std::error::Error + Send + Sync>);
 
 /// [`BalanceReader`] backed by an Alloy [`Provider`].
 pub(crate) struct ProviderBalanceReader<Prov> {
@@ -56,7 +56,7 @@ pub(crate) enum TransferGasRoute {
 
 /// Checks every signing wallet a fresh transfer route can use.
 #[derive(Clone)]
-pub(crate) struct GasReadiness {
+pub struct GasReadiness {
     base: ChainGasReadiness,
     ethereum: ChainGasReadiness,
     retry_interval: Duration,
@@ -91,7 +91,7 @@ impl GasReadiness {
 
     /// Build readiness from the validated alert thresholds and the two
     /// signing wallets used by rebalancing transfers.
-    pub(crate) fn from_wallets<Signer: Wallet + ?Sized>(
+    pub fn from_wallets<Signer: Wallet + ?Sized>(
         alerts: &AlertsCtx,
         base_wallet: &Signer,
         ethereum_wallet: &Signer,
@@ -207,8 +207,9 @@ impl ConfiguredGasReadiness {
     }
 }
 
+/// A configured readiness check could not prove that a transfer is safe to start.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum GasReadinessFailure {
+pub enum GasReadinessFailure {
     #[error("{source}")]
     Unavailable {
         #[source]
@@ -243,7 +244,7 @@ impl GasReadinessFailure {
 
 /// Why a fresh transfer cannot safely start.
 #[derive(Debug)]
-pub(crate) enum GasReadinessError {
+pub enum GasReadinessError {
     BalanceRead {
         chain: Chain,
         wallet: Address,

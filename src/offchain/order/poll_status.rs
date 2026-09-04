@@ -36,7 +36,7 @@ use crate::offchain::order::{
 };
 use crate::position::Position;
 
-pub(crate) type PollOrderStatusJobQueue = JobQueue<PollOrderStatus>;
+pub type PollOrderStatusJobQueue = JobQueue<PollOrderStatus>;
 
 /// Serializes the guard's reconcile/check and push as one process-local
 /// critical section. The service owns one apalis queue for this SQLite
@@ -83,7 +83,7 @@ pub(crate) struct PollOrderStatusCtx<E: Executor + Clone + Send + Sync + 'static
 
 /// Polls the broker for the status of a single offchain order.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct PollOrderStatus {
+pub struct PollOrderStatus {
     pub(crate) offchain_order_id: OffchainOrderId,
     /// Count of consecutive broker rate-limit (429) reschedules leading up
     /// to this attempt (RAI-1494). `#[serde(default)]` so a row enqueued

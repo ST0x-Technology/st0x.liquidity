@@ -16,7 +16,7 @@ use tracing::{debug, warn};
 
 use st0x_config::{ChainAssets, InventoryAdapterVenue, InventoryAdapters, TradingChain};
 use st0x_evm::{Chain, Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE};
-use st0x_execution::{Direction, FractionalShares, HasZero};
+use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_float_serde::format_float_with_fallback;
 use st0x_registry::SymbolCache;
 
@@ -68,7 +68,9 @@ impl RaindexTradeEvent {
     }
 }
 
-/// The bot's own signing wallet address. The bot's rebalancing also calls
+/// The bot's own signing wallet address.
+///
+/// The bot's rebalancing also calls
 /// `deposit4`/`withdraw4` on the shared inventory (treasury moves, not venue
 /// fills), so `InventoryTrade` pairing must filter out any `OperatorDeposit`/
 /// `OperatorWithdraw` whose `operator` is this address. Distinct from the
@@ -78,14 +80,14 @@ impl RaindexTradeEvent {
 /// misattribute which legs are "the bot's own", the same risk `InputToken`/
 /// `OutputToken` guard against in `io.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BotOperator(pub(crate) Address);
+pub struct BotOperator(pub Address);
 
 /// Addresses that distinguish the bot's two roles while recovering a trade
 /// from a transaction receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RecoveryActors {
-    pub(crate) order_owner: Address,
-    pub(crate) bot_operator: BotOperator,
+pub struct RecoveryActors {
+    pub order_owner: Address,
+    pub bot_operator: BotOperator,
 }
 
 /// Information about a vault extracted from an order's IO specification.
@@ -195,20 +197,30 @@ pub(crate) fn extract_owned_vaults(
 
 #[derive(Debug, Clone)]
 pub struct OnchainTrade {
-    pub(crate) source: OnChainTradeSource,
-    pub(crate) chain: Chain,
-    pub(crate) tx_hash: TxHash,
-    pub(crate) log_index: u64,
+    pub source: OnChainTradeSource,
+    pub chain: Chain,
+    pub tx_hash: TxHash,
+    pub log_index: u64,
     pub(crate) symbol: TokenizedSymbol<WrappedTokenizedShares>,
     pub(crate) equity_token: Address,
-    pub(crate) amount: FractionalShares,
-    pub(crate) direction: Direction,
+    pub amount: FractionalShares,
+    pub direction: Direction,
     pub(crate) price: Usdc,
     /// Block the fill was confirmed in. Needed to witness the fill into the
     /// `OnChainTrade` log (the `Witness` command requires it). Absent only when
     /// neither the log nor the receipt carried a block number.
-    pub(crate) block_number: Option<u64>,
-    pub(crate) block_timestamp: Option<DateTime<Utc>>,
+    pub block_number: Option<u64>,
+    pub block_timestamp: Option<DateTime<Utc>>,
+}
+
+impl OnchainTrade {
+    pub fn symbol(&self) -> &Symbol {
+        self.symbol.base()
+    }
+
+    pub fn price(&self) -> Float {
+        self.price.value()
+    }
 }
 
 /// Number of retries for `fetch_inventory_token_decimals`'s `decimals()`
@@ -496,7 +508,7 @@ impl OnchainTrade {
     /// the transaction receipt and parsing relevant orderbook or inventory
     /// events. Tries `ClearV3`/`TakeOrderV3` orderbook fills first; if none
     /// match, falls back to an `OperatorDeposit`/`OperatorWithdraw`
-    /// `InventoryTrade` settlement, paired via the same [`bucket_inventory_logs`]
+    /// `InventoryTrade` settlement, paired via the same `bucket_inventory_logs`
     /// rules the backfill path uses -- so the manual `process-tx` recovery
     /// path can recover both fill sources this bot hedges.
     pub async fn try_from_tx_hash<EvmImpl: Evm>(
@@ -880,7 +892,7 @@ fn timestamp_from_secs(timestamp_secs: u64) -> Result<Option<DateTime<Utc>>, OnC
 
 /// Business logic validation errors for trade processing rules.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum TradeValidationError {
+pub enum TradeValidationError {
     #[error("No transaction hash found in log")]
     NoTxHash,
     #[error("No log index found in log")]

@@ -29,7 +29,7 @@ use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 /// Persistent job queue for [`RecordBotGasReceiptCost`].
 pub(crate) type RecordBotGasReceiptCostJobQueue = JobQueue<RecordBotGasReceiptCost>;
 
-/// Enqueues [`RecordBotGasReceiptCost`] jobs from production confirm sites
+/// Enqueues `RecordBotGasReceiptCost` jobs from production confirm sites
 /// (vault deposit/withdraw, wrap/unwrap, CCTP burn/mint, USDC transfer).
 ///
 /// `Disabled` is for the two paths outside this design's scope (see ADR 0017
@@ -50,7 +50,7 @@ pub(crate) type RecordBotGasReceiptCostJobQueue = JobQueue<RecordBotGasReceiptCo
 /// risk sending tokens twice (see SPEC.md's bot-gas "Known gaps" for the
 /// resulting permanent loss of that one cost fact).
 #[derive(Clone)]
-pub(crate) enum BotGasReceiptCostEnqueuer {
+pub enum BotGasReceiptCostEnqueuer {
     Enabled(RecordBotGasReceiptCostJobQueue),
     Disabled,
 }
@@ -124,7 +124,7 @@ impl From<&QueuePushError> for QueuePushFailureKind {
 /// for diagnostics/logging, since it is strictly more detailed than `kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[error("Failed to enqueue bot-gas receipt cost recording for tx {tx_hash}: {message}")]
-pub(crate) struct BotGasEnqueueFailure {
+pub struct BotGasEnqueueFailure {
     pub(crate) tx_hash: TxHash,
     pub(crate) kind: QueuePushFailureKind,
     pub(crate) message: String,
@@ -160,7 +160,7 @@ pub(super) mod test_support {
 /// classification the consumer already knows (`category`, `symbol`), plus
 /// the bounded redrive counter described on [`MAX_REDRIVE_ATTEMPTS`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct RecordBotGasReceiptCost {
+pub struct RecordBotGasReceiptCost {
     pub(crate) chain: Chain,
     pub(crate) tx_hash: TxHash,
     pub(crate) category: BotGasOperationCategory,

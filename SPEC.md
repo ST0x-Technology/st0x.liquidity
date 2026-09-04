@@ -4911,12 +4911,11 @@ auth, client, order, and positions because broker integration has distinct
 business concerns).
 
 ```text
-Cargo.toml                        - Workspace definition (st0x-hedge + crates/execution)
+Cargo.toml                        - Workspace definition
 src/                              - Main st0x-hedge library crate
   lib.rs                          - Library exports, CQRS setup
   bin/
     server.rs                     - Main arbitrage bot server
-    cli.rs                        - CLI for manual operations
   position.rs                     - Position aggregate
   onchain_trade.rs                - OnChainTrade aggregate
   offchain_order.rs               - OffchainOrder aggregate
@@ -4938,8 +4937,8 @@ src/                              - Main st0x-hedge library crate
   symbol/                         - Token symbol caching and locking
   alpaca_wallet/                  - Alpaca cryptocurrency wallet and CCTP bridge
   dashboard/                      - Admin dashboard event streaming
-  cli/                            - CLI subcommands
 crates/
+  cli/                            - st0x-cli operator binary and subcommands
   bridge/                         - Circle CCTP bridge abstraction
   dto/                            - TypeScript binding generation for dashboard
   event-sorcery/                  - CQRS/ES framework (EventSourced, Store, Reactor, Projection)

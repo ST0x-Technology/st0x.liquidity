@@ -27,7 +27,7 @@ use crate::usdc_rebalance::UsdcRebalanceId;
 
 /// Error type for inventory view operations.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum InventoryViewError {
+pub enum InventoryViewError {
     #[error(transparent)]
     Equity(#[from] InventoryError<FractionalShares>),
     #[error(transparent)]
@@ -587,12 +587,12 @@ pub(crate) enum InFlightEquityLocation {
 /// points equity or cash may sit at in between.
 ///
 /// USDC observed in wallet transit is never "wrapped" (no wrapped-USDC
-/// concept exists onchain), so [`InFlightCashLocation::BaseWallet`] maps to
+/// concept exists onchain), so `InFlightCashLocation::BaseWallet` maps to
 /// `BaseWalletUnwrapped` here. The primary key `(et_day, location, asset)`
 /// prevents this from colliding with unwrapped equity at the same location,
 /// since `asset` still distinguishes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) enum PortfolioLocation {
+pub enum PortfolioLocation {
     MarketMaking(Chain),
     Hedging,
     EthereumWallet,
@@ -620,7 +620,7 @@ impl std::fmt::Display for PortfolioLocation {
 
 /// The asset held at a [`PortfolioLocation`] in a daily portfolio snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) enum PortfolioAsset {
+pub enum PortfolioAsset {
     Usdc,
     Equity(Symbol),
 }
@@ -634,17 +634,19 @@ impl std::fmt::Display for PortfolioAsset {
     }
 }
 
-/// A single observed balance at a `(location, asset)` pair, ready to be
+/// A single observed balance at a `(location, asset)` pair.
+///
+/// The balance is ready to be
 /// marked with a USD price and captured into the daily portfolio snapshot's
 /// `Captured` event. `available` and `inflight` are kept as independent
 /// observed facts (per "No Denormalized Columns") -- nothing computed from
 /// them is persisted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct PortfolioBalanceRow {
-    pub(crate) location: PortfolioLocation,
-    pub(crate) asset: PortfolioAsset,
-    pub(crate) available: Float,
-    pub(crate) inflight: Float,
+pub struct PortfolioBalanceRow {
+    pub location: PortfolioLocation,
+    pub asset: PortfolioAsset,
+    pub available: Float,
+    pub inflight: Float,
 }
 
 impl PartialEq for PortfolioBalanceRow {

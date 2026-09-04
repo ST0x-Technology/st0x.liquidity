@@ -3,7 +3,7 @@
 
 mod builder;
 
-pub(crate) use builder::configured_equity_symbols;
+pub use builder::configured_equity_symbols;
 mod exit;
 pub(crate) mod job;
 mod manifest;
@@ -369,40 +369,40 @@ async fn rebuild_stale_offchain_order_projection(
 }
 
 /// Bundles CQRS frameworks used throughout the trade processing pipeline.
-pub(crate) struct TradeProcessingCqrs {
-    pub(crate) pool: SqlitePool,
-    pub(crate) onchain_trade: Arc<Store<OnChainTrade>>,
-    pub(crate) position: Arc<Store<Position>>,
-    pub(crate) position_projection: Arc<Projection<Position>>,
-    pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
+pub struct TradeProcessingCqrs {
+    pub pool: SqlitePool,
+    pub onchain_trade: Arc<Store<OnChainTrade>>,
+    pub position: Arc<Store<Position>>,
+    pub position_projection: Arc<Projection<Position>>,
+    pub offchain_order: Arc<Store<OffchainOrder>>,
     /// Places the broker order for a newly-recorded offchain order. Lifted out
     /// of the (now pure) `OffchainOrder::Place` handler: the side effect lives
     /// in the placement path, not the command handler.
-    pub(crate) order_placer: Arc<dyn OrderPlacer>,
-    pub(crate) execution_threshold: ExecutionThreshold,
+    pub order_placer: Arc<dyn OrderPlacer>,
+    pub execution_threshold: ExecutionThreshold,
     /// What the trading chain lists: token addresses, vault ids, per-asset
     /// switches and operational limits.
-    pub(crate) assets: ChainAssets,
+    pub assets: ChainAssets,
     /// How each symbol is hedged, independent of where it is listed.
-    pub(crate) hedging: HedgingAssets,
-    pub(crate) counter_trade_submission_lock: Arc<Mutex<()>>,
-    pub(crate) close_flatten_policy: CloseFlattenPolicy,
-    pub(crate) close_flatten_ramp: CloseFlattenCrossRamp,
+    pub hedging: HedgingAssets,
+    pub counter_trade_submission_lock: Arc<Mutex<()>>,
+    pub close_flatten_policy: CloseFlattenPolicy,
+    pub close_flatten_ramp: CloseFlattenCrossRamp,
     /// Queue every newly-submitted offchain order is enrolled into so the
     /// per-order poll job picks up where the broker left off. Without this
     /// hook the order stays `Submitted` forever -- the system has no other
     /// trigger to ask the broker about an in-flight order.
-    pub(crate) poll_status_queue: PollOrderStatusJobQueue,
+    pub poll_status_queue: PollOrderStatusJobQueue,
     /// Used to enqueue an immediate `PlaceHedge` after the inline path uses
     /// `order_placer` to preflight the same crossed reference the job will use.
     /// `CheckPositions` is the backstop.
-    pub(crate) hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue,
-    /// Fed to [`push_poll_job_if_absent`] before every `PollOrderStatus`
+    pub hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue,
+    /// Fed to `push_poll_job_if_absent` before every `PollOrderStatus`
     /// push this pipeline makes, so a re-push for an order that already has a
     /// live poll job (for example, per-fill reconciliation against a
     /// still-open order) is skipped instead of forking a new
     /// self-perpetuating chain.
-    pub(crate) poll_interval: Duration,
+    pub poll_interval: Duration,
 }
 
 /// Orchestrates the bot's runtime by composing long-running supervised tasks
@@ -3476,7 +3476,7 @@ async fn execute_attribute_trade_source(
 /// resume path's crash window between the position write and the
 /// acknowledgement marker). Every other error propagates so the apalis job
 /// retries instead of silently dropping the fill.
-pub(crate) async fn execute_acknowledge_fill(
+pub async fn execute_acknowledge_fill(
     position: &Store<Position>,
     trade: &OnchainTrade,
     threshold: ExecutionThreshold,
@@ -3528,11 +3528,13 @@ pub(crate) async fn execute_acknowledge_fill(
     }
 }
 
-/// Marks the trade acknowledged on the `OnChainTrade` aggregate after the
+/// Marks the trade acknowledged after the position write succeeds.
+///
+/// The marker lives on the `OnChainTrade` aggregate. A
 /// position write succeeded. A re-driven marker (`AlreadyAcknowledged`) is
 /// idempotent; infrastructure errors propagate so the apalis retry re-drives
 /// the idempotent accounting steps.
-pub(crate) async fn execute_mark_acknowledged(
+pub async fn execute_mark_acknowledged(
     onchain_trade: &Store<OnChainTrade>,
     trade_id: &OnChainTradeId,
 ) -> Result<(), SendError<OnChainTrade>> {
@@ -3548,12 +3550,14 @@ pub(crate) async fn execute_mark_acknowledged(
     }
 }
 
-/// Prunes the fill from the position's pending-acknowledgement set once its
+/// Prunes a durably acknowledged fill from the position.
+///
+/// This removes it from the pending-acknowledgement set once its
 /// `OnChainTrade` marker is durable, completing the exactly-once sequence
 /// (ADR 0010). Pruning a trade not in the set emits no events (a no-op), so a
 /// re-driven settle is idempotent; infrastructure errors propagate so the
 /// apalis retry re-drives the settle until the entry self-heals.
-pub(crate) async fn execute_settle_fill(
+pub async fn execute_settle_fill(
     position: &Store<Position>,
     trade: &OnchainTrade,
 ) -> Result<(), SendError<Position>> {
@@ -3571,7 +3575,7 @@ pub(crate) async fn execute_settle_fill(
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum PositionFillLookupError {
+pub enum PositionFillLookupError {
     #[error("Failed to convert log_index for fill {trade_id}: {source}")]
     LogIndex {
         trade_id: OnChainTradeId,
@@ -3631,12 +3635,12 @@ pub(crate) async fn position_fill_already_recorded(
     Ok(count > 0)
 }
 
-pub(crate) enum FillAccountingOutcome {
+pub enum FillAccountingOutcome {
     AlreadyAcknowledged,
     Accounted { trade_id: OnChainTradeId },
 }
 
-pub(crate) async fn account_for_onchain_fill(
+pub async fn account_for_onchain_fill(
     pool: &SqlitePool,
     onchain_trade: &Store<OnChainTrade>,
     position: &Store<Position>,
@@ -3727,7 +3731,7 @@ pub(crate) async fn account_for_onchain_fill(
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-pub(crate) async fn process_queued_trade<E: Executor>(
+pub async fn process_queued_trade<E: Executor>(
     executor: &E,
     trade_event: &EmittedOnChain<RaindexTradeEvent>,
     trade: OnchainTrade,
@@ -4483,7 +4487,7 @@ async fn dispatch_post_place_state(
 
 /// Returns `true` if the Position aggregate accepted the order, `false` if it
 /// was rejected (e.g. already has a pending execution).
-pub(crate) fn is_expected_place_offchain_order_rejection(error: &SendError<Position>) -> bool {
+pub fn is_expected_place_offchain_order_rejection(error: &SendError<Position>) -> bool {
     matches!(
         error,
         AggregateError::UserError(LifecycleError::Apply(

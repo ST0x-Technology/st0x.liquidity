@@ -1,0 +1,83 @@
+[package]
+name = "st0x-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+rust-version = "1.89"
+
+[features]
+default = ["all-wallets"]
+all-wallets = ["wallet-private-key", "wallet-turnkey"]
+wallet-turnkey = [
+  "st0x-config/wallet-turnkey",
+  "st0x-evm/turnkey",
+  "st0x-hedge/wallet-turnkey",
+]
+wallet-private-key = [
+  "st0x-config/wallet-private-key",
+  "st0x-evm/local-signer",
+  "st0x-hedge/wallet-private-key",
+]
+test-support = [
+  "st0x-bridge/test-support",
+  "st0x-config/test-support",
+  "st0x-hedge/test-support",
+  "wallet-private-key",
+]
+mock = [
+  "st0x-evm/mock",
+  "st0x-execution/mock",
+  "st0x-hedge/mock",
+  "st0x-tokenization/mock",
+  "wallet-private-key",
+]
+
+[dependencies]
+alloy = { workspace = true, features = ["eip712"] }
+alloy-primitives.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+clap.workspace = true
+rain-math-float.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+st0x-bridge = { workspace = true, features = ["cctp"] }
+st0x-config.workspace = true
+st0x-event-sorcery.workspace = true
+st0x-evm.workspace = true
+st0x-execution.workspace = true
+st0x-finance.workspace = true
+st0x-float-macro.workspace = true
+st0x-float-serde.workspace = true
+st0x-hedge.workspace = true
+st0x-issuance-client = { git = "https://github.com/ST0x-Technology/st0x.issuance.git", branch = "2026-08-06-mint-authorization-client-dto", version = "0.1.0" }
+st0x-issuance-dto = { git = "https://github.com/ST0x-Technology/st0x.issuance.git", branch = "2026-08-06-mint-authorization-client-dto", version = "0.1.0" }
+st0x-raindex = { workspace = true, features = ["rain"] }
+st0x-registry.workspace = true
+st0x-tokenization.workspace = true
+st0x-wrapper = { workspace = true, features = ["erc4626"] }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+httpmock.workspace = true
+regex = "1.12.3"
+st0x-evm = { workspace = true, features = ["mock", "test-support"] }
+st0x-execution = { workspace = true, features = ["mock", "test-support"] }
+st0x-hedge = { workspace = true, features = ["mock", "test-support"] }
+st0x-tokenization = { workspace = true, features = ["mock", "test-support"] }
+st0x-wrapper = { workspace = true, features = ["mock"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tracing-test.workspace = true
+
+[lints]
+workspace = true

@@ -48,7 +48,7 @@ use st0x_execution::{
     DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, FractionalShares, Symbol, TimeInForce,
 };
 use st0x_finance::{Positive, Usd};
-use st0x_hedge::cli::TransferType;
+use st0x_hedge::e2e_support::TransferType;
 use st0x_hedge::mock_api::{
     REDEMPTION_WALLET, RedemptionOutcome, TokenizationRequestType, TokenizationStatus,
 };
@@ -685,7 +685,7 @@ fn log_recheck_command(
         TransferType::Redemption => "redemption",
     };
     let command = format!(
-        "nix develop --command cargo run --features mock --bin cli -- \
+        "nix develop --command cargo run -p st0x-cli --features mock -- \
          --config {} --secrets {} transfer recheck --kind {} --id {}",
         config_path.display(),
         secrets_path.display(),
@@ -1429,7 +1429,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
     let pool = connect_db(&infra.db_path).await?;
     let accepted_mint = latest_accepted_mint_ids(&pool).await?;
 
-    st0x_hedge::cli::fail_transfer_for_test(
+    st0x_hedge::e2e_support::fail_transfer(
         &pool,
         TransferType::Mint,
         &accepted_mint.issuer_request_id,
@@ -1518,7 +1518,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
     );
 
     if std::env::var_os("SIMULATE_EXIT_AFTER_SELF_HEAL").is_some() {
-        st0x_hedge::cli::recheck_transfer_for_test(
+        st0x_hedge::e2e_support::recheck_transfer(
             &cli_ctx,
             TransferType::Mint,
             &accepted_mint.issuer_request_id,
@@ -1538,7 +1538,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
         )
         .await;
 
-        st0x_hedge::cli::recheck_transfer_for_test(
+        st0x_hedge::e2e_support::recheck_transfer(
             &cli_ctx,
             TransferType::Redemption,
             &rejected_redemption.redemption_id,

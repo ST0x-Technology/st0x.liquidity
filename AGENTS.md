@@ -217,6 +217,7 @@ minimize delta exposure through automated hedging.
 This project uses a Cargo workspace with:
 
 - **`st0x-hedge`** (root): Main arbitrage bot application
+- **`st0x-cli`** (`crates/cli/`): Operator command-line application
 - **`st0x-config`** (`crates/config/`): TOML/secrets loading; restricted to
   binary crates
 - **`st0x-dto`** (`crates/dto/`): Dashboard DTOs and TypeScript bindings
@@ -250,9 +251,9 @@ verification before a release, or when the user explicitly asks to run the
 binary).
 
 - `cargo run --bin server` - Run the main arbitrage bot
-- `cargo run --bin cli -- buy -s AAPL -q 1` - Submit a manual buy order via the
-  configured broker
-- `cargo run --bin cli` - Run the command-line interface for manual operations
+- `cargo run -p st0x-cli -- buy -s AAPL -q 1` - Submit a manual buy order via
+  the configured broker
+- `cargo run -p st0x-cli` - Run the command-line interface for manual operations
 
 ### Testing
 

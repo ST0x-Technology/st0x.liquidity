@@ -194,7 +194,7 @@ fn stage_summary(operations: &[WindowedOperation]) -> Vec<EquityStageStats> {
 
 /// Reactor maintaining the equity mint/redemption stage-timing read model
 /// from live events.
-pub(crate) struct EquityTimingProjection {
+pub struct EquityTimingProjection {
     pool: SqlitePool,
 }
 
@@ -204,7 +204,7 @@ deps!(
 );
 
 impl EquityTimingProjection {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 
@@ -329,7 +329,7 @@ impl EquityTimingProjection {
     ///
     /// See `RebalanceTimingProjection::rebuild_all`'s doc for the full
     /// rationale (identical here).
-    pub(crate) async fn rebuild_all(&self) -> Result<u64, ProjectionError> {
+    pub async fn rebuild_all(&self) -> Result<u64, ProjectionError> {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query("DELETE FROM equity_stage_timing")
@@ -542,7 +542,7 @@ enum ReplayError {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum ProjectionError {
+pub enum ProjectionError {
     #[error("equity stage-timing read-model write failed")]
     Database(#[from] sqlx::Error),
     #[error("equity operation timing (de)serialization failed")]

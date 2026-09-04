@@ -166,7 +166,7 @@ struct ConfiguredInventoryVaults {
 
 /// Equity symbols the portfolio treats as configured. Shared with the CLI's
 /// snapshot-mark repair so the two cannot drift on what "configured" means.
-pub(crate) fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
+pub fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
     ctx.chains
         .sole_trading()
         .assets

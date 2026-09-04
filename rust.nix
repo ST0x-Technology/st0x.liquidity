@@ -203,11 +203,7 @@ in
       pname = "st0x-cli";
       inherit cargoArtifacts;
 
-      cargoExtraArgs = "--bin cli --features wallet-turnkey";
-
-      postInstall = ''
-        mv $out/bin/cli $out/bin/st0x-cli
-      '';
+      cargoExtraArgs = "-p st0x-cli --bin st0x-cli --features wallet-turnkey";
 
       meta = {
         description = "st0x liquidity CLI";

@@ -7,14 +7,16 @@
 //! RAI-1492 incident's "one job monopolizes the single worker" shape --
 //! the "worker" here is the one-shot CLI process the operator is already
 //! waiting on. This mirrors the job-path reschedule mechanism's
-//! classification (`crate::conductor::job::find_backpressure`/
+//! classification (`st0x_hedge::operator::conductor::job::find_backpressure`/
 //! `decide_backpressure`) but retries synchronously instead of pushing a
 //! delayed successor job.
 
 use std::future::Future;
 use tracing::warn;
 
-use crate::conductor::job::{BackpressureStreak, decide_backpressure, find_backpressure};
+use st0x_hedge::operator::conductor::job::{
+    BackpressureStreak, decide_backpressure, find_backpressure,
+};
 
 /// Default bounded retry budget for CLI Alpaca calls: a handful of attempts
 /// is enough to ride out a brief rate-limit window without turning a CLI

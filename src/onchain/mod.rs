@@ -28,18 +28,17 @@ pub(crate) mod approvals;
 pub(crate) mod backfill;
 mod clear;
 pub(crate) mod io;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod mock;
 mod take_order;
 pub(crate) mod trade;
 
-pub(crate) use trade::OnchainTrade;
-pub(crate) use trade::TradeValidationError;
+pub use trade::{OnchainTrade, TradeValidationError};
 
 /// Builds the [`st0x_raindex::RaindexContracts`] pair from the EVM config.
 /// The single conversion point keeps every construction site in sync should
 /// the struct grow a field.
-pub(crate) fn raindex_contracts(
+pub fn raindex_contracts(
     trading_chain: &st0x_config::TradingChain,
 ) -> st0x_raindex::RaindexContracts {
     st0x_raindex::RaindexContracts {
@@ -51,7 +50,7 @@ pub(crate) fn raindex_contracts(
 /// Unified error type for onchain trade processing with clear domain boundaries.
 /// Provides error mapping between layers while maintaining separation of concerns.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum OnChainError {
+pub enum OnChainError {
     #[error("Trade validation error: {0}")]
     Validation(#[from] TradeValidationError),
     #[error("Database persistence error: {0}")]

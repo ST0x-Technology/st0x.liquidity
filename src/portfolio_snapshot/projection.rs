@@ -22,14 +22,14 @@ use super::{
 
 /// Reactor maintaining the `portfolio_snapshot` read model from live
 /// `PortfolioSnapshot::Captured` events.
-pub(crate) struct PortfolioSnapshotProjection {
+pub struct PortfolioSnapshotProjection {
     pool: SqlitePool,
 }
 
 deps!(PortfolioSnapshotProjection, [PortfolioSnapshot]);
 
 impl PortfolioSnapshotProjection {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 
@@ -145,7 +145,7 @@ impl PortfolioSnapshotProjection {
     /// commits mid-rebuild is not replayed. Under WAL the rebuild's write-lock
     /// upgrade then fails (`SQLITE_BUSY_SNAPSHOT`) rather than committing a
     /// read model missing that day, but the rebuild itself must be re-run.
-    pub(crate) async fn rebuild_all(&self) -> Result<u64, ProjectionError> {
+    pub async fn rebuild_all(&self) -> Result<u64, ProjectionError> {
         let mut transaction = self.pool.begin().await?;
         let events: Vec<(String, String)> = sqlx::query_as(
             "SELECT aggregate_id, payload FROM events WHERE aggregate_type = ? \
@@ -171,7 +171,7 @@ impl PortfolioSnapshotProjection {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum ProjectionError {
+pub enum ProjectionError {
     #[error("portfolio-snapshot read-model write failed")]
     Database(#[from] sqlx::Error),
     #[error("failed to format a portfolio snapshot balance for persistence")]

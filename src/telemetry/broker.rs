@@ -35,13 +35,13 @@ use super::{Dependency, DependencyCallSample, TelemetrySender, scrub_secrets};
 /// Only the conversion and inventory methods the rebalancer uses are exposed
 /// and timed. Other `AlpacaBrokerApi` methods are intentionally not surfaced.
 #[derive(Debug, Clone)]
-pub(crate) struct InstrumentedAlpacaBroker {
+pub struct InstrumentedAlpacaBroker {
     inner: AlpacaBrokerApi,
     telemetry: TelemetrySender,
 }
 
 impl InstrumentedAlpacaBroker {
-    pub(crate) fn new(inner: AlpacaBrokerApi, telemetry: TelemetrySender) -> Self {
+    pub fn new(inner: AlpacaBrokerApi, telemetry: TelemetrySender) -> Self {
         Self { inner, telemetry }
     }
 

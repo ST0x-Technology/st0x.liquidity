@@ -1,6 +1,7 @@
 [workspace]
 members = [
   ".",
+  "crates/cli",
   "crates/config",
   "crates/dto",
   "crates/execution",
@@ -105,7 +106,7 @@ st0x-execution = { path = "crates/execution" }
 st0x-finance = { path = "crates/finance" }
 st0x-float-macro = { path = "crates/float-macro" }
 st0x-float-serde = { path = "crates/float-serde" }
-st0x-hedge = { path = "." }
+st0x-hedge = { path = ".", default-features = false }
 st0x-raindex = { path = "crates/raindex" }
 st0x-registry = { path = "crates/registry" }
 st0x-tokenization = { path = "crates/tokenization" }

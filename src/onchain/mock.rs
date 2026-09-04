@@ -4,11 +4,14 @@ use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
 use alloy::primitives::{Address, Bloom, Log as PrimitiveLog, TxHash, U256};
 use alloy::rpc::types::{Log, TransactionReceipt};
 use alloy::sol_types::SolEvent;
+#[cfg(test)]
 use alloy::transports::RpcError;
 use async_trait::async_trait;
 use std::sync::Mutex;
 
-use st0x_evm::{EvmError, IERC20};
+#[cfg(test)]
+use st0x_evm::EvmError;
+use st0x_evm::IERC20;
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
 
 /// Whether `submit_deposit` should succeed, fail generically, or fail
@@ -19,7 +22,9 @@ use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
 pub(crate) enum DepositBehavior {
     #[default]
     Succeed,
+    #[cfg(test)]
     FailGeneric,
+    #[cfg(test)]
     FailExecutionReverted,
 }
 
@@ -31,12 +36,15 @@ pub(crate) enum DepositBehavior {
 pub(crate) enum ConfirmTxBehavior {
     #[default]
     Succeed,
+    #[cfg(test)]
     Fail,
+    #[cfg(test)]
     Retryable,
     /// Returns a successful receipt but with `block_number: None`.
     /// Simulates the conformant-but-rare RPC edge case where a receipt
     /// is returned without a block number (e.g. a pending or uncle-block
     /// receipt from a load-balanced RPC).
+    #[cfg(test)]
     SucceedWithoutBlockNumber,
 }
 
@@ -56,7 +64,7 @@ struct WithdrawCall {
     amount: U256,
 }
 
-pub(crate) struct MockRaindex {
+pub struct MockRaindex {
     withdraw_tx: TxHash,
     deposit_tx: TxHash,
     deposit_behavior: DepositBehavior,
@@ -116,7 +124,7 @@ fn transfer_log(token: Address, to: Address, amount: U256) -> Log {
 }
 
 impl MockRaindex {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             withdraw_tx: TxHash::random(),
             deposit_tx: TxHash::random(),
@@ -133,6 +141,7 @@ impl MockRaindex {
     /// Configures how `submit_deposit` behaves; combinable with the
     /// confirm-behaviour knob, unlike the former one-knob-per-constructor
     /// design.
+    #[cfg(test)]
     pub(crate) fn with_deposit_behavior(mut self, behavior: DepositBehavior) -> Self {
         self.deposit_behavior = behavior;
         self
@@ -140,27 +149,47 @@ impl MockRaindex {
 
     /// Configures how `confirm_tx_receipt` behaves; combinable with the
     /// deposit-behaviour knob.
+    #[cfg(test)]
     pub(crate) fn with_confirm_behavior(mut self, behavior: ConfirmTxBehavior) -> Self {
         self.confirm_behavior = behavior;
         self
     }
 
     /// Returns the token address that was passed to the last `deposit()` call.
+    #[cfg(test)]
     pub(crate) fn last_deposited_token(&self) -> Option<Address> {
-        *self.deposited_token.lock().unwrap()
+        let Ok(deposited_token) = self.deposited_token.lock() else {
+            panic!("mock deposited-token mutex poisoned");
+        };
+        *deposited_token
     }
 
+    #[cfg(test)]
     pub(crate) fn last_deposit_call(&self) -> Option<DepositCall> {
-        *self.deposit_call.lock().unwrap()
+        let Ok(deposit_call) = self.deposit_call.lock() else {
+            panic!("mock deposit-call mutex poisoned");
+        };
+        *deposit_call
     }
 
+    #[cfg(test)]
     pub(crate) fn last_confirmed_tx(&self) -> Option<TxHash> {
-        *self.confirmed_tx.lock().unwrap()
+        let Ok(confirmed_tx) = self.confirmed_tx.lock() else {
+            panic!("mock confirmed-transaction mutex poisoned");
+        };
+        *confirmed_tx
     }
 
+    #[cfg(test)]
     pub(crate) fn with_withdraw_actual_amount(mut self, amount: U256) -> Self {
         self.withdraw_actual_amount = Some(amount);
         self
+    }
+}
+
+impl Default for MockRaindex {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -185,8 +214,15 @@ impl Raindex for MockRaindex {
     ) -> Result<TxHash, RaindexError> {
         match self.deposit_behavior {
             DepositBehavior::Succeed => {
-                *self.deposited_token.lock().unwrap() = Some(token);
-                *self.deposit_call.lock().unwrap() = Some(DepositCall {
+                let Ok(mut deposited_token) = self.deposited_token.lock() else {
+                    panic!("mock deposited-token mutex poisoned");
+                };
+                *deposited_token = Some(token);
+
+                let Ok(mut deposit_call) = self.deposit_call.lock() else {
+                    panic!("mock deposit-call mutex poisoned");
+                };
+                *deposit_call = Some(DepositCall {
                     token,
                     vault_id,
                     amount,
@@ -194,7 +230,9 @@ impl Raindex for MockRaindex {
                 });
                 Ok(self.deposit_tx)
             }
+            #[cfg(test)]
             DepositBehavior::FailGeneric => Err(RaindexError::ZeroAmount),
+            #[cfg(test)]
             DepositBehavior::FailExecutionReverted => {
                 // Full ABI-encoded ERC20InsufficientBalance(address,uint256,uint256):
                 // 4-byte selector + 3 x 32-byte zero-padded arguments, matching
@@ -226,7 +264,10 @@ impl Raindex for MockRaindex {
         target_amount: U256,
         _decimals: u8,
     ) -> Result<TxHash, RaindexError> {
-        *self.withdraw_transfer.lock().unwrap() = Some(WithdrawCall {
+        let Ok(mut withdraw_transfer) = self.withdraw_transfer.lock() else {
+            panic!("mock withdrawal-transfer mutex poisoned");
+        };
+        *withdraw_transfer = Some(WithdrawCall {
             token,
             amount: target_amount,
         });
@@ -237,23 +278,29 @@ impl Raindex for MockRaindex {
         &self,
         tx_hash: TxHash,
     ) -> Result<TransactionReceipt, RaindexError> {
-        *self.confirmed_tx.lock().unwrap() = Some(tx_hash);
+        let Ok(mut confirmed_tx) = self.confirmed_tx.lock() else {
+            panic!("mock confirmed-transaction mutex poisoned");
+        };
+        *confirmed_tx = Some(tx_hash);
 
         match self.confirm_behavior {
+            #[cfg(test)]
             ConfirmTxBehavior::Fail => {
                 return Err(RaindexError::Evm(EvmError::TransactionDropped {
                     tx_hash,
                     elapsed_secs: 0,
                 }));
             }
+            #[cfg(test)]
             ConfirmTxBehavior::Retryable => {
                 return Err(RaindexError::ScanInconclusive { from_block: 0 });
             }
+            #[cfg(test)]
             ConfirmTxBehavior::SucceedWithoutBlockNumber => {
-                let logs = self
-                    .withdraw_transfer
-                    .lock()
-                    .unwrap()
+                let Ok(withdraw_transfer) = self.withdraw_transfer.lock() else {
+                    panic!("mock withdrawal-transfer mutex poisoned");
+                };
+                let logs = withdraw_transfer
                     .map(|WithdrawCall { token, amount }| {
                         let amount = self.withdraw_actual_amount.unwrap_or(amount);
                         vec![transfer_log(token, Address::ZERO, amount)]
@@ -267,10 +314,10 @@ impl Raindex for MockRaindex {
             ConfirmTxBehavior::Succeed => {}
         }
 
-        let logs = self
-            .withdraw_transfer
-            .lock()
-            .unwrap()
+        let Ok(withdraw_transfer) = self.withdraw_transfer.lock() else {
+            panic!("mock withdrawal-transfer mutex poisoned");
+        };
+        let logs = withdraw_transfer
             .map(|WithdrawCall { token, amount }| {
                 let amount = self.withdraw_actual_amount.unwrap_or(amount);
                 vec![transfer_log(token, Address::ZERO, amount)]
@@ -278,5 +325,28 @@ impl Raindex for MockRaindex {
             .unwrap_or_default();
 
         Ok(successful_receipt(tx_hash, logs))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::thread;
+
+    use super::MockRaindex;
+
+    #[test]
+    #[should_panic(expected = "mock deposited-token mutex poisoned")]
+    fn recorded_call_access_panics_when_mock_state_is_poisoned() {
+        let mock = Arc::new(MockRaindex::new());
+        let thread_mock = Arc::clone(&mock);
+
+        let _ = thread::spawn(move || {
+            let _guard = thread_mock.deposited_token.lock().unwrap();
+            panic!("poison mock state");
+        })
+        .join();
+
+        mock.last_deposited_token();
     }
 }

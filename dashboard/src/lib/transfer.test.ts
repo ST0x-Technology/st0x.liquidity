@@ -262,7 +262,7 @@ describe('stuckReasonLabel', () => {
 const PROD = { simulateSourceId: null, backendPort: null }
 const SIM = { simulateSourceId: 'sim-1', backendPort: '8123' }
 const SIM_PREFIX =
-  'nix develop --command cargo run --features mock --bin cli -- --config /tmp/st0x-simulate-failures-8123.config.toml --secrets /tmp/st0x-simulate-failures-8123.secrets.toml'
+  'nix develop --command cargo run -p st0x-cli --features mock -- --config /tmp/st0x-simulate-failures-8123.config.toml --secrets /tmp/st0x-simulate-failures-8123.secrets.toml'
 
 const commandFor = (commands: { label: string; command: string }[], label: string): string => {
   const found = commands.find((entry) => entry.label === label)
