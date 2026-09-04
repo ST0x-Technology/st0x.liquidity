@@ -205,8 +205,9 @@ pub struct TurnkeyApprovalPolicyInputs {
 #[serde(deny_unknown_fields)]
 struct Config {
     database_url: String,
-    log_level: Option<LogLevel>,
+    log_level: LogLevel,
     log_dir: Option<String>,
+    file_log_level: Option<LogLevel>,
     log_format: Option<LogFormat>,
     log_query_url_template: Option<String>,
     server_port: u16,
@@ -683,8 +684,9 @@ pub enum TradingMode {
 #[derive(Clone)]
 pub struct Ctx {
     pub database_url: String,
+    /// Minimum level for stdout and remote exports.
     pub log_level: LogLevel,
-    pub log_dir: Option<String>,
+    pub file_logging: Option<crate::FileLogging>,
     pub log_format: LogFormat,
     /// Log query link printed by CLI transfer commands, with `{id}`
     /// substituted. `None` prints nothing.
@@ -1191,7 +1193,7 @@ impl std::fmt::Debug for Ctx {
         debug_struct
             .field("database_url", &self.database_url)
             .field("log_level", &self.log_level)
-            .field("log_dir", &self.log_dir)
+            .field("file_logging", &self.file_logging)
             .field("log_format", &self.log_format)
             .field("log_query_url_template", &self.log_query_url_template)
             .field("server_port", &self.server_port)
@@ -1338,7 +1340,7 @@ impl From<&LogLevel> for Level {
 struct ValidatedParts {
     database_url: String,
     log_level: LogLevel,
-    log_dir: Option<String>,
+    file_logging: Option<crate::FileLogging>,
     log_format: LogFormat,
     log_query_url_template: Option<LogQueryUrlTemplate>,
     server_port: u16,
@@ -1580,6 +1582,7 @@ fn validated_polling_intervals(config: &Config) -> Result<PollingIntervals, CtxE
 struct ValidatedConfigParts {
     polling_intervals: PollingIntervals,
     alerts: Option<AlertsCtx>,
+    file_logging: Option<crate::FileLogging>,
     log_query_url_template: Option<LogQueryUrlTemplate>,
     travel_rule: Option<TravelRuleConfig>,
 }
@@ -1598,6 +1601,15 @@ fn validate_config(
     config_path: &Path,
     startup_notices: &mut Vec<StartupNotice>,
 ) -> Result<ValidatedConfigParts, CtxError> {
+    let file_logging = match (&config.log_dir, &config.file_log_level) {
+        (Some(directory), Some(level)) => {
+            Some(crate::FileLogging::new(directory.clone(), level.clone()))
+        }
+        (Some(_), None) => return Err(CtxError::MissingFileLogLevel),
+        (None, Some(_)) => return Err(CtxError::MissingLogDirectory),
+        (None, None) => None,
+    };
+
     if config.server_port == config.board_port {
         return Err(CtxError::ServerAndBoardPortsMatch {
             port: config.server_port,
@@ -1697,6 +1709,7 @@ fn validate_config(
     Ok(ValidatedConfigParts {
         polling_intervals,
         alerts,
+        file_logging,
         log_query_url_template,
         travel_rule,
     })
@@ -1728,6 +1741,7 @@ fn parse_and_validate(
     let ValidatedConfigParts {
         polling_intervals,
         alerts,
+        file_logging,
         log_query_url_template,
         travel_rule,
     } = validate_config(&config, config_path, &mut startup_notices)?;
@@ -1774,7 +1788,6 @@ fn parse_and_validate(
     };
 
     let redemption_wallet = chains.sole_trading().redemption_wallet;
-    let log_level = config.log_level.unwrap_or(LogLevel::Debug);
     let log_format = config.log_format.unwrap_or(LogFormat::Text);
 
     let ExtendedHoursBrokerWindows {
@@ -1798,8 +1811,8 @@ fn parse_and_validate(
 
     Ok(ValidatedParts {
         database_url: config.database_url,
-        log_level,
-        log_dir: config.log_dir,
+        log_level: config.log_level,
+        file_logging,
         log_format,
         log_query_url_template,
         server_port: config.server_port,
@@ -1977,7 +1990,7 @@ impl Ctx {
         Ok(Self {
             database_url: parts.database_url,
             log_level: parts.log_level,
-            log_dir: parts.log_dir,
+            file_logging: parts.file_logging,
             log_format: parts.log_format,
             log_query_url_template: parts.log_query_url_template,
             server_port: parts.server_port,
@@ -2313,7 +2326,7 @@ impl Ctx {
         Ok(Self {
             database_url,
             log_level: LogLevel::Debug,
-            log_dir: None,
+            file_logging: None,
             log_format: LogFormat::Text,
             log_query_url_template: None,
             server_port,
@@ -2373,6 +2386,10 @@ pub enum CtxError {
     Pricing(#[from] PricingCtxError),
     #[error("log_query_url_template must contain the {{id}} placeholder")]
     LogQueryUrlTemplateMissingIdPlaceholder,
+    #[error("file_log_level is required when log_dir is configured")]
+    MissingFileLogLevel,
+    #[error("log_dir is required when file_log_level is configured")]
+    MissingLogDirectory,
     #[error(
         "[ops_api] audiences must not be blank: each role prefix's verifier pins the \
          audience IAP mints for that prefix's backend, and a blank pin verifies nothing"
@@ -2695,6 +2712,8 @@ impl CtxError {
             Self::LogQueryUrlTemplateMissingIdPlaceholder => {
                 "log_query_url_template missing {id} placeholder"
             }
+            Self::MissingFileLogLevel => "missing file log level",
+            Self::MissingLogDirectory => "missing log directory",
             Self::LogQueryUrlTemplateNotAUrl { .. } => "log_query_url_template is not a valid URL",
             Self::OpsApiAudienceBlank => "[ops_api] audience is blank",
             Self::OpsApiAudiencePadded => "[ops_api] audience has surrounding whitespace",
@@ -2782,7 +2801,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
     Ctx {
         database_url: ":memory:".to_owned(),
         log_level: LogLevel::Debug,
-        log_dir: None,
+        file_logging: None,
         log_format: LogFormat::Text,
         log_query_url_template: None,
         server_port: 8080,
@@ -2970,6 +2989,7 @@ mod tests {
     fn minimal_config_toml_bytes() -> &'static [u8] {
         br#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -3097,6 +3117,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -3155,6 +3176,7 @@ mod tests {
         toml_file(&format!(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -3212,6 +3234,7 @@ mod tests {
         toml_file(&format!(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -3295,6 +3318,7 @@ mod tests {
         toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -3393,6 +3417,7 @@ mod tests {
         toml_file(&format!(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -3543,6 +3568,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -3597,6 +3623,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -3659,6 +3686,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -3718,6 +3746,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -3782,6 +3811,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -3966,10 +3996,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stdout_log_level_is_required() {
+        let config = toml_file(
+            &String::from_utf8_lossy(minimal_config_toml_bytes())
+                .replace("            log_level = \"debug\"\n", ""),
+        );
+        let secrets = dry_run_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, CtxError::ConfigToml { .. }));
+    }
+
+    #[tokio::test]
+    async fn log_dir_requires_file_log_level() {
+        let config = toml_file(
+            &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
+                "            log_level = \"debug\"\n",
+                "            log_level = \"debug\"\n            log_dir = \"/tmp/logs\"\n",
+            ),
+        );
+        let secrets = dry_run_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, CtxError::MissingFileLogLevel));
+    }
+
+    #[tokio::test]
+    async fn file_log_level_requires_log_dir() {
+        let config = toml_file(
+            &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
+                "            log_level = \"debug\"\n",
+                "            log_level = \"debug\"\n            file_log_level = \"info\"\n",
+            ),
+        );
+        let secrets = dry_run_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, CtxError::MissingLogDirectory));
+    }
+
+    #[test]
+    fn file_logging_assembles_directory_and_independent_level() {
+        let config_toml = String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
+            "            log_level = \"debug\"\n",
+            "            log_level = \"trace\"\n            log_dir = \"/tmp/logs\"\n            file_log_level = \"info\"\n",
+        );
+        let config: Config = toml::from_str(&config_toml).unwrap();
+        let mut startup_notices = Vec::new();
+        let validated =
+            validate_config(&config, Path::new("test-config.toml"), &mut startup_notices).unwrap();
+        let file_logging = validated.file_logging.expect("file logging is configured");
+
+        assert!(matches!(config.log_level, LogLevel::Trace));
+        assert_eq!(file_logging.directory(), "/tmp/logs");
+        assert!(matches!(file_logging.level(), LogLevel::Info));
+    }
+
+    #[tokio::test]
     async fn apalis_finished_job_cleanup_interval_is_required() {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             inventory_divergence_threshold = 10
@@ -4023,6 +4120,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -4075,6 +4173,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -4118,6 +4217,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -4162,6 +4262,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -4215,6 +4316,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
@@ -4268,6 +4370,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
@@ -4325,6 +4428,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -4383,6 +4487,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 0
@@ -4438,6 +4543,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -4494,6 +4600,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8080
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -4561,6 +4668,7 @@ mod tests {
             let config = toml_file(&format!(
                 r#"
                 database_url = ":memory:"
+            log_level = "debug"
                 server_port = 8080
                 board_port = 8081
                 apalis_finished_job_cleanup_interval_secs = 3600
@@ -4647,6 +4755,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -4800,6 +4909,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
@@ -4853,6 +4963,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
@@ -4927,6 +5038,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -5037,6 +5149,7 @@ mod tests {
         toml_file(&format!(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -5403,6 +5516,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -5477,6 +5591,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -5575,6 +5690,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -5677,6 +5793,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -5786,6 +5903,7 @@ mod tests {
         format!(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -6062,6 +6180,7 @@ mod tests {
     fn standalone_mode_does_not_require_bot_gas_valuation() {
         let config_str = r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -6136,6 +6255,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -6220,6 +6340,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -6298,6 +6419,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -6374,6 +6496,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -6564,6 +6687,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -6803,6 +6927,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -6879,6 +7004,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -6959,6 +7085,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -7036,6 +7163,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -7116,6 +7244,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -7607,6 +7736,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -8233,6 +8363,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -8279,6 +8410,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -8329,6 +8461,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -8388,6 +8521,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -8507,6 +8641,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -8766,6 +8901,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -8887,6 +9023,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -8952,6 +9089,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -9015,6 +9153,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -9078,6 +9217,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -9160,6 +9300,7 @@ mod tests {
         toml_file(&format!(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -9270,6 +9411,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -9337,6 +9479,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             bogus_field = "should fail"
@@ -9406,6 +9549,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -9465,6 +9609,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -9542,6 +9687,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -9646,6 +9792,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
@@ -9703,6 +9850,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            log_level = "debug"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600

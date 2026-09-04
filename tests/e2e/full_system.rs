@@ -35,7 +35,7 @@ use st0x_float_macro::float;
 use tokio::sync::broadcast;
 use tracing::{debug, info};
 
-use st0x_config::{BrokerCtx, Ctx, configure_sqlite_pool};
+use st0x_config::{BrokerCtx, Ctx, FileLogging, LogLevel, configure_sqlite_pool};
 use st0x_config::{CashHedgePolicy, EquityHedgePolicy, HedgedEquities, HedgingAssets};
 use st0x_dto::Statement;
 use st0x_event_sorcery::Projection;
@@ -1160,7 +1160,10 @@ async fn simulate() -> anyhow::Result<()> {
         .board_port(board_port)
         .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
-    ctx.log_dir = Some(log_dir.display().to_string());
+    ctx.file_logging = Some(FileLogging::new(
+        log_dir.display().to_string(),
+        LogLevel::Debug,
+    ));
 
     // Seeded BEFORE the bot starts: the fixture's temporary
     // `Store<Position>`/`Store<OffchainOrder>` are wired only with
@@ -1394,7 +1397,10 @@ async fn simulate_failures() -> anyhow::Result<()> {
         .board_port(board_port)
         .issuance_base_url(infra.issuance_base_url.clone())
         .call()?;
-    ctx.log_dir = Some(log_dir.display().to_string());
+    ctx.file_logging = Some(FileLogging::new(
+        log_dir.display().to_string(),
+        LogLevel::Debug,
+    ));
     let cli_ctx = ctx.clone();
 
     let (config_path, secrets_path) = write_simulate_failure_cli_files(

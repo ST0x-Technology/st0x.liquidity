@@ -2,6 +2,25 @@
 
 Best practices for logging, tracing, and monitoring in this codebase.
 
+## Sink levels
+
+`log_level` is the minimum level for stdout and OpenTelemetry exports.
+`RUST_LOG` may refine the stdout filter for an operator session. When local
+daily files are enabled, `log_dir` and `file_log_level` must be configured
+together; neither field has an implicit counterpart. The local file layer uses
+only `file_log_level`, so `RUST_LOG` cannot increase disk usage.
+
+Production uses `log_level = "trace"` so Docker's `gcplogs` driver exports full
+diagnostics, while `file_log_level = "info"` limits the rotating files stored
+beside SQLite. Rotation retains seven daily files; the level split also bounds
+growth within each day, before retention can prune the oldest file.
+
+The active GCP configs are config-as-data in `T0Trade/t0.devops`, not the baked
+`config/*-gcp` copies in this repository. A logging-schema release must promote
+the matching image and runtime config together. Staging's automatic image roll
+must be paused before merging an incompatible schema change; production already
+pins its image and config in one gated promotion.
+
 ## Tracing targets
 
 Use the `target:` field in `tracing` macros to categorize log output by

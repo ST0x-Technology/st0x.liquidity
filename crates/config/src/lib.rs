@@ -44,8 +44,8 @@ pub use rebalancing::{
     RebalancingCtxError, UsdcRebalancing,
 };
 pub use telemetry::{
-    ExtraLayer, FileLogGuard, TelemetryConfig, TelemetryCtx, TelemetryError, TelemetryGuard,
-    mk_env_filter, setup_tracing,
+    ExtraLayer, FileLogGuard, FileLogging, TelemetryConfig, TelemetryCtx, TelemetryError,
+    TelemetryGuard, mk_env_filter, setup_tracing,
 };
 pub use threshold::{ExecutionThreshold, InvalidThresholdError};
 pub use wallet::{OnchainWalletCtx, SigningChains, WalletCtxError, build_wallet};

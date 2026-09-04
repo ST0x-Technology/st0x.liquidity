@@ -877,6 +877,11 @@ migration files in `migrations/`.
 ### Health Monitoring and Logging
 
 - System uptime and connectivity status using structured logging
+- Configure stdout and rotated-file minimum log levels independently. Production
+  keeps TRACE on stdout for remote log shipping and INFO in local rotated files,
+  so diagnostic logging cannot exhaust the SQLite data disk.
+- Require both log levels when rotated-file logging is enabled. A missing level
+  must fail config validation instead of inheriting another sink's level.
 - API rate limiting and error tracking with metrics collection
 - Position drift alerts and rebalancing triggers
 - Latency monitoring for trade execution timing
