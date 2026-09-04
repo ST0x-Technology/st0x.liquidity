@@ -282,16 +282,18 @@ excellent async ecosystem for handling concurrent trading flows.
 #### Raindex Event Monitor
 
 - Continuous HTTP `eth_getLogs` polling over a single transport -- no WebSocket.
-  The poll interval is per chain (`order_fill_poll_interval_secs`, required on
-  every watched chain's trading table; no global default). Every poll interval
-  the monitor enqueues a backfill range covering the blocks since the persisted
-  checkpoint, capped at the configured ingestion cutoff block (must be
-  explicitly configured; recommended value: `safe`, i.e.
-  `eth_getBlockByNumber("safe")`); the backfill worker fetches the `Clear` and
-  `TakeOrder` logs for the arbitrageur's owner address and advances the
-  checkpoint only on success. `required_confirmations` governs
-  transaction-submission paths only and does not affect fill ingestion. The
-  cutoff tag is configured via `ingestion_cutoff` (required field):
+  One monitor instance runs per watched chain, each with its own provider,
+  per-chain poll interval (`order_fill_poll_interval_secs`, required on every
+  watched chain's trading table; no global default), checkpoint keyed
+  `(chain, orderbook)`, and scan queue -- one chain's backlog or outage never
+  blocks another chain's ingestion. Every poll interval the monitor enqueues a
+  backfill range covering the blocks since the persisted checkpoint, capped at
+  the configured ingestion cutoff block (must be explicitly configured;
+  recommended value: `safe`, i.e. `eth_getBlockByNumber("safe")`); the backfill
+  worker fetches the `Clear` and `TakeOrder` logs for the arbitrageur's owner
+  address and advances the checkpoint only on success. `required_confirmations`
+  governs transaction-submission paths only and does not affect fill ingestion.
+  The cutoff tag is configured via `ingestion_cutoff` (required field):
   - **`safe` (recommended):** On OP Stack chains like Base, `safe` is the latest
     L2 block whose sequencer batch has been posted to L1 (not yet L1-finalized).
     Cuts hedging lag from ~20 min to ~seconds. Tradeoff: a sufficiently deep L1
