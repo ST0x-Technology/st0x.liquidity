@@ -333,6 +333,7 @@ where
             trade_event,
             trade,
             &ctx.cqrs,
+            &chain_ctx.trading.assets,
             trading_enabled,
         )
         .await
@@ -937,7 +938,6 @@ mod tests {
             offchain_order,
             order_placer: noop_order_placer(),
             execution_threshold,
-            assets: ctx.chains.primary().assets.clone(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
             close_flatten_policy:
                 crate::trading::offchain::close_flatten::CloseFlattenPolicy::from_secs(900).unwrap(),
