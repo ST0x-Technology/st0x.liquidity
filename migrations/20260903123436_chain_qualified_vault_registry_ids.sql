@@ -12,3 +12,9 @@ UPDATE snapshots
    SET aggregate_id = 'base:' || aggregate_id
  WHERE aggregate_type = 'VaultRegistry'
    AND aggregate_id LIKE '0x%';
+
+-- The projection is keyed by the same id. Its rows would survive as orphans
+-- under the legacy key (startup only rebuilds ids it finds in events), so
+-- clear it and let the framework rebuild every view from the migrated
+-- events, as 20260506235955 did for the last VaultRegistry shape change.
+DELETE FROM vault_registry_view;
