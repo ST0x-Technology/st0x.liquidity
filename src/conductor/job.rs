@@ -511,6 +511,19 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     }
 }
 
+/// Default upper bound on a single [`Job::perform`] invocation.
+///
+/// Every worker runs `.concurrency(1)`, so a `perform` future that never
+/// resolves parks its worker forever with no error, no retry, and no
+/// `on_terminal_failure` stop (RAI-2218). The bound converts the hang into a
+/// [`JobError`] that retries and, on exhaustion, halts through the worker's
+/// terminal-failure path. Generous by design: it exists to catch a future
+/// that will never resolve, not to enforce a latency target, so it sits well
+/// above the slowest legitimate `perform` (the USDC conversion poll's
+/// compiled-in wait of several minutes is the current ceiling). A job with a
+/// materially different legitimate ceiling (e.g. `BackfillRange`) sets its own.
+pub(crate) const DEFAULT_PERFORM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// A persistent, retryable unit of work backed by apalis storage.
 ///
 /// Implementations are serializable structs that carry the data
@@ -543,6 +556,19 @@ where
     /// Logged when retries are exhausted and the supervisor receives
     /// a terminal failure for this job.
     const TERMINAL_FAILURE_MSG: &'static str = "Job failed after retries";
+
+    /// Upper bound on a single [`perform`](Job::perform) invocation, past
+    /// which the attempt fails instead of parking the worker (RAI-2218). No
+    /// default: every impl states its own bound so the choice is conscious,
+    /// the same way `WORKER_NAME` and `JOB_KIND` are. Most jobs use
+    /// `Some(DEFAULT_PERFORM_TIMEOUT)`; see [`DEFAULT_PERFORM_TIMEOUT`] for the
+    /// rationale. `None` means the job deliberately opts out of the
+    /// perform-level bound because its handler has a phase that is unsafe to
+    /// interrupt (dropping the future mid-phase would strand or double-drive
+    /// real money); such a job relies on its own phase-aware deadlines and on
+    /// the bounded HTTP transports instead. Grep the impls that set `None` for
+    /// the current opt-outs and their per-job reasons.
+    const PERFORM_TIMEOUT: Option<Duration>;
 
     /// Identifier for this job type in the e2e [`FailureInjector`].
     #[cfg(any(test, feature = "test-support"))]
@@ -967,12 +993,7 @@ impl FailureInjector {
         }
 
         log_processing(&label, attempt);
-        job.perform(ctx).await.map_err(|source| JobError::Failed {
-            task_identity,
-            durably_terminal,
-            label,
-            source: Box::new(source),
-        })
+        perform_bounded(job, ctx, label, task_identity, durably_terminal).await
     }
 }
 
@@ -982,6 +1003,60 @@ fn log_processing(label: &Label, attempt: usize) {
     } else {
         warn!(%label, attempt, "Retrying job after transient failure");
     }
+}
+
+/// Error produced when [`Job::perform`] exceeds [`Job::PERFORM_TIMEOUT`].
+///
+/// Carried as the `source` of a [`JobError::Failed`] so a hung attempt flows
+/// through the same retry and terminal-failure machinery as any other job
+/// error instead of parking its single-concurrency worker forever.
+#[derive(Debug, thiserror::Error)]
+#[error("Job::perform did not resolve within {timeout:?}")]
+pub(crate) struct PerformTimeout {
+    timeout: Duration,
+}
+
+/// Runs [`Job::perform`], bounding it by [`Job::PERFORM_TIMEOUT`] when the job
+/// sets one, and mapping both a handler error and an elapsed bound into
+/// [`JobError::Failed`]. A `None` timeout awaits `perform` directly: the job
+/// has opted out because interrupting its handler is unsafe (see the trait
+/// const doc).
+async fn perform_bounded<Ctx, J>(
+    job: &J,
+    ctx: &Ctx,
+    label: Label,
+    task_identity: TaskIdentity,
+    durably_terminal: bool,
+) -> Result<J::Output, JobError>
+where
+    Ctx: Send + Sync + 'static,
+    J: Job<Ctx> + Sync,
+{
+    let source: Box<dyn std::error::Error + Send + Sync> = match J::PERFORM_TIMEOUT {
+        Some(timeout) => match tokio::time::timeout(timeout, job.perform(ctx)).await {
+            Ok(Ok(output)) => return Ok(output),
+            Ok(Err(error)) => Box::new(error),
+            Err(_elapsed) => {
+                error!(
+                    %label,
+                    ?timeout,
+                    "Job::perform did not resolve within its timeout; failing the attempt"
+                );
+                Box::new(PerformTimeout { timeout })
+            }
+        },
+        None => match job.perform(ctx).await {
+            Ok(output) => return Ok(output),
+            Err(error) => Box::new(error),
+        },
+    };
+
+    Err(JobError::Failed {
+        task_identity,
+        durably_terminal,
+        label,
+        source,
+    })
 }
 
 /// Generic apalis handler -- test-support build.
@@ -1026,12 +1101,14 @@ where
 {
     let label = job.label();
     log_processing(&label, attempt.current());
-    job.perform(&ctx).await.map_err(|source| JobError::Failed {
-        task_identity: TaskIdentity::from(&task_id),
-        durably_terminal: is_durably_terminal(&attempt, &sql_context),
+    perform_bounded::<Ctx, J>(
+        &job,
+        &ctx,
         label,
-        source: Box::new(source),
-    })
+        TaskIdentity::from(&task_id),
+        is_durably_terminal(&attempt, &sql_context),
+    )
+    .await
 }
 
 fn is_durably_terminal(attempt: &Attempt, sql_context: &SqliteContext) -> bool {
@@ -1823,6 +1900,7 @@ mod tests {
         type Error = TestJobError;
 
         const WORKER_NAME: &'static str = "test-worker";
+        const PERFORM_TIMEOUT: Option<Duration> = Some(DEFAULT_PERFORM_TIMEOUT);
         const JOB_KIND: JobKind = JobKind::OrderFill;
 
         fn label(&self) -> Label {
@@ -1858,6 +1936,7 @@ mod tests {
         type Error = TestJobError;
 
         const WORKER_NAME: &'static str = "recover-on-fifth-attempt-worker";
+        const PERFORM_TIMEOUT: Option<Duration> = Some(DEFAULT_PERFORM_TIMEOUT);
         const JOB_KIND: JobKind = JobKind::OrderFill;
 
         fn label(&self) -> Label {
@@ -1876,6 +1955,226 @@ mod tests {
             ctx.completed.notify_one();
             Ok(())
         }
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct HangingJob;
+
+    impl Job<()> for HangingJob {
+        type Output = ();
+        type Error = TestJobError;
+
+        const WORKER_NAME: &'static str = "hanging-worker";
+        const JOB_KIND: JobKind = JobKind::OrderFill;
+        const PERFORM_TIMEOUT: Option<Duration> = Some(Duration::from_millis(50));
+
+        fn label(&self) -> Label {
+            Label::new("hanging-job")
+        }
+
+        async fn perform(&self, (): &()) -> Result<Self::Output, Self::Error> {
+            std::future::pending().await
+        }
+    }
+
+    /// A `perform` future that never resolves must fail the attempt with a
+    /// [`PerformTimeout`] source instead of parking the worker forever.
+    #[tokio::test]
+    async fn perform_bounded_times_out_a_hung_perform() {
+        let error = perform_bounded(
+            &HangingJob,
+            &(),
+            HangingJob.label(),
+            TaskIdentity("hung-task".to_owned()),
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        let JobError::Failed {
+            durably_terminal,
+            source,
+            ..
+        } = error
+        else {
+            panic!("expected JobError::Failed, got: {error:?}");
+        };
+        assert!(durably_terminal, "durably_terminal must pass through");
+        assert!(
+            source.downcast_ref::<PerformTimeout>().is_some(),
+            "source must be PerformTimeout, got: {source:?}"
+        );
+    }
+
+    /// A job that opts out of the perform-level bound (`PERFORM_TIMEOUT` is
+    /// `None`), mirroring `TransferUsdcToMarketMaking`.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct UnboundedHangJob;
+
+    impl Job<()> for UnboundedHangJob {
+        type Output = ();
+        type Error = TestJobError;
+
+        const WORKER_NAME: &'static str = "unbounded-hang-worker";
+        const JOB_KIND: JobKind = JobKind::OrderFill;
+        const PERFORM_TIMEOUT: Option<Duration> = None;
+
+        fn label(&self) -> Label {
+            Label::new("unbounded-hang-job")
+        }
+
+        async fn perform(&self, (): &()) -> Result<Self::Output, Self::Error> {
+            std::future::pending().await
+        }
+    }
+
+    /// A `None` `PERFORM_TIMEOUT` must make `perform_bounded` await the handler
+    /// directly with no bound. `UnboundedHangJob::perform` never resolves, so
+    /// with `None` the only timer is the outer deadline and it fires; if a
+    /// regression restored `Some(DEFAULT_PERFORM_TIMEOUT)`, `perform_bounded`
+    /// would resolve to a `PerformTimeout` at 30 min instead. The outer
+    /// deadline is set ABOVE `DEFAULT_PERFORM_TIMEOUT` precisely so those two
+    /// cases diverge; `start_paused` auto-advances the clock while the runtime
+    /// is idle, so this costs no wall-clock time. A shorter outer deadline
+    /// would fire first in both cases and pass even under the regression.
+    #[tokio::test(start_paused = true)]
+    async fn perform_bounded_does_not_bound_a_none_timeout_job() {
+        let bounded = perform_bounded(
+            &UnboundedHangJob,
+            &(),
+            UnboundedHangJob.label(),
+            TaskIdentity("unbounded-task".to_owned()),
+            false,
+        );
+
+        let bounded_result =
+            tokio::time::timeout(DEFAULT_PERFORM_TIMEOUT + Duration::from_secs(60), bounded).await;
+
+        let Err(_elapsed) = &bounded_result else {
+            panic!(
+                "a None PERFORM_TIMEOUT must not be bounded by perform_bounded; \
+                 the call resolved to {bounded_result:?} instead of running until the outer deadline"
+            );
+        };
+    }
+
+    /// A handler error inside the bound must keep flowing through unchanged,
+    /// with the original error as the source.
+    #[tokio::test]
+    async fn perform_bounded_passes_through_handler_error() {
+        let ctx = TestCtx {
+            success_count: AtomicUsize::new(0),
+            success_notify: Arc::new(tokio::sync::Notify::new()),
+            failing_job_started: Arc::new(tokio::sync::Notify::new()),
+        };
+        let job = TestJob { should_fail: true };
+
+        let error = perform_bounded(
+            &job,
+            &ctx,
+            job.label(),
+            TaskIdentity("failing-task".to_owned()),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        let JobError::Failed { source, .. } = error else {
+            panic!("expected JobError::Failed, got: {error:?}");
+        };
+        assert!(
+            source.downcast_ref::<TestJobError>().is_some(),
+            "source must be the handler's own error, got: {source:?}"
+        );
+    }
+
+    /// A `perform` that resolves within the bound must return its output.
+    #[tokio::test]
+    async fn perform_bounded_returns_output_within_the_bound() {
+        let ctx = TestCtx {
+            success_count: AtomicUsize::new(0),
+            success_notify: Arc::new(tokio::sync::Notify::new()),
+            failing_job_started: Arc::new(tokio::sync::Notify::new()),
+        };
+        let job = TestJob { should_fail: false };
+
+        perform_bounded(
+            &job,
+            &ctx,
+            job.label(),
+            TaskIdentity("ok-task".to_owned()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ctx.success_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// End-to-end proof of the RAI-2218 fix through the real
+    /// `build_supervised_worker!` macro: a `perform` future that never
+    /// resolves must drive the supervised worker to a terminal fail-stop
+    /// (retries exhausted -> `on_terminal_failure` -> `ctx.stop()`), not latch
+    /// idle. `HangingJob`'s 50ms `PERFORM_TIMEOUT` keeps this fast; the
+    /// `RETRY_BACKOFF` (1s, 2s, 4s) across `retries(3)` bounds it to ~7s.
+    ///
+    /// Distinct from the unit tests above (which prove `perform_bounded`
+    /// alone) and from `job_failure_after_retries_halts_processing` (which
+    /// uses a job that returns `Err`): this proves the hang -> timeout -> Err
+    /// -> retry -> stop composition end to end on the production worker wiring.
+    #[tokio::test]
+    async fn supervised_worker_fail_stops_on_a_hung_perform() {
+        let apalis_pool = setup_test_apalis_pool().await;
+
+        let mut queue: JobQueue<HangingJob> = JobQueue::new(&apalis_pool);
+        queue.push(HangingJob).await.unwrap();
+
+        let failure_notify = Arc::new(TerminalFailureSignal::default());
+        let ctx = Arc::new(());
+
+        let monitor_handle = tokio::spawn({
+            let failure_notify = failure_notify.clone();
+            let monitor = Monitor::new()
+                .should_restart(|_ctx, _error, _attempt| false)
+                .register(move |index| {
+                    build_supervised_worker!(
+                        ::<(), HangingJob>,
+                        index,
+                        queue.clone(),
+                        ctx.clone(),
+                        failure_notify.clone(),
+                        FailureInjector::new(),
+                    )
+                });
+
+            async move {
+                let _ = monitor.run().await;
+            }
+        });
+
+        let info = tokio::time::timeout(Duration::from_secs(20), failure_notify.notified())
+            .await
+            .expect(
+                "a perform future that never resolves must drive a terminal fail-stop \
+                 through the macro path, not latch idle",
+            );
+
+        assert_eq!(
+            info.context,
+            HangingJob::TERMINAL_FAILURE_MSG,
+            "recorded failure must carry the job's terminal-failure context",
+        );
+        assert_eq!(
+            info.source.to_string(),
+            "hanging-job: Job::perform did not resolve within 50ms",
+            "the terminal failure must be the perform timeout surfaced through JobError, \
+             proving the hang became a loud error rather than a silent park",
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), monitor_handle)
+            .await
+            .expect("monitor should exit within 5s after the terminal timeout failure")
+            .expect("monitor task should not panic");
     }
 
     /// A job that fails after all retries must halt further processing --
@@ -2033,8 +2332,9 @@ mod tests {
     /// What this does NOT prove: it does not exercise the full
     /// systemd-restart loop (out of process, untestable at this layer), and
     /// it does not cover a `Job::perform()` future that itself never
-    /// resolves -- a distinct, pre-existing failure class this issue does
-    /// not claim to fix.
+    /// resolves -- that distinct failure class is bounded by
+    /// [`Job::PERFORM_TIMEOUT`] and covered by
+    /// [`perform_bounded_times_out_a_hung_perform`].
     #[tokio::test]
     async fn supervised_worker_fail_stops_past_the_vendored_circuit_breakers_hardcoded_threshold() {
         use apalis::layers::WorkerBuilderExt;

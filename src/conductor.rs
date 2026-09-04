@@ -714,6 +714,15 @@ type HttpProvider = FillProvider<
     RootProvider,
 >;
 
+/// Bounds for the trading chain RPC transport. A hung endpoint that accepts
+/// the connection and never responds otherwise parks every await that runs
+/// through this provider (the fill poll loop, backfill, and all read-only
+/// contract calls) with no error surfaced (RAI-2218). 30s accommodates the
+/// heavy eth_getLogs range scans backfill issues; the wallet transport uses
+/// 20s for its smaller payloads.
+const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn setup_instrumentation<E>(
     executor_ctx: impl TryIntoExecutor<Executor = E>,
     trading_chain: &TradingChain,
@@ -739,10 +748,21 @@ where
     // (via the OrderFillMonitor + backfill worker) and all read-only
     // contract calls. No WebSocket -- see `monitor::order_fills`. The
     // telemetry layer wraps the transport itself, so every JSON-RPC call
-    // from any provider handle is timed.
+    // from any provider handle is timed. The request timeout bounds a hung
+    // endpoint so a dead read becomes an error instead of a silent park.
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(RPC_CONNECT_TIMEOUT)
+        .timeout(RPC_REQUEST_TIMEOUT)
+        .build()
+        .context("Failed to build the trading chain RPC HTTP client")?;
+    // Same heuristic ClientBuilder::http applies, so local nodes keep
+    // alloy's faster polling defaults.
+    let is_local = alloy::transports::utils::guess_local_url(trading_chain.rpc_url.as_str());
+    let transport =
+        alloy::transports::http::Http::with_client(http_client, trading_chain.rpc_url.clone());
     let rpc_client = ClientBuilder::default()
         .layer(RpcTelemetryLayer::new(telemetry.clone()))
-        .http(trading_chain.rpc_url.clone());
+        .transport(transport, is_local);
     let provider = ProviderBuilder::new().connect_client(rpc_client);
 
     // Spawn the writer before returning the sender: the executor, RPC layer,

@@ -636,6 +636,24 @@ WorkerBuilder::new(name)
   `perform()` returns `Err` and rescheduled onto their own queue (see the
   backpressure section above), so they neither consume the retry budget nor
   reach `calculate_status`.
+- **`Job::PERFORM_TIMEOUT` (RAI-2218).** `work()` runs `perform()` inside
+  `tokio::time::timeout` bounded by the job's `PERFORM_TIMEOUT` (30 min default;
+  `BackfillRange` overrides to 2h for long catch-up ranges). A `perform()`
+  future that never resolves -- e.g. an external await against an endpoint that
+  accepts the connection and never responds -- otherwise parks the
+  single-concurrency worker forever with no error, no retry, and no
+  `on_terminal_failure` stop: neither the retry layer nor the supervisor ever
+  sees it. The bound converts the hang into a `JobError` carrying a
+  `PerformTimeout` source, which retries like any other failure and, on
+  exhaustion, reaches the worker's terminal path. This is a backstop: the
+  primary defense is that every external HTTP client (trading RPC transport,
+  broker, tokenization, bridge, Turnkey) carries its own request timeout.
+  `PERFORM_TIMEOUT` is an `Option`, and several money-moving jobs set `None` to
+  opt out entirely: dropping their future mid-phase (e.g. after an on-chain send
+  broadcasts but before the aggregate persists it) would double-drive real money
+  on retry, so they rely on their own phase-aware deadlines instead. A new `Job`
+  impl must decide this deliberately -- grep the impls that set `None` for the
+  current opt-outs and their reasons.
 - **No circuit breaker (RAI-1495).** Supervised workers do NOT install Apalis'
   `CircuitBreakerService` layer -- neither does `build_best_effort_worker!`,
   which never had one. Previously `build_supervised_worker!` did

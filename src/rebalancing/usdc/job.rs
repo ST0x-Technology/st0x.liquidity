@@ -610,6 +610,17 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
     type Error = TransferUsdcToHedgingJobError;
 
     const WORKER_NAME: &'static str = "transfer-usdc-to-hedging-worker";
+    /// No perform-level bound (`None`): `perform` already wraps
+    /// `resume_base_to_alpaca` in its own `tokio::time::timeout(ctx.timeout)`
+    /// (the configured `transfer_attempt_timeout`, 1h default) with a
+    /// controlled `handle_hedging_timeout_redrive` that adopts the persisted
+    /// `pending_burn_tx` rather than reburning. That config-driven internal
+    /// timeout is the single source of truth for how long an attempt may run;
+    /// a hardcoded outer bound would preempt it (and preempt it wrongly if the
+    /// config is raised), replacing the controlled redrive with a generic
+    /// `PerformTimeout`. Actual network hangs are bounded by the HTTP/RPC
+    /// transport timeouts.
+    const PERFORM_TIMEOUT: Option<std::time::Duration> = None;
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind =
@@ -1194,6 +1205,17 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
     type Error = TransferUsdcToMarketMakingJobError;
 
     const WORKER_NAME: &'static str = "transfer-usdc-to-market-making-worker";
+    /// No perform-level bound (`None`): the `resume_alpaca_to_base` handler
+    /// passes through the broker `Converting` leg, which has no safe re-entry
+    /// if the future is dropped mid-flight. `perform_bounded` dropping it after
+    /// a timeout would leave the aggregate `Converting`; the retry then emits
+    /// `FailConversion` without confirming the broker order, releasing the
+    /// in-flight guard while the order may still fill -- a double conversion of
+    /// real funds. The handler is instead bounded by its own phase-aware
+    /// deadlines (conversion order poll, attestation redrive) and by the
+    /// bounded HTTP transports; a phase-gated burn-leg timeout is the tracked
+    /// follow-up. See the `perform` doc below.
+    const PERFORM_TIMEOUT: Option<std::time::Duration> = None;
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind =
@@ -1207,19 +1229,22 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
         &self,
         ctx: &TransferUsdcToMarketMakingCtx,
     ) -> Result<Self::Output, Self::Error> {
-        // No per-attempt timeout here unlike the hedging direction. The
-        // AlpacaToBase resume can pass through a long-running broker Converting
-        // leg with no safe re-entry path if interrupted (unlike BaseToAlpaca
-        // which has resume_converting recovery). The burn-revert-redrive path
-        // below is the correct self-heal mechanism for the incident this PR
-        // targets.
+        // No perform-level timeout (`PERFORM_TIMEOUT` is `None`; see the const
+        // doc) unlike the hedging direction. The AlpacaToBase resume can pass
+        // through the broker `Converting` leg, which has no safe re-entry if
+        // interrupted (unlike BaseToAlpaca, which has resume_converting
+        // recovery): dropping the future there would strand the aggregate
+        // `Converting`, and the retry would `FailConversion` without confirming
+        // the broker order, releasing the guard while the order may still fill.
+        // The burn-revert-redrive path below is the self-heal mechanism for the
+        // incident this PR targets.
         //
-        // KNOWN LIMITATION: A wedged (not erroring) RPC during resume of the burn
-        // or attestation phase will stall this worker indefinitely with no
-        // per-attempt timeout bound. The burn-revert redrive above handles the case
-        // where the burn RETURNS a revert error; it does not handle a hung RPC that
-        // never returns. A burn-leg-only timeout (gated to post-Converting stages
-        // where re-entry is safe) is a follow-up.
+        // A wedged (not erroring) RPC during resume no longer stalls the worker
+        // indefinitely: the trading-chain RPC transport and the Alpaca HTTP
+        // clients now carry request timeouts (RAI-2218), so a dead call surfaces
+        // as an `Err` that the redrive/retry paths handle. A phase-gated
+        // perform-level timeout (safe only post-`Converting`) remains a
+        // follow-up; it is deliberately not the blanket bound here.
         let result = ctx
             .transfer
             .resume_alpaca_to_base(&self.id, self.amount)
@@ -4187,6 +4212,40 @@ mod tests {
         assert!(
             matches!(error, TransferUsdcToMarketMakingJobError::Transfer(_)),
             "perform must propagate the resume failure as a Transfer error, got {error:?}",
+        );
+    }
+
+    /// Regression guard for the cancellation-safety of the `Converting` leg:
+    /// `TransferUsdcToMarketMaking` must keep `PERFORM_TIMEOUT = None` so the
+    /// generic `perform_bounded` never drops `resume_alpaca_to_base` mid-flight.
+    /// A dropped `Converting` future strands the aggregate, and the retry would
+    /// `FailConversion` without confirming the broker order, releasing the
+    /// in-flight guard while the order may still fill -- a double conversion of
+    /// real funds. Any future edit that imposes a bound here must first make the
+    /// `Converting` leg re-entry-safe (place-then-commit the broker order).
+    #[test]
+    fn market_making_job_opts_out_of_perform_timeout() {
+        assert_eq!(
+            <TransferUsdcToMarketMaking as Job<TransferUsdcToMarketMakingCtx>>::PERFORM_TIMEOUT,
+            None,
+            "TransferUsdcToMarketMaking must not be perform-bounded: its Converting leg \
+             has no safe re-entry if the future is dropped mid-flight",
+        );
+    }
+
+    /// Regression guard: `TransferUsdcToHedging` must keep `PERFORM_TIMEOUT =
+    /// None` so the generic `perform_bounded` never preempts its own internal
+    /// `tokio::time::timeout(ctx.timeout)` and the controlled
+    /// `handle_hedging_timeout_redrive`. A hardcoded outer bound below the
+    /// configured `transfer_attempt_timeout` would fire first and replace the
+    /// redrive (which adopts the persisted burn) with a generic failure.
+    #[test]
+    fn hedging_job_opts_out_of_perform_timeout() {
+        assert_eq!(
+            <TransferUsdcToHedging as Job<TransferUsdcToHedgingCtx>>::PERFORM_TIMEOUT,
+            None,
+            "TransferUsdcToHedging owns its config-driven internal per-attempt timeout; \
+             the perform-level bound must stay None so it cannot preempt that",
         );
     }
 

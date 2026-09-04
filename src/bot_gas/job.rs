@@ -278,6 +278,8 @@ impl Job<RecordBotGasReceiptCostCtx> for RecordBotGasReceiptCost {
     type Error = RecordBotGasReceiptCostError;
 
     const WORKER_NAME: &'static str = "bot-gas-receipt-cost-worker";
+    const PERFORM_TIMEOUT: Option<std::time::Duration> =
+        Some(crate::conductor::job::DEFAULT_PERFORM_TIMEOUT);
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind =
