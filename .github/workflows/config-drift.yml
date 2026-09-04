@@ -1,0 +1,89 @@
+name: config-drift
+
+# The runtime configs the deployed bots actually mount live in T0Trade/
+# t0.devops (config-as-data), while images roll automatically on merges
+# here, so no single PR spans both repos. This gate parses those live
+# TOMLs with THIS ref's config schema (`validate-config` without
+# `--secrets`), so a schema change that would crash the deployed bot fails
+# the PR that introduces it instead of crash-looping the box after a green
+# merge (2026-09-01: staging was down for hours on a missing required
+# field, with every deploy signal green).
+#
+# A required new field must therefore land tolerantly (optional/defaulted)
+# here first, then get its t0.devops config line, then tighten -- the
+# ordering the t0.devops config header documents; this gate turns that
+# convention into a check.
+#
+# Needs the T0_DEVOPS_READ_TOKEN repository secret: a fine-grained PAT
+# with read-only Contents access to T0Trade/t0.devops. Fork PRs have no
+# secrets, so the job skips there rather than failing closed.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/master' && github.sha || ''}}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: parse live t0.devops configs with this schema
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          persist-credentials: false
+
+      - name: Check out the live runtime configs
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          repository: T0Trade/t0.devops
+          token: ${{ secrets.T0_DEVOPS_READ_TOKEN }}
+          path: t0.devops
+          persist-credentials: false
+          sparse-checkout: |
+            terraform/staging-liquidity/st0x-hedge.toml
+            terraform/production-liquidity/st0x-hedge.toml
+          sparse-checkout-cone-mode: false
+
+      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34
+        with:
+          # Same pin as ci.yaml: 2.24-2.28 cannot resolve rainix's foundry
+          # input.
+          nix_version: "2.31.2"
+          nix_conf: |
+            accept-flake-config = true
+            fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17
+        continue-on-error: true
+        with:
+          name: rainlanguage
+          skipPush: true
+          useDaemon: false
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          prefix-key: rust-${{ github.workflow }}
+
+      - name: Parse both live configs
+        run: |
+          nix develop .#ci-backend -c bash -c "
+            set -euxo pipefail
+            cargo run --bin validate-config -- --config t0.devops/terraform/staging-liquidity/st0x-hedge.toml
+            cargo run --bin validate-config -- --config t0.devops/terraform/production-liquidity/st0x-hedge.toml
+          "
