@@ -883,6 +883,18 @@ placement:
   trading disabled. The value is 0 when every fill is hedged or in flight. The
   gauge reads the same uncovered-fill replay as the performance report's
   open-exposure pool, so the two views always agree.
+- Every operator page follows one message contract. The message names the
+  symbol, the session, the order ID when one exists, the machine reason, a human
+  detail, and the runbook section with the response
+  (`docs/overnight-runbook.md#<section>`). One formatting helper builds all
+  pages, so no alert can drop a contract field.
+- Four `[broker]` knobs set the overnight alert thresholds:
+  `overnight_stale_quote_alert_scans`, `overnight_halted_order_alert_secs`,
+  `overnight_reprice_alert_count`, and `overnight_max_exposure_age_secs`. They
+  form one set: configure all four or none, and all four become required once
+  any asset enables overnight counter-trading. A partial set fails startup, so a
+  typo cannot silently disarm one alert. Zero values fail startup even while
+  every asset is disabled.
 - `close_flatten_outcomes_total{symbol,direction,outcome}` records terminal
   broker-state dispatches for close-flatten placements, with `outcome` equal to
   `filled`, `cancelled`, or `failed`. Evaluate attempt fill rate per

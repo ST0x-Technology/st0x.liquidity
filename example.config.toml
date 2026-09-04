@@ -59,6 +59,21 @@ close_flatten_cross_max_bps = 400
 # Reprice cadence (seconds) for unfilled overnight limit orders. Same
 # requiredness as overnight_max_quote_age_secs; must be nonzero.
 # overnight_reprice_timeout_secs = 120
+# Overnight operator-alert thresholds. The four knobs form one set: configure
+# all four or none, and all four become required once any asset enables
+# overnight counter-trading. Each must be nonzero.
+# Consecutive scans a symbol may defer on a stale/missing overnight quote
+# while exposure waits, before the operator is paged.
+# overnight_stale_quote_alert_scans = 5
+# Age (seconds) a live overnight order on a halted asset may reach before
+# the operator is paged.
+# overnight_halted_order_alert_secs = 900
+# Cancel/reprice count for one symbol within one overnight session beyond
+# which the operator is paged.
+# overnight_reprice_alert_count = 10
+# Maximum tolerated age (seconds) of unhedged exposure before the operator
+# is paged.
+# overnight_max_exposure_age_secs = 1800
 
 [broker.travel_rule]
 beneficiary_entity_name = "Acme Corp"

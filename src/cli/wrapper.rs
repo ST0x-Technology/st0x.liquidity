@@ -293,6 +293,7 @@ mod tests {
             overnight_max_quote_age_secs: None,
             overnight_slippage_bps: None,
             overnight_reprice_timeout_secs: None,
+            overnight_alert_thresholds: None,
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,

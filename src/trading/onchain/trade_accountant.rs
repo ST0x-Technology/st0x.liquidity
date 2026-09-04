@@ -674,6 +674,17 @@ impl DeadLetterReason {
             Self::OvernightQuoteFetch => "overnight_quote_fetch",
         }
     }
+
+    /// The runbook section that tells the operator how to respond to this
+    /// page. Anchors into `docs/overnight-runbook.md` (RAI-1956); section
+    /// names are coordinated with that document.
+    pub(crate) const fn runbook_anchor(self) -> &'static str {
+        match self {
+            Self::SymbolScoped(_) => "stale-exposure",
+            Self::BackpressureExhausted => "broker-outages",
+            Self::OvernightQuoteFetch => "entitlement-checks",
+        }
+    }
 }
 
 /// Where a [`TradeAccountingError`] sits relative to the position claim.
