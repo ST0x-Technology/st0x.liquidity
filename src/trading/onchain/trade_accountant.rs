@@ -1761,6 +1761,122 @@ mod tests {
         assert_eq!(order_count, 1, "the hedge order must be placed");
     }
 
+    /// Hedge sizing reads the fill chain's asset table: Ethereum caps COIN at
+    /// 0.01 shares while the primary (Base) table has no cap, so an Ethereum
+    /// fill above the cap must place a 0.01-share hedge, not the full amount.
+    #[tokio::test]
+    async fn hedge_sizing_reads_the_fill_chains_asset_table() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let asserter = Asserter::new();
+
+        let usdc_token = st0x_evm::USDC_ETHEREUM;
+        let equity_token = address!("0x5CdA0E1cA4ce2Af96315F7F8963c85399c172204");
+        let operator = address!("0x8b8b6e0507c125934c6129563f48e48c66f86475");
+
+        let inventory_trade = InventoryTrade {
+            deposit: OperatorDeposit {
+                operator,
+                token: usdc_token,
+                vaultId: alloy::primitives::b256!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000004"
+                ),
+                amount: alloy::primitives::uint!(5_000_000_U256),
+            },
+            withdraw: OperatorWithdraw {
+                operator,
+                token: equity_token,
+                vaultId: alloy::primitives::b256!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000003"
+                ),
+                amount: alloy::primitives::uint!(34_172_366_621_067_031_U256),
+            },
+        };
+        let mut log = crate::test_utils::create_log(0x97);
+        log.transaction_hash = Some(alloy::primitives::fixed_bytes!(
+            "0xe13a11de734768f08a9c1ef66e8de3bcb9072f8cdabce9f1d819e1ae9909d4b9"
+        ));
+        log.block_number = Some(48_030_415);
+        log.block_timestamp = Some(1_782_850_177);
+        let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
+        let job = AccountForDexTrade {
+            trade: EmittedOnChain::from_log(Chain::Ethereum, event, &log).unwrap(),
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+
+        let assets_with = |operational_limit| ChainAssets {
+            equities: ChainEquities {
+                operational_limit: None,
+                symbols: HashMap::from([(
+                    Symbol::new("COIN").unwrap(),
+                    ChainEquityAsset {
+                        tokenized_equity: Address::ZERO,
+                        tokenized_equity_derivative: equity_token,
+                        vault_ids: Vec::new(),
+                        trading: OperationMode::Enabled,
+                        rebalancing: OperationMode::Disabled,
+                        wrapped_equity_recovery: OperationMode::Disabled,
+                        operational_limit,
+                    },
+                )]),
+            },
+            cash: None,
+        };
+        ctx.chains.primary_mut().assets = assets_with(None);
+        let mut ethereum = ctx.chains.primary().clone();
+        ethereum.chain = Chain::Ethereum;
+        ethereum.assets = assets_with(Some(
+            Positive::new(FractionalShares::new(float!(0.01))).unwrap(),
+        ));
+
+        let cache = SymbolCache::default();
+        cache.preload_symbol(Chain::Ethereum, usdc_token, "USDC");
+        cache.preload_symbol(Chain::Ethereum, equity_token, "wtCOIN");
+
+        let mut accountant_ctx = build_test_accountant_ctx(
+            pool.clone(),
+            &apalis_pool,
+            ctx,
+            cache,
+            provider.clone(),
+            executor,
+            ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(0.01))).unwrap()),
+        )
+        .await;
+        accountant_ctx.chains.insert(
+            Chain::Ethereum,
+            ChainAccounting {
+                contracts: crate::onchain::raindex_contracts(&ethereum),
+                trading: ethereum,
+                evm: st0x_evm::ReadOnlyEvm::new(provider),
+            },
+        );
+
+        job.perform(&accountant_ctx).await.unwrap();
+
+        let (payload,): (String,) = sqlx::query_as(
+            "SELECT payload FROM events WHERE event_type = 'OffchainOrderEvent::Placed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let placed: crate::offchain::order::OffchainOrderEvent =
+            serde_json::from_str(&payload).unwrap();
+        let crate::offchain::order::OffchainOrderEvent::Placed { shares, .. } = placed else {
+            panic!("expected a Placed event, got {placed:?}");
+        };
+        assert_eq!(
+            shares,
+            Positive::new(FractionalShares::new(float!(0.01))).unwrap(),
+            "the hedge must be capped by Ethereum's operational limit"
+        );
+    }
+
     /// Executor whose `preflight_counter_trade` always fails with a
     /// classified broker rate-limit (429) -- `MockExecutor`'s errors are all
     /// `ExecutionError`, which is never classifiable, so a real `Executor`
