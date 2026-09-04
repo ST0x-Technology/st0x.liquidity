@@ -1940,6 +1940,17 @@ fn issuance_ctx(
         (None, None) => return Err(CtxError::MissingIssuanceBaseUrl),
     };
 
+    // The api_key rides along as a header on every issuance request, so a
+    // plaintext scheme exposes it to anyone on the path. Warn rather than
+    // refuse: local/e2e endpoints are legitimately plain HTTP.
+    if base_url.scheme() == "http" {
+        startup_notices.push(StartupNotice::warning(format!(
+            "[issuance] base_url {base_url} uses plain HTTP; the api_key is sent \
+             with every request and can be captured on the wire -- use HTTPS for \
+             any non-local endpoint",
+        )));
+    }
+
     Ok(IssuanceStatusCtx {
         base_url,
         api_key: IssuanceApiKey(secrets.api_key),
@@ -7474,7 +7485,7 @@ mod tests {
         let ctx = issuance_ctx(
             None,
             Some(IssuanceSecretsToml {
-                base_url: Some(Url::parse("http://issuance.test:8000").unwrap()),
+                base_url: Some(Url::parse("https://issuance.test:8000").unwrap()),
                 api_key: "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
                     .to_owned(),
             }),
@@ -7484,7 +7495,7 @@ mod tests {
 
         assert_eq!(
             ctx.base_url,
-            Url::parse("http://issuance.test:8000").unwrap(),
+            Url::parse("https://issuance.test:8000").unwrap(),
             "base_url must come from the (deprecated) issuance secrets location"
         );
         assert_eq!(
@@ -7498,6 +7509,62 @@ mod tests {
             ctx.api_key.header_value(),
             "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
             "header_value must be bare lowercase hex (no 0x prefix)"
+        );
+    }
+
+    /// The api_key rides as a header on every issuance request, so a plain
+    /// HTTP base_url exposes it on the wire. Local and e2e endpoints are
+    /// legitimately HTTP, which is why this is a startup warning rather than
+    /// a refusal.
+    #[test]
+    fn issuance_ctx_warns_on_plain_http_base_url() {
+        let mut notices = Vec::new();
+        issuance_ctx(
+            Some(IssuanceConfig {
+                base_url: Url::parse("http://issuance.internal:8000").unwrap(),
+            }),
+            Some(IssuanceSecretsToml {
+                base_url: None,
+                api_key: "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+                    .to_owned(),
+            }),
+            &mut notices,
+        )
+        .expect("an http base_url must still assemble the ctx");
+
+        assert_eq!(
+            notices.len(),
+            1,
+            "an http base_url must produce exactly the plaintext-scheme notice"
+        );
+        assert_eq!(notices[0].level, StartupNoticeLevel::Warn);
+        assert!(
+            notices[0].message.contains("plain HTTP"),
+            "the notice must name the plaintext scheme, got: {}",
+            notices[0].message
+        );
+    }
+
+    #[test]
+    fn issuance_ctx_is_quiet_on_https_base_url() {
+        let mut notices = Vec::new();
+        issuance_ctx(
+            Some(IssuanceConfig {
+                base_url: Url::parse("https://issuance.internal:8000").unwrap(),
+            }),
+            Some(IssuanceSecretsToml {
+                base_url: None,
+                api_key: "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+                    .to_owned(),
+            }),
+            &mut notices,
+        )
+        .expect("an https base_url must assemble the ctx");
+
+        assert!(
+            notices.is_empty(),
+            "an https base_url in its preferred config location needs no \
+             notice, got: {notices:?}"
         );
     }
 

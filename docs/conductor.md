@@ -728,8 +728,9 @@ notifier. Firing the alert as a detached `tokio::spawn` from inside that
 callback would race process teardown: `ctx.stop()` and the resulting process
 exit can complete before the spawned send does, silently dropping it in the
 common case. `wait_for_completion` is async and runs strictly before the process
-returns, so awaiting the alert there (with a bounded timeout) is what actually
-guarantees delivery-or-timeout instead of delivery-or-silently-lost.
+returns, so awaiting the alert there (with a bounded timeout) guarantees log
+emission-or-timeout; downstream Cloud Logging/Grafana delivery remains outside
+the process.
 
 **Blast radius: this restores the existing fail-stop design; it does not invent
 universal self-recovery.** `on_terminal_failure`'s `ctx.stop()` + non-zero
