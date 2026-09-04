@@ -569,6 +569,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_number: 1,
+                    block_hash: None,
                     block_timestamp: at,
                     filled_at: at,
                 },

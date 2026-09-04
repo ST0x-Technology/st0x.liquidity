@@ -6,7 +6,7 @@
 //!
 //! [`AccountForDexTrade`]: super::trade_accountant::AccountForDexTrade
 
-use alloy::primitives::TxHash;
+use alloy::primitives::{B256, TxHash};
 use alloy::rpc::types::Log;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,16 @@ pub struct EmittedOnChain<Event> {
     pub tx_hash: TxHash,
     pub log_index: u64,
     pub block_number: u64,
+    /// Hash of the block this event was included in. Identifies which fork
+    /// a confirmed `(tx_hash, log_index)` came from, so a later replay against
+    /// a different fork can be detected as a reorg rather than mistaken for a
+    /// duplicate. `None` when the source log carried no block hash (pending
+    /// logs, reconstructed logs).
+    ///
+    /// `#[serde(default)]` keeps in-flight jobs serialized before fork tracking
+    /// readable; those jobs correctly have no known block hash.
+    #[serde(default)]
+    pub block_hash: Option<B256>,
     pub block_timestamp: Option<DateTime<Utc>>,
 }
 
@@ -63,6 +73,7 @@ impl<Event> EmittedOnChain<Event> {
             tx_hash,
             log_index,
             block_number,
+            block_hash: log.block_hash,
             block_timestamp,
         })
     }
@@ -101,7 +112,7 @@ impl fmt::Display for RequiredField {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, LogData, fixed_bytes};
+    use alloy::primitives::{Address, LogData, b256, fixed_bytes};
     use alloy::rpc::types::Log;
 
     use super::*;
@@ -112,7 +123,9 @@ mod tests {
                 address: Address::ZERO,
                 data: LogData::empty(),
             },
-            block_hash: None,
+            block_hash: Some(b256!(
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            )),
             block_number: Some(42),
             block_timestamp: Some(1_700_000_000),
             transaction_hash: Some(fixed_bytes!(
@@ -152,10 +165,21 @@ mod tests {
         assert_eq!(included.tx_hash, log.transaction_hash.unwrap());
         assert_eq!(included.log_index, 7);
         assert_eq!(included.block_number, 42);
+        assert_eq!(included.block_hash, log.block_hash);
         assert_eq!(
             included.block_timestamp,
             DateTime::from_timestamp(1_700_000_000, 0),
         );
+    }
+
+    #[test]
+    fn from_log_handles_missing_block_hash() {
+        let mut log = valid_log();
+        log.block_hash = None;
+
+        let included = EmittedOnChain::from_log(Chain::Base, "event", &log).unwrap();
+
+        assert_eq!(included.block_hash, None);
     }
 
     #[test]
@@ -230,5 +254,24 @@ mod tests {
         assert_eq!(RequiredField::TxHash.to_string(), "transaction_hash");
         assert_eq!(RequiredField::LogIndex.to_string(), "log_index");
         assert_eq!(RequiredField::BlockNumber.to_string(), "block_number");
+    }
+
+    /// Apalis jobs serialized before `block_hash` existed (in-flight
+    /// `AccountForDexTrade` payloads during a deploy) must still deserialize,
+    /// with the absent field defaulting to `None` rather than failing the job.
+    #[test]
+    fn emitted_on_chain_without_block_hash_deserializes_to_none() {
+        let json = serde_json::json!({
+            "event": null,
+            "tx_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "log_index": 7,
+            "block_number": 42,
+            "block_timestamp": null,
+            // block_hash intentionally absent
+        });
+
+        let parsed: EmittedOnChain<()> = serde_json::from_value(json).unwrap();
+
+        assert_eq!(parsed.block_hash, None);
     }
 }
