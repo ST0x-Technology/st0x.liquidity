@@ -179,20 +179,6 @@ pub(crate) struct HedgeCtx {
     pub(crate) alerted_dead_letters: Arc<Mutex<HashSet<(Symbol, DeadLetterReason)>>>,
 }
 
-/// Pages the operator once per `(symbol, reason)` for a hedge this process
-/// abandoned, mirroring the USDC rebalancer's dead-letter alert. Delivery
-/// failure is logged and swallowed: the abandonment already happened, and the
-/// counter plus `error!` remain.
-///
-/// The pair is reserved before delivery so the hedge and position-scan workers
-/// cannot both send it. A failed or timed-out delivery releases the reservation
-/// for the next scan; a successful one keeps it latched until the symbol places.
-///
-/// Takes the notifier and the dedup set rather than a `HedgeCtx` because the
-/// position scan pages through the same mechanism for a buy it drops before a
-/// hedge job exists (`position_check.rs`). Both share one set, so a symbol
-/// paged by either path is silenced by the other until one of its hedges
-/// reaches the broker.
 /// Formats one operator page under the alert contract (SPEC "Observability"):
 /// the symbol, the session, the order ID when one exists, the machine
 /// reason, the human detail, and the runbook section holding the response.
@@ -215,34 +201,50 @@ pub(crate) fn operator_alert_message(
     )
 }
 
-pub(crate) async fn alert_dead_letter(
+/// Pages the operator once per `(symbol, reason)`, mirroring the USDC
+/// rebalancer's dead-letter alert. Delivery failure is logged and swallowed:
+/// the condition already happened, and the counter plus `error!` remain.
+///
+/// The pair is reserved before delivery so concurrent workers cannot both
+/// send it. A failed or timed-out delivery releases the reservation for the
+/// next scan; a successful one keeps it latched until the caller's release
+/// path clears it (a placed hedge for dead letters, a cleared condition for
+/// the scan's operator alerts).
+///
+/// Takes the notifier and the dedup set rather than a ctx type because the
+/// hedge job and the position scan share the dead-letter set, while the
+/// scan's `OperatorAlertReason` pages use their own set with their own
+/// release rules.
+pub(crate) async fn page_operator_once<Reason>(
     notifier: &dyn Notifier,
-    alerted_dead_letters: &Mutex<HashSet<(Symbol, DeadLetterReason)>>,
+    paged: &Mutex<HashSet<(Symbol, Reason)>>,
     symbol: &Symbol,
-    reason: DeadLetterReason,
+    reason: Reason,
     message: &str,
-) {
+) where
+    Reason: Clone + Eq + std::hash::Hash + Send,
+{
     let key = (symbol.clone(), reason);
-    if !alerted_dead_letters.lock().await.insert(key.clone()) {
+    if !paged.lock().await.insert(key.clone()) {
         return;
     }
 
     match tokio::time::timeout(DEAD_LETTER_ALERT_TIMEOUT, notifier.notify(message)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            alerted_dead_letters.lock().await.remove(&key);
+            paged.lock().await.remove(&key);
             warn!(
                 target: "hedge", ?error, %symbol,
-                "Failed to deliver hedge dead-letter alert; the next scan re-attempts it"
+                "Failed to deliver operator page; the next scan re-attempts it"
             );
         }
         Err(_elapsed) => {
-            alerted_dead_letters.lock().await.remove(&key);
+            paged.lock().await.remove(&key);
             warn!(
                 target: "hedge",
                 %symbol,
                 timeout_secs = DEAD_LETTER_ALERT_TIMEOUT.as_secs(),
-                "Timed out delivering hedge dead-letter alert; the next scan re-attempts it"
+                "Timed out delivering operator page; the next scan re-attempts it"
             );
         }
     }
@@ -1555,7 +1557,7 @@ impl PlaceHedge {
                      -- treat as a structurally-dead Alpaca integration needing manual \
                      reconciliation"
                 );
-                alert_dead_letter(
+                page_operator_once(
                     ctx.notifier.as_ref(),
                     &ctx.alerted_dead_letters,
                     &self.symbol,
@@ -1833,7 +1835,7 @@ impl PlaceHedge {
              this hedge instead of exiting the process -- CheckPositions will re-enqueue on \
              its next scan"
         );
-        alert_dead_letter(
+        page_operator_once(
             ctx.notifier.as_ref(),
             &ctx.alerted_dead_letters,
             &self.symbol,
@@ -2521,10 +2523,10 @@ mod tests {
         let reason = DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteFetch);
 
         tokio::join!(
-            alert_dead_letter(&notifier, &alerted, &symbol, reason, "first"),
+            page_operator_once(&notifier, &alerted, &symbol, reason, "first"),
             async {
                 notifier.started.notified().await;
-                alert_dead_letter(&notifier, &alerted, &symbol, reason, "second").await;
+                page_operator_once(&notifier, &alerted, &symbol, reason, "second").await;
                 notifier.release.notify_one();
             }
         );
@@ -2549,7 +2551,7 @@ mod tests {
         let key = (symbol.clone(), reason);
 
         tokio::join!(
-            alert_dead_letter(&notifier, &alerted, &symbol, reason, "page"),
+            page_operator_once(&notifier, &alerted, &symbol, reason, "page"),
             async {
                 notifier.started.notified().await;
                 assert!(
@@ -2574,7 +2576,7 @@ mod tests {
         let reason = DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteFetch);
 
         for _ in 0..2 {
-            alert_dead_letter(&notifier, &alerted, &symbol, reason, "page").await;
+            page_operator_once(&notifier, &alerted, &symbol, reason, "page").await;
         }
 
         assert_eq!(

@@ -895,6 +895,18 @@ placement:
   any asset enables overnight counter-trading. A partial set fails startup, so a
   typo cannot silently disarm one alert. Zero values fail startup even while
   every asset is disabled.
+- The operator alert catalog has six pages. Two come from existing paths: a
+  failed asset-eligibility sync alerts from the sync monitor, and a
+  non-retryable overnight quote-fetch failure (an entitlement rejection above
+  all) pages through the dead-letter path. Four are scan conditions gated by the
+  threshold knobs: a stale or missing overnight reference for N consecutive
+  scans while a buy waits; a live overnight order on a halted asset past the
+  configured age; more reprice cancellations for one symbol than allowed within
+  one overnight session; and unhedged exposure older than the configured
+  maximum. Each threshold page is deduped per `(symbol, reason)` and releases
+  when its condition clears, so a recurrence pages again. The reprice count
+  resets on the first non-overnight scan tick, which scopes it to one session
+  instance.
 - `close_flatten_outcomes_total{symbol,direction,outcome}` records terminal
   broker-state dispatches for close-flatten placements, with `outcome` equal to
   `filled`, `cancelled`, or `failed`. Evaluate attempt fill rate per
