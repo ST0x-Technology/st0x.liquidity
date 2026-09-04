@@ -117,9 +117,7 @@ default chain, or is removed. Zero or multiple primary claimants fail startup
 with a named error. Chains without a trading table are **transport** chains
 (RPC + confirmations only, e.g. Ethereum while it only carries CCTP transfers).
 Watch settings are per chain: poll interval, ingestion cutoff, asset tables with
-per-chain enable/disable flags. Startup verifies every watched chain (chain-id
-identity, cutoff support) and any failure is fatal; degraded per-chain startup
-is deferred to the chain-disable work.
+per-chain enable/disable flags.
 
 ##### Shared-Inventory Settlement
 
@@ -284,18 +282,16 @@ excellent async ecosystem for handling concurrent trading flows.
 #### Raindex Event Monitor
 
 - Continuous HTTP `eth_getLogs` polling over a single transport -- no WebSocket.
-  One monitor instance runs per watched chain, each with its own provider,
-  per-chain poll interval (`order_fill_poll_interval_secs`, required on every
-  watched chain's trading table; no global default), checkpoint keyed
-  `(chain, orderbook)`, and scan queue -- one chain's backlog or outage never
-  blocks another chain's ingestion. Every poll interval the monitor enqueues a
-  backfill range covering the blocks since the persisted checkpoint, capped at
-  the configured ingestion cutoff block (must be explicitly configured;
-  recommended value: `safe`, i.e. `eth_getBlockByNumber("safe")`); the backfill
-  worker fetches the `Clear` and `TakeOrder` logs for the arbitrageur's owner
-  address and advances the checkpoint only on success. `required_confirmations`
-  governs transaction-submission paths only and does not affect fill ingestion.
-  The cutoff tag is configured via `ingestion_cutoff` (required field):
+  The poll interval is per chain (`order_fill_poll_interval_secs`, required on
+  every watched chain's trading table; no global default). Every poll interval
+  the monitor enqueues a backfill range covering the blocks since the persisted
+  checkpoint, capped at the configured ingestion cutoff block (must be
+  explicitly configured; recommended value: `safe`, i.e.
+  `eth_getBlockByNumber("safe")`); the backfill worker fetches the `Clear` and
+  `TakeOrder` logs for the arbitrageur's owner address and advances the
+  checkpoint only on success. `required_confirmations` governs
+  transaction-submission paths only and does not affect fill ingestion. The
+  cutoff tag is configured via `ingestion_cutoff` (required field):
   - **`safe` (recommended):** On OP Stack chains like Base, `safe` is the latest
     L2 block whose sequencer batch has been posted to L1 (not yet L1-finalized).
     Cuts hedging lag from ~20 min to ~seconds. Tradeoff: a sufficiently deep L1
@@ -1231,14 +1227,12 @@ event position).
   authentication
 - Graceful shutdown handling to complete in-flight trades before stopping
 - Per-asset market enable/disable: individual equity markets can be disabled via
-  the `enabled` flag in the equity config, per chain. Disabled assets accumulate
-  position changes but do not trigger counter-trades or rebalancing operations.
-  When re-enabled (`enabled = true`), the system resumes both executing
-  accumulated counter-trade positions and evaluating rebalancing triggers for
-  any resulting inventory imbalances (same semantics as market close/open
-  behavior). A fill landing on a disabled asset raises a deduplicated critical
-  operational alert (once per process per symbol): the delta exposure it
-  accumulates is deliberate, but never silent
+  `trading = "disabled"` on the asset's entry in its chain's assets table.
+  Disabled assets accumulate position changes but do not trigger counter-trades
+  or rebalancing operations. When re-enabled (`trading = "enabled"`), the system
+  resumes both executing accumulated counter-trade positions and evaluating
+  rebalancing triggers for any resulting inventory imbalances (same semantics as
+  market close/open behavior)
 
 ### Infrastructure and Deployment
 
