@@ -4,6 +4,11 @@
 -- (the only chain ever watched) and is rewritten in the same transaction as
 -- the table rebuild.
 --
+-- Why two migrations: this one keeps a rollback window to the pre-per-chain
+-- binary so it can deploy on its own; the cleanup migration closes that
+-- window in the same change that first makes a second chain configurable,
+-- which is the first point the schema must allow one.
+--
 -- The UNIQUE(orderbook) shadow index preserves one release of rollback: a
 -- rolled-back (pre-per-chain) binary upserts with ON CONFLICT(orderbook),
 -- which needs a unique constraint on that column to resolve, and omits the
@@ -14,6 +19,12 @@
 -- ever watched: the cleanup migration ships together with the capability
 -- grant that first admits a non-Base watched chain, keeping rollback
 -- protection exactly as long as the deployment is single-chain.
+--
+-- The DEFAULT is a rollback shim only, never a fallback for live code: every
+-- write in this binary binds chain explicitly, since an unbound write would
+-- silently file a fill's checkpoint under Base (the same trap a reviewer
+-- caught on pnl_onchain_fill.chain). The cleanup migration drops the default
+-- and a test pins that a chain-less write is then refused.
 CREATE TABLE backfill_checkpoints_new (
     chain TEXT NOT NULL DEFAULT 'base',
     orderbook TEXT NOT NULL,
