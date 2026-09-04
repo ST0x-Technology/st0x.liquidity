@@ -4282,11 +4282,20 @@ skip the events that arrive, and failed USDC-transfer cleanups stamp
   wrong amount and mark the venue busy, freezing the very counter that resolves
   the divergence.
 
-Guard-skip starvation is observable: the view tracks consecutive guard-skipped
-Hedging snapshots (per symbol for equity, venue-level for cash) and logs a
-warning every five consecutive skips, so an ADR 0015 guard that starves a
-balance of broker truth surfaces at production log levels before the divergence
-machinery escalates. An applied snapshot resets the streak.
+The shared guard machinery is venue-aware. Equity suppression memberships and
+snapshot-skip streaks are keyed by `(venue, symbol)`; cash memberships and skip
+streaks are keyed by venue. A transfer is busy at both venues because it moves
+inventory between them, while an open hedge order or a fill applied after a
+broker read makes only the Hedging reading ambiguous. Suppression is read
+venue-agnostically: any engaged venue makes a transfer unsafe to size, and a
+matching poll at one venue cannot release another venue's membership.
+
+Guard-skip starvation is observable at both venues. The view logs a warning
+every five consecutive skipped equity snapshots for one `(venue, symbol)` and
+every five skipped cash snapshots for one venue; an applied snapshot resets only
+that streak. The active divergence detector and forced-reconcile commands remain
+Hedging-only. MarketMaking `OnchainEquity` and `OnchainUsdc` skip warnings are
+therefore operator signals, not claims that the onchain balance self-healed.
 
 The same machinery closes the restart-across-an-open-order window. The aggregate
 records every poll -- including mid-order broker readings the live view's guards
