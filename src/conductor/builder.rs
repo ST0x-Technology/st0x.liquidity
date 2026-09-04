@@ -227,7 +227,7 @@ fn configured_inventory_vaults(ctx: &Ctx) -> ConfiguredInventoryVaults {
 pub(crate) fn spawn<Prov, Exec>(
     context: ConductorCtx<Prov, Exec>,
     job_queue: DexTradeAccountingJobQueue,
-    backfill_queue: BackfillQueues,
+    backfill_queues: BackfillQueues,
     dashboard_trade_delivery_queue: DashboardTradeDeliveryJobQueue,
     dashboard_trade_delivery_ctx: Arc<DashboardTradeDeliveryCtx>,
     dashboard_trade_handoff_monitor: DashboardTradeHandoffMonitor,
@@ -558,7 +558,7 @@ where
                     what: "provider",
                 })?
         };
-        let queue = backfill_queue
+        let queue = backfill_queues
             .for_chain(chain)
             .ok_or(ConductorSpawnError::MissingWatchWiring {
                 chain,
@@ -657,7 +657,7 @@ where
         seed_vault_registry_ctx,
         job_queue,
         hedge_queue,
-        backfill_queue,
+        backfill_queues,
         dashboard_trade_delivery_queue,
         dashboard_trade_delivery_ctx,
         poll_status_queue,
@@ -728,7 +728,7 @@ where
     seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
     job_queue: DexTradeAccountingJobQueue,
     hedge_queue: HedgeJobQueue,
-    backfill_queue: BackfillQueues,
+    backfill_queues: BackfillQueues,
     dashboard_trade_delivery_queue: DashboardTradeDeliveryJobQueue,
     dashboard_trade_delivery_ctx: Arc<DashboardTradeDeliveryCtx>,
     poll_status_queue: PollOrderStatusJobQueue,
@@ -785,7 +785,7 @@ where
             seed_vault_registry_ctx,
             job_queue,
             hedge_queue,
-            backfill_queue,
+            backfill_queues,
             dashboard_trade_delivery_queue,
             dashboard_trade_delivery_ctx,
             poll_status_queue,
@@ -882,7 +882,7 @@ where
             // worker per watched chain, each on its own namespaced queue, so
             // one chain's scan backlog never occupies another chain's worker.
             let mut monitor = Monitor::new();
-            for (worker_chain, chain_queue) in backfill_queue.iter() {
+            for (worker_chain, chain_queue) in backfill_queues.iter() {
                 let chain_queue = chain_queue.clone();
                 let worker_chain = *worker_chain;
                 let accountant_ctx_for_backfill = accountant_ctx_for_backfill.clone();
