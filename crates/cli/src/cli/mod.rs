@@ -3078,8 +3078,8 @@ mod tests {
         // fixture-only `RequestMintAt` command through the aggregate's own
         // store -- never a raw `events` INSERT -- so the replay path folds
         // the exact event shapes/sequence the live system would produce.
-        // The default `MockTokenizer` accepts the request, so this emits
-        // both `MintRequested` and `MintAccepted`.
+        // Submit after persisting intent so the stream contains both
+        // `MintRequested` and `MintAccepted`.
         let store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .build(EquityTransferServices {
                 raindex: Arc::new(MockRaindex::new()),
@@ -3100,6 +3100,15 @@ mod tests {
                     quantity: float!(5),
                     wallet: Address::repeat_byte(0x11),
                     requested_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &IssuerRequestId(operation_id),
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: IssuerRequestId(operation_id),
                 },
             )
             .await

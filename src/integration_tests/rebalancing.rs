@@ -670,6 +670,8 @@ async fn equity_offchain_imbalance_triggers_mint() {
             .json_body(sample_pending_response(
                 "mint_int_test",
                 &job.issuer_request_id,
+                job.quantity,
+                signer.address(),
             ));
     });
 
@@ -680,6 +682,8 @@ async fn equity_offchain_imbalance_triggers_mint() {
             .json_body(json!([sample_completed_response(
                 "mint_int_test",
                 &job.issuer_request_id,
+                job.quantity,
+                signer.address(),
                 mint_tx_hash
             )]));
     });
@@ -926,8 +930,18 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     let job = fetch_pending_equity_redemption_job(&apalis_pool).await;
     assert_eq!(job.symbol, symbol);
 
+    let cleanup_services = EquityTransferServices {
+        raindex: Arc::new(MockRaindex::new()),
+        vault_lookup: Arc::new(MockVaultLookup::new()),
+        tokenizer: Arc::new(MockTokenizer::new()),
+        wrapper: Arc::new(MockWrapper::new()),
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+    };
     let ctx = TransferEquityToHedgingCtx {
         transfer: equity_transfer,
+        equity_in_progress: service.equity_in_progress.clone(),
+        redemption_store: Arc::new(test_store(pool.clone(), cleanup_services)),
         job_queue: TransferEquityToHedgingJobQueue::new(&apalis_pool),
     };
     Job::perform(&job, &ctx).await.unwrap();
@@ -1588,9 +1602,9 @@ async fn usdc_none_disables_usdc_rebalancing() {
 }
 
 /// Tests that when the Alpaca mint API returns an HTTP error, the
-/// `TokenizedEquityMint` aggregate returns an error without emitting any
-/// events. The job's perform propagates the pre-receipt failure (so apalis
-/// retries it), and no mint events appear in the event store.
+/// `TokenizedEquityMint` aggregate preserves the durable request intent and
+/// returns an error without recording provider acceptance. The job's perform
+/// propagates the pre-receipt failure so apalis retries through reconciliation.
 #[tokio::test]
 async fn mint_api_failure_produces_rejected_event() {
     let EquityTriggerFixture {
@@ -1695,9 +1709,10 @@ async fn mint_api_failure_produces_rejected_event() {
     }
     .to_string();
 
-    // When the mint API returns HTTP 500, the TokenizedEquityMint aggregate
-    // returns Err(RequestFailed) without emitting any events, so no
-    // TokenizedEquityMint events appear.
+    let mint_id = job.issuer_request_id.to_string();
+
+    // The intent is durable before the provider call; an HTTP 500 records no
+    // acceptance or rejection event.
     assert_events(
         &pool,
         &[
@@ -1737,17 +1752,22 @@ async fn mint_api_failure_produces_rejected_event() {
                 &aggregate_id,
                 "PositionEvent::OnChainFillApplied",
             ),
+            ExpectedEvent::new(
+                "TokenizedEquityMint",
+                &mint_id,
+                "TokenizedEquityMintEvent::MintRequested",
+            ),
         ],
     )
     .await;
 
     let events = fetch_events(&pool).await;
-    assert!(
-        !events
-            .iter()
-            .any(|event| event.aggregate_type == "TokenizedEquityMint"),
-        "No TokenizedEquityMint events should be emitted when the API fails"
-    );
+    assert!(!events.iter().any(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "TokenizedEquityMintEvent::MintAccepted" | "TokenizedEquityMintEvent::MintRejected"
+        )
+    }));
 }
 
 /// Tests that operational limits cap USDC rebalancing amounts, requiring
@@ -2235,6 +2255,8 @@ async fn mint_accepted_sets_offchain_inflight() {
             .json_body(sample_pending_response(
                 "inflight_test",
                 &job.issuer_request_id,
+                job.quantity,
+                signer.address(),
             ));
     });
 
@@ -2245,7 +2267,9 @@ async fn mint_accepted_sets_offchain_inflight() {
             .header("content-type", "application/json")
             .json_body(json!([sample_pending_response(
                 "inflight_test",
-                &job.issuer_request_id
+                &job.issuer_request_id,
+                job.quantity,
+                signer.address()
             )]));
     });
 
@@ -2453,6 +2477,8 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
             .json_body(sample_pending_response(
                 "completed_mint_test",
                 &job.issuer_request_id,
+                job.quantity,
+                signer.address(),
             ));
     });
 
@@ -2463,6 +2489,8 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
             .json_body(json!([sample_completed_response(
                 "completed_mint_test",
                 &job.issuer_request_id,
+                job.quantity,
+                signer.address(),
                 mint_tx_hash
             )]));
     });
@@ -3128,6 +3156,15 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
         )
         .await
         .expect("RequestMint must persist");
+    mint_store
+        .send(
+            &mint_id,
+            TokenizedEquityMintCommand::SubmitMintRequest {
+                issuer_request_id: mint_id.clone(),
+            },
+        )
+        .await
+        .expect("SubmitMintRequest must accept the mint");
     mint_store
         .send(&mint_id, TokenizedEquityMintCommand::Poll)
         .await

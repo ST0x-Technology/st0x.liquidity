@@ -1512,6 +1512,7 @@ mod tests {
         EquityTransferServices, MintError, MintTransferError, RedemptionError,
         ResumeEquityToHedging, ResumeEquityToMarketMaking,
     };
+    use crate::rebalancing::trigger::{GuardGeneration, GuardState, InProgressGuard};
     use crate::rebalancing::usdc::{ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcTransferError};
     use crate::test_utils::{setup_test_apalis_pool, setup_test_pools};
     use crate::usdc_rebalance::UsdcRebalanceId;
@@ -1812,18 +1813,32 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_equity_transfer_is_dead_lettered_without_stopping_worker() {
-        let apalis_pool = setup_test_apalis_pool().await;
+        let (cqrs_pool, apalis_pool) = setup_test_pools().await;
         let mut queue = TransferEquityToHedgingJobQueue::new(&apalis_pool);
         let poison_id = RedemptionAggregateId::generate();
         let healthy_id = RedemptionAggregateId::generate();
         let symbol = Symbol::new("AAPL").unwrap();
+        let generation = GuardGeneration::from_parts(1, 1);
+        let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
+            symbol.clone(),
+            GuardState::ActiveTransfer { generation },
+        )])));
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        };
+        let redemption_store = Arc::new(test_store(cqrs_pool, services));
 
         queue
             .push(TransferEquityToHedging {
                 aggregate_id: poison_id.clone(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
-
+                generation,
                 backpressure_streak: BackpressureStreak::default(),
             })
             .await
@@ -1836,6 +1851,8 @@ mod tests {
                 poison_id,
                 healthy_completed: healthy_completed.clone(),
             }),
+            equity_in_progress: equity_in_progress.clone(),
+            redemption_store,
             job_queue: queue.clone(),
         });
         let monitor = register_transfer_equity_to_hedging_worker(
@@ -1854,7 +1871,7 @@ mod tests {
                 aggregate_id: healthy_id,
                 symbol,
                 quantity: FractionalShares::new(float!(1)),
-
+                generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
             })
             .await
@@ -1873,6 +1890,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(terminal_count, 1, "the poison job must remain visible");
+        assert_eq!(
+            equity_in_progress
+                .read()
+                .unwrap()
+                .get(&Symbol::new("AAPL").unwrap()),
+            None,
+            "a terminal redemption with no aggregate must release its exact guard"
+        );
 
         assert!(
             !monitor_handle.is_finished(),
@@ -2056,13 +2081,14 @@ mod tests {
         let poison_id = IssuerRequestId::generate();
         let healthy_id = IssuerRequestId::generate();
         let symbol = Symbol::new("AAPL").unwrap();
+        let generation = GuardGeneration::from_parts(1, 2);
 
         queue
             .push(TransferEquityToMarketMaking {
                 issuer_request_id: poison_id.clone(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
-                generation: 0,
+                generation,
 
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -2079,6 +2105,12 @@ mod tests {
             cqrs_pool,
             queue.clone(),
         );
+        transfer_ctx
+            .equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), GuardState::ActiveTransfer { generation });
+        let equity_in_progress = transfer_ctx.equity_in_progress.clone();
         let monitor = register_transfer_equity_to_market_making_worker(
             Monitor::new().should_restart(|_ctx, _error, _attempt| false),
             Some(transfer_ctx),
@@ -2089,12 +2121,22 @@ mod tests {
         let monitor_handle = tokio::spawn(async move { monitor.run().await });
 
         wait_for_terminal_job::<TransferEquityToMarketMaking>(&apalis_pool).await;
+        assert_eq!(
+            equity_in_progress.read().unwrap().get(&symbol),
+            None,
+            "a terminal mint with no aggregate must release its exact guard"
+        );
+        let replacement_claim =
+            InProgressGuard::try_claim_for_transfer(symbol.clone(), equity_in_progress.clone())
+                .expect("the next equity check must be able to claim the released symbol");
+        drop(replacement_claim);
+
         push_queue
             .push(TransferEquityToMarketMaking {
                 issuer_request_id: healthy_id,
                 symbol,
                 quantity: FractionalShares::new(float!(1)),
-                generation: 0,
+                generation: GuardGeneration::default(),
 
                 backpressure_streak: BackpressureStreak::default(),
             })

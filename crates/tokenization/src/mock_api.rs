@@ -79,7 +79,7 @@ impl std::fmt::Display for TokenizationRequestType {
 /// A mock tokenization request tracked in shared state.
 struct MockTokenizationRequest {
     tokenization_request_id: String,
-    issuer_request_id: String,
+    correlation_id: String,
     underlying_symbol: String,
     quantity: Float,
     wallet_address: Address,
@@ -315,7 +315,7 @@ impl AlpacaTokenizationMock {
 
         state.requests.push(MockTokenizationRequest {
             tokenization_request_id: Uuid::new_v4().to_string(),
-            issuer_request_id: Uuid::new_v4().to_string(),
+            correlation_id: Uuid::new_v4().to_string(),
             underlying_symbol: symbol.to_string(),
             quantity,
             wallet_address: wallet,
@@ -507,7 +507,7 @@ async fn scan_block_for_redemptions<P: Provider>(
 
             guard.requests.push(MockTokenizationRequest {
                 tokenization_request_id: Uuid::new_v4().to_string(),
-                issuer_request_id: Uuid::new_v4().to_string(),
+                correlation_id: Uuid::new_v4().to_string(),
                 underlying_symbol: symbol.clone(),
                 quantity,
                 // Use the bot's wallet (order_owner), matching real Alpaca
@@ -609,7 +609,7 @@ fn register_mint_endpoint(server: &MockServer, state: &Arc<Mutex<TokenizationSta
                     &json!({"message": format!("invalid wallet_address: {wallet_address_str}")}),
                 );
             };
-            let issuer_request_id = body["issuer_request_id"]
+            let client_request_id = body["client_request_id"]
                 .as_str()
                 .map_or_else(|| Uuid::new_v4().to_string(), ToString::to_string);
 
@@ -621,7 +621,7 @@ fn register_mint_endpoint(server: &MockServer, state: &Arc<Mutex<TokenizationSta
 
                 state.requests.push(MockTokenizationRequest {
                     tokenization_request_id: tokenization_request_id.clone(),
-                    issuer_request_id: issuer_request_id.clone(),
+                    correlation_id: client_request_id.clone(),
                     underlying_symbol: underlying_symbol.clone(),
                     quantity,
                     wallet_address,
@@ -646,7 +646,7 @@ fn register_mint_endpoint(server: &MockServer, state: &Arc<Mutex<TokenizationSta
                     "issuer": "st0x",
                     "network": "base",
                     "wallet_address": wallet_address,
-                    "issuer_request_id": issuer_request_id,
+                    "client_request_id": client_request_id,
                     "tx_hash": "",
                     "created_at": Utc::now().to_rfc3339(),
                 }),
@@ -748,6 +748,11 @@ fn tokenization_request_to_json(request: &MockTokenizationRequest) -> Value {
         request.tx_hash.clone()
     };
 
+    let (client_request_id, issuer_request_id) = match request.request_type {
+        TokenizationRequestType::Mint => (Some(&request.correlation_id), None),
+        TokenizationRequestType::Redeem => (None, Some(&request.correlation_id)),
+    };
+
     json!({
         "tokenization_request_id": request.tokenization_request_id,
         "type": request.request_type.to_string(),
@@ -758,7 +763,8 @@ fn tokenization_request_to_json(request: &MockTokenizationRequest) -> Value {
         "issuer": "st0x",
         "network": "base",
         "wallet_address": request.wallet_address,
-        "issuer_request_id": request.issuer_request_id,
+        "client_request_id": client_request_id,
+        "issuer_request_id": issuer_request_id,
         "tx_hash": tx_hash,
         "created_at": "2025-01-01T00:00:00Z",
     })

@@ -1230,9 +1230,8 @@ mod tests {
 
         // Seed events directly through a store with NO projection attached,
         // simulating history that accumulated before this projection existed.
-        // `RequestMint`'s `initialize()` calls `services.tokenizer.request_mint`,
-        // so the panicking stub's tokenizer is swapped for a working mock --
-        // mirrors `simulated_transfers.rs`'s `FixtureTokenizer` wiring pattern.
+        // The submission command calls the tokenizer, so the panicking stub's
+        // tokenizer is swapped for a working mock.
         let mut services = crate::rebalancing::equity::EquityTransferServices::panicking();
         services.tokenizer = Arc::new(st0x_tokenization::mock::MockTokenizer::new());
         let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
@@ -1253,11 +1252,20 @@ mod tests {
             )
             .await
             .unwrap();
+        mint_store
+            .send(
+                &operation_id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: operation_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
 
         let projection = EquityTimingProjection::new(pool.clone());
         let replayed = projection.catch_up().await.unwrap();
-        // `RequestMintAt` against a mock tokenizer that returns `Pending` (not
-        // `Rejected`) persists both `MintRequested` and `MintAccepted`.
+        // Intent persistence followed by a successful submission creates the
+        // two pre-existing events.
         assert_eq!(
             replayed, 2,
             "catch_up must replay exactly the two pre-existing events"

@@ -2306,9 +2306,25 @@ loop. Wrapped- and unwrapped-equity recovery jobs follow the same best-effort
 failure policy because they repair individual inventory items rather than
 protecting the bot's core trading loop.
 
+An equity transfer that exhausts its retries may release its in-memory ownership
+claim only when its lifecycle aggregate is absent and its generation still owns
+the symbol. The lifecycle records intent before the first external side effect,
+so an absent aggregate proves that the transfer never started. Any existing
+aggregate, including an uncertain mint request, keeps the symbol blocked for
+reconciliation or explicit operator action.
+
 On startup, any equity-transfer row owns recovery of its aggregate: a
 non-terminal row is requeued, while a terminal row remains dead-lettered instead
-of being resurrected through generic tokenization recovery.
+of being resurrected through generic tokenization recovery. Startup restores the
+exact persisted generation for every non-terminal row whose lifecycle aggregate
+is absent or non-terminal, including a row persisted before its aggregate. A
+live row whose aggregate is already terminal does not restore a guard because
+the resumed handler has no work left to release. A legacy row uses the reserved
+zero generation, which blocks concurrent transfer and recovery claims and can
+only release a matching restored legacy owner. If more than one live row claims
+the same symbol, startup fails before it restores transfer guards or starts
+workers; it never chooses an arbitrary owner while another row remains
+executable.
 
 The trigger enqueues at most one transfer per scope at a time, guarded both by
 an in-memory in-progress set and by a Jobs-table dedupe (the in-memory guard
@@ -2362,8 +2378,9 @@ rather than guessing an orchestrator address.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> MintAccepted: RequestMint (calls request_mint)
-    [*] --> Failed: RequestMint (rejected)
+    [*] --> MintRequested: RequestMint (persists intent)
+    MintRequested --> MintAccepted: SubmitMintRequest / ReconcileMintRequest
+    MintRequested --> Failed: definitive provider rejection
     MintAccepted --> TokensReceived: Poll (calls poll_mint_until_complete)
     MintAccepted --> Failed: Poll (rejected/error)
     TokensReceived --> TokensWrapped: WrapTokens
@@ -2372,14 +2389,37 @@ stateDiagram-v2
     TokensWrapped --> Failed
 ```
 
-`RequestMint` is the initialize command -- it calls `request_mint()` on the
-tokenizer service and emits `MintRequested` + `MintAccepted` atomically. If the
-tokenizer rejects the request, it emits `MintRequested` + `MintRejected`.
+`RequestMint` is the initialize command. It validates the request and persists
+only `MintRequested`; it performs no external call. The invocation that creates
+this intent may then run `SubmitMintRequest` exactly once. The internal
+`IssuerRequestId` is sent to Alpaca as both `client_request_id` and the
+`Idempotency-Key` header. A later invocation that finds `MintRequested` runs
+`ReconcileMintRequest`, which scans Alpaca's mint-request history for that
+client request identity. The direct client-request lookup is not sufficient
+because it returns only the newest request when a client identity was reused.
+More than one history match preserves uncertainty. If no request is visible, the
+bot safely replays the identical request with the same idempotency key; Alpaca
+either creates it once or replays the original result.
+
+Both submission and reconciliation validate the provider identity: request type
+when present, echoed client request id, underlying symbol, quantity, and
+destination wallet when present. Alpaca's documented mint response can omit the
+request type and wallet; omission is accepted, but a contradictory value is
+rejected. The provider's free-form `client_request_id` is a distinct wire type
+and is compared to this bot's UUID string only when reconciling the bot's own
+mint. A matching pending or completed request emits `MintAccepted`; a matching
+rejected request emits `MintRejected`. A documented `400` rejection or a
+recognized position/validation rejection from the first submission also emits
+`MintRejected`. Transport, timeout, authentication, malformed-response, server,
+conflict, unknown `422`, duplicate-match, and lookup errors preserve
+`MintRequested` for later reconciliation or explicit operator resolution.
 
 `Poll` is a separate transition command that calls `poll_mint_until_complete()`
-on the tokenizer service. This split ensures that the
-`MintRequested`/`MintAccepted` events are persisted before the potentially
-long-running poll begins.
+on the tokenizer service. This split ensures that the `MintRequested` and then
+`MintAccepted` are each persisted before the potentially long-running poll
+begins. Startup recovery includes `MintRequested`, restores its ownership guard,
+and uses only reconciliation; it never submits without the persisted idempotency
+key.
 
 Alpaca mints unwrapped tokens. Before depositing to Raindex, we wrap them into
 ERC-4626 vault shares using the Wrapper service.
@@ -2414,9 +2454,12 @@ enum MintAuthorizationProgress {
 
 ```rust
 enum TokenizedEquityMintCommand {
-    /// Initialize: calls tokenizer.request_mint(), emits
-    /// MintRequested + MintAccepted (or MintRejected on rejection).
+    /// Initialize: validates and persists intent without an external call.
     RequestMint { issuer_request_id, symbol, quantity, wallet },
+    /// First invocation only: calls tokenizer.request_mint() once.
+    SubmitMintRequest { issuer_request_id },
+    /// Resume/restart path: finds the provider request by issuer identity.
+    ReconcileMintRequest { issuer_request_id },
     /// Orchestrator mode only: reads the orchestrator digest, signs it,
     /// emits MintAuthorizationSigned. No-op when already signed -- the
     /// persisted nonce is the mint's idempotency key and is never
@@ -2463,8 +2506,15 @@ enum TokenizedEquityMintEvent {
 
 ##### Business Rules
 
-- `RequestMint` only from uninitialized state; calls `request_mint()` on the
-  tokenizer service to submit the request and get acceptance
+- `RequestMint` only from uninitialized state; emits only the durable intent and
+  never calls the provider
+- `SubmitMintRequest` only from MintRequested and only in the invocation that
+  created the intent; a definitive rejection is terminal success for the worker
+- `ReconcileMintRequest` only from MintRequested; looks up Alpaca's echoed
+  `client_request_id`, validates the full request identity, and replays only
+  after a no-match response with the same persisted idempotency key
+- `MintRequested` is an uncertainty boundary: normal retries, startup recovery,
+  and timeout cleanup preserve it until reconciliation or operator resolution
 - `Poll` only from MintAccepted state; calls `poll_mint_until_complete()` on the
   tokenizer service until tokens arrive or failure
 - `WrapTokens` only from TokensReceived state; wraps unwrapped tokens into

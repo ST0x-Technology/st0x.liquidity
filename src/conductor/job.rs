@@ -59,8 +59,10 @@ impl Backoff for ExponentialBackoff {
     }
 }
 
+pub(crate) const WORKER_RETRIES: usize = 3;
+
 /// Production retry backoff: 1s base, doubles each attempt, capped at 30s.
-/// Sequence for `RetryPolicy::retries(3)`: 1s, 2s, 4s.
+/// Sequence for `RetryPolicy::retries(WORKER_RETRIES)`: 1s, 2s, 4s.
 pub(crate) const RETRY_BACKOFF: ExponentialBackoff =
     ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(30));
 
@@ -524,6 +526,11 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
 /// materially different legitimate ceiling (e.g. `BackfillRange`) sets its own.
 pub(crate) const DEFAULT_PERFORM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+/// Upper bound for best-effort work performed after a durable final attempt.
+/// The original job failure always wins; cleanup failure or timeout is logged
+/// and cannot replace it.
+const TERMINAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A persistent, retryable unit of work backed by apalis storage.
 ///
 /// Implementations are serializable structs that carry the data
@@ -579,6 +586,19 @@ where
 
     /// Process this job using the provided context.
     async fn perform(&self, ctx: &Ctx) -> Result<Self::Output, Self::Error>;
+
+    /// Best-effort cleanup for an attempt that will exhaust durable storage.
+    ///
+    /// This runs before the backend acknowledges the row as a dead letter, so
+    /// a crash can invoke it again after orphan recovery. Implementations must
+    /// therefore be idempotent. The default performs no cleanup.
+    async fn on_terminal_attempt(
+        &self,
+        _ctx: &Ctx,
+        _task_identity: &TaskIdentity,
+    ) -> Result<(), BoxDynError> {
+        Ok(())
+    }
 }
 
 /// Shared worker-construction body for [`build_supervised_worker!`]. Not part
@@ -621,7 +641,7 @@ macro_rules! build_worker_inner {
         builder
             .concurrency(1)
             .retry(
-                RetryPolicy::retries(3)
+                RetryPolicy::retries($crate::conductor::job::WORKER_RETRIES)
                     .with_backoff($crate::conductor::job::RETRY_BACKOFF.clone()),
             )
             .on_event($on_event)
@@ -719,7 +739,7 @@ macro_rules! build_best_effort_worker {
         builder
             .concurrency(1)
             .retry(
-                RetryPolicy::retries(3)
+                RetryPolicy::retries($crate::conductor::job::WORKER_RETRIES)
                     .with_backoff($crate::conductor::job::RETRY_BACKOFF.clone()),
             )
             .on_event($crate::conductor::job::on_best_effort_terminal_failure(
@@ -832,9 +852,22 @@ impl JobError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TaskIdentity(String);
 
+impl TaskIdentity {
+    #[cfg(test)]
+    pub(crate) fn for_test(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
 impl<IdType: fmt::Display> From<&TaskId<IdType>> for TaskIdentity {
     fn from(task_id: &TaskId<IdType>) -> Self {
         Self(task_id.to_string())
+    }
+}
+
+impl fmt::Display for TaskIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
     }
 }
 
@@ -1051,6 +1084,33 @@ where
         },
     };
 
+    if durably_terminal {
+        match tokio::time::timeout(
+            TERMINAL_ATTEMPT_TIMEOUT,
+            job.on_terminal_attempt(ctx, &task_identity),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(cleanup_error)) => {
+                error!(
+                    %label,
+                    %task_identity,
+                    %cleanup_error,
+                    "Terminal-attempt cleanup failed; preserving original job failure"
+                );
+            }
+            Err(_elapsed) => {
+                error!(
+                    %label,
+                    %task_identity,
+                    timeout = ?TERMINAL_ATTEMPT_TIMEOUT,
+                    "Terminal-attempt cleanup timed out; preserving original job failure"
+                );
+            }
+        }
+    }
+
     Err(JobError::Failed {
         task_identity,
         durably_terminal,
@@ -1120,7 +1180,13 @@ fn is_durably_terminal(attempt: &Attempt, sql_context: &SqliteContext) -> bool {
         return false;
     };
 
-    attempt.current() >= max_attempts
+    attempt_is_terminal(attempt.current(), max_attempts)
+}
+
+fn attempt_is_terminal(current_attempt: usize, max_attempts: usize) -> bool {
+    // Both the durable backend and the in-memory retry layer can schedule
+    // another call. Cleanup is terminal only after both budgets are exhausted.
+    current_attempt >= max_attempts && current_attempt > WORKER_RETRIES
 }
 
 /// Worker name, static failure context, and the original apalis error for a
@@ -1323,6 +1389,14 @@ mod tests {
         }));
 
         Event::Error(Arc::new(error))
+    }
+
+    #[test]
+    fn terminal_attempt_requires_both_retry_budgets_to_be_exhausted() {
+        assert!(!attempt_is_terminal(WORKER_RETRIES, 1));
+        assert!(attempt_is_terminal(WORKER_RETRIES + 1, 1));
+        assert!(!attempt_is_terminal(WORKER_RETRIES + 1, 5));
+        assert!(attempt_is_terminal(5, 5));
     }
 
     #[tokio::test]
@@ -1922,6 +1996,196 @@ mod tests {
     #[derive(Debug, thiserror::Error)]
     #[error("test job deliberately failed")]
     struct TestJobError;
+
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    enum HookJobBehavior {
+        Succeed,
+        Fail,
+        Hang,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    struct HookJob {
+        behavior: HookJobBehavior,
+        hook_hangs: bool,
+    }
+
+    #[derive(Default)]
+    struct HookCtx {
+        calls: AtomicUsize,
+    }
+
+    impl Job<HookCtx> for HookJob {
+        type Output = ();
+        type Error = TestJobError;
+
+        const WORKER_NAME: &'static str = "terminal-hook-worker";
+        const PERFORM_TIMEOUT: Option<Duration> = Some(Duration::from_millis(10));
+        const JOB_KIND: JobKind = JobKind::OrderFill;
+
+        fn label(&self) -> Label {
+            Label::new("terminal-hook-job")
+        }
+
+        async fn perform(&self, _ctx: &HookCtx) -> Result<Self::Output, Self::Error> {
+            match self.behavior {
+                HookJobBehavior::Succeed => Ok(()),
+                HookJobBehavior::Fail => Err(TestJobError),
+                HookJobBehavior::Hang => std::future::pending().await,
+            }
+        }
+
+        async fn on_terminal_attempt(
+            &self,
+            ctx: &HookCtx,
+            _task_identity: &TaskIdentity,
+        ) -> Result<(), BoxDynError> {
+            ctx.calls.fetch_add(1, Ordering::SeqCst);
+            if self.hook_hangs {
+                std::future::pending().await
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_handler_error_runs_hook_and_preserves_original_error() {
+        let ctx = HookCtx::default();
+        let job = HookJob {
+            behavior: HookJobBehavior::Fail,
+            hook_hangs: false,
+        };
+
+        let error = perform_bounded(
+            &job,
+            &ctx,
+            job.label(),
+            TaskIdentity("terminal-handler-error".to_owned()),
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(ctx.calls.load(Ordering::SeqCst), 1);
+        let JobError::Failed { source, .. } = error else {
+            panic!("expected JobError::Failed, got {error:?}");
+        };
+        assert!(
+            source.downcast_ref::<TestJobError>().is_some(),
+            "terminal cleanup must not replace the handler error: {source:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_perform_timeout_runs_hook() {
+        let ctx = HookCtx::default();
+        let job = HookJob {
+            behavior: HookJobBehavior::Hang,
+            hook_hangs: false,
+        };
+
+        let error = perform_bounded(
+            &job,
+            &ctx,
+            job.label(),
+            TaskIdentity("terminal-perform-timeout".to_owned()),
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(ctx.calls.load(Ordering::SeqCst), 1);
+        let JobError::Failed { source, .. } = error else {
+            panic!("expected JobError::Failed, got {error:?}");
+        };
+        assert!(source.downcast_ref::<PerformTimeout>().is_some());
+    }
+
+    #[tokio::test]
+    async fn nonfinal_failure_and_success_do_not_run_terminal_hook() {
+        let ctx = HookCtx::default();
+        let failing = HookJob {
+            behavior: HookJobBehavior::Fail,
+            hook_hangs: false,
+        };
+        let successful = HookJob {
+            behavior: HookJobBehavior::Succeed,
+            hook_hangs: false,
+        };
+
+        let _error = perform_bounded(
+            &failing,
+            &ctx,
+            failing.label(),
+            TaskIdentity("nonfinal-handler-error".to_owned()),
+            false,
+        )
+        .await
+        .unwrap_err();
+        perform_bounded(
+            &successful,
+            &ctx,
+            successful.label(),
+            TaskIdentity("successful-final-attempt".to_owned()),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ctx.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_hook_timeout_preserves_original_handler_error() {
+        let ctx = HookCtx::default();
+        let job = HookJob {
+            behavior: HookJobBehavior::Fail,
+            hook_hangs: true,
+        };
+
+        let error = perform_bounded(
+            &job,
+            &ctx,
+            job.label(),
+            TaskIdentity("hanging-terminal-hook".to_owned()),
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(ctx.calls.load(Ordering::SeqCst), 1);
+        let JobError::Failed { source, .. } = error else {
+            panic!("expected JobError::Failed, got {error:?}");
+        };
+        assert!(source.downcast_ref::<TestJobError>().is_some());
+    }
+
+    #[tokio::test]
+    async fn failure_injector_does_not_run_terminal_hook() {
+        let injector = FailureInjector::new();
+        injector.arm(JobKind::OrderFill);
+        let ctx = HookCtx::default();
+        let job = HookJob {
+            behavior: HookJobBehavior::Fail,
+            hook_hangs: false,
+        };
+
+        let error = injector
+            .perform(
+                JobKind::OrderFill,
+                &job,
+                &ctx,
+                4,
+                TaskIdentity("injected-terminal-attempt".to_owned()),
+                true,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(ctx.calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(error, JobError::Injected { .. }));
+    }
 
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct RecoverOnFifthAttemptJob;

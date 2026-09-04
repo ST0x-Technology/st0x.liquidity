@@ -26,7 +26,7 @@ use st0x_evm::{
 use st0x_execution::{Executor, FractionalShares, InventoryResult, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, UsdToCentsError, Usdc};
 use st0x_raindex::{RaindexError, RaindexService, RaindexVaultId};
-use st0x_tokenization::{IssuerRequestId, TokenizationRequestId};
+use st0x_tokenization::{ClientRequestId, TokenizationRequestId};
 use st0x_tokenization::{TokenizationRequestType, Tokenizer, TokenizerError};
 
 use super::BroadcastingInventory;
@@ -60,7 +60,7 @@ where
 /// Active bot-owned tokenization provider request identifiers.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PendingRequestOwnershipSnapshot {
-    pub(crate) mint_issuers: HashSet<IssuerRequestId>,
+    pub(crate) mint_issuers: HashSet<ClientRequestId>,
     pub(crate) mint_tokenizations: HashSet<TokenizationRequestId>,
     pub(crate) redemption_tokenizations: HashSet<TokenizationRequestId>,
     pub(crate) redemption_txs: HashSet<TxHash>,
@@ -1670,7 +1670,7 @@ where
         let is_owned = match request.r#type {
             Some(TokenizationRequestType::Mint) => {
                 request
-                    .issuer_request_id
+                    .client_request_id
                     .as_ref()
                     .is_some_and(|id| ownership.mint_issuers.contains(id))
                     || ownership.mint_tokenizations.contains(&request.id)
@@ -1716,6 +1716,7 @@ where
                 warn!(
                     target: "inventory",
                     request_id = %request.id,
+                    client_request_id = ?request.client_request_id,
                     issuer_request_id = ?request.issuer_request_id,
                     request_type = ?request.r#type,
                     symbol = %request.underlying_symbol,
@@ -1924,6 +1925,7 @@ mod tests {
                 mint_issuers: mint_issuer_request_ids
                     .into_iter()
                     .map(issuer_request_id)
+                    .map(|id| ClientRequestId::from(&id))
                     .collect(),
                 mint_tokenizations: mint_tokenization_request_ids
                     .into_iter()
@@ -4668,6 +4670,7 @@ mod tests {
             underlying_symbol: test_symbol(symbol),
             quantity: test_shares(quantity),
             wallet: None,
+            client_request_id: None,
             issuer_request_id: None,
             tx_hash: None,
             token_symbol: None,
@@ -4690,6 +4693,7 @@ mod tests {
             underlying_symbol: test_symbol(symbol),
             quantity: test_shares(quantity),
             wallet,
+            client_request_id: None,
             issuer_request_id: None,
             tx_hash: None,
             token_symbol: None,
@@ -4706,7 +4710,7 @@ mod tests {
         wallet: Option<Address>,
     ) -> st0x_tokenization::TokenizationRequest {
         st0x_tokenization::TokenizationRequest {
-            issuer_request_id: Some(issuer_request_id(issuer_id_label)),
+            client_request_id: Some(ClientRequestId::from(&issuer_request_id(issuer_id_label))),
             ..mock_pending_request_with_wallet(request_type, symbol, quantity, wallet)
         }
     }

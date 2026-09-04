@@ -22,7 +22,7 @@ use apalis_core::error::BoxDynError;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use sqlx_apalis::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::future::Future;
 use std::num::TryFromIntError;
 use std::pin::Pin;
@@ -111,7 +111,7 @@ use crate::rebalancing::equity::{
     TransferEquityToHedging, TransferEquityToHedgingCtx, TransferEquityToMarketMaking,
     TransferEquityToMarketMakingCtx,
 };
-use crate::rebalancing::trigger::GuardState;
+use crate::rebalancing::trigger::{GuardGeneration, GuardState};
 use crate::rebalancing::usdc::{
     TransferUsdcToHedging, TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking,
     TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
@@ -2719,6 +2719,8 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         let transfer_equity_to_hedging_ctx = Arc::new(TransferEquityToHedgingCtx {
             transfer: recovery_transfer.clone(),
+            equity_in_progress: rebalancing_service.equity_in_progress.clone(),
+            redemption_store: built.redemption.clone(),
             job_queue: transfer_equity_to_hedging_queue,
         });
 
@@ -2938,7 +2940,7 @@ async fn recover_interrupted_tokenization_aggregates(
         // because resume_mint is idempotent.
         let owned_by_transfer_job = transfer_mints
             .iter()
-            .any(|job| job.issuer_request_id == *mint_id);
+            .any(|row| row.task.issuer_request_id == *mint_id);
         if !owned_by_transfer_job
             && !is_pre_wrap_held_for_recovery(&mint, &rebalancing_service.equity_in_progress)
         {
@@ -2964,7 +2966,7 @@ async fn recover_interrupted_tokenization_aggregates(
 
         let owned_by_transfer_job = transfer_redemptions
             .iter()
-            .any(|job| job.aggregate_id == *redemption_id);
+            .any(|row| row.task.aggregate_id == *redemption_id);
         if !owned_by_transfer_job {
             // If cancel_all_pending silently failed above, a stale Pending row for
             // this aggregate may still exist. The duplicate Pending row is tolerated
@@ -2978,6 +2980,15 @@ async fn recover_interrupted_tokenization_aggregates(
         }
     }
 
+    restore_live_transfer_job_guards(
+        &rebalancing_service.equity_in_progress,
+        &transfer_mints,
+        &transfer_redemptions,
+        &mint_store,
+        &redemption_store,
+    )
+    .await?;
+
     recover_stuck_redemptions(pool, inventory).await?;
 
     Ok(())
@@ -2989,26 +3000,116 @@ async fn recover_interrupted_tokenization_aggregates(
 /// A terminal row is a dead letter and must remain terminal across restarts.
 /// Treating both as ownership prevents the generic tokenization queue from
 /// racing the transfer queue or silently resetting an exhausted retry budget.
-async fn load_transfer_jobs<Task>(pool: &SqlitePool) -> anyhow::Result<Vec<Task>>
+struct DurableTransferJob<Task> {
+    task: Task,
+    status: String,
+    attempts: i64,
+    max_attempts: i64,
+}
+
+impl<Task> DurableTransferJob<Task> {
+    fn is_terminal(&self) -> bool {
+        self.status == Status::Done.to_string()
+            || self.status == Status::Killed.to_string()
+            || (self.status == Status::Failed.to_string() && self.attempts >= self.max_attempts)
+    }
+}
+
+async fn load_transfer_jobs<Task>(
+    pool: &SqlitePool,
+) -> anyhow::Result<Vec<DurableTransferJob<Task>>>
 where
     Task: serde::de::DeserializeOwned + 'static,
 {
-    let payloads: Vec<Vec<u8>> = sqlx::query_scalar("SELECT job FROM Jobs WHERE job_type = ?")
-        .bind(std::any::type_name::<Task>())
-        .fetch_all(pool)
-        .await?;
+    let rows: Vec<(Vec<u8>, String, i64, i64)> =
+        sqlx::query_as("SELECT job, status, attempts, max_attempts FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<Task>())
+            .fetch_all(pool)
+            .await?;
 
-    payloads
-        .into_iter()
-        .map(|payload| {
-            serde_json::from_slice(&payload).with_context(|| {
+    rows.into_iter()
+        .map(|(payload, status, attempts, max_attempts)| {
+            let task = serde_json::from_slice(&payload).with_context(|| {
                 format!(
                     "failed to deserialize durable {} transfer job",
                     std::any::type_name::<Task>()
                 )
+            })?;
+            Ok(DurableTransferJob {
+                task,
+                status,
+                attempts,
+                max_attempts,
             })
         })
         .collect()
+}
+
+async fn restore_live_transfer_job_guards(
+    equity_in_progress: &RwLock<HashMap<Symbol, GuardState>>,
+    mints: &[DurableTransferJob<TransferEquityToMarketMaking>],
+    redemptions: &[DurableTransferJob<TransferEquityToHedging>],
+    mint_store: &Store<TokenizedEquityMint>,
+    redemption_store: &Store<EquityRedemption>,
+) -> anyhow::Result<()> {
+    let mut owners = HashMap::new();
+
+    for row in mints.iter().filter(|row| !row.is_terminal()) {
+        let aggregate = mint_store.load(&row.task.issuer_request_id).await?;
+        if !aggregate
+            .as_ref()
+            .is_some_and(TokenizedEquityMint::is_terminal)
+        {
+            insert_transfer_owner(&mut owners, &row.task.symbol, row.task.generation)?;
+        }
+    }
+
+    for row in redemptions.iter().filter(|row| !row.is_terminal()) {
+        let aggregate = redemption_store.load(&row.task.aggregate_id).await?;
+        if !aggregate
+            .as_ref()
+            .is_some_and(EquityRedemption::is_terminal)
+        {
+            insert_transfer_owner(&mut owners, &row.task.symbol, row.task.generation)?;
+        }
+    }
+
+    let mut guard = match equity_in_progress.write() {
+        Ok(guard) => guard,
+        Err(poison) => poison.into_inner(),
+    };
+    for (symbol, generation) in owners {
+        if generation.is_legacy() {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                "Restoring a live legacy equity transfer with its reserved zero generation"
+            );
+        }
+
+        guard.insert(symbol, GuardState::ActiveTransfer { generation });
+    }
+    drop(guard);
+
+    Ok(())
+}
+
+fn insert_transfer_owner(
+    owners: &mut HashMap<Symbol, GuardGeneration>,
+    symbol: &Symbol,
+    generation: GuardGeneration,
+) -> anyhow::Result<()> {
+    match owners.entry(symbol.clone()) {
+        Entry::Vacant(entry) => {
+            entry.insert(generation);
+            Ok(())
+        }
+        Entry::Occupied(entry) => Err(anyhow::anyhow!(
+            "multiple live equity transfer rows own symbol {symbol}: generations {:?} and {:?}",
+            entry.get(),
+            generation
+        )),
+    }
 }
 
 /// Returns `true` when `mint` is a pre-wrap post-receipt state
@@ -4807,7 +4908,7 @@ mod tests {
     use st0x_float_macro::float;
     use st0x_raindex::{Raindex, RaindexContracts};
     use st0x_tokenization::mock::MockTokenizer;
-    use st0x_tokenization::{issuer_request_id, tokenization_request_id};
+    use st0x_tokenization::{IssuerRequestId, issuer_request_id, tokenization_request_id};
     use st0x_wrapper::{MockWrapper, RATIO_ONE, UnderlyingPerWrapped, Wrapper};
 
     use super::*;
@@ -5749,7 +5850,7 @@ mod tests {
     }
 
     /// Shared setup for the three `recover_interrupted_tokenization_aggregates`
-    /// tests. Seeds one mint (MintAccepted state) and one redemption
+    /// tests. Seeds one mint (`MintRequested`) and one redemption
     /// (VaultWithdrawPending state) into an in-memory database, then builds the
     /// `RebalancingService` and `ResumeTokenizationJobQueue` that the recovery
     /// function requires.
@@ -5859,6 +5960,39 @@ mod tests {
         }
     }
 
+    async fn seed_mint_to_tokens_received(
+        store: &Store<TokenizedEquityMint>,
+        id: &IssuerRequestId,
+        symbol: &Symbol,
+        wallet: Address,
+    ) {
+        store
+            .send(
+                id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(5),
+                    wallet,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+    }
+
     /// Regression: `recover_interrupted_tokenization_aggregates` must enqueue
     /// a `ResumeTokenizationAggregate` job for each interrupted aggregate and
     /// return immediately without calling any issuer (tokenizer) method.
@@ -5957,6 +6091,14 @@ mod tests {
             "a queued resume job must target the interrupted redemption {redemption_id}, \
              got {targets:?}"
         );
+        assert!(matches!(
+            rebalancing_service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .get(&Symbol::new("AAPL").unwrap()),
+            Some(GuardState::ActiveTransfer { .. })
+        ));
     }
 
     /// `recover_interrupted_tokenization_aggregates` called twice (simulating a
@@ -6030,7 +6172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transfer_jobs_own_interrupted_aggregate_resume_on_restart() {
+    async fn mixed_direction_legacy_transfer_rows_for_one_symbol_fail_startup() {
         let InterruptedAggregateFixture {
             pool,
             apalis_pool,
@@ -6055,7 +6197,7 @@ mod tests {
                 issuer_request_id: mint_id.clone(),
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
-                generation: 1,
+                generation: GuardGeneration::default(),
 
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -6068,7 +6210,73 @@ mod tests {
                 aggregate_id: redemption_id,
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
+                generation: GuardGeneration::default(),
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
 
+        let error = recover_interrupted_tokenization_aggregates(
+            &pool,
+            &rebalancing_service,
+            inventory.as_ref(),
+            Arc::new(test_store::<TokenizedEquityMint>(
+                pool.clone(),
+                services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(pool.clone(), services)),
+            &mut resume_queue,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("multiple live equity transfer rows own symbol AAPL"),
+            "startup must reject competing live transfer owners, got: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_transfer_without_aggregate_restores_exact_guard_on_restart() {
+        let InterruptedAggregateFixture {
+            pool,
+            apalis_pool,
+            services,
+            mint_id: _,
+            redemption_id: _,
+            tokenizer: _,
+            rebalancing_service,
+            inventory,
+            mut resume_queue,
+        } = seed_interrupted_aggregates_and_build_service(
+            6,
+            "guardless-row-existing-mint",
+            "guardless-row-existing-redemption",
+        )
+        .await;
+        let symbol = Symbol::new("TSLA").unwrap();
+        let legacy_symbol = Symbol::new("NVDA").unwrap();
+        let generation = GuardGeneration::from_parts(7, 11);
+        let mut transfer_queue =
+            crate::rebalancing::equity::TransferEquityToMarketMakingJobQueue::new(&apalis_pool);
+        transfer_queue
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: issuer_request_id("guardless-row"),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+                generation,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+        transfer_queue
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: issuer_request_id("guardless-legacy-row"),
+                symbol: legacy_symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+                generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
             })
             .await
@@ -6088,25 +6296,177 @@ mod tests {
         .await
         .unwrap();
 
-        let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
-            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        assert_eq!(
+            rebalancing_service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .get(&symbol),
+            Some(&GuardState::ActiveTransfer { generation })
+        );
+        assert_eq!(
+            rebalancing_service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .get(&legacy_symbol),
+            Some(&GuardState::ActiveTransfer {
+                generation: GuardGeneration::default()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn live_pre_wrap_transfer_rows_replace_recovery_holds_on_restart() {
+        let InterruptedAggregateFixture {
+            pool,
+            apalis_pool: _,
+            services,
+            mint_id: _,
+            redemption_id: _,
+            tokenizer: _,
+            rebalancing_service: _,
+            inventory: _,
+            resume_queue: _,
+        } = seed_interrupted_aggregates_and_build_service(
+            8,
+            "pre-wrap-owner-existing-mint",
+            "pre-wrap-owner-existing-redemption",
         )
-        .bind(std::any::type_name::<ResumeTokenizationAggregate>())
-        .fetch_all(&apalis_pool)
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = issuer_request_id("live-pre-wrap-owner");
+        let mint_store = test_store::<TokenizedEquityMint>(pool.clone(), services.clone());
+        let redemption_store = test_store::<EquityRedemption>(pool, services);
+
+        seed_mint_to_tokens_received(&mint_store, &mint_id, &symbol, Address::from([8; 20])).await;
+        let generation = GuardGeneration::from_parts(8, 1);
+        let rows = vec![DurableTransferJob {
+            task: TransferEquityToMarketMaking {
+                issuer_request_id: mint_id.clone(),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+                generation,
+                backpressure_streak: BackpressureStreak::default(),
+            },
+            status: Status::Pending.to_string(),
+            attempts: 0,
+            max_attempts: 5,
+        }];
+        let guards = RwLock::new(HashMap::from([(
+            symbol.clone(),
+            GuardState::HeldForRecovery,
+        )]));
+
+        restore_live_transfer_job_guards(&guards, &rows, &[], &mint_store, &redemption_store)
+            .await
+            .unwrap();
+        assert_eq!(
+            guards.read().unwrap().get(&symbol),
+            Some(&GuardState::ActiveTransfer { generation })
+        );
+
+        mint_store
+            .send(
+                &mint_id,
+                TokenizedEquityMintCommand::SubmitWrap {
+                    wrap_tx_hash: TxHash::random(),
+                },
+            )
+            .await
+            .unwrap();
+        guards
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), GuardState::HeldForRecovery);
+
+        restore_live_transfer_job_guards(&guards, &rows, &[], &mint_store, &redemption_store)
+            .await
+            .unwrap();
+        assert_eq!(
+            guards.read().unwrap().get(&symbol),
+            Some(&GuardState::ActiveTransfer { generation })
+        );
+    }
+
+    #[tokio::test]
+    async fn live_transfer_with_terminal_aggregate_does_not_restore_guard_on_restart() {
+        let InterruptedAggregateFixture {
+            pool,
+            apalis_pool,
+            services,
+            mint_id: _,
+            redemption_id: _,
+            tokenizer: _,
+            rebalancing_service,
+            inventory,
+            mut resume_queue,
+        } = seed_interrupted_aggregates_and_build_service(
+            7,
+            "terminal-row-existing-mint",
+            "terminal-row-existing-redemption",
+        )
+        .await;
+        let symbol = Symbol::new("TSLA").unwrap();
+        let terminal_id = issuer_request_id("terminal-live-row");
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+            pool.clone(),
+            services.clone(),
+        ));
+        mint_store
+            .send(
+                &terminal_id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: terminal_id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(1),
+                    wallet: Address::from([7; 20]),
+                },
+            )
+            .await
+            .unwrap();
+        mint_store
+            .send(
+                &terminal_id,
+                TokenizedEquityMintCommand::FailAcceptance {
+                    reason: "terminal before queue acknowledgement".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut transfer_queue =
+            crate::rebalancing::equity::TransferEquityToMarketMakingJobQueue::new(&apalis_pool);
+        transfer_queue
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: terminal_id,
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(1)),
+                generation: GuardGeneration::from_parts(7, 12),
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        recover_interrupted_tokenization_aggregates(
+            &pool,
+            &rebalancing_service,
+            inventory.as_ref(),
+            mint_store,
+            Arc::new(test_store::<EquityRedemption>(pool.clone(), services)),
+            &mut resume_queue,
+        )
         .await
         .unwrap();
-        let targets: Vec<_> = payloads
-            .iter()
-            .map(|payload| {
-                serde_json::from_slice::<ResumeTokenizationAggregate>(payload)
-                    .unwrap()
-                    .target
-            })
-            .collect();
 
-        assert!(
-            targets.is_empty(),
-            "live transfer jobs must exclusively own mint and redemption resume; generic jobs found: {targets:?}"
+        assert_eq!(
+            rebalancing_service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .get(&symbol),
+            None,
+            "a terminal aggregate has no remaining handler work that could release a restored guard"
         );
     }
 
@@ -6136,7 +6496,7 @@ mod tests {
                 issuer_request_id: mint_id.clone(),
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
-                generation: 1,
+                generation: GuardGeneration::from_parts(1, 1),
 
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -6149,7 +6509,7 @@ mod tests {
                 aggregate_id: redemption_id,
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
-
+                generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
             })
             .await
@@ -6190,6 +6550,14 @@ mod tests {
             payloads.is_empty(),
             "dead-lettered mint and redemption transfers must not be resurrected through the generic resume queue"
         );
+        assert!(matches!(
+            rebalancing_service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .get(&Symbol::new("AAPL").unwrap()),
+            Some(GuardState::ActiveTransfer { .. })
+        ));
     }
 
     /// Extension of the above: a crash mid-job leaves a `Running` row (not
@@ -6325,25 +6693,13 @@ mod tests {
             services.clone(),
         ));
 
-        // RequestMint (Pending) -> MintAccepted state.
-        // Poll with Completed outcome -> TokensReceived state (pre-wrap).
-        seeding_mint_store
-            .send(
-                &mint_id,
-                TokenizedEquityMintCommand::RequestMint {
-                    issuer_request_id: mint_id.clone(),
-                    symbol: symbol.clone(),
-                    quantity: float!(5.0),
-                    wallet: alloy::primitives::Address::from([3u8; 20]),
-                },
-            )
-            .await
-            .unwrap();
-
-        seeding_mint_store
-            .send(&mint_id, TokenizedEquityMintCommand::Poll)
-            .await
-            .unwrap();
+        seed_mint_to_tokens_received(
+            &seeding_mint_store,
+            &mint_id,
+            &symbol,
+            alloy::primitives::Address::from([3_u8; 20]),
+        )
+        .await;
 
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
@@ -6426,23 +6782,13 @@ mod tests {
             services2.clone(),
         ));
 
-        seeding_mint_store2
-            .send(
-                &mint_id2,
-                TokenizedEquityMintCommand::RequestMint {
-                    issuer_request_id: mint_id2.clone(),
-                    symbol: symbol.clone(),
-                    quantity: float!(5.0),
-                    wallet: alloy::primitives::Address::from([4u8; 20]),
-                },
-            )
-            .await
-            .unwrap();
-
-        seeding_mint_store2
-            .send(&mint_id2, TokenizedEquityMintCommand::Poll)
-            .await
-            .unwrap();
+        seed_mint_to_tokens_received(
+            &seeding_mint_store2,
+            &mint_id2,
+            &symbol,
+            alloy::primitives::Address::from([4_u8; 20]),
+        )
+        .await;
 
         let (event_sender2, _) = broadcast::channel::<Statement>(16);
         let inventory2 = Arc::new(BroadcastingInventory::new(
@@ -13868,10 +14214,12 @@ mod tests {
         };
 
         // Without HeldForRecovery -- no mint is excluded.
-        equity_in_progress
-            .write()
-            .unwrap()
-            .insert(symbol.clone(), GuardState::ActiveTransfer { generation: 0 });
+        equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::ActiveTransfer {
+                generation: GuardGeneration::default(),
+            },
+        );
         assert!(
             !is_pre_wrap_held_for_recovery(&tokens_received, &equity_in_progress),
             "TokensReceived + ActiveTransfer must NOT be excluded"

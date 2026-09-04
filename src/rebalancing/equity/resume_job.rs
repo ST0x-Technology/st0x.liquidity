@@ -162,7 +162,7 @@ mod tests {
     use st0x_float_macro::float;
     use st0x_raindex::{Raindex, RaindexVaultId};
     use st0x_tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
-    use st0x_tokenization::{issuer_request_id, tokenization_request_id};
+    use st0x_tokenization::{ClientRequestId, issuer_request_id, tokenization_request_id};
     use st0x_wrapper::{MockWrapper, Wrapper};
 
     use super::*;
@@ -247,6 +247,21 @@ mod tests {
         (ctx, mint_store, redemption_store, tokenizer)
     }
 
+    async fn submit_requested_mint(
+        mint_store: &st0x_event_sorcery::Store<TokenizedEquityMint>,
+        id: &IssuerRequestId,
+    ) {
+        mint_store
+            .send(
+                id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
     /// `perform` on a `Mint` target with a terminal aggregate (`DepositedIntoRaindex`)
     /// returns `Ok(())` immediately without issuer contact.
     #[tokio::test]
@@ -269,6 +284,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&mint_store, &id).await;
 
         mint_store
             .send(&id, TokenizedEquityMintCommand::Poll)
@@ -339,6 +355,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&mint_store, &id).await;
 
         mint_store
             .send(&id, TokenizedEquityMintCommand::Poll)
@@ -464,8 +481,8 @@ mod tests {
         let id = issuer_request_id("resume-mint-interrupted");
         let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
 
-        // RequestMint emits MintRequested + MintAccepted (MockTokenizer accepts),
-        // leaving a non-terminal MintAccepted aggregate -- the interrupted state.
+        // Persist intent, then submit once to leave a non-terminal
+        // MintAccepted aggregate -- the interrupted state.
         mint_store
             .send(
                 &id,
@@ -478,6 +495,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&mint_store, &id).await;
 
         let seeded = mint_store.load(&id).await.unwrap();
         assert!(
@@ -574,6 +592,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&mint_store, &id).await;
         mint_store
             .send(&id, TokenizedEquityMintCommand::Poll)
             .await
@@ -669,6 +688,45 @@ mod tests {
             "missing redemption aggregate must propagate EntityNotFound so apalis retries, \
              got {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn perform_mint_requested_target_reconciles_without_resubmission() {
+        let id = issuer_request_id("resume-mint-requested");
+        let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
+        let mut provider_request = st0x_tokenization::TokenizationRequest::mock(
+            st0x_tokenization::TokenizationRequestStatus::Pending,
+        );
+        provider_request.r#type = Some(st0x_tokenization::TokenizationRequestType::Mint);
+        provider_request.underlying_symbol = symbol.clone();
+        provider_request.quantity = st0x_execution::FractionalShares::new(float!(1.0));
+        provider_request.wallet = Some(Address::ZERO);
+        provider_request.client_request_id = Some(ClientRequestId::from(&id));
+        let configured_tokenizer =
+            Arc::new(MockTokenizer::new().with_pending_requests(vec![provider_request]));
+        let (ctx, mint_store, _, tokenizer) = build_ctx_with_tokenizer(configured_tokenizer).await;
+
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol,
+                    quantity: float!(1.0),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Mint(id),
+            backpressure_streak: BackpressureStreak::default(),
+        };
+        Job::perform(&job, &ctx).await.unwrap();
+
+        assert_eq!(tokenizer.mint_lookup_call_count(), 1);
+        assert_eq!(tokenizer.mint_request_call_count(), 0);
     }
 
     /// `perform` on a `Redemption` target with a NON-TERMINAL (interrupted)

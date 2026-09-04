@@ -56,6 +56,76 @@ impl FromStr for IssuerRequestId {
     }
 }
 
+/// Client-supplied correlation label returned by the tokenization provider.
+///
+/// This wire type is intentionally wider than our UUID-backed
+/// [`IssuerRequestId`], because provider history can contain labels created by
+/// other clients.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct ClientRequestId(String);
+
+/// Error parsing a [`ClientRequestId`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ClientRequestIdError {
+    #[error("client request id must be non-empty")]
+    Empty,
+    #[error("client request id exceeds 128 characters")]
+    TooLong,
+    #[error("client request id must contain only printable ASCII characters")]
+    NonPrintableAscii,
+    #[error("client request id must not have leading or trailing whitespace")]
+    SurroundingWhitespace,
+}
+
+impl ClientRequestId {
+    pub fn try_new(value: impl AsRef<str>) -> Result<Self, ClientRequestIdError> {
+        let value = value.as_ref();
+        if value.is_empty() {
+            return Err(ClientRequestIdError::Empty);
+        }
+        if value.len() > 128 {
+            return Err(ClientRequestIdError::TooLong);
+        }
+        if !value.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+            return Err(ClientRequestIdError::NonPrintableAscii);
+        }
+        if value.starts_with(char::is_whitespace) || value.ends_with(char::is_whitespace) {
+            return Err(ClientRequestIdError::SurroundingWhitespace);
+        }
+
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl From<&IssuerRequestId> for ClientRequestId {
+    fn from(value: &IssuerRequestId) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl AsRef<str> for ClientRequestId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for ClientRequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientRequestId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::try_new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Deterministic issuer request id for tests. Maps a human-readable label to a
 /// UUID v5 so test aggregate ids stay valid [`IssuerRequestId`] values.
 #[cfg(any(test, feature = "test-support"))]
@@ -141,6 +211,16 @@ pub enum TokenizerError {
 }
 
 impl TokenizerError {
+    /// Whether a first mint submission proved that the provider rejected the
+    /// request before accepting it. Every other error leaves the submission
+    /// outcome uncertain and must be reconciled by issuer request id.
+    pub fn is_definitive_mint_rejection(&self) -> bool {
+        match self {
+            Self::Alpaca(source) => source.is_definitive_mint_rejection(),
+            Self::MintVerification(_) => false,
+        }
+    }
+
     /// Classifies this error as broker rate-limiting (HTTP 429), returning
     /// its `Retry-After` hint when the broker sent one.
     ///
@@ -207,6 +287,13 @@ pub trait Tokenizer: Send + Sync {
         wallet: Address,
         issuer_request_id: IssuerRequestId,
     ) -> Result<TokenizationRequest, TokenizerError>;
+
+    /// Find a mint request by our stable internal issuer request id.
+    /// Provider adapters map this to their client-supplied correlation field.
+    async fn find_mint_by_issuer_request_id(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<Option<TokenizationRequest>, TokenizerError>;
 
     /// Poll a mint request until it reaches a terminal state.
     async fn poll_mint_until_complete(
@@ -278,7 +365,45 @@ pub trait Tokenizer: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{TokenizationRequestId, TokenizationRequestIdError};
+    use super::{
+        ClientRequestId, ClientRequestIdError, TokenizationRequestId, TokenizationRequestIdError,
+    };
+
+    #[test]
+    fn client_request_id_accepts_documented_provider_domain() {
+        let label = ClientRequestId::try_new("my mint-ref-001").unwrap();
+        assert_eq!(label.as_ref(), "my mint-ref-001");
+
+        let maximum_length = "x".repeat(128);
+        assert_eq!(
+            ClientRequestId::try_new(&maximum_length).unwrap().as_ref(),
+            maximum_length
+        );
+    }
+
+    #[test]
+    fn client_request_id_rejects_values_outside_provider_domain() {
+        assert_eq!(
+            ClientRequestId::try_new("").unwrap_err(),
+            ClientRequestIdError::Empty
+        );
+        assert_eq!(
+            ClientRequestId::try_new("x".repeat(129)).unwrap_err(),
+            ClientRequestIdError::TooLong
+        );
+        assert_eq!(
+            ClientRequestId::try_new("contains\nnewline").unwrap_err(),
+            ClientRequestIdError::NonPrintableAscii
+        );
+        assert_eq!(
+            ClientRequestId::try_new(" leading-space").unwrap_err(),
+            ClientRequestIdError::SurroundingWhitespace
+        );
+        assert_eq!(
+            ClientRequestId::try_new("trailing-space ").unwrap_err(),
+            ClientRequestIdError::SurroundingWhitespace
+        );
+    }
 
     #[test]
     fn tokenization_request_id_rejects_empty_string() {

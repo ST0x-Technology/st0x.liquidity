@@ -6,7 +6,10 @@ mod usdc;
 
 #[cfg(test)]
 pub(crate) use equity::InProgressGuard;
-pub(crate) use equity::{GuardState, RecoveryGuard, claim_guard_for_recovery_or_orphan};
+pub(crate) use equity::{
+    GuardGeneration, GuardState, RecoveryGuard, claim_guard_for_recovery_or_orphan,
+    remove_active_transfer,
+};
 
 use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
@@ -28,7 +31,7 @@ use st0x_event_sorcery::{
 use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Positive, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, Usdc};
-use st0x_tokenization::{IssuerRequestId, TokenizationRequestId};
+use st0x_tokenization::{ClientRequestId, IssuerRequestId, TokenizationRequestId};
 use st0x_wrapper::{Wrapper, WrapperError};
 
 use self::freeze::FreezeStatusReader;
@@ -942,13 +945,7 @@ impl RebalancingService {
         };
 
         for id in timed_out_ids {
-            let Some(symbol) = self
-                .mint_tracking
-                .read()
-                .await
-                .get(&id)
-                .map(|t| t.symbol.clone())
-            else {
+            let Some(pending_tracking) = self.mint_tracking.read().await.get(&id).cloned() else {
                 debug!(
                     target: "rebalance",
                     ?id,
@@ -956,6 +953,19 @@ impl RebalancingService {
                 );
                 continue;
             };
+
+            if pending_tracking.stage == MintTrackingStage::Requested {
+                warn!(
+                    target: "rebalance",
+                    aggregate_id = %id,
+                    symbol = %pending_tracking.symbol,
+                    "Mint request exceeded the transfer timeout with an uncertain provider \
+                     outcome; preserving tracking, inventory, and guard for reconciliation"
+                );
+                continue;
+            }
+
+            let symbol = pending_tracking.symbol;
 
             // Steady-state skip: if recovery already owns the slot, leave the
             // mint untouched -- recovery drives it to terminal, and removing its
@@ -2560,7 +2570,7 @@ impl PendingRequestOwnership for RebalancingService {
         let redemption_tracking = self.redemption_tracking.read().await;
 
         PendingRequestOwnershipSnapshot {
-            mint_issuers: mint_tracking.keys().cloned().collect(),
+            mint_issuers: mint_tracking.keys().map(ClientRequestId::from).collect(),
             mint_tokenizations: mint_tracking
                 .values()
                 .filter_map(|tracking| tracking.tokenization_request_id.clone())
@@ -3170,7 +3180,7 @@ impl RebalancingService {
             TriggeredOperation::Redemption {
                 symbol, quantity, ..
             } => {
-                self.enqueue_transfer_equity_to_hedging(symbol, quantity)
+                self.enqueue_transfer_equity_to_hedging(symbol, quantity, guard.generation())
                     .await
             }
         };
@@ -3925,7 +3935,7 @@ impl RebalancingService {
         &self,
         symbol: Symbol,
         quantity: FractionalShares,
-        generation: u64,
+        generation: equity::GuardGeneration,
     ) -> bool {
         // A non-terminal row in flight longer than this is treated as likely
         // stuck: the suppression is logged at warn (with the row id and age)
@@ -4027,6 +4037,7 @@ impl RebalancingService {
         &self,
         symbol: Symbol,
         quantity: FractionalShares,
+        generation: equity::GuardGeneration,
     ) -> bool {
         const STUCK_TRANSFER_WARN_AFTER_SECS: i64 = 15 * 60;
 
@@ -4088,6 +4099,7 @@ impl RebalancingService {
                 aggregate_id: aggregate_id.clone(),
                 symbol: symbol.clone(),
                 quantity,
+                generation,
                 backpressure_streak: BackpressureStreak::default(),
             })
             .await;
@@ -4164,11 +4176,19 @@ impl RebalancingService {
             Ok(guard) => guard,
             Err(poison) => poison.into_inner(),
         };
+        let Some(generation) = equity::next_generation() else {
+            error!(
+                target: "rebalance",
+                %symbol,
+                "Equity guard generation counter exhausted during startup recovery; \
+                 holding the symbol for operator recovery"
+            );
+            guard.insert(symbol.clone(), equity::GuardState::HeldForRecovery);
+            return;
+        };
         guard.insert(
             symbol.clone(),
-            equity::GuardState::ActiveTransfer {
-                generation: equity::next_generation(),
-            },
+            equity::GuardState::ActiveTransfer { generation },
         );
     }
 
@@ -6049,7 +6069,11 @@ mod tests {
         assert_eq!(tracking.last_progress_at, accepted_at);
 
         let ownership = trigger.pending_request_ownership().await;
-        assert!(ownership.mint_issuers.contains(&mint_id));
+        assert!(
+            ownership
+                .mint_issuers
+                .contains(&ClientRequestId::from(&mint_id))
+        );
         assert!(
             ownership
                 .mint_tokenizations
@@ -7354,7 +7378,11 @@ mod tests {
 
         let ownership = trigger.pending_request_ownership().await;
 
-        assert!(ownership.mint_issuers.contains(&mint_id));
+        assert!(
+            ownership
+                .mint_issuers
+                .contains(&ClientRequestId::from(&mint_id))
+        );
         assert!(
             ownership
                 .mint_tokenizations
@@ -7373,7 +7401,11 @@ mod tests {
             .unwrap();
 
         let ownership = trigger.pending_request_ownership().await;
-        assert!(!ownership.mint_issuers.contains(&mint_id));
+        assert!(
+            !ownership
+                .mint_issuers
+                .contains(&ClientRequestId::from(&mint_id))
+        );
         assert!(
             !ownership
                 .mint_tokenizations
@@ -7419,7 +7451,11 @@ mod tests {
             .unwrap();
 
         let ownership = trigger.pending_request_ownership().await;
-        assert!(!ownership.mint_issuers.contains(&success_mint_id));
+        assert!(
+            !ownership
+                .mint_issuers
+                .contains(&ClientRequestId::from(&success_mint_id))
+        );
         assert!(
             !ownership
                 .mint_tokenizations
@@ -7673,7 +7709,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
 
@@ -8133,7 +8171,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
 
@@ -8164,7 +8204,9 @@ mod tests {
         // Verify clear works on ActiveTransfer.
         trigger.equity_in_progress.write().unwrap().insert(
             symbol.clone(),
-            equity::GuardState::ActiveTransfer { generation: 0 },
+            equity::GuardState::ActiveTransfer {
+                generation: equity::GuardGeneration::default(),
+            },
         );
         trigger.clear_equity_in_progress(&symbol);
         assert!(
@@ -9353,7 +9395,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
         assert!(
@@ -9392,7 +9436,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
 
@@ -9471,7 +9517,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
 
@@ -9515,7 +9563,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
 
@@ -9732,7 +9782,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
 
@@ -9795,7 +9847,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
 
@@ -9847,7 +9901,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
 
@@ -9893,7 +9949,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
 
@@ -9942,7 +10000,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
 
@@ -9991,7 +10051,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
 
@@ -12572,7 +12634,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
         assert!(
@@ -15181,7 +15245,7 @@ mod tests {
                 issuer_request_id: IssuerRequestId::generate(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
-                generation: 0,
+                generation: equity::GuardGeneration::default(),
 
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -15198,7 +15262,11 @@ mod tests {
         .unwrap();
 
         let enqueued = service
-            .enqueue_transfer_equity_to_hedging(symbol, FractionalShares::new(float!(1)))
+            .enqueue_transfer_equity_to_hedging(
+                symbol,
+                FractionalShares::new(float!(1)),
+                equity::GuardGeneration::default(),
+            )
             .await;
 
         assert!(
@@ -15221,7 +15289,7 @@ mod tests {
                 issuer_request_id: IssuerRequestId::generate(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
-                generation: 0,
+                generation: equity::GuardGeneration::default(),
 
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -15235,7 +15303,11 @@ mod tests {
             .unwrap();
 
         let enqueued = service
-            .enqueue_transfer_equity_to_hedging(symbol, FractionalShares::new(float!(1)))
+            .enqueue_transfer_equity_to_hedging(
+                symbol,
+                FractionalShares::new(float!(1)),
+                equity::GuardGeneration::default(),
+            )
             .await;
 
         assert!(!enqueued, "a Running equity transfer must block enqueue");
@@ -15258,7 +15330,7 @@ mod tests {
                 issuer_request_id: mint_id.clone(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
-                generation: 0,
+                generation: equity::GuardGeneration::default(),
 
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -15281,7 +15353,11 @@ mod tests {
         .await;
 
         let enqueued = service
-            .enqueue_transfer_equity_to_hedging(symbol, FractionalShares::new(float!(1)))
+            .enqueue_transfer_equity_to_hedging(
+                symbol,
+                FractionalShares::new(float!(1)),
+                equity::GuardGeneration::default(),
+            )
             .await;
 
         assert!(
@@ -15319,7 +15395,7 @@ mod tests {
                 aggregate_id: redemption_id,
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
-
+                generation: equity::GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
             })
             .await
@@ -15341,7 +15417,11 @@ mod tests {
         .await;
 
         let enqueued = service
-            .enqueue_transfer_equity_to_market_making(symbol, FractionalShares::new(float!(1)), 0)
+            .enqueue_transfer_equity_to_market_making(
+                symbol,
+                FractionalShares::new(float!(1)),
+                equity::GuardGeneration::default(),
+            )
             .await;
 
         assert!(
@@ -15378,7 +15458,7 @@ mod tests {
                 issuer_request_id: mint_id,
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
-                generation: 0,
+                generation: equity::GuardGeneration::default(),
 
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -15401,7 +15481,11 @@ mod tests {
         .await;
 
         let enqueued = service
-            .enqueue_transfer_equity_to_hedging(symbol, FractionalShares::new(float!(1)))
+            .enqueue_transfer_equity_to_hedging(
+                symbol,
+                FractionalShares::new(float!(1)),
+                equity::GuardGeneration::default(),
+            )
             .await;
 
         assert!(
@@ -15435,7 +15519,7 @@ mod tests {
                 aggregate_id: redemption_id,
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
-
+                generation: equity::GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
             })
             .await
@@ -15457,7 +15541,11 @@ mod tests {
         .await;
 
         let enqueued = service
-            .enqueue_transfer_equity_to_market_making(symbol, FractionalShares::new(float!(1)), 0)
+            .enqueue_transfer_equity_to_market_making(
+                symbol,
+                FractionalShares::new(float!(1)),
+                equity::GuardGeneration::default(),
+            )
             .await;
 
         assert!(
@@ -15490,7 +15578,7 @@ mod tests {
                 issuer_request_id: IssuerRequestId::generate(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
-                generation: 0,
+                generation: equity::GuardGeneration::default(),
 
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -15507,7 +15595,11 @@ mod tests {
 
         // Do NOT call set_stores: mint_store stays None.
         let enqueued = service
-            .enqueue_transfer_equity_to_hedging(symbol, FractionalShares::new(float!(1)))
+            .enqueue_transfer_equity_to_hedging(
+                symbol,
+                FractionalShares::new(float!(1)),
+                equity::GuardGeneration::default(),
+            )
             .await;
 
         assert!(
@@ -15531,7 +15623,7 @@ mod tests {
                 issuer_request_id: IssuerRequestId::generate(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
-                generation: 0,
+                generation: equity::GuardGeneration::default(),
 
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -15554,7 +15646,11 @@ mod tests {
         .await;
 
         let enqueued = service
-            .enqueue_transfer_equity_to_hedging(symbol, FractionalShares::new(float!(1)))
+            .enqueue_transfer_equity_to_hedging(
+                symbol,
+                FractionalShares::new(float!(1)),
+                equity::GuardGeneration::default(),
+            )
             .await;
 
         assert!(
@@ -15584,7 +15680,7 @@ mod tests {
                 issuer_request_id: IssuerRequestId::generate(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
-                generation: 0,
+                generation: equity::GuardGeneration::default(),
 
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -15617,7 +15713,11 @@ mod tests {
         .await;
 
         let enqueued = service
-            .enqueue_transfer_equity_to_hedging(symbol, FractionalShares::new(float!(1)))
+            .enqueue_transfer_equity_to_hedging(
+                symbol,
+                FractionalShares::new(float!(1)),
+                equity::GuardGeneration::default(),
+            )
             .await;
 
         assert!(
@@ -15643,7 +15743,7 @@ mod tests {
                 aggregate_id: redemption_aggregate_id("corrupt-redemption-payload"),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
-
+                generation: equity::GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
             })
             .await
@@ -15671,7 +15771,11 @@ mod tests {
         .await;
 
         let enqueued = service
-            .enqueue_transfer_equity_to_market_making(symbol, FractionalShares::new(float!(1)), 0)
+            .enqueue_transfer_equity_to_market_making(
+                symbol,
+                FractionalShares::new(float!(1)),
+                equity::GuardGeneration::default(),
+            )
             .await;
 
         assert!(
@@ -15701,7 +15805,7 @@ mod tests {
                     issuer_request_id: zombie_id.clone(),
                     symbol: symbol.clone(),
                     quantity: FractionalShares::new(float!(1)),
-                    generation: 0,
+                    generation: equity::GuardGeneration::default(),
 
                     backpressure_streak: BackpressureStreak::default(),
                 })
@@ -15725,7 +15829,11 @@ mod tests {
         .await;
 
         let enqueued = service
-            .enqueue_transfer_equity_to_hedging(symbol, FractionalShares::new(float!(1)))
+            .enqueue_transfer_equity_to_hedging(
+                symbol,
+                FractionalShares::new(float!(1)),
+                equity::GuardGeneration::default(),
+            )
             .await;
 
         assert!(enqueued, "all mint zombies cleared: enqueue must succeed");
@@ -15768,7 +15876,7 @@ mod tests {
                 issuer_request_id: zombie_mint_id.clone(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
-                generation: 0,
+                generation: equity::GuardGeneration::default(),
 
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -15791,7 +15899,7 @@ mod tests {
                 aggregate_id: live_redemption_id,
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
-
+                generation: equity::GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
             })
             .await
@@ -15806,7 +15914,11 @@ mod tests {
         .await;
 
         let enqueued = service
-            .enqueue_transfer_equity_to_market_making(symbol, FractionalShares::new(float!(1)), 0)
+            .enqueue_transfer_equity_to_market_making(
+                symbol,
+                FractionalShares::new(float!(1)),
+                equity::GuardGeneration::default(),
+            )
             .await;
 
         assert!(
@@ -21865,7 +21977,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
 
@@ -22031,7 +22145,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
 
@@ -23693,7 +23809,11 @@ mod tests {
 
         // A different symbol is not suppressed by AAPL's pending row.
         let enqueued = trigger
-            .enqueue_transfer_equity_to_market_making(Symbol::new("TSLA").unwrap(), shares(30), 0)
+            .enqueue_transfer_equity_to_market_making(
+                Symbol::new("TSLA").unwrap(),
+                shares(30),
+                equity::GuardGeneration::default(),
+            )
             .await;
         assert!(
             enqueued,
@@ -23790,7 +23910,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
 
@@ -26184,6 +26306,73 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn expire_stuck_mints_preserves_requested_uncertain_outcome() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(10)),
+                now,
+            )
+            .unwrap();
+        let reactor = make_trigger_with_inventory_and_registry_config(
+            inventory,
+            &symbol,
+            test_config_with_timeout(Duration::from_secs(60)),
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = issuer_request_id("requested-uncertain-timeout");
+        let generation = equity::next_generation().unwrap();
+
+        trigger.mint_tracking.write().await.insert(
+            id.clone(),
+            MintTracking {
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                tokenization_request_id: None,
+                stage: MintTrackingStage::Requested,
+                last_progress_at: now - ChronoDuration::hours(2),
+            },
+        );
+        trigger.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::ActiveTransfer { generation },
+        );
+
+        trigger.expire_stuck_mints(now).await.unwrap();
+
+        let tracking = trigger.mint_tracking.read().await.get(&id).unwrap().clone();
+        assert_eq!(tracking.symbol, symbol);
+        assert_eq!(tracking.quantity, shares(10));
+        assert_eq!(tracking.tokenization_request_id, None);
+        assert_eq!(tracking.stage, MintTrackingStage::Requested);
+        assert_eq!(tracking.last_progress_at, now - ChronoDuration::hours(2));
+        assert_eq!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&equity::GuardState::ActiveTransfer { generation })
+        );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(10))
+        );
+        assert!(!trigger.timed_out_mints.read().await.contains_key(&id));
+        assert!(
+            !trigger
+                .suppressed_inflight_symbols
+                .read()
+                .await
+                .contains_key(&symbol)
+        );
+    }
+
     /// `clear_equity_in_progress_unless_held_for_recovery` is the single-lock
     /// check-and-clear that closes the timeout-sweep TOCTOU race: a concurrent
     /// `mark_held_for_recovery` can flip `ActiveTransfer` -> `HeldForRecovery`
@@ -26239,7 +26428,9 @@ mod tests {
         // a fresh rebalance can proceed.
         trigger.equity_in_progress.write().unwrap().insert(
             symbol.clone(),
-            equity::GuardState::ActiveTransfer { generation: 0 },
+            equity::GuardState::ActiveTransfer {
+                generation: equity::GuardGeneration::default(),
+            },
         );
         assert!(
             trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol),
@@ -26490,7 +26681,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
         trigger.mint_tracking.write().await.insert(
@@ -26531,7 +26724,9 @@ mod tests {
                 .unwrap()
                 .get(&symbol)
                 .cloned(),
-            Some(equity::GuardState::ActiveTransfer { generation: 0 }),
+            Some(equity::GuardState::ActiveTransfer {
+                generation: equity::GuardGeneration::default(),
+            }),
             "a hard failure outside InsufficientInflight must leave the \
              in-progress guard latched, not silently clear it"
         );
@@ -26567,7 +26762,9 @@ mod tests {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(
                 symbol.clone(),
-                equity::GuardState::ActiveTransfer { generation: 0 },
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
             );
         }
         trigger.redemption_tracking.write().await.insert(
