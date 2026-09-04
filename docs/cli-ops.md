@@ -126,10 +126,10 @@ now runs from a keyholder's machine: decrypt the secret with your age identity
 and point the CLI at the committed config:
 
 ```sh
-nix develop -c secret decrypt s01-issuer.toml   # or: ragenix -d secret/s01-issuer.toml.age -i <key>
+ragenix -d secret/s01-issuer.toml.age -i <your-age-key> > /tmp/s01-secrets.toml
 cargo run --bin cli -- \
   --config config/s01-issuer.toml \
-  --secrets <decrypted-secrets-file> \
+  --secrets /tmp/s01-secrets.toml \
   dividend-bump -s COIN -q 10
 ```
 

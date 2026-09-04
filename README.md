@@ -417,7 +417,8 @@ secret/
 dashboard/                 # SvelteKit operations dashboard
 .github/workflows/
 ├── ci.yaml                # Build, test, clippy, dashboard
-└── cd.yaml                # Deploy to NixOS host
+├── build-oci.yml          # Build, sign, push the OCI images
+└── release-tag.yml        # Promote a tagged image
 ```
 
 ## Development
