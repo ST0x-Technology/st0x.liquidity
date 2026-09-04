@@ -7062,6 +7062,10 @@ mod tests {
         fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
     fn create_order_with_usdc_and_equity_vaults(owner: Address) -> OrderV4 {
+        create_order_with_vaults(owner, USDC_BASE)
+    }
+
+    fn create_order_with_vaults(owner: Address, usdc: Address) -> OrderV4 {
         OrderV4 {
             owner,
             evaluable: EvaluableV4 {
@@ -7074,7 +7078,7 @@ mod tests {
             ),
             validInputs: vec![
                 IOV2 {
-                    token: USDC_BASE,
+                    token: usdc,
                     vaultId: TEST_VAULT_ID,
                 },
                 IOV2 {
@@ -7084,7 +7088,7 @@ mod tests {
             ],
             validOutputs: vec![
                 IOV2 {
-                    token: USDC_BASE,
+                    token: usdc,
                     vaultId: TEST_VAULT_ID,
                 },
                 IOV2 {
@@ -7096,6 +7100,14 @@ mod tests {
     }
 
     fn create_emitted_clear_event(
+        alice: OrderV4,
+        bob: OrderV4,
+    ) -> EmittedOnChain<RaindexTradeEvent> {
+        create_emitted_clear_event_on(Chain::Base, alice, bob)
+    }
+
+    fn create_emitted_clear_event_on(
+        chain: Chain,
         alice: OrderV4,
         bob: OrderV4,
     ) -> EmittedOnChain<RaindexTradeEvent> {
@@ -7114,7 +7126,7 @@ mod tests {
         };
 
         EmittedOnChain::from_log(
-            Chain::Base,
+            chain,
             RaindexTradeEvent::ClearV3(Box::new(clear_event)),
             &get_test_log(),
         )
@@ -7266,6 +7278,39 @@ mod tests {
         assert!(
             !registry.usdc_vaults.is_empty(),
             "Expected USDC vault to be discovered"
+        );
+    }
+
+    /// The USDC vault is recognized by the fill chain's own canonical USDC
+    /// address and registered under that chain's registry id.
+    #[tokio::test]
+    async fn discover_vaults_for_trade_classifies_usdc_by_the_fills_chain() {
+        let pool = setup_test_db().await;
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), ());
+
+        let alice = create_order_with_vaults(ORDER_OWNER, st0x_evm::USDC_ETHEREUM);
+        let bob = create_order_with_vaults(OTHER_OWNER, st0x_evm::USDC_ETHEREUM);
+        let queued_event = create_emitted_clear_event_on(Chain::Ethereum, alice, bob);
+        let trade = create_test_trade("AAPL");
+
+        let context = create_vault_discovery_context(&vault_registry);
+        discover_vaults_for_trade(&queued_event, &trade, &context)
+            .await
+            .unwrap();
+
+        let registry = vault_registry
+            .load(&VaultRegistryId {
+                chain: Chain::Ethereum,
+                orderbook: TEST_ORDERBOOK,
+                owner: ORDER_OWNER,
+            })
+            .await
+            .unwrap()
+            .expect("registry under the Ethereum id");
+        assert_eq!(
+            registry.usdc_vaults.len(),
+            1,
+            "Ethereum USDC vault must be discovered"
         );
     }
 

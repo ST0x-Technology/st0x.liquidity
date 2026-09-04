@@ -1944,8 +1944,27 @@ mod tests {
         withdraw: OperatorWithdraw,
         withdraw_decimals: u8,
     ) -> Result<Option<OnchainTrade>, OnChainError> {
+        run_inventory_parser_on(
+            Chain::Ethereum,
+            INVENTORY_USDC,
+            deposit,
+            deposit_decimals,
+            withdraw,
+            withdraw_decimals,
+        )
+        .await
+    }
+
+    async fn run_inventory_parser_on(
+        chain: Chain,
+        usdc: Address,
+        deposit: OperatorDeposit,
+        deposit_decimals: u8,
+        withdraw: OperatorWithdraw,
+        withdraw_decimals: u8,
+    ) -> Result<Option<OnchainTrade>, OnChainError> {
         let cache = SymbolCache::default();
-        preload_on_all_chains(&cache, INVENTORY_USDC, "USDC");
+        preload_on_all_chains(&cache, usdc, "USDC");
         preload_on_all_chains(&cache, INVENTORY_EQUITY, "wtAAPL");
         let assets = assets_config_with_equity("AAPL", INVENTORY_EQUITY);
 
@@ -1962,7 +1981,7 @@ mod tests {
         let inv = InventoryTrade { deposit, withdraw };
 
         OnchainTrade::try_from_inventory_trade(
-            Chain::Ethereum,
+            chain,
             &cache,
             &evm,
             &assets,
@@ -2078,6 +2097,52 @@ mod tests {
         assert_eq!(trade.equity_token, INVENTORY_EQUITY);
         assert_eq!(trade.amount, FractionalShares::new(float!(2)));
         assert!(trade.price.value().eq(float!(80)).unwrap());
+    }
+
+    /// The USDC leg is validated against the fill chain's own canonical USDC:
+    /// an Ethereum inventory fill carries `USDC_ETHEREUM`, not Base's address.
+    #[tokio::test]
+    async fn try_from_inventory_trade_accepts_the_fill_chains_own_usdc() {
+        let trade = run_inventory_parser_on(
+            Chain::Ethereum,
+            st0x_evm::USDC_ETHEREUM,
+            operator_deposit(st0x_evm::USDC_ETHEREUM, uint!(160000000_U256)),
+            6,
+            operator_withdraw(INVENTORY_EQUITY, uint!(2000000000000000000_U256)),
+            18,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(trade.symbol.to_string(), "wtAAPL");
+        assert_eq!(trade.direction, Direction::Sell);
+    }
+
+    /// Base's USDC address is just another unrecognized token on Ethereum.
+    #[tokio::test]
+    async fn try_from_inventory_trade_rejects_another_chains_usdc() {
+        let error = run_inventory_parser_on(
+            Chain::Ethereum,
+            USDC_BASE,
+            operator_deposit(USDC_BASE, uint!(160000000_U256)),
+            6,
+            operator_withdraw(INVENTORY_EQUITY, uint!(2000000000000000000_U256)),
+            18,
+        )
+        .await
+        .unwrap_err();
+
+        match error {
+            OnChainError::Validation(TradeValidationError::UnrecognizedInventoryToken {
+                token,
+                claimed_symbol,
+            }) => {
+                assert_eq!(token, USDC_BASE);
+                assert_eq!(claimed_symbol, "USDC");
+            }
+            other => panic!("expected UnrecognizedInventoryToken, got {other:?}"),
+        }
     }
 
     /// A spoof token whose `symbol()` reports "USDC" but whose address is NOT
