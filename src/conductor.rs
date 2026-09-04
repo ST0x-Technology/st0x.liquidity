@@ -396,9 +396,6 @@ pub struct TradeProcessingCqrs {
     /// in the placement path, not the command handler.
     pub order_placer: Arc<dyn OrderPlacer>,
     pub execution_threshold: ExecutionThreshold,
-    /// What the trading chain lists: token addresses, vault ids, per-asset
-    /// switches and operational limits.
-    pub assets: ChainAssets,
     /// How each symbol is hedged, independent of where it is listed.
     pub hedging: HedgingAssets,
     pub counter_trade_submission_lock: Arc<Mutex<()>>,
@@ -3844,6 +3841,7 @@ pub async fn process_queued_trade<E: Executor>(
     trade_event: &EmittedOnChain<RaindexTradeEvent>,
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
+    assets: &ChainAssets,
     asset_enabled: bool,
 ) -> Result<Option<OffchainOrderId>, TradeAccountingError>
 where
@@ -3882,7 +3880,7 @@ where
         &cqrs.position_projection,
         base_symbol,
         executor_type,
-        &cqrs.assets,
+        assets,
         &cqrs.hedging,
         asset_enabled,
     )
@@ -7587,7 +7585,7 @@ mod tests {
         pool: &SqlitePool,
         threshold: ExecutionThreshold,
         apalis_pool: &apalis_sqlite::SqlitePool,
-    ) -> TradeProcessingCqrs {
+    ) -> (TradeProcessingCqrs, ChainAssets) {
         trade_processing_cqrs_with_assets(
             frameworks,
             pool,
@@ -7606,10 +7604,10 @@ mod tests {
         threshold: ExecutionThreshold,
         apalis_pool: &apalis_sqlite::SqlitePool,
         assets: ChainAssets,
-    ) -> TradeProcessingCqrs {
+    ) -> (TradeProcessingCqrs, ChainAssets) {
         let hedging = hedging_for(&assets, OperationMode::Disabled);
 
-        TradeProcessingCqrs {
+        let cqrs = TradeProcessingCqrs {
             hedging,
             pool: pool.clone(),
             onchain_trade: frameworks.onchain_trade.clone(),
@@ -7618,14 +7616,15 @@ mod tests {
             offchain_order: frameworks.offchain_order.clone(),
             order_placer: succeeding_order_placer(),
             execution_threshold: threshold,
-            assets,
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
             close_flatten_policy: CloseFlattenPolicy::from_secs(900).unwrap(),
             close_flatten_ramp: CloseFlattenCrossRamp::new(100, 400).unwrap(),
             poll_status_queue: PollOrderStatusJobQueue::new(apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
-        }
+        };
+
+        (cqrs, assets)
     }
 
     /// A hedging policy for every symbol the listing carries, which is what
@@ -7750,7 +7749,7 @@ mod tests {
     async fn trade_below_threshold_does_not_place_order() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -7760,8 +7759,15 @@ mod tests {
         let trade_event = make_trade_event(10);
         let trade = test_trade_with_amount(float!(0.5), 10);
 
-        let result =
-            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true).await;
+        let result = process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event,
+            trade,
+            &cqrs,
+            &assets,
+            true,
+        )
+        .await;
 
         assert_eq!(
             result.unwrap(),
@@ -7790,7 +7796,7 @@ mod tests {
     async fn trade_above_threshold_places_offchain_order() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -7800,8 +7806,15 @@ mod tests {
         let trade_event = make_trade_event(20);
         let trade = test_trade_with_amount(float!(1.5), 20);
 
-        let result =
-            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true).await;
+        let result = process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event,
+            trade,
+            &cqrs,
+            &assets,
+            true,
+        )
+        .await;
 
         let offchain_order_id = result
             .unwrap()
@@ -7849,7 +7862,7 @@ mod tests {
         let (pool, apalis_pool, db_path, _dir) =
             crate::test_utils::setup_file_backed_test_db(Duration::from_millis(250)).await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -7871,6 +7884,7 @@ mod tests {
             &make_trade_event(40),
             test_trade_with_amount(float!(1.5), 40),
             &cqrs,
+            &assets,
             true,
         )
         .await;
@@ -7890,6 +7904,7 @@ mod tests {
             &make_trade_event(40),
             test_trade_with_amount(float!(1.5), 40),
             &cqrs,
+            &assets,
             true,
         )
         .await
@@ -7946,7 +7961,7 @@ mod tests {
     async fn dedup_load_failure_propagates_as_retryable_error() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -7962,6 +7977,7 @@ mod tests {
             &make_trade_event(41),
             test_trade_with_amount(float!(1.5), 41),
             &cqrs,
+            &assets,
             true,
         )
         .await;
@@ -7986,7 +8002,7 @@ mod tests {
     async fn redelivery_after_crash_between_witness_and_acknowledge_recovers_fill() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -8026,6 +8042,7 @@ mod tests {
             &trade_event,
             test_trade_with_amount(float!(1.5), 60),
             &cqrs,
+            &assets,
             true,
         )
         .await
@@ -8121,6 +8138,7 @@ mod tests {
             &trade_event,
             test_trade_with_amount(float!(1.5), 60),
             &cqrs,
+            &assets,
             true,
         )
         .await
@@ -8148,7 +8166,7 @@ mod tests {
     async fn resume_path_acknowledges_trade_without_enrichment() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -8189,9 +8207,16 @@ mod tests {
             .expect("witnessed aggregate exists");
         assert!(witnessed_state.enrichment.is_none());
 
-        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
-            .await
-            .unwrap();
+        process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event,
+            trade,
+            &cqrs,
+            &assets,
+            true,
+        )
+        .await
+        .unwrap();
 
         let recovered = cqrs
             .onchain_trade
@@ -8223,7 +8248,7 @@ mod tests {
     async fn redelivery_after_crash_between_position_write_and_marker_recovers_fill() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -8279,6 +8304,7 @@ mod tests {
             &trade_event,
             test_trade_with_amount(float!(1.5), 60),
             &cqrs,
+            &assets,
             true,
         )
         .await
@@ -8347,7 +8373,7 @@ mod tests {
     async fn execute_mark_acknowledged_is_idempotent() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -8409,7 +8435,7 @@ mod tests {
     async fn redelivery_of_marked_fill_after_later_fill_is_deduped() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -8424,6 +8450,7 @@ mod tests {
             &event_a,
             test_trade_with_amount(float!(1.0), 60),
             &cqrs,
+            &assets,
             true,
         )
         .await
@@ -8435,6 +8462,7 @@ mod tests {
             &event_b,
             test_trade_with_amount(float!(2.0), 61),
             &cqrs,
+            &assets,
             true,
         )
         .await
@@ -8459,6 +8487,7 @@ mod tests {
             &event_a,
             test_trade_with_amount(float!(1.0), 60),
             &cqrs,
+            &assets,
             true,
         )
         .await
@@ -8493,7 +8522,7 @@ mod tests {
     async fn redelivery_of_unmarked_fill_after_later_fill_is_rejected() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -8532,6 +8561,7 @@ mod tests {
             &event_b,
             test_trade_with_amount(float!(2.0), 61),
             &cqrs,
+            &assets,
             true,
         )
         .await
@@ -8553,6 +8583,7 @@ mod tests {
             &event_a,
             test_trade_with_amount(float!(1.0), 60),
             &cqrs,
+            &assets,
             true,
         )
         .await
@@ -8580,7 +8611,7 @@ mod tests {
     async fn execute_acknowledge_fill_redrive_is_idempotent() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -8629,7 +8660,7 @@ mod tests {
     async fn acknowledge_fill_persists_the_trades_block_number() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -8681,7 +8712,7 @@ mod tests {
     async fn process_queued_trade_rejects_missing_block_timestamp() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -8692,9 +8723,16 @@ mod tests {
         let mut trade = test_trade_with_amount(float!(1.5), 60);
         trade.block_timestamp = None;
 
-        let error = process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
-            .await
-            .unwrap_err();
+        let error = process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event,
+            trade,
+            &cqrs,
+            &assets,
+            true,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(error, TradeAccountingError::MissingBlockTimestamp { .. }),
             "a fill without a block timestamp must fail loudly, not drop silently; got {error:?}"
@@ -8715,7 +8753,7 @@ mod tests {
     async fn broker_outage_records_fill_and_defers_hedge_to_rescan() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -8729,6 +8767,7 @@ mod tests {
             &make_trade_event(50),
             test_trade_with_amount(float!(1.5), 50),
             &cqrs,
+            &assets,
             true,
         )
         .await;
@@ -8742,6 +8781,7 @@ mod tests {
             &make_trade_event(50),
             test_trade_with_amount(float!(1.5), 50),
             &cqrs,
+            &assets,
             true,
         )
         .await
@@ -8781,7 +8821,7 @@ mod tests {
                 order_placer: cqrs.order_placer.as_ref(),
                 counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
                 threshold: &cqrs.execution_threshold,
-                assets: &cqrs.assets,
+                assets: &assets,
             },
             |_| true,
         )
@@ -8813,7 +8853,7 @@ mod tests {
     async fn duplicate_trade_event_is_single_effect() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -8827,6 +8867,7 @@ mod tests {
             &trade_event,
             test_trade_with_amount(float!(1.5), 30),
             &cqrs,
+            &assets,
             true,
         )
         .await
@@ -8839,6 +8880,7 @@ mod tests {
             &trade_event,
             test_trade_with_amount(float!(1.5), 30),
             &cqrs,
+            &assets,
             true,
         )
         .await
@@ -8896,7 +8938,7 @@ mod tests {
     async fn trade_above_threshold_skips_counter_trade_without_offchain_inventory() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -8913,7 +8955,7 @@ mod tests {
             cash_withdrawable_cents: None,
         });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
             .await
             .unwrap();
 
@@ -8949,7 +8991,7 @@ mod tests {
         let (frameworks, offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let cqrs = trade_processing_cqrs_with_assets(
+        let (cqrs, assets) = trade_processing_cqrs_with_assets(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -8969,7 +9011,7 @@ mod tests {
                 cash_withdrawable_cents: None,
             });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
             .await
             .unwrap();
 
@@ -9028,7 +9070,7 @@ mod tests {
                 alpaca_usdc: None,
                 cash_withdrawable_cents: None,
             });
-        let mut cqrs = trade_processing_cqrs_with_assets(
+        let (mut cqrs, _assets) = trade_processing_cqrs_with_assets(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -9067,7 +9109,7 @@ mod tests {
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let symbol = Symbol::new("AAPL").unwrap();
         let executor = MockExecutor::new().with_market_session(MarketSession::Extended);
-        let mut cqrs = trade_processing_cqrs_with_assets(
+        let (mut cqrs, _assets) = trade_processing_cqrs_with_assets(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -9112,7 +9154,7 @@ mod tests {
             .with_position_mark(
                 Positive::new(Usd::new(Float::max_positive_value().unwrap())).unwrap(),
             );
-        let mut cqrs = trade_processing_cqrs_with_assets(
+        let (mut cqrs, _assets) = trade_processing_cqrs_with_assets(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -9151,7 +9193,7 @@ mod tests {
         let executor = MockExecutor::new()
             .with_market_session(MarketSession::Extended)
             .with_market_session_status_failure("calendar endpoint unavailable");
-        let mut cqrs = trade_processing_cqrs_with_assets(
+        let (mut cqrs, _assets) = trade_processing_cqrs_with_assets(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -9197,7 +9239,7 @@ mod tests {
                 alpaca_usdc: None,
                 cash_withdrawable_cents: None,
             });
-        let mut cqrs = trade_processing_cqrs_with_assets(
+        let (mut cqrs, _assets) = trade_processing_cqrs_with_assets(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -9240,6 +9282,24 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let assets = ChainAssets {
+            equities: ChainEquities {
+                operational_limit: None,
+                symbols: HashMap::from([(
+                    Symbol::new("AAPL").unwrap(),
+                    ChainEquityAsset {
+                        tokenized_equity: Address::ZERO,
+                        tokenized_equity_derivative: Address::ZERO,
+                        vault_ids: Vec::new(),
+                        trading: OperationMode::Enabled,
+                        rebalancing: OperationMode::Disabled,
+                        wrapped_equity_recovery: OperationMode::Disabled,
+                        operational_limit: None,
+                    },
+                )]),
+            },
+            cash: None,
+        };
         let cqrs = TradeProcessingCqrs {
             hedging: HedgingAssets {
                 equities: st0x_config::HedgedEquities {
@@ -9260,24 +9320,6 @@ mod tests {
             offchain_order: frameworks.offchain_order.clone(),
             order_placer: succeeding_order_placer(),
             execution_threshold: ExecutionThreshold::whole_share(),
-            assets: ChainAssets {
-                equities: ChainEquities {
-                    operational_limit: None,
-                    symbols: HashMap::from([(
-                        Symbol::new("AAPL").unwrap(),
-                        ChainEquityAsset {
-                            tokenized_equity: Address::ZERO,
-                            tokenized_equity_derivative: Address::ZERO,
-                            vault_ids: Vec::new(),
-                            trading: OperationMode::Enabled,
-                            rebalancing: OperationMode::Disabled,
-                            wrapped_equity_recovery: OperationMode::Disabled,
-                            operational_limit: None,
-                        },
-                    )]),
-                },
-                cash: None,
-            },
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
             close_flatten_policy: CloseFlattenPolicy::from_secs(900).unwrap(),
             close_flatten_ramp: CloseFlattenCrossRamp::new(100, 400).unwrap(),
@@ -9303,7 +9345,7 @@ mod tests {
                 cash_withdrawable_cents: None,
             });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
             .await
             .unwrap();
 
@@ -9371,7 +9413,7 @@ mod tests {
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let symbol = Symbol::new("AAPL").unwrap();
         let assets = extended_hours_assets(&symbol);
-        let mut cqrs = trade_processing_cqrs_with_assets(
+        let (mut cqrs, assets) = trade_processing_cqrs_with_assets(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -9397,7 +9439,7 @@ mod tests {
                 cash_withdrawable_cents: None,
             });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
             .await
             .unwrap();
 
@@ -9437,7 +9479,7 @@ mod tests {
         let (frameworks, _offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let cqrs = trade_processing_cqrs_with_assets(
+        let (cqrs, assets) = trade_processing_cqrs_with_assets(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -9468,7 +9510,7 @@ mod tests {
                 cash_withdrawable_cents: None,
             });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
             .await
             .expect("closed apalis pool should defer to the CheckPositions backstop");
         assert_eq!(
@@ -9507,7 +9549,7 @@ mod tests {
     async fn trade_above_threshold_places_partial_hedge_with_available_inventory() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -9531,10 +9573,11 @@ mod tests {
             cash_withdrawable_cents: None,
         });
 
-        let offchain_order_id = process_queued_trade(&executor, &trade_event, trade, &cqrs, true)
-            .await
-            .unwrap()
-            .expect("Should place a partial hedge order, not skip entirely");
+        let offchain_order_id =
+            process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+                .await
+                .unwrap()
+                .expect("Should place a partial hedge order, not skip entirely");
 
         let offchain_order = offchain_order_projection
             .load(&offchain_order_id)
@@ -9571,7 +9614,7 @@ mod tests {
     async fn trade_above_threshold_still_skips_with_zero_inventory() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -9594,7 +9637,7 @@ mod tests {
             cash_withdrawable_cents: None,
         });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
             .await
             .unwrap();
 
@@ -9617,7 +9660,7 @@ mod tests {
     async fn multiple_trades_accumulate_then_trigger() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -9627,8 +9670,15 @@ mod tests {
         let trade_event_1 = make_trade_event(30);
         let trade_1 = test_trade_with_amount(float!(0.5), 30);
 
-        let result_1 =
-            process_queued_trade(&MockExecutor::new(), &trade_event_1, trade_1, &cqrs, true).await;
+        let result_1 = process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event_1,
+            trade_1,
+            &cqrs,
+            &assets,
+            true,
+        )
+        .await;
 
         assert_eq!(
             result_1.unwrap(),
@@ -9639,8 +9689,15 @@ mod tests {
         let trade_event_2 = make_trade_event(31);
         let trade_2 = test_trade_with_amount(float!(0.7), 31);
 
-        let result_2 =
-            process_queued_trade(&MockExecutor::new(), &trade_event_2, trade_2, &cqrs, true).await;
+        let result_2 = process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event_2,
+            trade_2,
+            &cqrs,
+            &assets,
+            true,
+        )
+        .await;
 
         assert!(
             result_2.unwrap().is_some(),
@@ -9662,7 +9719,7 @@ mod tests {
     async fn pending_order_blocks_new_execution() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -9672,17 +9729,30 @@ mod tests {
         let trade_event_1 = make_trade_event(40);
         let trade_1 = test_trade_with_amount(float!(1.5), 40);
 
-        let first_order_id =
-            process_queued_trade(&MockExecutor::new(), &trade_event_1, trade_1, &cqrs, true)
-                .await
-                .unwrap()
-                .expect("first trade should place an order");
+        let first_order_id = process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event_1,
+            trade_1,
+            &cqrs,
+            &assets,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("first trade should place an order");
 
         let trade_event_2 = make_trade_event(41);
         let trade_2 = test_trade_with_amount(float!(1.5), 41);
 
-        let result_2 =
-            process_queued_trade(&MockExecutor::new(), &trade_event_2, trade_2, &cqrs, true).await;
+        let result_2 = process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event_2,
+            trade_2,
+            &cqrs,
+            &assets,
+            true,
+        )
+        .await;
 
         assert_eq!(
             result_2.unwrap(),
@@ -9720,7 +9790,7 @@ mod tests {
     async fn repeated_fills_against_one_open_order_do_not_fork_additional_poll_jobs() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -9730,10 +9800,17 @@ mod tests {
         let trade_event_1 = make_trade_event(90);
         let trade_1 = test_trade_with_amount(float!(1.5), 90);
 
-        process_queued_trade(&MockExecutor::new(), &trade_event_1, trade_1, &cqrs, true)
-            .await
-            .unwrap()
-            .expect("first trade should place an order");
+        process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event_1,
+            trade_1,
+            &cqrs,
+            &assets,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("first trade should place an order");
 
         assert_eq!(
             pending_job_count::<PollOrderStatus>(&apalis_pool).await,
@@ -9745,9 +9822,16 @@ mod tests {
             let trade_event = make_trade_event(log_index);
             let trade = test_trade_with_amount(float!(0.1), log_index);
 
-            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
-                .await
-                .unwrap();
+            process_queued_trade(
+                &MockExecutor::new(),
+                &trade_event,
+                trade,
+                &cqrs,
+                &assets,
+                true,
+            )
+            .await
+            .unwrap();
         }
 
         assert_eq!(
@@ -9762,7 +9846,7 @@ mod tests {
     async fn periodic_checker_executes_after_order_completion() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -9773,19 +9857,32 @@ mod tests {
         let trade_event_1 = make_trade_event(50);
         let trade_1 = test_trade_with_amount(float!(1.5), 50);
 
-        let first_order_id =
-            process_queued_trade(&MockExecutor::new(), &trade_event_1, trade_1, &cqrs, true)
-                .await
-                .unwrap()
-                .expect("first trade should place an order");
+        let first_order_id = process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event_1,
+            trade_1,
+            &cqrs,
+            &assets,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("first trade should place an order");
 
         // Process second trade -> blocked by pending order
         let trade_event_2 = make_trade_event(51);
         let trade_2 = test_trade_with_amount(float!(1.5), 51);
 
-        process_queued_trade(&MockExecutor::new(), &trade_event_2, trade_2, &cqrs, true)
-            .await
-            .unwrap();
+        process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event_2,
+            trade_2,
+            &cqrs,
+            &assets,
+            true,
+        )
+        .await
+        .unwrap();
 
         // Complete the first order via CQRS
         let symbol = Symbol::new("AAPL").unwrap();
@@ -9830,7 +9927,7 @@ mod tests {
                 order_placer: cqrs.order_placer.as_ref(),
                 counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
                 threshold: &cqrs.execution_threshold,
-                assets: &cqrs.assets,
+                assets: &assets,
             },
             |_| true,
         )
@@ -9859,7 +9956,7 @@ mod tests {
     async fn periodic_checker_skips_counter_trade_without_buying_power() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -9889,7 +9986,7 @@ mod tests {
                 order_placer: cqrs.order_placer.as_ref(),
                 counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
                 threshold: &cqrs.execution_threshold,
-                assets: &cqrs.assets,
+                assets: &assets,
             },
             |_| true,
         )
@@ -9921,7 +10018,7 @@ mod tests {
     async fn periodic_checker_reserves_buying_power_across_batch() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -9954,7 +10051,7 @@ mod tests {
                 order_placer: cqrs.order_placer.as_ref(),
                 counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
                 threshold: &cqrs.execution_threshold,
-                assets: &cqrs.assets,
+                assets: &assets,
             },
             |_| true,
         )
@@ -9986,7 +10083,7 @@ mod tests {
     async fn periodic_checker_places_partial_hedge_with_limited_inventory() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -10018,7 +10115,7 @@ mod tests {
                 order_placer: cqrs.order_placer.as_ref(),
                 counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
                 threshold: &cqrs.execution_threshold,
-                assets: &cqrs.assets,
+                assets: &assets,
             },
             |_| true,
         )
@@ -10113,7 +10210,7 @@ mod tests {
             attempts: AtomicUsize::new(0),
         });
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let mut cqrs = trade_processing_cqrs_with_threshold(
+        let (mut cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -10143,7 +10240,7 @@ mod tests {
                 order_placer: cqrs.order_placer.as_ref(),
                 counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
                 threshold: &cqrs.execution_threshold,
-                assets: &cqrs.assets,
+                assets: &assets,
             },
             |_| true,
         )
@@ -11034,7 +11131,7 @@ mod tests {
 
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let mut cqrs = trade_processing_cqrs_with_threshold(
+        let (mut cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -11046,9 +11143,16 @@ mod tests {
         let trade_event = make_trade_event(70);
         let trade = test_trade_with_amount(float!(1.5), 70);
 
-        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
-            .await
-            .unwrap();
+        process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event,
+            trade,
+            &cqrs,
+            &assets,
+            true,
+        )
+        .await
+        .unwrap();
 
         let position = cqrs
             .position_projection
@@ -11083,7 +11187,7 @@ mod tests {
         // Rebuild CQRS with a broker that accepts orders (simulating the
         // transient PDT restriction being lifted).
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -11101,7 +11205,7 @@ mod tests {
                 order_placer: cqrs.order_placer.as_ref(),
                 counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
                 threshold: &cqrs.execution_threshold,
-                assets: &cqrs.assets,
+                assets: &assets,
             },
             |_| true,
         )
@@ -11199,7 +11303,7 @@ mod tests {
         // broker order id the concurrent poll recorded.
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let mut cqrs = trade_processing_cqrs_with_threshold(
+        let (mut cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -11210,11 +11314,17 @@ mod tests {
         let trade_event = make_trade_event(70);
         let trade = test_trade_with_amount(float!(1.5), 70);
 
-        let offchain_order_id =
-            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
-                .await
-                .unwrap()
-                .expect("a failed placement still reports the order id");
+        let offchain_order_id = process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event,
+            trade,
+            &cqrs,
+            &assets,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("a failed placement still reports the order id");
 
         let position = cqrs
             .position_projection
@@ -11276,7 +11386,7 @@ mod tests {
 
         // Build CQRS with a rejecting broker
         let (frameworks, _) = create_cqrs_frameworks(&pool).await;
-        let mut cqrs = trade_processing_cqrs_with_threshold(
+        let (mut cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -11327,7 +11437,7 @@ mod tests {
                 order_placer: cqrs.order_placer.as_ref(),
                 counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
                 threshold: &cqrs.execution_threshold,
-                assets: &cqrs.assets,
+                assets: &assets,
             },
             |_| true,
         )
@@ -11352,7 +11462,7 @@ mod tests {
     async fn trade_processing_does_not_emit_retired_enrichment_event() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -11363,9 +11473,16 @@ mod tests {
 
         let trade = test_trade_with_amount(float!("1.5"), 60);
 
-        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
-            .await
-            .unwrap();
+        process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event,
+            trade,
+            &cqrs,
+            &assets,
+            true,
+        )
+        .await
+        .unwrap();
 
         let trade_id = OnChainTradeId {
             chain: Chain::Base,
@@ -12776,7 +12893,7 @@ mod tests {
     async fn dispatch_post_place_state_none_clears_position_pending() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -12827,7 +12944,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -12881,7 +12998,7 @@ mod tests {
     async fn dispatch_post_place_state_pending_preserves_position_claim() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -13310,7 +13427,7 @@ mod tests {
     async fn dispatch_post_place_state_filled_preserves_position_claim() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -13368,7 +13485,7 @@ mod tests {
     async fn dispatch_post_place_state_failed_clears_position_pending() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -13425,7 +13542,7 @@ mod tests {
     async fn dispatch_post_place_state_failed_with_executor_id_preserves_the_anchor() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -13472,7 +13589,7 @@ mod tests {
     async fn recover_claimed_offchain_order_clears_filled_terminal_claim() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -13583,7 +13700,7 @@ mod tests {
     async fn recover_claimed_offchain_order_submitted_with_live_poll_job_skips_duplicate_push() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -13675,7 +13792,7 @@ mod tests {
     async fn recover_claimed_offchain_order_submitted_without_live_poll_job_pushes_poll() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -13756,7 +13873,7 @@ mod tests {
     async fn recover_claimed_offchain_order_wraps_stale_after_overflow_as_poll_job_guard() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) = create_cqrs_frameworks(&pool).await;
-        let mut cqrs = trade_processing_cqrs_with_threshold(
+        let (mut cqrs, _assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -13828,7 +13945,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
@@ -13887,7 +14004,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
-        let cqrs = trade_processing_cqrs_with_threshold(
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),

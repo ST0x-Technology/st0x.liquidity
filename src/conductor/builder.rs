@@ -491,7 +491,6 @@ where
         offchain_order: context.frameworks.offchain_order,
         order_placer,
         execution_threshold: context.execution_threshold,
-        assets: context.ctx.chains.primary().assets.clone(),
         hedging: context.ctx.assets.clone(),
         counter_trade_submission_lock,
         close_flatten_policy,
