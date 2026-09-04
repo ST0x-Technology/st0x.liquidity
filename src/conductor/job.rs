@@ -373,7 +373,7 @@ impl<Task> Clone for JobQueue<Task> {
 /// the in-memory fetch buffer is dropped, those rows are no longer `Pending`
 /// and the deterministic worker heartbeat keeps them from aging out. Fetch one
 /// row at a time so durable queue state mirrors actual handler execution.
-fn build_poll_config<T: 'static>() -> Config {
+fn build_poll_config<T: 'static>(namespace: Option<&str>) -> Config {
     let strategy = StrategyBuilder::new()
         .apply(
             IntervalStrategy::new(Duration::from_millis(100))
@@ -381,7 +381,15 @@ fn build_poll_config<T: 'static>() -> Config {
         )
         .build();
 
-    Config::new(std::any::type_name::<T>())
+    // The queue string doubles as the durable `Jobs.job_type` key: a
+    // namespaced queue stores and fetches under "{type_name}@{namespace}",
+    // giving per-chain queues of the same task type disjoint rows.
+    let queue = namespace.map_or_else(
+        || std::any::type_name::<T>().to_string(),
+        |namespace| format!("{}@{namespace}", std::any::type_name::<T>()),
+    );
+
+    Config::new(&queue)
         .set_buffer_size(1)
         .with_poll_interval(strategy)
 }
@@ -390,8 +398,26 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     pub fn new(pool: &SqlitePool) -> Self {
         Self(SqliteStorage::new_with_config(
             pool,
-            &build_poll_config::<Task>(),
+            &build_poll_config::<Task>(None),
         ))
+    }
+
+    /// A queue whose durable rows are scoped by `namespace` (e.g. a chain):
+    /// same task type, disjoint `Jobs.job_type` key, so one namespace's
+    /// backlog or in-flight rows are invisible to another's queue, workers,
+    /// and the overlap/orphan helpers below.
+    pub(crate) fn new_namespaced(pool: &SqlitePool, namespace: &str) -> Self {
+        Self(SqliteStorage::new_with_config(
+            pool,
+            &build_poll_config::<Task>(Some(namespace)),
+        ))
+    }
+
+    /// The durable queue key this storage reads and writes (`Jobs.job_type`).
+    /// Every raw-SQL helper must key on THIS, not the bare type name, or a
+    /// namespaced queue's helpers silently match zero rows.
+    fn queue_key(&self) -> &str {
+        self.0.config().queue().as_ref()
     }
 
     pub(crate) async fn push(&mut self, task: Task) -> Result<(), QueuePushError> {
@@ -440,7 +466,7 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     /// callers that need to discard stale work after a terminal domain event
     /// invalidates everything queued before it.
     pub(crate) async fn cancel_all_pending(&self) {
-        let job_type = std::any::type_name::<Task>();
+        let job_type = self.queue_key();
         if let Err(error) = sqlx_apalis::query(
             "UPDATE Jobs SET status = 'Done' \
              WHERE status = 'Pending' AND job_type = ?",
@@ -476,7 +502,7 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     /// every restart. `attempts` is preserved because a crash is not a failed
     /// attempt against the retry budget.
     pub(crate) async fn requeue_orphaned(&self) -> Result<u64, SqlxError> {
-        let job_type = std::any::type_name::<Task>();
+        let job_type = self.queue_key();
         let result = sqlx_apalis::query(
             "UPDATE Jobs SET status = 'Pending', lock_by = NULL, lock_at = NULL \
              WHERE job_type = ? AND status IN ('Running', 'Queued')",
@@ -498,7 +524,7 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     /// ranges: while a previous range is still being processed the checkpoint
     /// has not advanced yet, so re-enqueuing would re-scan the same blocks.
     pub(crate) async fn has_in_flight(&self) -> Result<bool, SqlxError> {
-        let job_type = std::any::type_name::<Task>();
+        let job_type = self.queue_key();
         let in_flight = sqlx_apalis::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM Jobs \
              WHERE job_type = ? AND status NOT IN ('Done', 'Failed', 'Killed')",
@@ -1733,7 +1759,7 @@ mod tests {
 
     #[test]
     fn poll_config_fetches_one_row_per_single_concurrency_worker() {
-        let config = build_poll_config::<u32>();
+        let config = build_poll_config::<u32>(None);
 
         assert_eq!(
             config.buffer_size(),

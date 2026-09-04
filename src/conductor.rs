@@ -22,6 +22,7 @@ use apalis_core::error::BoxDynError;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use sqlx_apalis::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::future::Future;
 use std::num::TryFromIntError;
@@ -89,7 +90,7 @@ use crate::onchain::OnchainTrade;
 use crate::onchain::accumulator::check_all_positions;
 use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
 use crate::onchain::approvals::{build_approval_targets, grant_startup_approvals};
-use crate::onchain::backfill::BackfillJobQueue;
+use crate::onchain::backfill::BackfillQueues;
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain_trade::{
     OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId, OnChainTradeSource,
@@ -163,7 +164,9 @@ pub(crate) struct ConductorStartupTokens {
 }
 
 pub(crate) struct SupervisorStartupTokens {
-    pub(crate) order_fill_monitor: StartupToken,
+    /// One readiness token per watched chain's fill monitor: startup is not
+    /// complete until every watcher reached its run loop.
+    pub(crate) order_fill_monitors: BTreeMap<Chain, StartupToken>,
     pub(crate) inventory_monitor: StartupToken,
     pub(crate) dashboard_trade_handoff_monitor: StartupToken,
     pub(crate) executor_maintenance: StartupToken,
@@ -207,17 +210,29 @@ async fn setup_apalis_queues(
     pool: &SqlitePool,
     apalis_pool: &apalis_sqlite::SqlitePool,
     event_sender: broadcast::Sender<Statement>,
+    chains: &st0x_config::ChainRegistry,
 ) -> anyhow::Result<(
     DexTradeAccountingJobQueue,
-    BackfillJobQueue,
+    BackfillQueues,
     DashboardTradeDelivery,
     RebalancingSchedulers,
 )> {
     setup_apalis_tables(apalis_pool).await?;
 
+    // Before any worker spawns: adopt rows enqueued by a pre-per-chain
+    // binary into Base's namespaced queue, or they would sit stranded until
+    // the retention sweep deleted them.
+    let relabeled = BackfillQueues::relabel_legacy_rows(apalis_pool).await?;
+    if relabeled > 0 {
+        info!(
+            relabeled,
+            "Adopted legacy backfill jobs into the base chain's queue"
+        );
+    }
+
     Ok((
         DexTradeAccountingJobQueue::new(apalis_pool),
-        BackfillJobQueue::new(apalis_pool),
+        BackfillQueues::new(apalis_pool, chains),
         DashboardTradeDelivery::new(apalis_pool, pool, event_sender),
         RebalancingSchedulers::new(apalis_pool),
     ))
@@ -492,7 +507,7 @@ async fn requeue_wired_transfer_orphans(
 
 async fn requeue_startup_orphans(
     schedulers: &RebalancingSchedulers,
-    backfill_queue: &BackfillJobQueue,
+    backfill_queues: &BackfillQueues,
     usdc_to_hedging_ctx: Option<&Arc<TransferUsdcToHedgingCtx>>,
     usdc_to_market_making_ctx: Option<&Arc<TransferUsdcToMarketMakingCtx>>,
     equity_to_market_making_ctx: Option<&Arc<TransferEquityToMarketMakingCtx>>,
@@ -506,7 +521,7 @@ async fn requeue_startup_orphans(
         equity_to_hedging_ctx,
     )
     .await?;
-    requeue_backfill_orphans(backfill_queue).await
+    requeue_backfill_orphans(backfill_queues).await
 }
 
 /// Borrowed dependencies for [`finish_startup_recovery`]. Bundled into a
@@ -516,7 +531,7 @@ async fn requeue_startup_orphans(
 /// inventory.
 struct StartupRecoveryDeps<'startup> {
     schedulers: &'startup RebalancingSchedulers,
-    backfill_queue: &'startup BackfillJobQueue,
+    backfill_queues: &'startup BackfillQueues,
     usdc_to_hedging_ctx: Option<&'startup Arc<TransferUsdcToHedgingCtx>>,
     usdc_to_market_making_ctx: Option<&'startup Arc<TransferUsdcToMarketMakingCtx>>,
     equity_to_market_making_ctx: Option<&'startup Arc<TransferEquityToMarketMakingCtx>>,
@@ -538,7 +553,7 @@ struct StartupRecoveryDeps<'startup> {
 async fn finish_startup_recovery(deps: StartupRecoveryDeps<'_>) -> anyhow::Result<()> {
     requeue_startup_orphans(
         deps.schedulers,
-        deps.backfill_queue,
+        deps.backfill_queues,
         deps.usdc_to_hedging_ctx,
         deps.usdc_to_market_making_ctx,
         deps.equity_to_market_making_ctx,
@@ -625,18 +640,21 @@ where
     Ok(())
 }
 
-async fn requeue_backfill_orphans(backfill_queue: &BackfillJobQueue) -> anyhow::Result<()> {
-    let count = backfill_queue
-        .requeue_orphaned()
-        .await
-        .context("failed to re-queue orphaned backfill jobs at startup")?;
+async fn requeue_backfill_orphans(backfill_queues: &BackfillQueues) -> anyhow::Result<()> {
+    for (chain, backfill_queue) in backfill_queues.iter() {
+        let count = backfill_queue
+            .requeue_orphaned()
+            .await
+            .context("failed to re-queue orphaned backfill jobs at startup")?;
 
-    if count > 0 {
-        info!(
-            target: "backfill",
-            count,
-            "Re-queued orphaned backfill range job(s) for crash-safe resume",
-        );
+        if count > 0 {
+            info!(
+                target: "backfill",
+                %chain,
+                count,
+                "Re-queued orphaned backfill range job(s) for crash-safe resume",
+            );
+        }
     }
 
     Ok(())
@@ -852,8 +870,8 @@ impl Conductor {
         startup_smoke_checks(&executor, &provider, &ctx).await?;
         let cache = SymbolCache::default();
 
-        let (job_queue, backfill_queue, dashboard_delivery, schedulers) =
-            setup_apalis_queues(&pool, &apalis_pool, event_sender).await?;
+        let (job_queue, backfill_queues, dashboard_delivery, schedulers) =
+            setup_apalis_queues(&pool, &apalis_pool, event_sender, &ctx.chains).await?;
 
         let onchain_trade =
             setup_onchain_trade_store(&pool, dashboard_delivery.broadcaster.clone()).await?;
@@ -928,7 +946,7 @@ impl Conductor {
                 notifier: notifier.clone(),
                 record_bot_gas_receipt_cost_queue: record_bot_gas_receipt_cost_queue.clone(),
             },
-            &backfill_queue,
+            &backfill_queues,
             record_bot_gas_receipt_cost_ctx.as_ref(),
         ))
         .await?;
@@ -994,6 +1012,7 @@ impl Conductor {
 
         let conductor_ctx = builder::ConductorCtx {
             ctx: ctx.clone(),
+            watch_providers: BTreeMap::new(),
             poll_freshness,
             cache,
             provider,
@@ -1025,7 +1044,7 @@ impl Conductor {
         let conductor = builder::spawn()
             .context(conductor_ctx)
             .job_queue(job_queue)
-            .backfill_queue(backfill_queue)
+            .backfill_queues(backfill_queues)
             .dashboard_trade_delivery_queue(dashboard_delivery.queue)
             .dashboard_trade_delivery_ctx(dashboard_delivery.ctx)
             .dashboard_trade_handoff_monitor(dashboard_delivery.handoff_monitor)
@@ -1762,7 +1781,7 @@ impl PositionAndRebalancing {
     async fn setup_with_recovery(
         rebalancing: Option<RebalancingCtx>,
         deps: RebalancingDeps,
-        backfill_queue: &BackfillJobQueue,
+        backfill_queues: &BackfillQueues,
         record_bot_gas_receipt_cost_ctx: Option<&Arc<RecordBotGasReceiptCostCtx>>,
     ) -> anyhow::Result<Self> {
         // Cloned out before `deps` is consumed by `setup`: recovery must run
@@ -1776,7 +1795,7 @@ impl PositionAndRebalancing {
 
         finish_startup_recovery(StartupRecoveryDeps {
             schedulers: &schedulers,
-            backfill_queue,
+            backfill_queues,
             usdc_to_hedging_ctx: assembled.transfer_usdc_to_hedging_ctx.as_ref(),
             usdc_to_market_making_ctx: assembled.transfer_usdc_to_market_making_ctx.as_ref(),
             equity_to_market_making_ctx: assembled.transfer_equity_to_market_making_ctx.as_ref(),
