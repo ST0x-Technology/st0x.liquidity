@@ -178,7 +178,8 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
     type Error = TransferEquityToMarketMakingJobError;
 
     const WORKER_NAME: &'static str = "transfer-equity-to-market-making-worker";
-    const PERFORM_TIMEOUT: std::time::Duration = crate::conductor::job::DEFAULT_PERFORM_TIMEOUT;
+    const PERFORM_TIMEOUT: Option<std::time::Duration> =
+        Some(crate::conductor::job::DEFAULT_PERFORM_TIMEOUT);
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind =
@@ -525,7 +526,8 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
     type Error = TransferEquityToHedgingJobError;
 
     const WORKER_NAME: &'static str = "transfer-equity-to-hedging-worker";
-    const PERFORM_TIMEOUT: std::time::Duration = crate::conductor::job::DEFAULT_PERFORM_TIMEOUT;
+    const PERFORM_TIMEOUT: Option<std::time::Duration> =
+        Some(crate::conductor::job::DEFAULT_PERFORM_TIMEOUT);
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind =

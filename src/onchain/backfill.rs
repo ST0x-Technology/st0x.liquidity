@@ -193,7 +193,8 @@ where
     /// re-scans the range from the start (safe: downstream dedupes by
     /// `(tx_hash, log_index)`, but not incremental). The generous bound keeps
     /// the timeout a hang detector, not a cap on legitimate catch-up work.
-    const PERFORM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+    const PERFORM_TIMEOUT: Option<std::time::Duration> =
+        Some(std::time::Duration::from_secs(2 * 60 * 60));
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind = crate::conductor::job::JobKind::Backfill;

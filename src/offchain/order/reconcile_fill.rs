@@ -43,7 +43,8 @@ impl Job<ReconcileOrderFillCtx> for ReconcileOrderFill {
     type Error = JobError;
 
     const WORKER_NAME: &'static str = "reconcile-order-fill-worker";
-    const PERFORM_TIMEOUT: std::time::Duration = crate::conductor::job::DEFAULT_PERFORM_TIMEOUT;
+    const PERFORM_TIMEOUT: Option<std::time::Duration> =
+        Some(crate::conductor::job::DEFAULT_PERFORM_TIMEOUT);
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind =

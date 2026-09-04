@@ -554,8 +554,14 @@ where
     /// which the attempt fails instead of parking the worker (RAI-2218). No
     /// default: every impl states its own bound so the choice is conscious,
     /// the same way `WORKER_NAME` and `JOB_KIND` are. Most jobs use
-    /// [`DEFAULT_PERFORM_TIMEOUT`]; see its doc for the rationale.
-    const PERFORM_TIMEOUT: Duration;
+    /// `Some(DEFAULT_PERFORM_TIMEOUT)`; see [`DEFAULT_PERFORM_TIMEOUT`] for the
+    /// rationale. `None` means the job deliberately opts out of the
+    /// perform-level bound because its handler has a phase that is unsafe to
+    /// interrupt (dropping the future mid-phase would strand or double-drive
+    /// real money); such a job relies on its own phase-aware deadlines and on
+    /// the bounded HTTP transports instead. `TransferUsdcToMarketMaking` is the
+    /// current `None`.
+    const PERFORM_TIMEOUT: Option<Duration>;
 
     /// Identifier for this job type in the e2e [`FailureInjector`].
     #[cfg(any(test, feature = "test-support"))]
@@ -1003,8 +1009,11 @@ pub(crate) struct PerformTimeout {
     timeout: Duration,
 }
 
-/// Runs [`Job::perform`] bounded by [`Job::PERFORM_TIMEOUT`], mapping both a
-/// handler error and an elapsed bound into [`JobError::Failed`].
+/// Runs [`Job::perform`], bounding it by [`Job::PERFORM_TIMEOUT`] when the job
+/// sets one, and mapping both a handler error and an elapsed bound into
+/// [`JobError::Failed`]. A `None` timeout awaits `perform` directly: the job
+/// has opted out because interrupting its handler is unsafe (see the trait
+/// const doc).
 async fn perform_bounded<Ctx, J>(
     job: &J,
     ctx: &Ctx,
@@ -1016,21 +1025,24 @@ where
     Ctx: Send + Sync + 'static,
     J: Job<Ctx> + Sync,
 {
-    let source: Box<dyn std::error::Error + Send + Sync> =
-        match tokio::time::timeout(J::PERFORM_TIMEOUT, job.perform(ctx)).await {
+    let source: Box<dyn std::error::Error + Send + Sync> = match J::PERFORM_TIMEOUT {
+        Some(timeout) => match tokio::time::timeout(timeout, job.perform(ctx)).await {
             Ok(Ok(output)) => return Ok(output),
             Ok(Err(error)) => Box::new(error),
             Err(_elapsed) => {
                 error!(
                     %label,
-                    timeout = ?J::PERFORM_TIMEOUT,
+                    ?timeout,
                     "Job::perform did not resolve within its timeout; failing the attempt"
                 );
-                Box::new(PerformTimeout {
-                    timeout: J::PERFORM_TIMEOUT,
-                })
+                Box::new(PerformTimeout { timeout })
             }
-        };
+        },
+        None => match job.perform(ctx).await {
+            Ok(output) => return Ok(output),
+            Err(error) => Box::new(error),
+        },
+    };
 
     Err(JobError::Failed {
         task_identity,
@@ -1881,7 +1893,7 @@ mod tests {
         type Error = TestJobError;
 
         const WORKER_NAME: &'static str = "test-worker";
-        const PERFORM_TIMEOUT: Duration = DEFAULT_PERFORM_TIMEOUT;
+        const PERFORM_TIMEOUT: Option<Duration> = Some(DEFAULT_PERFORM_TIMEOUT);
         const JOB_KIND: JobKind = JobKind::OrderFill;
 
         fn label(&self) -> Label {
@@ -1917,7 +1929,7 @@ mod tests {
         type Error = TestJobError;
 
         const WORKER_NAME: &'static str = "recover-on-fifth-attempt-worker";
-        const PERFORM_TIMEOUT: Duration = DEFAULT_PERFORM_TIMEOUT;
+        const PERFORM_TIMEOUT: Option<Duration> = Some(DEFAULT_PERFORM_TIMEOUT);
         const JOB_KIND: JobKind = JobKind::OrderFill;
 
         fn label(&self) -> Label {
@@ -1947,7 +1959,7 @@ mod tests {
 
         const WORKER_NAME: &'static str = "hanging-worker";
         const JOB_KIND: JobKind = JobKind::OrderFill;
-        const PERFORM_TIMEOUT: Duration = Duration::from_millis(50);
+        const PERFORM_TIMEOUT: Option<Duration> = Some(Duration::from_millis(50));
 
         fn label(&self) -> Label {
             Label::new("hanging-job")
@@ -1984,6 +1996,53 @@ mod tests {
         assert!(
             source.downcast_ref::<PerformTimeout>().is_some(),
             "source must be PerformTimeout, got: {source:?}"
+        );
+    }
+
+    /// A job that opts out of the perform-level bound (`PERFORM_TIMEOUT` is
+    /// `None`), mirroring `TransferUsdcToMarketMaking`.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct UnboundedHangJob;
+
+    impl Job<()> for UnboundedHangJob {
+        type Output = ();
+        type Error = TestJobError;
+
+        const WORKER_NAME: &'static str = "unbounded-hang-worker";
+        const JOB_KIND: JobKind = JobKind::OrderFill;
+        const PERFORM_TIMEOUT: Option<Duration> = None;
+
+        fn label(&self) -> Label {
+            Label::new("unbounded-hang-job")
+        }
+
+        async fn perform(&self, (): &()) -> Result<Self::Output, Self::Error> {
+            std::future::pending().await
+        }
+    }
+
+    /// A `None` `PERFORM_TIMEOUT` must make `perform_bounded` await the handler
+    /// directly with no bound: dropping the future mid-flight is exactly what
+    /// the opt-out exists to prevent. Proven by the call never returning while
+    /// the handler is pending -- the outer test timeout is what fires, not
+    /// `perform_bounded`. A regression that re-imposed a bound would instead
+    /// resolve the call to a `PerformTimeout` error before the outer deadline.
+    #[tokio::test]
+    async fn perform_bounded_does_not_bound_a_none_timeout_job() {
+        let bounded = perform_bounded(
+            &UnboundedHangJob,
+            &(),
+            UnboundedHangJob.label(),
+            TaskIdentity("unbounded-task".to_owned()),
+            false,
+        );
+
+        let outcome = tokio::time::timeout(Duration::from_millis(200), bounded).await;
+
+        assert!(
+            outcome.is_err(),
+            "a None PERFORM_TIMEOUT must not be bounded by perform_bounded; \
+             the call resolved to {outcome:?} instead of running until the outer deadline",
         );
     }
 

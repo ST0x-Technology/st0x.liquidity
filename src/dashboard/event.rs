@@ -932,7 +932,8 @@ impl Job<DashboardTradeDeliveryCtx> for DeliverDashboardTrade {
     type Error = DashboardTradeDeliveryError;
 
     const WORKER_NAME: &'static str = "dashboard-trade-delivery-worker";
-    const PERFORM_TIMEOUT: std::time::Duration = crate::conductor::job::DEFAULT_PERFORM_TIMEOUT;
+    const PERFORM_TIMEOUT: Option<std::time::Duration> =
+        Some(crate::conductor::job::DEFAULT_PERFORM_TIMEOUT);
     const TERMINAL_FAILURE_MSG: &'static str =
         "Dashboard trade delivery failed after retries; terminal update remains undelivered";
 
