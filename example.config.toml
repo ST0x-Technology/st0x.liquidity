@@ -130,8 +130,8 @@ inventory = "0x6b7B523fADd1677413AD92c9404C8F0796bACF6F"
 # it does here.
 vault_owner = "0x6b7B523fADd1677413AD92c9404C8F0796bACF6F"
 deployment_block = 1
-# Block tag used as the fill-ingestion cutoff. REQUIRED -- must be set
-# explicitly to "safe" or "finalized"; omitting this field fails startup.
+# Fill-ingestion cutoff mode. REQUIRED -- must be set explicitly to "safe",
+# "finalized", or "confirmations"; omitting this field fails startup.
 # "safe"      -- OP-Stack safe block: sequencer batch posted to L1, not yet
 #                L1-finalized. Cuts hedging lag to ~seconds on Base.
 #                Tradeoff: an L1 reorg dropping the batch tx could in principle
@@ -142,6 +142,9 @@ deployment_block = 1
 #                reorged range are not ingested (same no-reversal-path tradeoff).
 # "finalized" -- L1-finalized block (Casper FFG). Full reorg protection but
 #                ~20 min hedging lag on Base.
+# "confirmations" -- a fixed depth behind the chain tip, set via the companion
+#                ingestion_cutoff_confirmations = N (required with this mode,
+#                non-zero). No extra RPC read. Ethereum mainnet watches at 12.
 ingestion_cutoff = "safe"
 # Seconds between fill-watch poll cycles on this chain (required; was the
 # global order_fill_poll_interval with a hidden default of 5).
