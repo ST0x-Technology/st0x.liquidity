@@ -36,9 +36,9 @@ use st0x_execution::{AlpacaTransferId, ClientOrderId, FractionalShares, Symbol};
 use st0x_finance::Usdc;
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
 use st0x_tokenization::{
-    AlpacaTokenizationError, IssuerRequestId, TokenizationRequest, TokenizationRequestId,
-    TokenizationRequestStatus, TokenizationRequestType, Tokenizer, TokenizerError,
-    tokenization_request_id,
+    AlpacaTokenizationError, ClientRequestId, IssuerRequestId, TokenizationRequest,
+    TokenizationRequestId, TokenizationRequestStatus, TokenizationRequestType, Tokenizer,
+    TokenizerError, tokenization_request_id,
 };
 use st0x_wrapper::{
     UnderlyingPerWrapped, UnwrapConfirmation, WrapConfirmation, Wrapper, WrapperError,
@@ -75,7 +75,7 @@ use crate::vault_lookup::{VaultLookup, VaultLookupError};
 /// `token_symbol == format!("t{symbol}")`, and this fixture cycles through
 /// multiple symbols in one run.
 struct FixtureTokenizer {
-    pending: Mutex<HashMap<TokenizationRequestId, (Symbol, TxHash)>>,
+    pending: Mutex<HashMap<TokenizationRequestId, (TokenizationRequest, TxHash)>>,
     redemption_wallet: Address,
     /// Feeds `send_for_redemption`'s synthetic tx hash through
     /// `simulated_transfer_uuid`, keeping it deterministic across runs like
@@ -107,12 +107,7 @@ impl Tokenizer for FixtureTokenizer {
         // `TokenizationRequestId` string: `TxHash::left_padding_from` panics
         // above 32 input bytes, and the request-id string exceeds that.
         let tx_hash = TxHash::left_padding_from(issuer_request_id.0.as_bytes());
-        self.pending
-            .lock()
-            .await
-            .insert(id.clone(), (symbol.clone(), tx_hash));
-
-        Ok(TokenizationRequest {
+        let request = TokenizationRequest {
             id,
             r#type: Some(TokenizationRequestType::Mint),
             status: TokenizationRequestStatus::Pending,
@@ -120,20 +115,45 @@ impl Tokenizer for FixtureTokenizer {
             token_symbol: None,
             quantity,
             wallet: Some(wallet),
-            issuer_request_id: Some(issuer_request_id),
+            client_request_id: Some(ClientRequestId::from(&issuer_request_id)),
+            issuer_request_id: None,
             tx_hash: None,
             fees: None,
             created_at: Utc::now(),
-        })
+        };
+        self.pending
+            .lock()
+            .await
+            .insert(request.id.clone(), (request.clone(), tx_hash));
+
+        Ok(request)
+    }
+
+    async fn find_mint_by_issuer_request_id(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<Option<TokenizationRequest>, TokenizerError> {
+        let expected_client_request_id = issuer_request_id.to_string();
+        Ok(self
+            .pending
+            .lock()
+            .await
+            .values()
+            .find(|(request, _)| {
+                request.client_request_id.as_ref().map(AsRef::as_ref)
+                    == Some(expected_client_request_id.as_str())
+            })
+            .map(|(request, _)| request.clone()))
     }
 
     async fn poll_mint_until_complete(
         &self,
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        let (symbol, tx_hash) = self.pending.lock().await.get(id).cloned().ok_or_else(|| {
+        let (request, tx_hash) = self.pending.lock().await.get(id).cloned().ok_or_else(|| {
             TokenizerError::Alpaca(AlpacaTokenizationError::RequestNotFound { id: id.clone() })
         })?;
+        let symbol = request.underlying_symbol;
 
         Ok(TokenizationRequest {
             id: id.clone(),
@@ -143,6 +163,7 @@ impl Tokenizer for FixtureTokenizer {
             underlying_symbol: symbol,
             quantity: FractionalShares::ZERO,
             wallet: None,
+            client_request_id: None,
             issuer_request_id: None,
             tx_hash: Some(tx_hash),
             fees: None,
@@ -275,6 +296,14 @@ pub async fn seed_simulated_mint_history(
                 quantity,
                 wallet,
                 requested_at,
+            },
+        )
+        .await?;
+
+        mint.send(
+            &issuer_request_id,
+            TokenizedEquityMintCommand::SubmitMintRequest {
+                issuer_request_id: issuer_request_id.clone(),
             },
         )
         .await?;

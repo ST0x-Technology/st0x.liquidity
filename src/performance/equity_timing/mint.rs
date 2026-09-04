@@ -58,8 +58,8 @@ impl StoredOperation {
             // so derive and fail the stage the event implies instead --
             // otherwise the operation would go `Failed` with zero stage
             // entries. `MintRejected` fires only from `MintRequested` (see
-            // `TokenizedEquityMintCommand::RequestMint`'s immediate-rejection
-            // doc), and `RaindexDepositFailed`'s two source states
+            // `TokenizedEquityMintCommand::SubmitMintRequest`), and
+            // `RaindexDepositFailed`'s two source states
             // (`TokensWrapped`/`VaultDepositSubmitted`) both map to the SAME
             // stage (`MintDeposit`, see its own `evolve` arm), so the
             // ambiguity there is harmless and the derivation below is a fixed

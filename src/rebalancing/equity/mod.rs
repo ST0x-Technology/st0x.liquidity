@@ -314,6 +314,13 @@ impl Tokenizer for PanickingTokenizer {
         unimplemented!("PanickingTokenizer: not available in CLI context")
     }
 
+    async fn find_mint_by_issuer_request_id(
+        &self,
+        _: &IssuerRequestId,
+    ) -> Result<Option<TokenizationRequest>, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+
     async fn poll_mint_until_complete(
         &self,
         _: &TokenizationRequestId,
@@ -1320,12 +1327,16 @@ impl CrossVenueEquityTransfer {
                 TokenizedEquityMint::DepositedIntoRaindex { .. }
                 | TokenizedEquityMint::Failed { .. }
                 | TokenizedEquityMint::Reconciled { .. } => return Ok(()),
-                entity @ TokenizedEquityMint::MintRequested { .. } => {
-                    return Err(MintError::UnexpectedState {
-                        issuer_request_id: issuer_request_id.clone(),
-                        expected_state: "MintAccepted, TokensReceived, or TokensWrapped",
-                        entity: Box::new(entity),
-                    });
+                TokenizedEquityMint::MintRequested { .. } => {
+                    info!(%issuer_request_id, "Reconciling requested mint");
+                    self.mint_store
+                        .send(
+                            issuer_request_id,
+                            TokenizedEquityMintCommand::ReconcileMintRequest {
+                                issuer_request_id: issuer_request_id.clone(),
+                            },
+                        )
+                        .await?;
                 }
             }
         }
@@ -1994,6 +2005,32 @@ impl CrossVenueEquityTransfer {
             .await
             .map_err(|error| MintTransferError::PreReceipt(error.into()))?;
 
+        self.mint_store
+            .send(
+                issuer_request_id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            )
+            .await
+            .map_err(|error| MintTransferError::PreReceipt(error.into()))?;
+
+        let submitted = self
+            .load_mint_entity(issuer_request_id)
+            .await
+            .map_err(MintTransferError::PreReceipt)?;
+        match submitted {
+            TokenizedEquityMint::Failed { .. } => return Ok(()),
+            TokenizedEquityMint::MintAccepted { .. } => {}
+            entity => {
+                return Err(MintTransferError::PreReceipt(MintError::UnexpectedState {
+                    issuer_request_id: issuer_request_id.clone(),
+                    expected_state: "MintAccepted or Failed",
+                    entity: Box::new(entity),
+                }));
+            }
+        }
+
         // Orchestrator-mode assets need the recipient authorization signed
         // and on its way to issuance BEFORE polling: issuance will not mint
         // (and the poll cannot complete) until the authorization arrives.
@@ -2097,7 +2134,8 @@ mod tests {
     use st0x_float_macro::float;
     use st0x_tokenization::issuer_request_id;
     use st0x_tokenization::mock::{
-        MockCompletionOutcome, MockDetectionOutcome, MockTokenizer, MockVerificationOutcome,
+        MockCompletionOutcome, MockDetectionOutcome, MockMintRequestOutcome, MockTokenizer,
+        MockVerificationOutcome,
     };
     use st0x_tokenization::tokenization_request_id;
     use st0x_wrapper::MockWrapper;
@@ -2132,6 +2170,19 @@ mod tests {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
             mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         }
+    }
+
+    async fn submit_requested_mint(transfer: &CrossVenueEquityTransfer, id: &IssuerRequestId) {
+        transfer
+            .mint_store
+            .send(
+                id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
     }
 
     async fn insert_mint_event(
@@ -2809,15 +2860,22 @@ mod tests {
     ) -> (CrossVenueEquityTransfer, SqlitePool) {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        let services = mock_services();
+        let vault_lookup = Arc::new(mock_vault_lookup());
+        let services = EquityTransferServices {
+            raindex: raindex.clone(),
+            vault_lookup: vault_lookup.clone(),
+            tokenizer: tokenizer.clone(),
+            wrapper: wrapper.clone(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        };
 
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
         let redemption_store = Arc::new(test_store(pool.clone(), services));
-        let vault_lookup = mock_vault_lookup();
 
         let transfer = CrossVenueEquityTransfer::new(
             raindex,
-            Arc::new(vault_lookup),
+            vault_lookup,
             tokenizer,
             wrapper,
             Address::random(),
@@ -2845,6 +2903,33 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn definitive_mint_rejection_completes_without_later_steps() {
+        let tokenizer = Arc::new(
+            MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::DefinitiveError),
+        );
+        let transfer = create_equity_transfer(
+            tokenizer.clone(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+        let id = issuer_request_id("ISS-DEFINITIVE-REJECTION");
+
+        transfer
+            .resume_equity_to_market_making(
+                &id,
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(100.0)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tokenizer.mint_request_call_count(), 1);
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(matches!(entity, TokenizedEquityMint::Failed { .. }));
     }
 
     #[tokio::test]
@@ -3017,6 +3102,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&transfer, &id).await;
         transfer
             .mint_store
             .send(&id, TokenizedEquityMintCommand::Poll)
@@ -3103,6 +3189,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&transfer, &id).await;
 
         transfer.resume_mint(&id).await.unwrap();
 
@@ -3193,6 +3280,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&transfer, &id).await;
 
         transfer.resume_mint(&id).await.unwrap();
 
@@ -3245,6 +3333,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&transfer, &id).await;
         transfer
             .mint_store
             .send(
@@ -3305,6 +3394,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&transfer, &id).await;
 
         transfer.resume_mint(&id).await.unwrap();
 
@@ -3390,6 +3480,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&transfer, &id).await;
 
         transfer
             .ensure_mint_authorization(&id, &symbol)
@@ -3440,6 +3531,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&transfer, &id).await;
 
         // The re-enqueued job runs the same entry point with the same id; a
         // fresh RequestMint here would fail with AlreadyInProgress, so
@@ -4243,6 +4335,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&transfer, &id).await;
 
         // Poll advances to TokensReceived
         transfer
@@ -4337,6 +4430,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&transfer, &id).await;
 
         transfer
             .mint_store
@@ -4420,6 +4514,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&transfer, &id).await;
 
         transfer
             .mint_store
@@ -4513,6 +4608,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&transfer, &id).await;
 
         transfer
             .mint_store
@@ -4620,6 +4716,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&transfer, &id).await;
 
         transfer
             .mint_store
@@ -4715,6 +4812,7 @@ mod tests {
             )
             .await
             .unwrap();
+        submit_requested_mint(&transfer, &id).await;
 
         transfer
             .mint_store

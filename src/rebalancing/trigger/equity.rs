@@ -1,6 +1,9 @@
 //! Equity-specific trigger types and logic.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use alloy::primitives::Address;
@@ -49,7 +52,7 @@ pub(crate) enum GuardState {
     /// `RecoveryGuard::Drop` to detect the ABA race: if a terminal event
     /// cleared the slot and a new transfer immediately claimed it, Drop sees
     /// a different `generation` and does not clobber the new claim.
-    ActiveTransfer { generation: u64 },
+    ActiveTransfer { generation: GuardGeneration },
     /// Tokens were received but post-receipt processing failed.
     /// A recovery job must run to wrap/deposit them.
     /// Blocks new triggers; does NOT block `UnwrappedEquityRecovery` or
@@ -57,20 +60,94 @@ pub(crate) enum GuardState {
     HeldForRecovery,
 }
 
-/// Monotonic counter for `GuardState::ActiveTransfer` generation tokens.
+/// Identifies the exact process and claim that owns an active equity transfer.
 ///
-/// Starts at 1 so [`next_generation`] never returns 0: generation 0 is reserved
-/// for legacy transfer-job payloads that predate the `generation` field and
-/// deserialize via `#[serde(default)]` to 0. Because every live claim is >= 1,
-/// such a stale payload can never coincide with a real `ActiveTransfer` slot, so
-/// its `mark_held_for_recovery`/`Drop` generation check always mismatches (a safe
-/// no-op) instead of clobbering the wrong active transfer.
-static GUARD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// The upper 32 bits are a random nonzero boot nonce and the lower 32 bits are
+/// a monotonic per-process counter. Zero is reserved for persisted job payloads
+/// created before generations were introduced; it can never own a live guard.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct GuardGeneration(u64);
 
-/// Returns the next `ActiveTransfer` generation token. Always >= 1; 0 is the
-/// reserved legacy/default-payload sentinel (see [`GUARD_GENERATION`]).
-pub(super) fn next_generation() -> u64 {
-    GUARD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+impl GuardGeneration {
+    pub(crate) const fn from_parts(boot_nonce: u32, counter: u32) -> Self {
+        Self((boot_nonce as u64) << 32 | counter as u64)
+    }
+
+    pub(crate) const fn is_legacy(self) -> bool {
+        self.0 == 0
+    }
+}
+
+struct GenerationSource {
+    boot_nonce: NonZeroU32,
+    counter: AtomicU32,
+}
+
+impl GenerationSource {
+    fn new() -> Self {
+        let boot_nonce = loop {
+            if let Some(boot_nonce) = NonZeroU32::new(rand::random()) {
+                break boot_nonce;
+            }
+        };
+
+        Self::with_counter(boot_nonce, 0)
+    }
+
+    const fn with_counter(boot_nonce: NonZeroU32, counter: u32) -> Self {
+        Self {
+            boot_nonce,
+            counter: AtomicU32::new(counter),
+        }
+    }
+
+    fn next(&self) -> Option<GuardGeneration> {
+        self.counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |counter| {
+                counter.checked_add(1)
+            })
+            .ok()
+            .map(|counter| GuardGeneration::from_parts(self.boot_nonce.get(), counter + 1))
+    }
+}
+
+static GUARD_GENERATION: LazyLock<GenerationSource> = LazyLock::new(GenerationSource::new);
+
+pub(super) fn next_generation() -> Option<GuardGeneration> {
+    GUARD_GENERATION.next()
+}
+
+/// Atomically removes an active transfer only when the exact owner still holds
+/// the symbol. The reserved zero generation can remove only a restored legacy
+/// zero-generation owner; it can never match a new process-generated claim.
+pub(crate) fn remove_active_transfer(
+    map: &RwLock<HashMap<Symbol, GuardState>>,
+    symbol: &Symbol,
+    expected_generation: GuardGeneration,
+) -> bool {
+    let mut guard = match map.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!(
+                %symbol,
+                "equity_in_progress lock poisoned during exact-generation removal; \
+                 recovering inner guard"
+            );
+            poisoned.into_inner()
+        }
+    };
+
+    if guard.get(symbol)
+        != Some(&GuardState::ActiveTransfer {
+            generation: expected_generation,
+        })
+    {
+        return false;
+    }
+
+    guard.remove(symbol);
+    true
 }
 
 /// RAII guard that holds an equity in-progress claim.
@@ -82,7 +159,7 @@ pub(crate) struct InProgressGuard {
     in_progress: Arc<std::sync::RwLock<HashMap<Symbol, GuardState>>>,
     /// Generation token matching the `ActiveTransfer { generation }` this
     /// guard inserted. Used on Drop to avoid clobbering a newer claim.
-    generation: u64,
+    generation: GuardGeneration,
     /// When true, the guard will not release the claim on drop.
     defused: bool,
 }
@@ -97,7 +174,10 @@ impl InProgressGuard {
         symbol: Symbol,
         in_progress: Arc<std::sync::RwLock<HashMap<Symbol, GuardState>>>,
     ) -> Option<Self> {
-        let generation = next_generation();
+        let Some(generation) = next_generation() else {
+            warn!(%symbol, "Equity guard generation counter exhausted; refusing transfer claim");
+            return None;
+        };
         {
             let mut guard = match in_progress.write() {
                 Ok(guard) => guard,
@@ -122,7 +202,7 @@ impl InProgressGuard {
     /// Returns the generation token for this guard's `ActiveTransfer` slot.
     /// Used by the transfer job to store the generation in its payload so
     /// `mark_held_for_recovery` can detect if a newer transfer claimed the slot.
-    pub(super) fn generation(&self) -> u64 {
+    pub(super) fn generation(&self) -> GuardGeneration {
         self.generation
     }
 
@@ -136,20 +216,7 @@ impl InProgressGuard {
 impl Drop for InProgressGuard {
     fn drop(&mut self) {
         if !self.defused {
-            let mut guard = match self.in_progress.write() {
-                Ok(guard) => guard,
-                Err(poison) => poison.into_inner(),
-            };
-            // Only remove if this guard still owns the slot (same generation).
-            // A terminal event may have cleared the slot and a new transfer
-            // claimed it before this drop -- in that case, leave the new claim.
-            if guard.get(&self.symbol)
-                == Some(&GuardState::ActiveTransfer {
-                    generation: self.generation,
-                })
-            {
-                guard.remove(&self.symbol);
-            }
+            remove_active_transfer(&self.in_progress, &self.symbol, self.generation);
         }
     }
 }
@@ -189,7 +256,7 @@ pub(crate) struct RecoveryGuard {
     map: Arc<RwLock<HashMap<Symbol, GuardState>>>,
     /// Generation token matching the `ActiveTransfer` entry this guard
     /// inserted. Drop only acts when the map still holds this exact generation.
-    generation: u64,
+    generation: GuardGeneration,
     /// Tracks the state the slot was in before this guard claimed it.
     claim_origin: RecoveryClaimOrigin,
     /// When true, Drop removes the entry instead of restoring prior state.
@@ -224,6 +291,11 @@ impl RecoveryGuard {
 
 impl Drop for RecoveryGuard {
     fn drop(&mut self) {
+        if self.released {
+            remove_active_transfer(&self.map, &self.symbol, self.generation);
+            return;
+        }
+
         let mut guard = match self.map.write() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -248,22 +320,17 @@ impl Drop for RecoveryGuard {
             return;
         }
 
-        if self.released {
-            // Recovery succeeded: remove the entry to unblock future transfers.
-            guard.remove(&self.symbol);
-        } else {
-            match self.claim_origin {
-                RecoveryClaimOrigin::HeldForRecovery => {
-                    // Recovery failed: restore to HeldForRecovery so retries can
-                    // claim the slot but a new transfer cannot start while tokens
-                    // are still stranded (prevents double-mints).
-                    guard.insert(self.symbol.clone(), GuardState::HeldForRecovery);
-                }
-                RecoveryClaimOrigin::Orphan => {
-                    // Orphan failure: no prior guard state; remove entirely so
-                    // inventory-driven recovery can restart on the next poll.
-                    guard.remove(&self.symbol);
-                }
+        match self.claim_origin {
+            RecoveryClaimOrigin::HeldForRecovery => {
+                // Recovery failed: restore to HeldForRecovery so retries can
+                // claim the slot but a new transfer cannot start while tokens
+                // are still stranded (prevents double-mints).
+                guard.insert(self.symbol.clone(), GuardState::HeldForRecovery);
+            }
+            RecoveryClaimOrigin::Orphan => {
+                // Orphan failure: no prior guard state; remove entirely so
+                // inventory-driven recovery can restart on the next poll.
+                guard.remove(&self.symbol);
             }
         }
     }
@@ -314,7 +381,10 @@ pub(crate) fn claim_guard_for_recovery_or_orphan(
         None => RecoveryClaimOrigin::Orphan,
     };
 
-    let generation = next_generation();
+    let Some(generation) = next_generation() else {
+        warn!(%symbol, "Equity guard generation counter exhausted; refusing recovery claim");
+        return None;
+    };
     guard.insert(symbol.clone(), GuardState::ActiveTransfer { generation });
     drop(guard);
 
@@ -553,6 +623,8 @@ pub(crate) async fn drain_pending_equity_jobs(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use alloy::primitives::{U256, address};
     use chrono::Utc;
     use rain_math_float::Float;
@@ -572,19 +644,84 @@ mod tests {
         Arc::new(std::sync::RwLock::new(HashMap::new()))
     }
 
-    /// `next_generation` must never return 0: 0 is the reserved sentinel for
-    /// legacy `#[serde(default)]` transfer-job payloads. A live claim colliding
-    /// with it would let a stale payload clobber a real active transfer,
-    /// defeating the ABA guard. The counter is process-global and shared across
-    /// tests, so assert the invariant rather than a specific value.
     #[test]
-    fn next_generation_never_returns_legacy_zero_sentinel() {
-        for _ in 0..1_000 {
-            assert!(
-                next_generation() >= 1,
-                "next_generation must never return the reserved legacy sentinel 0"
-            );
-        }
+    fn generation_source_combines_boot_nonce_and_monotonic_counter() {
+        let source = GenerationSource::with_counter(NonZeroU32::new(7).unwrap(), 0);
+
+        assert_eq!(source.next().unwrap(), GuardGeneration::from_parts(7, 1));
+        assert_eq!(source.next().unwrap(), GuardGeneration::from_parts(7, 2));
+    }
+
+    #[test]
+    fn generation_sources_from_different_boots_cannot_collide() {
+        let first = GenerationSource::with_counter(NonZeroU32::new(7).unwrap(), 0);
+        let second = GenerationSource::with_counter(NonZeroU32::new(8).unwrap(), 0);
+
+        assert_ne!(first.next().unwrap(), second.next().unwrap());
+    }
+
+    #[test]
+    fn generation_source_fails_at_counter_exhaustion() {
+        let source = GenerationSource::with_counter(NonZeroU32::new(7).unwrap(), u32::MAX);
+
+        assert_eq!(source.next(), None);
+    }
+
+    #[test]
+    fn exact_generation_removal_rejects_other_owners() {
+        let map = make_in_progress();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let owner = GuardGeneration::from_parts(7, 1);
+        let other_boot = GuardGeneration::from_parts(8, 1);
+        map.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::ActiveTransfer { generation: owner },
+        );
+
+        assert!(!remove_active_transfer(
+            &map,
+            &symbol,
+            GuardGeneration::default()
+        ));
+        assert!(!remove_active_transfer(&map, &symbol, other_boot));
+        assert_eq!(
+            map.read().unwrap().get(&symbol),
+            Some(&GuardState::ActiveTransfer { generation: owner })
+        );
+        assert!(remove_active_transfer(&map, &symbol, owner));
+        assert_eq!(map.read().unwrap().get(&symbol), None);
+    }
+
+    #[test]
+    fn exact_generation_removal_releases_restored_legacy_owner() {
+        let map = make_in_progress();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let generation = GuardGeneration::default();
+        map.write()
+            .unwrap()
+            .insert(symbol.clone(), GuardState::ActiveTransfer { generation });
+
+        assert!(remove_active_transfer(&map, &symbol, generation));
+        assert_eq!(map.read().unwrap().get(&symbol), None);
+    }
+
+    #[test]
+    fn exact_generation_removal_preserves_recovery_hold() {
+        let map = make_in_progress();
+        let symbol = Symbol::new("AAPL").unwrap();
+        map.write()
+            .unwrap()
+            .insert(symbol.clone(), GuardState::HeldForRecovery);
+
+        assert!(!remove_active_transfer(
+            &map,
+            &symbol,
+            GuardGeneration::from_parts(7, 1)
+        ));
+        assert_eq!(
+            map.read().unwrap().get(&symbol),
+            Some(&GuardState::HeldForRecovery)
+        );
     }
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {

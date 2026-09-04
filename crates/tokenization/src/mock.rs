@@ -11,8 +11,9 @@ use st0x_evm::{EvmError, NODE_SYNC_MAX_ATTEMPTS};
 use st0x_execution::{FractionalShares, Symbol};
 
 use super::{
-    AlpacaTokenizationError, IssuerRequestId, MintVerificationError, TokenizationRequest,
-    TokenizationRequestId, TokenizationRequestStatus, Tokenizer, TokenizerError,
+    AlpacaTokenizationError, ClientRequestId, IssuerRequestId, MintVerificationError,
+    TokenizationRequest, TokenizationRequestId, TokenizationRequestStatus, TokenizationRequestType,
+    Tokenizer, TokenizerError,
 };
 use crate::alpaca::AlpacaApiErrorMessage;
 
@@ -21,6 +22,7 @@ use crate::alpaca::AlpacaApiErrorMessage;
 pub enum MockMintRequestOutcome {
     Pending,
     Rejected,
+    DefinitiveError,
     ApiError,
 }
 
@@ -91,6 +93,13 @@ enum MockListPendingOutcome {
     ApiError,
 }
 
+#[derive(Clone, Copy)]
+enum MockMintLookupOutcome {
+    Succeed,
+    ApiError,
+    DefinitiveError,
+}
+
 pub struct MockTokenizer {
     redemption_wallet: Option<Address>,
     redemption_tx: TxHash,
@@ -103,9 +112,12 @@ pub struct MockTokenizer {
     wait_for_block_outcome: MockWaitForBlockOutcome,
     wait_for_block_calls: Mutex<Vec<u64>>,
     list_pending_outcome: MockListPendingOutcome,
+    mint_lookup_outcome: MockMintLookupOutcome,
     last_issuer_request_id: Mutex<Option<IssuerRequestId>>,
     /// Total number of tokenizer method calls made (across all methods).
     call_count: AtomicUsize,
+    mint_request_call_count: AtomicUsize,
+    mint_lookup_call_count: AtomicUsize,
     pending_requests: Vec<TokenizationRequest>,
     /// Override the token_symbol in completed mint responses.
     token_symbol_behavior: MockTokenSymbolBehavior,
@@ -127,8 +139,11 @@ impl MockTokenizer {
             wait_for_block_outcome: MockWaitForBlockOutcome::Succeed,
             wait_for_block_calls: Mutex::new(Vec::new()),
             list_pending_outcome: MockListPendingOutcome::Succeed,
+            mint_lookup_outcome: MockMintLookupOutcome::Succeed,
             last_issuer_request_id: Mutex::new(None),
             call_count: AtomicUsize::new(0),
+            mint_request_call_count: AtomicUsize::new(0),
+            mint_lookup_call_count: AtomicUsize::new(0),
             token_symbol_behavior: MockTokenSymbolBehavior::Default,
             fees_override: None,
             pending_requests: Vec::new(),
@@ -138,6 +153,14 @@ impl MockTokenizer {
     /// Returns the total number of tokenizer method calls made since construction.
     pub fn call_count(&self) -> usize {
         self.call_count.load(Ordering::Relaxed)
+    }
+
+    pub fn mint_request_call_count(&self) -> usize {
+        self.mint_request_call_count.load(Ordering::Relaxed)
+    }
+
+    pub fn mint_lookup_call_count(&self) -> usize {
+        self.mint_lookup_call_count.load(Ordering::Relaxed)
     }
 
     #[must_use]
@@ -199,6 +222,18 @@ impl MockTokenizer {
     }
 
     #[must_use]
+    pub fn with_mint_lookup_failure(mut self) -> Self {
+        self.mint_lookup_outcome = MockMintLookupOutcome::ApiError;
+        self
+    }
+
+    #[must_use]
+    pub fn with_definitive_mint_lookup_failure(mut self) -> Self {
+        self.mint_lookup_outcome = MockMintLookupOutcome::DefinitiveError;
+        self
+    }
+
+    #[must_use]
     pub fn with_pending_requests(mut self, requests: Vec<TokenizationRequest>) -> Self {
         self.pending_requests = requests;
         self
@@ -246,23 +281,33 @@ impl Default for MockTokenizer {
 impl Tokenizer for MockTokenizer {
     async fn request_mint(
         &self,
-        _symbol: Symbol,
-        _quantity: FractionalShares,
-        _wallet: Address,
+        symbol: Symbol,
+        quantity: FractionalShares,
+        wallet: Address,
         issuer_request_id: IssuerRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
+        self.mint_request_call_count.fetch_add(1, Ordering::Relaxed);
         *self
             .last_issuer_request_id
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(issuer_request_id);
+            .unwrap_or_else(PoisonError::into_inner) = Some(issuer_request_id.clone());
+
+        let response = |status| {
+            let mut request = TokenizationRequest::mock(status);
+            request.r#type = Some(TokenizationRequestType::Mint);
+            request.underlying_symbol = symbol.clone();
+            request.quantity = quantity;
+            request.wallet = Some(wallet);
+            request.client_request_id = Some(ClientRequestId::from(&issuer_request_id));
+            request
+        };
 
         match self.mint_request_outcome {
-            MockMintRequestOutcome::Pending => Ok(TokenizationRequest::mock(
-                TokenizationRequestStatus::Pending,
-            )),
-            MockMintRequestOutcome::Rejected => Ok(TokenizationRequest::mock(
-                TokenizationRequestStatus::Rejected,
+            MockMintRequestOutcome::Pending => Ok(response(TokenizationRequestStatus::Pending)),
+            MockMintRequestOutcome::Rejected => Ok(response(TokenizationRequestStatus::Rejected)),
+            MockMintRequestOutcome::DefinitiveError => Err(TokenizerError::Alpaca(
+                AlpacaTokenizationError::UnsupportedAccount,
             )),
             MockMintRequestOutcome::ApiError => {
                 Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
@@ -274,6 +319,47 @@ impl Tokenizer for MockTokenizer {
                 }))
             }
         }
+    }
+
+    async fn find_mint_by_issuer_request_id(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<Option<TokenizationRequest>, TokenizerError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+        self.mint_lookup_call_count.fetch_add(1, Ordering::Relaxed);
+        match self.mint_lookup_outcome {
+            MockMintLookupOutcome::Succeed => {}
+            MockMintLookupOutcome::ApiError => {
+                return Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: AlpacaApiErrorMessage::from_response(
+                        "mock mint lookup failure".to_string(),
+                    ),
+                    retry_after: None,
+                }));
+            }
+            MockMintLookupOutcome::DefinitiveError => {
+                return Err(TokenizerError::Alpaca(
+                    AlpacaTokenizationError::UnsupportedAccount,
+                ));
+            }
+        }
+
+        let expected_client_request_id = issuer_request_id.to_string();
+        let mut candidates = self.pending_requests.iter().filter(|request| {
+            request.client_request_id.as_ref().map(AsRef::as_ref)
+                == Some(expected_client_request_id.as_str())
+        });
+        let first_match = candidates.next().cloned();
+        if candidates.next().is_some() {
+            return Err(TokenizerError::Alpaca(
+                AlpacaTokenizationError::DuplicateMintIssuerRequestId {
+                    issuer_request_id: issuer_request_id.clone(),
+                },
+            ));
+        }
+
+        Ok(first_match)
     }
 
     async fn poll_mint_until_complete(

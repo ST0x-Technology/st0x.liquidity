@@ -47,7 +47,8 @@ use st0x_execution::{
 };
 
 use super::{
-    IssuerRequestId, MintVerificationError, TokenizationRequestId, Tokenizer, TokenizerError,
+    ClientRequestId, IssuerRequestId, MintVerificationError, TokenizationRequestId, Tokenizer,
+    TokenizerError,
 };
 
 /// High-level service for Alpaca tokenization operations.
@@ -104,7 +105,7 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
             issuer: Issuer::new("st0x"),
             network: self.client.network.clone(),
             wallet,
-            issuer_request_id,
+            client_request_id: issuer_request_id,
         };
         self.client.request_mint(request).await
     }
@@ -116,6 +117,15 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
     ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
         self.client
             .poll_until_terminal(id, &self.polling_config)
+            .await
+    }
+
+    pub(crate) async fn find_mint_by_issuer_request_id(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<Option<TokenizationRequest>, AlpacaTokenizationError> {
+        self.client
+            .find_mint_by_issuer_request_id(issuer_request_id)
             .await
     }
 
@@ -316,6 +326,7 @@ pub struct TokenizationRequest {
     pub quantity: FractionalShares,
     #[serde(rename = "wallet_address")]
     pub wallet: Option<Address>,
+    pub client_request_id: Option<ClientRequestId>,
     pub issuer_request_id: Option<IssuerRequestId>,
     #[serde(default, deserialize_with = "deserialize_tx_hash")]
     pub tx_hash: Option<TxHash>,
@@ -342,6 +353,7 @@ impl TokenizationRequest {
             token_symbol: None,
             quantity: FractionalShares::ZERO,
             wallet: None,
+            client_request_id: None,
             issuer_request_id: None,
             tx_hash: None,
             fees: None,
@@ -361,6 +373,7 @@ impl TokenizationRequest {
             token_symbol: Some("tAAPL".to_string()),
             quantity: FractionalShares::ZERO,
             wallet: None,
+            client_request_id: None,
             issuer_request_id: None,
             tx_hash: Some(TxHash::ZERO),
             fees: None,
@@ -403,7 +416,7 @@ struct MintRequest {
     network: Network,
     #[serde(rename = "wallet_address")]
     wallet: Address,
-    issuer_request_id: IssuerRequestId,
+    client_request_id: IssuerRequestId,
 }
 
 /// Parameters for filtering tokenization requests.
@@ -449,6 +462,9 @@ pub enum AlpacaTokenizationError {
 
     #[error("Request not found: {id}")]
     RequestNotFound { id: TokenizationRequestId },
+
+    #[error("multiple mint requests found for issuer request id {issuer_request_id}")]
+    DuplicateMintIssuerRequestId { issuer_request_id: IssuerRequestId },
 
     #[error("EVM error: {0}")]
     Evm(#[from] EvmError),
@@ -516,6 +532,25 @@ impl std::fmt::Display for InvalidTokenizationParameters {
 }
 
 impl AlpacaTokenizationError {
+    pub fn is_definitive_mint_rejection(&self) -> bool {
+        match self {
+            Self::InsufficientPosition { .. }
+            | Self::UnsupportedAccount
+            | Self::InvalidParameters { .. } => true,
+            Self::ApiError { status, .. } if *status == StatusCode::BAD_REQUEST => true,
+            Self::Reqwest(_)
+            | Self::Auth(_)
+            | Self::JsonParse(_)
+            | Self::Utf8(_)
+            | Self::ApiError { .. }
+            | Self::RequestNotFound { .. }
+            | Self::DuplicateMintIssuerRequestId { .. }
+            | Self::Evm(_)
+            | Self::PollTimeout { .. }
+            | Self::MissingRedemptionWallet => false,
+        }
+    }
+
     /// Returns the HTTP status code if this error was caused by an API response.
     pub fn status_code(&self) -> Option<StatusCode> {
         match self {
@@ -558,6 +593,7 @@ impl AlpacaTokenizationError {
             | Self::UnsupportedAccount
             | Self::InvalidParameters { .. }
             | Self::RequestNotFound { .. }
+            | Self::DuplicateMintIssuerRequestId { .. }
             | Self::Evm(_)
             | Self::PollTimeout { .. }
             | Self::MissingRedemptionWallet => None,
@@ -571,17 +607,36 @@ fn map_mint_error(
     symbol: Symbol,
     retry_after: Option<Duration>,
 ) -> AlpacaTokenizationError {
+    let normalized_message = message.to_ascii_lowercase();
+
     match status {
         StatusCode::FORBIDDEN => {
-            if message.contains("insufficient") || message.contains("position") {
+            if normalized_message.contains("insufficient")
+                && normalized_message.contains("position")
+            {
                 AlpacaTokenizationError::InsufficientPosition { symbol }
-            } else {
+            } else if normalized_message.contains("not supported")
+                && normalized_message.contains("tokenization")
+            {
                 AlpacaTokenizationError::UnsupportedAccount
+            } else {
+                AlpacaTokenizationError::ApiError {
+                    status,
+                    message: AlpacaApiErrorMessage::from_response(message),
+                    retry_after,
+                }
             }
         }
-        StatusCode::UNPROCESSABLE_ENTITY => AlpacaTokenizationError::InvalidParameters {
-            details: InvalidTokenizationParameters::from_response(message),
-        },
+        StatusCode::UNPROCESSABLE_ENTITY if normalized_message.contains("no positions found") => {
+            AlpacaTokenizationError::InsufficientPosition { symbol }
+        }
+        StatusCode::UNPROCESSABLE_ENTITY
+            if normalized_message.contains("invalid wallet address") =>
+        {
+            AlpacaTokenizationError::InvalidParameters {
+                details: InvalidTokenizationParameters::from_response(message),
+            }
+        }
         _ => AlpacaTokenizationError::ApiError {
             status,
             message: AlpacaApiErrorMessage::from_response(message),
@@ -636,7 +691,8 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
     ///
     /// - `InsufficientPosition` if the account lacks the required shares (403)
     /// - `UnsupportedAccount` if the account is not enabled for tokenization (403)
-    /// - `InvalidParameters` if the request parameters are invalid (422)
+    /// - `InvalidParameters` if a recognized validation response rejects the request
+    /// - `InsufficientPosition` if the provider reports no position (403 or 422)
     /// - `ApiError` for other API errors
     /// - `Reqwest` for network errors
     async fn request_mint(
@@ -661,6 +717,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             .auth
             .apply_apca(self.http_client.post(&url))
             .await?
+            .header("Idempotency-Key", request.client_request_id.to_string())
             .json(&request)
             .send()
             .await?;
@@ -687,7 +744,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
                         body_len = bytes.len(),
                         error = %error,
                         symbol = %request.underlying_symbol,
-                        issuer_request_id = %request.issuer_request_id.0,
+                        client_request_id = %request.client_request_id.0,
                         "Failed to deserialize tokenization response"
                     );
                 })?;
@@ -872,6 +929,36 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             );
         })
         .map_err(AlpacaTokenizationError::from)
+    }
+
+    async fn find_mint_by_issuer_request_id(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<Option<TokenizationRequest>, AlpacaTokenizationError> {
+        let params = ListRequestsParams {
+            request_type: Some(TokenizationRequestType::Mint),
+            ..Default::default()
+        };
+        let body = self.fetch_requests_body(&params).await?;
+        let expected_client_request_id = issuer_request_id.to_string();
+        let requests: Vec<Value> = serde_json::from_str(&body)?;
+        let mut candidates = requests.iter().filter(|request| {
+            request.get("client_request_id").and_then(Value::as_str)
+                == Some(expected_client_request_id.as_str())
+        });
+        let first_match = candidates.next();
+
+        if candidates.next().is_some() {
+            return Err(AlpacaTokenizationError::DuplicateMintIssuerRequestId {
+                issuer_request_id: issuer_request_id.clone(),
+            });
+        }
+
+        first_match
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(AlpacaTokenizationError::from)
     }
 
     /// Poll until a tokenization request reaches a terminal state (Completed or Rejected).
@@ -1070,6 +1157,13 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
         Ok(Self::poll_mint_until_complete(self, id).await?)
     }
 
+    async fn find_mint_by_issuer_request_id(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<Option<TokenizationRequest>, TokenizerError> {
+        Ok(Self::find_mint_by_issuer_request_id(self, issuer_request_id).await?)
+    }
+
     async fn get_request(
         &self,
         id: &TokenizationRequestId,
@@ -1251,7 +1345,7 @@ pub(crate) mod tests {
             issuer: Issuer::new("st0x"),
             network: Network::new("base"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
-            issuer_request_id: issuer_request_id("test-issuer-request-id"),
+            client_request_id: issuer_request_id("test-client-request-id"),
         }
     }
 
@@ -1263,20 +1357,21 @@ pub(crate) mod tests {
         let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
         let request = create_mint_request();
-        let issuer_id = request.issuer_request_id.to_string();
+        let client_id = request.client_request_id.to_string();
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST)
                 .path(tokenization_mint_path())
                 .header("APCA-API-KEY-ID", "test_api_key")
                 .header("APCA-API-SECRET-KEY", "test_api_secret")
+                .header("Idempotency-Key", &client_id)
                 .json_body(json!({
                     "underlying_symbol": "AAPL",
                     "qty": "100.5",
                     "issuer": "st0x",
                     "network": "base",
                     "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "issuer_request_id": issuer_id,
+                    "client_request_id": client_id,
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -1290,12 +1385,12 @@ pub(crate) mod tests {
                     "issuer": "st0x",
                     "network": "base",
                     "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "issuer_request_id": issuer_id,
+                    "client_request_id": client_id,
                     "created_at": "2024-01-15T10:30:00Z"
                 }));
         });
 
-        let expected_issuer_id = request.issuer_request_id.clone();
+        let expected_client_id = ClientRequestId::from(&request.client_request_id);
         let result = client.request_mint(request).await.unwrap();
 
         assert_eq!(result.id, tokenization_request_id("tok_req_123"));
@@ -1307,7 +1402,7 @@ pub(crate) mod tests {
             Some("tAAPL".to_string())
         );
         assert_eq!(result.quantity, FractionalShares::new(float!(100.5)));
-        assert_eq!(result.issuer_request_id, Some(expected_issuer_id));
+        assert_eq!(result.client_request_id, Some(expected_client_id));
         assert!(logs_contain(
             "Alpaca tokenization mint response body received"
         ));
@@ -1358,7 +1453,7 @@ pub(crate) mod tests {
                     "issuer": "st0x",
                     "network": "ethereum",
                     "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "issuer_request_id": issuer_id_str,
+                    "client_request_id": issuer_id_str,
                     "created_at": "2026-08-02T10:30:00Z"
                 }));
         });
@@ -1412,6 +1507,32 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn test_request_mint_unknown_forbidden_remains_uncertain() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+        let mint_mock = server.mock(|when, then| {
+            when.method(POST).path(tokenization_mint_path());
+            then.status(403)
+                .header("content-type", "application/json")
+                .json_body(json!({ "message": "caller is not authorized" }));
+        });
+
+        let error = client
+            .request_mint(create_mint_request())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            AlpacaTokenizationError::ApiError { status, .. }
+                if *status == StatusCode::FORBIDDEN
+        ));
+        assert!(!error.is_definitive_mint_rejection());
+        mint_mock.assert();
+    }
+
+    #[tokio::test]
     async fn test_request_mint_invalid_parameters() {
         let server = MockServer::start();
         let (_anvil, endpoint, key) = setup_anvil();
@@ -1439,6 +1560,129 @@ pub(crate) mod tests {
             "expected InvalidParameters with 'invalid wallet address', got: {err:?}"
         );
 
+        mint_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_request_mint_no_positions_is_definitive() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let mint_mock = server.mock(|when, then| {
+            when.method(POST).path(tokenization_mint_path());
+            then.status(422)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "message": "no positions found for account 1481094OM and symbol COIN"
+                }));
+        });
+
+        let err = client
+            .request_mint(create_mint_request())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, AlpacaTokenizationError::InsufficientPosition { symbol } if *symbol == "AAPL")
+        );
+        assert!(err.is_definitive_mint_rejection());
+        mint_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_request_mint_bad_request_is_definitive() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let mint_mock = server.mock(|when, then| {
+            when.method(POST).path(tokenization_mint_path());
+            then.status(400)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "message": "insufficient position"
+                }));
+        });
+
+        let err = client
+            .request_mint(create_mint_request())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            &err,
+            AlpacaTokenizationError::ApiError { status, .. }
+                if *status == StatusCode::BAD_REQUEST
+        ));
+        assert!(err.is_definitive_mint_rejection());
+        mint_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_request_mint_unknown_422_remains_uncertain() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let mint_mock = server.mock(|when, then| {
+            when.method(POST).path(tokenization_mint_path());
+            then.status(422)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "message": "issuer request id has already been used"
+                }));
+        });
+
+        let err = client
+            .request_mint(create_mint_request())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            &err,
+            AlpacaTokenizationError::ApiError { status, .. }
+                if *status == StatusCode::UNPROCESSABLE_ENTITY
+        ));
+        assert!(!err.is_definitive_mint_rejection());
+        mint_mock.assert();
+    }
+
+    #[test]
+    fn mint_conflict_and_server_errors_are_uncertain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        for status in [StatusCode::CONFLICT, StatusCode::INTERNAL_SERVER_ERROR] {
+            let error = map_mint_error(
+                status,
+                "provider did not confirm acceptance".to_string(),
+                symbol.clone(),
+                None,
+            );
+            assert!(!error.is_definitive_mint_rejection());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_mint_malformed_success_response_is_uncertain() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let mint_mock = server.mock(|when, then| {
+            when.method(POST).path(tokenization_mint_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .body("not-json");
+        });
+
+        let error = client
+            .request_mint(create_mint_request())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(&error, AlpacaTokenizationError::JsonParse(_)));
+        assert!(!error.is_definitive_mint_rejection());
         mint_mock.assert();
     }
 
@@ -1553,6 +1797,8 @@ pub(crate) mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, key) = setup_anvil();
         let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+        let mut mint_request = sample_tokenization_request_json("req_1", "mint", "AAPL");
+        mint_request["client_request_id"] = json!("my-mint-ref-001");
 
         let list_mock = server.mock(|when, then| {
             when.method(GET)
@@ -1562,7 +1808,7 @@ pub(crate) mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
-                    sample_tokenization_request_json("req_1", "mint", "AAPL"),
+                    mint_request,
                     sample_tokenization_request_json("req_2", "redeem", "TSLA")
                 ]));
         });
@@ -1575,6 +1821,10 @@ pub(crate) mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].id, tokenization_request_id("req_1"));
         assert_eq!(result[0].r#type, Some(TokenizationRequestType::Mint));
+        assert_eq!(
+            result[0].client_request_id,
+            Some(ClientRequestId::try_new("my-mint-ref-001").unwrap())
+        );
         assert_eq!(result[1].id, tokenization_request_id("req_2"));
         assert_eq!(result[1].r#type, Some(TokenizationRequestType::Redeem));
 
@@ -1662,6 +1912,96 @@ pub(crate) mod tests {
         assert_eq!(result[0].r#type, Some(TokenizationRequestType::Mint));
 
         list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn find_mint_by_issuer_request_id_scans_mint_history() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+        let issuer_id = issuer_request_id("completed-mint");
+        let issuer_id_string = issuer_id.to_string();
+
+        let lookup_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(tokenization_requests_path())
+                .query_param("type", "mint");
+            let mut request = sample_tokenization_request_json("req_1", "mint", "AAPL");
+            request["status"] = json!("completed");
+            request["client_request_id"] = json!(issuer_id_string);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([request]));
+        });
+
+        let request = client
+            .find_mint_by_issuer_request_id(&issuer_id)
+            .await
+            .unwrap()
+            .expect("matching completed mint");
+
+        assert_eq!(request.status, TokenizationRequestStatus::Completed);
+        assert_eq!(
+            request.client_request_id,
+            Some(ClientRequestId::from(&issuer_id))
+        );
+        lookup_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn find_mint_by_issuer_request_id_returns_none_without_history_match() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+        let issuer_id = issuer_request_id("duplicate-mint");
+        let lookup_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(tokenization_requests_path())
+                .query_param("type", "mint");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        let request = client
+            .find_mint_by_issuer_request_id(&issuer_id)
+            .await
+            .unwrap();
+
+        assert!(request.is_none());
+        lookup_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn find_mint_by_issuer_request_id_rejects_duplicate_history_matches() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+        let issuer_id = issuer_request_id("duplicate-mint");
+        let issuer_id_string = issuer_id.to_string();
+        let lookup_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(tokenization_requests_path())
+                .query_param("type", "mint");
+            let mut first = sample_tokenization_request_json("req_1", "mint", "AAPL");
+            first["client_request_id"] = json!(issuer_id_string);
+            let mut second = sample_tokenization_request_json("req_2", "mint", "AAPL");
+            second["client_request_id"] = json!(issuer_id.to_string());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([first, second]));
+        });
+
+        let error = client
+            .find_mint_by_issuer_request_id(&issuer_id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AlpacaTokenizationError::DuplicateMintIssuerRequestId { .. }
+        ));
+        lookup_mock.assert();
     }
 
     #[tokio::test]
@@ -2345,7 +2685,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_request_mint_includes_issuer_request_id_in_body() {
+    async fn test_request_mint_includes_client_request_id_and_idempotency_key() {
         let server = MockServer::start();
         let (_anvil, endpoint, key) = setup_anvil();
         let service =
@@ -2357,13 +2697,14 @@ pub(crate) mod tests {
         let mint_mock = server.mock(|when, then| {
             when.method(POST)
                 .path(tokenization_mint_path())
+                .header("Idempotency-Key", &expected_id_str)
                 .json_body(json!({
                     "underlying_symbol": "AAPL",
                     "qty": "100.5",
                     "issuer": "st0x",
                     "network": "base",
                     "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "issuer_request_id": expected_id_str,
+                    "client_request_id": expected_id_str,
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -2376,8 +2717,7 @@ pub(crate) mod tests {
                     "qty": "100.5",
                     "issuer": "st0x",
                     "network": "base",
-                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "issuer_request_id": expected_id_str,
+                    "client_request_id": expected_id_str,
                     "created_at": "2024-01-15T10:30:00Z"
                 }));
         });
@@ -2392,10 +2732,11 @@ pub(crate) mod tests {
             .unwrap();
 
         assert_eq!(
-            result.issuer_request_id,
-            Some(expected_id),
-            "Alpaca should return the same issuer_request_id we sent"
+            result.client_request_id,
+            Some(ClientRequestId::from(&expected_id)),
+            "Alpaca should return the same client_request_id we sent"
         );
+        assert_eq!(result.wallet, None);
 
         mint_mock.assert();
     }

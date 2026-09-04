@@ -616,7 +616,9 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
             symbol.clone(),
-            GuardState::ActiveTransfer { generation: 0 },
+            GuardState::ActiveTransfer {
+                generation: crate::rebalancing::trigger::GuardGeneration::default(),
+            },
         )])));
 
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
