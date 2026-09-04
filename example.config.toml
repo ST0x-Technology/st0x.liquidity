@@ -274,9 +274,12 @@ rebalancing = "enabled"
 # url = "https://api.example.com"
 
 # Required: issuance internal status API origin for the rebalancing freeze
-# guard. The api_key stays in the secrets file under [issuance].
+# guard. The api_key stays in the secrets file under [issuance] and is sent
+# as a header on every request, so use an HTTPS endpoint; a plain-HTTP
+# base_url loads but raises a startup warning (the key would travel in
+# cleartext).
 [issuance]
-base_url = "http://issuance.internal:8000"
+base_url = "https://issuance.internal:8000"
 
 # Required in rebalancing mode — low-gas balance alerting and the thresholds
 # that refuse fresh transfers before funds move. Optional only when the

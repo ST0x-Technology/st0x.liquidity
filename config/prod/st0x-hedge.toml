@@ -272,9 +272,6 @@ max_burn_revert_redrives = 5
 # Dividend freeze guard: query issuance each equity cycle and fail closed when
 # the status cannot be confirmed. Set to "disabled" to fail open during an
 # issuance outage (issuance secrets stay required, so re-enabling is config-only).
-# The issuance base_url now belongs in this config file's [issuance] section
-# (only the api_key is a secret); this deployment still carries it in the
-# deployed secrets file, accepted for one more release.
 freeze_check = "enabled"
 
 [rebalancing.usdc]
@@ -288,6 +285,13 @@ deviation = 0.05
 
 [rest_api]
 url = "https://api.st0x.io"
+
+# Issuance internal status API for the rebalancing freeze guard. The
+# non-secret base_url belongs here, in this config file's [issuance] section
+# (only the api_key is a secret); this deployment still carries it in the
+# deployed secrets file, accepted for one more release.
+# [issuance]
+# base_url = "..."
 
 # Low-gas balance alerting for the bot wallet. Alerts are structured ERROR
 # logs (target "operational_alert"); delivery to humans happens downstream via
