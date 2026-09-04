@@ -5467,6 +5467,14 @@ a leftover `[alerts]` table (`bot_token`) in the secrets file. Deployed config
 versions still carry the former, deployed secret versions the latter, and the
 previous build required them.)
 
+After a wrapper donation is confirmed, the bot emits a structured
+`operational_alert` ERROR log containing the equity symbol and transaction hash.
+The message omits the literal share quantity to stay concise; this is not a
+confidentiality guarantee because the public transaction reveals the amount. The
+production notifier cannot fail in-process: human delivery is owned by the Cloud
+Logging and Grafana alert pipeline, so the bot holds no notification
+credentials.
+
 ### BaseToAlpaca deposit send
 
 The CCTP mint on the BaseToAlpaca leg sets `mintRecipient` to the bot's own
