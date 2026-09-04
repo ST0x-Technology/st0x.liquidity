@@ -780,6 +780,29 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use st0x_config::{
+        ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode,
+        create_test_ctx_with_order_owner,
+    };
+
+    use st0x_event_sorcery::{EntityList, Reactor, StoreBuilder, TestHarness, deps, replay};
+
+    use super::*;
+    use crate::conductor::job::{FailureInjector, JobQueue, work};
+    use crate::test_utils::{setup_test_db, setup_test_pools};
+
+    const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
+    const TEST_OWNER: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+    const TEST_TOKEN: Address = address!("0x9876543210987654321098765432109876543210");
+    const TEST_VAULT_ID: B256 =
+        b256!("0x0000000000000000000000000000000000000000000000000000000000000001");
+    const TEST_TX_HASH: TxHash =
+        b256!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+    fn test_symbol() -> Symbol {
+        Symbol::new("AAPL").unwrap()
+    }
+
     /// Chain-qualified identity round-trips through Display/FromStr, and a
     /// legacy two-segment id is refused (persisted rows are migrated).
     #[test]
@@ -811,27 +834,63 @@ mod tests {
         assert!(matches!(error, ParseVaultRegistryIdError::Chain(_)));
     }
 
-    use st0x_config::{
-        ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode,
-        create_test_ctx_with_order_owner,
-    };
+    /// Runs the id migration over raw legacy-shaped rows: the aggregate id
+    /// comes out chain-qualified, and the view row keyed by the legacy id is
+    /// gone, so nothing parses it at startup and the framework rebuilds the
+    /// view from the migrated events. The direct INSERTs reproduce the
+    /// pre-migration on-disk shape, which no current code path can produce.
+    #[tokio::test]
+    async fn id_migration_upgrades_legacy_rows_and_clears_the_view() {
+        let pool = setup_test_db().await;
+        let legacy_id = format!("{TEST_ORDERBOOK}:{TEST_OWNER}");
 
-    use st0x_event_sorcery::{EntityList, Reactor, StoreBuilder, TestHarness, deps, replay};
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, \
+             event_version, payload, metadata) VALUES \
+             ('VaultRegistry', ?1, 1, 'VaultRegistryEvent::UsdcVaultDiscovered', '1.0', '{}', '{}')",
+        )
+        .bind(&legacy_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO vault_registry_view (view_id, version, payload) VALUES (?1, 1, '{}')",
+        )
+        .bind(&legacy_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
-    use super::*;
-    use crate::conductor::job::{FailureInjector, JobQueue, work};
-    use crate::test_utils::{setup_test_db, setup_test_pools};
+        let migration =
+            include_str!("../migrations/20260903123436_chain_qualified_vault_registry_ids.sql");
+        // Twice: the WHERE guards make the upgrade idempotent.
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
 
-    const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
-    const TEST_OWNER: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
-    const TEST_TOKEN: Address = address!("0x9876543210987654321098765432109876543210");
-    const TEST_VAULT_ID: B256 =
-        b256!("0x0000000000000000000000000000000000000000000000000000000000000001");
-    const TEST_TX_HASH: TxHash =
-        b256!("0x1111111111111111111111111111111111111111111111111111111111111111");
+        let (aggregate_id,): (String,) = sqlx::query_as(
+            "SELECT aggregate_id FROM events WHERE aggregate_type = 'VaultRegistry'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            aggregate_id.parse::<VaultRegistryId>().unwrap(),
+            VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_OWNER,
+            }
+        );
 
-    fn test_symbol() -> Symbol {
-        Symbol::new("AAPL").unwrap()
+        let (legacy_view_rows,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM vault_registry_view WHERE view_id LIKE '0x%'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            legacy_view_rows, 0,
+            "legacy-keyed view rows must not survive the migration"
+        );
     }
 
     #[test]

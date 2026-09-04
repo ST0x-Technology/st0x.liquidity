@@ -2851,6 +2851,7 @@ mod tests {
 
     async fn discover_equity_vault(
         pool: &SqlitePool,
+        chain: Chain,
         orderbook: Address,
         order_owner: Address,
         token: Address,
@@ -2859,7 +2860,7 @@ mod tests {
     ) {
         let store = test_store::<VaultRegistry>(pool.clone(), ());
         let vault_registry_id = VaultRegistryId {
-            chain: st0x_evm::Chain::Base,
+            chain,
             orderbook,
             owner: order_owner,
         };
@@ -2880,13 +2881,14 @@ mod tests {
 
     async fn discover_usdc_vault(
         pool: &SqlitePool,
+        chain: Chain,
         orderbook: Address,
         order_owner: Address,
         vault_id: B256,
     ) {
         let store = test_store::<VaultRegistry>(pool.clone(), ());
         let vault_registry_id = VaultRegistryId {
-            chain: st0x_evm::Chain::Base,
+            chain,
             orderbook,
             owner: order_owner,
         };
@@ -2960,7 +2962,7 @@ mod tests {
         let pool = setup_test_db().await;
         let (orderbook, order_owner) = test_addresses();
 
-        discover_usdc_vault(&pool, orderbook, order_owner, TEST_VAULT_ID).await;
+        discover_usdc_vault(&pool, Chain::Base, orderbook, order_owner, TEST_VAULT_ID).await;
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::Value::from(100u64)); // eth_blockNumber (pinned poll block)
@@ -3012,6 +3014,7 @@ mod tests {
 
         discover_equity_vault(
             &pool,
+            Chain::Base,
             orderbook,
             order_owner,
             TEST_TOKEN,
@@ -3080,6 +3083,7 @@ mod tests {
         // Registry seeded under the VAULT OWNER key only.
         discover_equity_vault(
             &pool,
+            Chain::Base,
             orderbook,
             vault_owner,
             TEST_TOKEN,
@@ -3128,6 +3132,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_onchain_keys_vault_registry_on_configured_chain() {
+        // The registry lookup is chain-qualified. Seed the equity vault ONLY
+        // under Ethereum and poll as Ethereum: a lookup that hard-coded Base
+        // would find no registry and skip on-chain polling.
+        let pool = setup_test_db().await;
+        let (orderbook, owner) = test_addresses();
+
+        discover_equity_vault(
+            &pool,
+            Chain::Ethereum,
+            orderbook,
+            owner,
+            TEST_TOKEN,
+            TEST_VAULT_ID,
+            test_symbol("AAPL"),
+        )
+        .await;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::from(100u64)); // eth_blockNumber (pinned poll block)
+        asserter.push_success(&vault_balance_hex(float!(7))); // vaultBalance2 for the equity vault
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let raindex_service = create_test_raindex_service(provider);
+
+        let service = InventoryPollingService::new(
+            PollFreshness::new(),
+            raindex_service,
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Chain::Ethereum,
+            InventorySnapshotId { orderbook, owner },
+            owner,
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, owner).await;
+        let has_onchain_equity = events
+            .iter()
+            .any(|event| matches!(event, InventorySnapshotEvent::OnchainEquity { .. }));
+
+        assert!(
+            has_onchain_equity,
+            "OnchainEquity must be emitted, proving the registry was looked up \
+             under the configured chain rather than Base",
+        );
+    }
+
+    #[tokio::test]
     async fn timestamp_is_captured_before_the_external_read_future_is_polled() {
         let read_started_at = Arc::new(Mutex::new(None));
         let observed_read_start = Arc::clone(&read_started_at);
@@ -3152,6 +3209,7 @@ mod tests {
         let (orderbook, order_owner) = test_addresses();
         discover_equity_vault(
             &pool,
+            Chain::Base,
             orderbook,
             order_owner,
             TEST_TOKEN,
@@ -3159,7 +3217,7 @@ mod tests {
             test_symbol("AAPL"),
         )
         .await;
-        discover_usdc_vault(&pool, orderbook, order_owner, TEST_VAULT_ID).await;
+        discover_usdc_vault(&pool, Chain::Base, orderbook, order_owner, TEST_VAULT_ID).await;
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::Value::from(100u64));
@@ -3219,6 +3277,7 @@ mod tests {
 
         discover_equity_vault(
             &pool,
+            Chain::Base,
             orderbook,
             order_owner,
             TEST_TOKEN,
@@ -3269,7 +3328,7 @@ mod tests {
         let pool = setup_test_db().await;
         let (orderbook, order_owner) = test_addresses();
 
-        discover_usdc_vault(&pool, orderbook, order_owner, TEST_VAULT_ID).await;
+        discover_usdc_vault(&pool, Chain::Base, orderbook, order_owner, TEST_VAULT_ID).await;
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::Value::from(100u64)); // eth_blockNumber (pinned poll block)
@@ -3319,6 +3378,7 @@ mod tests {
 
         discover_equity_vault(
             &pool,
+            Chain::Base,
             orderbook,
             order_owner,
             TEST_TOKEN,
@@ -3328,6 +3388,7 @@ mod tests {
         .await;
         discover_equity_vault(
             &pool,
+            Chain::Base,
             orderbook,
             order_owner,
             TEST_TOKEN,
@@ -3388,8 +3449,15 @@ mod tests {
         let configured_vault_id =
             b256!("0x0000000000000000000000000000000000000000000000000000000000000002");
 
-        discover_usdc_vault(&pool, orderbook, order_owner, retired_vault_id).await;
-        discover_usdc_vault(&pool, orderbook, order_owner, configured_vault_id).await;
+        discover_usdc_vault(&pool, Chain::Base, orderbook, order_owner, retired_vault_id).await;
+        discover_usdc_vault(
+            &pool,
+            Chain::Base,
+            orderbook,
+            order_owner,
+            configured_vault_id,
+        )
+        .await;
 
         let retired_balance = vault_balance_hex(float!(125));
         let asserter = Asserter::new();
@@ -3436,7 +3504,7 @@ mod tests {
         let pool = setup_test_db().await;
         let (orderbook, order_owner) = test_addresses();
 
-        discover_usdc_vault(&pool, orderbook, order_owner, TEST_VAULT_ID).await;
+        discover_usdc_vault(&pool, Chain::Base, orderbook, order_owner, TEST_VAULT_ID).await;
 
         let asserter = Asserter::new();
         asserter.push_failure_msg("RPC failure");
@@ -7090,6 +7158,7 @@ mod tests {
 
         discover_equity_vault(
             &pool,
+            Chain::Base,
             orderbook,
             order_owner,
             TEST_TOKEN,
@@ -7292,6 +7361,7 @@ mod tests {
 
         discover_equity_vault(
             &pool,
+            Chain::Base,
             orderbook,
             order_owner,
             TEST_TOKEN,
@@ -7420,6 +7490,7 @@ mod tests {
 
         discover_equity_vault(
             &pool,
+            Chain::Base,
             orderbook,
             order_owner,
             TEST_TOKEN,
@@ -7427,7 +7498,7 @@ mod tests {
             symbol.clone(),
         )
         .await;
-        discover_usdc_vault(&pool, orderbook, order_owner, TEST_VAULT_ID).await;
+        discover_usdc_vault(&pool, Chain::Base, orderbook, order_owner, TEST_VAULT_ID).await;
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::Value::from(100u64)); // eth_blockNumber (pinned poll block)
