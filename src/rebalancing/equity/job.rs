@@ -526,8 +526,14 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
     type Error = TransferEquityToHedgingJobError;
 
     const WORKER_NAME: &'static str = "transfer-equity-to-hedging-worker";
-    const PERFORM_TIMEOUT: Option<std::time::Duration> =
-        Some(crate::conductor::job::DEFAULT_PERFORM_TIMEOUT);
+    /// No perform-level bound (`None`): `resume_equity_to_hedging` drives the
+    /// redemption through `unwrap_and_send` / `SendPending -> SendTokens`, the
+    /// same non-idempotent on-chain send that `ResumeTokenizationAggregate`
+    /// opts out for. Dropping the future mid-send would re-send tokens to the
+    /// redemption wallet on retry. The post-send phases (detection/completion
+    /// polling) resume safely from the persisted `TokensSent`; actual hangs are
+    /// bounded by the HTTP/RPC transport timeouts.
+    const PERFORM_TIMEOUT: Option<std::time::Duration> = None;
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind =
@@ -600,6 +606,21 @@ mod tests {
     use crate::rebalancing::equity::{EquityTransferServices, MintError};
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::vault_lookup::MockVaultLookup;
+
+    /// Regression guard: `TransferEquityToHedging` must keep `PERFORM_TIMEOUT =
+    /// None`. It drives the same `unwrap_and_send` / `SendPending -> SendTokens`
+    /// redemption send as `ResumeTokenizationAggregate` (also `None`); a dropped
+    /// future mid-send would re-send tokens on retry. Any edit re-imposing a
+    /// bound must first make that send re-entry-safe.
+    #[test]
+    fn equity_to_hedging_opts_out_of_perform_timeout() {
+        assert_eq!(
+            <TransferEquityToHedging as Job<TransferEquityToHedgingCtx>>::PERFORM_TIMEOUT,
+            None,
+            "TransferEquityToHedging must not be perform-bounded: its redemption send \
+             has no safe re-entry if the future is dropped mid-flight",
+        );
+    }
 
     /// Builds a test ctx with recovery enabled for AAPL and an empty guard map.
     async fn test_ctx(
