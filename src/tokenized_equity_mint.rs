@@ -47,7 +47,7 @@ use sqlx::SqlitePool;
 use tracing::{info, warn};
 
 use st0x_dto::{EquityMintOperation, EquityMintStatus, TransferOperation};
-use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Id;
 use st0x_tokenization::{IssuerRequestId, TokenizationRequestId, TokenizationRequestStatus};
@@ -1578,10 +1578,10 @@ impl EventSourced for TokenizedEquityMint {
     type Command = TokenizedEquityMintCommand;
     type Error = TokenizedEquityMintError;
     type Services = EquityTransferServices;
-    type Materialized = Nil;
+    type Materialized = Table;
 
     const AGGREGATE_TYPE: &'static str = "TokenizedEquityMint";
-    const PROJECTION: Nil = Nil;
+    const PROJECTION: Table = Table("tokenized_equity_mint_view");
     // v3: removed the vestigial `receipt_id` field and added the
     // `ProviderCompletionRecovered` event for in-process failed-transfer recovery.
     // v4: added the terminal `Reconciled` state and the `OperatorReconciled`

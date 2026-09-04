@@ -35,7 +35,9 @@ use crate::dashboard::pnl::{
     PnlError, PnlQuery, PnlResponse, acquire_pnl_report_permit, build_pnl_report_with_permit,
     validate_pnl_snapshot_rowid,
 };
-use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
+use crate::dashboard::transfer_loader::{
+    InvalidTransferKind, TransferHistoryQuery, TransferKind, query_transfer_history,
+};
 use crate::dashboard::{TradePage, TradeProtocol, TradeQuery, query_trades};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
 use crate::iap_auth::{IapVerifier, require_iap};
@@ -770,10 +772,7 @@ struct TransfersQuery {
     until: Option<String>,
 }
 
-/// Paginated transfer history using event-sourced aggregate replay.
-///
-/// Replays transfer aggregates to produce proper DTO statuses, then
-/// applies time-range filtering and pagination.
+/// Paginated transfer history backed by aggregate projections.
 async fn transfers_endpoint(
     State(state): State<AppState>,
     Query(query): Query<TransfersQuery>,
@@ -800,44 +799,24 @@ async fn transfers_endpoint(
         None => None,
     };
 
-    let loaded = crate::dashboard::transfer_loader::load_all_transfer_operations(
+    let page = query_transfer_history(
         &state.pool,
-        kind_filter.as_deref(),
+        &TransferHistoryQuery {
+            limit,
+            offset,
+            kinds: kind_filter,
+            since: since_dt,
+            until: until_dt,
+        },
     )
-    .await;
+    .await
+    .map_err(|error| {
+        tracing::error!(target: "dashboard", %error, "Failed to query transfer history");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    let mut operations = loaded.operations;
-
-    // Filter by time range
-    if since_dt.is_some() || until_dt.is_some() {
-        operations.retain(|op| {
-            let started = op.started_at();
-
-            if let Some(ref since) = since_dt
-                && started < *since
-            {
-                return false;
-            }
-
-            if let Some(ref until) = until_dt
-                && started > *until
-            {
-                return false;
-            }
-
-            true
-        });
-    }
-
-    // Sort newest first
-    operations.sort_by_key(|op| std::cmp::Reverse(op.started_at()));
-
-    let filtered_total = operations.len();
-    let start = offset.min(filtered_total);
-    let end = filtered_total.min(offset + limit);
-    let has_more = end < filtered_total;
-
-    let entries: Vec<serde_json::Value> = operations[start..end]
+    let entries: Vec<serde_json::Value> = page
+        .operations
         .iter()
         .map(serde_json::to_value)
         .collect::<Result<_, _>>()
@@ -852,13 +831,13 @@ async fn transfers_endpoint(
 
     let mut response = serde_json::json!({
         "entries": entries,
-        "total": filtered_total,
-        "hasMore": has_more,
+        "total": page.total,
+        "hasMore": page.has_more,
     });
 
-    if !loaded.warnings.is_empty() {
+    if !page.warnings.is_empty() {
         response["warnings"] =
-            serde_json::to_value(&loaded.warnings).unwrap_or_else(|_| serde_json::json!([]));
+            serde_json::to_value(&page.warnings).unwrap_or_else(|_| serde_json::json!([]));
     }
 
     Ok(Json(response))

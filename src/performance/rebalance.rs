@@ -1152,7 +1152,7 @@ mod tests {
         let pool = setup_test_db().await;
         // Production wiring: the reactor is a registered query, so each `send`
         // persists the event to the store AND drives the live read-model write.
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .with(std::sync::Arc::new(RebalanceTimingProjection::new(
                 pool.clone(),
             )))
@@ -1386,7 +1386,7 @@ mod tests {
         // Production wiring: the reactor is a registered query, so each `send`
         // persists the event AND drives the live read-model write (last_sequence
         // stays NULL).
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .with(std::sync::Arc::new(RebalanceTimingProjection::new(
                 pool.clone(),
             )))
@@ -1499,7 +1499,7 @@ mod tests {
     #[tokio::test]
     async fn live_write_preserves_the_catch_up_checkpoint() {
         let pool = setup_test_db().await;
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .with(std::sync::Arc::new(RebalanceTimingProjection::new(
                 pool.clone(),
             )))
