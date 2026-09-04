@@ -2070,7 +2070,7 @@ mod tests {
         Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
-            log_dir: None,
+            file_logging: None,
             log_format: LogFormat::Text,
             log_query_url_template: None,
             server_port: 8080,
@@ -3960,6 +3960,7 @@ mod tests {
             &config_path,
             r#"
                 database_url = ":memory:"
+                log_level = "debug"
                 server_port = 8080
                 board_port = 8081
                 apalis_finished_job_cleanup_interval_secs = 3600
