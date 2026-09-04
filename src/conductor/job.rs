@@ -2040,6 +2040,72 @@ mod tests {
         assert_eq!(ctx.success_count.load(Ordering::SeqCst), 1);
     }
 
+    /// End-to-end proof of the RAI-2218 fix through the real
+    /// `build_supervised_worker!` macro: a `perform` future that never
+    /// resolves must drive the supervised worker to a terminal fail-stop
+    /// (retries exhausted -> `on_terminal_failure` -> `ctx.stop()`), not latch
+    /// idle. `HangingJob`'s 50ms `PERFORM_TIMEOUT` keeps this fast; the
+    /// `RETRY_BACKOFF` (1s, 2s, 4s) across `retries(3)` bounds it to ~7s.
+    ///
+    /// Distinct from the unit tests above (which prove `perform_bounded`
+    /// alone) and from `job_failure_after_retries_halts_processing` (which
+    /// uses a job that returns `Err`): this proves the hang -> timeout -> Err
+    /// -> retry -> stop composition end to end on the production worker wiring.
+    #[tokio::test]
+    async fn supervised_worker_fail_stops_on_a_hung_perform() {
+        let apalis_pool = setup_test_apalis_pool().await;
+
+        let mut queue: JobQueue<HangingJob> = JobQueue::new(&apalis_pool);
+        queue.push(HangingJob).await.unwrap();
+
+        let failure_notify = Arc::new(TerminalFailureSignal::default());
+        let ctx = Arc::new(());
+
+        let monitor_handle = tokio::spawn({
+            let failure_notify = failure_notify.clone();
+            let monitor = Monitor::new()
+                .should_restart(|_ctx, _error, _attempt| false)
+                .register(move |index| {
+                    build_supervised_worker!(
+                        ::<(), HangingJob>,
+                        index,
+                        queue.clone(),
+                        ctx.clone(),
+                        failure_notify.clone(),
+                        FailureInjector::new(),
+                    )
+                });
+
+            async move {
+                let _ = monitor.run().await;
+            }
+        });
+
+        let info = tokio::time::timeout(Duration::from_secs(20), failure_notify.notified())
+            .await
+            .expect(
+                "a perform future that never resolves must drive a terminal fail-stop \
+                 through the macro path, not latch idle",
+            );
+
+        assert_eq!(
+            info.context,
+            HangingJob::TERMINAL_FAILURE_MSG,
+            "recorded failure must carry the job's terminal-failure context",
+        );
+        assert_eq!(
+            info.source.to_string(),
+            "hanging-job: Job::perform did not resolve within 50ms",
+            "the terminal failure must be the perform timeout surfaced through JobError, \
+             proving the hang became a loud error rather than a silent park",
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), monitor_handle)
+            .await
+            .expect("monitor should exit within 5s after the terminal timeout failure")
+            .expect("monitor task should not panic");
+    }
+
     /// A job that fails after all retries must halt further processing --
     /// the worker must not pick up the next job with stale state.
     ///
