@@ -297,10 +297,15 @@ symbol and contract details.
 
 ### Host access
 
-Reach the VM over IAP with gcloud (`docs/cli-ops.md` covers the CLI it runs):
+Reach a VM over IAP with gcloud (`docs/cli-ops.md` covers the CLI it runs):
 
 ```bash
+# Staging
 gcloud compute ssh t0-liquidity-staging --project t0-liquidity-staging \
+  --zone europe-west3-b --tunnel-through-iap
+
+# Production
+gcloud compute ssh t0-liquidity --project t0-liquidity \
   --zone europe-west3-b --tunnel-through-iap
 ```
 
