@@ -475,6 +475,24 @@ where
         })
     }
 
+    /// Atomically replace a venue with a fresh available balance and an exact
+    /// recovered source reservation.
+    ///
+    /// This is narrower than [`Self::force_on_snapshot`]: it is used only when
+    /// durable transfer state proves the reservation amount, so recovery keeps
+    /// that inflight amount while replacing potentially stale available state.
+    pub(crate) fn restore_reservation(
+        venue: Venue,
+        available: T,
+        inflight: T,
+    ) -> Box<dyn FnOnce(Self, Chain) -> Result<Self, InventoryError<T>> + Send> {
+        Box::new(move |inventory, chain| {
+            let balance = VenueBalance::new(available, T::ZERO).set_inflight(inflight)?;
+
+            Ok(inventory.set_venue(venue, chain, Some(balance)))
+        })
+    }
+
     /// Apply a fetched venue snapshot.
     ///
     /// Skips if ANY venue has inflight operations, because we cannot
@@ -2398,7 +2416,6 @@ impl InventoryView {
     }
 
     /// Returns the aggregate ID of the in-flight USDC rebalance, if any.
-    #[cfg(test)]
     pub(crate) fn active_usdc_rebalance(&self) -> Option<&UsdcRebalanceId> {
         self.active_usdc_rebalance.as_ref()
     }
@@ -4435,6 +4452,22 @@ mod tests {
 
         let onchain = result.onchain[&Chain::Base];
         assert_eq!(onchain.total().unwrap(), shares(999));
+    }
+
+    #[test]
+    fn restore_reservation_replaces_stale_available_and_existing_inflight() {
+        let inventory = make_inventory(50, 0, 100, 20);
+
+        let restored = Inventory::restore_reservation(Venue::Hedging, shares(75), shares(30))(
+            inventory,
+            Chain::Base,
+        )
+        .unwrap();
+
+        let offchain = restored.offchain.unwrap();
+        assert_eq!(offchain.available(), shares(75));
+        assert_eq!(offchain.inflight(), shares(30));
+        assert_eq!(restored.onchain[&Chain::Base], venue(50, 0));
     }
 
     #[test]

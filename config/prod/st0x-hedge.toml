@@ -267,6 +267,7 @@ transfer_timeout_secs = 1800
 # older than this bound (or absent, e.g. right after a restart).
 inventory_staleness_bound_secs = 300
 transfer_attempt_timeout_secs = 3600
+inventory_recovery_redrive_delay_secs = 30
 attestation_retry_deadline_secs = 86400
 max_burn_revert_redrives = 5
 # Dividend freeze guard: query issuance each equity cycle and fail closed when
