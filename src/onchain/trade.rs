@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use st0x_config::{ChainAssets, InventoryAdapterVenue, InventoryAdapters, TradingChain};
-use st0x_evm::{Chain, Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE};
+use st0x_evm::{Chain, Evm, EvmError, IERC20, OpenChainErrorRegistry};
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_float_serde::format_float_with_fallback;
 use st0x_registry::SymbolCache;
@@ -486,7 +486,7 @@ impl OnchainTrade {
         )
         .map_err(reclassify_inventory_float_error)?;
 
-        validate_inventory_token_addresses(assets, &trade_details)?;
+        validate_inventory_token_addresses(chain, assets, &trade_details)?;
 
         finalize_onchain_trade(
             evm.provider(),
@@ -704,11 +704,15 @@ fn reclassify_inventory_float_error(error: OnChainError) -> OnChainError {
 /// `InventoryTrade` path; the trusted ClearV3/TakeOrderV3 path never needs
 /// this since its token addresses already come from the bot's own orders.
 fn validate_inventory_token_addresses(
+    chain: Chain,
     assets: &ChainAssets,
     trade_details: &TradeDetails,
 ) -> Result<(), TradeValidationError> {
+    let expected_usdc = chain
+        .usdc()
+        .ok_or(TradeValidationError::UsdcUnknownOnChain { chain })?;
     let usdc_token = trade_details.usdc_token();
-    if usdc_token != USDC_BASE {
+    if usdc_token != expected_usdc {
         return Err(TradeValidationError::UnrecognizedInventoryToken {
             token: usdc_token,
             claimed_symbol: "USDC".to_string(),
@@ -983,6 +987,11 @@ pub enum TradeValidationError {
         token: Address,
         claimed_symbol: String,
     },
+    /// This build does not pin a canonical USDC address for the fill's
+    /// chain, so the USDC leg cannot be validated; refuse rather than accept
+    /// another chain's address.
+    #[error("no canonical USDC address is pinned for chain {chain}")]
+    UsdcUnknownOnChain { chain: Chain },
 }
 
 #[cfg(test)]
@@ -999,9 +1008,9 @@ mod tests {
         ChainEquities, ChainEquityAsset, InventoryAdapter, InventoryAdapterVenue,
         InventoryAdapters, InventoryMode, OperationMode, TradingChain,
     };
-    use st0x_evm::Chain;
     use st0x_evm::IERC20::decimalsCall;
     use st0x_evm::ReadOnlyEvm;
+    use st0x_evm::{Chain, USDC_BASE};
     use st0x_execution::Symbol;
     use st0x_float_macro::float;
     use st0x_registry::SymbolCache;
@@ -1877,10 +1886,10 @@ mod tests {
         assert!(vaults.is_empty());
     }
 
-    // `try_from_inventory_trade` validates the USDC leg against the
-    // hardcoded canonical `USDC_BASE` address, so the InventoryTrade tests'
-    // USDC leg must use it too, not an arbitrary placeholder.
-    const INVENTORY_USDC: Address = USDC_BASE;
+    // `try_from_inventory_trade` validates the USDC leg against the fill
+    // chain's canonical USDC address; the InventoryTrade fixtures run on
+    // Ethereum, so their USDC leg must be Ethereum's, not a placeholder.
+    const INVENTORY_USDC: Address = st0x_evm::USDC_ETHEREUM;
     const INVENTORY_EQUITY: Address = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
     /// Builds an `ChainAssets` with a single configured equity symbol,
@@ -2062,7 +2071,7 @@ mod tests {
         };
 
         let trade = OnchainTrade::try_from_inventory_trade(
-            Chain::Base,
+            Chain::Ethereum,
             &cache,
             &evm,
             &assets,
