@@ -505,7 +505,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     cache: &SymbolCache,
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
-    let trading_chain = ctx.chains.sole_trading();
+    let trading_chain = ctx.chains.primary();
     // Matches ClearV3/TakeOrderV3 fills to our Raindex orders -- owned by the
     // inventory contract post-migration, the bot EOA before it.
     let actors = RecoveryActors {
@@ -785,11 +785,7 @@ pub(super) async fn process_found_trade<W: Write>(
         }
     }
 
-    let trading_enabled = ctx
-        .chains
-        .sole_trading()
-        .assets
-        .is_trading_enabled(base_symbol);
+    let trading_enabled = ctx.chains.primary().assets.is_trading_enabled(base_symbol);
 
     if !trading_enabled {
         writeln!(
@@ -812,7 +808,7 @@ pub(super) async fn process_found_trade<W: Write>(
         &position_projection,
         base_symbol,
         executor_type,
-        &ctx.chains.sole_trading().assets,
+        &ctx.chains.primary().assets,
         &ctx.assets,
         trading_enabled,
     )
@@ -1191,16 +1187,14 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
-    use url::Url;
     use uuid::uuid;
 
     use st0x_config::ChainRegistry;
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
-        BrokerCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, IngestionCutoff,
-        InventoryAdapters, InventoryMode, LogFormat, LogLevel, OperationMode, TradingChain,
-        TradingMode,
+        BrokerCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, InventoryMode, LogFormat,
+        LogLevel, OperationMode, TradingChain, TradingMode,
     };
     use st0x_evm::Chain;
     use st0x_execution::{
@@ -1433,28 +1427,22 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            chains: ChainRegistry::single_trading_chain(TradingChain {
-                redemption_wallet: None,
-                assets: ChainAssets::default(),
-                chain: Chain::Base,
-                inventory_adapters: InventoryAdapters::default(),
-                rpc_url: Url::parse("http://localhost:8545").unwrap(),
-                orderbook: address!("0x1234567890123456789012345678901234567890"),
-                inventory: InventoryMode::Managed {
-                    inventory: address!("0x1234567890123456789012345678901234567890"),
-                },
-                vault_owner: Address::ZERO,
-                deployment_block: 1,
-                required_confirmations: 0,
-                ingestion_cutoff: IngestionCutoff::Safe,
-            }),
+            chains: ChainRegistry::single_trading_chain(
+                TradingChain::test()
+                    .orderbook(address!("0x1234567890123456789012345678901234567890"))
+                    .inventory(InventoryMode::Managed {
+                        inventory: address!("0x1234567890123456789012345678901234567890"),
+                    })
+                    .vault_owner(Address::ZERO)
+                    .deployment_block(1)
+                    .call(),
+            ),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
             inventory_poll_interval: 60,
             inventory_divergence_threshold: std::num::NonZeroU32::MIN,
             hedge_order_gate_reconciliation_timeout_secs: std::num::NonZeroU64::MIN,
-            order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: std::num::NonZeroU64::new(300),
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
@@ -2469,23 +2457,18 @@ mod tests {
         // Enable trading so check_execution_readiness would trigger if we fell
         // through — confirming that the early return fires before hedge placement.
         let mut ctx = create_base_test_ctx();
-        ctx.chains
-            .sole_trading_mut()
-            .assets
-            .equities
-            .symbols
-            .insert(
-                Symbol::new("AAPL").unwrap(),
-                ChainEquityAsset {
-                    tokenized_equity: Address::ZERO,
-                    tokenized_equity_derivative: Address::ZERO,
-                    vault_ids: vec![],
-                    trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Disabled,
-                    wrapped_equity_recovery: OperationMode::Disabled,
-                    operational_limit: None,
-                },
-            );
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
 
         let order_placer = create_order_placer(&ctx, &pool);
 
@@ -2922,23 +2905,18 @@ mod tests {
 
         // Enable trading so check_execution_readiness can trigger hedge placement.
         let mut ctx = create_base_test_ctx();
-        ctx.chains
-            .sole_trading_mut()
-            .assets
-            .equities
-            .symbols
-            .insert(
-                Symbol::new("AAPL").unwrap(),
-                ChainEquityAsset {
-                    tokenized_equity: Address::ZERO,
-                    tokenized_equity_derivative: Address::ZERO,
-                    vault_ids: vec![],
-                    trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Disabled,
-                    wrapped_equity_recovery: OperationMode::Disabled,
-                    operational_limit: None,
-                },
-            );
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(FailingOrderPlacer);
         let onchain_trade = onchain_trade_builder().with_block_number(42).build();
@@ -3484,23 +3462,18 @@ mod tests {
         // Enable trading so that if we fell through to hedge placement we would
         // know — confirming the early return fires before any of that.
         let mut ctx = create_base_test_ctx();
-        ctx.chains
-            .sole_trading_mut()
-            .assets
-            .equities
-            .symbols
-            .insert(
-                Symbol::new("AAPL").unwrap(),
-                ChainEquityAsset {
-                    tokenized_equity: Address::ZERO,
-                    tokenized_equity_derivative: Address::ZERO,
-                    vault_ids: vec![],
-                    trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Disabled,
-                    wrapped_equity_recovery: OperationMode::Disabled,
-                    operational_limit: None,
-                },
-            );
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
 
         let order_placer = create_order_placer(&ctx, &pool);
 
@@ -3865,23 +3838,18 @@ mod tests {
 
         // Enable trading so check_execution_readiness can trigger hedge placement.
         let mut ctx = create_base_test_ctx();
-        ctx.chains
-            .sole_trading_mut()
-            .assets
-            .equities
-            .symbols
-            .insert(
-                Symbol::new("AAPL").unwrap(),
-                ChainEquityAsset {
-                    tokenized_equity: Address::ZERO,
-                    tokenized_equity_derivative: Address::ZERO,
-                    vault_ids: vec![],
-                    trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Disabled,
-                    wrapped_equity_recovery: OperationMode::Disabled,
-                    operational_limit: None,
-                },
-            );
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(SucceedingOrderPlacer);
 

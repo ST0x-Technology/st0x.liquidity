@@ -75,18 +75,14 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
     writeln!(
         stdout,
         "   Inventory: {}",
-        ctx.chains.sole_trading().inventory_address()
+        ctx.chains.primary().inventory_address()
     )?;
-    writeln!(
-        stdout,
-        "   Orderbook: {}",
-        ctx.chains.sole_trading().orderbook
-    )?;
+    writeln!(stdout, "   Orderbook: {}", ctx.chains.primary().orderbook)?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
     let raindex_service = RaindexService::new(
         wallet_ctx.base_wallet().clone(),
-        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.sole_trading()),
+        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.primary()),
         sender_address,
     );
 
@@ -137,18 +133,14 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
     writeln!(
         stdout,
         "   Inventory: {}",
-        ctx.chains.sole_trading().inventory_address()
+        ctx.chains.primary().inventory_address()
     )?;
-    writeln!(
-        stdout,
-        "   Orderbook: {}",
-        ctx.chains.sole_trading().orderbook
-    )?;
+    writeln!(stdout, "   Orderbook: {}", ctx.chains.primary().orderbook)?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
     let raindex_service = RaindexService::new(
         wallet_ctx.base_wallet().clone(),
-        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.sole_trading()),
+        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.primary()),
         sender_address,
     );
 
@@ -175,17 +167,11 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
 ) -> anyhow::Result<()> {
     ctx.wallet()?;
 
-    let cash = ctx
-        .chains
-        .sole_trading()
-        .assets
-        .cash
-        .as_ref()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
-            )
-        })?;
+    let cash = ctx.chains.primary().assets.cash.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+        )
+    })?;
 
     let vault_id = cash.vault_ids.first().copied().ok_or_else(|| {
         anyhow::anyhow!(
@@ -215,7 +201,6 @@ mod tests {
     use alloy::primitives::{Address, address, b256};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::sol_types::SolCall;
-    use url::Url;
 
     use st0x_config::ChainRegistry;
     use st0x_config::ExecutionThreshold;
@@ -226,8 +211,7 @@ mod tests {
         BrokerCtx, ChainAssets, ChainCashAsset, ChainEquities, LogFormat, LogLevel, OperationMode,
         TradingMode,
     };
-    use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
-    use st0x_evm::Chain;
+    use st0x_config::{InventoryMode, TradingChain};
     use st0x_evm::IERC20::decimalsCall;
     use st0x_evm::ReadOnlyEvm;
     use st0x_finance::Usdc;
@@ -245,28 +229,22 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            chains: ChainRegistry::single_trading_chain(TradingChain {
-                redemption_wallet: None,
-                assets: ChainAssets::default(),
-                chain: Chain::Base,
-                inventory_adapters: InventoryAdapters::default(),
-                rpc_url: Url::parse("http://localhost:8545").unwrap(),
-                orderbook: address!("0x1234567890123456789012345678901234567890"),
-                inventory: InventoryMode::Managed {
-                    inventory: address!("0x2345678901234567890123456789012345678901"),
-                },
-                vault_owner: Address::ZERO,
-                deployment_block: 1,
-                required_confirmations: 0,
-                ingestion_cutoff: IngestionCutoff::Safe,
-            }),
+            chains: ChainRegistry::single_trading_chain(
+                TradingChain::test()
+                    .orderbook(address!("0x1234567890123456789012345678901234567890"))
+                    .inventory(InventoryMode::Managed {
+                        inventory: address!("0x2345678901234567890123456789012345678901"),
+                    })
+                    .vault_owner(Address::ZERO)
+                    .deployment_block(1)
+                    .call(),
+            ),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
             inventory_poll_interval: 60,
             inventory_divergence_threshold: std::num::NonZeroU32::MIN,
             hedge_order_gate_reconciliation_timeout_secs: std::num::NonZeroU64::MIN,
-            order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: std::num::NonZeroU64::new(300),
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
@@ -302,31 +280,26 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            chains: ChainRegistry::single_trading_chain(TradingChain {
-                redemption_wallet: None,
-                assets: ChainAssets {
-                    equities: ChainEquities::default(),
-                    cash,
-                },
-                chain: Chain::Base,
-                inventory_adapters: InventoryAdapters::default(),
-                rpc_url: Url::parse("http://localhost:8545").unwrap(),
-                orderbook: address!("0x1234567890123456789012345678901234567890"),
-                inventory: InventoryMode::Managed {
-                    inventory: address!("0x2345678901234567890123456789012345678901"),
-                },
-                vault_owner: Address::ZERO,
-                deployment_block: 1,
-                required_confirmations: 0,
-                ingestion_cutoff: IngestionCutoff::Safe,
-            }),
+            chains: ChainRegistry::single_trading_chain(
+                TradingChain::test()
+                    .orderbook(address!("0x1234567890123456789012345678901234567890"))
+                    .inventory(InventoryMode::Managed {
+                        inventory: address!("0x2345678901234567890123456789012345678901"),
+                    })
+                    .vault_owner(Address::ZERO)
+                    .deployment_block(1)
+                    .assets(ChainAssets {
+                        equities: ChainEquities::default(),
+                        cash,
+                    })
+                    .call(),
+            ),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
             inventory_poll_interval: 60,
             inventory_divergence_threshold: std::num::NonZeroU32::MIN,
             hedge_order_gate_reconciliation_timeout_secs: std::num::NonZeroU64::MIN,
-            order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: std::num::NonZeroU64::new(300),
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,

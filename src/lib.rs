@@ -249,15 +249,15 @@ async fn run_bot_session_inner(
     let metrics_handle = metrics::setup().context("failed to install Prometheus recorder")?;
 
     let inventory = Arc::new(inventory::BroadcastingInventory::new(
-        inventory::InventoryView::for_trading_chain(ctx.chains.sole_trading().chain),
+        inventory::InventoryView::for_trading_chain(ctx.chains.primary().chain),
         event_sender.clone(),
     ));
     let equity_prices =
-        dashboard::equity_price::EquityPriceStore::new(&ctx.chains.sole_trading().assets);
+        dashboard::equity_price::EquityPriceStore::new(&ctx.chains.primary().assets);
     let equity_price_monitor = ctx.pricing.clone().map(|pricing| {
         dashboard::equity_price::EquityPriceMonitor::new(
             pricing,
-            &ctx.chains.sole_trading().assets,
+            &ctx.chains.primary().assets,
             equity_prices.clone(),
             event_sender.clone(),
         )
@@ -1243,7 +1243,7 @@ mod tests {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         // Port 1 refuses connections immediately, so the startup RPC probe
         // fails fast rather than hanging on a retry loop.
-        ctx.chains.sole_trading_mut().rpc_url = "http://127.0.0.1:1".parse().unwrap();
+        ctx.chains.primary_mut().rpc_url = "http://127.0.0.1:1".parse().unwrap();
         let error = Box::pin(run_conductor_session(
             ctx,
             DatabasePools {
@@ -1276,7 +1276,7 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
-        ctx.chains.sole_trading_mut().rpc_url = "http://127.0.0.1:1".parse().unwrap();
+        ctx.chains.primary_mut().rpc_url = "http://127.0.0.1:1".parse().unwrap();
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let error = Box::pin(run_conductor_session(
             ctx,

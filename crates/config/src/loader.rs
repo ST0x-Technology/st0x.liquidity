@@ -220,7 +220,6 @@ struct Config {
     inventory_poll_interval: Option<u64>,
     inventory_divergence_threshold: NonZeroU32,
     hedge_order_gate_reconciliation_timeout_secs: NonZeroU64,
-    order_fill_poll_interval: Option<u64>,
     apalis_finished_job_cleanup_interval_secs: u64,
     telemetry: Option<TelemetryConfig>,
     alerts: Option<AlertsConfig>,
@@ -692,7 +691,7 @@ pub struct Ctx {
     pub server_port: u16,
     pub board_port: u16,
     /// Every chain the bot acts on. Read the trading chain out of it with
-    /// [`ChainRegistry::sole_trading`].
+    /// [`ChainRegistry::primary`].
     pub chains: ChainRegistry,
     pub order_polling_interval: u64,
     pub order_polling_max_jitter: u64,
@@ -710,7 +709,6 @@ pub struct Ctx {
     /// Interval (seconds) between continuous `eth_getLogs` polls for orderbook
     /// fills. Each tick enqueues a backfill range over the unprocessed blocks
     /// (capped at the chain's latest finalized block).
-    pub order_fill_poll_interval: u64,
     /// Maximum age (seconds) for a live extended-hours limit hedge before it is
     /// cancelled so the next scan can place a fresh marketable limit. `None`
     /// is valid only for DryRun with no extended-hours-enabled assets; loaded
@@ -1209,7 +1207,6 @@ impl std::fmt::Debug for Ctx {
                 "hedge_order_gate_reconciliation_timeout_secs",
                 &self.hedge_order_gate_reconciliation_timeout_secs,
             )
-            .field("order_fill_poll_interval", &self.order_fill_poll_interval)
             .field(
                 "extended_hours_reprice_timeout_secs",
                 &self.extended_hours_reprice_timeout_secs,
@@ -1350,7 +1347,6 @@ struct ValidatedParts {
     inventory_poll_interval: u64,
     inventory_divergence_threshold: NonZeroU32,
     hedge_order_gate_reconciliation_timeout_secs: NonZeroU64,
-    order_fill_poll_interval: u64,
     extended_hours_reprice_timeout_secs: Option<NonZeroU64>,
     close_flatten_reprice_timeout_secs: u64,
     extended_hours_close_flatten_window_secs: u64,
@@ -1540,7 +1536,6 @@ struct PollingIntervals {
     order_polling_interval: u64,
     position_check_interval: u64,
     inventory_poll_interval: u64,
-    order_fill_poll_interval: u64,
     apalis_finished_job_cleanup_interval_secs: u64,
 }
 
@@ -1549,7 +1544,6 @@ fn validated_polling_intervals(config: &Config) -> Result<PollingIntervals, CtxE
         order_polling_interval: config.order_polling_interval.unwrap_or(15),
         position_check_interval: config.position_check_interval.unwrap_or(60),
         inventory_poll_interval: config.inventory_poll_interval.unwrap_or(60),
-        order_fill_poll_interval: config.order_fill_poll_interval.unwrap_or(5),
         apalis_finished_job_cleanup_interval_secs: config.apalis_finished_job_cleanup_interval_secs,
     };
 
@@ -1557,10 +1551,6 @@ fn validated_polling_intervals(config: &Config) -> Result<PollingIntervals, CtxE
         (intervals.order_polling_interval, "order_polling_interval"),
         (intervals.position_check_interval, "position_check_interval"),
         (intervals.inventory_poll_interval, "inventory_poll_interval"),
-        (
-            intervals.order_fill_poll_interval,
-            "order_fill_poll_interval",
-        ),
         (
             intervals.apalis_finished_job_cleanup_interval_secs,
             "apalis_finished_job_cleanup_interval_secs",
@@ -1773,7 +1763,7 @@ fn parse_and_validate(
         None => TradingMode::Standalone,
     };
 
-    let redemption_wallet = chains.sole_trading().redemption_wallet;
+    let redemption_wallet = chains.primary().redemption_wallet;
     let log_level = config.log_level.unwrap_or(LogLevel::Debug);
     let log_format = config.log_format.unwrap_or(LogFormat::Text);
 
@@ -1812,7 +1802,6 @@ fn parse_and_validate(
         inventory_divergence_threshold: config.inventory_divergence_threshold,
         hedge_order_gate_reconciliation_timeout_secs: config
             .hedge_order_gate_reconciliation_timeout_secs,
-        order_fill_poll_interval: polling_intervals.order_fill_poll_interval,
         extended_hours_reprice_timeout_secs,
         close_flatten_reprice_timeout_secs,
         extended_hours_close_flatten_window_secs,
@@ -1990,7 +1979,6 @@ impl Ctx {
             inventory_divergence_threshold: parts.inventory_divergence_threshold,
             hedge_order_gate_reconciliation_timeout_secs: parts
                 .hedge_order_gate_reconciliation_timeout_secs,
-            order_fill_poll_interval: parts.order_fill_poll_interval,
             extended_hours_reprice_timeout_secs: parts.extended_hours_reprice_timeout_secs,
             close_flatten_reprice_timeout_secs: parts.close_flatten_reprice_timeout_secs,
             extended_hours_close_flatten_window_secs: parts
@@ -2133,8 +2121,8 @@ impl Ctx {
             kms_api_key,
             api_private_key,
             wallet_address,
-            orderbook: parts.chains.sole_trading().orderbook,
-            assets: parts.chains.sole_trading().assets.clone(),
+            orderbook: parts.chains.primary().orderbook,
+            assets: parts.chains.primary().assets.clone(),
         }))
     }
 
@@ -2186,7 +2174,7 @@ impl Ctx {
     /// shared-inventory migration makes the inventory contract `msg.sender` to
     /// Raindex (and therefore the vault owner).
     pub fn vault_owner(&self) -> Address {
-        self.chains.sole_trading().vault_owner
+        self.chains.primary().vault_owner
     }
 }
 
@@ -2196,7 +2184,7 @@ impl Ctx {
 /// `ctx.X(symbol)` with `ctx.assets.X(symbol)`. Code that holds only an
 /// `&ChainAssets` (e.g. the accumulator) can reach every guard without a `Ctx`.
 #[cfg(any(test, feature = "test-support"))]
-use crate::{IngestionCutoff, InventoryMode};
+use crate::InventoryMode;
 
 /// Test-only constructor for `Ctx` that internalizes fields e2e tests
 /// don't need to control (log level, operational limits, EVM wrapping,
@@ -2318,26 +2306,25 @@ impl Ctx {
             log_query_url_template: None,
             server_port,
             board_port,
-            chains: ChainRegistry::single_trading_chain(TradingChain {
-                chain: Chain::Base,
-                rpc_url,
-                required_confirmations,
-                orderbook,
-                inventory: inventory_mode,
-                inventory_adapters,
-                vault_owner,
-                deployment_block,
-                ingestion_cutoff: IngestionCutoff::Safe,
-                redemption_wallet,
-                assets,
-            }),
+            chains: ChainRegistry::single_trading_chain(
+                TradingChain::test()
+                    .rpc_url(rpc_url)
+                    .required_confirmations(required_confirmations)
+                    .orderbook(orderbook)
+                    .inventory(inventory_mode)
+                    .inventory_adapters(inventory_adapters)
+                    .vault_owner(vault_owner)
+                    .deployment_block(deployment_block)
+                    .maybe_redemption_wallet(redemption_wallet)
+                    .assets(assets)
+                    .call(),
+            ),
             order_polling_interval: 1,
             order_polling_max_jitter: 0,
             position_check_interval: 2,
             inventory_poll_interval,
             inventory_divergence_threshold,
             hedge_order_gate_reconciliation_timeout_secs,
-            order_fill_poll_interval: 1,
             extended_hours_reprice_timeout_secs: NonZeroU64::new(300),
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
@@ -2787,31 +2774,23 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         log_query_url_template: None,
         server_port: 8080,
         board_port: 8081,
-        chains: ChainRegistry::single_trading_chain(TradingChain {
-            chain: Chain::Base,
-            // Hard-coded literal URL — parse cannot fail in a test helper.
-            #[allow(clippy::unwrap_used)]
-            rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
-            required_confirmations: 1,
-            orderbook: alloy::primitives::address!("0x1111111111111111111111111111111111111111"),
-            // Legacy by default: no distinct inventory, so the OPERATOR_ROLE
-            // preflight is skipped. Tests exercising the managed path override
-            // the trading chain's `inventory` explicitly.
-            inventory: InventoryMode::Legacy,
-            inventory_adapters: InventoryAdapters::default(),
-            vault_owner: order_owner,
-            deployment_block: 1,
-            ingestion_cutoff: IngestionCutoff::Safe,
-            redemption_wallet: None,
-            assets: crate::ChainAssets::default(),
-        }),
+        // Legacy by default: no distinct inventory, so the OPERATOR_ROLE
+        // preflight is skipped. Tests exercising the managed path override
+        // the trading chain's `inventory` explicitly.
+        chains: ChainRegistry::single_trading_chain(
+            TradingChain::test()
+                .required_confirmations(1)
+                .inventory(InventoryMode::Legacy)
+                .vault_owner(order_owner)
+                .deployment_block(1)
+                .call(),
+        ),
         order_polling_interval: 15,
         order_polling_max_jitter: 5,
         position_check_interval: 60,
         inventory_poll_interval: 60,
         inventory_divergence_threshold: NonZeroU32::MIN,
         hedge_order_gate_reconciliation_timeout_secs: NonZeroU64::MIN,
-        order_fill_poll_interval: 5,
         extended_hours_reprice_timeout_secs: NonZeroU64::new(300),
         close_flatten_reprice_timeout_secs: 60,
         extended_hours_close_flatten_window_secs: 900,
@@ -2877,8 +2856,8 @@ mod tests {
             .call()
             .unwrap();
 
-        assert_eq!(ctx.chains.sole_trading().inventory, InventoryMode::Legacy);
-        assert_eq!(ctx.chains.sole_trading().vault_owner, order_owner);
+        assert_eq!(ctx.chains.primary().inventory, InventoryMode::Legacy);
+        assert_eq!(ctx.chains.primary().vault_owner, order_owner);
     }
 
     #[test]
@@ -2900,10 +2879,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            ctx.chains.sole_trading().inventory,
+            ctx.chains.primary().inventory,
             InventoryMode::Managed { inventory }
         );
-        assert_eq!(ctx.chains.sole_trading().vault_owner, inventory);
+        assert_eq!(ctx.chains.primary().vault_owner, inventory);
     }
 
     #[test]
@@ -2990,6 +2969,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -3114,6 +3095,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.base.trading.assets.equities.AAPL]
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -3175,6 +3158,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -3232,6 +3217,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -3315,6 +3302,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -3426,6 +3415,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -3559,6 +3550,8 @@ mod tests {
             orderbook = "not-an-address"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -3617,6 +3610,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -3679,6 +3674,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -3738,6 +3735,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -3802,6 +3801,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -3962,7 +3963,6 @@ mod tests {
         assert_eq!(ctx.position_check_interval, 60);
         assert_eq!(ctx.inventory_poll_interval, 60);
         assert_eq!(ctx.hedge_order_gate_reconciliation_timeout_secs.get(), 10);
-        assert_eq!(ctx.order_fill_poll_interval, 5);
     }
 
     #[tokio::test]
@@ -3989,6 +3989,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -4042,6 +4044,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -4092,6 +4096,8 @@ mod tests {
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -4136,6 +4142,8 @@ mod tests {
             deployment_block = 1
             required_confirmations = 3
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -4182,6 +4190,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -4234,6 +4244,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -4287,6 +4299,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -4350,6 +4364,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -4403,6 +4419,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -4443,7 +4461,6 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
-            order_fill_poll_interval = 0
 
             [chains.base.trading.assets.equities]
 
@@ -4459,6 +4476,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 0
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -4478,14 +4497,10 @@ mod tests {
             .await
             .unwrap_err();
 
+        let error_text = format!("{error:#}");
         assert!(
-            matches!(
-                error,
-                CtxError::ZeroPollingInterval {
-                    field: "order_fill_poll_interval"
-                }
-            ),
-            "expected ZeroPollingInterval for order fill poll interval, got: {error:#}"
+            error_text.contains("order_fill_poll_interval_secs must be non-zero"),
+            "expected the per-chain zero-interval error, got: {error_text}"
         );
     }
 
@@ -4514,6 +4529,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -4585,6 +4602,8 @@ mod tests {
                 vault_owner = "0x3333333333333333333333333333333333333333"
                 deployment_block = 1
                 ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
                 [chains.ethereum]
                 lifecycle = "active"
@@ -4671,6 +4690,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
@@ -4759,6 +4780,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -4822,6 +4845,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -4875,6 +4900,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -4947,6 +4974,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
@@ -5057,6 +5086,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -5423,6 +5454,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -5497,6 +5530,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
@@ -5595,6 +5630,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
@@ -5697,6 +5734,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -5806,6 +5845,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
@@ -6082,6 +6123,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -6156,6 +6199,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -6240,6 +6285,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -6318,6 +6365,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -6394,6 +6443,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -6584,6 +6635,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -6823,6 +6876,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -6899,6 +6954,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -6979,6 +7036,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -7056,6 +7115,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -7136,6 +7197,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -7627,6 +7690,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [chains.ethereum]
@@ -8252,6 +8317,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -8302,6 +8369,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -8361,6 +8430,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -8410,6 +8481,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -8526,6 +8599,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -8800,6 +8875,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -8920,6 +8997,8 @@ mod tests {
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -8985,6 +9064,8 @@ mod tests {
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -9048,6 +9129,8 @@ mod tests {
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -9111,6 +9194,8 @@ mod tests {
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -9193,6 +9278,8 @@ mod tests {
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -9303,6 +9390,8 @@ mod tests {
             vault_owner = "0x0000000000000000000000000000000000000001"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -9353,6 +9442,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -9426,6 +9517,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -9485,6 +9578,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -9562,6 +9657,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -9666,6 +9763,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"
@@ -9724,6 +9823,8 @@ mod tests {
             vault_owner = "0x3333333333333333333333333333333333333333"
             deployment_block = 1
             ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
 
             [chains.ethereum]
             lifecycle = "active"

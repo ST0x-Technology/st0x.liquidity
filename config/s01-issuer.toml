@@ -53,6 +53,12 @@ inventory_adapters = []
 vault_owner = "0x975789F46b5De4624d6a4c3B3679901edF1a5bdA"
 deployment_block = 43259507
 ingestion_cutoff = "safe"
+# Seconds between fill-watch poll cycles on this chain (required; was the
+# global order_fill_poll_interval with a hidden default of 5).
+order_fill_poll_interval_secs = 5
+# Exactly one watched chain is the primary: the one whose inventory the bot
+# polls and rebalances automatically. Fills are hedged on every watched chain.
+primary = true
 # Alpaca's issuer wallet on this chain -- ERC-20 transfers for redemption go
 # here. Per chain: a redemption delivers tokens that exist on one chain, so
 # sending them to another chain's issuer address would burn them.

@@ -1945,7 +1945,7 @@ async fn run_provider_command<W: Write + Send>(
     stdout: &mut W,
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
-    let provider = ProviderBuilder::new().connect_http(ctx.chains.sole_trading().rpc_url.clone());
+    let provider = ProviderBuilder::new().connect_http(ctx.chains.primary().rpc_url.clone());
 
     match command {
         ProviderCommand::ProcessTx { tx_hash } => {
@@ -2023,16 +2023,14 @@ mod tests {
     use alloy::primitives::{Address, TxHash, address};
     use chrono::Utc;
     use clap::{CommandFactory, Parser};
-    use url::Url;
 
     use st0x_config::ChainRegistry;
     use st0x_config::ExecutionThreshold;
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
-    use st0x_config::{BrokerCtx, ChainAssets, LogFormat, LogLevel, TradingMode};
-    use st0x_config::{IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain};
+    use st0x_config::{BrokerCtx, LogFormat, LogLevel, TradingMode};
+    use st0x_config::{IngestionCutoff, InventoryMode, TradingChain};
     use st0x_event_sorcery::StoreBuilder;
-    use st0x_evm::Chain;
     use st0x_float_macro::float;
     use st0x_tokenization::IssuerRequestId;
     use st0x_tokenization::mock::MockTokenizer;
@@ -2075,28 +2073,22 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            chains: ChainRegistry::single_trading_chain(TradingChain {
-                redemption_wallet: None,
-                assets: ChainAssets::default(),
-                chain: Chain::Base,
-                inventory_adapters: InventoryAdapters::default(),
-                rpc_url: Url::parse("http://localhost:8545").unwrap(),
-                orderbook: address!("0x1234567890123456789012345678901234567890"),
-                inventory: InventoryMode::Managed {
-                    inventory: address!("0x1234567890123456789012345678901234567890"),
-                },
-                vault_owner: Address::ZERO,
-                deployment_block: 1,
-                required_confirmations: 0,
-                ingestion_cutoff: IngestionCutoff::Safe,
-            }),
+            chains: ChainRegistry::single_trading_chain(
+                TradingChain::test()
+                    .orderbook(address!("0x1234567890123456789012345678901234567890"))
+                    .inventory(InventoryMode::Managed {
+                        inventory: address!("0x1234567890123456789012345678901234567890"),
+                    })
+                    .vault_owner(Address::ZERO)
+                    .deployment_block(1)
+                    .call(),
+            ),
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
             inventory_poll_interval: 60,
             inventory_divergence_threshold: std::num::NonZeroU32::MIN,
             hedge_order_gate_reconciliation_timeout_secs: std::num::NonZeroU64::MIN,
-            order_fill_poll_interval: 5,
             extended_hours_reprice_timeout_secs: std::num::NonZeroU64::new(300),
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
@@ -3980,6 +3972,8 @@ mod tests {
                 vault_owner = "0x3333333333333333333333333333333333333333"
                 deployment_block = 1
                 ingestion_cutoff = "safe"
+                order_fill_poll_interval_secs = 1
+                primary = true
 
                 [chains.ethereum]
                 lifecycle = "active"
@@ -4040,17 +4034,14 @@ mod tests {
 
         assert!(matches!(command, Commands::Buy { .. }));
         assert_eq!(ctx.database_url, ":memory:");
-        assert_eq!(ctx.chains.sole_trading().required_confirmations, 3);
+        assert_eq!(ctx.chains.primary().required_confirmations, 3);
         assert_eq!(
-            ctx.chains.sole_trading().inventory,
+            ctx.chains.primary().inventory,
             InventoryMode::Managed {
                 inventory: address!("0x2222222222222222222222222222222222222222"),
             },
         );
-        assert_eq!(
-            ctx.chains.sole_trading().ingestion_cutoff,
-            IngestionCutoff::Safe
-        );
+        assert_eq!(ctx.chains.primary().ingestion_cutoff, IngestionCutoff::Safe);
         assert!(matches!(ctx.broker, BrokerCtx::DryRun));
     }
 }
