@@ -2037,13 +2037,14 @@ mod tests {
             false,
         );
 
-        let outcome = tokio::time::timeout(Duration::from_millis(200), bounded).await;
+        let bounded_result = tokio::time::timeout(Duration::from_millis(200), bounded).await;
 
-        assert!(
-            outcome.is_err(),
-            "a None PERFORM_TIMEOUT must not be bounded by perform_bounded; \
-             the call resolved to {outcome:?} instead of running until the outer deadline",
-        );
+        let Err(_elapsed) = &bounded_result else {
+            panic!(
+                "a None PERFORM_TIMEOUT must not be bounded by perform_bounded; \
+                 the call resolved to {bounded_result:?} instead of running until the outer deadline"
+            );
+        };
     }
 
     /// A handler error inside the bound must keep flowing through unchanged,

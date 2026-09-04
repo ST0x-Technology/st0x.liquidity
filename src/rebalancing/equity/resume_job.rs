@@ -102,8 +102,14 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
     type Error = ResumeTokenizationJobError;
 
     const WORKER_NAME: &'static str = "resume-tokenization-aggregate-worker";
-    const PERFORM_TIMEOUT: Option<std::time::Duration> =
-        Some(crate::conductor::job::DEFAULT_PERFORM_TIMEOUT);
+    /// No perform-level bound (`None`): the redemption resume path drives
+    /// `SendPending` -> `send_for_redemption`, an on-chain token transfer with
+    /// no pre-send persisted guard. `perform_bounded` dropping it after the
+    /// transfer broadcast but before `TokensSent` persists would, on retry,
+    /// re-enter `SendPending` and send the tokens a second time. `resume_mint`
+    /// (the other target) is idempotent, so leaving the whole job unbounded is
+    /// safe; actual hangs are bounded by the HTTP/RPC transport timeouts.
+    const PERFORM_TIMEOUT: Option<std::time::Duration> = None;
     const TERMINAL_FAILURE_MSG: &'static str = "Interrupted tokenization aggregate failed all resume retries; \
          the aggregate remains stuck. Operator action required.";
 
@@ -168,6 +174,21 @@ mod tests {
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
     use crate::vault_lookup::MockVaultLookup;
+
+    /// Regression guard: `ResumeTokenizationAggregate` must keep
+    /// `PERFORM_TIMEOUT = None`. The redemption target drives `SendPending`
+    /// -> `send_for_redemption`, an on-chain transfer with no pre-send guard;
+    /// `perform_bounded` dropping it mid-send would re-send on retry. Any edit
+    /// re-imposing a bound must first make that send re-entry-safe.
+    #[test]
+    fn resume_job_opts_out_of_perform_timeout() {
+        assert_eq!(
+            <ResumeTokenizationAggregate as Job<ResumeTokenizationCtx>>::PERFORM_TIMEOUT,
+            None,
+            "ResumeTokenizationAggregate must not be perform-bounded: the redemption \
+             send has no safe re-entry if the future is dropped mid-flight",
+        );
+    }
 
     /// Builds a [`ResumeTokenizationCtx`] backed by in-memory stores, plus
     /// the underlying stores for seeding aggregate state and the tokenizer

@@ -610,8 +610,17 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
     type Error = TransferUsdcToHedgingJobError;
 
     const WORKER_NAME: &'static str = "transfer-usdc-to-hedging-worker";
-    const PERFORM_TIMEOUT: Option<std::time::Duration> =
-        Some(crate::conductor::job::DEFAULT_PERFORM_TIMEOUT);
+    /// No perform-level bound (`None`): `perform` already wraps
+    /// `resume_base_to_alpaca` in its own `tokio::time::timeout(ctx.timeout)`
+    /// (the configured `transfer_attempt_timeout`, 1h default) with a
+    /// controlled `handle_hedging_timeout_redrive` that adopts the persisted
+    /// `pending_burn_tx` rather than reburning. That config-driven internal
+    /// timeout is the single source of truth for how long an attempt may run;
+    /// a hardcoded outer bound would preempt it (and preempt it wrongly if the
+    /// config is raised), replacing the controlled redrive with a generic
+    /// `PerformTimeout`. Actual network hangs are bounded by the HTTP/RPC
+    /// transport timeouts.
+    const PERFORM_TIMEOUT: Option<std::time::Duration> = None;
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind =
@@ -4221,6 +4230,22 @@ mod tests {
             None,
             "TransferUsdcToMarketMaking must not be perform-bounded: its Converting leg \
              has no safe re-entry if the future is dropped mid-flight",
+        );
+    }
+
+    /// Regression guard: `TransferUsdcToHedging` must keep `PERFORM_TIMEOUT =
+    /// None` so the generic `perform_bounded` never preempts its own internal
+    /// `tokio::time::timeout(ctx.timeout)` and the controlled
+    /// `handle_hedging_timeout_redrive`. A hardcoded outer bound below the
+    /// configured `transfer_attempt_timeout` would fire first and replace the
+    /// redrive (which adopts the persisted burn) with a generic failure.
+    #[test]
+    fn hedging_job_opts_out_of_perform_timeout() {
+        assert_eq!(
+            <TransferUsdcToHedging as Job<TransferUsdcToHedgingCtx>>::PERFORM_TIMEOUT,
+            None,
+            "TransferUsdcToHedging owns its config-driven internal per-attempt timeout; \
+             the perform-level bound must stay None so it cannot preempt that",
         );
     }
 
