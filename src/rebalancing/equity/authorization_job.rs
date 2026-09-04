@@ -110,6 +110,7 @@ impl Job<DeliverMintAuthorizationCtx> for DeliverMintAuthorization {
     type Error = DeliverMintAuthorizationError;
 
     const WORKER_NAME: &'static str = "deliver-mint-authorization-worker";
+    const PERFORM_TIMEOUT: std::time::Duration = crate::conductor::job::DEFAULT_PERFORM_TIMEOUT;
     const TERMINAL_FAILURE_MSG: &'static str = "Mint authorization delivery failed all retries; the orchestrator-mode \
          mint cannot proceed until the authorization reaches issuance. \
          Operator action required.";

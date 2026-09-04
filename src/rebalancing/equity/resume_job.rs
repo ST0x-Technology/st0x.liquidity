@@ -102,6 +102,7 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
     type Error = ResumeTokenizationJobError;
 
     const WORKER_NAME: &'static str = "resume-tokenization-aggregate-worker";
+    const PERFORM_TIMEOUT: std::time::Duration = crate::conductor::job::DEFAULT_PERFORM_TIMEOUT;
     const TERMINAL_FAILURE_MSG: &'static str = "Interrupted tokenization aggregate failed all resume retries; \
          the aggregate remains stuck. Operator action required.";
 

@@ -63,6 +63,7 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
     type Error = JobError;
 
     const WORKER_NAME: &'static str = "handle-order-rejection-worker";
+    const PERFORM_TIMEOUT: std::time::Duration = crate::conductor::job::DEFAULT_PERFORM_TIMEOUT;
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind =

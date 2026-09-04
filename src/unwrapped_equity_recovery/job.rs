@@ -179,6 +179,7 @@ impl Job<UnwrappedEquityRecoveryCtx> for UnwrappedEquityRecoveryJob {
     type Error = UnwrappedEquityRecoveryJobError;
 
     const WORKER_NAME: &'static str = "unwrapped-equity-recovery-worker";
+    const PERFORM_TIMEOUT: std::time::Duration = crate::conductor::job::DEFAULT_PERFORM_TIMEOUT;
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind =

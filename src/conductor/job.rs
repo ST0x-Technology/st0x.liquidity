@@ -504,6 +504,19 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     }
 }
 
+/// Default upper bound on a single [`Job::perform`] invocation.
+///
+/// Every worker runs `.concurrency(1)`, so a `perform` future that never
+/// resolves parks its worker forever with no error, no retry, and no
+/// `on_terminal_failure` stop (RAI-2218). The bound converts the hang into a
+/// [`JobError`] that retries and, on exhaustion, halts through the worker's
+/// terminal-failure path. Generous by design: it exists to catch a future
+/// that will never resolve, not to enforce a latency target, so it sits well
+/// above the slowest legitimate `perform` (the USDC conversion poll's
+/// compiled-in wait of several minutes is the current ceiling). A job with a
+/// materially different legitimate ceiling (e.g. `BackfillRange`) sets its own.
+pub(crate) const DEFAULT_PERFORM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// A persistent, retryable unit of work backed by apalis storage.
 ///
 /// Implementations are serializable structs that carry the data
@@ -537,18 +550,12 @@ where
     /// a terminal failure for this job.
     const TERMINAL_FAILURE_MSG: &'static str = "Job failed after retries";
 
-    /// Upper bound on a single [`perform`](Job::perform) invocation.
-    ///
-    /// Every worker runs `.concurrency(1)`, so a `perform` future that never
-    /// resolves parks its worker forever with no error, no retry, and no
-    /// `on_terminal_failure` stop (RAI-2218). The bound converts the hang
-    /// into a [`JobError`] that retries and, on exhaustion, halts through
-    /// the worker's terminal-failure path. Generous by design: it exists to
-    /// catch a future that will never resolve, not to enforce a latency
-    /// target, so it must sit well above the slowest legitimate `perform`
-    /// (the USDC conversion poll's compiled-in wait of several minutes is
-    /// the current ceiling).
-    const PERFORM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+    /// Upper bound on a single [`perform`](Job::perform) invocation, past
+    /// which the attempt fails instead of parking the worker (RAI-2218). No
+    /// default: every impl states its own bound so the choice is conscious,
+    /// the same way `WORKER_NAME` and `JOB_KIND` are. Most jobs use
+    /// [`DEFAULT_PERFORM_TIMEOUT`]; see its doc for the rationale.
+    const PERFORM_TIMEOUT: Duration;
 
     /// Identifier for this job type in the e2e [`FailureInjector`].
     #[cfg(any(test, feature = "test-support"))]
@@ -1874,6 +1881,7 @@ mod tests {
         type Error = TestJobError;
 
         const WORKER_NAME: &'static str = "test-worker";
+        const PERFORM_TIMEOUT: Duration = DEFAULT_PERFORM_TIMEOUT;
         const JOB_KIND: JobKind = JobKind::OrderFill;
 
         fn label(&self) -> Label {
@@ -1909,6 +1917,7 @@ mod tests {
         type Error = TestJobError;
 
         const WORKER_NAME: &'static str = "recover-on-fifth-attempt-worker";
+        const PERFORM_TIMEOUT: Duration = DEFAULT_PERFORM_TIMEOUT;
         const JOB_KIND: JobKind = JobKind::OrderFill;
 
         fn label(&self) -> Label {

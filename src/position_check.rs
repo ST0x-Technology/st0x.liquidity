@@ -234,6 +234,8 @@ where
 
     const WORKER_NAME: &'static str = "check-positions-worker";
 
+    const PERFORM_TIMEOUT: std::time::Duration = crate::conductor::job::DEFAULT_PERFORM_TIMEOUT;
+
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind = crate::conductor::job::JobKind::CheckPositions;
 
