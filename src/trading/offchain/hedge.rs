@@ -193,6 +193,28 @@ pub(crate) struct HedgeCtx {
 /// hedge job exists (`position_check.rs`). Both share one set, so a symbol
 /// paged by either path is silenced by the other until one of its hedges
 /// reaches the broker.
+/// Formats one operator page under the alert contract (SPEC "Observability"):
+/// the symbol, the session, the order ID when one exists, the machine
+/// reason, the human detail, and the runbook section holding the response.
+/// One helper so every page carries the same greppable header and no alert
+/// can drop a contract field.
+pub(crate) fn operator_alert_message(
+    symbol: &Symbol,
+    session: MarketSession,
+    order_id: Option<&str>,
+    reason: &str,
+    detail: &str,
+    runbook_anchor: &str,
+) -> String {
+    let order = order_id.unwrap_or("none");
+
+    format!(
+        "Hedge alert [symbol={symbol} session={} order={order} reason={reason}]: {detail} \
+         Operator action: docs/overnight-runbook.md#{runbook_anchor}",
+        session_metric_label(session)
+    )
+}
+
 pub(crate) async fn alert_dead_letter(
     notifier: &dyn Notifier,
     alerted_dead_letters: &Mutex<HashSet<(Symbol, DeadLetterReason)>>,
@@ -1538,11 +1560,18 @@ impl PlaceHedge {
                     &ctx.alerted_dead_letters,
                     &self.symbol,
                     DeadLetterReason::BackpressureExhausted,
-                    &format!(
-                        "Hedge for {} abandoned: broker rate-limiting exceeded the \
-                         {BACKPRESSURE_RESCHEDULE_LIMIT}-reschedule budget. The symbol carries \
-                         a standing delta until the Alpaca integration is reconciled.",
-                        self.symbol
+                    &operator_alert_message(
+                        &self.symbol,
+                        self.market_session,
+                        Some(&self.offchain_order_id.to_string()),
+                        DeadLetterReason::BackpressureExhausted.metric_label(),
+                        &format!(
+                            "hedge abandoned: broker rate-limiting exceeded the \
+                             {BACKPRESSURE_RESCHEDULE_LIMIT}-reschedule budget; the symbol \
+                             carries a standing delta until the Alpaca integration is \
+                             reconciled.",
+                        ),
+                        DeadLetterReason::BackpressureExhausted.runbook_anchor(),
                     ),
                 )
                 .await;
@@ -1809,12 +1838,15 @@ impl PlaceHedge {
             &ctx.alerted_dead_letters,
             &self.symbol,
             reason,
-            &format!(
-                "Hedge for {} abandoned: {} failure did not clear. CheckPositions keeps \
+            &operator_alert_message(
+                &self.symbol,
+                self.market_session,
+                Some(&self.offchain_order_id.to_string()),
+                reason.metric_label(),
+                "hedge abandoned: the failure did not clear; CheckPositions keeps \
                  re-enqueueing it, so the symbol carries a standing delta until the \
                  market-data failure is fixed.",
-                self.symbol,
-                reason.metric_label()
+                reason.runbook_anchor(),
             ),
         )
         .await;
@@ -2256,6 +2288,41 @@ mod tests {
         })
     }
 
+    #[test]
+    fn operator_alert_message_carries_the_full_contract() {
+        let symbol = Symbol::new("RKLB").unwrap();
+
+        let with_order = operator_alert_message(
+            &symbol,
+            MarketSession::Overnight,
+            Some("019a2b3c"),
+            "overnight_quote_fetch",
+            "the feed rejected the request.",
+            "entitlement-checks",
+        );
+        assert_eq!(
+            with_order,
+            "Hedge alert [symbol=RKLB session=overnight order=019a2b3c \
+             reason=overnight_quote_fetch]: the feed rejected the request. \
+             Operator action: docs/overnight-runbook.md#entitlement-checks"
+        );
+
+        let without_order = operator_alert_message(
+            &symbol,
+            MarketSession::Extended,
+            None,
+            "slippage_calculation",
+            "the cross failed.",
+            "stale-exposure",
+        );
+        assert_eq!(
+            without_order,
+            "Hedge alert [symbol=RKLB session=extended order=none \
+             reason=slippage_calculation]: the cross failed. \
+             Operator action: docs/overnight-runbook.md#stale-exposure"
+        );
+    }
+
     /// Exercises the shared handler directly; end-to-end placement
     /// backpressure is covered separately below.
     #[tokio::test]
@@ -2312,9 +2379,12 @@ mod tests {
         assert_eq!(
             notifier.messages(),
             vec![format!(
-                "Hedge for AAPL abandoned: broker rate-limiting exceeded the \
-                 {BACKPRESSURE_RESCHEDULE_LIMIT}-reschedule budget. The symbol carries a \
-                 standing delta until the Alpaca integration is reconciled."
+                "Hedge alert [symbol=AAPL session=regular order={} \
+                 reason=backpressure_exhausted]: hedge abandoned: broker rate-limiting \
+                 exceeded the {BACKPRESSURE_RESCHEDULE_LIMIT}-reschedule budget; the \
+                 symbol carries a standing delta until the Alpaca integration is \
+                 reconciled. Operator action: docs/overnight-runbook.md#broker-outages",
+                job.offchain_order_id
             )]
         );
     }
@@ -2332,11 +2402,13 @@ mod tests {
         }
     }
 
-    fn dead_letter_page(symbol: &str, reason: &str) -> String {
+    fn dead_letter_page(job: &PlaceHedge, reason: &str) -> String {
         format!(
-            "Hedge for {symbol} abandoned: {reason} failure did not clear. CheckPositions \
-             keeps re-enqueueing it, so the symbol carries a standing delta until the \
-             market-data failure is fixed."
+            "Hedge alert [symbol={} session=regular order={} reason={reason}]: hedge \
+             abandoned: the failure did not clear; CheckPositions keeps re-enqueueing it, \
+             so the symbol carries a standing delta until the market-data failure is \
+             fixed. Operator action: docs/overnight-runbook.md#stale-exposure",
+            job.symbol, job.offchain_order_id
         )
     }
 
@@ -2357,7 +2429,7 @@ mod tests {
 
         assert_eq!(
             notifier.messages(),
-            vec![dead_letter_page("AAPL", "limit_quote_fetch")]
+            vec![dead_letter_page(&job, "limit_quote_fetch")]
         );
 
         job.handle_place_hedge_error(
@@ -2386,9 +2458,9 @@ mod tests {
         assert_eq!(
             notifier.messages(),
             vec![
-                dead_letter_page("AAPL", "limit_quote_fetch"),
-                dead_letter_page("AAPL", "limit_quote_unavailable"),
-                dead_letter_page("TSLA", "limit_quote_fetch"),
+                dead_letter_page(&job, "limit_quote_fetch"),
+                dead_letter_page(&job, "limit_quote_unavailable"),
+                dead_letter_page(&other_job, "limit_quote_fetch"),
             ],
             "a second reason for the same symbol, and the same reason for a second symbol, are \
              each a separate thing to fix and must page"
@@ -2437,7 +2509,7 @@ mod tests {
 
         assert_eq!(
             notifier.messages(),
-            vec![dead_letter_page("AAPL", "limit_quote_fetch")]
+            vec![dead_letter_page(&job, "limit_quote_fetch")]
         );
     }
 
@@ -2589,8 +2661,8 @@ mod tests {
         assert_eq!(
             notifier.messages(),
             vec![
-                dead_letter_page("AAPL", "limit_quote_fetch"),
-                dead_letter_page("AAPL", "limit_quote_fetch"),
+                dead_letter_page(&abandoned, "limit_quote_fetch"),
+                dead_letter_page(&abandoned, "limit_quote_fetch"),
             ],
             "a failure that returns after the symbol recovered is a new thing to fix and \
              must page again"
@@ -3026,7 +3098,7 @@ mod tests {
         );
         assert_eq!(
             notifier.messages(),
-            vec![dead_letter_page("AAPL", "limit_quote_fetch")],
+            vec![dead_letter_page(&job, "limit_quote_fetch")],
             "the operator must be paged for a symbol abandoned to a sustained outage"
         );
     }
@@ -3712,7 +3784,7 @@ mod tests {
         );
         assert_eq!(
             notifier.messages(),
-            vec![dead_letter_page("AAPL", "mark_fetch")],
+            vec![dead_letter_page(&job, "mark_fetch")],
             "leaving the claim for the recovery sweep must still page the standing delta"
         );
     }

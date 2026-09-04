@@ -44,7 +44,7 @@ use crate::trading::offchain::close_flatten::{
 };
 use crate::trading::offchain::hedge::{
     HedgeJobQueue, OvernightReferenceError, PlaceHedge, ReferencePriceError,
-    TransientFailureStreak, alert_dead_letter, apply_slippage,
+    TransientFailureStreak, alert_dead_letter, apply_slippage, operator_alert_message,
     resolve_extended_hours_reference_price, resolve_overnight_reference_price,
 };
 use crate::trading::onchain::trade_accountant::{DeadLetterReason, SymbolScopedReason};
@@ -779,12 +779,16 @@ where
                         &self.alerted_dead_letters,
                         &order.symbol,
                         error.dead_letter_reason(),
-                        &format!(
-                            "Hedge for {} skipped: {} failure left no reference price to \
-                             preflight against. The scan keeps skipping it, so the symbol \
-                             carries a standing delta until the market-data failure is fixed.",
-                            order.symbol,
-                            error.dead_letter_reason().metric_label()
+                        &operator_alert_message(
+                            &order.symbol,
+                            MarketSession::Extended,
+                            None,
+                            error.dead_letter_reason().metric_label(),
+                            "hedge skipped: the failure left no reference price to \
+                             preflight against; the scan keeps skipping it, so the symbol \
+                             carries a standing delta until the market-data failure is \
+                             fixed.",
+                            error.dead_letter_reason().runbook_anchor(),
                         ),
                     )
                     .await;
@@ -814,16 +818,24 @@ where
                     %error,
                     "Skipping hedge enqueue: could not cross the reference price"
                 );
+                let reason =
+                    DeadLetterReason::SymbolScoped(SymbolScopedReason::SlippageCalculation);
                 alert_dead_letter(
                     self.notifier.as_ref(),
                     &self.alerted_dead_letters,
                     &order.symbol,
-                    DeadLetterReason::SymbolScoped(SymbolScopedReason::SlippageCalculation),
-                    &format!(
-                        "Hedge for {} skipped: the reference price could not be crossed at \
-                         {cross_bps} bps. The scan keeps skipping the symbol while the cross \
-                         stays this wide, so it carries a standing delta.",
-                        order.symbol,
+                    reason,
+                    &operator_alert_message(
+                        &order.symbol,
+                        MarketSession::Extended,
+                        None,
+                        reason.metric_label(),
+                        &format!(
+                            "hedge skipped: the reference price could not be crossed at \
+                             {cross_bps} bps; the scan keeps skipping the symbol while the \
+                             cross stays this wide, so it carries a standing delta.",
+                        ),
+                        reason.runbook_anchor(),
                     ),
                 )
                 .await;
@@ -903,12 +915,16 @@ where
                         &self.alerted_dead_letters,
                         &order.symbol,
                         DeadLetterReason::OvernightQuoteFetch,
-                        &format!(
-                            "Hedge for {} skipped: the overnight indicative quote fetch \
-                             failed with a non-retryable classification, leaving no \
-                             reference price. The scan keeps skipping it, so the symbol \
-                             carries a standing delta until the feed access is fixed.",
-                            order.symbol
+                        &operator_alert_message(
+                            &order.symbol,
+                            MarketSession::Overnight,
+                            None,
+                            DeadLetterReason::OvernightQuoteFetch.metric_label(),
+                            "hedge skipped: the overnight indicative quote fetch failed \
+                             with a non-retryable classification, leaving no reference \
+                             price; the scan keeps skipping it, so the symbol carries a \
+                             standing delta until the feed access is fixed.",
+                            DeadLetterReason::OvernightQuoteFetch.runbook_anchor(),
                         ),
                     )
                     .await;
@@ -5059,10 +5075,12 @@ mod tests {
             "the skip must name its cause, in:\n{rendered}"
         );
 
-        let expected_page = "Hedge for AAPL skipped: the overnight indicative quote fetch \
-             failed with a non-retryable classification, leaving no reference price. The \
-             scan keeps skipping it, so the symbol carries a standing delta until the feed \
-             access is fixed."
+        let expected_page = "Hedge alert [symbol=AAPL session=overnight order=none \
+             reason=overnight_quote_fetch]: hedge skipped: the overnight indicative quote \
+             fetch failed with a non-retryable classification, leaving no reference \
+             price; the scan keeps skipping it, so the symbol carries a standing delta \
+             until the feed access is fixed. Operator action: \
+             docs/overnight-runbook.md#entitlement-checks"
             .to_string();
         assert_eq!(notifier.messages(), vec![expected_page.clone()]);
 
@@ -5350,9 +5368,11 @@ mod tests {
             "the skip must name the symbol carrying the standing delta, in:\n{rendered}"
         );
 
-        let expected_page = "Hedge for AAPL skipped: limit_quote_fetch failure left no \
-             reference price to preflight against. The scan keeps skipping it, so the \
-             symbol carries a standing delta until the market-data failure is fixed."
+        let expected_page = "Hedge alert [symbol=AAPL session=extended order=none \
+             reason=limit_quote_fetch]: hedge skipped: the failure left no reference \
+             price to preflight against; the scan keeps skipping it, so the symbol \
+             carries a standing delta until the market-data failure is fixed. Operator \
+             action: docs/overnight-runbook.md#stale-exposure"
             .to_string();
         assert_eq!(notifier.messages(), vec![expected_page.clone()]);
 
@@ -5397,9 +5417,11 @@ mod tests {
         assert_eq!(
             notifier.messages(),
             vec![
-                "Hedge for AAPL skipped: the reference price could not be crossed at 9999 bps. \
-                 The scan keeps skipping the symbol while the cross stays this wide, so it \
-                 carries a standing delta."
+                "Hedge alert [symbol=AAPL session=extended order=none \
+                 reason=slippage_calculation]: hedge skipped: the reference price could \
+                 not be crossed at 9999 bps; the scan keeps skipping the symbol while the \
+                 cross stays this wide, so it carries a standing delta. Operator action: \
+                 docs/overnight-runbook.md#stale-exposure"
                     .to_string()
             ]
         );
