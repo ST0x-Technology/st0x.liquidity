@@ -37,6 +37,34 @@ use crate::{LogFormat, LogLevel};
 /// cannot fill the disk (root cause of the 2026-06-08 SQLITE_FULL incident).
 const LOG_RETENTION_DAYS: usize = 7;
 
+/// Validated configuration for the local rotating log sink.
+///
+/// Keeping the directory and threshold together prevents runtime callers from
+/// enabling one without the other. The stdout/export threshold remains the
+/// top-level [`LogLevel`].
+#[derive(Clone, Debug)]
+pub struct FileLogging {
+    directory: String,
+    level: LogLevel,
+}
+
+impl FileLogging {
+    #[must_use]
+    pub fn new(directory: String, level: LogLevel) -> Self {
+        Self { directory, level }
+    }
+
+    #[must_use]
+    pub fn directory(&self) -> &str {
+        &self.directory
+    }
+
+    #[must_use]
+    pub fn level(&self) -> &LogLevel {
+        &self.level
+    }
+}
+
 /// Build the daily-rolling file appender used by every file-logging path.
 ///
 /// Unlike `tracing_appender::rolling::daily`, the builder form bounds history
@@ -148,7 +176,7 @@ impl TelemetryCtx {
         &self,
         log_level: tracing::Level,
         log_format: LogFormat,
-        log_dir: Option<&str>,
+        file_logging: Option<&FileLogging>,
         extra_layer: Option<ExtraLayer>,
     ) -> Result<(Option<FileLogGuard>, TelemetryGuard), TelemetryError> {
         let http_client =
@@ -225,21 +253,19 @@ impl TelemetryCtx {
         let fmt_layer =
             console_fmt_layer(log_format, mk_env_filter(log_level), ConsoleTextStyle::Full);
 
-        let file_appender = log_dir.and_then(|dir| match build_log_file_appender(dir) {
-            Ok(appender) => Some(appender),
-            Err(error) => {
-                eprintln!("Failed to build rolling file appender, continuing without file logging: {error}");
-                None
+        let file_appender = file_logging.and_then(|file_logging| {
+            match build_log_file_appender(file_logging.directory()) {
+                Ok(appender) => Some((appender, file_logging.level().into())),
+                Err(error) => {
+                    eprintln!("Failed to build rolling file appender, continuing without file logging: {error}");
+                    None
+                }
             }
         });
 
-        let file_guard = if let Some(file_appender) = file_appender {
+        let file_guard = if let Some((file_appender, file_level)) = file_appender {
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-            let file_layer = tracing_subscriber::fmt::layer()
-                .json()
-                .with_writer(non_blocking)
-                .with_filter(mk_crate_filter(log_level));
+            let file_layer = file_fmt_layer(non_blocking, file_level);
 
             let subscriber = Registry::default()
                 .with(extra_layer)
@@ -347,18 +373,18 @@ pub type ExtraLayer =
 pub fn setup_tracing(
     log_level: &LogLevel,
     log_format: LogFormat,
-    log_dir: Option<&str>,
+    file_logging: Option<&FileLogging>,
     extra_layer: Option<ExtraLayer>,
 ) -> Option<FileLogGuard> {
     let level: tracing::Level = log_level.into();
     let env_filter = mk_env_filter(level);
 
-    let Some(dir) = log_dir else {
+    let Some(file_logging) = file_logging else {
         install_console_only_subscriber(log_format, extra_layer, env_filter);
         return None;
     };
 
-    let file_appender = match build_log_file_appender(dir) {
+    let file_appender = match build_log_file_appender(file_logging.directory()) {
         Ok(appender) => appender,
         Err(error) => {
             // A misconfigured log directory must not silently disable all
@@ -372,10 +398,7 @@ pub fn setup_tracing(
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-    let file_layer = tracing_subscriber::fmt::layer()
-        .json()
-        .with_writer(non_blocking)
-        .with_filter(mk_crate_filter(level));
+    let file_layer = file_fmt_layer(non_blocking, file_logging.level().into());
 
     let fmt_layer = console_fmt_layer(log_format, env_filter, ConsoleTextStyle::Compact);
 
@@ -390,6 +413,21 @@ pub fn setup_tracing(
     }
 
     Some(FileLogGuard { _guard: guard })
+}
+
+/// Builds the local JSON layer with only its configured threshold. Deliberately
+/// bypasses [`mk_env_filter`] so `RUST_LOG` can refine stdout diagnostics
+/// without increasing local disk volume.
+fn file_fmt_layer<S, W>(writer: W, level: tracing::Level) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .json()
+        .with_writer(writer)
+        .with_filter(mk_crate_filter(level))
+        .boxed()
 }
 
 /// Install a console-only tracing subscriber as the global default.
@@ -571,13 +609,10 @@ mod tests {
     fn setup_tracing_degrades_to_console_only_when_log_dir_is_invalid() {
         let file = NamedTempFile::new().unwrap();
         let uncreatable_dir = file.path().join("nested");
+        let file_logging =
+            FileLogging::new(uncreatable_dir.to_str().unwrap().to_owned(), LogLevel::Info);
 
-        let file_guard = setup_tracing(
-            &LogLevel::Info,
-            LogFormat::Text,
-            uncreatable_dir.to_str(),
-            None,
-        );
+        let file_guard = setup_tracing(&LogLevel::Info, LogFormat::Text, Some(&file_logging), None);
 
         assert!(
             file_guard.is_none(),
@@ -646,6 +681,31 @@ mod tests {
     }
 
     #[test]
+    fn stdout_trace_and_file_info_filters_are_independent() {
+        let stdout = SharedWriter::default();
+        let file = SharedWriter::default();
+        let stdout_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(stdout.clone())
+            .with_filter(mk_crate_filter(tracing::Level::TRACE));
+        let file_layer = file_fmt_layer(file.clone(), tracing::Level::INFO);
+        let subscriber = Registry::default().with(stdout_layer).with(file_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "rebalance", "remote-only detail");
+            tracing::info!(target: "rebalance", "retained locally");
+        });
+
+        let stdout = String::from_utf8(stdout.0.lock().clone()).unwrap();
+        let file = String::from_utf8(file.0.lock().clone()).unwrap();
+
+        assert!(stdout.contains("remote-only detail"));
+        assert!(stdout.contains("retained locally"));
+        assert!(!file.contains("remote-only detail"));
+        assert!(file.contains("retained locally"));
+    }
+
+    #[test]
     fn telemetry_setup_continues_without_file_logging_when_log_dir_is_invalid() {
         // A regular file cannot contain a subdirectory, so the log directory
         // cannot be created. setup() must keep the OTLP trace/log pipeline live
@@ -653,6 +713,8 @@ mod tests {
         // rather than failing the whole telemetry stack.
         let file = NamedTempFile::new().unwrap();
         let uncreatable_dir = file.path().join("nested");
+        let file_logging =
+            FileLogging::new(uncreatable_dir.to_str().unwrap().to_owned(), LogLevel::Info);
 
         let ctx = TelemetryCtx {
             service_name: "test-service".to_string(),
@@ -665,7 +727,7 @@ mod tests {
             .setup(
                 tracing::Level::INFO,
                 LogFormat::Text,
-                uncreatable_dir.to_str(),
+                Some(&file_logging),
                 None,
             )
             .unwrap();

@@ -14,7 +14,7 @@ async fn main() -> anyhow::Result<()> {
         match telemetry.setup(
             log_level,
             ctx.log_format,
-            ctx.log_dir.as_deref(),
+            ctx.file_logging.as_ref(),
             Some(apalis_board_tracing_layer(log_level)),
         ) {
             Ok((file_guard, tele_guard)) => (file_guard, Some(tele_guard)),
@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
                 let file_guard = setup_tracing(
                     &ctx.log_level,
                     ctx.log_format,
-                    ctx.log_dir.as_deref(),
+                    ctx.file_logging.as_ref(),
                     Some(apalis_board_tracing_layer(log_level)),
                 );
                 (file_guard, None)
@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
         let file_guard = setup_tracing(
             &ctx.log_level,
             ctx.log_format,
-            ctx.log_dir.as_deref(),
+            ctx.file_logging.as_ref(),
             Some(apalis_board_tracing_layer(log_level)),
         );
         (file_guard, None)
