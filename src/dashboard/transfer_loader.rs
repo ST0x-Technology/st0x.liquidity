@@ -1,20 +1,22 @@
-//! Loads transfer aggregates from the event store for dashboard display.
+//! Loads cross-venue transfer state for dashboard display.
 
-use chrono::{Duration, Utc};
-use sqlx::SqlitePool;
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use serde::Deserialize;
+use sqlx::{Row, SqlitePool};
 use thiserror::Error;
 use tracing::warn;
 
-use std::fmt::{self, Debug, Display};
+use std::fmt::{self, Display};
+use std::num::TryFromIntError;
 use std::str::FromStr;
 
 use st0x_dto::{TransferOperation, TransferWarning};
-use st0x_event_sorcery::{EventSourced, load_all_ids, load_entity};
 use st0x_finance::Id;
+use st0x_tokenization::IssuerRequestId;
 
-use crate::equity_redemption::EquityRedemption;
+use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
-use crate::usdc_rebalance::UsdcRebalance;
+use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceId};
 
 /// The three categories of cross-venue transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +33,53 @@ impl TransferKind {
             Self::EquityMint => "TokenizedEquityMint",
             Self::EquityRedemption => "EquityRedemption",
             Self::UsdcBridge => "UsdcRebalance",
+        }
+    }
+
+    fn table(self) -> &'static str {
+        match self {
+            Self::EquityMint => "tokenized_equity_mint_view",
+            Self::EquityRedemption => "equity_redemption_view",
+            Self::UsdcBridge => "usdc_rebalance_view",
+        }
+    }
+
+    const fn discriminant(self) -> i64 {
+        match self {
+            Self::EquityMint => 0,
+            Self::EquityRedemption => 1,
+            Self::UsdcBridge => 2,
+        }
+    }
+
+    const fn from_discriminant(value: i64) -> Option<Self> {
+        match value {
+            0 => Some(Self::EquityMint),
+            1 => Some(Self::EquityRedemption),
+            2 => Some(Self::UsdcBridge),
+            _ => None,
+        }
+    }
+
+    fn warning(self, view_id: &str) -> TransferWarning {
+        match self {
+            Self::EquityMint => TransferWarning::MintReplayFailed {
+                id: Id::new(view_id.to_owned()),
+            },
+            Self::EquityRedemption => TransferWarning::RedemptionReplayFailed {
+                id: Id::new(view_id.to_owned()),
+            },
+            Self::UsdcBridge => TransferWarning::BridgeReplayFailed {
+                id: Id::new(view_id.to_owned()),
+            },
+        }
+    }
+
+    const fn category_unavailable_warning(self) -> TransferWarning {
+        match self {
+            Self::EquityMint => TransferWarning::MintCategoryUnavailable,
+            Self::EquityRedemption => TransferWarning::RedemptionCategoryUnavailable,
+            Self::UsdcBridge => TransferWarning::BridgeCategoryUnavailable,
         }
     }
 }
@@ -64,10 +113,249 @@ impl FromStr for TransferKind {
     }
 }
 
-/// Result of [`load_all_transfer_operations`] including any replay warnings.
-pub(crate) struct AllTransferOperations {
+const ALL_TRANSFER_KINDS: [TransferKind; 3] = [
+    TransferKind::EquityMint,
+    TransferKind::EquityRedemption,
+    TransferKind::UsdcBridge,
+];
+
+#[derive(Debug, Default)]
+pub(crate) struct TransferHistoryQuery {
+    pub(crate) limit: usize,
+    pub(crate) offset: usize,
+    pub(crate) kinds: Option<Vec<TransferKind>>,
+    pub(crate) since: Option<DateTime<Utc>>,
+    pub(crate) until: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TransferHistoryPage {
     pub(crate) operations: Vec<TransferOperation>,
     pub(crate) warnings: Vec<TransferWarning>,
+    pub(crate) total: usize,
+    pub(crate) has_more: bool,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum TransferHistoryError {
+    #[error("failed to query transfer history: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("transfer history matched {total} rows, which does not fit a usize")]
+    CountOutOfRange {
+        total: i64,
+        #[source]
+        source: TryFromIntError,
+    },
+    #[error("transfer history query produced unknown kind discriminant {value}")]
+    UnknownKind { value: i64 },
+}
+
+#[derive(Default)]
+struct HistoryFilter {
+    clauses: Vec<&'static str>,
+    binds: Vec<String>,
+}
+
+impl HistoryFilter {
+    fn from_query(query: &TransferHistoryQuery) -> Self {
+        let mut filter = Self::default();
+
+        if let Some(since) = query.since {
+            filter.clauses.push("started_at >= ?");
+            filter.binds.push(sortable_timestamp(since));
+        }
+
+        if let Some(until) = query.until {
+            filter.clauses.push("started_at <= ?");
+            filter.binds.push(sortable_timestamp(until));
+        }
+
+        filter
+    }
+
+    fn where_sql(&self) -> String {
+        std::iter::once("started_at IS NOT NULL")
+            .chain(self.clauses.iter().copied())
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    }
+}
+
+/// Query one bounded page of transfer history from aggregate projections.
+pub(crate) async fn query_transfer_history(
+    pool: &SqlitePool,
+    query: &TransferHistoryQuery,
+) -> Result<TransferHistoryPage, TransferHistoryError> {
+    let kinds: Vec<TransferKind> = ALL_TRANSFER_KINDS
+        .into_iter()
+        .filter(|kind| {
+            query
+                .kinds
+                .as_ref()
+                .is_none_or(|requested| requested.contains(kind))
+        })
+        .collect();
+    if kinds.is_empty() {
+        return Ok(TransferHistoryPage {
+            operations: Vec::new(),
+            warnings: Vec::new(),
+            total: 0,
+            has_more: false,
+        });
+    }
+
+    let filter = HistoryFilter::from_query(query);
+    let total = count_transfer_rows(pool, &kinds, &filter).await?;
+    let (operations, warnings, rows_read) =
+        fetch_transfer_page(pool, query, &kinds, &filter).await?;
+
+    Ok(TransferHistoryPage {
+        operations,
+        warnings,
+        total,
+        has_more: query.offset.saturating_add(rows_read) < total,
+    })
+}
+
+async fn count_transfer_rows(
+    pool: &SqlitePool,
+    kinds: &[TransferKind],
+    filter: &HistoryFilter,
+) -> Result<usize, TransferHistoryError> {
+    let mut total = 0_i64;
+
+    for kind in kinds {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE {}",
+            kind.table(),
+            filter.where_sql()
+        );
+        let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql));
+        for bind in &filter.binds {
+            query = query.bind(bind);
+        }
+        total += query.fetch_one(pool).await?;
+    }
+
+    usize::try_from(total).map_err(|source| TransferHistoryError::CountOutOfRange { total, source })
+}
+
+async fn fetch_transfer_page(
+    pool: &SqlitePool,
+    query: &TransferHistoryQuery,
+    kinds: &[TransferKind],
+    filter: &HistoryFilter,
+) -> Result<(Vec<TransferOperation>, Vec<TransferWarning>, usize), TransferHistoryError> {
+    let bound = clamp_to_i64(query.offset.saturating_add(query.limit));
+    let sql = format!(
+        "SELECT view_id, payload, kind FROM ({}) \
+         ORDER BY started_at DESC, kind ASC, view_id ASC LIMIT ? OFFSET ?",
+        kinds
+            .iter()
+            .map(|kind| transfer_branch_sql(*kind, filter))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ")
+    );
+
+    let mut page = sqlx::query(sqlx::AssertSqlSafe(sql));
+    for _kind in kinds {
+        for bind in &filter.binds {
+            page = page.bind(bind);
+        }
+        page = page.bind(bound);
+    }
+    page = page.bind(clamp_to_i64(query.limit));
+    page = page.bind(clamp_to_i64(query.offset));
+
+    let rows = page.fetch_all(pool).await?;
+    let rows_read = rows.len();
+    let mut operations = Vec::with_capacity(rows_read);
+    let mut warnings = Vec::new();
+
+    for row in rows {
+        let view_id: String = row.try_get("view_id")?;
+        let payload: String = row.try_get("payload")?;
+        let kind_value: i64 = row.try_get("kind")?;
+        let kind = TransferKind::from_discriminant(kind_value)
+            .ok_or(TransferHistoryError::UnknownKind { value: kind_value })?;
+
+        match convert_projection_row(kind, &view_id, &payload) {
+            Ok(operation) => operations.push(operation),
+            Err(error) => {
+                warn!(
+                    target: "dashboard",
+                    %view_id,
+                    %kind,
+                    %error,
+                    "Skipping unreadable transfer history row"
+                );
+                warnings.push(kind.warning(&view_id));
+            }
+        }
+    }
+
+    Ok((operations, warnings, rows_read))
+}
+
+fn transfer_branch_sql(kind: TransferKind, filter: &HistoryFilter) -> String {
+    format!(
+        "SELECT * FROM (SELECT view_id, payload, started_at, {kind} AS kind \
+         FROM {table} WHERE {predicates} \
+         ORDER BY started_at DESC, view_id ASC LIMIT ?)",
+        kind = kind.discriminant(),
+        table = kind.table(),
+        predicates = filter.where_sql(),
+    )
+}
+
+fn sortable_timestamp(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(SecondsFormat::Nanos, true)
+        .trim_end_matches('Z')
+        .to_owned()
+}
+
+fn clamp_to_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn convert_projection_row(
+    kind: TransferKind,
+    view_id: &str,
+    payload: &str,
+) -> Result<TransferOperation, TransferRowError> {
+    match kind {
+        TransferKind::EquityMint => {
+            let ProjectionPayload::Live(entity): ProjectionPayload<TokenizedEquityMint> =
+                serde_json::from_str(payload)?;
+            let id = IssuerRequestId::from_str(view_id)?;
+            Ok(entity.to_dto(&id))
+        }
+        TransferKind::EquityRedemption => {
+            let ProjectionPayload::Live(entity): ProjectionPayload<EquityRedemption> =
+                serde_json::from_str(payload)?;
+            let id = RedemptionAggregateId::from_str(view_id)?;
+            Ok(entity.to_dto(&id))
+        }
+        TransferKind::UsdcBridge => {
+            let ProjectionPayload::Live(entity): ProjectionPayload<UsdcRebalance> =
+                serde_json::from_str(payload)?;
+            let id = UsdcRebalanceId::from_str(view_id)?;
+            Ok(entity.to_dto(&id))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+enum ProjectionPayload<Entity> {
+    Live(Entity),
+}
+
+#[derive(Debug, Error)]
+enum TransferRowError {
+    #[error("invalid projection payload: {0}")]
+    Payload(#[from] serde_json::Error),
+    #[error("invalid transfer aggregate id: {0}")]
+    Id(#[from] uuid::Error),
 }
 
 /// Loaded transfers split into active (in-progress) and recent (terminal).
@@ -77,45 +365,19 @@ pub(crate) struct LoadedTransfers {
     pub(crate) warnings: Vec<TransferWarning>,
 }
 
-/// Load all transfer aggregates, classified into active and recent.
+/// Load transfer projections for the dashboard WebSocket seed.
 ///
 /// Active: non-terminal transfers (in progress).
 /// Recent: terminal transfers (completed/failed) within the last 24 hours.
 pub(crate) async fn load_transfers(pool: &SqlitePool) -> LoadedTransfers {
     let cutoff = Utc::now() - Duration::hours(24);
 
-    let categories = [
-        load_category::<TokenizedEquityMint, _, _>(
-            pool,
-            &cutoff,
-            TransferWarning::MintCategoryUnavailable,
-            |id| TransferWarning::MintReplayFailed {
-                id: Id::new(id.to_string()),
-            },
-            TokenizedEquityMint::to_dto,
-        )
-        .await,
-        load_category::<EquityRedemption, _, _>(
-            pool,
-            &cutoff,
-            TransferWarning::RedemptionCategoryUnavailable,
-            |id| TransferWarning::RedemptionReplayFailed {
-                id: Id::new(id.to_string()),
-            },
-            EquityRedemption::to_dto,
-        )
-        .await,
-        load_category::<UsdcRebalance, _, _>(
-            pool,
-            &cutoff,
-            TransferWarning::BridgeCategoryUnavailable,
-            |id| TransferWarning::BridgeReplayFailed {
-                id: Id::new(id.to_string()),
-            },
-            UsdcRebalance::to_dto,
-        )
-        .await,
-    ];
+    let (mint, redemption, usdc) = tokio::join!(
+        load_category(pool, cutoff, TransferKind::EquityMint),
+        load_category(pool, cutoff, TransferKind::EquityRedemption),
+        load_category(pool, cutoff, TransferKind::UsdcBridge),
+    );
+    let categories: [CategoryResult; 3] = (mint, redemption, usdc).into();
 
     let merged = categories
         .into_iter()
@@ -139,106 +401,6 @@ pub(crate) async fn load_transfers(pool: &SqlitePool) -> LoadedTransfers {
     }
 }
 
-/// Load all transfer DTOs for the REST endpoint's paginated listing.
-///
-/// Unlike [`load_transfers`] (which partitions into active/recent with a
-/// 24h cutoff for the WebSocket), this returns every transfer without
-/// filtering.  The caller handles time-range filtering and pagination.
-pub(crate) async fn load_all_transfer_operations(
-    pool: &SqlitePool,
-    kind_filter: Option<&[TransferKind]>,
-) -> AllTransferOperations {
-    let include = |kind: TransferKind| kind_filter.is_none_or(|allowed| allowed.contains(&kind));
-
-    let mut operations = Vec::new();
-    let mut warnings = Vec::new();
-
-    if include(TransferKind::EquityMint) {
-        let (ops, warns) = replay_all::<TokenizedEquityMint>(
-            pool,
-            |id| TransferWarning::MintReplayFailed {
-                id: Id::new(id.to_string()),
-            },
-            TokenizedEquityMint::to_dto,
-        )
-        .await;
-
-        operations.extend(ops);
-        warnings.extend(warns);
-    }
-
-    if include(TransferKind::EquityRedemption) {
-        let (ops, warns) = replay_all::<EquityRedemption>(
-            pool,
-            |id| TransferWarning::RedemptionReplayFailed {
-                id: Id::new(id.to_string()),
-            },
-            EquityRedemption::to_dto,
-        )
-        .await;
-
-        operations.extend(ops);
-        warnings.extend(warns);
-    }
-
-    if include(TransferKind::UsdcBridge) {
-        let (ops, warns) = replay_all::<UsdcRebalance>(
-            pool,
-            |id| TransferWarning::BridgeReplayFailed {
-                id: Id::new(id.to_string()),
-            },
-            UsdcRebalance::to_dto,
-        )
-        .await;
-
-        operations.extend(ops);
-        warnings.extend(warns);
-    }
-
-    AllTransferOperations {
-        operations,
-        warnings,
-    }
-}
-
-/// Replay every aggregate of a given type and convert to DTOs.
-///
-/// Returns both the successfully replayed operations and any warnings for
-/// aggregates that failed to load, so the caller can surface them.
-async fn replay_all<Entity>(
-    pool: &SqlitePool,
-    make_replay_warning: impl Fn(&Entity::Id) -> TransferWarning + Send + Sync,
-    convert: impl Fn(&Entity, &Entity::Id) -> TransferOperation + Send + Sync,
-) -> (Vec<TransferOperation>, Vec<TransferWarning>)
-where
-    Entity: EventSourced,
-    Entity::Id: Debug,
-    <Entity::Id as FromStr>::Err: Debug,
-{
-    let ids = match load_all_ids::<Entity>(pool).await {
-        Ok(ids) => ids,
-        Err(error) => {
-            warn!(?error, "Failed to load aggregate IDs for REST listing");
-            return (Vec::new(), Vec::new());
-        }
-    };
-
-    let mut operations = Vec::with_capacity(ids.len());
-    let mut warnings = Vec::new();
-
-    for id in &ids {
-        match replay_aggregate::<Entity, _>(pool, id, &make_replay_warning).await {
-            Ok(entity) => operations.push(convert(&entity, id)),
-            Err(warning) => {
-                warn!(?warning, "Skipping transfer in REST listing");
-                warnings.push(warning);
-            }
-        }
-    }
-
-    (operations, warnings)
-}
-
 /// Result of loading a single transfer category.
 struct CategoryResult {
     active: Vec<TransferOperation>,
@@ -256,81 +418,53 @@ impl CategoryResult {
     }
 }
 
-/// Replay an aggregate from the event store, returning the entity on success
-/// or a dashboard warning on failure.
-async fn replay_aggregate<Entity, MakeWarning>(
+async fn load_category(
     pool: &SqlitePool,
-    id: &Entity::Id,
-    make_warning: &MakeWarning,
-) -> Result<Entity, TransferWarning>
-where
-    Entity: EventSourced,
-    Entity::Id: Debug,
-    <Entity::Id as FromStr>::Err: Debug,
-    MakeWarning: Fn(&Entity::Id) -> TransferWarning + Send + Sync,
-{
-    match load_entity::<Entity>(pool, id).await {
-        Ok(Some(entity)) => Ok(entity),
-
-        Ok(None) => {
-            warn!(?id, "Aggregate has events but replayed to empty state");
-            Err(make_warning(id))
-        }
-
+    cutoff: DateTime<Utc>,
+    kind: TransferKind,
+) -> CategoryResult {
+    let sql = format!(
+        "SELECT view_id, payload FROM {table} WHERE terminal_at IS NULL \
+         UNION ALL \
+         SELECT view_id, payload FROM {table} WHERE terminal_at >= ?",
+        table = kind.table(),
+    );
+    let rows = match sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql))
+        .bind(sortable_timestamp(cutoff))
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows,
         Err(error) => {
-            warn!(?error, ?id, "Failed to load aggregate");
-            Err(make_warning(id))
-        }
-    }
-}
-
-async fn load_category<Entity, MakeWarning, Convert>(
-    pool: &SqlitePool,
-    cutoff: &chrono::DateTime<Utc>,
-    category_unavailable: TransferWarning,
-    make_replay_warning: MakeWarning,
-    convert: Convert,
-) -> CategoryResult
-where
-    Entity: EventSourced,
-    Entity::Id: Debug,
-    <Entity::Id as FromStr>::Err: Debug,
-    MakeWarning: Fn(&Entity::Id) -> TransferWarning + Send + Sync,
-    Convert: Fn(&Entity, &Entity::Id) -> TransferOperation + Send + Sync,
-{
-    let ids = match load_all_ids::<Entity>(pool).await {
-        Ok(ids) => ids,
-        Err(error) => {
-            warn!(?error, "Failed to load aggregate IDs");
+            warn!(target: "dashboard", %kind, %error, "Failed to load transfer projections");
             return CategoryResult {
-                warnings: vec![category_unavailable],
+                warnings: vec![kind.category_unavailable_warning()],
                 ..CategoryResult::empty()
             };
         }
     };
 
-    let mut replayed = Vec::with_capacity(ids.len());
-
-    for id in &ids {
-        replayed.push((
-            id,
-            replay_aggregate::<Entity, _>(pool, id, &make_replay_warning).await,
-        ));
+    let mut transfers = Vec::with_capacity(rows.len());
+    let mut warnings = Vec::new();
+    for (view_id, payload) in rows {
+        match convert_projection_row(kind, &view_id, &payload) {
+            Ok(transfer) => transfers.push(transfer),
+            Err(error) => {
+                warn!(
+                    target: "dashboard",
+                    %view_id,
+                    %kind,
+                    %error,
+                    "Skipping unreadable transfer seed row"
+                );
+                warnings.push(kind.warning(&view_id));
+            }
+        }
     }
-
-    let warnings: Vec<TransferWarning> = replayed
-        .iter()
-        .filter_map(|(_, result)| result.as_ref().err().cloned())
-        .collect();
-
-    let transfers: Vec<TransferOperation> = replayed
-        .iter()
-        .filter_map(|(id, result)| result.as_ref().ok().map(|entity| convert(entity, id)))
-        .collect();
 
     let (active, recent): (Vec<_>, Vec<_>) = transfers
         .into_iter()
-        .filter(|transfer| !transfer.is_terminal() || transfer.updated_at() >= *cutoff)
+        .filter(|transfer| !transfer.is_terminal() || transfer.updated_at() >= cutoff)
         .partition(|transfer| !transfer.is_terminal());
 
     CategoryResult {
@@ -351,6 +485,7 @@ mod tests {
         EquityRedemptionStatus, EquityRedemptionTag, TransferOperation, TransferWarning,
         UsdcBridgeDirection, UsdcBridgeOperation, UsdcBridgeStatus, UsdcBridgeTag,
     };
+    use st0x_event_sorcery::{EventSourced, StoreBuilder};
     use st0x_execution::{ClientOrderId, FractionalShares, Symbol};
     use st0x_finance::{Id, Usdc};
     use st0x_float_macro::float;
@@ -360,6 +495,7 @@ mod tests {
     use crate::equity_redemption::{
         EquityRedemptionEvent, RedemptionAggregateId, redemption_aggregate_id,
     };
+    use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
     use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent};
 
@@ -427,6 +563,36 @@ mod tests {
         let loaded = load_transfers(&pool).await;
 
         assert!(loaded.active.is_empty());
+        assert!(loaded.recent.is_empty());
+        assert!(loaded.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_transfers_reads_materialized_projection_without_events() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let id = issuer_request_id("projected-mint");
+        let mint = TokenizedEquityMint::originate(&TokenizedEquityMintEvent::MintRequested {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: float!(1),
+            wallet: Address::ZERO,
+            requested_at: Utc::now(),
+        })
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO tokenized_equity_mint_view (view_id, version, payload) \
+             VALUES (?1, 1, ?2)",
+        )
+        .bind(id.to_string())
+        .bind(serde_json::json!({ "Live": mint }).to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let loaded = load_transfers(&pool).await;
+
+        assert_eq!(loaded.active.len(), 1);
         assert!(loaded.recent.is_empty());
         assert!(loaded.warnings.is_empty());
     }
@@ -620,12 +786,28 @@ mod tests {
         }
     }
 
+    async fn backfill_transfer_projections(pool: &SqlitePool) {
+        let _ = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .build(EquityTransferServices::panicking())
+            .await
+            .unwrap();
+        let _ = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(EquityTransferServices::panicking())
+            .await
+            .unwrap();
+        let _ = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn load_transfers_non_empty_database() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
         let seeded = seed_transfer_events(&pool).await;
+        backfill_transfer_projections(&pool).await;
         let loaded = load_transfers(&pool).await;
 
         // Active should contain the in-progress mint and in-progress redemption
@@ -805,25 +987,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_all_transfer_operations_returns_warnings_for_malformed_aggregate() {
+    async fn transfer_history_returns_warnings_for_malformed_projection() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
         let bad_mint_id = issuer_request_id("bad-mint-1");
-
-        insert_event(
-            &pool,
-            "TokenizedEquityMint",
-            &bad_mint_id.to_string(),
-            1,
-            "TokenizedEquityMintEvent::MintRequested",
-            serde_json::json!({"malformed": true}),
+        let payload = serde_json::json!({
+            "Live": {
+                "MintRequested": {
+                    "requested_at": Utc::now(),
+                    "malformed": true
+                }
+            }
+        });
+        sqlx::query(
+            "INSERT INTO tokenized_equity_mint_view (view_id, version, payload) \
+             VALUES (?1, 1, ?2)",
         )
-        .await;
+        .bind(bad_mint_id.to_string())
+        .bind(payload.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        let result = load_all_transfer_operations(&pool, None).await;
+        let result = query_transfer_history(
+            &pool,
+            &TransferHistoryQuery {
+                limit: 100,
+                ..TransferHistoryQuery::default()
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(result.operations.is_empty());
+        assert_eq!(result.total, 1);
         assert_eq!(result.warnings.len(), 1, "expected one warning");
         match result.warnings.as_slice() {
             [TransferWarning::MintReplayFailed { id }] => {
@@ -834,14 +1032,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_all_transfer_operations_filters_by_kind() {
+    async fn transfer_history_filters_by_kind_before_paging() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        seed_transfer_events(&pool).await;
+        let now = Utc::now();
+        let mint_id = issuer_request_id("mint-filter");
+        let mint = TokenizedEquityMint::originate(&TokenizedEquityMintEvent::MintRequested {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: float!(1),
+            wallet: Address::ZERO,
+            requested_at: now,
+        })
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tokenized_equity_mint_view (view_id, version, payload) \
+             VALUES (?1, 1, ?2)",
+        )
+        .bind(mint_id.to_string())
+        .bind(serde_json::json!({ "Live": mint }).to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        let mint_only =
-            load_all_transfer_operations(&pool, Some(&[TransferKind::EquityMint])).await;
+        let redemption_id = redemption_aggregate_id("redemption-filter");
+        let redemption = EquityRedemption::VaultWithdrawPending {
+            symbol: Symbol::new("MSFT").unwrap(),
+            quantity: float!(2),
+            token: Address::ZERO,
+            wrapped_amount: alloy::primitives::U256::from(2),
+            pending_at: now,
+        };
+        sqlx::query(
+            "INSERT INTO equity_redemption_view (view_id, version, payload) \
+             VALUES (?1, 1, ?2)",
+        )
+        .bind(redemption_id.to_string())
+        .bind(serde_json::json!({ "Live": redemption }).to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
 
+        let usdc_id = Uuid::new_v4();
+        let usdc = UsdcRebalance::Converting {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc::new(float!(100)),
+            order_id: ClientOrderId::from_uuid(usdc_id),
+            initiated_at: now,
+        };
+        sqlx::query(
+            "INSERT INTO usdc_rebalance_view (view_id, version, payload) \
+             VALUES (?1, 1, ?2)",
+        )
+        .bind(usdc_id.to_string())
+        .bind(serde_json::json!({ "Live": usdc }).to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mint_only = query_transfer_history(
+            &pool,
+            &TransferHistoryQuery {
+                limit: 100,
+                kinds: Some(vec![TransferKind::EquityMint]),
+                ..TransferHistoryQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(mint_only.total, 1);
         assert!(
             mint_only
                 .operations
@@ -855,6 +1114,261 @@ mod tests {
             !mint_only.operations.is_empty(),
             "expected at least one mint operation"
         );
+
+        let deduplicated = query_transfer_history(
+            &pool,
+            &TransferHistoryQuery {
+                limit: 100,
+                kinds: Some(vec![TransferKind::EquityMint, TransferKind::EquityMint]),
+                ..TransferHistoryQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(deduplicated.total, 1);
+
+        let all = query_transfer_history(
+            &pool,
+            &TransferHistoryQuery {
+                limit: 100,
+                ..TransferHistoryQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(all.total, 3);
+        assert_eq!(all.operations.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn transfer_history_pages_projection_rows_before_decoding() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        let times = [
+            Utc::now() - Duration::hours(3),
+            Utc::now() - Duration::hours(2),
+            Utc::now() - Duration::hours(1),
+        ];
+
+        for (index, requested_at) in times.iter().copied().enumerate() {
+            let label = format!("mint-{index}");
+            let id = issuer_request_id(&label);
+            let entity = TokenizedEquityMint::originate(&TokenizedEquityMintEvent::MintRequested {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: float!(1),
+                wallet: Address::ZERO,
+                requested_at,
+            })
+            .unwrap();
+            let payload = serde_json::json!({ "Live": entity });
+
+            sqlx::query(
+                "INSERT INTO tokenized_equity_mint_view (view_id, version, payload) \
+                 VALUES (?1, 1, ?2)",
+            )
+            .bind(id.to_string())
+            .bind(payload.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        sqlx::query(
+            "INSERT INTO tokenized_equity_mint_view (view_id, version, payload) \
+             VALUES ('unreadable-old-row', 1, '{\"Live\":{\"invalid\":true}}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let page = query_transfer_history(
+            &pool,
+            &TransferHistoryQuery {
+                limit: 2,
+                ..TransferHistoryQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(page.total, 3);
+        assert!(page.has_more);
+        assert_eq!(page.operations.len(), 2);
+        assert!(page.warnings.is_empty());
+        assert!(page.operations[0].started_at() > page.operations[1].started_at());
+
+        let bounded = query_transfer_history(
+            &pool,
+            &TransferHistoryQuery {
+                limit: 100,
+                since: Some(times[1]),
+                until: Some(times[2]),
+                ..TransferHistoryQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(bounded.total, 2);
+        assert_eq!(bounded.operations.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn transfer_projection_backfills_existing_aggregates() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let id = issuer_request_id("backfilled-mint");
+        insert_event(
+            &pool,
+            "TokenizedEquityMint",
+            &id.to_string(),
+            1,
+            "TokenizedEquityMintEvent::MintRequested",
+            serde_json::to_value(TokenizedEquityMintEvent::MintRequested {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: float!(1),
+                wallet: Address::ZERO,
+                requested_at: Utc::now(),
+            })
+            .unwrap(),
+        )
+        .await;
+
+        let (_store, _projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .build(EquityTransferServices::panicking())
+            .await
+            .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tokenized_equity_mint_view WHERE view_id = ?1",
+        )
+        .bind(id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+
+        let page = query_transfer_history(
+            &pool,
+            &TransferHistoryQuery {
+                limit: 100,
+                ..TransferHistoryQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.operations.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn transfer_history_tables_use_their_ordering_indexes() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        for (table, index) in [
+            (
+                "tokenized_equity_mint_view",
+                "idx_tokenized_equity_mint_view_started_at",
+            ),
+            (
+                "equity_redemption_view",
+                "idx_equity_redemption_view_started_at",
+            ),
+            ("usdc_rebalance_view", "idx_usdc_rebalance_view_started_at"),
+        ] {
+            let sql = format!(
+                "EXPLAIN QUERY PLAN SELECT view_id FROM {table} \
+                 WHERE started_at IS NOT NULL ORDER BY started_at DESC, view_id ASC LIMIT 100"
+            );
+            let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            assert!(
+                rows.iter().any(|(_, _, _, detail)| detail.contains(index)),
+                "expected {index} in query plan: {rows:?}"
+            );
+        }
+
+        for (table, index) in [
+            (
+                "tokenized_equity_mint_view",
+                "idx_tokenized_equity_mint_view_terminal_at",
+            ),
+            (
+                "equity_redemption_view",
+                "idx_equity_redemption_view_terminal_at",
+            ),
+            ("usdc_rebalance_view", "idx_usdc_rebalance_view_terminal_at"),
+        ] {
+            let sql = format!(
+                "EXPLAIN QUERY PLAN SELECT view_id FROM {table} \
+                 WHERE terminal_at >= ?"
+            );
+            let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                .bind(sortable_timestamp(Utc::now() - Duration::hours(24)))
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            assert!(
+                rows.iter().any(|(_, _, _, detail)| detail.contains(index)),
+                "expected {index} in query plan: {rows:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn usdc_terminal_timestamp_respects_directional_completion() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let now = Utc::now();
+        let cases = [
+            ("ConversionComplete", "BaseToAlpaca", "converted_at", true),
+            ("ConversionComplete", "AlpacaToBase", "converted_at", false),
+            (
+                "DepositConfirmed",
+                "AlpacaToBase",
+                "deposit_confirmed_at",
+                true,
+            ),
+            (
+                "DepositConfirmed",
+                "BaseToAlpaca",
+                "deposit_confirmed_at",
+                false,
+            ),
+        ];
+
+        for (state, direction, timestamp_field, expected_terminal) in cases {
+            let id = Uuid::new_v4();
+            let payload = serde_json::json!({
+                "Live": {
+                    (state): {
+                        "direction": direction,
+                        (timestamp_field): now,
+                    }
+                }
+            });
+            sqlx::query(
+                "INSERT INTO usdc_rebalance_view (view_id, version, payload) \
+                 VALUES (?1, 1, ?2)",
+            )
+            .bind(id.to_string())
+            .bind(payload.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let terminal_at: Option<String> = sqlx::query_scalar(
+                "SELECT terminal_at FROM usdc_rebalance_view WHERE view_id = ?1",
+            )
+            .bind(id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(terminal_at.is_some(), expected_terminal);
+        }
     }
 
     #[tokio::test]
@@ -864,17 +1378,25 @@ mod tests {
 
         let bad_mint_id = issuer_request_id("bad-mint-1");
 
-        // Insert an event with a payload that can't be deserialized as a
-        // TokenizedEquityMintEvent — this triggers a MintReplayFailed warning.
-        insert_event(
-            &pool,
-            "TokenizedEquityMint",
-            &bad_mint_id.to_string(),
-            1,
-            "TokenizedEquityMintEvent::MintRequested",
-            serde_json::json!({"malformed": true}),
+        sqlx::query(
+            "INSERT INTO tokenized_equity_mint_view (view_id, version, payload) \
+             VALUES (?1, 1, ?2)",
         )
-        .await;
+        .bind(bad_mint_id.to_string())
+        .bind(
+            serde_json::json!({
+                "Live": {
+                    "MintRequested": {
+                        "requested_at": Utc::now(),
+                        "malformed": true
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let loaded = load_transfers(&pool).await;
 

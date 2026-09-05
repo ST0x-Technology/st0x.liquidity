@@ -166,13 +166,14 @@ async fn build_equity_transfer_services(
         mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
 
-    let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+    let (mint_store, _mint_projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
         .build(services.clone())
         .await?;
 
-    let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-        .build(services.clone())
-        .await?;
+    let (redemption_store, _redemption_projection) =
+        StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(services.clone())
+            .await?;
 
     let transfer = CrossVenueEquityTransfer::new(
         raindex,
@@ -477,7 +478,7 @@ async fn run_usdc_transfer<Writer: Write>(
         TransferDirection::ToAlpaca => "Raindex -> Alpaca",
     };
 
-    let usdc_store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+    let (usdc_store, _usdc_projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
         .build(())
         .await?;
 
@@ -753,7 +754,7 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
     let id = UsdcRebalanceId(id);
     writeln!(stdout, "Failing pre-burn USDC transfer {id}")?;
 
-    let usdc_store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+    let (usdc_store, _usdc_projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
         .build(())
         .await?;
 
@@ -979,7 +980,7 @@ pub(super) async fn clear_pending_burn_command<Writer: Write>(
         "Clearing recorded pending CCTP burn for USDC transfer {id} (reason: {reason})"
     )?;
 
-    let usdc_store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+    let (usdc_store, _usdc_projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
         .build(())
         .await?;
 
@@ -1072,7 +1073,7 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
     let id = UsdcRebalanceId(id);
     writeln!(stdout, "Reconciling stuck USDC transfer id: {id}")?;
 
-    let usdc_store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+    let (usdc_store, _usdc_projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
         .build(())
         .await?;
 
@@ -2424,7 +2425,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(7777);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -2469,7 +2470,7 @@ mod tests {
         let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
         let id = Uuid::from_u128(99);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -2510,7 +2511,7 @@ mod tests {
         let seeded_amount = Usdc::new(Float::parse("100".to_string()).unwrap());
         let id = Uuid::from_u128(123);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -2911,7 +2912,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_0001);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -2936,7 +2937,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_0002);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -2971,7 +2972,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_0002_000B);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3010,7 +3011,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_0003);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3050,7 +3051,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_0004);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3087,7 +3088,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_0005);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3141,7 +3142,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_0009);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3192,7 +3193,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_000C);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3240,7 +3241,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_000D);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3292,7 +3293,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_0006);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3463,7 +3464,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_000B);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3487,7 +3488,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_000C);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3511,7 +3512,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_000D);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3565,7 +3566,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_000E);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3593,7 +3594,7 @@ mod tests {
     #[tokio::test]
     async fn classify_fail_bridging_reload_distinguishes_pre_and_post_burn() {
         let pool = setup_test_db().await;
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3664,7 +3665,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_0008);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3701,7 +3702,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_0009);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3726,7 +3727,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_000A);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3791,7 +3792,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_000F);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -3848,7 +3849,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_0010);
 
-        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .build(())
             .await
             .unwrap();
@@ -4149,7 +4150,7 @@ mod tests {
     async fn seed_redemption_to_withdrawn(pool: &SqlitePool, id: &RedemptionAggregateId) {
         use EquityRedemptionCommand::*;
 
-        let store = StoreBuilder::<EquityRedemption>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(redemption_services())
             .await
             .unwrap();
@@ -4178,7 +4179,7 @@ mod tests {
 
         seed_redemption_to_withdrawn(pool, id).await;
 
-        let store = StoreBuilder::<EquityRedemption>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(redemption_services())
             .await
             .unwrap();
@@ -4198,7 +4199,7 @@ mod tests {
         id: &RedemptionAggregateId,
         command: EquityRedemptionCommand,
     ) {
-        let store = StoreBuilder::<EquityRedemption>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(redemption_services())
             .await
             .unwrap();
@@ -4444,7 +4445,7 @@ mod tests {
     /// requested, then acceptance force-failed. (`redemption_services()` returns
     /// the shared `EquityTransferServices`, used by both aggregate stores.)
     async fn seed_mint_to_failed(pool: &SqlitePool, id: &IssuerRequestId) {
-        let store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .build(redemption_services())
             .await
             .unwrap();
@@ -4476,7 +4477,7 @@ mod tests {
         id: &IssuerRequestId,
         command: TokenizedEquityMintCommand,
     ) {
-        let store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .build(redemption_services())
             .await
             .unwrap();

@@ -2272,6 +2272,17 @@ is fundamentally about transferring inventory between these venues. The transfer
 steps differ by asset type and direction, but the core abstraction is the same:
 move assets from one venue to the other.
 
+The operator dashboard reads cross-venue transfer history from the three
+aggregates' materialized projections. Type and time filters, newest-first
+ordering, and pagination are applied in SQLite before payloads are decoded, so
+serving one page is bounded by the requested page rather than the lifetime
+number of transfers. Unreadable rows in the selected page are skipped and
+surfaced as category-specific warnings without hiding readable transfers. The
+dashboard WebSocket's initial snapshot reads the same projections, selecting all
+active transfers and only terminal transfers updated within the last 24 hours
+before decoding payloads. It never rebuilds transfer state from event history
+when a client connects.
+
 ##### Architecture: Three Layers
 
 **Top layer -- Inventory management**: Decides _when_ and _how much_ to transfer

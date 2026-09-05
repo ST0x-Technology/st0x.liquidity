@@ -1235,7 +1235,7 @@ mod tests {
         // mirrors `simulated_transfers.rs`'s `FixtureTokenizer` wiring pattern.
         let mut services = crate::rebalancing::equity::EquityTransferServices::panicking();
         services.tokenizer = Arc::new(st0x_tokenization::mock::MockTokenizer::new());
-        let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+        let (mint_store, _mint_projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .build(services)
             .await
             .unwrap();

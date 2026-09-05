@@ -517,17 +517,18 @@ async fn build_equity_transfer_with_service(
         mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
 
-    let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+    let (mint_store, _mint_projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
         .with(Arc::clone(service))
         .build(equity_services.clone())
         .await
         .unwrap();
 
-    let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-        .with(Arc::clone(service))
-        .build(equity_services)
-        .await
-        .unwrap();
+    let (redemption_store, _redemption_projection) =
+        StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .with(Arc::clone(service))
+            .build(equity_services)
+            .await
+            .unwrap();
 
     Arc::new(CrossVenueEquityTransfer::new(
         raindex,
@@ -2563,11 +2564,12 @@ async fn transfer_failed_cancels_redemption_inflight() {
         mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
 
-    let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-        .with(Arc::clone(&service))
-        .build(equity_services)
-        .await
-        .unwrap();
+    let (redemption_store, _redemption_projection) =
+        StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .with(Arc::clone(&service))
+            .build(equity_services)
+            .await
+            .unwrap();
 
     let redemption_id = redemption_aggregate_id("redemption-transfer-failed");
 

@@ -3,10 +3,9 @@
 //! `super::seed_simulated_hedge_latency_history`'s approach: real CQRS
 //! commands through a temporary store instead of raw inserts.
 //!
-//! The Transfers panel (`dashboard/transfer_loader.rs`) replays straight from
-//! the `events` table via `load_entity`/`load_all_ids`, so the bare `events`
-//! rows these commands persist are all it needs -- no reactor required.
-//! The mint/redemption stores are still wired with `EquityTimingProjection`
+//! The aggregate stores maintain the materialized views consumed by the
+//! Transfers panel (`dashboard/transfer_loader.rs`) while these commands are
+//! persisted. The mint/redemption stores are also wired with `EquityTimingProjection`
 //! (mirroring how the USDC store is wired with `RebalanceTimingProjection`
 //! below) so the Performance tab's "Equity rebalance stage breakdown" chart
 //! also gets historical data, not just the Transfers panel.
@@ -245,7 +244,7 @@ pub async fn seed_simulated_mint_history(
     // `seed_simulated_equity_redemption_history`'s use of this same fixture.
     services.tokenizer = Arc::new(FixtureTokenizer::new(Address::ZERO, 0));
 
-    let mint = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+    let (mint, _mint_projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
         .with(Arc::new(RetryOnBusy {
             inner: EquityTimingProjection::new(pool.clone()),
         }))
@@ -335,11 +334,7 @@ pub async fn seed_simulated_usdc_rebalance_history(
 ) -> anyhow::Result<()> {
     sqlx::migrate!().set_ignore_missing(true).run(pool).await?;
 
-    // `UsdcRebalance::Materialized = Nil`, so `build()` returns `Arc<Store<_>>`
-    // alone regardless of `.with()` reactor count (unlike `Position`'s
-    // `Materialized = Table`, which returns a `(Store, Projection)` pair) --
-    // the reactor is wired into the store's dispatch either way.
-    let rebalance = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+    let (rebalance, _rebalance_projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
         .with(Arc::new(RetryOnBusy {
             inner: RebalanceTimingProjection::new(pool.clone()),
         }))
@@ -1054,12 +1049,13 @@ pub async fn seed_simulated_equity_redemption_history(
             mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
-        let redemption = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .with(Arc::new(RetryOnBusy {
-                inner: EquityTimingProjection::new(pool.clone()),
-            }))
-            .build(services)
-            .await?;
+        let (redemption, _redemption_projection) =
+            StoreBuilder::<EquityRedemption>::new(pool.clone())
+                .with(Arc::new(RetryOnBusy {
+                    inner: EquityTimingProjection::new(pool.clone()),
+                }))
+                .build(services)
+                .await?;
 
         let id = RedemptionAggregateId(simulated_transfer_uuid("redemption", day));
         let quantity = Float::parse("5".to_string())?;

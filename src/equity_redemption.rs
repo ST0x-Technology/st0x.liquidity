@@ -70,7 +70,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use st0x_dto::{EquityRedemptionOperation, EquityRedemptionStatus, TransferOperation};
-use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 use st0x_evm::{EvmError, IERC20, NODE_SYNC_MAX_ATTEMPTS};
 use st0x_execution::Symbol;
 use st0x_finance::{FractionalShares, Id};
@@ -1268,10 +1268,10 @@ impl EventSourced for EquityRedemption {
     type Command = EquityRedemptionCommand;
     type Error = EquityRedemptionError;
     type Services = EquityTransferServices;
-    type Materialized = Nil;
+    type Materialized = Table;
 
     const AGGREGATE_TYPE: &'static str = "EquityRedemption";
-    const PROJECTION: Nil = Nil;
+    const PROJECTION: Table = Table("equity_redemption_view");
     // v3: added the `ProviderCompletionRecovered` event for in-process
     // failed-transfer recovery.
     // v4: `Failed.reason` is now materialized from `DetectionFailed`

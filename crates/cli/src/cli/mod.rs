@@ -3080,7 +3080,7 @@ mod tests {
         // the exact event shapes/sequence the live system would produce.
         // The default `MockTokenizer` accepts the request, so this emits
         // both `MintRequested` and `MintAccepted`.
-        let store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .build(EquityTransferServices {
                 raindex: Arc::new(MockRaindex::new()),
                 vault_lookup: Arc::new(MockVaultLookup::new()),
