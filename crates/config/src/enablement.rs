@@ -92,8 +92,10 @@ impl fmt::Display for ChainCapability {
 ///
 /// - Base has everything: the fill watcher, the wrapper, CCTP's domain 6, and
 ///   an ETH/USD Pyth feed read at a Base block.
-/// - Ethereum signs, holds USDC (CCTP domain 0) and pays gas in ETH, but has
-///   no orderbook wiring and no wrapper.
+/// - Ethereum signs, holds USDC (CCTP domain 0), pays gas in ETH, and has a
+///   fill watcher whose fills are accounted and hedged against its own asset
+///   table (the position check backstop sweeps every watched chain's table),
+///   but no wrapper.
 /// - HyperEVM has a signer and nothing else: no CCTP domain is known for it,
 ///   and its native token is HYPE, which the ETH/USD feed cannot value.
 pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
@@ -108,8 +110,6 @@ pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
             CashRebalancing,
             GasValuation,
         ]),
-        // FillIngestion + Hedging granted with the per-chain watcher and
-        // chain-aware accounting code (RAI-2079); rebalancing stays Base-only.
         Chain::Ethereum => BTreeSet::from([
             FillIngestion,
             Hedging,
