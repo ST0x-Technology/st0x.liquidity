@@ -2,7 +2,8 @@
 //!
 //! This crate provides the generic [`Wrapper`] trait for wrapping and unwrapping
 //! tokenized equity against ERC-4626 vaults, plus the shared domain types
-//! ([`WrapperError`], [`UnderlyingPerWrapped`], [`RatioError`], [`WrappedEquity`]).
+//! ([`WrapperError`], [`UnderlyingPerWrapped`], [`RatioError`], [`WrappedEquity`],
+//! [`UnwrappedToken`]).
 //!
 //! The default (no-feature) build ships only the trait and domain types. The
 //! ERC-4626 implementation ([`WrapperService`]) is gated behind the `erc4626`
@@ -11,6 +12,8 @@
 use alloy::contract::Error as ContractError;
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::fmt::{self, Display, Formatter};
 
 use st0x_evm::{EvmError, NODE_SYNC_MAX_ATTEMPTS};
 use st0x_execution::Symbol;
@@ -45,14 +48,46 @@ pub struct WrapConfirmation {
     pub block: u64,
 }
 
-/// Result returned by [`Wrapper::confirm_unwrap`]: the underlying amount
-/// received and the block in which the redeem transaction was included.
+/// A tokenized-equity address a [`Wrapper`] attested as an ERC-4626 vault's
+/// `asset()`: the token a redeem delivers, never the vault share itself.
+///
+/// Only wrapper implementations construct it, so a value of this type proves
+/// the address went through that attestation. The issuer's redemption transfer
+/// accepts nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UnwrappedToken(Address);
+
+impl UnwrappedToken {
+    pub fn address(self) -> Address {
+        let Self(address) = self;
+        address
+    }
+
+    /// Skips the vault attestation for test doubles outside this crate.
+    #[cfg(feature = "mock")]
+    pub fn unchecked(address: Address) -> Self {
+        Self(address)
+    }
+}
+
+impl Display for UnwrappedToken {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let Self(address) = self;
+        Display::fmt(address, formatter)
+    }
+}
+
+/// Result returned by [`Wrapper::confirm_unwrap`]: the token and amount the
+/// redeem delivered and the block in which the transaction was included.
 ///
 /// The block number is returned so callers can pass it to
 /// [`Wrapper::wait_for_block`] before submitting any dependent on-chain write
 /// that reads the unwrapped balance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnwrapConfirmation {
+    /// The vault's `asset()`: the token the redeem delivered.
+    pub token: UnwrappedToken,
     /// Actual underlying tokens returned by the redeem.
     pub assets: U256,
     /// Block number of the confirmed redeem transaction.
@@ -98,6 +133,19 @@ pub enum WrapperError {
         requested: U256,
         max_redeem: U256,
     },
+    /// The configured vault reports an `asset()` other than the configured
+    /// underlying, so the config and the chain disagree about which token an
+    /// unwrap delivers. Refused rather than trusting either side.
+    #[error(
+        "Vault {vault} for {symbol} reports asset {attested}, \
+         but the configured underlying is {configured}"
+    )]
+    VaultAssetMismatch {
+        symbol: Symbol,
+        vault: Address,
+        configured: Address,
+        attested: Address,
+    },
     #[error("Contract call error: {0}")]
     Evm(#[from] EvmError),
     #[error("Contract view error: {0}")]
@@ -137,6 +185,7 @@ pub fn node_sync_attempts(error: &WrapperError) -> u32 {
         | WrapperError::MissingDepositEvent
         | WrapperError::MissingWithdrawEvent
         | WrapperError::RedeemExceedsMax { .. }
+        | WrapperError::VaultAssetMismatch { .. }
         | WrapperError::Contract(_)
         | WrapperError::Ratio(_)
         | WrapperError::MissingBlockNumber { .. } => NODE_SYNC_MAX_ATTEMPTS,
@@ -157,6 +206,12 @@ pub trait Wrapper: Send + Sync {
 
     /// Gets the tokenized equity derivative (ERC-4626 vault) token address for a symbol.
     fn lookup_derivative(&self, symbol: &Symbol) -> Result<Address, WrapperError>;
+
+    /// Reads the configured vault's `asset()` for a symbol and returns it as
+    /// the attested [`UnwrappedToken`], refusing with
+    /// [`WrapperError::VaultAssetMismatch`] when it differs from the
+    /// configured underlying.
+    async fn attest_underlying(&self, symbol: &Symbol) -> Result<UnwrappedToken, WrapperError>;
 
     /// Deposits underlying tokens to receive wrapped tokens.
     async fn to_wrapped(

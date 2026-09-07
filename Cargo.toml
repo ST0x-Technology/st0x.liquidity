@@ -166,6 +166,7 @@ wallet-private-key = ["st0x-evm/local-signer", "st0x-config/wallet-private-key"]
 test-support = [
   "st0x-bridge/test-support",
   "st0x-config/test-support",
+  "st0x-wrapper/mock",
   "wallet-private-key",
 ]
 mock = [

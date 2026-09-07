@@ -11,7 +11,8 @@ use st0x_evm::{EvmError, NODE_SYNC_MAX_ATTEMPTS};
 use st0x_execution::Symbol;
 
 use crate::{
-    RATIO_ONE, UnderlyingPerWrapped, UnwrapConfirmation, WrapConfirmation, Wrapper, WrapperError,
+    RATIO_ONE, UnderlyingPerWrapped, UnwrapConfirmation, UnwrappedToken, WrapConfirmation, Wrapper,
+    WrapperError,
 };
 
 /// Which operation the mock should simulate failing.
@@ -40,6 +41,9 @@ pub struct MockWrapper {
     unwrap_tx: TxHash,
     tokenized_shares: Address,
     wrapped_token: Address,
+    /// What the mock vault reports as its `asset()`; `None` means the
+    /// configured underlying (`tokenized_shares`).
+    attested_unwrapped_token: Option<Address>,
     ratio: U256,
     ratio_calls: AtomicUsize,
     failure: MockFailure,
@@ -56,6 +60,7 @@ impl MockWrapper {
             unwrap_tx: TxHash::random(),
             tokenized_shares: Address::random(),
             wrapped_token: Address::ZERO,
+            attested_unwrapped_token: None,
             ratio: RATIO_ONE,
             ratio_calls: AtomicUsize::new(0),
             failure: MockFailure::None,
@@ -71,6 +76,7 @@ impl MockWrapper {
             unwrap_tx: TxHash::random(),
             tokenized_shares: Address::random(),
             wrapped_token: Address::ZERO,
+            attested_unwrapped_token: None,
             ratio,
             ratio_calls: AtomicUsize::new(0),
             failure: MockFailure::None,
@@ -91,6 +97,15 @@ impl MockWrapper {
     #[must_use]
     pub fn with_wrapped_token(mut self, token: Address) -> Self {
         self.wrapped_token = token;
+        self
+    }
+
+    /// Makes the mock vault report `token` as its `asset()` in
+    /// `confirm_unwrap` and `attest_underlying`, simulating a vault that
+    /// delivers a token other than the configured underlying.
+    #[must_use]
+    pub fn attesting_unwrapped_token(mut self, token: Address) -> Self {
+        self.attested_unwrapped_token = Some(token);
         self
     }
 
@@ -220,6 +235,20 @@ impl Wrapper for MockWrapper {
         Ok(self.wrapped_token)
     }
 
+    async fn attest_underlying(&self, symbol: &Symbol) -> Result<UnwrappedToken, WrapperError> {
+        let configured = self.lookup_underlying(symbol)?;
+        match self.attested_unwrapped_token {
+            Some(attested) if attested != configured => Err(WrapperError::VaultAssetMismatch {
+                symbol: symbol.clone(),
+                vault: self.wrapped_token,
+                configured,
+                attested,
+            }),
+            Some(attested) => Ok(UnwrappedToken(attested)),
+            None => Ok(UnwrappedToken(configured)),
+        }
+    }
+
     async fn to_wrapped(
         &self,
         _wrapped_token: Address,
@@ -342,7 +371,14 @@ impl Wrapper for MockWrapper {
             .remove(&tx_hash)
             .ok_or(WrapperError::MissingWithdrawEvent)?;
 
-        Ok(UnwrapConfirmation { assets, block: 0 })
+        Ok(UnwrapConfirmation {
+            token: UnwrappedToken(
+                self.attested_unwrapped_token
+                    .unwrap_or(self.tokenized_shares),
+            ),
+            assets,
+            block: 0,
+        })
     }
 
     async fn wait_for_block(&self, block: u64) -> Result<(), WrapperError> {

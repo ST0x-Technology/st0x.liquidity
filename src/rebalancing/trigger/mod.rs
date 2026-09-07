@@ -5744,7 +5744,7 @@ mod tests {
     use st0x_float_macro::float;
     use st0x_tokenization::mock::MockTokenizer;
     use st0x_tokenization::{issuer_request_id, tokenization_request_id};
-    use st0x_wrapper::MockWrapper;
+    use st0x_wrapper::{MockWrapper, UnwrappedToken};
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -12822,7 +12822,7 @@ mod tests {
                 id.clone(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: Some(float!(28.224)),
-                    underlying_token: Address::random(),
+                    underlying_token: UnwrappedToken::unchecked(Address::random()),
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount: U256::from(28_224_000_000_000_000_000_u128),
                     unwrap_block: None,
@@ -12902,7 +12902,7 @@ mod tests {
                 id.clone(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: Some(float!(28.224)),
-                    underlying_token: Address::random(),
+                    underlying_token: UnwrappedToken::unchecked(Address::random()),
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount: U256::from(28_224_000_000_000_000_000_u128),
                     unwrap_block: None,
@@ -12968,7 +12968,7 @@ mod tests {
                 id.clone(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: None,
-                    underlying_token: Address::random(),
+                    underlying_token: UnwrappedToken::unchecked(Address::random()),
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount,
                     unwrap_block: None,
@@ -13039,7 +13039,7 @@ mod tests {
                 id.clone(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: Some(float!(28.224)),
-                    underlying_token: Address::random(),
+                    underlying_token: UnwrappedToken::unchecked(Address::random()),
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount: U256::from(28_224_000_000_000_000_000_u128),
                     unwrap_block: None,
@@ -13129,7 +13129,7 @@ mod tests {
                 id.clone(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: Some(float!(28.224)),
-                    underlying_token: Address::random(),
+                    underlying_token: UnwrappedToken::unchecked(Address::random()),
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount: U256::from(28_224_000_000_000_000_000_u128),
                     unwrap_block: None,
@@ -13219,7 +13219,7 @@ mod tests {
                 id.clone(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: Some(float!(28.224)),
-                    underlying_token: Address::random(),
+                    underlying_token: UnwrappedToken::unchecked(Address::random()),
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount: U256::from(28_224_000_000_000_000_000_u128),
                     unwrap_block: None,
@@ -13295,7 +13295,7 @@ mod tests {
                 id.clone(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: Some(float!(28)),
-                    underlying_token: Address::random(),
+                    underlying_token: UnwrappedToken::unchecked(Address::random()),
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount: U256::from(28_000_000_000_000_000_000_u128),
                     unwrap_block: None,
@@ -13364,7 +13364,7 @@ mod tests {
                 id.clone(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: Some(float!(28.148)),
-                    underlying_token: Address::random(),
+                    underlying_token: UnwrappedToken::unchecked(Address::random()),
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount: U256::from(28_148_000_000_000_000_000_u128),
                     unwrap_block: None,
@@ -27073,7 +27073,7 @@ mod tests {
 
         let unwrapped_less_than_tracked = EquityRedemptionEvent::TokensUnwrapped {
             quantity: Some(float!(8)),
-            underlying_token: Address::random(),
+            underlying_token: UnwrappedToken::unchecked(Address::random()),
             unwrap_tx_hash: TxHash::random(),
             unwrapped_amount: U256::from(8_000_000_000_000_000_000_u128),
             unwrap_block: None,

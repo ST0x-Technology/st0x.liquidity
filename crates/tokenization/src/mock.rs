@@ -9,6 +9,7 @@ use std::sync::{Mutex, PoisonError};
 
 use st0x_evm::{EvmError, NODE_SYNC_MAX_ATTEMPTS};
 use st0x_execution::{FractionalShares, Symbol};
+use st0x_wrapper::UnwrappedToken;
 
 use super::{
     AlpacaTokenizationError, ClientRequestId, IssuerRequestId, MintVerificationError,
@@ -435,7 +436,7 @@ impl Tokenizer for MockTokenizer {
 
     async fn send_for_redemption(
         &self,
-        _token: Address,
+        _token: UnwrappedToken,
         _amount: U256,
     ) -> Result<TxHash, TokenizerError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
