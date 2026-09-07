@@ -4,6 +4,7 @@
   abiEnv,
   rainMathFloatAbiEnv,
   rainMathFloat,
+  gitCommit,
 }:
 
 let
@@ -194,6 +195,9 @@ in
         homepage = "https://github.com/ST0x-Technology/st0x.liquidity";
       };
     }
+    # The server binary reads ST0X_GIT_COMMIT at compile time (src/api.rs)
+    # and reports it from /health.
+    // pkgs.lib.optionalAttrs (gitCommit != null) { ST0X_GIT_COMMIT = gitCommit; }
   );
 
   # CLI binary for remote operations
