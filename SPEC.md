@@ -141,6 +141,19 @@ wallet, orderbook and canonical USDC, as do the startup MAX approvals in either
 mode; a watched chain for which this build has no pinned USDC fails startup
 rather than borrowing another chain's address.
 
+The operator CLI selects its chain the same way. Every command that submits an
+onchain operation -- `vault-deposit`, `vault-withdraw`, `vault-withdraw-usdc`,
+`reset-allowance`, `transfer-equity`, `donate-equity` and `dividend-bump`,
+alongside the wrap, unwrap, mint and redeem commands -- takes `--network`
+(default `base`) and runs on that chain's signing wallet and
+`[chains.<name>.trading]` table: orderbook, inventory, vault owner, asset table
+and redemption wallet. A network with no trading table is refused by name, never
+served the primary's addresses; USDC is the selected chain's canonical contract,
+refused where this build pins none. An operator equity transfer checks gas on
+the selected chain's wallet against its `[alerts.low_balance_thresholds]` entry
+and refuses a chain without one. The mint and redemption aggregates record no
+chain yet, so a resumed transfer must be given the network it started on.
+
 ##### Shared-Inventory Settlement
 
 Rebalancing deposits and withdrawals do not necessarily settle on the Rain
