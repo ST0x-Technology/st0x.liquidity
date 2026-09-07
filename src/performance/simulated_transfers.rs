@@ -118,7 +118,7 @@ impl Tokenizer for FixtureTokenizer {
             wallet: Some(wallet),
             client_request_id: Some(ClientRequestId::from(&issuer_request_id)),
             issuer_request_id: None,
-            network: Network::new(Chain::Base.as_str()),
+            network: Some(Network::new(Chain::Base.as_str())),
             tx_hash: None,
             fees: None,
             created_at: Utc::now(),
