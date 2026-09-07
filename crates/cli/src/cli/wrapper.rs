@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use st0x_config::Ctx;
-use st0x_evm::Wallet;
+use st0x_evm::{Chain, Wallet};
 use st0x_execution::{FractionalShares, Positive, Symbol};
 use st0x_hedge::operator::rebalancing::to_wrapped_equities;
 use st0x_wrapper::{WrappedEquity, Wrapper, WrapperService};
@@ -219,7 +219,7 @@ pub(super) fn wrap_context(
              from [chains.<name>.trading.assets.equities]"
         ),
         (TokenizationNetwork::Ethereum | TokenizationNetwork::HyperEvm, Some(path)) => {
-            load_wrapped_equities(path, network.chain_id())?
+            load_wrapped_equities(path, Chain::from(network).chain_id())?
         }
         (TokenizationNetwork::Ethereum | TokenizationNetwork::HyperEvm, None) => anyhow::bail!(
             "pass --registry with the st0x.registry token list for the \
@@ -239,8 +239,7 @@ pub(super) fn wrap_context(
     // Config-only checks first so a typo or a missing registry fails before
     // the wallet is required.
     let wallet_ctx = ctx.wallet()?;
-    let (wallet, _network_wire) =
-        super::rebalancing::tokenization_network_context(wallet_ctx, network);
+    let (wallet, _chain) = super::rebalancing::tokenization_network_context(wallet_ctx, network);
 
     Ok(WrapContext { wallet, equities })
 }

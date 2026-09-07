@@ -1874,7 +1874,7 @@ mod tests {
     use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_evm::{Chain, ReadOnlyEvm};
     use st0x_execution::{
-        Direction, EquityPosition, FractionalShares, Inventory, MockExecutor, Positive,
+        Direction, EquityPosition, FractionalShares, Inventory, MockExecutor, Network, Positive,
         SupportedExecutor, Symbol,
     };
     use st0x_finance::Usdc;
@@ -4742,6 +4742,7 @@ mod tests {
             quantity: test_shares(quantity),
             wallet: None,
             client_request_id: None,
+            network: Network::new(Chain::Base.as_str()),
             issuer_request_id: None,
             tx_hash: None,
             token_symbol: None,
@@ -4765,6 +4766,7 @@ mod tests {
             quantity: test_shares(quantity),
             wallet,
             client_request_id: None,
+            network: Network::new(Chain::Base.as_str()),
             issuer_request_id: None,
             tx_hash: None,
             token_symbol: None,

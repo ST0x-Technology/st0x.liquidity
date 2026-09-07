@@ -39,7 +39,7 @@ use tracing::{debug, error, info, trace, warn};
 use url::{Host, Url};
 
 use st0x_evm::{
-    EvmError, IERC20, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
+    Chain, EvmError, IERC20, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
     OpenChainErrorRegistry, Wallet, wait_for_node_sync,
 };
 use st0x_execution::{
@@ -62,13 +62,14 @@ pub struct AlpacaTokenizationService<W: Wallet> {
 }
 
 impl<W: Wallet> AlpacaTokenizationService<W> {
-    /// Create a new tokenization service.
+    /// Create a new tokenization service bound to `chain`: mint requests
+    /// name it on the wire and responses for any other network are refused.
     pub fn new(
         base_url: String,
         account_id: AlpacaAccountId,
         auth: AlpacaBrokerAuth,
         wallet: W,
-        network: Network,
+        chain: Chain,
         redemption_wallet: Option<Address>,
     ) -> Result<Self, AlpacaTokenizationError> {
         let client = AlpacaTokenizationClient::new(
@@ -76,7 +77,7 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
             account_id,
             auth,
             wallet,
-            network,
+            chain,
             redemption_wallet,
         )?;
 
@@ -105,7 +106,7 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
             underlying_symbol,
             quantity,
             issuer: Issuer::new("st0x"),
-            network: self.client.network.clone(),
+            network: Network::new(self.client.chain.as_str()),
             wallet,
             client_request_id: issuer_request_id,
         };
@@ -329,6 +330,8 @@ pub struct TokenizationRequest {
     #[serde(rename = "wallet_address")]
     pub wallet: Option<Address>,
     pub client_request_id: Option<ClientRequestId>,
+    /// The chain the request settles on, as the issuer names it.
+    pub network: Network,
     pub issuer_request_id: Option<IssuerRequestId>,
     #[serde(default, deserialize_with = "deserialize_tx_hash")]
     pub tx_hash: Option<TxHash>,
@@ -356,6 +359,7 @@ impl TokenizationRequest {
             quantity: FractionalShares::ZERO,
             wallet: None,
             client_request_id: None,
+            network: Network::new(Chain::Base.as_str()),
             issuer_request_id: None,
             tx_hash: None,
             fees: None,
@@ -376,6 +380,7 @@ impl TokenizationRequest {
             quantity: FractionalShares::ZERO,
             wallet: None,
             client_request_id: None,
+            network: Network::new(Chain::Base.as_str()),
             issuer_request_id: None,
             tx_hash: Some(TxHash::ZERO),
             fees: None,
@@ -485,6 +490,16 @@ pub enum AlpacaTokenizationError {
          redemption operations"
     )]
     MissingRedemptionWallet,
+
+    /// The issuer answered for a request on another network than the one
+    /// this client is bound to; acting on it would drive a mint or
+    /// redemption on the wrong chain.
+    #[error("tokenization request {id} is on network '{actual}', not '{expected}'")]
+    WrongNetwork {
+        id: TokenizationRequestId,
+        expected: Chain,
+        actual: Network,
+    },
 }
 
 /// Opaque body text from an Alpaca tokenization API error response.
@@ -554,6 +569,7 @@ impl AlpacaTokenizationError {
             | Self::DuplicateMintIssuerRequestId { .. }
             | Self::InvalidBaseUrl(_)
             | Self::InsecureBaseUrl
+            | Self::WrongNetwork { .. }
             | Self::Evm(_)
             | Self::PollTimeout { .. }
             | Self::MissingRedemptionWallet => false,
@@ -605,6 +621,7 @@ impl AlpacaTokenizationError {
             | Self::DuplicateMintIssuerRequestId { .. }
             | Self::InvalidBaseUrl(_)
             | Self::InsecureBaseUrl
+            | Self::WrongNetwork { .. }
             | Self::Evm(_)
             | Self::PollTimeout { .. }
             | Self::MissingRedemptionWallet => None,
@@ -684,7 +701,7 @@ struct AlpacaTokenizationClient<W: Wallet> {
     account_id: AlpacaAccountId,
     auth: AuthRuntime,
     wallet: W,
-    network: Network,
+    chain: Chain,
     redemption_wallet: Option<Address>,
 }
 
@@ -694,7 +711,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         account_id: AlpacaAccountId,
         auth: AlpacaBrokerAuth,
         wallet: W,
-        network: Network,
+        chain: Chain,
         redemption_wallet: Option<Address>,
     ) -> Result<Self, AlpacaTokenizationError> {
         validate_credentialed_base_url(&base_url)?;
@@ -709,8 +726,34 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             account_id,
             auth: AuthRuntime::build(auth)?,
             wallet,
-            network,
+            chain,
             redemption_wallet,
+        })
+    }
+
+    /// Refuses a request the issuer reports on another network than this
+    /// client's chain. Every read that yields one request for this client
+    /// passes through here, so a foreign-chain mint or redemption cannot be
+    /// polled, verified or credited as if it were ours.
+    fn confirm_network(
+        &self,
+        request: TokenizationRequest,
+    ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+        if request.network.as_ref() == self.chain.as_str() {
+            return Ok(request);
+        }
+
+        warn!(
+            target: "tokenization",
+            request_id = %request.id,
+            expected = %self.chain,
+            actual = %request.network,
+            "Refusing tokenization request reported on another network"
+        );
+        Err(AlpacaTokenizationError::WrongNetwork {
+            id: request.id,
+            expected: self.chain,
+            actual: request.network,
         })
     }
 
@@ -779,7 +822,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
                 })?;
 
             info!(target: "tokenization", request_id = %tokenization_request.id, "Mint request created");
-            return Ok(tokenization_request);
+            return self.confirm_network(tokenization_request);
         }
 
         let message = String::from_utf8_lossy(&response.bytes().await?).into_owned();
@@ -863,6 +906,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             );
         })?
         .ok_or_else(|| AlpacaTokenizationError::RequestNotFound { id: id.clone() })
+        .and_then(|request| self.confirm_network(request))
     }
 
     /// Send tokens to the redemption wallet to initiate a redemption.
@@ -956,8 +1000,9 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
                 tx_hash = %expected_tx_hash,
                 "Failed to scan list requests response for redemption request"
             );
-        })
-        .map_err(AlpacaTokenizationError::from)
+        })?
+        .map(|request| self.confirm_network(request))
+        .transpose()
     }
 
     async fn find_mint_by_issuer_request_id(
@@ -1352,7 +1397,7 @@ pub(crate) mod tests {
                 api_secret: "test_api_secret".to_string(),
             },
             wallet,
-            Network::new("base"),
+            Chain::Base,
             Some(redemption_wallet),
         )
         .expect("basic-auth tokenization client")
@@ -1401,7 +1446,7 @@ pub(crate) mod tests {
                 api_secret: "test_api_secret".to_string(),
             },
             wallet.clone(),
-            Network::new("base"),
+            Chain::Base,
             Some(TEST_REDEMPTION_WALLET),
         );
         assert!(matches!(
@@ -1417,7 +1462,7 @@ pub(crate) mod tests {
                 api_secret: "test_api_secret".to_string(),
             },
             wallet,
-            Network::new("base"),
+            Chain::Base,
             Some(TEST_REDEMPTION_WALLET),
         );
 
@@ -2437,7 +2482,7 @@ pub(crate) mod tests {
                 api_secret: "test_api_secret".to_string(),
             },
             wallet,
-            Network::new("base"),
+            Chain::Base,
             Some(TEST_REDEMPTION_WALLET),
         )
         .expect("basic-auth tokenization client");
@@ -2485,7 +2530,7 @@ pub(crate) mod tests {
                 api_secret: "test_api_secret".to_string(),
             },
             wallet,
-            Network::new("base"),
+            Chain::Base,
             Some(TEST_REDEMPTION_WALLET),
         )
         .expect("basic-auth tokenization client");
@@ -2518,7 +2563,7 @@ pub(crate) mod tests {
                 api_secret: "test_api_secret".to_string(),
             },
             wallet,
-            Network::new("base"),
+            Chain::Base,
             Some(TEST_REDEMPTION_WALLET),
         )
         .expect("basic-auth tokenization client");

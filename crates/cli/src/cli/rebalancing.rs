@@ -16,11 +16,11 @@ use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_config::{BrokerCtx, Ctx, OnchainWalletCtx};
 use st0x_event_sorcery::StoreBuilder;
 use st0x_evm::{
-    Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, USDC_BASE, USDC_ETHEREUM, Wallet,
+    Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, USDC_BASE, USDC_ETHEREUM, Wallet,
 };
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletService, Executor,
-    FractionalShares, Network, Positive, Symbol, TimeInForce,
+    FractionalShares, Positive, Symbol, TimeInForce,
 };
 use st0x_finance::Usdc;
 use st0x_hedge::operator::api::ResumeResponse;
@@ -88,23 +88,20 @@ fn resolve_redemption_wallet(flag: Option<Address>, ctx: &Ctx) -> anyhow::Result
 }
 
 /// The bot wallet whose chain matches the selected tokenization network,
-/// paired with that network's Alpaca `network` wire value. One match produces
-/// both so a wallet/wire mismatch cannot be constructed at the call site.
+/// paired with that [`Chain`]. One match produces both so a wallet/chain
+/// mismatch cannot be constructed at the call site.
 pub(super) fn tokenization_network_context(
     wallet_ctx: &OnchainWalletCtx,
     network: TokenizationNetwork,
-) -> (Arc<dyn Wallet<Provider = RootProvider>>, Network) {
-    match network {
-        TokenizationNetwork::Base => (wallet_ctx.base_wallet().clone(), Network::new("base")),
-        TokenizationNetwork::Ethereum => (
-            wallet_ctx.ethereum_wallet().clone(),
-            Network::new("ethereum"),
-        ),
-        TokenizationNetwork::HyperEvm => (
-            wallet_ctx.hyperevm_wallet().clone(),
-            Network::new("hyperevm"),
-        ),
-    }
+) -> (Arc<dyn Wallet<Provider = RootProvider>>, Chain) {
+    let chain = Chain::from(network);
+    let wallet = match chain {
+        Chain::Base => wallet_ctx.base_wallet(),
+        Chain::Ethereum => wallet_ctx.ethereum_wallet(),
+        Chain::HyperEvm => wallet_ctx.hyperevm_wallet(),
+    };
+
+    (wallet.clone(), chain)
 }
 
 async fn build_equity_transfer_services(
@@ -127,7 +124,7 @@ async fn build_equity_transfer_services(
         alpaca_auth.account_id,
         alpaca_auth.auth.clone(),
         base_caller.clone(),
-        Network::new("base"),
+        Chain::Base,
         Some(redemption_wallet),
     )?);
 
@@ -1188,7 +1185,7 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write>(
     };
 
     let wallet_ctx = ctx.wallet()?;
-    let (wallet, wire_network) = tokenization_network_context(wallet_ctx, network);
+    let (wallet, chain) = tokenization_network_context(wallet_ctx, network);
 
     let receiving_wallet = recipient.unwrap_or_else(|| wallet.address());
     writeln!(stdout, "   Receiving wallet: {receiving_wallet}")?;
@@ -1217,7 +1214,7 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write>(
         alpaca_auth.account_id,
         alpaca_auth.auth.clone(),
         wallet,
-        wire_network,
+        chain,
         None,
     )?;
 
@@ -1334,7 +1331,7 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
     };
 
     let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, ctx)?;
-    let (_, wire_network) = tokenization_network_context(ctx.wallet()?, network);
+    let (_, chain) = tokenization_network_context(ctx.wallet()?, network);
     writeln!(stdout, "   Redemption wallet: {redemption_wallet}")?;
 
     // The issuer redeems only the vault's underlying, so the token comes from
@@ -1349,7 +1346,7 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
         alpaca_auth.account_id,
         alpaca_auth.auth.clone(),
         wallet,
-        wire_network,
+        chain,
         Some(redemption_wallet),
     )?;
 
@@ -1424,7 +1421,7 @@ pub(super) async fn alpaca_tokenization_requests_command<Writer: Write>(
         alpaca_auth.account_id,
         alpaca_auth.auth.clone(),
         wallet_ctx.base_wallet().clone(),
-        Network::new("base"),
+        Chain::Base,
         None,
     )?;
 
@@ -2843,20 +2840,20 @@ mod tests {
             StubWallet::stub(hyperevm_address),
         );
 
-        let (base_wallet, base_wire) =
+        let (base_wallet, base_chain) =
             tokenization_network_context(&wallet_ctx, TokenizationNetwork::Base);
         assert_eq!(base_wallet.address(), base_address);
-        assert_eq!(base_wire, Network::new("base"));
+        assert_eq!(base_chain, Chain::Base);
 
-        let (ethereum_wallet, ethereum_wire) =
+        let (ethereum_wallet, ethereum_chain) =
             tokenization_network_context(&wallet_ctx, TokenizationNetwork::Ethereum);
         assert_eq!(ethereum_wallet.address(), ethereum_address);
-        assert_eq!(ethereum_wire, Network::new("ethereum"));
+        assert_eq!(ethereum_chain, Chain::Ethereum);
 
-        let (hyperevm_wallet, hyperevm_wire) =
+        let (hyperevm_wallet, hyperevm_chain) =
             tokenization_network_context(&wallet_ctx, TokenizationNetwork::HyperEvm);
         assert_eq!(hyperevm_wallet.address(), hyperevm_address);
-        assert_eq!(hyperevm_wire, Network::new("hyperevm"));
+        assert_eq!(hyperevm_chain, Chain::HyperEvm);
     }
 
     async fn seed_to_withdrawal_complete(
@@ -4020,7 +4017,7 @@ mod tests {
                 api_secret: "test_secret".to_string(),
             },
             st0x_evm::StubWallet::stub(Address::ZERO),
-            Network::new("base"),
+            Chain::Base,
             None,
         )
         .expect("basic-auth tokenization service");
@@ -4076,7 +4073,7 @@ mod tests {
                 api_secret: "test_secret".to_string(),
             },
             st0x_evm::StubWallet::stub(Address::ZERO),
-            Network::new("base"),
+            Chain::Base,
             None,
         )
         .expect("basic-auth tokenization service");
