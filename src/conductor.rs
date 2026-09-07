@@ -39,7 +39,8 @@ use url::Url;
 
 use st0x_config::{
     BrokerCtx, ChainAssets, Ctx, CtxError, ExecutionThreshold, HedgingAssets, InventoryMode,
-    IssuanceStatusCtx, OnchainWalletCtx, OperationMode, RebalancingCtx, TradingChain,
+    IssuanceStatusCtx, OnchainWalletCtx, OperationMode, OrchestratorAddresses, RebalancingCtx,
+    TradingChain,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
@@ -1801,16 +1802,102 @@ struct PositionAndRebalancing {
     deliver_mint_authorization_ctx: Option<Arc<DeliverMintAuthorizationCtx>>,
 }
 
-/// Builds the wrapper service from the single wallet/config source shared by
-/// startup approvals, portfolio snapshots, and rebalancing.
+/// Builds one chain's wrapper service on that chain's signer and asset table.
 fn build_wrapper<Signer: Wallet + Clone>(
-    base_wallet: Signer,
-    ctx: &Ctx,
+    wallet: Signer,
+    trading_chain: &TradingChain,
 ) -> Arc<WrapperService<Signer>> {
     Arc::new(WrapperService::new(
-        base_wallet,
-        to_wrapped_equities(&ctx.chains.primary().assets.equities.symbols),
+        wallet,
+        to_wrapped_equities(&trading_chain.assets.equities.symbols),
     ))
+}
+
+/// The signer for `chain`. An exhaustive match, so a new variant must name
+/// its wallet here rather than silently inheriting another chain's.
+fn chain_wallet(
+    wallet_ctx: &OnchainWalletCtx,
+    chain: Chain,
+) -> &Arc<dyn Wallet<Provider = RootProvider>> {
+    match chain {
+        Chain::Base => wallet_ctx.base_wallet(),
+        Chain::Ethereum => wallet_ctx.ethereum_wallet(),
+        Chain::HyperEvm => wallet_ctx.hyperevm_wallet(),
+    }
+}
+
+/// The tokenization services bound to one watched chain: the issuer client,
+/// the wrapper and the mint authorizer, each built on that chain's signer,
+/// asset table, issuer redemption wallet and orchestrator entry.
+struct ChainTokenization<Signer: Wallet> {
+    chain: Chain,
+    wallet: Signer,
+    tokenizer: Arc<dyn Tokenizer>,
+    wrapper: Arc<WrapperService<Signer>>,
+    mint_authorizer: ConfiguredMintAuthorizer,
+    /// Every configured equity's underlying token on this chain: the table
+    /// the mint saga resolves a symbol through before signing.
+    token_addresses: HashMap<Symbol, Address>,
+}
+
+/// Every watched chain's [`ChainTokenization`] on the wallets `[wallet]`
+/// builds, keyed by chain.
+type WatchedChainTokenizations =
+    BTreeMap<Chain, ChainTokenization<Arc<dyn Wallet<Provider = RootProvider>>>>;
+
+/// One [`ChainTokenization`] per watched chain. A watched chain without its
+/// own redemption wallet refuses startup naming the chain, rather than
+/// borrowing the primary's: tokens sent to another chain's issuer address
+/// are lost.
+fn build_chain_tokenizations(
+    ctx: &Ctx,
+    wallet_ctx: &OnchainWalletCtx,
+) -> anyhow::Result<WatchedChainTokenizations> {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("tokenization requires Alpaca Broker API configuration");
+    };
+
+    ctx.chains
+        .watched()
+        .map(|watched| {
+            let chain = watched.chain;
+            let wallet = chain_wallet(wallet_ctx, chain).clone();
+            let redemption_wallet = ctx.redemption_wallet(chain)?;
+            let tokenizer: Arc<dyn Tokenizer> = Arc::new(AlpacaTokenizationService::new(
+                alpaca_auth.base_url().to_string(),
+                alpaca_auth.account_id,
+                alpaca_auth.auth.clone(),
+                wallet.clone(),
+                chain,
+                Some(redemption_wallet),
+            )?);
+            let wrapper = build_wrapper(wallet.clone(), watched);
+            let mint_authorizer = build_mint_authorizer(
+                ctx.orchestrator.as_ref().map(|config| &config.addresses),
+                chain,
+                wallet.clone(),
+            );
+            let token_addresses = watched
+                .assets
+                .equities
+                .symbols
+                .iter()
+                .map(|(symbol, equity)| (symbol.clone(), equity.tokenized_equity))
+                .collect();
+
+            Ok((
+                chain,
+                ChainTokenization {
+                    chain,
+                    wallet,
+                    tokenizer,
+                    wrapper,
+                    mint_authorizer,
+                    token_addresses,
+                },
+            ))
+        })
+        .collect()
 }
 
 impl PositionAndRebalancing {
@@ -1873,9 +1960,7 @@ impl PositionAndRebalancing {
         if let Some(rebalancing_ctx) = rebalancing {
             let wallet_ctx = deps.ctx.wallet()?;
             let wallets = ChainWallets::from_wallet_ctx(wallet_ctx);
-            let redemption_wallet = deps
-                .ctx
-                .redemption_wallet(deps.ctx.chains.primary().chain)?;
+            let tokenizations = build_chain_tokenizations(&deps.ctx, wallet_ctx)?;
 
             // Computed before `deps` is moved into the spawn call, since
             // `WalletPollingCtx` below also needs the config behind `deps.ctx`.
@@ -1886,7 +1971,7 @@ impl PositionAndRebalancing {
 
             let infra = spawn_rebalancing_infrastructure(
                 rebalancing_ctx,
-                redemption_wallet,
+                tokenizations,
                 wallets.clone(),
                 deps,
             )
@@ -1952,7 +2037,13 @@ impl PositionAndRebalancing {
             // portfolio-snapshot job still needs a ratio source. Mirrors
             // `grant_startup_token_approvals`'s wallet-presence check.
             let wrapper: Option<Arc<dyn Wrapper>> = match ctx.wallet() {
-                Ok(wallet_ctx) => Some(build_wrapper(wallet_ctx.base_wallet().clone(), &ctx)),
+                Ok(wallet_ctx) => {
+                    let primary = ctx.chains.primary();
+                    Some(build_wrapper(
+                        chain_wallet(wallet_ctx, primary.chain).clone(),
+                        primary,
+                    ))
+                }
                 Err(CtxError::WalletNotConfigured) => None,
                 Err(error) => return Err(error.into()),
             };
@@ -2023,20 +2114,49 @@ struct MintAuthorizationInfra {
     issuance_client: Arc<IssuanceClient>,
 }
 
-/// Builds [`MintAuthorizationInfra`]. The authorizer is `Enabled` only when
-/// `[orchestrator]` is configured: while every asset is vault-direct the bot
-/// deploys dark without the section, and an orchestrator-mode mint reaching
-/// the signing step then fails loudly rather than guessing an address.
+/// The mint authorizer for one watched chain. `Enabled` only with that
+/// chain's `[orchestrator.addresses]` entry: while every asset is vault-direct
+/// the bot deploys dark without the section, and an orchestrator-mode mint
+/// reaching the signing step then fails loudly rather than guessing an
+/// address. A section carrying only other chains' entries leaves this chain
+/// `Disabled` the same way, but warns at startup: the operator explicitly
+/// configured orchestrator mode, and staying silent until the first such
+/// mint stalls would hide the dead config.
+fn build_mint_authorizer<Signer: Wallet + 'static>(
+    addresses: Option<&OrchestratorAddresses>,
+    chain: Chain,
+    wallet: Signer,
+) -> ConfiguredMintAuthorizer {
+    match addresses.map(|addresses| addresses.get(chain)) {
+        Some(Some(orchestrator)) => ConfiguredMintAuthorizer::Enabled(Arc::new(
+            MintAuthorizationService::new(chain, wallet, orchestrator),
+        )),
+        Some(None) => {
+            warn!(
+                %chain,
+                "[orchestrator.addresses] is configured without an entry for \
+                 watched chain {chain}; mint authorization stays disabled there, \
+                 so an orchestrator-mode mint would fail at the signing step"
+            );
+            ConfiguredMintAuthorizer::Disabled
+        }
+        None => ConfiguredMintAuthorizer::Disabled,
+    }
+}
+
+/// Builds [`MintAuthorizationInfra`] around the primary chain's services:
+/// every mint the bot requests today lands there, so the saga signs with
+/// that chain's authorizer and resolves tokens through its table.
 ///
 /// Also runs the queue's orphan sweep for delivery rows a crash caught
 /// mid-run; pending rows stay queued (still-valid work for the persisted
 /// authorization, unlike resume jobs, which startup re-derives). A failed
 /// sweep fails startup -- an unrepaired orphan would read as a live
 /// delivery and suppress resume.
-async fn build_mint_authorization_infra(
+async fn build_mint_authorization_infra<Signer: Wallet>(
     ctx: &Ctx,
     apalis_pool: &apalis_sqlite::SqlitePool,
-    wallet_ctx: &OnchainWalletCtx,
+    primary: &ChainTokenization<Signer>,
 ) -> anyhow::Result<MintAuthorizationInfra> {
     let issuance_client = Arc::new(IssuanceClient::new(
         ctx.issuance.base_url.clone(),
@@ -2062,55 +2182,11 @@ async fn build_mint_authorization_infra(
         );
     }
 
-    let token_addresses = ctx
-        .chains
-        .primary()
-        .assets
-        .equities
-        .symbols
-        .iter()
-        .map(|(symbol, equity)| (symbol.clone(), equity.tokenized_equity))
-        .collect();
-
-    // Every mint the bot requests today lands on the primary chain, so the
-    // authorizer signs with that chain's wallet against that chain's
-    // orchestrator entry. A section carrying only other chains' entries
-    // stays `Disabled` -- an orchestrator-mode mint then fails loudly at
-    // signing rather than borrowing another chain's address -- but warns
-    // here at startup: the operator explicitly configured orchestrator
-    // mode, and staying silent until the first orchestrator-mode mint
-    // stalls would hide the dead config.
-    let chain = ctx.chains.primary().chain;
-    let signing_wallet = match chain {
-        Chain::Base => wallet_ctx.base_wallet(),
-        Chain::Ethereum => wallet_ctx.ethereum_wallet(),
-        Chain::HyperEvm => wallet_ctx.hyperevm_wallet(),
-    };
-    let authorizer = match ctx
-        .orchestrator
-        .as_ref()
-        .map(|config| config.addresses.get(chain))
-    {
-        Some(Some(orchestrator)) => ConfiguredMintAuthorizer::Enabled(Arc::new(
-            MintAuthorizationService::new(chain, signing_wallet.clone(), orchestrator),
-        )),
-        Some(None) => {
-            warn!(
-                %chain,
-                "[orchestrator.addresses] is configured without an entry for \
-                 the primary chain; mint authorization stays disabled, so an \
-                 orchestrator-mode mint would fail at the signing step"
-            );
-            ConfiguredMintAuthorizer::Disabled
-        }
-        None => ConfiguredMintAuthorizer::Disabled,
-    };
-
     Ok(MintAuthorizationInfra {
-        authorizer,
+        authorizer: primary.mint_authorizer.clone(),
         wiring: MintAuthorizationWiring {
             vault_mode_reader: issuance_client.clone(),
-            token_addresses,
+            token_addresses: primary.token_addresses.clone(),
             delivery_queue: queue.clone(),
         },
         queue,
@@ -2210,12 +2286,7 @@ async fn confirm_transport_chain_ids(ctx: &Ctx) -> anyhow::Result<()> {
             continue;
         }
 
-        let signer = match chain {
-            Chain::Base => wallet_ctx.base_wallet(),
-            Chain::Ethereum => wallet_ctx.ethereum_wallet(),
-            Chain::HyperEvm => wallet_ctx.hyperevm_wallet(),
-        };
-        confirm_chain_id(signer.provider(), chain).await?;
+        confirm_chain_id(chain_wallet(wallet_ctx, chain).provider(), chain).await?;
     }
 
     Ok(())
@@ -2593,23 +2664,32 @@ fn build_rebalancing_service(
     ))
 }
 
+/// The rebalancer, the recovery jobs and the resume paths run on the primary
+/// chain's [`ChainTokenization`] until chain selection moves into the global
+/// rebalancer; the other watched chains' services are built and preflighted
+/// so that move is a lookup, not a rewire.
 fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
-    redemption_wallet: Address,
+    tokenizations: BTreeMap<Chain, ChainTokenization<Signer>>,
     wallets: ChainWallets<Signer>,
     deps: RebalancingDeps,
 ) -> Pin<Box<dyn Future<Output = anyhow::Result<RebalancingInfrastructure>> + Send>> {
     let rebalancing_ctx = Arc::new(rebalancing_ctx);
 
     Box::pin(async move {
-        info!("Initializing rebalancing infrastructure");
-
         let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &deps.ctx.broker else {
             anyhow::bail!("rebalancing requires Alpaca Broker API configuration");
         };
 
-        let BaseWallet(base_wallet) = wallets.base();
-        let market_maker_wallet = base_wallet.address();
+        let primary_chain = deps.ctx.chains.primary().chain;
+        let primary = tokenizations.get(&primary_chain).with_context(|| {
+            format!("no tokenization services were built for the primary chain {primary_chain}")
+        })?;
+        info!(
+            chain = %primary.chain,
+            "Initializing rebalancing infrastructure on the primary chain's tokenization services"
+        );
+        let market_maker_wallet = primary.wallet.address();
         let gas_readiness = build_transfer_gas_readiness(&wallets, &deps.ctx)?;
 
         // This function only runs under `TradingMode::Rebalancing`, which
@@ -2632,26 +2712,15 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             build_rebalancing_vault_lookup(&deps.ctx, deps.vault_registry_projection.clone());
 
         let raindex_service =
-            build_rebalancing_raindex_service(base_wallet, &deps.ctx, market_maker_wallet);
+            build_rebalancing_raindex_service(&primary.wallet, &deps.ctx, market_maker_wallet);
 
         preflight_inventory_access(&raindex_service, &deps.ctx).await?;
 
-        let tokenization = Arc::new(AlpacaTokenizationService::new(
-            alpaca_auth.base_url().to_string(),
-            alpaca_auth.account_id,
-            alpaca_auth.auth.clone(),
-            base_wallet.clone(),
-            deps.ctx.chains.primary().chain,
-            Some(redemption_wallet),
-        )?);
-
-        let tokenizer: Arc<dyn Tokenizer> = tokenization;
-
-        let wrapper = build_wrapper(base_wallet.clone(), &deps.ctx);
+        let tokenizer = primary.tokenizer.clone();
+        let wrapper = primary.wrapper.clone();
 
         let mint_authorization =
-            build_mint_authorization_infra(&deps.ctx, &deps.apalis_pool, deps.ctx.wallet()?)
-                .await?;
+            build_mint_authorization_infra(&deps.ctx, &deps.apalis_pool, primary).await?;
 
         let equity_transfer_services = EquityTransferServices {
             raindex: raindex_service.clone(),
@@ -2723,7 +2792,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
                 vault_lookup.clone(),
                 wrapper.clone(),
                 recovery_transfer.clone(),
-                base_wallet.address(),
+                market_maker_wallet,
                 bot_gas_enqueuer.clone(),
             )
             .await?;
@@ -4890,7 +4959,7 @@ mod tests {
 
     use st0x_config::{
         BotGasValuationConfig, ChainAssets, ChainEquities, ChainEquityAsset, ExecutionThreshold,
-        OperationMode, OrchestratorAddresses, OrchestratorConfig, create_test_ctx_with_order_owner,
+        OperationMode, OrchestratorConfig, create_test_ctx_with_order_owner,
         test_issuance_status_ctx,
     };
     use st0x_dto::Statement;
@@ -14234,109 +14303,84 @@ mod tests {
         ctx
     }
 
-    /// Public service construction with an entry for the primary chain
-    /// (Base in this fixture): mint authorization comes up Enabled.
-    #[tokio::test]
-    async fn orchestrator_primary_chain_entry_enables_mint_authorization() {
-        let (_pool, apalis_pool) = setup_test_pools().await;
+    fn mint_authorizer_for(ctx: &Ctx, chain: Chain) -> ConfiguredMintAuthorizer {
+        build_mint_authorizer(
+            ctx.orchestrator.as_ref().map(|config| &config.addresses),
+            chain,
+            chain_wallet(&OnchainWalletCtx::stub(), chain).clone(),
+        )
+    }
+
+    /// A section with an entry for the chain: mint authorization comes up
+    /// Enabled there.
+    #[test]
+    fn orchestrator_chain_entry_enables_mint_authorization() {
         let ctx = ctx_with_orchestrator(Some(OrchestratorAddresses::from_iter([(
             Chain::Base,
             address!("0x4444444444444444444444444444444444444444"),
         )])));
 
-        let infra = build_mint_authorization_infra(&ctx, &apalis_pool, &OnchainWalletCtx::stub())
-            .await
-            .unwrap();
-
         assert!(matches!(
-            infra.authorizer,
+            mint_authorizer_for(&ctx, Chain::Base),
             ConfiguredMintAuthorizer::Enabled(_)
         ));
     }
 
     /// A section carrying only other chains' entries is dead config for
-    /// mint authorization (mints land on the primary chain): public
-    /// construction must leave the authorizer Disabled -- signing fails
-    /// loudly with `NotConfigured` instead of borrowing another chain's
-    /// address -- and must warn at startup rather than staying silent until
-    /// the first orchestrator-mode mint stalls.
+    /// this chain: the authorizer must be Disabled -- signing fails loudly
+    /// with `NotConfigured` instead of borrowing another chain's address --
+    /// and must warn at startup rather than staying silent until the first
+    /// orchestrator-mode mint stalls.
     #[tokio::test]
     #[tracing_test::traced_test]
-    async fn orchestrator_config_without_the_primary_chain_disables_mint_authorization() {
-        let (_pool, apalis_pool) = setup_test_pools().await;
+    async fn orchestrator_config_without_the_chain_disables_mint_authorization() {
         let ctx = ctx_with_orchestrator(Some(OrchestratorAddresses::from_iter([(
             Chain::Ethereum,
             address!("0x5555555555555555555555555555555555555555"),
         )])));
 
-        let infra = build_mint_authorization_infra(&ctx, &apalis_pool, &OnchainWalletCtx::stub())
-            .await
-            .unwrap();
-
-        let error = infra
-            .authorizer
+        let error = mint_authorizer_for(&ctx, Chain::Base)
             .sign(Address::repeat_byte(0x21), float!(1), B256::ZERO)
             .await
             .unwrap_err();
         assert!(matches!(error, MintAuthorizationError::NotConfigured));
         assert!(logs_contain(
-            "[orchestrator.addresses] is configured without an entry for the primary chain"
+            "[orchestrator.addresses] is configured without an entry for watched chain base"
         ));
     }
 
-    /// The entry is resolved for whichever chain is primary, not for Base:
-    /// with Ethereum primary an ethereum-only section enables the
-    /// authorizer, and a base-only section is the dead config.
-    #[tokio::test]
-    async fn orchestrator_entry_follows_the_primary_chain() {
-        let (_pool, apalis_pool) = setup_test_pools().await;
-        let mut ctx = ctx_with_orchestrator(Some(OrchestratorAddresses::from_iter([(
+    /// The entry is resolved for the chain the services are built for, not
+    /// for Base: an ethereum-only section enables Ethereum's authorizer and
+    /// leaves Base's disabled.
+    #[test]
+    fn orchestrator_entry_follows_the_chain() {
+        let ctx = ctx_with_orchestrator(Some(OrchestratorAddresses::from_iter([(
             Chain::Ethereum,
             address!("0x5555555555555555555555555555555555555555"),
         )])));
-        ctx.chains.primary_mut().chain = Chain::Ethereum;
 
-        let infra = build_mint_authorization_infra(&ctx, &apalis_pool, &OnchainWalletCtx::stub())
-            .await
-            .unwrap();
         assert!(matches!(
-            infra.authorizer,
+            mint_authorizer_for(&ctx, Chain::Ethereum),
             ConfiguredMintAuthorizer::Enabled(_)
         ));
-
-        ctx.orchestrator = Some(OrchestratorConfig {
-            addresses: OrchestratorAddresses::from_iter([(
-                Chain::Base,
-                address!("0x4444444444444444444444444444444444444444"),
-            )]),
-        });
-
-        let infra = build_mint_authorization_infra(&ctx, &apalis_pool, &OnchainWalletCtx::stub())
-            .await
-            .unwrap();
         assert!(matches!(
-            infra.authorizer,
+            mint_authorizer_for(&ctx, Chain::Base),
             ConfiguredMintAuthorizer::Disabled
         ));
     }
 
     /// No section at all is the deliberate dark deployment -- Disabled with
     /// no warning.
-    #[tokio::test]
+    #[test]
     #[tracing_test::traced_test]
-    async fn absent_orchestrator_section_disables_mint_authorization_silently() {
-        let (_pool, apalis_pool) = setup_test_pools().await;
+    fn absent_orchestrator_section_disables_mint_authorization_silently() {
         let ctx = ctx_with_orchestrator(None);
 
-        let infra = build_mint_authorization_infra(&ctx, &apalis_pool, &OnchainWalletCtx::stub())
-            .await
-            .unwrap();
-
         assert!(matches!(
-            infra.authorizer,
+            mint_authorizer_for(&ctx, Chain::Base),
             ConfiguredMintAuthorizer::Disabled
         ));
-        assert!(!logs_contain("without an entry for the primary chain"));
+        assert!(!logs_contain("without an entry for watched chain"));
     }
 
     fn alpaca_broker_ctx() -> BrokerCtx {
@@ -14446,7 +14490,9 @@ mod tests {
         ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
         ctx.chains.insert_secondary(ethereum_trading_chain(None));
 
-        let error = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()).unwrap_err();
+        let Err(error) = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()) else {
+            panic!("a watched chain without a redemption wallet must fail startup");
+        };
 
         assert!(matches!(
             error.downcast_ref::<CtxError>(),

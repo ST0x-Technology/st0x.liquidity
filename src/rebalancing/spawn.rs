@@ -72,10 +72,6 @@ pub(crate) struct ChainWallets<Signer> {
 }
 
 impl<Signer> ChainWallets<Signer> {
-    pub(crate) fn base(&self) -> &BaseWallet<Signer> {
-        &self.base
-    }
-
     pub(crate) fn into_parts(self) -> (EthereumWallet<Signer>, BaseWallet<Signer>) {
         (self.ethereum, self.base)
     }
