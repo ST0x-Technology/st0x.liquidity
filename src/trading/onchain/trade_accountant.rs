@@ -122,7 +122,7 @@ where
         let trade_result = match &trade_event.event {
             ClearV3(clear_event) => {
                 OnchainTrade::try_from_clear_v3(
-                    ctx.ctx.chains.sole_trading(),
+                    ctx.ctx.chains.primary(),
                     &ctx.cache,
                     &ctx.evm,
                     *clear_event.clone(),
@@ -134,7 +134,7 @@ where
 
             TakeOrderV3(take_event) => {
                 OnchainTrade::try_from_take_order_if_target_owner(
-                    ctx.ctx.chains.sole_trading().chain,
+                    ctx.ctx.chains.primary().chain,
                     &ctx.cache,
                     &ctx.evm,
                     *take_event.clone(),
@@ -150,11 +150,11 @@ where
                 // `try_from_inventory_trade` uses the log's block number and
                 // fetches receipt metadata only if that number is absent.
                 OnchainTrade::try_from_inventory_trade(
-                    ctx.ctx.chains.sole_trading().chain,
+                    ctx.ctx.chains.primary().chain,
                     &ctx.cache,
                     &ctx.evm,
-                    &ctx.ctx.chains.sole_trading().assets,
-                    &ctx.ctx.chains.sole_trading().inventory_adapters,
+                    &ctx.ctx.chains.primary().assets,
+                    &ctx.ctx.chains.primary().inventory_adapters,
                     inv.as_ref(),
                     reconstructed_log,
                     None,
@@ -331,7 +331,7 @@ where
         let trading_enabled = ctx
             .ctx
             .chains
-            .sole_trading()
+            .primary()
             .assets
             .is_trading_enabled(trade.symbol.base());
 
@@ -845,7 +845,7 @@ mod tests {
             offchain_order,
             order_placer: noop_order_placer(),
             execution_threshold,
-            assets: ctx.chains.sole_trading().assets.clone(),
+            assets: ctx.chains.primary().assets.clone(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
             close_flatten_policy:
                 crate::trading::offchain::close_flatten::CloseFlattenPolicy::from_secs(900).unwrap(),
@@ -860,7 +860,7 @@ mod tests {
         let job_queue = DexTradeAccountingJobQueue::new(apalis_pool);
 
         AccountantCtx {
-            contracts: crate::onchain::raindex_contracts(ctx.chains.sole_trading()),
+            contracts: crate::onchain::raindex_contracts(ctx.chains.primary()),
             ctx,
             cache,
             evm: st0x_evm::ReadOnlyEvm::new(provider),
@@ -1485,7 +1485,7 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
 
         // Trading must be explicitly enabled for COIN: `perform` computes
-        // `trading_enabled` from `ctx.chains.sole_trading().assets.is_trading_enabled`, which
+        // `trading_enabled` from `ctx.chains.primary().assets.is_trading_enabled`, which
         // defaults to disabled for any symbol absent from the config.
         // `tokenized_equity_derivative` must equal the real wtCOIN address
         // used above -- `try_from_inventory_trade` now validates the
@@ -1504,7 +1504,7 @@ mod tests {
                 operational_limit: None,
             },
         );
-        ctx.chains.sole_trading_mut().assets = ChainAssets {
+        ctx.chains.primary_mut().assets = ChainAssets {
             equities: ChainEquities {
                 operational_limit: None,
                 symbols,
@@ -1737,7 +1737,7 @@ mod tests {
                 operational_limit: None,
             },
         );
-        ctx.chains.sole_trading_mut().assets = ChainAssets {
+        ctx.chains.primary_mut().assets = ChainAssets {
             equities: ChainEquities {
                 operational_limit: None,
                 symbols,
@@ -1855,7 +1855,7 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
 
         // Trading must be explicitly enabled for COIN: `perform` computes
-        // `trading_enabled` from `ctx.chains.sole_trading().assets.is_trading_enabled`, which
+        // `trading_enabled` from `ctx.chains.primary().assets.is_trading_enabled`, which
         // defaults to disabled for any symbol absent from the config.
         // `tokenized_equity_derivative` must equal the real wtCOIN address
         // used above -- `try_from_inventory_trade` now validates the
@@ -1874,7 +1874,7 @@ mod tests {
                 operational_limit: None,
             },
         );
-        ctx.chains.sole_trading_mut().assets = ChainAssets {
+        ctx.chains.primary_mut().assets = ChainAssets {
             equities: ChainEquities {
                 operational_limit: None,
                 symbols,

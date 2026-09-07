@@ -847,7 +847,7 @@ impl Conductor {
         crate::offchain::order::JobError: From<E::Error>,
     {
         let (executor, provider, telemetry_writer, telemetry) =
-            setup_instrumentation(executor_ctx, ctx.chains.sole_trading(), pool.clone()).await?;
+            setup_instrumentation(executor_ctx, ctx.chains.primary(), pool.clone()).await?;
 
         startup_smoke_checks(&executor, &provider, &ctx).await?;
         let cache = SymbolCache::default();
@@ -1391,22 +1391,18 @@ fn build_record_bot_gas_receipt_cost_ctx(
 }
 
 fn base_wallet_equity_recovery_enabled(ctx: &Ctx, symbol: &Symbol) -> bool {
-    ctx.chains.sole_trading().assets.is_trading_enabled(symbol)
+    ctx.chains.primary().assets.is_trading_enabled(symbol)
+        || ctx.chains.primary().assets.is_rebalancing_enabled(symbol)
         || ctx
             .chains
-            .sole_trading()
-            .assets
-            .is_rebalancing_enabled(symbol)
-        || ctx
-            .chains
-            .sole_trading()
+            .primary()
             .assets
             .is_wrapped_equity_recovery_enabled(symbol)
 }
 
 fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
     ctx.chains
-        .sole_trading()
+        .primary()
         .assets
         .equities
         .symbols
@@ -1418,7 +1414,7 @@ fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Ad
 
 fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
     ctx.chains
-        .sole_trading()
+        .primary()
         .assets
         .equities
         .symbols
@@ -1450,8 +1446,8 @@ async fn grant_startup_token_approvals(ctx: &Ctx) -> anyhow::Result<()> {
     };
 
     let targets = build_approval_targets(
-        &ctx.chains.sole_trading().assets,
-        ctx.chains.sole_trading().orderbook,
+        &ctx.chains.primary().assets,
+        ctx.chains.primary().orderbook,
         USDC_BASE,
     );
 
@@ -1754,7 +1750,7 @@ fn build_wrapper<Signer: Wallet + Clone>(
 ) -> Arc<WrapperService<Signer>> {
     Arc::new(WrapperService::new(
         base_wallet,
-        to_wrapped_equities(&ctx.chains.sole_trading().assets.equities.symbols),
+        to_wrapped_equities(&ctx.chains.primary().assets.equities.symbols),
     ))
 }
 
@@ -2010,7 +2006,7 @@ where
 
     let token_addresses = ctx
         .chains
-        .sole_trading()
+        .primary()
         .assets
         .equities
         .symbols
@@ -2110,7 +2106,7 @@ fn build_rebalancing_raindex_service<Signer: Wallet + Clone>(
 ) -> Arc<RaindexService<Signer>> {
     Arc::new(RaindexService::new(
         base_wallet.clone(),
-        crate::onchain::raindex_contracts(ctx.chains.sole_trading()),
+        crate::onchain::raindex_contracts(ctx.chains.primary()),
         market_maker_wallet,
     ))
 }
@@ -2146,7 +2142,7 @@ async fn confirm_transport_chain_ids(ctx: &Ctx) -> anyhow::Result<()> {
     };
 
     for chain in Chain::ALL {
-        if chain == ctx.chains.sole_trading().chain || ctx.chains.rpc_url(chain).is_none() {
+        if chain == ctx.chains.primary().chain || ctx.chains.rpc_url(chain).is_none() {
             continue;
         }
 
@@ -2174,7 +2170,7 @@ where
     E: Executor,
     P: Provider + Clone + 'static,
 {
-    let trading_chain = ctx.chains.sole_trading();
+    let trading_chain = ctx.chains.primary();
 
     // The HTTP transport connects lazily, so reach the RPC once to fail fast
     // on a misconfigured or unreachable endpoint rather than only surfacing
@@ -2287,7 +2283,7 @@ async fn preflight_inventory_access<Signer: Wallet + Clone>(
     raindex_service: &RaindexService<Signer>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let InventoryMode::Managed { inventory } = ctx.chains.sole_trading().inventory else {
+    let InventoryMode::Managed { inventory } = ctx.chains.primary().inventory else {
         debug!(
             target: "inventory",
             "legacy inventory mode; skipping OPERATOR_ROLE preflight (no distinct inventory in play)",
@@ -2321,7 +2317,7 @@ async fn revoke_stale_orderbook_allowances<Signer: Wallet + Clone>(
 ) {
     let revoke_tokens = std::iter::once(st0x_evm::USDC_BASE).chain(
         ctx.chains
-            .sole_trading()
+            .primary()
             .assets
             .equities
             .symbols
@@ -2458,7 +2454,7 @@ fn build_rebalancing_vault_lookup(
     // The (orderbook, vault-owner) pair keys both the vault-registry lookup
     // and the rebalancing service's registry reads.
     let registry_id = VaultRegistryId {
-        orderbook: ctx.chains.sole_trading().orderbook,
+        orderbook: ctx.chains.primary().orderbook,
         owner: ctx.vault_owner(),
     };
     let lookup = Arc::new(VaultRegistryLookup::new(projection, registry_id.clone()));
@@ -2495,7 +2491,7 @@ fn build_rebalancing_service(
             equity: rebalancing_ctx.equity,
             usdc: rebalancing_ctx.usdc,
             transfer_timeout: rebalancing_ctx.transfer_timeout,
-            assets: deps.ctx.chains.sole_trading().assets.clone(),
+            assets: deps.ctx.chains.primary().assets.clone(),
             cash_reserved: deps.ctx.assets.cash.as_ref().map(|cash| cash.reserved),
         },
         deps.vault_registry.clone(),
@@ -2663,7 +2659,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             wallets,
             raindex_service,
             &rebalancing_ctx,
-            deps.ctx.chains.sole_trading().required_confirmations,
+            deps.ctx.chains.primary().required_confirmations,
             cash.map(|cash| cash.reserved).map(Positive::inner),
             deps.telemetry.clone(),
         )
@@ -2672,7 +2668,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let usdc_vault_id = deps
             .ctx
             .chains
-            .sole_trading()
+            .primary()
             .assets
             .cash
             .as_ref()
@@ -2713,7 +2709,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             transfer: recovery_transfer.clone(),
             equity_in_progress: rebalancing_service.equity_in_progress.clone(),
             mint_store: built.mint.clone(),
-            equities_config: deps.ctx.chains.sole_trading().assets.equities.clone(),
+            equities_config: deps.ctx.chains.primary().assets.equities.clone(),
             job_queue: transfer_equity_to_market_making_queue,
         });
 
@@ -4861,7 +4857,7 @@ mod tests {
     fn trading_chain_with_equity(symbol: &str, token: Address) -> TradingChain {
         let mut trading = create_test_ctx_with_order_owner(Address::ZERO)
             .chains
-            .sole_trading()
+            .primary()
             .clone();
         trading.assets = ChainAssets {
             equities: ChainEquities {
@@ -4939,7 +4935,7 @@ mod tests {
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
         let trading = create_test_ctx_with_order_owner(Address::ZERO)
             .chains
-            .sole_trading()
+            .primary()
             .clone();
 
         confirm_configured_asset_responds(&provider, &trading)
@@ -5069,7 +5065,7 @@ mod tests {
         // preflight tried to read OPERATOR_ROLE / hasRole, the mock would error.
         let service = mock_wallet_raindex_service(Asserter::new());
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.chains.sole_trading_mut().inventory = InventoryMode::Legacy;
+        ctx.chains.primary_mut().inventory = InventoryMode::Legacy;
 
         preflight_inventory_access(&service, &ctx)
             .await
@@ -5085,7 +5081,7 @@ mod tests {
         // covered by the RaindexService::verify_operator_role unit tests.
         let service = mock_wallet_raindex_service(Asserter::new());
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.chains.sole_trading_mut().inventory = InventoryMode::Managed {
+        ctx.chains.primary_mut().inventory = InventoryMode::Managed {
             inventory: Address::repeat_byte(0xAA),
         };
 
@@ -6857,7 +6853,7 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
-        ctx.chains.sole_trading_mut().assets = ChainAssets {
+        ctx.chains.primary_mut().assets = ChainAssets {
             equities: ChainEquities {
                 symbols,
                 operational_limit: None,
@@ -6945,7 +6941,7 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
-        ctx.chains.sole_trading_mut().assets = ChainAssets {
+        ctx.chains.primary_mut().assets = ChainAssets {
             equities: ChainEquities {
                 symbols,
                 operational_limit: None,

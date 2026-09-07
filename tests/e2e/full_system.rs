@@ -566,6 +566,8 @@ inventory_adapters = []
 vault_owner = "{owner}"
 deployment_block = {current_block}
 ingestion_cutoff = "safe"
+order_fill_poll_interval_secs = 1
+primary = true
 redemption_wallet = "{redemption_wallet}"
 
 [chains.ethereum]
