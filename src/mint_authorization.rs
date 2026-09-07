@@ -21,7 +21,7 @@ use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use st0x_evm::{EvmError, NoOpErrorRegistry, Wallet};
+use st0x_evm::{Chain, EvmError, NoOpErrorRegistry, Wallet};
 use st0x_execution::Symbol;
 use st0x_issuance_client::{ClientError, IssuanceClient};
 use st0x_issuance_dto::{MintAuthorizationRequest, UnderlyingSymbol, VaultModeTag};
@@ -50,10 +50,10 @@ pub struct SignedMintAuthorization {
 /// Mint-authorizer handle for the mint aggregate's services.
 ///
 /// `Disabled` when the config has no `[orchestrator.addresses]` entry for
-/// Base (the chain every tokenized equity the bot mints lives on) -- the
-/// bot runs dark while every asset is vault-direct, and an
-/// orchestrator-mode mint reaching the signing step then fails loudly
-/// rather than guessing an address. Mirrors `BotGasReceiptCostEnqueuer`'s
+/// the chain the mint lands on -- the bot runs dark while every asset is
+/// vault-direct, and an orchestrator-mode mint reaching the signing step
+/// then fails loudly rather than guessing an address or borrowing another
+/// chain's deployment. Mirrors `BotGasReceiptCostEnqueuer`'s
 /// explicit-absence shape.
 #[derive(Clone)]
 pub enum ConfiguredMintAuthorizer {
@@ -127,13 +127,12 @@ pub enum MintAuthorizationError {
     #[error(transparent)]
     Evm(#[from] EvmError),
     /// An orchestrator-mode mint reached the signing step but the config
-    /// has no `[orchestrator.addresses]` entry for Base -- the chain every
-    /// tokenized equity the bot mints lives on. Fails loudly instead of
-    /// guessing an address (or another chain's address); the mint stays
-    /// `MintAccepted` and resumes once configured.
+    /// has no `[orchestrator.addresses]` entry for the chain the mint lands
+    /// on. Fails loudly instead of guessing an address (or another chain's
+    /// address); the mint stays `MintAccepted` and resumes once configured.
     #[error(
-        "orchestrator-mode mint requires an [orchestrator.addresses] base \
-         entry; the mint authorizer is disabled"
+        "orchestrator-mode mint requires an [orchestrator.addresses] entry \
+         for the mint's chain; the mint authorizer is disabled"
     )]
     NotConfigured,
     /// Our locally declared `MintAuth` struct hashes to a different
@@ -184,22 +183,36 @@ pub enum MintAuthorizationError {
          foreign chain"
     )]
     ChainIdDiverged { reported: U256, rpc: u64 },
+    /// The serving RPC's `eth_chainId` is not the chain this service was
+    /// configured for. The domain check above only proves the contract and
+    /// the RPC agree with each other; a mis-pointed endpoint fronting a
+    /// faithful deployment on another network passes it, and this is what
+    /// refuses to sign for a chain the operator never named.
+    #[error(
+        "the serving RPC's eth_chainId is {rpc} but the mint authorizer is \
+         configured for {configured} (chain id {}); refusing to sign for \
+         another chain",
+        configured.chain_id()
+    )]
+    RpcChainDiverged { configured: Chain, rpc: u64 },
     /// The typed-data payload could not be serialized for the signing
     /// backend.
     #[error("failed to serialize the MintAuth typed-data payload: {0}")]
     PayloadSerialization(#[from] serde_json::Error),
 }
 
-/// [`MintAuthorizer`] backed by the configured orchestrator contract and
-/// this bot's signing wallet.
+/// [`MintAuthorizer`] backed by the configured orchestrator contract on
+/// `chain` and this bot's signing wallet for that chain.
 pub struct MintAuthorizationService<SigningWallet: Wallet> {
+    chain: Chain,
     wallet: SigningWallet,
     orchestrator: Address,
 }
 
 impl<SigningWallet: Wallet> MintAuthorizationService<SigningWallet> {
-    pub const fn new(wallet: SigningWallet, orchestrator: Address) -> Self {
+    pub const fn new(chain: Chain, wallet: SigningWallet, orchestrator: Address) -> Self {
         Self {
+            chain,
             wallet,
             orchestrator,
         }
@@ -274,6 +287,15 @@ impl<SigningWallet: Wallet + Sync> MintAuthorizer for MintAuthorizationService<S
         if reported.chainId != U256::from(rpc_chain_id) {
             return Err(MintAuthorizationError::ChainIdDiverged {
                 reported: reported.chainId,
+                rpc: rpc_chain_id,
+            });
+        }
+
+        // The domain and the RPC agreeing only proves they describe the
+        // same network; the configured chain is what the operator meant.
+        if rpc_chain_id != self.chain.chain_id() {
+            return Err(MintAuthorizationError::RpcChainDiverged {
+                configured: self.chain,
                 rpc: rpc_chain_id,
             });
         }
@@ -532,7 +554,6 @@ mod tests {
     use serde_json::json;
     use url::Url;
 
-    use st0x_evm::Chain;
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_float_macro::float;
 
@@ -801,7 +822,7 @@ mod tests {
             })
             .await;
 
-        let service = MintAuthorizationService::new(wallet, ORCHESTRATOR);
+        let service = MintAuthorizationService::new(Chain::Base, wallet, ORCHESTRATOR);
 
         let authorization = service
             .sign_mint_authorization(TOKEN, float!(50), NONCE)
@@ -832,7 +853,7 @@ mod tests {
         let private_key =
             b256!("0x4242424242424242424242424242424242424242424242424242424242424242");
         let wallet = RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
-        let service = MintAuthorizationService::new(wallet, ORCHESTRATOR);
+        let service = MintAuthorizationService::new(Chain::Base, wallet, ORCHESTRATOR);
 
         let error = service
             .sign_mint_authorization(TOKEN, float!(50), NONCE)
@@ -869,7 +890,7 @@ mod tests {
         let private_key =
             b256!("0x4242424242424242424242424242424242424242424242424242424242424242");
         let wallet = RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
-        let service = MintAuthorizationService::new(wallet, ORCHESTRATOR);
+        let service = MintAuthorizationService::new(Chain::Base, wallet, ORCHESTRATOR);
 
         let error = service
             .sign_mint_authorization(TOKEN, float!(50), NONCE)
@@ -911,7 +932,7 @@ mod tests {
         let private_key =
             b256!("0x4242424242424242424242424242424242424242424242424242424242424242");
         let wallet = RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
-        let service = MintAuthorizationService::new(wallet, ORCHESTRATOR);
+        let service = MintAuthorizationService::new(Chain::Base, wallet, ORCHESTRATOR);
 
         let error = service
             .sign_mint_authorization(TOKEN, float!(50), NONCE)
@@ -946,7 +967,7 @@ mod tests {
         let private_key =
             b256!("0x4242424242424242424242424242424242424242424242424242424242424242");
         let wallet = RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
-        let service = MintAuthorizationService::new(wallet, ORCHESTRATOR);
+        let service = MintAuthorizationService::new(Chain::Base, wallet, ORCHESTRATOR);
 
         let error = service
             .sign_mint_authorization(TOKEN, float!(50), NONCE)
@@ -1027,7 +1048,7 @@ mod tests {
         let private_key =
             b256!("0x4242424242424242424242424242424242424242424242424242424242424242");
         let wallet = RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
-        let service = MintAuthorizationService::new(wallet, ORCHESTRATOR);
+        let service = MintAuthorizationService::new(Chain::Base, wallet, ORCHESTRATOR);
 
         let error = service
             .sign_mint_authorization(TOKEN, float!(50), NONCE)
@@ -1053,7 +1074,7 @@ mod tests {
             b256!("0x4242424242424242424242424242424242424242424242424242424242424242");
         let wallet = RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
 
-        let service = MintAuthorizationService::new(wallet, ORCHESTRATOR);
+        let service = MintAuthorizationService::new(Chain::Base, wallet, ORCHESTRATOR);
 
         let error = service
             .sign_mint_authorization(TOKEN, float!(0.0000000000000000001), NONCE)

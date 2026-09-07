@@ -39,7 +39,7 @@ use url::Url;
 
 use st0x_config::{
     BrokerCtx, ChainAssets, Ctx, CtxError, ExecutionThreshold, HedgingAssets, InventoryMode,
-    IssuanceStatusCtx, OperationMode, RebalancingCtx, TradingChain,
+    IssuanceStatusCtx, OnchainWalletCtx, OperationMode, RebalancingCtx, TradingChain,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
@@ -2031,14 +2031,11 @@ struct MintAuthorizationInfra {
 /// authorization, unlike resume jobs, which startup re-derives). A failed
 /// sweep fails startup -- an unrepaired orphan would read as a live
 /// delivery and suppress resume.
-async fn build_mint_authorization_infra<Signer>(
+async fn build_mint_authorization_infra(
     ctx: &Ctx,
     apalis_pool: &apalis_sqlite::SqlitePool,
-    base_wallet: &Signer,
-) -> anyhow::Result<MintAuthorizationInfra>
-where
-    Signer: Wallet + Clone + Send + Sync + 'static,
-{
+    wallet_ctx: &OnchainWalletCtx,
+) -> anyhow::Result<MintAuthorizationInfra> {
     let issuance_client = Arc::new(IssuanceClient::new(
         ctx.issuance.base_url.clone(),
         ctx.issuance.api_key.header_value(),
@@ -2073,28 +2070,34 @@ where
         .map(|(symbol, equity)| (symbol.clone(), equity.tokenized_equity))
         .collect();
 
-    // Base-scoped: every tokenized equity the bot mints lives on Base (the
-    // assets config carries no network dimension), so the authorizer signs
-    // with the Base wallet against the Base orchestrator entry. A section
-    // carrying only other networks' entries stays `Disabled` -- an
-    // orchestrator-mode mint then fails loudly at signing rather than
-    // guessing another chain's address -- but warns here at startup: the
-    // operator explicitly configured orchestrator mode, and staying silent
-    // until the first orchestrator-mode mint stalls would hide the dead
-    // config.
+    // Every mint the bot requests today lands on the primary chain, so the
+    // authorizer signs with that chain's wallet against that chain's
+    // orchestrator entry. A section carrying only other chains' entries
+    // stays `Disabled` -- an orchestrator-mode mint then fails loudly at
+    // signing rather than borrowing another chain's address -- but warns
+    // here at startup: the operator explicitly configured orchestrator
+    // mode, and staying silent until the first orchestrator-mode mint
+    // stalls would hide the dead config.
+    let chain = ctx.chains.primary().chain;
+    let signing_wallet = match chain {
+        Chain::Base => wallet_ctx.base_wallet(),
+        Chain::Ethereum => wallet_ctx.ethereum_wallet(),
+        Chain::HyperEvm => wallet_ctx.hyperevm_wallet(),
+    };
     let authorizer = match ctx
         .orchestrator
         .as_ref()
-        .map(|config| config.addresses.get(Chain::Base))
+        .map(|config| config.addresses.get(chain))
     {
-        Some(Some(base_orchestrator)) => ConfiguredMintAuthorizer::Enabled(Arc::new(
-            MintAuthorizationService::new(base_wallet.clone(), base_orchestrator),
+        Some(Some(orchestrator)) => ConfiguredMintAuthorizer::Enabled(Arc::new(
+            MintAuthorizationService::new(chain, signing_wallet.clone(), orchestrator),
         )),
         Some(None) => {
             warn!(
-                "[orchestrator.addresses] is configured without a base entry; \
-                 mint authorization stays disabled (mints are Base-only), so \
-                 an orchestrator-mode mint would fail at the signing step"
+                %chain,
+                "[orchestrator.addresses] is configured without an entry for \
+                 the primary chain; mint authorization stays disabled, so an \
+                 orchestrator-mode mint would fail at the signing step"
             );
             ConfiguredMintAuthorizer::Disabled
         }
@@ -2645,7 +2648,8 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let wrapper = build_wrapper(base_wallet.clone(), &deps.ctx);
 
         let mint_authorization =
-            build_mint_authorization_infra(&deps.ctx, &deps.apalis_pool, base_wallet).await?;
+            build_mint_authorization_infra(&deps.ctx, &deps.apalis_pool, deps.ctx.wallet()?)
+                .await?;
 
         let equity_transfer_services = EquityTransferServices {
             raindex: raindex_service.clone(),
@@ -4868,7 +4872,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, TxHash, U256, address, b256, bytes, fixed_bytes};
+    use alloy::primitives::{Address, B256, TxHash, U256, address, bytes, fixed_bytes};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use apalis::prelude::Status;
@@ -14220,40 +14224,25 @@ mod tests {
         assert_eq!(result.chainlink_feed, chainlink_feed);
     }
 
-    /// A wallet whose provider never answers -- mint-authorization
-    /// construction performs no chain reads, so the tests below only need
-    /// a well-formed wallet identity.
-    fn mint_authorization_test_wallet()
-    -> RawPrivateKeyWallet<impl alloy::providers::Provider + Clone> {
-        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
-        RawPrivateKeyWallet::new(
-            &b256!("0x4242424242424242424242424242424242424242424242424242424242424242"),
-            provider,
-            1,
-        )
-        .unwrap()
-    }
-
     fn ctx_with_orchestrator(addresses: Option<OrchestratorAddresses>) -> Ctx {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.orchestrator = addresses.map(|addresses| OrchestratorConfig { addresses });
         ctx
     }
 
-    /// Public service construction with a base entry: mint authorization
-    /// comes up Enabled.
+    /// Public service construction with an entry for the primary chain
+    /// (Base in this fixture): mint authorization comes up Enabled.
     #[tokio::test]
-    async fn orchestrator_base_entry_enables_mint_authorization() {
+    async fn orchestrator_primary_chain_entry_enables_mint_authorization() {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let ctx = ctx_with_orchestrator(Some(OrchestratorAddresses::from_iter([(
             Chain::Base,
             address!("0x4444444444444444444444444444444444444444"),
         )])));
 
-        let infra =
-            build_mint_authorization_infra(&ctx, &apalis_pool, &mint_authorization_test_wallet())
-                .await
-                .unwrap();
+        let infra = build_mint_authorization_infra(&ctx, &apalis_pool, &OnchainWalletCtx::stub())
+            .await
+            .unwrap();
 
         assert!(matches!(
             infra.authorizer,
@@ -14261,25 +14250,24 @@ mod tests {
         ));
     }
 
-    /// A section carrying only other networks' entries is dead config for
-    /// mint authorization (mints are Base-only): public construction must
-    /// leave the authorizer Disabled -- signing fails loudly with
-    /// `NotConfigured` instead of guessing another chain's address -- and
-    /// must warn at startup rather than staying silent until the first
-    /// orchestrator-mode mint stalls.
+    /// A section carrying only other chains' entries is dead config for
+    /// mint authorization (mints land on the primary chain): public
+    /// construction must leave the authorizer Disabled -- signing fails
+    /// loudly with `NotConfigured` instead of borrowing another chain's
+    /// address -- and must warn at startup rather than staying silent until
+    /// the first orchestrator-mode mint stalls.
     #[tokio::test]
     #[tracing_test::traced_test]
-    async fn ethereum_only_orchestrator_config_disables_mint_authorization() {
+    async fn orchestrator_config_without_the_primary_chain_disables_mint_authorization() {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let ctx = ctx_with_orchestrator(Some(OrchestratorAddresses::from_iter([(
             Chain::Ethereum,
             address!("0x5555555555555555555555555555555555555555"),
         )])));
 
-        let infra =
-            build_mint_authorization_infra(&ctx, &apalis_pool, &mint_authorization_test_wallet())
-                .await
-                .unwrap();
+        let infra = build_mint_authorization_infra(&ctx, &apalis_pool, &OnchainWalletCtx::stub())
+            .await
+            .unwrap();
 
         let error = infra
             .authorizer
@@ -14288,7 +14276,43 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, MintAuthorizationError::NotConfigured));
         assert!(logs_contain(
-            "[orchestrator.addresses] is configured without a base entry"
+            "[orchestrator.addresses] is configured without an entry for the primary chain"
+        ));
+    }
+
+    /// The entry is resolved for whichever chain is primary, not for Base:
+    /// with Ethereum primary an ethereum-only section enables the
+    /// authorizer, and a base-only section is the dead config.
+    #[tokio::test]
+    async fn orchestrator_entry_follows_the_primary_chain() {
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let mut ctx = ctx_with_orchestrator(Some(OrchestratorAddresses::from_iter([(
+            Chain::Ethereum,
+            address!("0x5555555555555555555555555555555555555555"),
+        )])));
+        ctx.chains.primary_mut().chain = Chain::Ethereum;
+
+        let infra = build_mint_authorization_infra(&ctx, &apalis_pool, &OnchainWalletCtx::stub())
+            .await
+            .unwrap();
+        assert!(matches!(
+            infra.authorizer,
+            ConfiguredMintAuthorizer::Enabled(_)
+        ));
+
+        ctx.orchestrator = Some(OrchestratorConfig {
+            addresses: OrchestratorAddresses::from_iter([(
+                Chain::Base,
+                address!("0x4444444444444444444444444444444444444444"),
+            )]),
+        });
+
+        let infra = build_mint_authorization_infra(&ctx, &apalis_pool, &OnchainWalletCtx::stub())
+            .await
+            .unwrap();
+        assert!(matches!(
+            infra.authorizer,
+            ConfiguredMintAuthorizer::Disabled
         ));
     }
 
@@ -14300,15 +14324,14 @@ mod tests {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let ctx = ctx_with_orchestrator(None);
 
-        let infra =
-            build_mint_authorization_infra(&ctx, &apalis_pool, &mint_authorization_test_wallet())
-                .await
-                .unwrap();
+        let infra = build_mint_authorization_infra(&ctx, &apalis_pool, &OnchainWalletCtx::stub())
+            .await
+            .unwrap();
 
         assert!(matches!(
             infra.authorizer,
             ConfiguredMintAuthorizer::Disabled
         ));
-        assert!(!logs_contain("without a base entry"));
+        assert!(!logs_contain("without an entry for the primary chain"));
     }
 }
