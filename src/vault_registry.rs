@@ -854,6 +854,14 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
+            "INSERT INTO snapshots (aggregate_type, aggregate_id, last_sequence, payload, \
+             timestamp) VALUES ('VaultRegistry', ?1, 1, '{}', '2026-01-01T00:00:00Z')",
+        )
+        .bind(&legacy_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
             "INSERT INTO vault_registry_view (view_id, version, payload) VALUES (?1, 1, '{}')",
         )
         .bind(&legacy_id)
@@ -867,20 +875,28 @@ mod tests {
         sqlx::raw_sql(migration).execute(&pool).await.unwrap();
         sqlx::raw_sql(migration).execute(&pool).await.unwrap();
 
-        let (aggregate_id,): (String,) = sqlx::query_as(
-            "SELECT aggregate_id FROM events WHERE aggregate_type = 'VaultRegistry'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            aggregate_id.parse::<VaultRegistryId>().unwrap(),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_OWNER,
-            }
-        );
+        let upgraded_id = VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_OWNER,
+        };
+        for (table, query) in [
+            (
+                "events",
+                "SELECT aggregate_id FROM events WHERE aggregate_type = 'VaultRegistry'",
+            ),
+            (
+                "snapshots",
+                "SELECT aggregate_id FROM snapshots WHERE aggregate_type = 'VaultRegistry'",
+            ),
+        ] {
+            let (aggregate_id,): (String,) = sqlx::query_as(query).fetch_one(&pool).await.unwrap();
+            assert_eq!(
+                aggregate_id.parse::<VaultRegistryId>().unwrap(),
+                upgraded_id,
+                "{table} row must carry the chain-qualified id"
+            );
+        }
 
         let (legacy_view_rows,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM vault_registry_view WHERE view_id LIKE '0x%'")
