@@ -1762,6 +1762,36 @@ mod tests {
         );
     }
 
+    /// The seed keys the registry on the primary chain, so readers that look
+    /// it up by `primary().chain` find what it wrote when the primary is not
+    /// Base.
+    #[tokio::test]
+    async fn seed_keys_the_registry_on_the_primary_chain() {
+        let pool = setup_test_db().await;
+        let mut ctx = ctx_with_seeded_assets();
+        ctx.chains.primary_mut().chain = st0x_evm::Chain::Ethereum;
+        let seed_ctx = seed_ctx_from(pool, &ctx).await;
+
+        SeedVaultRegistry.perform(&seed_ctx).await.unwrap();
+
+        let primary = ctx.chains.primary();
+        let registry = loaded_registry(
+            &seed_ctx.vault_registry,
+            &VaultRegistryId {
+                chain: primary.chain,
+                orderbook: primary.orderbook,
+                owner: ctx.vault_owner(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            registry.primary_usdc_vault_id(),
+            Some(test_usdc_vault_id()),
+            "the seeded registry must be readable under the primary chain's id",
+        );
+    }
+
     #[tokio::test]
     async fn perform_reasserts_configured_equity_primary_after_vault_id_change() {
         let pool = setup_test_db().await;
