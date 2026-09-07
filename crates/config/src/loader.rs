@@ -219,6 +219,7 @@ struct Config {
     position_check_interval: Option<u64>,
     inventory_poll_interval: Option<u64>,
     inventory_divergence_threshold: NonZeroU32,
+    #[serde(default = "default_hedge_order_gate_reconciliation_timeout_secs")]
     hedge_order_gate_reconciliation_timeout_secs: NonZeroU64,
     order_fill_poll_interval: Option<u64>,
     apalis_finished_job_cleanup_interval_secs: u64,
@@ -241,6 +242,10 @@ struct Config {
     /// Per-network ST0xOrchestrator contract addresses. See
     /// [`Ctx::orchestrator`].
     orchestrator: Option<OrchestratorConfig>,
+}
+
+fn default_hedge_order_gate_reconciliation_timeout_secs() -> NonZeroU64 {
+    const { NonZeroU64::new(10).unwrap() }
 }
 
 /// Plaintext REST API settings (URL only). Credentials live in secrets.
@@ -705,7 +710,7 @@ pub struct Ctx {
     pub inventory_divergence_threshold: NonZeroU32,
     /// Maximum duration (seconds) the inventory poller may wait for durable
     /// Position state while holding the inventory write lock to reconcile
-    /// hedge-order gates. Required and nonzero.
+    /// hedge-order gates. Nonzero; defaults to 10 when the config omits it.
     pub hedge_order_gate_reconciliation_timeout_secs: NonZeroU64,
     /// Interval (seconds) between continuous `eth_getLogs` polls for orderbook
     /// fills. Each tick enqueues a backfill range over the unprocessed blocks
@@ -4070,9 +4075,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn hedge_order_gate_reconciliation_timeout_is_required() {
-        let config = toml_file(
+    #[test]
+    fn hedge_order_gate_reconciliation_timeout_defaults() {
+        let config: Config = toml::from_str(
             r#"
             database_url = ":memory:"
             server_port = 8080
@@ -4080,36 +4085,14 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
 
-            [assets.equities]
-            retired_symbols = []
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            inventory_mode = "managed"
-            inventory_adapters = []
-            inventory = "0x2222222222222222222222222222222222222222"
-            vault_owner = "0x3333333333333333333333333333333333333333"
-            deployment_block = 1
-            required_confirmations = 3
-            ingestion_cutoff = "safe"
+            [chains]
         "#,
-        );
-        let secrets = dry_run_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap_err();
+        )
+        .unwrap();
 
-        assert!(
-            matches!(error, CtxError::ConfigToml { .. }),
-            "expected config parse failure for missing reconciliation timeout, got: {error:#}"
-        );
-
-        let source = std::error::Error::source(&error).unwrap();
-        let source_display = source.to_string();
-        assert!(
-            source_display.contains("hedge_order_gate_reconciliation_timeout_secs"),
-            "expected parse error to mention the reconciliation timeout field, got: \
-             {source_display}"
+        assert_eq!(
+            config.hedge_order_gate_reconciliation_timeout_secs,
+            NonZeroU64::new(10).unwrap()
         );
     }
 
@@ -8698,7 +8681,7 @@ mod tests {
         let stripped = String::from_utf8(minimal_config_toml_bytes().to_vec())
             .unwrap()
             .lines()
-            .filter(|line| !line.contains("hedge_order_gate_reconciliation_timeout_secs"))
+            .filter(|line| !line.contains("inventory_divergence_threshold"))
             .collect::<Vec<_>>()
             .join("\n");
         let mut file = NamedTempFile::new().unwrap();
