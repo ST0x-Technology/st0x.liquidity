@@ -603,7 +603,7 @@ impl SeedVaultRegistryCtx {
         }
 
         let id = VaultRegistryId {
-            chain: st0x_evm::Chain::Base,
+            chain: ctx.chains.primary().chain,
             orderbook: ctx.chains.primary().orderbook,
             owner: ctx.vault_owner(),
         };
