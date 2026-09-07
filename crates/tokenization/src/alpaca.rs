@@ -3550,6 +3550,80 @@ pub(crate) mod tests {
         pending_mock.assert();
     }
 
+    /// The pending list feeds inflight-equity reconciliation, so an entry the
+    /// issuer reports without a network must still count rather than vanish
+    /// as a "malformed" row.
+    #[tokio::test]
+    async fn list_pending_requests_keeps_an_entry_that_omits_network() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let service =
+            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let with_network = sample_tokenization_request_json("req_1", "mint", "AAPL");
+        let mut without_network = sample_tokenization_request_json("req_2", "redeem", "TSLA");
+        without_network.as_object_mut().unwrap().remove("network");
+
+        let pending_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(tokenization_requests_path())
+                .query_param("status", "pending");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([with_network, without_network]));
+        });
+
+        let result = service.list_pending_requests().await.unwrap();
+
+        assert_eq!(
+            result
+                .iter()
+                .map(|request| request.id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                tokenization_request_id("req_1"),
+                tokenization_request_id("req_2")
+            ],
+            "an entry without a network must not be dropped from the pending list"
+        );
+        assert_eq!(result[1].network, None);
+        pending_mock.assert();
+    }
+
+    /// Acting on a single request needs its network: one the issuer reports
+    /// without it is refused by name, never assumed to be ours.
+    #[tokio::test]
+    async fn get_request_refuses_an_entry_that_omits_network() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let service =
+            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let mut without_network = sample_tokenization_request_json("req_1", "mint", "AAPL");
+        without_network.as_object_mut().unwrap().remove("network");
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET).path(tokenization_requests_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([without_network]));
+        });
+
+        let error = Tokenizer::get_request(&service, &tokenization_request_id("req_1"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                TokenizerError::Alpaca(AlpacaTokenizationError::NetworkMissing { ref id })
+                    if *id == tokenization_request_id("req_1")
+            ),
+            "expected NetworkMissing, got {error:?}"
+        );
+        list_mock.assert();
+    }
+
     #[tokio::test]
     async fn list_pending_requests_filters_non_pending_from_response() {
         let server = MockServer::start();
