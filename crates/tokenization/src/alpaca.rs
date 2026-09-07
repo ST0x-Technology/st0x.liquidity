@@ -318,8 +318,12 @@ pub struct TokenizationRequest {
     pub quantity: FractionalShares,
     #[serde(rename = "wallet_address")]
     pub wallet: Option<Address>,
-    /// The chain the request settles on, as the issuer names it.
-    pub network: Network,
+    /// The chain the request settles on, as the issuer names it. `None` when
+    /// the issuer omitted it: the read-only list keeps such an entry so
+    /// inflight equity is never understated, while every path that acts on a
+    /// single request refuses it (`confirm_network`).
+    #[serde(default)]
+    pub network: Option<Network>,
     pub issuer_request_id: Option<IssuerRequestId>,
     #[serde(default, deserialize_with = "deserialize_tx_hash")]
     pub tx_hash: Option<TxHash>,
@@ -346,7 +350,7 @@ impl TokenizationRequest {
             token_symbol: None,
             quantity: FractionalShares::ZERO,
             wallet: None,
-            network: Network::new(Chain::Base.as_str()),
+            network: Some(Network::new(Chain::Base.as_str())),
             issuer_request_id: None,
             tx_hash: None,
             fees: None,
@@ -366,7 +370,7 @@ impl TokenizationRequest {
             token_symbol: Some("tAAPL".to_string()),
             quantity: FractionalShares::ZERO,
             wallet: None,
-            network: Network::new(Chain::Base.as_str()),
+            network: Some(Network::new(Chain::Base.as_str())),
             issuer_request_id: None,
             tx_hash: Some(TxHash::ZERO),
             fees: None,
@@ -477,6 +481,11 @@ pub enum AlpacaTokenizationError {
         expected: Chain,
         actual: Network,
     },
+
+    /// The issuer reported the request without a network, so this client
+    /// cannot prove it is the one it is bound to; refused rather than assumed.
+    #[error("tokenization request {id} reports no network")]
+    NetworkMissing { id: TokenizationRequestId },
 }
 
 /// Opaque body text from an Alpaca tokenization API error response.
@@ -575,6 +584,7 @@ impl AlpacaTokenizationError {
             | Self::InvalidParameters { .. }
             | Self::RequestNotFound { .. }
             | Self::WrongNetwork { .. }
+            | Self::NetworkMissing { .. }
             | Self::Evm(_)
             | Self::PollTimeout { .. }
             | Self::MissingRedemptionWallet => None,
@@ -655,22 +665,32 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         &self,
         request: TokenizationRequest,
     ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
-        if request.network.as_ref() == self.chain.as_str() {
-            return Ok(request);
+        match request.network {
+            Some(ref network) if network.as_ref() == self.chain.as_str() => Ok(request),
+            Some(actual) => {
+                warn!(
+                    target: "tokenization",
+                    request_id = %request.id,
+                    expected = %self.chain,
+                    %actual,
+                    "Refusing tokenization request reported on another network"
+                );
+                Err(AlpacaTokenizationError::WrongNetwork {
+                    id: request.id,
+                    expected: self.chain,
+                    actual,
+                })
+            }
+            None => {
+                warn!(
+                    target: "tokenization",
+                    request_id = %request.id,
+                    expected = %self.chain,
+                    "Refusing tokenization request reported without a network"
+                );
+                Err(AlpacaTokenizationError::NetworkMissing { id: request.id })
+            }
         }
-
-        warn!(
-            target: "tokenization",
-            request_id = %request.id,
-            expected = %self.chain,
-            actual = %request.network,
-            "Refusing tokenization request reported on another network"
-        );
-        Err(AlpacaTokenizationError::WrongNetwork {
-            id: request.id,
-            expected: self.chain,
-            actual: request.network,
-        })
     }
 
     /// Request a mint operation to convert offchain shares to onchain tokens.
@@ -1440,7 +1460,7 @@ pub(crate) mod tests {
                 .unwrap();
 
             assert_eq!(result.id, tokenization_request_id(&request_id));
-            assert_eq!(result.network, Network::new(chain.as_str()));
+            assert_eq!(result.network, Some(Network::new(chain.as_str())));
             mint_mock.assert();
         }
     }
