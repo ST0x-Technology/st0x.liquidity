@@ -367,7 +367,7 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
     // symbol is on-chain is a chain fact, how it hedges is not.
     let assets = ctx
         .chains
-        .sole_trading()
+        .primary()
         .assets
         .equities
         .symbols
@@ -439,8 +439,8 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         wallet,
         log_level: format!("{:?}", ctx.log_level),
         server_port: ctx.server_port,
-        orderbook: format!("{:#x}", ctx.chains.sole_trading().orderbook),
-        deployment_block: ctx.chains.sole_trading().deployment_block,
+        orderbook: format!("{:#x}", ctx.chains.primary().orderbook),
+        deployment_block: ctx.chains.primary().deployment_block,
         trading_mode: trading_mode.to_string(),
         broker: broker.to_string(),
         order_polling_interval: ctx.order_polling_interval,
@@ -666,25 +666,18 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
         let symbol = st0x_finance::Symbol::new("RKLB").unwrap();
-        ctx.chains
-            .sole_trading_mut()
-            .assets
-            .equities
-            .symbols
-            .insert(
-                symbol.clone(),
-                ChainEquityAsset {
-                    tokenized_equity: address!("0x1111111111111111111111111111111111111111"),
-                    tokenized_equity_derivative: address!(
-                        "0x2222222222222222222222222222222222222222"
-                    ),
-                    vault_ids: Vec::new(),
-                    trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Disabled,
-                    wrapped_equity_recovery: OperationMode::Disabled,
-                    operational_limit: None,
-                },
-            );
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            symbol.clone(),
+            ChainEquityAsset {
+                tokenized_equity: address!("0x1111111111111111111111111111111111111111"),
+                tokenized_equity_derivative: address!("0x2222222222222222222222222222222222222222"),
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
         // The dashboard row joins the chain listing above with the symbol's
         // hedging policy, which lives in the global table.
         ctx.assets.equities.symbols.insert(
@@ -716,25 +709,18 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
         let symbol = st0x_finance::Symbol::new("RKLB").unwrap();
-        ctx.chains
-            .sole_trading_mut()
-            .assets
-            .equities
-            .symbols
-            .insert(
-                symbol.clone(),
-                ChainEquityAsset {
-                    tokenized_equity: address!("0x1111111111111111111111111111111111111111"),
-                    tokenized_equity_derivative: address!(
-                        "0x2222222222222222222222222222222222222222"
-                    ),
-                    vault_ids: Vec::new(),
-                    trading: OperationMode::Disabled,
-                    rebalancing: OperationMode::Enabled,
-                    wrapped_equity_recovery: OperationMode::Disabled,
-                    operational_limit: None,
-                },
-            );
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            symbol.clone(),
+            ChainEquityAsset {
+                tokenized_equity: address!("0x1111111111111111111111111111111111111111"),
+                tokenized_equity_derivative: address!("0x2222222222222222222222222222222222222222"),
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
 
         let settings = settings_from_ctx(&ctx);
         let asset = settings
