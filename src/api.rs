@@ -26,6 +26,7 @@ use st0x_dto::{
     EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, Trade,
     TradingVenue,
 };
+use st0x_event_sorcery::{StoreBuilder, load_entity, send_command};
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
 use st0x_execution::{AlpacaWalletError, Symbol};
 use st0x_finance::FractionalShares;
@@ -40,7 +41,9 @@ use crate::dashboard::transfer_loader::{
     InvalidTransferKind, TransferHistoryQuery, TransferKind, query_transfer_history,
 };
 use crate::dashboard::{TradePage, TradeProtocol, TradeQuery, query_trades};
-use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
+use crate::equity_redemption::{
+    EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
+};
 use crate::iap_auth::{IapVerifier, require_iap};
 use crate::operator::equity_transfer::{
     EquityTransferKind, FailTransferError, validate_failure_reason,
@@ -52,11 +55,17 @@ use crate::performance::reliability::{
     aggregate_log_entries, load_failure_events, load_job_queue_health,
 };
 use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performance};
-use crate::rebalancing::equity::{CrossVenueEquityTransfer, RecheckError, RecheckOutcome};
+use crate::rebalancing::equity::{
+    CrossVenueEquityTransfer, EquityTransferServices, RecheckError, RecheckOutcome,
+};
 use crate::rebalancing::usdc::{RecheckUsdcDeposit, UsdcRecheckError};
 use crate::rebalancing::{RebalancingService, UsdcResumeError};
-use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
-use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceId};
+use crate::tokenized_equity_mint::{
+    TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
+};
+use crate::usdc_rebalance::{
+    RebalanceDirection, ReconcileReason, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
+};
 
 /// Comma-separated filter for transfer kinds in query parameters.
 ///
@@ -1995,6 +2004,348 @@ async fn performance_infra(
     }))
 }
 
+/// Wire contract for the USDC reconcile route: the operator-supplied reason,
+/// constrained to the same fixed vocabulary the CLI accepts.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconcileUsdcRequest {
+    reason: ReconcileReasonWire,
+}
+
+/// The fixed `--reason` vocabulary for a USDC reconcile, kebab-cased on the
+/// wire (`funds-moved-manually`, `deposit-credited-offline`).
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "kebab-case")]
+enum ReconcileReasonWire {
+    FundsMovedManually,
+    DepositCreditedOffline,
+}
+
+impl From<ReconcileReasonWire> for ReconcileReason {
+    fn from(wire: ReconcileReasonWire) -> Self {
+        match wire {
+            ReconcileReasonWire::FundsMovedManually => Self::FundsMovedManually,
+            ReconcileReasonWire::DepositCreditedOffline => Self::DepositCreditedOffline,
+        }
+    }
+}
+
+/// Wire contract for the clear-pending-burn route.
+#[derive(Deserialize)]
+struct ClearPendingBurnRequest {
+    /// Operator audit reason, logged with the action (the command itself
+    /// carries no reason field).
+    reason: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsdcTransferOpResponse {
+    transfer_id: String,
+    outcome: &'static str,
+}
+
+/// Parses the `{id}` path segment into a [`UsdcRebalanceId`].
+fn parse_usdc_rebalance_id(id: &str) -> Result<UsdcRebalanceId, (StatusCode, Json<ErrorResponse>)> {
+    id.parse::<uuid::Uuid>()
+        .map(UsdcRebalanceId)
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid USDC transfer id: {error}"),
+                }),
+            )
+        })
+}
+
+/// Maps a store or command failure to a `500` while logging the detail, the
+/// same internal-failure treatment used elsewhere in this module.
+fn ops_store_error(error: impl std::fmt::Display) -> (StatusCode, Json<ErrorResponse>) {
+    error!(%error, "Operator write command failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: format!("{error}"),
+        }),
+    )
+}
+
+/// Reconciles a USDC rebalance stranded in a post-burn terminal failure to the
+/// clearing `Reconciled` terminal, releasing the in-progress guard. The residue
+/// was handled out-of-band, so this only loads the aggregate and sends the
+/// command; no broker, bridge, or provider is touched. Safe against the live
+/// bot: a post-burn terminal failure has no active job driving the aggregate.
+///
+/// Mirrors `stox transfer reconcile --kind usdc`; the precondition matches the
+/// aggregate command's accepted set so the operator gets a clear `400` before
+/// any write.
+async fn reconcile_usdc_transfer(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ReconcileUsdcRequest>,
+) -> Result<Json<UsdcTransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let id = parse_usdc_rebalance_id(&id)?;
+    let reason = ReconcileReason::from(request.reason);
+
+    let store = StoreBuilder::<UsdcRebalance>::new(state.pool.clone())
+        .build(())
+        .await
+        .map_err(ops_store_error)?;
+
+    let Some(rebalance) = store.load(&id).await.map_err(ops_store_error)? else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("No USDC transfer found for id {id}"),
+            }),
+        ));
+    };
+
+    let is_post_burn_failure = matches!(
+        rebalance,
+        UsdcRebalance::DepositFailed { .. }
+            | UsdcRebalance::BridgingFailed {
+                burn_tx_hash: Some(_),
+                ..
+            }
+            | UsdcRebalance::BridgingFailed {
+                cctp_nonce: Some(_),
+                ..
+            }
+            | UsdcRebalance::ConversionFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            }
+    );
+    if !is_post_burn_failure {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "Transfer {id} is in {rebalance:?}, not a post-burn terminal failure \
+                     (DepositFailed, post-burn BridgingFailed, or a BaseToAlpaca \
+                     ConversionFailed); refusing to reconcile."
+                ),
+            }),
+        ));
+    }
+
+    store
+        .send(
+            &id,
+            UsdcRebalanceCommand::ReconcileStuckRebalance { reason },
+        )
+        .await
+        .map_err(ops_store_error)?;
+
+    info!(%id, ?reason, "USDC transfer reconciled via API");
+    Ok(Json(UsdcTransferOpResponse {
+        transfer_id: id.to_string(),
+        outcome: "reconciled",
+    }))
+}
+
+/// Clears a recorded (dropped) pending CCTP burn on a transfer latched at
+/// `BridgingSubmitting`, returning it to `BridgingSubmitting` with no recorded
+/// burn. The guard stays held (release it next with fail-usdc-transfer). Store
+/// only; safe against the live bot because the precondition is a latched
+/// transfer whose job has already fail-closed.
+///
+/// Mirrors `stox clear-pending-burn`.
+async fn clear_pending_usdc_burn(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ClearPendingBurnRequest>,
+) -> Result<Json<UsdcTransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let id = parse_usdc_rebalance_id(&id)?;
+
+    let store = StoreBuilder::<UsdcRebalance>::new(state.pool.clone())
+        .build(())
+        .await
+        .map_err(ops_store_error)?;
+
+    let Some(rebalance) = store.load(&id).await.map_err(ops_store_error)? else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("No USDC transfer found for id {id}"),
+            }),
+        ));
+    };
+
+    match &rebalance {
+        UsdcRebalance::BridgingSubmitting {
+            pending_burn_tx: Some(_),
+            ..
+        } => {}
+        UsdcRebalance::BridgingSubmitting {
+            pending_burn_tx: None,
+            ..
+        } => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!(
+                        "Transfer {id} is at BridgingSubmitting with no recorded pending burn \
+                         to clear; use fail-usdc-transfer to release the guard."
+                    ),
+                }),
+            ));
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!(
+                        "clear-pending-burn is only valid from BridgingSubmitting with a \
+                         recorded pending burn; transfer {id} is in {rebalance:?}."
+                    ),
+                }),
+            ));
+        }
+    }
+
+    store
+        .send(&id, UsdcRebalanceCommand::ClearPendingBurn)
+        .await
+        .map_err(ops_store_error)?;
+
+    info!(%id, reason = %request.reason, "USDC pending burn cleared via API");
+    Ok(Json(UsdcTransferOpResponse {
+        transfer_id: id.to_string(),
+        outcome: "pending_burn_cleared",
+    }))
+}
+
+/// Wire contract for the equity reconcile route (mint or redemption).
+#[derive(Deserialize)]
+struct ReconcileEquityRequest {
+    /// Free-text operator audit reason (required; persisted on the event).
+    reason: String,
+}
+
+/// Reconciles an equity mint or redemption stuck in the `Failed` terminal to
+/// `Reconciled` once its residue was handled out-of-band. Pure bookkeeping: it
+/// loads the aggregate and sends `Reconcile`, dispatching no reactor effect and
+/// no inventory update, so it is safe against the live bot (a `Failed` terminal
+/// has no active driver).
+///
+/// Mirrors `stox transfer reconcile --kind mint|redemption`.
+async fn reconcile_equity_transfer(
+    State(state): State<AppState>,
+    Path((kind, id)): Path<(String, String)>,
+    Json(request): Json<ReconcileEquityRequest>,
+) -> Result<Json<UsdcTransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let reason = request.reason.trim().to_owned();
+    if reason.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "reason is required".to_string(),
+            }),
+        ));
+    }
+    let services = EquityTransferServices::panicking();
+
+    match kind.as_str() {
+        "mint" => {
+            let mint_id: IssuerRequestId = id.parse().map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("Invalid mint id: {error}"),
+                    }),
+                )
+            })?;
+            let entity = load_entity::<TokenizedEquityMint>(&state.pool, &mint_id)
+                .await
+                .map_err(ops_store_error)?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse {
+                            error: format!("Mint aggregate not found: {id}"),
+                        }),
+                    )
+                })?;
+            if !matches!(entity, TokenizedEquityMint::Failed { .. }) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!(
+                            "Mint {id} is not in the Failed state; reconcile only resolves a \
+                             Failed terminal."
+                        ),
+                    }),
+                ));
+            }
+            send_command::<TokenizedEquityMint>(
+                &state.pool,
+                &mint_id,
+                TokenizedEquityMintCommand::Reconcile { reason },
+                services,
+            )
+            .await
+            .map_err(ops_store_error)?;
+        }
+        "redemption" => {
+            let redemption_id: RedemptionAggregateId = id.parse().map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("Invalid redemption id: {error}"),
+                    }),
+                )
+            })?;
+            let entity = load_entity::<EquityRedemption>(&state.pool, &redemption_id)
+                .await
+                .map_err(ops_store_error)?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse {
+                            error: format!("Redemption aggregate not found: {id}"),
+                        }),
+                    )
+                })?;
+            if !matches!(entity, EquityRedemption::Failed { .. }) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!(
+                            "Redemption {id} is not in the Failed state; reconcile only resolves \
+                             a Failed terminal."
+                        ),
+                    }),
+                ));
+            }
+            send_command::<EquityRedemption>(
+                &state.pool,
+                &redemption_id,
+                EquityRedemptionCommand::Reconcile { reason },
+                services,
+            )
+            .await
+            .map_err(ops_store_error)?;
+        }
+        other => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Unknown transfer kind {other:?} (expected mint or redemption)"),
+                }),
+            ));
+        }
+    }
+
+    info!(%id, kind = %kind, "Equity transfer reconciled via API");
+    Ok(Json(UsdcTransferOpResponse {
+        transfer_id: id,
+        outcome: "reconciled",
+    }))
+}
+
 /// The role-gated ops API: the same handlers the dashboard routes use, mounted
 /// under a prefix the load balancer routes to a role-specific IAP backend.
 ///
@@ -2098,6 +2449,18 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
         .route(
             "/liquidity-write/transfers/usdc/resume/{direction}/{id}",
             post(resume_usdc_transfer),
+        )
+        .route(
+            "/liquidity-write/transfers/usdc/{id}/reconcile",
+            post(reconcile_usdc_transfer),
+        )
+        .route(
+            "/liquidity-write/transfers/usdc/{id}/clear-pending-burn",
+            post(clear_pending_usdc_burn),
+        )
+        .route(
+            "/liquidity-write/transfers/{kind}/{id}/reconcile",
+            post(reconcile_equity_transfer),
         )
         .layer(axum::middleware::from_fn(move |request, next| {
             let verifier = Arc::clone(&write_verifier);
@@ -5189,6 +5552,13 @@ mod tests {
             ("POST", "/liquidity-write/transfers/fail/equity_mint/x"),
             ("POST", "/liquidity-write/transfers/recheck/equity_mint/x"),
             ("POST", "/liquidity-write/transfers/resume"),
+            ("POST", "/liquidity-write/transfers/usdc/x/reconcile"),
+            (
+                "POST",
+                "/liquidity-write/transfers/usdc/x/clear-pending-burn",
+            ),
+            ("POST", "/liquidity-write/transfers/mint/x/reconcile"),
+            ("POST", "/liquidity-write/transfers/redemption/x/reconcile"),
         ] {
             let response = app
                 .clone()
@@ -5224,6 +5594,13 @@ mod tests {
             ("POST", "/liquidity-write/transfers/fail/equity_mint/x"),
             ("POST", "/liquidity-write/transfers/recheck/equity_mint/x"),
             ("POST", "/liquidity-write/transfers/resume"),
+            ("POST", "/liquidity-write/transfers/usdc/x/reconcile"),
+            (
+                "POST",
+                "/liquidity-write/transfers/usdc/x/clear-pending-burn",
+            ),
+            ("POST", "/liquidity-write/transfers/mint/x/reconcile"),
+            ("POST", "/liquidity-write/transfers/redemption/x/reconcile"),
         ] {
             let response = app
                 .clone()
