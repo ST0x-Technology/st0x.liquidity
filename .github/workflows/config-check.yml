@@ -18,7 +18,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: ST0x-Technology/.github/.github/workflows/config-check.yml@cae26fdb27c048ba9d9d203e5c633892a27dd4aa # config-check, bump via PR
+    uses: ST0x-Technology/.github/.github/workflows/config-check.yml@cae26fdb27c048ba9d9d203e5c633892a27dd4aa  # config-check, bump via PR
     with:
       config_files: config/staging/st0x-hedge.toml config/prod/st0x-hedge.toml
       ar_repo: europe-west3-docker.pkg.dev/t0-artifacts/t0-liquidity

@@ -43,7 +43,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@cae26fdb27c048ba9d9d203e5c633892a27dd4aa # app-release, bump via PR
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@cae26fdb27c048ba9d9d203e5c633892a27dd4aa  # app-release, bump via PR
     with:
       environment: production
       runtime: bot-vm
