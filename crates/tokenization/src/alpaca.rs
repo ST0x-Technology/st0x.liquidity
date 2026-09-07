@@ -1591,13 +1591,6 @@ pub(crate) mod tests {
         mint_mock.assert();
     }
 
-    fn basic_auth() -> AlpacaBrokerAuth {
-        AlpacaBrokerAuth::Basic {
-            api_key: "test_api_key".to_string(),
-            api_secret: "test_api_secret".to_string(),
-        }
-    }
-
     async fn create_test_client_on(
         server: &MockServer,
         anvil_endpoint: &str,
@@ -1613,7 +1606,10 @@ pub(crate) mod tests {
         AlpacaTokenizationClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            basic_auth(),
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_api_key".to_string(),
+                api_secret: "test_api_secret".to_string(),
+            },
             wallet,
             chain,
             Some(TEST_REDEMPTION_WALLET),
