@@ -14706,4 +14706,80 @@ mod tests {
             }
         ));
     }
+
+    fn assets_with_equity(symbol: &str, asset: ChainEquityAsset) -> ChainAssets {
+        ChainAssets {
+            equities: ChainEquities {
+                symbols: HashMap::from([(Symbol::new(symbol).unwrap(), asset)]),
+                operational_limit: None,
+            },
+            cash: None,
+        }
+    }
+
+    /// The tokenization preflight attests every enabled equity's vault on
+    /// the chain it is configured for: a vault whose `asset()` is not the
+    /// configured underlying fails startup naming the chain and the symbol,
+    /// before any mint or redemption could route through it.
+    #[tokio::test]
+    async fn tokenization_preflight_refuses_a_vault_whose_asset_differs_from_config() {
+        let underlying = Address::repeat_byte(0xa5);
+        let vault = Address::repeat_byte(0xa6);
+        let wrapper = MockWrapper::new()
+            .with_tokenized_shares(underlying)
+            .with_wrapped_token(vault)
+            .attesting_unwrapped_token(Address::repeat_byte(0xa7));
+        let assets = assets_with_equity("AAPL", equity_asset(underlying, vault));
+
+        let error = attest_chain_vaults(Chain::Ethereum, &wrapper, &assets)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.chain, Chain::Ethereum);
+        assert!(matches!(
+            error.source,
+            st0x_wrapper::WrapperError::VaultAssetMismatch { ref symbol, .. }
+                if symbol.as_str() == "AAPL"
+        ));
+    }
+
+    /// Only equities the bot may wrap or redeem are attested: an equity with
+    /// trading and rebalancing both disabled is left alone even when its
+    /// vault would disagree, and an agreeing vault passes.
+    #[tokio::test]
+    async fn tokenization_preflight_attests_only_enabled_equities() {
+        let underlying = Address::repeat_byte(0xa5);
+        let vault = Address::repeat_byte(0xa6);
+        let disagreeing = MockWrapper::new()
+            .with_tokenized_shares(underlying)
+            .with_wrapped_token(vault)
+            .attesting_unwrapped_token(Address::repeat_byte(0xa7));
+        let mut disabled = equity_asset(underlying, vault);
+        disabled.trading = OperationMode::Disabled;
+        disabled.rebalancing = OperationMode::Disabled;
+
+        attest_chain_vaults(
+            Chain::Base,
+            &disagreeing,
+            &assets_with_equity("AAPL", disabled),
+        )
+        .await
+        .unwrap();
+
+        let agreeing = MockWrapper::new()
+            .with_tokenized_shares(underlying)
+            .with_wrapped_token(vault)
+            .attesting_unwrapped_token(underlying);
+        let mut rebalancing_only = equity_asset(underlying, vault);
+        rebalancing_only.trading = OperationMode::Disabled;
+        rebalancing_only.rebalancing = OperationMode::Enabled;
+
+        attest_chain_vaults(
+            Chain::Base,
+            &agreeing,
+            &assets_with_equity("AAPL", rebalancing_only),
+        )
+        .await
+        .unwrap();
+    }
 }
