@@ -4,15 +4,14 @@ use std::fmt::{Display, Formatter};
 use std::path::Path;
 
 use alloy::primitives::Address;
-use st0x_config::Ctx;
-use st0x_evm::USDC_BASE;
+use st0x_config::{ChainApprovalInputs, Ctx};
+use st0x_evm::Chain;
 use st0x_evm::turnkey::{
     TurnkeyPolicy, TurnkeyPolicyClient, TurnkeyPolicyEffect, TurnkeyPolicyError,
+    TurnkeyPolicySnapshot,
 };
 
 use crate::onchain::approvals::{ApprovalTarget, build_approval_targets};
-
-const BASE_CHAIN_ID: u64 = 8_453;
 
 /// Successful result of a deploy-time policy verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,16 +26,17 @@ pub enum ApprovalPolicyVerification {
     },
 }
 
-/// Every startup approval target for which no provably matching allow policy
-/// was returned by Turnkey.
+/// Every startup approval target on one watched chain for which no provably
+/// matching allow policy was returned by Turnkey.
 #[derive(Debug)]
 pub struct MissingPolicyCoverage {
+    chain: Chain,
     missing: Vec<ApprovalTarget>,
 }
 
 impl MissingPolicyCoverage {
-    fn new(missing: Vec<ApprovalTarget>) -> Self {
-        Self { missing }
+    fn new(chain: Chain, missing: Vec<ApprovalTarget>) -> Self {
+        Self { chain, missing }
     }
 }
 
@@ -44,8 +44,9 @@ impl Display for MissingPolicyCoverage {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         writeln!(
             formatter,
-            "Turnkey policies do not cover {} startup approval target(s):",
-            self.missing.len()
+            "Turnkey policies do not cover {} startup approval target(s) on {}:",
+            self.missing.len(),
+            self.chain,
         )?;
 
         for target in &self.missing {
@@ -74,7 +75,18 @@ pub enum ApprovalPolicyVerificationError {
     #[error(transparent)]
     Turnkey(#[from] TurnkeyPolicyError),
     #[error(transparent)]
+    Coverage(#[from] ChainCoverageError),
+}
+
+/// Why one watched chain's startup approvals are not provably covered.
+#[derive(Debug, thiserror::Error)]
+pub enum ChainCoverageError {
+    #[error(transparent)]
     MissingCoverage(#[from] MissingPolicyCoverage),
+    /// This build pins no canonical USDC for the chain, so its USDC grant has
+    /// no target to prove covered; fails closed.
+    #[error("[chains.{chain}] has no canonical USDC pinned in this build")]
+    UsdcNotPinned { chain: Chain },
 }
 
 /// Validates deploy inputs, lists Turnkey policies, and fails unless every
@@ -86,7 +98,6 @@ pub async fn verify_turnkey_approval_policies(
     let Some(inputs) = Ctx::load_turnkey_approval_policy_inputs(config_path, secrets_path)? else {
         return Ok(ApprovalPolicyVerification::SkippedNonTurnkey);
     };
-    let targets = build_approval_targets(&inputs.assets, inputs.orderbook, USDC_BASE);
     let client = TurnkeyPolicyClient::new(
         inputs.organization_id,
         inputs.kms_api_key,
@@ -94,22 +105,46 @@ pub async fn verify_turnkey_approval_policies(
     )
     .await?;
     let snapshot = client.list_policies().await?;
-    let context = ApprovalPolicyContext {
-        user_id: &snapshot.user_id,
-        user_tags: &snapshot.user_tags,
-        wallet_address: inputs.wallet_address,
-        chain_id: BASE_CHAIN_ID,
-    };
-    let missing = missing_policy_coverage(&targets, &snapshot.policies, &context);
-
-    if !missing.is_empty() {
-        return Err(MissingPolicyCoverage::new(missing).into());
-    }
+    let target_count = verify_watched_chains(&inputs.watched, &snapshot, inputs.wallet_address)?;
 
     Ok(ApprovalPolicyVerification::Verified {
-        target_count: targets.len(),
+        target_count,
         policy_count: snapshot.policies.len(),
     })
+}
+
+/// Every watched chain's startup targets, each checked against the policies
+/// on that chain's own id; the covered target count on success. The first
+/// chain with an uncovered target fails the gate naming that chain.
+fn verify_watched_chains(
+    watched: &[ChainApprovalInputs],
+    snapshot: &TurnkeyPolicySnapshot,
+    wallet_address: Address,
+) -> Result<usize, ChainCoverageError> {
+    let mut target_count = 0;
+
+    for chain_inputs in watched {
+        let chain = chain_inputs.chain;
+        let usdc = chain
+            .usdc()
+            .ok_or(ChainCoverageError::UsdcNotPinned { chain })?;
+        let targets = build_approval_targets(&chain_inputs.assets, chain_inputs.orderbook, usdc);
+        let context = ApprovalPolicyContext {
+            user_id: &snapshot.user_id,
+            user_tags: &snapshot.user_tags,
+            wallet_address,
+            chain_id: chain.chain_id(),
+        };
+        let missing = missing_policy_coverage(&targets, &snapshot.policies, &context);
+
+        if !missing.is_empty() {
+            return Err(MissingPolicyCoverage::new(chain, missing).into());
+        }
+
+        target_count += targets.len();
+    }
+
+    Ok(target_count)
 }
 
 fn missing_policy_coverage(

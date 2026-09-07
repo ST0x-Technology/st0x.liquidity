@@ -187,8 +187,19 @@ pub fn load_deployment_symbol_policy(
     )
 }
 
+/// One watched chain's approval surface: the orderbook and asset table its
+/// startup MAX approvals target.
+#[cfg(feature = "wallet-turnkey")]
+#[derive(Clone, Debug)]
+pub struct ChainApprovalInputs {
+    pub chain: Chain,
+    pub orderbook: Address,
+    pub assets: crate::ChainAssets,
+}
+
 /// Validated, network-free inputs required by the deploy-time Turnkey approval
-/// policy coverage check.
+/// policy coverage check: one approval surface per watched chain, since
+/// startup grants approvals on every one of them.
 #[cfg(feature = "wallet-turnkey")]
 #[derive(Clone, Debug)]
 pub struct TurnkeyApprovalPolicyInputs {
@@ -196,8 +207,7 @@ pub struct TurnkeyApprovalPolicyInputs {
     pub kms_api_key: Option<st0x_evm::turnkey::TurnkeyKmsApiKey>,
     pub api_private_key: Option<st0x_evm::turnkey::TurnkeyApiPrivateKey>,
     pub wallet_address: Address,
-    pub orderbook: Address,
-    pub assets: crate::ChainAssets,
+    pub watched: Vec<ChainApprovalInputs>,
 }
 
 /// Non-secret settings deserialized from the plaintext config TOML.
@@ -2131,8 +2141,15 @@ impl Ctx {
             kms_api_key,
             api_private_key,
             wallet_address,
-            orderbook: parts.chains.primary().orderbook,
-            assets: parts.chains.primary().assets.clone(),
+            watched: parts
+                .chains
+                .watched()
+                .map(|watched| ChainApprovalInputs {
+                    chain: watched.chain,
+                    orderbook: watched.orderbook,
+                    assets: watched.assets.clone(),
+                })
+                .collect(),
         }))
     }
 
@@ -9038,12 +9055,14 @@ mod tests {
             inputs.wallet_address,
             address!("0x6666666666666666666666666666666666666666")
         );
+        assert_eq!(inputs.watched.len(), 1);
+        assert_eq!(inputs.watched[0].chain, Chain::Base);
         assert_eq!(
-            inputs.orderbook,
+            inputs.watched[0].orderbook,
             address!("0x1111111111111111111111111111111111111111")
         );
         assert!(
-            inputs
+            inputs.watched[0]
                 .assets
                 .is_trading_enabled(&Symbol::new("AAPL").unwrap())
         );
