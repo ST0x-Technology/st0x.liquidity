@@ -1,27 +1,34 @@
 //! Raindex vault deposit and withdrawal CLI commands.
 
 use alloy::primitives::{Address, B256, U256};
+use alloy::providers::RootProvider;
 use anyhow::Context;
 use rain_math_float::{Float, FloatError};
 use std::io::Write;
+use std::sync::Arc;
 use thiserror::Error;
 
 use st0x_config::Ctx;
-use st0x_evm::{Evm, IERC20, OpenChainErrorRegistry, USDC_BASE};
+use st0x_evm::{Evm, IERC20, OpenChainErrorRegistry, Wallet};
 use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
 use st0x_raindex::{Raindex, RaindexService, RaindexVaultId};
+
+use super::TokenizationNetwork;
+use super::rebalancing::{TradingChainContext, chain_usdc, trading_chain_context};
 
 pub(super) struct Deposit {
     pub(super) amount: Float,
     pub(super) token: Address,
     pub(super) vault_id: B256,
+    pub(super) network: TokenizationNetwork,
 }
 
 pub(super) struct Withdraw {
     pub(super) amount: Float,
     pub(super) token: Address,
     pub(super) vault_id: B256,
+    pub(super) network: TokenizationNetwork,
 }
 
 #[derive(Debug, Error)]
@@ -50,6 +57,32 @@ async fn get_token_decimals<E: Evm>(evm: &E, token: Address) -> anyhow::Result<u
         .with_context(|| format!("failed to read decimals() for token {token}"))
 }
 
+/// Prints the selected chain and its orderbook facts, and builds the Raindex
+/// service on that chain's wallet.
+fn print_chain_context<Writer: Write>(
+    stdout: &mut Writer,
+    context: &TradingChainContext<'_>,
+    wallet_label: &str,
+) -> anyhow::Result<RaindexService<Arc<dyn Wallet<Provider = RootProvider>>>> {
+    let TradingChainContext {
+        chain,
+        wallet,
+        trading,
+    } = context;
+    let sender_address = wallet.address();
+
+    writeln!(stdout, "   Chain: {chain}")?;
+    writeln!(stdout, "   {wallet_label}: {sender_address}")?;
+    writeln!(stdout, "   Inventory: {}", trading.inventory_address())?;
+    writeln!(stdout, "   Orderbook: {}", trading.orderbook)?;
+
+    Ok(RaindexService::new(
+        wallet.clone(),
+        st0x_hedge::operator::onchain::raindex_contracts(trading),
+        sender_address,
+    ))
+}
+
 pub(super) async fn vault_deposit_command<Writer: Write>(
     stdout: &mut Writer,
     deposit: Deposit,
@@ -59,6 +92,7 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
         amount,
         token,
         vault_id,
+        network,
     } = deposit;
     writeln!(stdout, "Depositing tokens to Raindex vault")?;
     writeln!(stdout, "   Amount: {}", format_float_with_fallback(&amount))?;
@@ -68,25 +102,11 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
         return Err(VaultCliError::NegativeAmount(amount).into());
     }
 
-    let wallet_ctx = ctx.wallet()?;
-    let sender_address = wallet_ctx.base_wallet().address();
-
-    writeln!(stdout, "   Sender wallet: {sender_address}")?;
-    writeln!(
-        stdout,
-        "   Inventory: {}",
-        ctx.chains.primary().inventory_address()
-    )?;
-    writeln!(stdout, "   Orderbook: {}", ctx.chains.primary().orderbook)?;
+    let context = trading_chain_context(ctx, network)?;
+    let raindex_service = print_chain_context(stdout, &context, "Sender wallet")?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
-    let raindex_service = RaindexService::new(
-        wallet_ctx.base_wallet().clone(),
-        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.primary()),
-        sender_address,
-    );
-
-    let token_decimals = get_token_decimals(wallet_ctx.base_wallet(), token).await?;
+    let token_decimals = get_token_decimals(&context.wallet, token).await?;
     writeln!(stdout, "   Decimals: {token_decimals}")?;
     let amount_u256 = float_to_u256(amount, token_decimals)?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
@@ -116,6 +136,7 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
         amount,
         token,
         vault_id,
+        network,
     } = withdraw;
 
     writeln!(stdout, "Withdrawing tokens from Raindex vault")?;
@@ -126,25 +147,11 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
         return Err(VaultCliError::NegativeAmount(amount).into());
     }
 
-    let wallet_ctx = ctx.wallet()?;
-    let sender_address = wallet_ctx.base_wallet().address();
-
-    writeln!(stdout, "   Recipient wallet: {sender_address}")?;
-    writeln!(
-        stdout,
-        "   Inventory: {}",
-        ctx.chains.primary().inventory_address()
-    )?;
-    writeln!(stdout, "   Orderbook: {}", ctx.chains.primary().orderbook)?;
+    let context = trading_chain_context(ctx, network)?;
+    let raindex_service = print_chain_context(stdout, &context, "Recipient wallet")?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
-    let raindex_service = RaindexService::new(
-        wallet_ctx.base_wallet().clone(),
-        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.primary()),
-        sender_address,
-    );
-
-    let token_decimals = get_token_decimals(wallet_ctx.base_wallet(), token).await?;
+    let token_decimals = get_token_decimals(&context.wallet, token).await?;
     writeln!(stdout, "   Decimals: {token_decimals}")?;
     let amount_u256 = float_to_u256(amount, token_decimals)?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
@@ -160,14 +167,19 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
     Ok(())
 }
 
+/// Withdraws USDC from the selected chain's configured cash vault: that
+/// chain's canonical USDC and the first `vault_ids` entry of its
+/// `[chains.<name>.trading.assets.cash]` table.
 pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
     stdout: &mut Writer,
     amount: st0x_finance::Usdc,
+    network: TokenizationNetwork,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    ctx.wallet()?;
+    let TradingChainContext { chain, trading, .. } = trading_chain_context(ctx, network)?;
+    let token = chain_usdc(chain)?;
 
-    let cash = ctx.chains.primary().assets.cash.as_ref().ok_or_else(|| {
+    let cash = trading.assets.cash.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
         )
@@ -189,8 +201,9 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
 
     let withdraw = Withdraw {
         amount: amount.into(),
-        token: USDC_BASE,
+        token,
         vault_id,
+        network,
     };
 
     vault_withdraw_command(stdout, withdraw, ctx).await
@@ -213,7 +226,7 @@ mod tests {
     };
     use st0x_config::{InventoryMode, TradingChain};
     use st0x_evm::IERC20::decimalsCall;
-    use st0x_evm::{Chain, ReadOnlyEvm, USDC_ETHEREUM};
+    use st0x_evm::{Chain, ReadOnlyEvm, USDC_BASE, USDC_ETHEREUM};
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
 

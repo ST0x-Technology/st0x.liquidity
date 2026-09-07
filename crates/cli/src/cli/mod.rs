@@ -599,6 +599,12 @@ pub enum Commands {
         /// Vault ID
         #[arg(short = 'v', long = "vault-id")]
         vault_id: B256,
+
+        /// Chain of the vault: selects the wallet and the
+        /// `[chains.<name>.trading]` orderbook; a chain without that table is
+        /// refused
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
     },
 
     /// Withdraw tokens from a Raindex vault
@@ -617,6 +623,12 @@ pub enum Commands {
         /// Vault ID
         #[arg(short = 'v', long = "vault-id")]
         vault_id: B256,
+
+        /// Chain of the vault: selects the wallet and the
+        /// `[chains.<name>.trading]` orderbook; a chain without that table is
+        /// refused
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
     },
 
     /// Withdraw USDC from the configured Raindex cash vault
@@ -628,6 +640,12 @@ pub enum Commands {
         /// Amount of USDC to withdraw
         #[arg(short = 'a', long = "amount")]
         amount: Usdc,
+
+        /// Chain of the cash vault: its canonical USDC and its
+        /// `[chains.<name>.trading.assets.cash]` vault; a chain with no pinned
+        /// USDC is refused
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
     },
 
     /// Bridge USDC via CCTP (full flow: burn -> attestation -> mint)
@@ -1039,14 +1057,17 @@ enum SimpleCommand {
         amount: Float,
         token: Address,
         vault_id: B256,
+        network: TokenizationNetwork,
     },
     VaultWithdraw {
         amount: Float,
         token: Address,
         vault_id: B256,
+        network: TokenizationNetwork,
     },
     VaultWithdrawUsdc {
         amount: Usdc,
+        network: TokenizationNetwork,
     },
     OrderStatus {
         order_id: String,
@@ -1334,22 +1355,26 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
             amount,
             token,
             vault_id,
+            network,
         } => CommandRoute::Simple(SimpleCommand::VaultDeposit {
             amount,
             token,
             vault_id,
+            network,
         }),
         Commands::VaultWithdraw {
             amount,
             token,
             vault_id,
+            network,
         } => CommandRoute::Simple(SimpleCommand::VaultWithdraw {
             amount,
             token,
             vault_id,
+            network,
         }),
-        Commands::VaultWithdrawUsdc { amount } => {
-            CommandRoute::Simple(SimpleCommand::VaultWithdrawUsdc { amount })
+        Commands::VaultWithdrawUsdc { amount, network } => {
+            CommandRoute::Simple(SimpleCommand::VaultWithdrawUsdc { amount, network })
         }
         Commands::CctpBridge { amount, all, from } => {
             CommandRoute::Provider(ProviderCommand::CctpBridge { amount, all, from })
@@ -1618,11 +1643,13 @@ async fn run_simple_command<W: Write>(
             amount,
             token,
             vault_id,
+            network,
         } => {
             let deposit = vault::Deposit {
                 amount,
                 token,
                 vault_id,
+                network,
             };
             vault::vault_deposit_command(stdout, deposit, ctx).await
         }
@@ -1630,16 +1657,18 @@ async fn run_simple_command<W: Write>(
             amount,
             token,
             vault_id,
+            network,
         } => {
             let withdraw = vault::Withdraw {
                 amount,
                 token,
                 vault_id,
+                network,
             };
             vault::vault_withdraw_command(stdout, withdraw, ctx).await
         }
-        SimpleCommand::VaultWithdrawUsdc { amount } => {
-            vault::vault_withdraw_usdc_command(stdout, amount, ctx).await
+        SimpleCommand::VaultWithdrawUsdc { amount, network } => {
+            vault::vault_withdraw_usdc_command(stdout, amount, network, ctx).await
         }
         SimpleCommand::OrderStatus { order_id } => {
             trading::order_status_command(stdout, &order_id, ctx, pool).await
