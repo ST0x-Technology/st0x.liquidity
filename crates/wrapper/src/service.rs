@@ -415,12 +415,13 @@ fn check_redeem_within_max(
 #[cfg(test)]
 mod tests {
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
-    use alloy::primitives::{Bloom, Bytes};
+    use alloy::primitives::{Bloom, Bytes, Log as PrimitiveLog};
     use alloy::providers::Provider;
     use alloy::providers::ProviderBuilder;
     use alloy::providers::RootProvider;
     use alloy::providers::mock::Asserter;
     use alloy::rpc::client::RpcClient;
+    use alloy::rpc::types::Log;
     use alloy::rpc::types::TransactionReceipt;
     use alloy::sol_types::SolCall;
     use st0x_evm::{Evm, EvmError};
@@ -948,6 +949,121 @@ mod tests {
         assert!(
             matches!(error, WrapperError::MissingBlockNumber { tx_hash } if tx_hash == approve_tx),
             "submit_wrap must fail with MissingBlockNumber when the approval receipt has no block, got: {error:?}"
+        );
+    }
+
+    /// Builds a confirmed redeem receipt at block 7 whose only log is the
+    /// vault's `Withdraw` event for `assets` underlying tokens.
+    fn unwrap_receipt(tx_hash: TxHash, wrapped_token: Address, assets: U256) -> TransactionReceipt {
+        let withdraw = IERC4626::Withdraw {
+            sender: Address::ZERO,
+            receiver: Address::ZERO,
+            owner: Address::ZERO,
+            assets,
+            shares: assets,
+        };
+        let log = Log {
+            inner: PrimitiveLog {
+                address: wrapped_token,
+                data: withdraw.encode_log_data(),
+            },
+            transaction_hash: None,
+            transaction_index: None,
+            block_hash: None,
+            block_number: None,
+            block_timestamp: None,
+            log_index: None,
+            removed: false,
+        };
+        let mut receipt = receipt_with_block(tx_hash, Some(7));
+        receipt.inner = ReceiptEnvelope::Eip1559(ReceiptWithBloom {
+            receipt: Receipt {
+                status: true.into(),
+                cumulative_gas_used: 0,
+                logs: vec![log],
+            },
+            logs_bloom: Bloom::default(),
+        });
+        receipt
+    }
+
+    /// `confirm_unwrap` returns the token the vault itself reports as its
+    /// `asset()`, typed as the attested `UnwrappedToken`, next to the amount
+    /// from the `Withdraw` log.
+    #[tokio::test]
+    async fn confirm_unwrap_attests_the_vaults_asset_as_the_unwrapped_token() {
+        let equity = test_equity();
+        let tx_hash = TxHash::random();
+        let assets = U256::from(5_000_000_000_000_000_000_u128);
+        let asserter = Asserter::new();
+        asserter.push_success(&<IERC4626::assetCall as SolCall>::abi_encode_returns(
+            &equity.underlying,
+        ));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let wallet = MockedWallet::new(Address::ZERO, provider)
+            .with_write_results(unwrap_receipt(tx_hash, equity.derivative, assets), tx_hash);
+        let service = WrapperService::new(
+            wallet,
+            HashMap::from([(Symbol::new("AAPL").unwrap(), equity)]),
+        );
+
+        let confirmation = service
+            .confirm_unwrap(equity.derivative, tx_hash)
+            .await
+            .unwrap();
+
+        assert_eq!(confirmation.token.address(), equity.underlying);
+        assert_eq!(confirmation.assets, assets);
+        assert_eq!(confirmation.block, 7);
+    }
+
+    #[tokio::test]
+    async fn attest_underlying_returns_the_configured_underlying_when_the_vault_agrees() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let equity = test_equity();
+        let asserter = Asserter::new();
+        asserter.push_success(&<IERC4626::assetCall as SolCall>::abi_encode_returns(
+            &equity.underlying,
+        ));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let service = WrapperService::new(
+            MockedWallet::new(Address::ZERO, provider),
+            HashMap::from([(symbol.clone(), equity)]),
+        );
+
+        let token = service.attest_underlying(&symbol).await.unwrap();
+
+        assert_eq!(token.address(), equity.underlying);
+    }
+
+    /// A vault whose `asset()` is not the configured underlying is config
+    /// drift: the attestation refuses rather than returning either address.
+    #[tokio::test]
+    async fn attest_underlying_refuses_a_vault_whose_asset_differs_from_config() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let equity = test_equity();
+        let other = Address::random();
+        let asserter = Asserter::new();
+        asserter.push_success(&<IERC4626::assetCall as SolCall>::abi_encode_returns(
+            &other,
+        ));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let service = WrapperService::new(
+            MockedWallet::new(Address::ZERO, provider),
+            HashMap::from([(symbol.clone(), equity)]),
+        );
+
+        let error = service.attest_underlying(&symbol).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                WrapperError::VaultAssetMismatch { vault, configured, attested, .. }
+                    if vault == equity.derivative
+                        && configured == equity.underlying
+                        && attested == other
+            ),
+            "expected VaultAssetMismatch, got: {error:?}"
         );
     }
 }

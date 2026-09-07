@@ -4362,6 +4362,85 @@ mod tests {
         );
     }
 
+    /// The token sent to the issuer is the one the vault attests as its
+    /// `asset()`. When that differs from the configured underlying, unwrap
+    /// confirmation refuses instead of carrying either address forward, and
+    /// the redemption stays at `UnwrapSubmitted`.
+    #[tokio::test]
+    async fn confirm_unwrap_refuses_a_vault_that_delivered_another_token() {
+        let configured = Address::random();
+        let delivered = Address::random();
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(
+                MockWrapper::new()
+                    .with_tokenized_shares(configured)
+                    .attesting_unwrapped_token(delivered),
+            ),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        };
+
+        let store = TestStore::<EquityRedemption>::new(services);
+        let id = redemption_aggregate_id("unwrap-delivered-another-token");
+
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    token: Address::random(),
+                    amount: U256::from(10_000_000_000_000_000_000_u128),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
+            .await
+            .unwrap();
+        store
+            .send(&id, EquityRedemptionCommand::ConfirmWithdraw)
+            .await
+            .unwrap();
+        store
+            .send(&id, EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .unwrap();
+        store
+            .send(&id, EquityRedemptionCommand::SubmitUnwrap)
+            .await
+            .unwrap();
+
+        let error = store
+            .send(&id, EquityRedemptionCommand::ConfirmUnwrap)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    EquityRedemptionError::UnwrapDeliveredUnexpectedToken {
+                        configured: reported_configured,
+                        delivered: reported_delivered,
+                        ..
+                    }
+                )) if reported_configured == configured && reported_delivered == delivered
+            ),
+            "expected UnwrapDeliveredUnexpectedToken, got: {error:?}"
+        );
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::UnwrapSubmitted { .. }),
+            "a refused attestation must leave the redemption at UnwrapSubmitted, got: {entity:?}"
+        );
+    }
+
     #[tokio::test]
     async fn underlying_lookup_failure_returns_underlying_lookup_failed_error() {
         let services = EquityTransferServices {
