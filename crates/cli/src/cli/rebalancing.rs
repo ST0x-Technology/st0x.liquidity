@@ -2783,9 +2783,10 @@ mod tests {
         let mut ctx = create_alpaca_ctx_without_rebalancing();
         let config_wallet = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let flag_wallet = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        ctx.redemption_wallet = Some(config_wallet);
+        ctx.chains.primary_mut().redemption_wallet = Some(config_wallet);
 
-        let result = resolve_redemption_wallet(Some(flag_wallet), &ctx).unwrap();
+        let result =
+            resolve_redemption_wallet(Some(flag_wallet), TokenizationNetwork::Base, &ctx).unwrap();
         assert_eq!(result, flag_wallet);
     }
 
@@ -2793,18 +2794,18 @@ mod tests {
     fn resolve_redemption_wallet_falls_back_to_config() {
         let mut ctx = create_alpaca_ctx_without_rebalancing();
         let config_wallet = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        ctx.redemption_wallet = Some(config_wallet);
+        ctx.chains.primary_mut().redemption_wallet = Some(config_wallet);
 
-        let result = resolve_redemption_wallet(None, &ctx).unwrap();
+        let result = resolve_redemption_wallet(None, TokenizationNetwork::Base, &ctx).unwrap();
         assert_eq!(result, config_wallet);
     }
 
     #[test]
     fn resolve_redemption_wallet_errors_when_missing() {
         let ctx = create_alpaca_ctx_without_rebalancing();
-        assert_eq!(ctx.redemption_wallet, None);
+        assert_eq!(ctx.chains.primary().redemption_wallet, None);
 
-        let result = resolve_redemption_wallet(None, &ctx);
+        let result = resolve_redemption_wallet(None, TokenizationNetwork::Base, &ctx);
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("redemption_wallet"),
@@ -2812,16 +2813,47 @@ mod tests {
         );
     }
 
-    /// Same key → same address on every EVM chain; ethereum uses the
-    /// `[tokenization]` config wallet without requiring `--redemption-wallet`.
+    /// Redemption wallets are per chain: the selected network resolves its
+    /// own `[chains.<name>.trading].redemption_wallet`, never the primary's.
     #[test]
-    fn resolve_redemption_wallet_ethereum_uses_config() {
+    fn resolve_redemption_wallet_uses_the_selected_networks_chain() {
         let mut ctx = create_alpaca_ctx_without_rebalancing();
-        let config_wallet = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        ctx.redemption_wallet = Some(config_wallet);
+        let base_wallet = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let ethereum_wallet = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        ctx.chains.primary_mut().redemption_wallet = Some(base_wallet);
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .redemption_wallet(ethereum_wallet)
+                .call(),
+        );
 
-        let result = resolve_redemption_wallet(None, &ctx).unwrap();
-        assert_eq!(result, config_wallet);
+        assert_eq!(
+            resolve_redemption_wallet(None, TokenizationNetwork::Ethereum, &ctx).unwrap(),
+            ethereum_wallet
+        );
+        assert_eq!(
+            resolve_redemption_wallet(None, TokenizationNetwork::Base, &ctx).unwrap(),
+            base_wallet
+        );
+    }
+
+    /// A network without its own trading entry cannot borrow the primary's
+    /// wallet: tokens sent to another chain's issuer address are lost.
+    #[test]
+    fn resolve_redemption_wallet_refuses_a_network_without_its_own_entry() {
+        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        ctx.chains.primary_mut().redemption_wallet =
+            Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+
+        let error = resolve_redemption_wallet(None, TokenizationNetwork::Ethereum, &ctx)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("ethereum") && error.contains("redemption_wallet"),
+            "expected a per-chain redemption wallet error naming ethereum, got: {error}"
+        );
     }
 
     /// One match yields both the wallet and the wire value, so the pairing is
