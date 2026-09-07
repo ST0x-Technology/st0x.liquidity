@@ -792,14 +792,14 @@ migration files in `migrations/`.
 
 #### Bot-Paid Gas Cost Recording
 
-- After each bot-signed on-chain transaction confirms successfully -- vault
+- After each bot-signed on-chain transaction mines successfully -- vault
   deposit, vault withdraw, wrap, unwrap, CCTP burn, CCTP mint, or the USDC
   transfer to the Alpaca deposit address -- the confirming service enqueues a
   durable `RecordBotGasReceiptCost` job identifying the chain, transaction hash,
-  operation category, and symbol (when known). A transaction that mines but
-  reverts is not recorded: the gas it consumed is a real cost, but capture of
-  reverted-transaction gas is a known, deliberately deferred gap (see "Known
-  gaps" below)
+  operation category, and symbol (when known). Each CCTP burn that mines but
+  reverts is also enqueued: the confirming or recovery path records that attempt
+  before retrying the burn, because a reverted transaction still consumes real
+  gas
 - The recorded native cost is `gas_used * effective_gas_price` from the
   transaction receipt, plus the receipt's `l1Fee` on Base. The Base fee is
   required and decoded from the OP-Stack receipt shape; a missing or malformed
@@ -868,7 +868,7 @@ migration files in `migrations/`.
   recording call sites, and CLI operations run in a separate binary without the
   server's job queue
 - Known gaps (deliberately deferred, tracked as follow-up work rather than
-  blocking this feature): gas paid on reverted-but-mined transactions is not
+  blocking this feature): gas paid by reverted non-CCTP-burn transactions is not
   recorded, `EquityRedemption::SendTokens`'s enqueue failure is swallowed
   (logged and not retried, to avoid re-sending tokens) so that one send's gas
   cost is permanently lost rather than dead-lettered for recovery, a mint's
