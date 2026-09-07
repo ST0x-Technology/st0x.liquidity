@@ -1301,8 +1301,8 @@ pub(crate) mod tests {
     use std::time::Duration;
     use uuid::uuid;
 
-    use st0x_evm::OpenChainErrorRegistry;
     use st0x_evm::local::RawPrivateKeyWallet;
+    use st0x_evm::{Chain, OpenChainErrorRegistry};
 
     use super::*;
     use crate::bindings::TestERC20;
@@ -1525,64 +1525,205 @@ pub(crate) mod tests {
         mint_mock.assert();
     }
 
-    #[tokio::test]
-    async fn service_mint_request_carries_configured_network() {
-        let server = MockServer::start();
-        let (_anvil, endpoint, key) = setup_anvil();
-        let provider = ProviderBuilder::new().connect(&endpoint).await.unwrap();
-        let wallet = RawPrivateKeyWallet::new(&key, provider, 1).unwrap();
+    fn basic_auth() -> AlpacaBrokerAuth {
+        AlpacaBrokerAuth::Basic {
+            api_key: "test_api_key".to_string(),
+            api_secret: "test_api_secret".to_string(),
+        }
+    }
 
-        let client = AlpacaTokenizationClient::new(
+    async fn create_test_client_on(
+        server: &MockServer,
+        anvil_endpoint: &str,
+        private_key: &B256,
+        chain: Chain,
+    ) -> AlpacaTokenizationClient<impl Wallet> {
+        let provider = ProviderBuilder::new()
+            .connect(anvil_endpoint)
+            .await
+            .unwrap();
+        let wallet = RawPrivateKeyWallet::new(private_key, provider, 1).unwrap();
+
+        AlpacaTokenizationClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
-            AlpacaBrokerAuth::Basic {
-                api_key: "test_api_key".to_string(),
-                api_secret: "test_api_secret".to_string(),
-            },
+            basic_auth(),
             wallet,
-            Network::new("ethereum"),
+            chain,
             Some(TEST_REDEMPTION_WALLET),
         )
-        .expect("basic-auth tokenization client");
-        let service = create_test_service(client);
+        .expect("basic-auth tokenization client")
+    }
 
+    /// The ITN `network` wire value is derived from the client's `Chain`, so
+    /// every variant must reach the mint endpoint under its pinned name and
+    /// the matching response must be accepted.
+    #[tokio::test]
+    async fn mint_request_carries_the_chain_wire_name_for_every_chain() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
         let recipient = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let issuer_id = issuer_request_id("test-ethereum-mint");
-        let issuer_id_str = issuer_id.to_string();
+
+        for chain in Chain::ALL {
+            let client = create_test_client_on(&server, &endpoint, &key, chain).await;
+            let service = create_test_service(client);
+            let issuer_id = issuer_request_id(&format!("mint-on-{chain}"));
+            let issuer_id_str = issuer_id.to_string();
+            let request_id = format!("tok_req_{chain}");
+
+            let mint_mock = server.mock(|when, then| {
+                when.method(POST)
+                    .path(tokenization_mint_path())
+                    .json_body_includes(json!({ "network": chain.as_str() }).to_string());
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(json!({
+                        "tokenization_request_id": request_id,
+                        "type": "mint",
+                        "status": "pending",
+                        "underlying_symbol": "RKLB",
+                        "token_symbol": "tRKLB",
+                        "qty": "1",
+                        "issuer": "st0x",
+                        "network": chain.as_str(),
+                        "wallet_address": recipient,
+                        "client_request_id": issuer_id_str,
+                        "created_at": "2026-08-02T10:30:00Z"
+                    }));
+            });
+
+            let result = service
+                .request_mint(
+                    Symbol::new("RKLB").unwrap(),
+                    FractionalShares::new(float!(1.0)),
+                    recipient,
+                    issuer_id,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(result.id, tokenization_request_id(&request_id));
+            assert_eq!(result.network, Network::new(chain.as_str()));
+            mint_mock.assert();
+        }
+    }
+
+    /// A mint acknowledged on another network would be polled, verified and
+    /// deposited as if it had landed on this client's chain; the response is
+    /// refused before any of that.
+    #[tokio::test]
+    async fn mint_response_on_another_network_is_refused() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client_on(&server, &endpoint, &key, Chain::Base).await;
+
+        let request = create_mint_request();
+        let issuer_id = request.client_request_id.to_string();
 
         let mint_mock = server.mock(|when, then| {
-            when.method(POST)
-                .path(tokenization_mint_path())
-                .json_body_includes(r#"{"network":"ethereum"}"#);
+            when.method(POST).path(tokenization_mint_path());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "tokenization_request_id": "tok_req_eth_1",
+                    "tokenization_request_id": "tok_req_foreign",
                     "type": "mint",
                     "status": "pending",
-                    "underlying_symbol": "RKLB",
-                    "token_symbol": "tRKLB",
-                    "qty": "1",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "100.5",
                     "issuer": "st0x",
                     "network": "ethereum",
                     "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "client_request_id": issuer_id_str,
-                    "created_at": "2026-08-02T10:30:00Z"
+                    "client_request_id": issuer_id,
+                    "created_at": "2024-01-15T10:30:00Z"
                 }));
         });
 
-        let result = service
-            .request_mint(
-                Symbol::new("RKLB").unwrap(),
-                FractionalShares::new(float!(1.0)),
-                recipient,
-                issuer_id,
-            )
-            .await
-            .unwrap();
+        let error = client.request_mint(request).await.unwrap_err();
 
-        assert_eq!(result.id, tokenization_request_id("tok_req_eth_1"));
+        assert!(
+            matches!(
+                &error,
+                AlpacaTokenizationError::WrongNetwork { id, expected: Chain::Base, actual }
+                    if *id == tokenization_request_id("tok_req_foreign")
+                        && *actual == Network::new("ethereum")
+            ),
+            "expected WrongNetwork, got {error:?}"
+        );
         mint_mock.assert();
+    }
+
+    /// The mint poll reads the request back by id; a history entry for the
+    /// same id on another network is refused rather than driving the mint
+    /// to completion on the wrong chain.
+    #[tokio::test]
+    async fn mint_poll_on_another_network_is_refused() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client_on(&server, &endpoint, &key, Chain::Base).await;
+
+        let mut foreign = sample_tokenization_request_json("req_foreign", "mint", "AAPL");
+        foreign["network"] = json!("hyperevm");
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET).path(tokenization_requests_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([foreign]));
+        });
+
+        let error = client
+            .get_request(&tokenization_request_id("req_foreign"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                AlpacaTokenizationError::WrongNetwork { id, expected: Chain::Base, actual }
+                    if *id == tokenization_request_id("req_foreign")
+                        && *actual == Network::new("hyperevm")
+            ),
+            "expected WrongNetwork, got {error:?}"
+        );
+        list_mock.assert();
+    }
+
+    /// Redemption detection matches on the transfer hash alone; a redeem
+    /// entry carrying that hash on another network is refused instead of
+    /// being taken as this chain's detection.
+    #[tokio::test]
+    async fn redemption_detection_on_another_network_is_refused() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client_on(&server, &endpoint, &key, Chain::Base).await;
+
+        let hash: TxHash =
+            fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+        let mut foreign = sample_redemption_request_json_with_tx("redeem_foreign", "AAPL", hash);
+        foreign["network"] = json!("ethereum");
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(tokenization_requests_path())
+                .query_param("type", "redeem");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([foreign]));
+        });
+
+        let error = client.find_redemption_by_tx(&hash).await.unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                AlpacaTokenizationError::WrongNetwork { id, expected: Chain::Base, actual }
+                    if *id == tokenization_request_id("redeem_foreign")
+                        && *actual == Network::new("ethereum")
+            ),
+            "expected WrongNetwork, got {error:?}"
+        );
+        list_mock.assert();
     }
 
     #[tracing_test::traced_test]
