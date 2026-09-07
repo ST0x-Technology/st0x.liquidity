@@ -159,8 +159,8 @@ hedging policy for a symbol listed on no chain, fails startup.
 
 The chain table the asset goes under decides what the bot uses for it: that
 chain's signing wallet, orderbook, `redemption_wallet` and
-`[orchestrator.addresses]` entry. For a chain other than Base, check before
-enabling the asset:
+`[orchestrator.addresses]` entry. On each watched chain where the asset is
+listed (Base included), check before enabling the asset:
 
 - `[chains.<name>.trading]` carries a `redemption_wallet` (the issuer's wallet
   on that chain). Startup refuses, naming the chain, without it.
@@ -172,8 +172,9 @@ enabling the asset:
   USDC to its orderbook) are granted per watched chain, and the deploy gate
   checks coverage per chain.
 - If the asset is in orchestrator mode on that chain, `[orchestrator.addresses]`
-  has an entry for it. A missing entry is only warned about at startup and fails
-  the first orchestrator-mode mint.
+  has an entry for that chain (keys are chain names: `base`, `ethereum`,
+  `hyperevm`). A missing entry is only warned about at startup and fails the
+  first orchestrator-mode mint.
 
 **Fields:**
 
@@ -219,8 +220,9 @@ For adding asset **XYZ**:
 - [ ] Test a mint via the liquidity bot CLI:
       `stox alpaca-tokenize -t <token_addr> -s XYZ -q 1 -r <receiving_wallet>`
 - [ ] Add config entry to `config/staging/st0x-hedge.toml` (disabled first)
-- [ ] On a chain other than Base: `redemption_wallet`, Turnkey approval policies
-      for that chain's id, and the orchestrator entry if needed (see step 4a)
+- [ ] On each watched chain where the asset is listed: `redemption_wallet`,
+      Turnkey approval policies for that chain's id, and the orchestrator entry
+      for that chain if needed (see step 4a)
 - [ ] Deploy to staging, verify bot sees the asset
 - [ ] Enable trading in config, deploy again
 - [ ] Repeat for production when staging looks good
