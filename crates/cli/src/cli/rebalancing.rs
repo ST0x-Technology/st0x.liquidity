@@ -2894,6 +2894,77 @@ mod tests {
         assert_eq!(hyperevm_chain, Chain::HyperEvm);
     }
 
+    const ETHEREUM_ORDERBOOK: Address = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+
+    /// A Base primary with an Ethereum secondary and the stub wallets, so a
+    /// command that resolves the wrong chain observes Base's addresses.
+    fn create_ctx_watching_ethereum() -> Ctx {
+        let mut ctx = create_ctx_without_rebalancing();
+        ctx.wallet = Some(OnchainWalletCtx::stub());
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .orderbook(ETHEREUM_ORDERBOOK)
+                .call(),
+        );
+        ctx
+    }
+
+    /// The selected network yields its own wallet and its own trading table,
+    /// never the primary's.
+    #[test]
+    fn trading_chain_context_resolves_the_selected_chains_wallet_and_trading_table() {
+        let ctx = create_ctx_watching_ethereum();
+        let base_orderbook = ctx.chains.primary().orderbook;
+
+        let ethereum = trading_chain_context(&ctx, TokenizationNetwork::Ethereum).unwrap();
+        assert_eq!(ethereum.chain, Chain::Ethereum);
+        assert_eq!(
+            ethereum.wallet.address(),
+            ctx.wallet().unwrap().ethereum_wallet().address()
+        );
+        assert_eq!(ethereum.trading.orderbook, ETHEREUM_ORDERBOOK);
+
+        let base = trading_chain_context(&ctx, TokenizationNetwork::Base).unwrap();
+        assert_eq!(base.chain, Chain::Base);
+        assert_eq!(
+            base.wallet.address(),
+            ctx.wallet().unwrap().base_wallet().address()
+        );
+        assert_eq!(base.trading.orderbook, base_orderbook);
+    }
+
+    /// A chain with no `[chains.<name>.trading]` table has no orderbook to
+    /// act on; the refusal names the chain and the table, before the wallet
+    /// is required.
+    #[test]
+    fn trading_chain_context_refuses_a_network_without_a_trading_table() {
+        let ctx = create_ctx_without_rebalancing();
+
+        let error = trading_chain_context(&ctx, TokenizationNetwork::Ethereum)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("[chains.ethereum.trading]"),
+            "expected the missing trading table named, got: {error}"
+        );
+    }
+
+    /// USDC differs per chain: the pinned contracts resolve, an unpinned
+    /// chain is refused by name rather than served another chain's address.
+    #[test]
+    fn chain_usdc_refuses_a_chain_without_a_pinned_contract() {
+        assert_eq!(chain_usdc(Chain::Base).unwrap(), USDC_BASE);
+        assert_eq!(chain_usdc(Chain::Ethereum).unwrap(), USDC_ETHEREUM);
+
+        let error = chain_usdc(Chain::HyperEvm).unwrap_err().to_string();
+        assert!(
+            error.contains("hyperevm"),
+            "expected the unpinned chain named, got: {error}"
+        );
+    }
+
     async fn seed_to_withdrawal_complete(
         store: &st0x_event_sorcery::Store<UsdcRebalance>,
         id: Uuid,
