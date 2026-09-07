@@ -754,6 +754,13 @@ impl ChainRegistry {
         &mut self.primary
     }
 
+    /// Adds a watched, non-primary chain, so a fixture can exercise the
+    /// two-chain paths without assembling config and secrets tables.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_secondary(&mut self, chain: TradingChain) {
+        self.secondary.insert(chain.chain, chain);
+    }
+
     /// A registry holding one primary chain and nothing else.
     ///
     /// Test and fixture construction only: production registries come from

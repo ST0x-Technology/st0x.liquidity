@@ -1763,6 +1763,74 @@ mod tests {
         assert_eq!(count_jobs(&apalis_pool, &hedge_job_type()).await, 2);
     }
 
+    async fn load_hedge_jobs(apalis_pool: &apalis_sqlite::SqlitePool) -> Vec<PlaceHedge> {
+        let payloads: Vec<Vec<u8>> =
+            sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE job_type = ?")
+                .bind(hedge_job_type())
+                .fetch_all(apalis_pool)
+                .await
+                .unwrap();
+
+        payloads
+            .iter()
+            .map(|payload| serde_json::from_slice(payload).unwrap())
+            .collect()
+    }
+
+    /// A symbol listed only on a watched secondary chain is still swept by
+    /// the backstop: its inline hedge can defer (broker outage, dead letter),
+    /// and this scan is the only path that retries it. The hedge is sized by
+    /// that chain's operational limit, not the primary's table (which does
+    /// not list the symbol at all).
+    #[tokio::test]
+    async fn backstop_hedges_a_symbol_enabled_only_on_a_secondary_chain() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let coin = Symbol::new("COIN").unwrap();
+        let ethereum_cap = Positive::new(FractionalShares::new(float!(0.5))).unwrap();
+
+        let mut cfg = dry_run_ctx(&["COIN"], OperationMode::Disabled);
+        let mut ethereum = cfg.chains.primary().clone();
+        ethereum.chain = Chain::Ethereum;
+        ethereum
+            .assets
+            .equities
+            .symbols
+            .get_mut(&coin)
+            .unwrap()
+            .operational_limit = Some(ethereum_cap);
+        cfg.chains.primary_mut().assets.equities.symbols.clear();
+        cfg.chains.insert_secondary(ethereum);
+
+        let (ctx, position) = build_ctx(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+        )
+        .await;
+        accumulate_position(
+            &position,
+            &coin,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let jobs = load_hedge_jobs(&apalis_pool).await;
+        assert_eq!(
+            jobs.len(),
+            1,
+            "a symbol enabled on a secondary chain must be swept by the backstop"
+        );
+        assert_eq!(jobs[0].symbol, coin);
+        assert_eq!(
+            jobs[0].shares, ethereum_cap,
+            "the backstop must size with the enabling chain's operational limit"
+        );
+    }
+
     #[tokio::test]
     async fn no_positions_above_threshold_enqueues_no_hedge_jobs() {
         let (pool, apalis_pool) = setup_test_pools().await;
