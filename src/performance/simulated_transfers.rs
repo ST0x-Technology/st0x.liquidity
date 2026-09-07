@@ -41,7 +41,8 @@ use st0x_tokenization::{
     tokenization_request_id,
 };
 use st0x_wrapper::{
-    UnderlyingPerWrapped, UnwrapConfirmation, WrapConfirmation, Wrapper, WrapperError,
+    UnderlyingPerWrapped, UnwrapConfirmation, UnwrappedToken, WrapConfirmation, Wrapper,
+    WrapperError,
 };
 
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
@@ -167,7 +168,7 @@ impl Tokenizer for FixtureTokenizer {
 
     async fn send_for_redemption(
         &self,
-        _token: Address,
+        _token: UnwrappedToken,
         _amount: U256,
     ) -> Result<TxHash, TokenizerError> {
         Ok(TxHash::left_padding_from(
@@ -914,6 +915,10 @@ impl Wrapper for FixtureWrapper {
         unimplemented!("FixtureWrapper: redemption fixture never calls lookup_derivative")
     }
 
+    async fn attest_underlying(&self, _symbol: &Symbol) -> Result<UnwrappedToken, WrapperError> {
+        Ok(UnwrappedToken::unchecked(self.underlying_token))
+    }
+
     async fn to_wrapped(
         &self,
         _wrapped_token: Address,
@@ -983,6 +988,7 @@ impl Wrapper for FixtureWrapper {
             .ok_or(WrapperError::MissingWithdrawEvent)?;
 
         Ok(UnwrapConfirmation {
+            token: UnwrappedToken::unchecked(self.underlying_token),
             assets,
             block: self.unwrap_block,
         })

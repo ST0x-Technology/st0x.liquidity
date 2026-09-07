@@ -190,10 +190,11 @@ async fn donate_equity_with_wrapper<Writer: Write, WrapperImpl: Wrapper + ?Sized
     Ok(())
 }
 
-/// The wallet and symbol to address map a wrap or unwrap runs against.
-struct WrapContext {
-    wallet: Arc<dyn Wallet<Provider = RootProvider>>,
-    equities: HashMap<Symbol, WrappedEquity>,
+/// The wallet and symbol to address map a wrap, unwrap or redemption runs
+/// against.
+pub(super) struct WrapContext {
+    pub(super) wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    pub(super) equities: HashMap<Symbol, WrappedEquity>,
 }
 
 /// Resolves the wallet and the symbol to address map for a wrap or unwrap.
@@ -203,7 +204,7 @@ struct WrapContext {
 /// and a stray one on Base is rejected instead of silently ignored. The
 /// resolved map must contain the requested symbol so a typo fails here with
 /// the available symbols instead of deeper in the vault call.
-fn wrap_context(
+pub(super) fn wrap_context(
     ctx: &Ctx,
     network: TokenizationNetwork,
     registry: Option<&PathBuf>,

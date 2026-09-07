@@ -45,6 +45,7 @@ use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerAuth, AuthRuntime, Backpressure, FractionalShares, KmsJwtError,
     Network, PollingConfig, Symbol, retry_after_from_response_headers,
 };
+use st0x_wrapper::UnwrappedToken;
 
 use super::{
     IssuerRequestId, MintVerificationError, TokenizationRequestId, Tokenizer, TokenizerError,
@@ -134,7 +135,7 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
     /// Send tokens to the redemption wallet to initiate a redemption.
     pub(crate) async fn send_for_redemption<Registry: IntoErrorRegistry>(
         &self,
-        token: Address,
+        token: UnwrappedToken,
         amount: U256,
     ) -> Result<TxHash, AlpacaTokenizationError> {
         self.client
@@ -790,7 +791,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
     /// - `Evm(EvmError)` if the ERC20 transfer transaction fails
     async fn send_tokens_for_redemption<Registry: IntoErrorRegistry>(
         &self,
-        token: Address,
+        token: UnwrappedToken,
         amount: U256,
     ) -> Result<TxHash, AlpacaTokenizationError> {
         let redemption_wallet = self
@@ -800,7 +801,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         let receipt = self
             .wallet
             .submit::<Registry, _>(
-                token,
+                token.address(),
                 IERC20::transferCall {
                     to: redemption_wallet,
                     amount,
@@ -1087,7 +1088,7 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
 
     async fn send_for_redemption(
         &self,
-        token: Address,
+        token: UnwrappedToken,
         amount: U256,
     ) -> Result<TxHash, TokenizerError> {
         Ok(Self::send_for_redemption::<OpenChainErrorRegistry>(self, token, amount).await?)
@@ -1812,7 +1813,10 @@ pub(crate) mod tests {
         let transfer_amount = U256::from(100_000u64);
 
         client
-            .send_tokens_for_redemption::<OpenChainErrorRegistry>(token_address, transfer_amount)
+            .send_tokens_for_redemption::<OpenChainErrorRegistry>(
+                UnwrappedToken::unchecked(token_address),
+                transfer_amount,
+            )
             .await
             .unwrap();
 
@@ -1889,7 +1893,10 @@ pub(crate) mod tests {
 
         let transfer_amount = U256::from(100_000u64);
         let err = client
-            .send_tokens_for_redemption::<OpenChainErrorRegistry>(token_address, transfer_amount)
+            .send_tokens_for_redemption::<OpenChainErrorRegistry>(
+                UnwrappedToken::unchecked(token_address),
+                transfer_amount,
+            )
             .await
             .unwrap_err();
 

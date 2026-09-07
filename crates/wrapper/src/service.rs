@@ -19,8 +19,8 @@ use st0x_evm::{
 use st0x_execution::Symbol;
 
 use crate::{
-    UnderlyingPerWrapped, UnwrapConfirmation, WrapConfirmation, WrappedEquity, Wrapper,
-    WrapperError,
+    UnderlyingPerWrapped, UnwrapConfirmation, UnwrappedToken, WrapConfirmation, WrappedEquity,
+    Wrapper, WrapperError,
 };
 
 sol!(
@@ -127,6 +127,28 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))?;
 
         Ok(asset.derivative)
+    }
+
+    async fn attest_underlying(&self, symbol: &Symbol) -> Result<UnwrappedToken, WrapperError> {
+        let equity = self
+            .lookup_equity(symbol)
+            .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))?;
+
+        let attested: Address = self
+            .wallet
+            .call::<OpenChainErrorRegistry, _>(equity.derivative, IERC4626::assetCall {})
+            .await?;
+
+        if attested != equity.underlying {
+            return Err(WrapperError::VaultAssetMismatch {
+                symbol: symbol.clone(),
+                vault: equity.derivative,
+                configured: equity.underlying,
+                attested,
+            });
+        }
+
+        Ok(UnwrappedToken(attested))
     }
 
     async fn to_wrapped(
@@ -368,7 +390,16 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             })
             .ok_or(WrapperError::MissingWithdrawEvent)?;
 
-        Ok(UnwrapConfirmation { assets, block })
+        let token: Address = self
+            .wallet
+            .call::<OpenChainErrorRegistry, _>(wrapped_token, IERC4626::assetCall {})
+            .await?;
+
+        Ok(UnwrapConfirmation {
+            token: UnwrappedToken(token),
+            assets,
+            block,
+        })
     }
 
     async fn wait_for_block(&self, block: u64) -> Result<(), WrapperError> {

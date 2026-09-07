@@ -11,6 +11,7 @@ mock = []
 [dependencies]
 alloy.workspace = true
 async-trait.workspace = true
+serde.workspace = true
 st0x-evm.workspace = true
 st0x-execution.workspace = true
 thiserror.workspace = true

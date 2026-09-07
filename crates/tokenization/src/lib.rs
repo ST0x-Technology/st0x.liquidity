@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use st0x_evm::EvmError;
 use st0x_execution::{Backpressure, FractionalShares, Symbol};
+use st0x_wrapper::UnwrappedToken;
 
 pub use alpaca::{
     AlpacaApiErrorMessage, AlpacaTokenizationError, AlpacaTokenizationService, TokenizationRequest,
@@ -231,10 +232,12 @@ pub trait Tokenizer: Send + Sync {
     /// catching up gives no guarantee about the tokenizer's provider.
     async fn wait_for_block(&self, block: u64) -> Result<(), EvmError>;
 
-    /// Send tokens to the redemption wallet to initiate redemption.
+    /// Send tokens to the redemption wallet to initiate redemption. Only a
+    /// wrapper-attested [`UnwrappedToken`] is accepted, so a wrapped ERC-4626
+    /// share can never be handed to the issuer.
     async fn send_for_redemption(
         &self,
-        token: Address,
+        token: UnwrappedToken,
         amount: U256,
     ) -> Result<TxHash, TokenizerError>;
 

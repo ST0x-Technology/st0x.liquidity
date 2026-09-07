@@ -76,7 +76,7 @@ use st0x_execution::Symbol;
 use st0x_finance::{FractionalShares, Id};
 use st0x_tokenization::TokenizationRequestId;
 use st0x_tokenization::Tokenizer;
-use st0x_wrapper::WrapperError;
+use st0x_wrapper::{UnwrappedToken, WrapperError};
 
 use crate::bot_gas::{
     BotGasEnqueueFailure, BotGasOperationCategory, BotGasReceiptCostEnqueuer,
@@ -194,6 +194,18 @@ pub enum EquityRedemptionError {
     UnderlyingLookupFailed {
         symbol: Symbol,
         error_message: String,
+    },
+    /// The vault reported an `asset()` other than the configured underlying:
+    /// the unwrap delivered a token the config does not describe, so neither
+    /// address is trusted for the issuer transfer.
+    #[error(
+        "Unwrap of {symbol} delivered {delivered}, \
+         but the configured underlying is {configured}"
+    )]
+    UnwrapDeliveredUnexpectedToken {
+        symbol: Symbol,
+        configured: Address,
+        delivered: Address,
     },
     /// Transaction failed with a known tx hash
     #[error("Transaction failed: {tx_hash}")]
@@ -447,7 +459,7 @@ pub enum EquityRedemptionEvent {
             deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
         )]
         quantity: Option<Float>,
-        underlying_token: Address,
+        underlying_token: UnwrappedToken,
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
         /// Block number in which the unwrap tx confirmed.
@@ -901,7 +913,7 @@ pub enum EquityRedemption {
         )]
         quantity: Float,
         token: Address,
-        underlying_token: Address,
+        underlying_token: UnwrappedToken,
         raindex_withdraw_tx: TxHash,
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
@@ -921,7 +933,7 @@ pub enum EquityRedemption {
         )]
         quantity: Float,
         token: Address,
-        underlying_token: Address,
+        underlying_token: UnwrappedToken,
         raindex_withdraw_tx: TxHash,
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
@@ -1645,7 +1657,7 @@ impl EventSourced for EquityRedemption {
                 } => Some(Self::TokensSent {
                     symbol: symbol.clone(),
                     quantity: *quantity,
-                    token: *underlying_token,
+                    token: underlying_token.address(),
                     raindex_withdraw_tx: *raindex_withdraw_tx,
                     unwrap_tx_hash: Some(*unwrap_tx_hash),
                     redemption_wallet: *redemption_wallet,
@@ -2280,7 +2292,7 @@ impl EquityRedemption {
                 unwrap_tx_hash,
                 ..
             } => {
-                let underlying_token = services
+                let configured = services
                     .wrapper
                     .lookup_underlying(symbol)
                     .inspect_err(|error| {
@@ -2303,6 +2315,20 @@ impl EquityRedemption {
                         wrapped_amount: *wrapped_amount,
                         error_message: error.to_string(),
                     })?;
+                let underlying_token = unwrap_confirmation.token;
+                if underlying_token.address() != configured {
+                    warn!(
+                        target: "rebalance",
+                        %symbol, %configured, delivered = %underlying_token,
+                        "Unwrap delivered a token other than the configured underlying"
+                    );
+                    return Err(EquityRedemptionError::UnwrapDeliveredUnexpectedToken {
+                        symbol: symbol.clone(),
+                        configured,
+                        delivered: underlying_token.address(),
+                    });
+                }
+
                 let unwrapped_amount = unwrap_confirmation.assets;
                 let unwrap_block = unwrap_confirmation.block;
                 let quantity =
@@ -3018,7 +3044,7 @@ mod tests {
     fn tokens_unwrapped_event() -> EquityRedemptionEvent {
         EquityRedemptionEvent::TokensUnwrapped {
             quantity: Some(float!(50.25)),
-            underlying_token: Address::random(),
+            underlying_token: UnwrappedToken::unchecked(Address::random()),
             unwrap_tx_hash: TxHash::random(),
             unwrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
             unwrap_block: None,
@@ -3555,7 +3581,7 @@ mod tests {
             mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
-        let underlying_token = Address::random();
+        let underlying_token = UnwrappedToken::unchecked(Address::random());
         let send_pending = EquityRedemption::SendPending {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(10),
@@ -5099,7 +5125,7 @@ mod tests {
             symbol: symbol.clone(),
             quantity: float!(50.25),
             token: Address::random(),
-            underlying_token: Address::random(),
+            underlying_token: UnwrappedToken::unchecked(Address::random()),
             raindex_withdraw_tx: TxHash::random(),
             unwrap_tx_hash: TxHash::random(),
             unwrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
@@ -5557,7 +5583,7 @@ mod tests {
                 withdrawn_from_raindex_event(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: Some(float!(1.0)),
-                    underlying_token: Address::ZERO,
+                    underlying_token: UnwrappedToken::unchecked(Address::ZERO),
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
                     unwrap_block: Some(unwrap_block),
@@ -5612,7 +5638,7 @@ mod tests {
                 withdrawn_from_raindex_event(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: Some(float!(1.0)),
-                    underlying_token: Address::ZERO,
+                    underlying_token: UnwrappedToken::unchecked(Address::ZERO),
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
                     unwrap_block: None,
@@ -5664,7 +5690,7 @@ mod tests {
                 withdrawn_from_raindex_event(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: Some(float!(1.0)),
-                    underlying_token: Address::ZERO,
+                    underlying_token: UnwrappedToken::unchecked(Address::ZERO),
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
                     unwrap_block: Some(required_block),
@@ -6080,7 +6106,7 @@ mod tests {
                 symbol: sym.clone(),
                 quantity: float!(1),
                 token: Address::ZERO,
-                underlying_token: Address::ZERO,
+                underlying_token: UnwrappedToken::unchecked(Address::ZERO),
                 raindex_withdraw_tx: TxHash::default(),
                 unwrap_tx_hash: TxHash::default(),
                 unwrapped_amount: U256::ZERO,
@@ -6096,7 +6122,7 @@ mod tests {
                 symbol: sym.clone(),
                 quantity: float!(1),
                 token: Address::ZERO,
-                underlying_token: Address::ZERO,
+                underlying_token: UnwrappedToken::unchecked(Address::ZERO),
                 raindex_withdraw_tx: TxHash::default(),
                 unwrap_tx_hash: TxHash::default(),
                 unwrapped_amount: U256::ZERO,
