@@ -97,6 +97,24 @@ pub struct UsdcSettlementParams {
     pub message_transmitter: Address,
 }
 
+/// Identifies the market-making endpoints for bridged USDC.
+///
+/// `wallet` receives or sends the bridged funds. `vault_id` identifies the
+/// Raindex vault used for inventory, which managed-inventory deployments may
+/// own through a separate inventory contract.
+#[derive(Debug, Clone, Copy)]
+pub struct MarketMakingUsdcEndpoints {
+    wallet: Address,
+    vault_id: RaindexVaultId,
+}
+
+impl MarketMakingUsdcEndpoints {
+    #[must_use]
+    pub const fn new(wallet: Address, vault_id: RaindexVaultId) -> Self {
+        Self { wallet, vault_id }
+    }
+}
+
 /// Ethereum-specific helpers used by [`CrossVenueCashTransfer`] that fall
 /// outside the generic [`Bridge`] interface (chain-specific queries, USDC
 /// transfers, and scan utilities). Defined here so the struct can be generic
@@ -253,8 +271,6 @@ pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>
     gas_readiness: ConfiguredGasReadiness,
     /// Enqueues bot-gas cost recording after CCTP burn/mint confirmations and
     /// the USDC-to-Alpaca wallet transfer succeed (ADR 0017).
-    /// Defaults to `Disabled`; production wiring opts in via
-    /// [`Self::with_bot_gas_enqueuer`].
     bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
 }
 
@@ -316,9 +332,9 @@ impl<
         cctp_bridge: Arc<B>,
         raindex: Arc<RaindexService<Signer>>,
         cqrs: Arc<Store<UsdcRebalance>>,
-        market_maker_wallet: Address,
-        vault_id: RaindexVaultId,
+        market_making_endpoints: MarketMakingUsdcEndpoints,
         settlement: &UsdcSettlementParams,
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
     ) -> Self {
         Self {
             alpaca_broker,
@@ -326,13 +342,13 @@ impl<
             cctp_bridge,
             raindex,
             cqrs,
-            market_maker_wallet,
-            vault_id,
+            market_maker_wallet: market_making_endpoints.wallet,
+            vault_id: market_making_endpoints.vault_id,
             attestation_retry_deadline: settlement.attestation_retry_deadline,
             required_confirmations: settlement.required_confirmations,
             reserved_cash: settlement.reserved_cash,
             gas_readiness: ConfiguredGasReadiness::default(),
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            bot_gas_enqueuer,
         }
     }
 
@@ -340,14 +356,6 @@ impl<
     #[must_use]
     pub fn with_gas_readiness(mut self, readiness: Arc<GasReadiness>) -> Self {
         self.gas_readiness = ConfiguredGasReadiness::Wired(readiness);
-        self
-    }
-
-    /// Opts this transfer into bot-gas cost recording. Called at the
-    /// production wiring site only; CLI and test construction leave the
-    /// `Disabled` default from [`Self::new`].
-    pub(crate) fn with_bot_gas_enqueuer(mut self, enqueuer: BotGasReceiptCostEnqueuer) -> Self {
-        self.bot_gas_enqueuer = enqueuer;
         self
     }
 
@@ -5814,9 +5822,12 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            address!("0x1111111111111111111111111111111111111111"),
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(
+                address!("0x1111111111111111111111111111111111111111"),
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         )
         .with_gas_readiness(crate::native_gas::GasReadiness::for_test(
             U256::MAX,
@@ -5887,9 +5898,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // Mock conversion order (conversion happens before withdrawal)
@@ -5947,9 +5958,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // Mock conversion order (conversion happens before withdrawal)
@@ -6014,9 +6025,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // Mock conversion order (conversion happens before withdrawal)
@@ -6075,9 +6086,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -6123,9 +6134,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -6166,9 +6177,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // Mock the conversion order placement (POST)
@@ -6216,9 +6227,12 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            address!("0x1111111111111111111111111111111111111111"),
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(
+                address!("0x1111111111111111111111111111111111111111"),
+                TEST_VAULT_ID,
+            ),
             &settlement,
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let rejected = server.mock(|when, then| {
@@ -6667,9 +6681,12 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            address!("0x1111111111111111111111111111111111111111"),
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(
+                address!("0x1111111111111111111111111111111111111111"),
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let placement_mock = server.mock(|when, then| {
@@ -6740,9 +6757,12 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            address!("0x1111111111111111111111111111111111111111"),
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(
+                address!("0x1111111111111111111111111111111111111111"),
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let placement_mock = server.mock(|when, then| {
@@ -6804,9 +6824,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // Mock the conversion order - will be called but CQRS command will fail
@@ -6862,9 +6882,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // Order starts as pending
@@ -6911,9 +6931,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // Order starts as pending
@@ -7037,9 +7057,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // Order starts as pending then gets rejected
@@ -7093,9 +7113,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // Mock order placement to fail with 500 error
@@ -7171,9 +7191,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let order_mock = server.mock(|when, then| {
@@ -7255,9 +7275,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let order_mock = server.mock(|when, then| {
@@ -7330,9 +7350,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // Mock conversion order - MUST be called before withdrawal, and MUST
@@ -7407,9 +7427,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // The post-deposit conversion MUST be sized as a qty sell (the
@@ -7481,9 +7501,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // Order starts as pending
@@ -7560,9 +7580,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // Mock that should NOT be called - if InitiateConversion fails, no order should be placed
@@ -7628,9 +7648,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // Mock order placement to fail with API error
@@ -7695,9 +7715,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let _order_mock =
@@ -7753,9 +7773,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // Request 1000, but only 999.5 fills due to slippage
@@ -7808,9 +7828,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let _order_mock =
@@ -7876,9 +7896,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let _order_mock =
@@ -7950,9 +7970,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let _order_mock =
@@ -8010,9 +8030,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let order_mock = server.mock(|when, then| {
@@ -8095,9 +8115,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let order_mock = server.mock(|when, then| {
@@ -8170,9 +8190,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let _order_mock =
@@ -8243,9 +8263,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let _order_mock =
@@ -8316,9 +8336,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         (manager, cqrs, anvil)
@@ -8355,9 +8375,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         (manager, cqrs, anvil)
@@ -10640,9 +10660,9 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // Drive the aggregate to `Attested`, recording the real burn tx and the
@@ -10825,9 +10845,9 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // Drive to a POST-burn BridgingFailed: InitiateBridging records the burn
@@ -11088,9 +11108,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -11146,9 +11166,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -11434,9 +11454,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            chain.bot_address,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(chain.bot_address, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         )
     }
 
@@ -11893,9 +11913,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         (manager, cqrs)
@@ -11931,9 +11951,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         (manager, cqrs)
@@ -14432,9 +14452,9 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            chains.bot_address,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -14851,9 +14871,9 @@ mod tests {
             Arc::clone(&mock_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            recipient,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(recipient, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let submission = manager.submit_and_record_burn(
@@ -14929,9 +14949,12 @@ mod tests {
             }),
             Arc::new(vault_service),
             cqrs.clone(),
-            address!("0x2222222222222222222222222222222222222222"),
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(
+                address!("0x2222222222222222222222222222222222222222"),
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let initiated_at = Utc::now() - chrono::Duration::minutes(30);
@@ -15009,9 +15032,12 @@ mod tests {
             }),
             Arc::new(vault_service),
             cqrs.clone(),
-            address!("0x2222222222222222222222222222222222222222"),
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(
+                address!("0x2222222222222222222222222222222222222222"),
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let initiated_at = Utc::now() - chrono::Duration::minutes(30);
@@ -15125,9 +15151,12 @@ mod tests {
             }),
             Arc::new(vault_service),
             cqrs.clone(),
-            address!("0x2222222222222222222222222222222222222222"),
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(
+                address!("0x2222222222222222222222222222222222222222"),
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let error = manager
@@ -15210,9 +15239,12 @@ mod tests {
             }),
             Arc::new(vault_service),
             cqrs.clone(),
-            address!("0x2222222222222222222222222222222222222222"),
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(
+                address!("0x2222222222222222222222222222222222222222"),
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let error = manager
@@ -15282,9 +15314,12 @@ mod tests {
             }),
             Arc::new(vault_service),
             cqrs.clone(),
-            address!("0x2222222222222222222222222222222222222222"),
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(
+                address!("0x2222222222222222222222222222222222222222"),
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let error = manager
@@ -15360,11 +15395,10 @@ mod tests {
             Arc::new(bridge),
             Arc::new(vault_service),
             cqrs,
-            recipient,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(recipient, TEST_VAULT_ID),
             &test_settlement_params(),
-        )
-        .with_bot_gas_enqueuer(BotGasReceiptCostEnqueuer::Enabled(queue));
+            BotGasReceiptCostEnqueuer::Enabled(queue),
+        );
 
         (manager, apalis_pool, server)
     }
@@ -15919,9 +15953,9 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            chains.bot_address,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let ethereum_provider = ProviderBuilder::new()
@@ -16297,9 +16331,9 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            chains.bot_address,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // A REVERT-opcode tx (PUSH1 0, PUSH1 0, REVERT): explicit gas skips
@@ -16438,9 +16472,9 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            chains.bot_address,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let ethereum_provider = ProviderBuilder::new()
@@ -16666,9 +16700,9 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            chains.bot_address,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let base_provider = ProviderBuilder::new()
@@ -16750,9 +16784,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // The bridge's Base wallet (Anvil account 0) is the address a reburn would
@@ -16856,9 +16890,9 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            chains.bot_address,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // A REVERT-opcode tx (PUSH1 0, PUSH1 0, REVERT): explicit gas skips
@@ -16958,9 +16992,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -17015,9 +17049,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -17134,9 +17168,9 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            chains.bot_address,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let error = manager
@@ -17263,9 +17297,9 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            chains.bot_address,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -17404,9 +17438,9 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            chains.bot_address,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -17493,9 +17527,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            market_maker_wallet,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         // The bridge's Base wallet (Anvil account 0) is the address a reburn would
@@ -17626,9 +17660,9 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            chains.bot_address,
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -17732,9 +17766,9 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            wallet.address(),
-            TEST_VAULT_ID,
+            MarketMakingUsdcEndpoints::new(wallet.address(), TEST_VAULT_ID),
             &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         (manager, cqrs)

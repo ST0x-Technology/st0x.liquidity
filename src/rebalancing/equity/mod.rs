@@ -716,8 +716,7 @@ pub struct CrossVenueEquityTransfer {
     mint_store: Arc<Store<TokenizedEquityMint>>,
     redemption_store: Arc<Store<EquityRedemption>>,
     /// Enqueues bot-gas cost recording after vault deposit / wrap
-    /// confirmations succeed (ADR 0017). Defaults to `Disabled`;
-    /// production wiring opts in via [`Self::with_bot_gas_enqueuer`].
+    /// confirmations succeed (ADR 0017).
     bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
     /// Mint-authorization capability for orchestrator-mode assets
     /// (RAI-1243). Defaults to [`ConfiguredMintAuthorization::VaultDirectOnly`]
@@ -769,6 +768,7 @@ impl CrossVenueEquityTransfer {
         wallet: Address,
         mint_store: Arc<Store<TokenizedEquityMint>>,
         redemption_store: Arc<Store<EquityRedemption>>,
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
     ) -> Self {
         Self {
             raindex,
@@ -778,7 +778,7 @@ impl CrossVenueEquityTransfer {
             wallet,
             mint_store,
             redemption_store,
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            bot_gas_enqueuer,
             mint_authorization: ConfiguredMintAuthorization::VaultDirectOnly,
             gas_readiness: ConfiguredGasReadiness::default(),
         }
@@ -788,14 +788,6 @@ impl CrossVenueEquityTransfer {
     #[must_use]
     pub fn with_gas_readiness(mut self, readiness: Arc<GasReadiness>) -> Self {
         self.gas_readiness = ConfiguredGasReadiness::Wired(readiness);
-        self
-    }
-
-    /// Opts this transfer into bot-gas cost recording. Called at the
-    /// production wiring site only; CLI and test construction leave the
-    /// `Disabled` default from [`Self::new`].
-    pub(crate) fn with_bot_gas_enqueuer(mut self, enqueuer: BotGasReceiptCostEnqueuer) -> Self {
-        self.bot_gas_enqueuer = enqueuer;
         self
     }
 
@@ -2445,6 +2437,7 @@ mod tests {
             address!("0x0000000000000000000000000000000000000001"),
             mint_store,
             redemption_store,
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let outcome = transfer.recover_mint(&id, &pool, &service).await.unwrap();
@@ -2590,6 +2583,7 @@ mod tests {
             address!("0x0000000000000000000000000000000000000001"),
             mint_store,
             redemption_store,
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let outcome = transfer.recover_mint(&id, &pool, &service).await.unwrap();
@@ -2967,6 +2961,7 @@ mod tests {
             address!("0x0000000000000000000000000000000000000001"),
             mint_store,
             redemption_store,
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         (transfer, service, pool)
@@ -3012,9 +3007,26 @@ mod tests {
             Address::random(),
             mint_store,
             redemption_store,
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         (transfer, pool)
+    }
+
+    fn recreate_equity_transfer_with_bot_gas_enqueuer(
+        transfer: &CrossVenueEquityTransfer,
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
+    ) -> CrossVenueEquityTransfer {
+        CrossVenueEquityTransfer::new(
+            transfer.raindex.clone(),
+            transfer.vault_lookup.clone(),
+            transfer.tokenizer.clone(),
+            transfer.wrapper.clone(),
+            transfer.wallet,
+            transfer.mint_store.clone(),
+            transfer.redemption_store.clone(),
+            bot_gas_enqueuer,
+        )
     }
 
     async fn advance_redemption_to_tokens_sent(
@@ -3137,8 +3149,8 @@ mod tests {
             Address::random(),
             mint_store,
             redemption_store,
-        )
-        .with_bot_gas_enqueuer(BotGasReceiptCostEnqueuer::Enabled(queue));
+            BotGasReceiptCostEnqueuer::Enabled(queue),
+        );
 
         let symbol = Symbol::new("AAPL").unwrap();
         transfer
@@ -3195,8 +3207,8 @@ mod tests {
             Address::random(),
             mint_store,
             redemption_store,
-        )
-        .with_bot_gas_enqueuer(BotGasReceiptCostEnqueuer::Enabled(queue));
+            BotGasReceiptCostEnqueuer::Enabled(queue),
+        );
 
         let error = transfer
             .resume_equity_to_market_making(
@@ -3236,8 +3248,8 @@ mod tests {
             Address::random(),
             mint_store,
             redemption_store,
-        )
-        .with_bot_gas_enqueuer(BotGasReceiptCostEnqueuer::Enabled(queue));
+            BotGasReceiptCostEnqueuer::Enabled(queue),
+        );
 
         let id = issuer_request_id("ISS-BOT-GAS-DEPOSIT-FAIL");
         transfer
@@ -3382,6 +3394,7 @@ mod tests {
             Address::random(),
             mint_store,
             redemption_store,
+            BotGasReceiptCostEnqueuer::Disabled,
         )
         .with_mint_authorization(MintAuthorizationWiring {
             vault_mode_reader: Arc::new(StubVaultModeReader(mode)),
@@ -3614,6 +3627,7 @@ mod tests {
             Address::random(),
             mint_store,
             redemption_store,
+            BotGasReceiptCostEnqueuer::Disabled,
         );
 
         let id = issuer_request_id("ISS-VAULT-DIRECT-ONLY");
@@ -3795,7 +3809,10 @@ mod tests {
         let redemption_tx = advance_redemption_to_tokens_sent(&transfer, &id, &symbol).await;
         let (_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
-        let transfer = transfer.with_bot_gas_enqueuer(BotGasReceiptCostEnqueuer::Enabled(queue));
+        let transfer = recreate_equity_transfer_with_bot_gas_enqueuer(
+            &transfer,
+            BotGasReceiptCostEnqueuer::Enabled(queue),
+        );
 
         transfer.resume_redemption(&id).await.unwrap();
 
@@ -3827,7 +3844,10 @@ mod tests {
         let (_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
         apalis_pool.close().await;
-        let transfer = transfer.with_bot_gas_enqueuer(BotGasReceiptCostEnqueuer::Enabled(queue));
+        let transfer = recreate_equity_transfer_with_bot_gas_enqueuer(
+            &transfer,
+            BotGasReceiptCostEnqueuer::Enabled(queue),
+        );
 
         let error = transfer.resume_redemption(&id).await.unwrap_err();
 
@@ -3939,8 +3959,8 @@ mod tests {
             Address::random(),
             mint_store,
             redemption_store,
-        )
-        .with_bot_gas_enqueuer(BotGasReceiptCostEnqueuer::Enabled(queue));
+            BotGasReceiptCostEnqueuer::Enabled(queue),
+        );
 
         let symbol = Symbol::new("TEST").unwrap();
         let id = redemption_aggregate_id("redeem-bot-gas");

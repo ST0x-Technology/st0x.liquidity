@@ -14,7 +14,7 @@ pub(crate) use job::{
     TransferUsdcToMarketMakingJobQueue,
 };
 pub(crate) use manager::u256_to_usdc;
-pub use manager::{CrossVenueCashTransfer, UsdcSettlementParams};
+pub use manager::{CrossVenueCashTransfer, MarketMakingUsdcEndpoints, UsdcSettlementParams};
 
 use std::time::Duration;
 

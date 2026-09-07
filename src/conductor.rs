@@ -2701,9 +2701,9 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
                 market_maker_wallet,
                 built.mint.clone(),
                 built.redemption.clone(),
+                bot_gas_enqueuer.clone(),
             )
             .with_gas_readiness(gas_readiness.clone())
-            .with_bot_gas_enqueuer(bot_gas_enqueuer.clone())
             .with_mint_authorization(mint_authorization.wiring),
         );
 

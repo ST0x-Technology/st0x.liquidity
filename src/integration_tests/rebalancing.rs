@@ -492,6 +492,7 @@ fn build_equity_transfer_with_wrapper(
         wallet,
         mint_store,
         redemption_store,
+        BotGasReceiptCostEnqueuer::Disabled,
     ))
 }
 
@@ -540,6 +541,7 @@ async fn build_equity_transfer_with_service(
         wallet,
         mint_store,
         redemption_store,
+        BotGasReceiptCostEnqueuer::Disabled,
     ))
 }
 
@@ -2752,6 +2754,7 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
         Address::random(),
         Arc::clone(&mint_store),
         Arc::clone(&redemption_store),
+        BotGasReceiptCostEnqueuer::Disabled,
     ));
     let store = Arc::new(test_store(
         pool.clone(),
@@ -2874,6 +2877,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
         Address::random(),
         Arc::clone(&mint_store),
         Arc::clone(&redemption_store),
+        BotGasReceiptCostEnqueuer::Disabled,
     ));
     let store = Arc::new(test_store(
         pool.clone(),
@@ -3015,6 +3019,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
         Address::random(),
         Arc::clone(&mint_store),
         Arc::clone(&redemption_store),
+        BotGasReceiptCostEnqueuer::Disabled,
     ));
     let store = Arc::new(test_store(
         pool.clone(),
@@ -3148,6 +3153,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
         Address::random(),
         Arc::clone(&mint_store),
         Arc::clone(&redemption_store),
+        BotGasReceiptCostEnqueuer::Disabled,
     ));
     let store = Arc::new(test_store(
         pool.clone(),
