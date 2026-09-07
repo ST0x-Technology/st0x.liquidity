@@ -2,11 +2,12 @@
   pkgs,
   ragenix,
   system,
-  environments,
   environmentConfigs,
 }:
 
 let
+  environments = builtins.attrNames environmentConfigs;
+
   buildInputs = [
     pkgs.terraform
     pkgs.rage
@@ -165,64 +166,69 @@ let
     ${vars.decrypt}
   '';
 
+  dbSnapshotRemoteLifecycle = ''
+    allocate_remote_snapshot() {
+      local remote_snapshot_dir
+      remote_snapshot_dir="$(ssh_remote "mktemp -d /tmp/st0x-hedge-snapshot.XXXXXX")"
+      printf '%s\n' "$remote_snapshot_dir/st0x-hedge.db"
+    }
+
+    cleanup_remote_snapshot() {
+      local remote_snapshot="$1"
+      local remote_snapshot_dir="''${remote_snapshot%/*}"
+      ssh_remote "rm -f '$remote_snapshot'" || true
+      ssh_remote "rmdir '$remote_snapshot_dir'" || true
+    }
+  '';
+
   inherit (import ../keys.nix) tailscaleHost;
 
   mkEnv =
     env:
     let
       envConfig = environmentConfigs.${env};
+      inherit (envConfig) dbSnapshotGcpIap;
       remoteFile = remoteFiles.${env};
       outputKey = "${env}_droplet_ipv4";
       sshInputs = sshBuildInputs ++ [ pkgs.openssh ];
-      dbSnapshotGcpIap = envConfig.dbSnapshotGcpIap or null;
-      dbSnapshotInputs =
-        sshInputs
-        ++ [ pkgs.coreutils ]
-        ++ pkgs.lib.optionals (dbSnapshotGcpIap != null) [ pkgs.google-cloud-sdk ];
+      dbSnapshotInputs = sshInputs ++ [
+        pkgs.coreutils
+        pkgs.google-cloud-sdk
+      ];
 
-      dbSnapshotConnection =
-        if dbSnapshotGcpIap == null then
-          ''
-            ${resolveHost}
+      dbSnapshotConnection = ''
+        ${parseIdentity}
+        : "$identity"
 
-            ssh_remote() {
-              # shellcheck disable=SC2029
-              ssh ''${identity:+-i "$identity"} "root@$host_ip" "$@"
-            }
+        ssh_remote() {
+          gcloud compute ssh ${pkgs.lib.escapeShellArg dbSnapshotGcpIap.instance} \
+            --project=${pkgs.lib.escapeShellArg dbSnapshotGcpIap.project} \
+            --zone=${pkgs.lib.escapeShellArg dbSnapshotGcpIap.zone} \
+            --tunnel-through-iap \
+            --quiet \
+            --command="$*"
+        }
 
-            download_remote_snapshot() {
-              scp ''${identity:+-i "$identity"} "root@$host_ip:$remote_snapshot" "$local_snapshot"
-            }
+        download_remote_snapshot() {
+          local remote_snapshot="$1"
+          local local_snapshot="$2"
+          gcloud compute scp \
+            ${pkgs.lib.escapeShellArg "${dbSnapshotGcpIap.instance}:"}"$remote_snapshot" \
+            "$local_snapshot" \
+            --project=${pkgs.lib.escapeShellArg dbSnapshotGcpIap.project} \
+            --zone=${pkgs.lib.escapeShellArg dbSnapshotGcpIap.zone} \
+            --tunnel-through-iap \
+            --quiet
+        }
 
-            create_remote_snapshot() {
-              ssh_remote "sqlite3 $db_path \"VACUUM INTO '$remote_snapshot'\""
-            }
-          ''
-        else
-          ''
-            _cleanup_identity() { :; }
+        create_remote_snapshot() {
+          local db_path="$1"
+          local remote_snapshot="$2"
+          ssh_remote "python3 -c 'import sqlite3, sys; connection = sqlite3.connect(sys.argv[1], uri=True); connection.execute(\"VACUUM INTO ?\", (sys.argv[2],)); connection.close()' 'file:$db_path?mode=ro' '$remote_snapshot'"
+        }
 
-            ssh_remote() {
-              gcloud compute ssh ${pkgs.lib.escapeShellArg dbSnapshotGcpIap.instance} \
-                --project=${pkgs.lib.escapeShellArg dbSnapshotGcpIap.project} \
-                --zone=${pkgs.lib.escapeShellArg dbSnapshotGcpIap.zone} \
-                --tunnel-through-iap \
-                --command="$1"
-            }
-
-            download_remote_snapshot() {
-              gcloud compute scp \
-                ${pkgs.lib.escapeShellArg "${dbSnapshotGcpIap.instance}:"}"$remote_snapshot" \
-                "$local_snapshot" \
-                --project=${pkgs.lib.escapeShellArg dbSnapshotGcpIap.project} \
-                --zone=${pkgs.lib.escapeShellArg dbSnapshotGcpIap.zone} \
-                --tunnel-through-iap
-            }
-
-            create_remote_snapshot() {
-              ssh_remote "python3 -c 'import sqlite3; connection = sqlite3.connect(\"file:$db_path?mode=ro\", uri=True); connection.execute(\"VACUUM INTO ?\", (\"$remote_snapshot\",)); connection.close()'"
-            }
-          '';
+        ${dbSnapshotRemoteLifecycle}
+      '';
 
       resolveIp = ''
         ${parseIdentity}
@@ -279,21 +285,18 @@ let
           trap _cleanup_identity EXIT
 
           db_path="/mnt/data/st0x-hedge.db"
-          remote_snapshot="/tmp/st0x-hedge-snapshot-$(date -u +%Y%m%d%H%M%S).db"
           out_dir="''${1:-./.tmp/$(date -u +%Y-%m-%d_%H-%M-%S)-${env}-db-snapshot}"
           mkdir -p "$out_dir"
           local_snapshot="$out_dir/st0x-hedge.db"
 
-          echo "Taking a consistent snapshot of ${env}'s live database..." >&2
-          create_remote_snapshot
+          remote_snapshot="$(allocate_remote_snapshot)"
+          trap 'cleanup_remote_snapshot "$remote_snapshot"; _cleanup_identity' EXIT
 
-          cleanup_remote_snapshot() {
-            ssh_remote "rm -f $remote_snapshot" || true
-          }
-          trap 'cleanup_remote_snapshot; _cleanup_identity' EXIT
+          echo "Taking a consistent snapshot of ${env}'s live database..." >&2
+          create_remote_snapshot "$db_path" "$remote_snapshot"
 
           echo "Downloading snapshot to $local_snapshot..." >&2
-          download_remote_snapshot
+          download_remote_snapshot "$remote_snapshot" "$local_snapshot"
 
           echo "$local_snapshot"
         '';
@@ -472,6 +475,7 @@ in
 {
   inherit
     buildInputs
+    dbSnapshotRemoteLifecycle
     sshBuildInputs
     parseIdentity
     ;
