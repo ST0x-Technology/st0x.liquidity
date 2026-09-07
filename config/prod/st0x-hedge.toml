@@ -257,10 +257,12 @@ operational_limit = 20000
 # but is refused by the release-time validator until a build that knows
 # the field is tagged: the first liquidity production release after the
 # hand-over must be a version tag, not a config-only release, and
-# config-check stays red on this file until that tag exists. QSEP retired
-# per the previous in-repo copy.
+# config-check stays red on this file until that tag exists. Empty on
+# purpose: QSEP is still CONFIGURED below (as production runs it), and the
+# schema refuses a symbol that is both configured and retired; retire it
+# by deleting its tables and listing it here in one change.
 [assets.equities]
-retired_symbols = ["QSEP"]
+retired_symbols = []
 
 [assets.equities.RKLB]
 extended_hours_counter_trading = "disabled"
