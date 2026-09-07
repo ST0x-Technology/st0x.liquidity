@@ -307,6 +307,7 @@ pub trait Wrapper: Send + Sync {
 
     /// Wait for a previously submitted unwrap transaction to confirm and
     /// extract the underlying amount received and the block it confirmed in.
+    /// The returned token is the vault's `asset()` read at that block.
     ///
     /// The block number is returned alongside the amount so callers can pass
     /// it to [`Wrapper::wait_for_block`] before submitting any dependent
