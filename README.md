@@ -185,6 +185,14 @@ it:
 cargo run -p st0x-cli -- --config path/to/config.toml --secrets path/to/secrets.toml wrap-equity --symbol RKLB --quantity 0.1 --network ethereum --registry path/to/st0x.registry/token-lists/ethereum.json
 ```
 
+The vault, allowance, transfer and dividend commands take the same `--network`
+flag and run on that chain's `[chains.<name>.trading]` table (no `--registry`:
+they need the chain's orderbook):
+
+```bash
+cargo run -p st0x-cli -- --config path/to/config.toml --secrets path/to/secrets.toml vault-deposit --amount 10 --token 0x... --vault-id 0x... --network ethereum
+```
+
 Manual cancellation of an open Alpaca order by the id printed at placement:
 
 ```bash

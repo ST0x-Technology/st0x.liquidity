@@ -11,6 +11,17 @@ stox <command> [options]
 Use `stox --help` to list all commands and `stox <command> --help` for details
 on any specific command.
 
+Every command that submits an onchain operation takes `--network` (`base`,
+`ethereum`, `hyperevm`; default `base`) and runs on that chain's signing wallet
+and `[chains.<name>.trading]` table: orderbook, inventory, vault owner, asset
+table and redemption wallet. A network with no trading table is refused by name;
+the primary's addresses are never substituted. Where a command needs USDC it
+uses the selected chain's canonical contract, refused on a chain this build pins
+none for (HyperEVM). The wrap, unwrap and redeem commands additionally accept
+`--registry` for a chain that lists an asset but runs no orderbook; the vault,
+allowance, transfer and dividend commands do not, since they need the orderbook
+a trading table provides.
+
 ## Running the CLI on GCP
 
 The bot OCI image ships `/bin/st0x-cli` alongside the server, so on the GCP VMs
@@ -127,6 +138,13 @@ s01 dividend-bump -s COIN -q 10
 buy, tokenize, and donate from the **market-making** wallet, not the issuer. To
 use `stox` you must pass the issuer `--config`/`--secrets` explicitly.
 
+On another chain pass `--network`
+(`s01 dividend-bump -s COIN -q 10 --network ethereum`): the mint lands on that
+chain, the tStock address comes from its
+`[chains.<name>.trading.assets.equities]` entry, and the donation goes into the
+wrapper that table lists, from that chain's wallet. `donate-equity` takes the
+same flag.
+
 The command buys 10 COIN offchain and waits for the fill, tokenizes the exact
 quantity Alpaca reports as filled, then donates that same quantity into the
 wrapper and waits for confirmation. Alpaca may truncate the requested order to
@@ -199,10 +217,49 @@ stox vault-deposit \
   --vault-id <configured-vault-id>
 ```
 
-The commands print the amount, token, wallet, orderbook, vault ID, decimals, and
-smallest-unit amount before submitting the transaction. Verify those values
-match the retired source vault and configured destination vault before relying
-on the printed transaction hash.
+The commands print the chain, amount, token, wallet, orderbook, vault ID,
+decimals, and smallest-unit amount before submitting the transaction. Verify
+those values match the retired source vault and configured destination vault
+before relying on the printed transaction hash. Both take `--network` for a
+vault on another chain; the orderbook and inventory come from that chain's
+`[chains.<name>.trading]` table.
+
+### Funding a New Chain's Inventory
+
+Go-live on a new chain starts with inventory in its Raindex vaults; there is no
+automated path for this, the operator deposits it. Prerequisites, all per chain:
+
+- A `[chains.<name>.trading]` table with the chain's orderbook, inventory, vault
+  owner, asset table and `redemption_wallet`; the bot fails startup without the
+  last one.
+- A signing wallet for the chain in `[wallet]`, funded with native gas, and an
+  `[alerts.low_balance_thresholds]` entry for it (an operator equity transfer
+  refuses a chain without a threshold).
+- Turnkey policies on the chain id for what the wallet submits there: ERC-20
+  `approve`, Raindex `deposit4`/`withdraw4` against the chain's orderbook or
+  inventory, ERC-4626 `deposit`/`redeem` on the wrapper vaults, and the plain
+  ERC-20 `transfer` to the issuer redemption wallet. The deploy gate
+  (`verify-approvals`) proves the approval policies; the rest are exercised by
+  the commands below.
+
+Then, per asset:
+
+```bash
+# mint onto the chain (the tStock address resolves from the chain's asset table)
+stox alpaca-tokenize -s COIN -q 10 --network ethereum -r <liquidity-wallet>
+# wrap into the ERC-4626 vault the chain's asset table lists
+stox wrap-equity -s COIN -q 10 --network ethereum --registry token-lists/ethereum.json
+# deposit the wrapped shares into the configured vault
+stox vault-deposit --amount 10 --token <wrapped-token> --vault-id <vault-id> --network ethereum
+```
+
+For USDC, deposit the chain's canonical USDC into the cash vault the same way
+(`vault-deposit --network ethereum --token <usdc> --vault-id <cash-vault-id>`);
+`vault-withdraw-usdc --network <chain>` reverses it and
+`reset-allowance --network <chain>` zeroes the orderbook's USDC allowance on
+that chain. `transfer-equity --network <chain>` runs a mint or redemption on the
+chain end to end; a resumed mint (`--issuer-request-id`) must be given the
+network it started on, since the aggregate records no chain yet.
 
 ## Alpaca Crypto Wallet Management
 
