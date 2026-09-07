@@ -13,7 +13,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
-use st0x_config::{BrokerCtx, Ctx, OnchainWalletCtx};
+use st0x_config::{BrokerCtx, Ctx, OnchainWalletCtx, TradingChain};
 use st0x_event_sorcery::StoreBuilder;
 use st0x_evm::{
     Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, USDC_BASE, USDC_ETHEREUM, Wallet,
@@ -106,6 +106,49 @@ pub(super) fn tokenization_network_context(
     };
 
     (wallet.clone(), chain)
+}
+
+/// The chain an operator command acts on: its signing wallet and its
+/// `[chains.<name>.trading]` table (orderbook, inventory, vault owner, assets).
+pub(super) struct TradingChainContext<'ctx> {
+    pub(super) chain: Chain,
+    pub(super) wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    pub(super) trading: &'ctx TradingChain,
+}
+
+/// Resolves the selected network's wallet and trading table.
+///
+/// A chain with no trading table is refused by name: a vault operation needs
+/// that chain's orderbook, and the primary's addresses mean nothing there.
+/// The config check runs before the wallet is required, so a misnamed chain
+/// fails without a `[wallet]` section.
+pub(super) fn trading_chain_context(
+    ctx: &Ctx,
+    network: TokenizationNetwork,
+) -> anyhow::Result<TradingChainContext<'_>> {
+    let chain = Chain::from(network);
+    let Some(trading) = ctx.chains.watch(chain) else {
+        anyhow::bail!(
+            "{chain} has no [chains.{chain}.trading] table: vault operations need \
+             that chain's orderbook, and the primary's addresses do not apply there"
+        );
+    };
+
+    let (wallet, chain) = tokenization_network_context(ctx.wallet()?, network);
+
+    Ok(TradingChainContext {
+        chain,
+        wallet,
+        trading,
+    })
+}
+
+/// The canonical USDC on the selected chain, refused by name where this build
+/// pins none: another chain's address would approve or withdraw nothing.
+pub(super) fn chain_usdc(chain: Chain) -> anyhow::Result<Address> {
+    chain
+        .usdc()
+        .with_context(|| format!("no canonical USDC is pinned for {chain} in this build"))
 }
 
 async fn build_equity_transfer_services(
@@ -2941,9 +2984,10 @@ mod tests {
     fn trading_chain_context_refuses_a_network_without_a_trading_table() {
         let ctx = create_ctx_without_rebalancing();
 
-        let error = trading_chain_context(&ctx, TokenizationNetwork::Ethereum)
-            .unwrap_err()
-            .to_string();
+        let Err(error) = trading_chain_context(&ctx, TokenizationNetwork::Ethereum) else {
+            panic!("a chain without a trading table must be refused");
+        };
+        let error = error.to_string();
 
         assert!(
             error.contains("[chains.ethereum.trading]"),
