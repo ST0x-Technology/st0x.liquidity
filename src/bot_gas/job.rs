@@ -44,16 +44,13 @@ pub(crate) type RecordBotGasReceiptCostJobQueue = JobQueue<RecordBotGasReceiptCo
 /// before an enqueue would be attempted. `Disabled` is a deliberate no-op, not
 /// a swallowed failure.
 ///
-/// Every `Enabled` site propagates enqueue errors to its caller, with two
-/// caller-side responses: the USDC cross-venue transfer jobs, the
+/// Every `Enabled` site propagates enqueue errors to its caller. The USDC
+/// cross-venue transfer jobs, the
 /// wrapped/unwrapped equity-recovery jobs, and the equity mint/redemption
 /// transfer jobs all treat the error as non-terminal and delayed-redrive the
 /// job (see each job module's `perform`) so the failure never consumes the
 /// apalis retry budget or trips a supervised worker's fail-stop circuit (ADR
-/// 0017 SS4). `EquityRedemption::SendTokens` is the one exception: it logs
-/// and continues rather than propagating, because retrying the send would
-/// risk sending tokens twice (see SPEC.md's bot-gas "Known gaps" for the
-/// resulting permanent loss of that one cost fact).
+/// 0017 SS4).
 #[derive(Clone)]
 pub enum BotGasReceiptCostEnqueuer {
     Enabled(RecordBotGasReceiptCostJobQueue),
@@ -112,12 +109,13 @@ impl From<&QueuePushError> for QueuePushFailureKind {
     }
 }
 
-/// Shared error payload for a failed bot-gas receipt-cost enqueue, reused by
-/// every aggregate that enqueues one after a confirm step (`EquityRedemption`,
-/// `WrappedEquityRecovery`, `UnwrappedEquityRecovery`). Each of those call
-/// sites is a local SQLite write via apalis, distinct from the onchain
-/// operation it follows, and is safe to retry because the aggregate has not
-/// advanced past the confirmed state yet.
+/// Shared error payload for a failed bot-gas receipt-cost enqueue. Aggregate
+/// confirm sites (`EquityRedemption`, `WrappedEquityRecovery`, and
+/// `UnwrappedEquityRecovery`) use it before advancing past the confirmed
+/// state. The equity transfer manager also uses it after `TokensSent` has
+/// persisted a redemption send. In both cases durable aggregate state retains
+/// the transaction hash, so retrying the accounting write cannot repeat the
+/// onchain operation.
 ///
 /// `QueuePushError` can't be carried as a typed `#[source]`/`#[from]` field on
 /// those aggregates' error enums: `EventSourced::Error` must satisfy

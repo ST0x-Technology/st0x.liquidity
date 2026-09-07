@@ -641,6 +641,8 @@ pub enum RedemptionError {
     Tokenizer(#[from] TokenizerError),
     #[error(transparent)]
     SharesConversion(#[from] SharesConversionError),
+    #[error("Failed to enqueue redemption-send bot-gas receipt cost recording: {0}")]
+    BotGasEnqueue(BotGasEnqueueFailure),
     #[error("Entity not found after command: {aggregate_id}")]
     EntityNotFound { aggregate_id: RedemptionAggregateId },
     #[error("Token send to Alpaca failed: {entity:?}")]
@@ -667,7 +669,8 @@ impl BotGasFailureClassifier for RedemptionError {
         match self {
             Self::Send(AggregateError::UserError(LifecycleError::Apply(
                 EquityRedemptionError::BotGasEnqueueFailed(_),
-            ))) => true,
+            )))
+            | Self::BotGasEnqueue(_) => true,
             Self::GasReadiness(_)
             | Self::Send(_)
             | Self::Raindex(_)
@@ -1410,10 +1413,41 @@ impl CrossVenueEquityTransfer {
         )?;
 
         match entity {
-            EquityRedemption::TokensSent { redemption_tx, .. } => Ok(redemption_tx),
+            EquityRedemption::TokensSent {
+                symbol,
+                redemption_tx,
+                ..
+            } => {
+                self.enqueue_redemption_send_gas_cost(redemption_tx, symbol)
+                    .await?;
+                Ok(redemption_tx)
+            }
             entity @ EquityRedemption::Failed { .. } => Err(RedemptionError::SendFailed { entity }),
             entity => Err(RedemptionError::UnexpectedEntity { entity }),
         }
+    }
+
+    /// Enqueues the gas fact only after `TokensSent` has persisted the
+    /// non-idempotent transfer's hash. A failed queue write can therefore be
+    /// retried from aggregate state without sending tokens again.
+    async fn enqueue_redemption_send_gas_cost(
+        &self,
+        redemption_tx: TxHash,
+        symbol: Symbol,
+    ) -> Result<(), RedemptionError> {
+        self.bot_gas_enqueuer
+            .enqueue(RecordBotGasReceiptCost::for_base_tx(
+                redemption_tx,
+                BotGasOperationCategory::WalletTransfer,
+                symbol,
+            ))
+            .await
+            .map_err(|error| {
+                RedemptionError::BotGasEnqueue(BotGasEnqueueFailure::from_queue_push_error(
+                    redemption_tx,
+                    &error,
+                ))
+            })
     }
 
     /// Polls for redemption detection and records it.
@@ -1572,8 +1606,12 @@ impl CrossVenueEquityTransfer {
                         .send(aggregate_id, EquityRedemptionCommand::SendTokens)
                         .await?;
                 }
-                EquityRedemption::TokensSent { redemption_tx, .. } => {
-                    self.resume_sent_redemption(aggregate_id, &redemption_tx)
+                EquityRedemption::TokensSent {
+                    symbol,
+                    redemption_tx,
+                    ..
+                } => {
+                    self.resume_sent_redemption(aggregate_id, symbol, redemption_tx)
                         .await?;
                 }
                 EquityRedemption::Pending {
@@ -1618,10 +1656,14 @@ impl CrossVenueEquityTransfer {
     async fn resume_sent_redemption(
         &self,
         aggregate_id: &RedemptionAggregateId,
-        redemption_tx: &TxHash,
+        symbol: Symbol,
+        redemption_tx: TxHash,
     ) -> Result<(), RedemptionError> {
         info!(%aggregate_id, "Resuming sent redemption");
-        match self.poll_detection(aggregate_id, redemption_tx).await {
+        self.enqueue_redemption_send_gas_cost(redemption_tx, symbol)
+            .await?;
+
+        match self.poll_detection(aggregate_id, &redemption_tx).await {
             Ok(_) => Ok(()),
             Err(error) => {
                 self.ignore_redemption_error_if_terminal(aggregate_id, error)
@@ -2975,6 +3017,26 @@ mod tests {
         (transfer, pool)
     }
 
+    async fn advance_redemption_to_tokens_sent(
+        transfer: &CrossVenueEquityTransfer,
+        id: &RedemptionAggregateId,
+        symbol: &Symbol,
+    ) -> TxHash {
+        let token = transfer
+            .vault_lookup
+            .vault_token_for_symbol(symbol)
+            .await
+            .unwrap();
+        let quantity = FractionalShares::new(float!(50));
+        let amount = quantity.to_u256_18_decimals().unwrap();
+
+        transfer
+            .withdraw_from_raindex(id, symbol, quantity, token, amount)
+            .await
+            .unwrap();
+        transfer.unwrap_and_send(id).await.unwrap()
+    }
+
     #[tokio::test]
     async fn mint_transfer_sends_mint_and_deposit_commands() {
         let transfer = create_equity_transfer(
@@ -3715,6 +3777,73 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn resume_redemption_from_tokens_sent_reenqueues_wallet_transfer_gas() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let transfer = create_equity_transfer(
+            tokenizer,
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+        let id = redemption_aggregate_id("redemption-gas-resume");
+        let symbol = Symbol::new("TEST").unwrap();
+        let redemption_tx = advance_redemption_to_tokens_sent(&transfer, &id, &symbol).await;
+        let (_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+        let transfer = transfer.with_bot_gas_enqueuer(BotGasReceiptCostEnqueuer::Enabled(queue));
+
+        transfer.resume_redemption(&id).await.unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(jobs.len(), 1, "expected exactly one recovered gas job");
+        assert_eq!(jobs[0].category, BotGasOperationCategory::WalletTransfer);
+        assert_eq!(jobs[0].chain, Chain::Base);
+        assert_eq!(jobs[0].tx_hash, redemption_tx);
+        assert_eq!(jobs[0].symbol, Some(symbol));
+    }
+
+    #[tokio::test]
+    async fn resume_redemption_enqueue_failure_does_not_resend_tokens() {
+        let tokenizer = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let transfer = create_equity_transfer(
+            tokenizer.clone(),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+        let id = redemption_aggregate_id("redemption-gas-enqueue-failure");
+        let symbol = Symbol::new("TEST").unwrap();
+        advance_redemption_to_tokens_sent(&transfer, &id, &symbol).await;
+        let calls_before_resume = tokenizer.call_count();
+        let (_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+        apalis_pool.close().await;
+        let transfer = transfer.with_bot_gas_enqueuer(BotGasReceiptCostEnqueuer::Enabled(queue));
+
+        let error = transfer.resume_redemption(&id).await.unwrap_err();
+
+        assert!(error.is_bot_gas_enqueue_failure());
+        assert_eq!(
+            tokenizer.call_count(),
+            calls_before_resume,
+            "retrying accounting must not call the tokenizer or resend tokens"
+        );
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::TokensSent { .. }),
+            "failed accounting enqueue must leave the persisted send resumable, got: {entity:?}"
+        );
+    }
+
     /// A fresh id runs the full redemption flow through the job entry point.
     #[tokio::test]
     async fn resume_equity_to_hedging_starts_fresh_redemption() {
@@ -3797,7 +3926,7 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: tokenizer.clone(),
             wrapper: Arc::new(MockWrapper::new()),
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(queue),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(queue.clone()),
             mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
@@ -3810,7 +3939,8 @@ mod tests {
             Address::random(),
             mint_store,
             redemption_store,
-        );
+        )
+        .with_bot_gas_enqueuer(BotGasReceiptCostEnqueuer::Enabled(queue));
 
         let symbol = Symbol::new("TEST").unwrap();
         let id = redemption_aggregate_id("redeem-bot-gas");

@@ -66,7 +66,7 @@ use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use st0x_dto::{EquityRedemptionOperation, EquityRedemptionStatus, TransferOperation};
@@ -2413,32 +2413,9 @@ impl EquityRedemption {
                     .await
                 {
                     Ok(redemption_tx) => {
-                        // Unlike the VaultWithdraw/Unwrap enqueue sites (which follow an
-                        // idempotent `confirm_tx`/`confirm_unwrap` receipt lookup, so
-                        // retrying the enqueue on resume is safe), `send_for_redemption`
-                        // above is itself the non-idempotent onchain transfer. If the
-                        // enqueue failed and we propagated the error here, no `TokensSent`
-                        // event would be written, the aggregate would stay in
-                        // `SendPending`, and the crash-recovery resume loop would
-                        // re-invoke `SendTokens`, sending the underlying tokens a second
-                        // time. So the enqueue here is best-effort: losing one gas-cost
-                        // record is strictly better than double-sending assets.
-                        if let Err(error) = enqueue_bot_gas_cost(
-                            &services.bot_gas_enqueuer,
-                            redemption_tx,
-                            BotGasOperationCategory::WalletTransfer,
-                            symbol.clone(),
-                        )
-                        .await
-                        {
-                            error!(
-                                target: "rebalance",
-                                ?error, %redemption_tx, %symbol,
-                                "Failed to enqueue bot-gas receipt cost for redemption send; \
-                                 recording TokensSent anyway to avoid re-sending tokens"
-                            );
-                        }
-
+                        // Persist the non-idempotent transfer hash first. The transfer
+                        // manager enqueues its gas fact after this event is stored, so a
+                        // queue failure resumes from `TokensSent` without sending again.
                         Ok(vec![TokensSent {
                             redemption_wallet,
                             redemption_tx,
@@ -3533,25 +3510,17 @@ mod tests {
         );
     }
 
-    /// Acceptance criterion: a bot-gas enqueue failure at `SendTokens` must
-    /// NOT prevent `TokensSent` -- unlike the VaultWithdraw/Unwrap enqueue
-    /// sites (which follow an idempotent confirm and are safe to fail-fast
-    /// on), `send_for_redemption` is a non-idempotent onchain transfer of
-    /// real tokens, so a hard failure here would leave the aggregate in
-    /// `SendPending` and the crash-recovery resume loop would re-invoke
-    /// `SendTokens`, sending the underlying tokens a second time.
+    /// `SendTokens` must persist the non-idempotent transfer hash without
+    /// attempting gas accounting inside the aggregate. The transfer manager
+    /// performs that accounting only after `TokensSent` is durable.
     #[tokio::test]
-    async fn send_tokens_enqueue_failure_does_not_block_tokens_sent() {
-        let (_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
-        let queue = crate::bot_gas::RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
-        apalis_pool.close().await;
-
+    async fn send_tokens_persists_tokens_sent_before_gas_accounting() {
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
             vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(queue),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
             mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
@@ -3569,11 +3538,6 @@ mod tests {
             unwrapped_at: Utc::now(),
         };
 
-        // Despite the enqueuer's pool being closed (every enqueue fails),
-        // SendTokens must still produce TokensSent -- proving the enqueue
-        // failure was swallowed (logged) rather than propagated, which would
-        // otherwise leave the aggregate stuck in SendPending for the
-        // crash-recovery resume loop to blindly re-send from.
         let events = send_pending
             .transition(EquityRedemptionCommand::SendTokens, &services)
             .await
@@ -3582,7 +3546,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(
             matches!(events[0], EquityRedemptionEvent::TokensSent { .. }),
-            "expected TokensSent despite the enqueue failure, got: {:?}",
+            "expected SendTokens to produce TokensSent, got: {:?}",
             events[0]
         );
     }

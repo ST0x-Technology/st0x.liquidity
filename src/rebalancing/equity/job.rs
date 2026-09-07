@@ -610,9 +610,9 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
         // Bot-gas cost recording is best-effort (see `BotGasReceiptCostEnqueuer`'s
         // doc, ADR 0017 SS4): classify and redrive through the shared
         // mechanism rather than consuming the apalis retry budget. The
-        // confirm step this follows already succeeded onchain and the
-        // aggregate has not advanced past it, so redriving the same resume
-        // call is safe.
+        // onchain step already succeeded, and persisted aggregate state keeps
+        // the transaction hash needed to retry accounting without repeating
+        // the transaction.
         redrive_on_bot_gas_failure(
             self,
             &ctx.job_queue,
@@ -1973,20 +1973,33 @@ mod tests {
         }
     }
 
-    /// Acceptance criterion (ADR 0017 SS4): a bot-gas receipt cost enqueue
-    /// failure on the redemption side must delayed-redrive rather than
-    /// consuming the apalis retry budget and dead-lettering a redemption
-    /// whose vault withdraw / unwrap already succeeded onchain.
-    #[tokio::test]
-    async fn redemption_perform_bot_gas_enqueue_failure_redrives_without_terminal_error() {
+    /// Stub for the manager-level enqueue failure emitted after `TokensSent`
+    /// has persisted the non-idempotent redemption transfer hash.
+    struct PersistedSendBotGasEnqueueFailureRedemptionResume;
+
+    #[async_trait]
+    impl ResumeEquityToHedging for PersistedSendBotGasEnqueueFailureRedemptionResume {
+        async fn resume_equity_to_hedging(
+            &self,
+            _aggregate_id: &RedemptionAggregateId,
+            _symbol: &Symbol,
+            _quantity: FractionalShares,
+        ) -> Result<(), RedemptionError> {
+            Err(RedemptionError::BotGasEnqueue(
+                crate::bot_gas::test_bot_gas_enqueue_failure(alloy::primitives::TxHash::ZERO),
+            ))
+        }
+    }
+
+    async fn assert_redemption_bot_gas_failure_redrives(
+        transfer: Arc<dyn ResumeEquityToHedging>,
+        aggregate_id: RedemptionAggregateId,
+    ) {
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
-        let ctx = redemption_test_ctx(
-            Arc::new(BotGasEnqueueFailureRedemptionResume),
-            TransferEquityToHedgingJobQueue::new(&apalis_pool),
-        )
-        .await;
+        let ctx =
+            redemption_test_ctx(transfer, TransferEquityToHedgingJobQueue::new(&apalis_pool)).await;
         let job = TransferEquityToHedging {
-            aggregate_id: redemption_aggregate_id("redeem-bot-gas-enqueue-failure"),
+            aggregate_id,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
@@ -2019,6 +2032,29 @@ mod tests {
             "redrive must be delayed by ~{BOT_GAS_ENQUEUE_REDRIVE_DELAY:?} -- \
              run_at={run_at} before={before} after={after}"
         );
+    }
+
+    /// Acceptance criterion (ADR 0017 SS4): a bot-gas receipt cost enqueue
+    /// failure after a confirmed withdraw/unwrap must delayed-redrive rather
+    /// than consume the apalis retry budget.
+    #[tokio::test]
+    async fn redemption_perform_aggregate_bot_gas_enqueue_failure_redrives() {
+        assert_redemption_bot_gas_failure_redrives(
+            Arc::new(BotGasEnqueueFailureRedemptionResume),
+            redemption_aggregate_id("redeem-aggregate-bot-gas-enqueue-failure"),
+        )
+        .await;
+    }
+
+    /// The manager-level failure introduced for redemption sends must take the
+    /// same delayed-redrive path as aggregate-level confirmation failures.
+    #[tokio::test]
+    async fn redemption_perform_persisted_send_bot_gas_enqueue_failure_redrives() {
+        assert_redemption_bot_gas_failure_redrives(
+            Arc::new(PersistedSendBotGasEnqueueFailureRedemptionResume),
+            redemption_aggregate_id("redeem-send-bot-gas-enqueue-failure"),
+        )
+        .await;
     }
 
     #[tokio::test]
