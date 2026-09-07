@@ -261,14 +261,20 @@ pub fn get_test_order() -> OrderV4 {
 /// undetected.
 #[cfg(test)]
 pub(crate) fn seed_get_test_order_token_symbols(cache: &st0x_registry::SymbolCache) {
-    cache.preload_symbol(
-        address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        "USDC",
-    );
-    cache.preload_symbol(
-        address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-        "wtAAPL",
-    );
+    // Seeded on both chains: fixtures run against Base and (post per-chain
+    // cache keying) Ethereum-flavored tests alike.
+    for chain in [st0x_evm::Chain::Base, st0x_evm::Chain::Ethereum] {
+        cache.preload_symbol(
+            chain,
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "USDC",
+        );
+        cache.preload_symbol(
+            chain,
+            address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "wtAAPL",
+        );
+    }
 }
 
 /// Builds a JSON-RPC error payload for a genuine on-chain revert

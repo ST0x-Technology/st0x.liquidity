@@ -18,7 +18,7 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tracing::{debug, error, warn};
 
-use st0x_config::Ctx;
+use st0x_config::{ChainAssets, ChainRegistry, Ctx};
 use st0x_event_sorcery::{AggregateError, LifecycleError, Projection, Store};
 use st0x_execution::{
     ClientOrderId, CounterTradePreflight, Direction, Executor, MarketOrder, MarketSession,
@@ -195,6 +195,38 @@ fn should_page_reference_price_failure(
     }
 }
 
+/// The asset table that sizes `symbol`'s backstop hedge: the watched chain that
+/// enables the symbol or, when several do, the one with the tightest
+/// operational limit. One global `Position` cannot say which chain's fills it
+/// holds, so the sweep takes the most conservative cap; whatever the cap leaves
+/// behind is hedged on a later tick. `None` when no watched chain enables the
+/// symbol.
+fn backstop_sizing_assets<'registry>(
+    chains: &'registry ChainRegistry,
+    symbol: &Symbol,
+) -> Option<&'registry ChainAssets> {
+    chains
+        .watched()
+        .map(|chain| &chain.assets)
+        .filter(|assets| assets.is_trading_enabled(symbol))
+        .reduce(|tightest, candidate| {
+            match (
+                tightest.operational_limit(symbol),
+                candidate.operational_limit(symbol),
+            ) {
+                (Some(current), Some(other)) => {
+                    if other < current {
+                        candidate
+                    } else {
+                        tightest
+                    }
+                }
+                (None, Some(_)) => candidate,
+                (Some(_) | None, None) => tightest,
+            }
+        })
+}
+
 /// A durable, self-rescheduling job that scans every position and enqueues a
 /// [`PlaceHedge`] for any symbol whose net exposure has crossed the execution
 /// threshold.
@@ -358,9 +390,15 @@ where
         let all_positions = self.position_projection.load_all().await?;
         let active_transfers = symbols_with_active_transfers(&self.pool).await?;
 
-        let eligible: Vec<Symbol> = all_positions
+        // Each symbol is paired with the asset table that sizes its hedge:
+        // the watched chain enabling it, or the tightest-capped one when
+        // several do. A symbol no watched chain enables is not swept.
+        let eligible: Vec<(Symbol, &ChainAssets)> = all_positions
             .iter()
-            .filter(|(symbol, _)| self.ctx.chains.primary().assets.is_trading_enabled(symbol))
+            .filter_map(|(symbol, _)| {
+                backstop_sizing_assets(&self.ctx.chains, symbol)
+                    .map(|assets| (symbol.clone(), assets))
+            })
             .filter(|(symbol, _)| {
                 if active_transfers.contains(symbol) {
                     debug!(%symbol, "Skipping hedge: equity transfer in progress");
@@ -369,11 +407,10 @@ where
                     true
                 }
             })
-            .map(|(symbol, _)| symbol.clone())
             .collect();
 
-        for symbol in &eligible {
-            self.check_and_enqueue_symbol(symbol, close_flatten_window_cache)
+        for (symbol, assets) in &eligible {
+            self.check_and_enqueue_symbol(symbol, assets, close_flatten_window_cache)
                 .await;
         }
 
@@ -383,6 +420,7 @@ where
     async fn check_and_enqueue_symbol(
         &self,
         symbol: &Symbol,
+        assets: &ChainAssets,
         close_flatten_window_cache: &mut CloseFlattenWindowCache,
     ) {
         let readiness = check_execution_readiness(
@@ -390,7 +428,7 @@ where
             &self.position_projection,
             symbol,
             self.executor.to_supported_executor(),
-            &self.ctx.chains.primary().assets,
+            assets,
             &self.ctx.assets,
             true,
         )
@@ -1761,6 +1799,137 @@ mod tests {
         CheckPositions::default().perform(&ctx).await.unwrap();
 
         assert_eq!(count_jobs(&apalis_pool, &hedge_job_type()).await, 2);
+    }
+
+    async fn load_hedge_jobs(apalis_pool: &apalis_sqlite::SqlitePool) -> Vec<PlaceHedge> {
+        let payloads: Vec<Vec<u8>> =
+            sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE job_type = ?")
+                .bind(hedge_job_type())
+                .fetch_all(apalis_pool)
+                .await
+                .unwrap();
+
+        payloads
+            .iter()
+            .map(|payload| serde_json::from_slice(payload).unwrap())
+            .collect()
+    }
+
+    /// A symbol listed only on a watched secondary chain is still swept by
+    /// the backstop: its inline hedge can defer (broker outage, dead letter),
+    /// and this scan is the only path that retries it. The hedge is sized by
+    /// that chain's operational limit, not the primary's table (which does
+    /// not list the symbol at all).
+    #[tokio::test]
+    async fn backstop_hedges_a_symbol_enabled_only_on_a_secondary_chain() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let coin = Symbol::new("COIN").unwrap();
+        let ethereum_cap = Positive::new(FractionalShares::new(float!(0.5))).unwrap();
+
+        let mut cfg = dry_run_ctx(&["COIN"], OperationMode::Disabled);
+        let mut ethereum = cfg.chains.primary().clone();
+        ethereum.chain = Chain::Ethereum;
+        ethereum
+            .assets
+            .equities
+            .symbols
+            .get_mut(&coin)
+            .unwrap()
+            .operational_limit = Some(ethereum_cap);
+        cfg.chains.primary_mut().assets.equities.symbols.clear();
+        cfg.chains.insert_secondary(ethereum);
+
+        let (ctx, position) = build_ctx(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+        )
+        .await;
+        accumulate_position(
+            &position,
+            &coin,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let jobs = load_hedge_jobs(&apalis_pool).await;
+        assert_eq!(
+            jobs.len(),
+            1,
+            "a symbol enabled on a secondary chain must be swept by the backstop"
+        );
+        assert_eq!(jobs[0].symbol, coin);
+        assert_eq!(
+            jobs[0].shares, ethereum_cap,
+            "the backstop must size with the enabling chain's operational limit"
+        );
+    }
+
+    /// A symbol enabled on two watched chains is sized by the tightest cap
+    /// among them, whichever chain carries it and whether the other chain
+    /// caps it at all: the shared `Position` cannot say which chain's fills
+    /// it holds, so the backstop takes the conservative limit.
+    #[tokio::test]
+    async fn backstop_sizes_with_the_tightest_cap_across_enabling_chains() {
+        let coin = Symbol::new("COIN").unwrap();
+        let cap = |shares: Float| Some(Positive::new(FractionalShares::new(shares)).unwrap());
+        let tightest = Positive::new(FractionalShares::new(float!(0.5))).unwrap();
+
+        for (base_cap, ethereum_cap) in [
+            (None, cap(float!(0.5))),
+            (cap(float!(1.5)), cap(float!(0.5))),
+            (cap(float!(0.5)), cap(float!(1.5))),
+            (cap(float!(0.5)), None),
+        ] {
+            let (pool, apalis_pool) = setup_test_pools().await;
+            let mut cfg = dry_run_ctx(&["COIN"], OperationMode::Disabled);
+            let mut ethereum = cfg.chains.primary().clone();
+            ethereum.chain = Chain::Ethereum;
+            ethereum
+                .assets
+                .equities
+                .symbols
+                .get_mut(&coin)
+                .unwrap()
+                .operational_limit = ethereum_cap;
+            cfg.chains
+                .primary_mut()
+                .assets
+                .equities
+                .symbols
+                .get_mut(&coin)
+                .unwrap()
+                .operational_limit = base_cap;
+            cfg.chains.insert_secondary(ethereum);
+
+            let (ctx, position) = build_ctx(
+                pool.clone(),
+                apalis_pool.clone(),
+                cfg,
+                Duration::from_secs(60),
+            )
+            .await;
+            accumulate_position(
+                &position,
+                &coin,
+                FractionalShares::new(float!(2.0)),
+                Direction::Buy,
+            )
+            .await;
+
+            CheckPositions::default().perform(&ctx).await.unwrap();
+
+            let jobs = load_hedge_jobs(&apalis_pool).await;
+            assert_eq!(jobs.len(), 1, "caps {base_cap:?} / {ethereum_cap:?}");
+            assert_eq!(
+                jobs[0].shares, tightest,
+                "caps {base_cap:?} / {ethereum_cap:?}: the tightest cap must size the hedge"
+            );
+        }
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use st0x_config::{ChainAssets, InventoryAdapterVenue, InventoryAdapters, TradingChain};
-use st0x_evm::{Chain, Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE};
+use st0x_evm::{Chain, Evm, EvmError, IERC20, OpenChainErrorRegistry};
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_float_serde::format_float_with_fallback;
 use st0x_registry::SymbolCache;
@@ -290,10 +290,11 @@ async fn fetch_inventory_token_decimals<E: Evm>(
 async fn resolve_inventory_token_symbol<E: Evm>(
     cache: &SymbolCache,
     evm: &E,
+    chain: Chain,
     token: Address,
 ) -> Result<String, OnChainError> {
     cache
-        .resolve_symbol(evm, token)
+        .resolve_symbol(evm, chain, token)
         .await
         .map_err(|source| classify_inventory_token_introspection_error(source, token))
 }
@@ -363,8 +364,8 @@ impl OnchainTrade {
         let onchain_output_amount = Float::from_raw(fill.output_amount);
 
         let (onchain_input_symbol, onchain_output_symbol) = tokio::try_join!(
-            cache.resolve_symbol(evm, input.token),
-            cache.resolve_symbol(evm, output.token),
+            cache.resolve_symbol(evm, chain, input.token),
+            cache.resolve_symbol(evm, chain, output.token),
         )?;
 
         // Use centralized TradeDetails::try_from_io to extract all trade data consistently
@@ -440,8 +441,8 @@ impl OnchainTrade {
         // (decimals does not depend on the resolved symbol), so all four run
         // in a single concurrent batch rather than two sequential waves.
         let (input_symbol, output_symbol, deposit_decimals, withdraw_decimals) = tokio::try_join!(
-            resolve_inventory_token_symbol(cache, evm, trade.deposit.token),
-            resolve_inventory_token_symbol(cache, evm, trade.withdraw.token),
+            resolve_inventory_token_symbol(cache, evm, chain, trade.deposit.token),
+            resolve_inventory_token_symbol(cache, evm, chain, trade.withdraw.token),
             fetch_inventory_token_decimals(evm, trade.deposit.token),
             fetch_inventory_token_decimals(evm, trade.withdraw.token),
         )?;
@@ -485,7 +486,7 @@ impl OnchainTrade {
         )
         .map_err(reclassify_inventory_float_error)?;
 
-        validate_inventory_token_addresses(assets, &trade_details)?;
+        validate_inventory_token_addresses(chain, assets, &trade_details)?;
 
         finalize_onchain_trade(
             evm.provider(),
@@ -703,11 +704,15 @@ fn reclassify_inventory_float_error(error: OnChainError) -> OnChainError {
 /// `InventoryTrade` path; the trusted ClearV3/TakeOrderV3 path never needs
 /// this since its token addresses already come from the bot's own orders.
 fn validate_inventory_token_addresses(
+    chain: Chain,
     assets: &ChainAssets,
     trade_details: &TradeDetails,
 ) -> Result<(), TradeValidationError> {
+    let expected_usdc = chain
+        .usdc()
+        .ok_or(TradeValidationError::UsdcUnknownOnChain { chain })?;
     let usdc_token = trade_details.usdc_token();
-    if usdc_token != USDC_BASE {
+    if usdc_token != expected_usdc {
         return Err(TradeValidationError::UnrecognizedInventoryToken {
             token: usdc_token,
             claimed_symbol: "USDC".to_string(),
@@ -982,6 +987,11 @@ pub enum TradeValidationError {
         token: Address,
         claimed_symbol: String,
     },
+    /// This build does not pin a canonical USDC address for the fill's
+    /// chain, so the USDC leg cannot be validated; refuse rather than accept
+    /// another chain's address.
+    #[error("no canonical USDC address is pinned for chain {chain}")]
+    UsdcUnknownOnChain { chain: Chain },
 }
 
 #[cfg(test)]
@@ -998,14 +1008,22 @@ mod tests {
         ChainEquities, ChainEquityAsset, InventoryAdapter, InventoryAdapterVenue,
         InventoryAdapters, InventoryMode, OperationMode, TradingChain,
     };
-    use st0x_evm::Chain;
     use st0x_evm::IERC20::decimalsCall;
     use st0x_evm::ReadOnlyEvm;
+    use st0x_evm::{Chain, USDC_BASE};
     use st0x_execution::Symbol;
     use st0x_float_macro::float;
     use st0x_registry::SymbolCache;
 
     use super::*;
+
+    /// Preloads a symbol under every chain the fixtures run on, so tests
+    /// exercising either Base- or Ethereum-flavored parsing hit the cache.
+    fn preload_on_all_chains(cache: &SymbolCache, token: Address, symbol: &str) {
+        for chain in [Chain::Base, Chain::Ethereum] {
+            cache.preload_symbol(chain, token, symbol);
+        }
+    }
     use crate::bindings::IRaindexV6;
     use crate::test_utils::{
         get_test_order, panic_revert_payload, seed_get_test_order_token_symbols,
@@ -1353,8 +1371,8 @@ mod tests {
         let bot_operator = address!("0x679df30b30ac2947aa3143490add6717af81dcc3");
 
         let cache = SymbolCache::default();
-        cache.preload_symbol(REAL_USDC_BASE, "USDC");
-        cache.preload_symbol(REAL_WTCOIN_BASE, "wtCOIN");
+        preload_on_all_chains(&cache, REAL_USDC_BASE, "USDC");
+        preload_on_all_chains(&cache, REAL_WTCOIN_BASE, "wtCOIN");
 
         let tx_hash =
             fixed_bytes!("0xe13a11de734768f08a9c1ef66e8de3bcb9072f8cdabce9f1d819e1ae9909d4b9");
@@ -1868,10 +1886,10 @@ mod tests {
         assert!(vaults.is_empty());
     }
 
-    // `try_from_inventory_trade` validates the USDC leg against the
-    // hardcoded canonical `USDC_BASE` address, so the InventoryTrade tests'
-    // USDC leg must use it too, not an arbitrary placeholder.
-    const INVENTORY_USDC: Address = USDC_BASE;
+    // `try_from_inventory_trade` validates the USDC leg against the fill
+    // chain's canonical USDC address; the InventoryTrade fixtures run on
+    // Ethereum, so their USDC leg must be Ethereum's, not a placeholder.
+    const INVENTORY_USDC: Address = st0x_evm::USDC_ETHEREUM;
     const INVENTORY_EQUITY: Address = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
     /// Builds an `ChainAssets` with a single configured equity symbol,
@@ -1935,9 +1953,28 @@ mod tests {
         withdraw: OperatorWithdraw,
         withdraw_decimals: u8,
     ) -> Result<Option<OnchainTrade>, OnChainError> {
+        run_inventory_parser_on(
+            Chain::Ethereum,
+            INVENTORY_USDC,
+            deposit,
+            deposit_decimals,
+            withdraw,
+            withdraw_decimals,
+        )
+        .await
+    }
+
+    async fn run_inventory_parser_on(
+        chain: Chain,
+        usdc: Address,
+        deposit: OperatorDeposit,
+        deposit_decimals: u8,
+        withdraw: OperatorWithdraw,
+        withdraw_decimals: u8,
+    ) -> Result<Option<OnchainTrade>, OnChainError> {
         let cache = SymbolCache::default();
-        cache.preload_symbol(INVENTORY_USDC, "USDC");
-        cache.preload_symbol(INVENTORY_EQUITY, "wtAAPL");
+        preload_on_all_chains(&cache, usdc, "USDC");
+        preload_on_all_chains(&cache, INVENTORY_EQUITY, "wtAAPL");
         let assets = assets_config_with_equity("AAPL", INVENTORY_EQUITY);
 
         let asserter = Asserter::new();
@@ -1953,7 +1990,7 @@ mod tests {
         let inv = InventoryTrade { deposit, withdraw };
 
         OnchainTrade::try_from_inventory_trade(
-            Chain::Ethereum,
+            chain,
             &cache,
             &evm,
             &assets,
@@ -2002,8 +2039,8 @@ mod tests {
     #[tokio::test]
     async fn missing_inventory_log_block_number_uses_receipt_block_number() {
         let cache = SymbolCache::default();
-        cache.preload_symbol(INVENTORY_USDC, "USDC");
-        cache.preload_symbol(INVENTORY_EQUITY, "wtAAPL");
+        preload_on_all_chains(&cache, INVENTORY_USDC, "USDC");
+        preload_on_all_chains(&cache, INVENTORY_EQUITY, "wtAAPL");
         let assets = assets_config_with_equity("AAPL", INVENTORY_EQUITY);
         let mut log = crate::test_utils::create_log(7);
         log.block_number = None;
@@ -2034,7 +2071,7 @@ mod tests {
         };
 
         let trade = OnchainTrade::try_from_inventory_trade(
-            Chain::Base,
+            Chain::Ethereum,
             &cache,
             &evm,
             &assets,
@@ -2071,6 +2108,52 @@ mod tests {
         assert!(trade.price.value().eq(float!(80)).unwrap());
     }
 
+    /// The USDC leg is validated against the fill chain's own canonical USDC:
+    /// an Ethereum inventory fill carries `USDC_ETHEREUM`, not Base's address.
+    #[tokio::test]
+    async fn try_from_inventory_trade_accepts_the_fill_chains_own_usdc() {
+        let trade = run_inventory_parser_on(
+            Chain::Ethereum,
+            st0x_evm::USDC_ETHEREUM,
+            operator_deposit(st0x_evm::USDC_ETHEREUM, uint!(160000000_U256)),
+            6,
+            operator_withdraw(INVENTORY_EQUITY, uint!(2000000000000000000_U256)),
+            18,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(trade.symbol.to_string(), "wtAAPL");
+        assert_eq!(trade.direction, Direction::Sell);
+    }
+
+    /// Base's USDC address is just another unrecognized token on Ethereum.
+    #[tokio::test]
+    async fn try_from_inventory_trade_rejects_another_chains_usdc() {
+        let error = run_inventory_parser_on(
+            Chain::Ethereum,
+            USDC_BASE,
+            operator_deposit(USDC_BASE, uint!(160000000_U256)),
+            6,
+            operator_withdraw(INVENTORY_EQUITY, uint!(2000000000000000000_U256)),
+            18,
+        )
+        .await
+        .unwrap_err();
+
+        match error {
+            OnChainError::Validation(TradeValidationError::UnrecognizedInventoryToken {
+                token,
+                claimed_symbol,
+            }) => {
+                assert_eq!(token, USDC_BASE);
+                assert_eq!(claimed_symbol, "USDC");
+            }
+            other => panic!("expected UnrecognizedInventoryToken, got {other:?}"),
+        }
+    }
+
     /// A spoof token whose `symbol()` reports "USDC" but whose address is NOT
     /// the configured canonical `USDC_BASE` must be rejected -- accepting it
     /// on symbol alone would let a compromised/buggy `OPERATOR_ROLE` holder
@@ -2081,8 +2164,8 @@ mod tests {
         let spoof_usdc = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
         let cache = SymbolCache::default();
-        cache.preload_symbol(spoof_usdc, "USDC");
-        cache.preload_symbol(INVENTORY_EQUITY, "wtAAPL");
+        preload_on_all_chains(&cache, spoof_usdc, "USDC");
+        preload_on_all_chains(&cache, INVENTORY_EQUITY, "wtAAPL");
         let assets = assets_config_with_equity("AAPL", INVENTORY_EQUITY);
 
         let asserter = Asserter::new();
@@ -2129,8 +2212,8 @@ mod tests {
         let spoof_equity = address!("0xbadbadbadbadbadbadbadbadbadbadbadbadbad0");
 
         let cache = SymbolCache::default();
-        cache.preload_symbol(REAL_USDC_BASE, "USDC");
-        cache.preload_symbol(spoof_equity, "wtCOIN");
+        preload_on_all_chains(&cache, REAL_USDC_BASE, "USDC");
+        preload_on_all_chains(&cache, spoof_equity, "wtCOIN");
         let assets = assets_config_with_equity("COIN", REAL_WTCOIN_BASE);
 
         let asserter = Asserter::new();
@@ -2222,8 +2305,8 @@ mod tests {
         // sent 0.034172366621067031 wtCOIN (withdraw), i.e. it sold equity
         // onchain, so it must hedge Sell (USDC on the deposit side).
         let cache = SymbolCache::default();
-        cache.preload_symbol(REAL_USDC_BASE, "USDC");
-        cache.preload_symbol(REAL_WTCOIN_BASE, "wtCOIN");
+        preload_on_all_chains(&cache, REAL_USDC_BASE, "USDC");
+        preload_on_all_chains(&cache, REAL_WTCOIN_BASE, "wtCOIN");
 
         let tx_hash =
             fixed_bytes!("0xe13a11de734768f08a9c1ef66e8de3bcb9072f8cdabce9f1d819e1ae9909d4b9");
@@ -2299,8 +2382,8 @@ mod tests {
         // must hedge Buy (equity on the deposit side, mirroring the
         // happy-path unit test above).
         let cache = SymbolCache::default();
-        cache.preload_symbol(REAL_USDC_BASE, "USDC");
-        cache.preload_symbol(REAL_WTCOIN_BASE, "wtCOIN");
+        preload_on_all_chains(&cache, REAL_USDC_BASE, "USDC");
+        preload_on_all_chains(&cache, REAL_WTCOIN_BASE, "wtCOIN");
 
         let tx_hash =
             fixed_bytes!("0x9ee8e401a6f12227df1a30a236b60ac83c72b2b1eb610d83cf292ae789eb0805");
@@ -2432,7 +2515,7 @@ mod tests {
         }
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
 
-        let error = resolve_inventory_token_symbol(&cache, &evm, INVENTORY_EQUITY)
+        let error = resolve_inventory_token_symbol(&cache, &evm, Chain::Base, INVENTORY_EQUITY)
             .await
             .unwrap_err();
 
@@ -2455,7 +2538,7 @@ mod tests {
         }
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
 
-        let error = resolve_inventory_token_symbol(&cache, &evm, INVENTORY_EQUITY)
+        let error = resolve_inventory_token_symbol(&cache, &evm, Chain::Base, INVENTORY_EQUITY)
             .await
             .unwrap_err();
 

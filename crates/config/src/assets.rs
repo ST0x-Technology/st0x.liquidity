@@ -160,6 +160,16 @@ impl ChainAssets {
             .is_some_and(|config| config.trading == OperationMode::Enabled)
     }
 
+    /// The share cap for one hedge of `symbol` on this chain: the symbol's own
+    /// `operational_limit`, else the chain-wide equities default, else uncapped.
+    pub fn operational_limit(&self, symbol: &Symbol) -> Option<Positive<FractionalShares>> {
+        self.equities
+            .symbols
+            .get(symbol)
+            .and_then(|config| config.operational_limit)
+            .or(self.equities.operational_limit)
+    }
+
     /// Returns whether rebalancing is enabled for the given equity on this
     /// chain. Assets not present in the config are treated as
     /// rebalancing-disabled.

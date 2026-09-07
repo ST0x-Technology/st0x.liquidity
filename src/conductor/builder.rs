@@ -479,7 +479,7 @@ where
         usdc_tracking_enabled: context.ctx.chains.primary().assets.cash.is_some(),
         wallet_polling_enabled,
         poll_freshness,
-        notifier,
+        notifier: notifier.clone(),
         queue: portfolio_snapshot_queue.clone(),
     });
 
@@ -491,7 +491,6 @@ where
         offchain_order: context.frameworks.offchain_order,
         order_placer,
         execution_threshold: context.execution_threshold,
-        assets: context.ctx.chains.primary().assets.clone(),
         hedging: context.ctx.assets.clone(),
         counter_trade_submission_lock,
         close_flatten_policy,
@@ -503,11 +502,38 @@ where
 
     let maintenance_interval = context.executor.maintenance_interval();
 
+    // One accounting entry per watched chain: the primary reuses the main
+    // provider; secondaries take theirs from `watch_providers` (shared with
+    // the per-chain monitors below).
+    let watch_providers = context.watch_providers;
+    let mut chain_accounting = std::collections::BTreeMap::new();
+    for watched in context.ctx.chains.watched() {
+        let provider = if watched.chain == context.ctx.chains.primary().chain {
+            context.provider.clone()
+        } else {
+            watch_providers.get(&watched.chain).cloned().ok_or(
+                ConductorSpawnError::MissingWatchWiring {
+                    chain: watched.chain,
+                    what: "accounting provider",
+                },
+            )?
+        };
+        chain_accounting.insert(
+            watched.chain,
+            crate::trading::onchain::trade_accountant::ChainAccounting {
+                trading: watched.clone(),
+                contracts: crate::onchain::raindex_contracts(watched),
+                evm: ReadOnlyEvm::new(provider),
+            },
+        );
+    }
+
     let accountant_ctx = Arc::new(AccountantCtx {
-        contracts: crate::onchain::raindex_contracts(context.ctx.chains.primary()),
+        chains: chain_accounting,
+        notifier,
+        disabled_asset_alerts: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         ctx: context.ctx.clone(),
         cache: context.cache,
-        evm: ReadOnlyEvm::new(context.provider.clone()),
         cqrs: trade_cqrs,
         vault_registry: context.frameworks.vault_registry,
         executor: context.executor.clone(),
@@ -542,7 +568,6 @@ where
     // reuses the conductor's main provider; secondaries take theirs from
     // `watch_providers` (absent entries are a startup bug: the token map,
     // queue map, and provider map are all derived from the same registry).
-    let mut watch_providers = context.watch_providers;
     let primary_chain = context.ctx.chains.primary().chain;
     let watched_chains: Vec<st0x_config::TradingChain> =
         context.ctx.chains.watched().cloned().collect();
@@ -552,7 +577,8 @@ where
             context.provider.clone()
         } else {
             watch_providers
-                .remove(&chain)
+                .get(&chain)
+                .cloned()
                 .ok_or(ConductorSpawnError::MissingWatchWiring {
                     chain,
                     what: "provider",

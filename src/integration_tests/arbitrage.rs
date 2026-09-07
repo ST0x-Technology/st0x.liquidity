@@ -157,9 +157,18 @@ impl AnvilTrade {
     async fn submit(
         &self,
         cqrs: &TradeProcessingCqrs,
+        assets: &ChainAssets,
     ) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
         let executor = MockExecutor::default();
-        process_queued_trade(&executor, &self.trade_event, self.trade.clone(), cqrs, true).await
+        process_queued_trade(
+            &executor,
+            &self.trade_event,
+            self.trade.clone(),
+            cqrs,
+            assets,
+            true,
+        )
+        .await
     }
 }
 
@@ -904,6 +913,18 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
     }
 }
 
+/// The asset table the fill path is handed when a test has no per-symbol
+/// limits to express: nothing configured, nothing capped.
+fn default_assets() -> ChainAssets {
+    ChainAssets {
+        equities: ChainEquities {
+            operational_limit: None,
+            ..ChainEquities::default()
+        },
+        cash: None,
+    }
+}
+
 /// Constructs the CQRS frameworks needed by the integration tests.
 ///
 /// Uses `ExecutorOrderPlacer(MockExecutor::new())` so that the `PlaceOrder`
@@ -914,31 +935,6 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
 async fn create_test_cqrs(
     pool: &SqlitePool,
     apalis_pool: &apalis_sqlite::SqlitePool,
-) -> (
-    TradeProcessingCqrs,
-    Arc<Store<Position>>,
-    Arc<Projection<Position>>,
-    Arc<Store<crate::offchain::order::OffchainOrder>>,
-    Arc<Projection<OffchainOrder>>,
-) {
-    create_test_cqrs_with_assets(
-        pool,
-        apalis_pool,
-        ChainAssets {
-            equities: ChainEquities {
-                operational_limit: None,
-                ..ChainEquities::default()
-            },
-            cash: None,
-        },
-    )
-    .await
-}
-
-async fn create_test_cqrs_with_assets(
-    pool: &SqlitePool,
-    apalis_pool: &apalis_sqlite::SqlitePool,
-    assets: ChainAssets,
 ) -> (
     TradeProcessingCqrs,
     Arc<Store<Position>>,
@@ -970,7 +966,6 @@ async fn create_test_cqrs_with_assets(
         position_projection: position_projection.clone(),
         offchain_order: offchain_order.clone(),
         execution_threshold: ExecutionThreshold::whole_share(),
-        assets,
         counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
         close_flatten_policy:
             crate::trading::offchain::close_flatten::CloseFlattenPolicy::from_secs(900).unwrap(),
@@ -1015,7 +1010,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    let result1 = trade1.submit(&cqrs).await?;
+    let result1 = trade1.submit(&cqrs, &default_assets()).await?;
     assert!(
         result1.is_none(),
         "No execution should be created below threshold"
@@ -1057,7 +1052,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         .await;
     let trade2_agg = trade2.aggregate_id();
     let order_id = trade2
-        .submit(&cqrs)
+        .submit(&cqrs, &default_assets())
         .await?
         .expect("Threshold crossed, should return OffchainOrderId");
     let order_id_str = order_id.to_string();
@@ -1181,7 +1176,10 @@ async fn poll_helper_rejects_mismatched_filled_quantity() -> Result<(), Box<dyn 
         .price(AAPL_PRICE)
         .call()
         .await;
-    let order_id = trade.submit(&cqrs).await?.expect("Threshold crossed");
+    let order_id = trade
+        .submit(&cqrs, &default_assets())
+        .await?
+        .expect("Threshold crossed");
     let mismatched_executor = MockExecutor::new().with_order_status(OrderState::Filled {
         executed_at: Utc::now(),
         order_id: ExecutorOrderId::new("broker-order-id"),
@@ -1244,7 +1242,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    trade1.submit(&cqrs).await?;
+    trade1.submit(&cqrs, &default_assets()).await?;
 
     let trade2 = orderbook
         .take_order()
@@ -1255,7 +1253,10 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    let order_id = trade2.submit(&cqrs).await?.expect("Threshold crossed");
+    let order_id = trade2
+        .submit(&cqrs, &default_assets())
+        .await?
+        .expect("Threshold crossed");
     let order_id_str = order_id.to_string();
 
     // Poller discovers the broker FAILED the order
@@ -1416,7 +1417,10 @@ async fn retains_failed_terminal_partial_fill() -> Result<(), Box<dyn std::error
         .price(AAPL_PRICE)
         .call()
         .await;
-    let order_id = trade.submit(&cqrs).await?.expect("Threshold crossed");
+    let order_id = trade
+        .submit(&cqrs, &default_assets())
+        .await?
+        .expect("Threshold crossed");
 
     let partially_filled_executor =
         MockExecutor::new().with_order_status(OrderState::PartiallyFilled {
@@ -1524,7 +1528,9 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let trade2_agg = trade2.aggregate_id();
 
     // Submit both below-threshold trades concurrently (different symbols)
-    let (aapl_result, msft_result) = tokio::join!(trade1.submit(&cqrs), trade2.submit(&cqrs));
+    let assets = default_assets();
+    let (aapl_result, msft_result) =
+        tokio::join!(trade1.submit(&cqrs, &assets), trade2.submit(&cqrs, &assets));
     assert!(aapl_result?.is_none());
     assert!(msft_result?.is_none());
 
@@ -1538,7 +1544,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     let trade3_agg = trade3.aggregate_id();
     let aapl_order_id = trade3
-        .submit(&cqrs)
+        .submit(&cqrs, &default_assets())
         .await?
         .expect("AAPL 1.2 crosses threshold");
     let aapl_order_str = aapl_order_id.to_string();
@@ -1692,7 +1698,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     let trade4_agg = trade4.aggregate_id();
     let msft_order_id = trade4
-        .submit(&cqrs)
+        .submit(&cqrs, &default_assets())
         .await?
         .expect("MSFT 1.0 hits threshold");
     let msft_order_str = msft_order_id.to_string();
@@ -1805,7 +1811,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    let result1 = trade1.submit(&cqrs).await?;
+    let result1 = trade1.submit(&cqrs, &default_assets()).await?;
     assert!(result1.is_none(), "Below threshold");
 
     assert_position()
@@ -1829,7 +1835,10 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    let order_id = trade2.submit(&cqrs).await?.expect("Threshold crossed");
+    let order_id = trade2
+        .submit(&cqrs, &default_assets())
+        .await?
+        .expect("Threshold crossed");
     let order_id_str = order_id.to_string();
 
     assert_position()
@@ -1952,7 +1961,7 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
         .await;
     let trade1_agg = trade1.aggregate_id();
     let order_id = trade1
-        .submit(&cqrs)
+        .submit(&cqrs, &default_assets())
         .await?
         .expect("Exactly 1.0 should cross whole-share threshold");
 
@@ -2033,7 +2042,10 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
         .price(AAPL_PRICE)
         .call()
         .await;
-    trade1.submit(&cqrs).await?.expect("Threshold crossed");
+    trade1
+        .submit(&cqrs, &default_assets())
+        .await?
+        .expect("Threshold crossed");
     poll_submitted_orders(
         &MockExecutor::new(),
         &offchain_order_projection,
@@ -2094,7 +2106,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .await;
     let trade1_agg = trade1.aggregate_id();
     let order1 = trade1
-        .submit(&cqrs)
+        .submit(&cqrs, &default_assets())
         .await?
         .expect("First threshold crossing");
     poll_submitted_orders(
@@ -2127,7 +2139,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .await;
     let trade2_agg = trade2.aggregate_id();
     let order2 = trade2
-        .submit(&cqrs)
+        .submit(&cqrs, &default_assets())
         .await?
         .expect("Second threshold crossing");
     assert_ne!(order1, order2, "Second cycle should create a new order");
@@ -2217,7 +2229,7 @@ async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::E
         .price(AAPL_PRICE)
         .call()
         .await;
-    trade1.submit(&cqrs).await?;
+    trade1.submit(&cqrs, &default_assets()).await?;
 
     // Run vault discovery using the same trade data
     let vault_registry = test_store(pool.clone(), ());
@@ -2230,6 +2242,7 @@ async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::E
     discover_vaults_for_trade(&trade1.trade_event, &trade1.trade, &context).await?;
 
     let vault_agg_id = VaultRegistryId {
+        chain: st0x_evm::Chain::Base,
         orderbook: orderbook.orderbook_addr,
         owner: orderbook.owner,
     }
@@ -2310,7 +2323,7 @@ async fn tiny_fractional_trade_tracks_precisely() -> Result<(), Box<dyn std::err
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    let result = trade1.submit(&cqrs).await?;
+    let result = trade1.submit(&cqrs, &default_assets()).await?;
     assert!(result.is_none(), "Tiny trade should not trigger execution");
 
     assert_position()
@@ -2364,7 +2377,7 @@ async fn large_trade_triggers_immediate_execution() -> Result<(), Box<dyn std::e
         .await;
     let trade1_agg = trade1.aggregate_id();
     let order_id = trade1
-        .submit(&cqrs)
+        .submit(&cqrs, &default_assets())
         .await?
         .expect("500 shares should immediately cross threshold");
 
@@ -2428,7 +2441,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    assert!(trade1.submit(&cqrs).await?.is_none());
+    assert!(trade1.submit(&cqrs, &default_assets()).await?.is_none());
 
     assert_position()
         .query(&position_query)
@@ -2451,7 +2464,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    assert!(trade2.submit(&cqrs).await?.is_none());
+    assert!(trade2.submit(&cqrs, &default_assets()).await?.is_none());
 
     assert_position()
         .query(&position_query)
@@ -2474,7 +2487,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .call()
         .await;
     let trade3_agg = trade3.aggregate_id();
-    assert!(trade3.submit(&cqrs).await?.is_none());
+    assert!(trade3.submit(&cqrs, &default_assets()).await?.is_none());
 
     assert_position()
         .query(&position_query)
@@ -2498,7 +2511,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .await;
     let trade4_agg = trade4.aggregate_id();
     let order_id = trade4
-        .submit(&cqrs)
+        .submit(&cqrs, &default_assets())
         .await?
         .expect("Net -1.1 crosses threshold");
     let order_id_str = order_id.to_string();
@@ -2615,7 +2628,7 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
         .await;
     let trade1_agg = trade1.aggregate_id();
     let order_id = trade1
-        .submit(&cqrs)
+        .submit(&cqrs, &default_assets())
         .await?
         .expect("1.5 shares crosses threshold");
     let order_id_str = order_id.to_string();
@@ -2641,7 +2654,7 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    let result2 = trade2.submit(&cqrs).await?;
+    let result2 = trade2.submit(&cqrs, &default_assets()).await?;
     assert!(
         result2.is_none(),
         "No new offchain order while one is pending"
@@ -2717,10 +2730,10 @@ async fn duplicate_onchain_event_is_idempotent() -> Result<(), Box<dyn std::erro
         .await;
 
     // Process the trade through the CQRS pipeline
-    trade1.submit(&cqrs).await?;
+    trade1.submit(&cqrs, &default_assets()).await?;
 
     // Submit the same trade again — CQRS aggregate rejects the duplicate
-    trade1.submit(&cqrs).await?;
+    trade1.submit(&cqrs, &default_assets()).await?;
 
     // Verify exactly one set of CQRS events was emitted
     assert_position()
@@ -2788,7 +2801,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         cash: None,
     };
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
-        create_test_cqrs_with_assets(&pool, &apalis_pool, assets.clone()).await;
+        create_test_cqrs(&pool, &apalis_pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // 3-share sell -> net = -3
@@ -2801,7 +2814,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         .call()
         .await;
     let order1 = trade1
-        .submit(&cqrs)
+        .submit(&cqrs, &assets)
         .await?
         .expect("3 shares crosses threshold");
 
@@ -2998,7 +3011,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         cash: None,
     };
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
-        create_test_cqrs_with_assets(&pool, &apalis_pool, assets.clone()).await;
+        create_test_cqrs(&pool, &apalis_pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // 5-share sell -> net = -5, capped to 2 shares by max_shares
@@ -3011,7 +3024,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         .call()
         .await;
     let order1 = trade1
-        .submit(&cqrs)
+        .submit(&cqrs, &assets)
         .await?
         .expect("5 shares crosses threshold");
 

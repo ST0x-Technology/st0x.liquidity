@@ -26,30 +26,43 @@ use st0x_config::{Ctx, CtxError};
 
 use crate::conductor::job::{Job, JobQueue, Label};
 
-/// Typed identifier for VaultRegistry aggregates, keyed by
-/// orderbook and owner address pair.
+/// Typed identifier for VaultRegistry aggregates: chain, orderbook, owner.
+///
+/// The chain is part of the identity because deterministic deployments and a
+/// shared bot EOA make the same (orderbook, owner) pair real on several
+/// chains -- without it, two chains' registries would silently merge into one
+/// aggregate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultRegistryId {
+    #[serde(default = "crate::onchain::legacy_chain")]
+    pub(crate) chain: st0x_evm::Chain,
     pub(crate) orderbook: Address,
     pub(crate) owner: Address,
 }
 
 impl VaultRegistryId {
-    pub fn new(orderbook: Address, owner: Address) -> Self {
-        Self { orderbook, owner }
+    pub fn new(chain: st0x_evm::Chain, orderbook: Address, owner: Address) -> Self {
+        Self {
+            chain,
+            orderbook,
+            owner,
+        }
     }
 }
 
 impl fmt::Display for VaultRegistryId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.orderbook, self.owner)
+        write!(f, "{}:{}:{}", self.chain, self.orderbook, self.owner)
     }
 }
 
 #[derive(Debug, Error)]
 pub enum ParseVaultRegistryIdError {
-    #[error("expected 'orderbook:owner', got '{id_provided}'")]
+    #[error("expected 'chain:orderbook:owner', got '{id_provided}'")]
     MissingDelimiter { id_provided: String },
+
+    #[error("invalid chain segment: {0}")]
+    Chain(#[from] st0x_evm::ParseChainError),
 
     #[error("invalid orderbook address: {0}")]
     Orderbook(FromHexError),
@@ -62,19 +75,23 @@ impl FromStr for VaultRegistryId {
     type Err = ParseVaultRegistryIdError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (orderbook_str, owner_str) =
-            value
-                .split_once(':')
-                .ok_or_else(|| ParseVaultRegistryIdError::MissingDelimiter {
-                    id_provided: value.to_string(),
-                })?;
+        let missing = || ParseVaultRegistryIdError::MissingDelimiter {
+            id_provided: value.to_string(),
+        };
+        let (chain_str, rest) = value.split_once(':').ok_or_else(missing)?;
+        let (orderbook_str, owner_str) = rest.split_once(':').ok_or_else(missing)?;
+        let chain = chain_str.parse()?;
         let orderbook = orderbook_str
             .parse()
             .map_err(ParseVaultRegistryIdError::Orderbook)?;
         let owner = owner_str
             .parse()
             .map_err(ParseVaultRegistryIdError::Owner)?;
-        Ok(Self { orderbook, owner })
+        Ok(Self {
+            chain,
+            orderbook,
+            owner,
+        })
     }
 }
 
@@ -586,6 +603,7 @@ impl SeedVaultRegistryCtx {
         }
 
         let id = VaultRegistryId {
+            chain: ctx.chains.primary().chain,
             orderbook: ctx.chains.primary().orderbook,
             owner: ctx.vault_owner(),
         };
@@ -785,9 +803,116 @@ mod tests {
         Symbol::new("AAPL").unwrap()
     }
 
+    /// Chain-qualified identity round-trips through Display/FromStr, and a
+    /// legacy two-segment id is refused (persisted rows are migrated).
+    #[test]
+    fn vault_registry_id_round_trips_with_chain() {
+        let id = VaultRegistryId {
+            chain: st0x_evm::Chain::Ethereum,
+            orderbook: Address::repeat_byte(0x11),
+            owner: Address::repeat_byte(0x22),
+        };
+
+        let parsed: VaultRegistryId = id.to_string().parse().unwrap();
+        assert_eq!(parsed, id);
+
+        // A legacy two-segment id has no third segment to split off.
+        let error = "0x1111:0x2222".parse::<VaultRegistryId>().unwrap_err();
+        assert!(matches!(
+            error,
+            ParseVaultRegistryIdError::MissingDelimiter { .. }
+        ));
+
+        // A three-segment id whose first segment is not a chain name.
+        let error = format!(
+            "notachain:{}:{}",
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22)
+        )
+        .parse::<VaultRegistryId>()
+        .unwrap_err();
+        assert!(matches!(error, ParseVaultRegistryIdError::Chain(_)));
+    }
+
+    /// Runs the id migration over raw legacy-shaped rows: the aggregate id
+    /// comes out chain-qualified, and the view row keyed by the legacy id is
+    /// gone, so nothing parses it at startup and the framework rebuilds the
+    /// view from the migrated events. The direct INSERTs reproduce the
+    /// pre-migration on-disk shape, which no current code path can produce.
+    #[tokio::test]
+    async fn id_migration_upgrades_legacy_rows_and_clears_the_view() {
+        let pool = setup_test_db().await;
+        let legacy_id = format!("{TEST_ORDERBOOK}:{TEST_OWNER}");
+
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, \
+             event_version, payload, metadata) VALUES \
+             ('VaultRegistry', ?1, 1, 'VaultRegistryEvent::UsdcVaultDiscovered', '1.0', '{}', '{}')",
+        )
+        .bind(&legacy_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO snapshots (aggregate_type, aggregate_id, last_sequence, payload, \
+             timestamp) VALUES ('VaultRegistry', ?1, 1, '{}', '2026-01-01T00:00:00Z')",
+        )
+        .bind(&legacy_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO vault_registry_view (view_id, version, payload) VALUES (?1, 1, '{}')",
+        )
+        .bind(&legacy_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let migration =
+            include_str!("../migrations/20260903123436_chain_qualified_vault_registry_ids.sql");
+        // Twice: the WHERE guards make the upgrade idempotent.
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+
+        let upgraded_id = VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_OWNER,
+        };
+        for (table, query) in [
+            (
+                "events",
+                "SELECT aggregate_id FROM events WHERE aggregate_type = 'VaultRegistry'",
+            ),
+            (
+                "snapshots",
+                "SELECT aggregate_id FROM snapshots WHERE aggregate_type = 'VaultRegistry'",
+            ),
+        ] {
+            let (aggregate_id,): (String,) = sqlx::query_as(query).fetch_one(&pool).await.unwrap();
+            assert_eq!(
+                aggregate_id.parse::<VaultRegistryId>().unwrap(),
+                upgraded_id,
+                "{table} row must carry the chain-qualified id"
+            );
+        }
+
+        let (legacy_view_rows,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM vault_registry_view WHERE view_id LIKE '0x%'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            legacy_view_rows, 0,
+            "legacy-keyed view rows must not survive the migration"
+        );
+    }
+
     #[test]
     fn aggregate_id_format() {
         let id = VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook: TEST_ORDERBOOK,
             owner: TEST_OWNER,
         };
@@ -1464,6 +1589,7 @@ mod tests {
     async fn reactors_only_see_new_events_not_historical() {
         let pool = setup_test_db().await;
         let id = VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook: TEST_ORDERBOOK,
             owner: TEST_OWNER,
         };
@@ -1649,6 +1775,36 @@ mod tests {
             registry.primary_usdc_vault_id(),
             Some(test_usdc_vault_id()),
             "usdc vault should be seeded as primary",
+        );
+    }
+
+    /// The seed keys the registry on the primary chain, so readers that look
+    /// it up by `primary().chain` find what it wrote when the primary is not
+    /// Base.
+    #[tokio::test]
+    async fn seed_keys_the_registry_on_the_primary_chain() {
+        let pool = setup_test_db().await;
+        let mut ctx = ctx_with_seeded_assets();
+        ctx.chains.primary_mut().chain = st0x_evm::Chain::Ethereum;
+        let seed_ctx = seed_ctx_from(pool, &ctx).await;
+
+        SeedVaultRegistry.perform(&seed_ctx).await.unwrap();
+
+        let primary = ctx.chains.primary();
+        let registry = loaded_registry(
+            &seed_ctx.vault_registry,
+            &VaultRegistryId {
+                chain: primary.chain,
+                orderbook: primary.orderbook,
+                owner: ctx.vault_owner(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            registry.primary_usdc_vault_id(),
+            Some(test_usdc_vault_id()),
+            "the seeded registry must be readable under the primary chain's id",
         );
     }
 
