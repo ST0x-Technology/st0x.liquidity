@@ -2214,6 +2214,39 @@ mod tests {
         }
     }
 
+    /// The vault commands take the same `--network` flag as every other
+    /// chain-touching command, defaulting to Base.
+    #[test]
+    fn vault_commands_parse_network_and_default_to_base() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "vault-deposit",
+            "-a",
+            "1",
+            "-t",
+            "0x9876543210987654321098765432109876543210",
+            "-v",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "--network",
+            "ethereum",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::VaultDeposit { network, .. } => {
+                assert_eq!(network, TokenizationNetwork::Ethereum);
+            }
+            other => panic!("expected vault-deposit command, got: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["st0x-cli", "vault-withdraw-usdc", "-a", "100"]).unwrap();
+        match cli.command {
+            Commands::VaultWithdrawUsdc { network, .. } => {
+                assert_eq!(network, TokenizationNetwork::Base);
+            }
+            other => panic!("expected vault-withdraw-usdc command, got: {other:?}"),
+        }
+    }
+
     #[test]
     fn dividend_bump_command_parses_symbol_and_quantity() {
         let cli =
