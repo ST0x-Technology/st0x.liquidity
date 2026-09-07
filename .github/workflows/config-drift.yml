@@ -1,22 +1,18 @@
 name: config-drift
 
-# The runtime configs the deployed bots actually mount live in T0Trade/
-# t0.devops (config-as-data), while images roll automatically on merges
-# here, so no single PR spans both repos. This gate parses those live
-# TOMLs with THIS ref's config schema (`validate-config` without
-# `--secrets`), so a schema change that would crash the deployed bot fails
-# the PR that introduces it instead of crash-looping the box after a green
-# merge (2026-09-01: staging was down for hours on a missing required
-# field, with every deploy signal green).
-#
-# A required new field must therefore land tolerantly (optional/defaulted)
-# here first, then get its t0.devops config line, then tighten -- the
-# ordering the t0.devops config header documents; this gate turns that
-# convention into a check.
-#
-# Needs the T0_DEVOPS_READ_TOKEN repository secret: a fine-grained PAT
-# with read-only Contents access to T0Trade/t0.devops. Fork PRs have no
-# secrets, so the job skips there rather than failing closed.
+# The runtime configs the deployed bots mount are config/staging/st0x-hedge.toml
+# and config/prod/st0x-hedge.toml in THIS repo (since 2026-09-07; before
+# that they lived in T0Trade/t0.devops and this job needed a cross-repo
+# token). Two directions are guarded:
+#   - this job: parse both files with THIS ref's schema (`validate-config`
+#     without `--secrets`), so a schema change that would crash the
+#     deployed bot on its current config fails the PR that introduces it;
+#   - config-check.yml: parse both files with the newest RELEASED image's
+#     validator, so a config change that only a not-yet-released binary
+#     understands fails its PR. The release itself re-validates against the
+#     exact digest it rolls (ST0x-Technology/.github app-release).
+# A required new field therefore still lands tolerantly (optional or
+# defaulted) first, then gets its config line, then tightens.
 
 on:
   workflow_dispatch:
@@ -34,8 +30,7 @@ permissions:
 
 jobs:
   check:
-    name: parse live t0.devops configs with this schema
-    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+    name: parse the deployed configs with this schema
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     env:
@@ -44,18 +39,6 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           persist-credentials: false
-
-      - name: Check out the live runtime configs
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
-        with:
-          repository: T0Trade/t0.devops
-          token: ${{ secrets.T0_DEVOPS_READ_TOKEN }}
-          path: t0.devops
-          persist-credentials: false
-          sparse-checkout: |
-            terraform/staging-liquidity/st0x-hedge.toml
-            terraform/production-liquidity/st0x-hedge.toml
-          sparse-checkout-cone-mode: false
 
       - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34
         with:
@@ -80,10 +63,10 @@ jobs:
         with:
           prefix-key: rust-${{ github.workflow }}
 
-      - name: Parse both live configs
+      - name: Parse both deployed configs with this schema
         run: |
           nix develop .#ci-backend -c bash -c "
             set -euxo pipefail
-            cargo run --bin validate-config -- --config t0.devops/terraform/staging-liquidity/st0x-hedge.toml
-            cargo run --bin validate-config -- --config t0.devops/terraform/production-liquidity/st0x-hedge.toml
+            cargo run --bin validate-config -- --config config/staging/st0x-hedge.toml
+            cargo run --bin validate-config -- --config config/prod/st0x-hedge.toml
           "

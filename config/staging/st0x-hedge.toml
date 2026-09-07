@@ -1,23 +1,41 @@
+# st0x liquidity bot runtime config for STAGING: the deployed source of truth
+# since 2026-09-07 (moved here from t0.devops terraform/staging-
+# liquidity/st0x-hedge.toml; the stack there keeps only the secret and its
+# grants). Every merge to the default branch validates it with the validate-
+# config just built, publishes it as a version of the liquidity-runtime-config
+# secret and pins that version into the new revision (build-oci.yml ->
+# ST0x-Technology/.github app-release). No approval: staging is the fast path.
+# Non-secret settings only; secrets come from Secret Manager env injection.
+#
+# STAGING config for the GCP VM (t0.devops terraform/staging-liquidity holds
+# the VM; this file is what it runs). The image and this file now roll
+# TOGETHER on every master merge, so the format-ahead-of-image gap the old
+# split had is closed; the VM still fetches exactly the CONFIG_VERSION that
+# images.env names, never `latest`.
+# [wallet] kms_api_key is keyless Turnkey auth (no [wallet] secrets); there
+# is no [telemetry] section (stdout -> Cloud Logging).
+#
 # HTTP API port for the dashboard and health checks.
 server_port = 8001
 # HTTP port for the apalis-board job queue UI.
 board_port = 8002
 # Minimum log level: trace, debug, info, warn, error.
 #
-# NOT trace. On 2026-08-30 trace filled the production bot's 10 GB data disk
-# with its own logs and SQLite began failing every write with SQLITE_FULL:
-# order-fill polling stopped, no hedge fills for 20 hours, every telemetry
-# collector went stale, and the process stayed up throughout so nothing
-# paged. Same failure as 2026-06-08, which is why LOG_RETENTION_DAYS keeps
-# seven daily files; that bound is on FILE COUNT, and at 2-2.9 GB a file
-# seven of them could never fit on the disk.
+# NOT trace. On 2026-08-30 trace filled this VM's 10 GB data disk with its
+# own logs (9.3 GB in /mnt/data/logs) and SQLite began failing every write
+# with SQLITE_FULL: order-fill polling stopped, no hedge fills for 20 hours,
+# and every telemetry collector went stale — while the process stayed up, so
+# nothing paged. Same failure as 2026-06-08, which is why the appender keeps
+# only 7 daily files; that bound is on FILE COUNT, and at trace each file was
+# 2-2.9 GB, so seven of them could never fit.
 #
-# Measured on the 2026-08-29 production file: TRACE was 99.0% of the bytes,
-# DEBUG 0.9%, INFO 0.1%. debug therefore cuts volume ~100x while keeping
-# every line anything reads: the metrics exporter ships ERROR/WARN/INFO,
-# /performance/reliability counts ERROR/WARN, and the SPA log viewer still
-# shows debug. This one level also drives the console layer and both OTel
-# exporters, so trace was being paid for in Cloud Logging ingest too.
+# Measured on a sample of the 2026-08-29 file: TRACE was 99.0% of the bytes,
+# DEBUG 0.9%, INFO 0.1%. debug therefore cuts on-disk volume ~100x (2.4 GB/day
+# to ~24 MB/day) and keeps every line anything actually reads: the exporter
+# ships ERROR/WARN/INFO onward, /performance/reliability counts ERROR/WARN,
+# and a human browsing the SPA log viewer still gets debug detail. It also
+# ends ~$18/month of Cloud Logging ingest for trace nobody reads (this one
+# level drives the file, the console, and both OTel exporters).
 log_level = "debug"
 # Directory for rotated log files (stdout if omitted).
 log_dir = "/mnt/data/logs"
@@ -29,28 +47,21 @@ apalis_finished_job_cleanup_interval_secs = 3600
 # Hedging balance for a symbol before the poller escalates a forced snapshot
 # reconciliation.
 inventory_divergence_threshold = 10
+# Durable-read deadline (seconds) for reconciling open hedge order gates by
+# order ID at startup (st0x.liquidity#1316). Required since that merge; its
+# absence crash-looped the staging bot from 10:24 UTC on 2026-09-01.
 hedge_order_gate_reconciliation_timeout_secs = 10
 
 [pricing]
-ws_url = "ws://st0x-pricing:8080/ws"
-[telemetry]
-service_name = "st0x-liquidity"
-environment = "staging"
-# st0x-observability GCP VM (replaces the DO st0x-management-observability
-# droplet, which is being decommissioned); staging traces/logs are
-# distinguished by deployment.environment, not endpoint. MagicDNS FQDN rather
-# than a pinned tailnet IP so the endpoint survives VM rebuilds.
-traces_endpoint = "http://st0x-observability.tail6094d7.ts.net:10428"
-logs_endpoint = "http://st0x-observability.tail6094d7.ts.net:9428"
-
+# The pricing plane on Cloud Run for THIS environment. Auth is the VM's
+# ambient Google identity (run.invoker on the service, granted in
+# t0.devops' pricing stack) : an ID token minted per connect, no
+# [pricing] secret exists. The droplet's ws://st0x-pricing:8080 was a
+# droplet-local container; it never existed on this VM.
+ws_url = "wss://st0x-pricing-3z4ofantqq-ey.a.run.app/ws"
+gcp_id_token = true
 # Slippage tolerance (basis points) for counter-trades that hedge
 # incoming orderbook fills.
-# Broker identity (type, mode, account_id, and for the keyless variant
-# client_id and kms_key_version) now belongs in this section: it is names and
-# identifiers, not credentials. The values for this deployment still live in
-# the deployed secrets file's [broker] table (accepted for one more release);
-# the next config release moves them here, and only the legacy
-# api_key/api_secret pair may stay in secrets.
 [broker]
 counter_trade_slippage_bps = 100
 extended_hours_reprice_timeout_secs = 300
@@ -65,6 +76,10 @@ beneficiary_entity_name = "T0 TRADE (BVI) LTD"
 # Per-equity hedging policy (broker-side). Chain asset facts live under
 # [chains.base.trading.assets].
 [assets.equities]
+# Symbols deliberately removed from the tables below while the DB still
+# references them (st0x.liquidity#1321). Required since that merge: its
+# absence crash-looped the staging bot from 15:38 UTC on 2026-09-02, the
+# same drift as hedge_order_gate_reconciliation_timeout_secs the day before.
 retired_symbols = []
 
 [assets.equities.RKLB]
@@ -187,10 +202,28 @@ extended_hours_counter_trading = "disabled"
 [assets.equities.TQQQ]
 extended_hours_counter_trading = "disabled"
 
-[assets.equities.FTF]
+[assets.equities.MCD]
 extended_hours_counter_trading = "disabled"
 
-[assets.equities.CBRS]
+[assets.equities.NKE]
+extended_hours_counter_trading = "disabled"
+
+[assets.equities.GRND]
+extended_hours_counter_trading = "disabled"
+
+[assets.equities.DNUT]
+extended_hours_counter_trading = "disabled"
+
+[assets.equities.FGI]
+extended_hours_counter_trading = "disabled"
+
+[assets.equities.PLBY]
+extended_hours_counter_trading = "disabled"
+
+[assets.equities.TR]
+extended_hours_counter_trading = "disabled"
+
+[assets.equities.WEN]
 extended_hours_counter_trading = "disabled"
 
 [chains.base]
@@ -251,6 +284,10 @@ required_confirmations = 1
 
 [wallet]
 kind = "turnkey"
+# Keyless Turnkey authentication (GCP only): requests are stamped by this
+# KMS-held P-256 key via the VM's ambient identity, so the secrets file
+# carries no [wallet] section at all. See crates/evm/src/gcp_kms_stamper.rs.
+kms_api_key = "projects/t0-liquidity-staging/locations/europe-west3/keyRings/t0-liquidity/cryptoKeys/turnkey-api-key/cryptoKeyVersions/1"
 # On-chain address controlled by the Turnkey key.
 address = "0x16ca08a5825612aAe805D172a81B1a52b43574bf"
 # Turnkey organization that owns the signing key.
@@ -263,18 +300,18 @@ chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 
 [rebalancing]
 transfer_timeout_secs = 1800
-# Skip a chain's rebalancing evaluations when its inventory snapshot is
-# older than this bound (or absent, e.g. right after a restart).
-inventory_staleness_bound_secs = 300
 transfer_attempt_timeout_secs = 3600
 attestation_retry_deadline_secs = 86400
 max_burn_revert_redrives = 5
+# An inventory book last polled more than this many seconds ago (or never,
+# e.g. right after a restart) is stale: its imbalance checks are skipped with
+# a warning until a fresh poll lands. Required (non-zero) since st0x.liquidity
+# #1352; the image built from master after that merge refuses to start
+# without it.
+inventory_staleness_bound_secs = 300
 # Dividend freeze guard: query issuance each equity cycle and fail closed when
 # the status cannot be confirmed. Set to "disabled" to fail open during an
 # issuance outage (issuance secrets stay required, so re-enabling is config-only).
-# The issuance base_url now belongs in this config file's [issuance] section
-# (only the api_key is a secret); this deployment still carries it in the
-# deployed secrets file, accepted for one more release.
 freeze_check = "disabled"
 equity = { target = 0.5, deviation = 0.2 }
 usdc = { mode = "disabled" }
@@ -282,16 +319,41 @@ usdc = { mode = "disabled" }
 [rest_api]
 url = "https://api.st0x.io"
 
-# Low-gas balance alerting for the bot wallet. Alerts are structured ERROR
-# logs (target "operational_alert"); delivery to humans happens downstream via
-# the log pipeline (Cloud Logging -> Grafana alert rules). Every field is
-# required (no defaults).
+# IAP audiences for the role-gated ops API, from the ops_api_audiences output
+# of ops-api-iap.tf. The bot pins the audience per path prefix, so a token IAP
+# minted for the read backend is refused on the write path even though its
+# signature is valid.
+#
+# Not secrets: an audience names an IAM-gated backend and is useless without an
+# identity Google will sign for. Removing this section unmounts the role-gated
+# routes entirely.
+[ops_api]
+read_audience = "/projects/819265953297/global/backendServices/6620592880358364228"
+write_audience = "/projects/819265953297/global/backendServices/6816788502563099716"
+
+# Low-gas balance alerting for the bot wallet. Telegram bot_token lives in the
+# encrypted secrets file under [alerts]. Every field is required (no defaults).
+# Shares the encrypted secret (and thus bot_token) with prod, so this section
+# must be present whenever the secret carries [alerts].
 [alerts]
+# Intentionally bogus chat id so staging alert deliveries fail instead of
+# posting into the shared St0x Product Operations supergroup. The field is
+# required whenever the shared secret carries [alerts], so it cannot be
+# omitted; send failures are logged as warnings and are otherwise harmless.
+chat_id = -1
+# Forum topic alerts post into (the "DEX Liquidity" topic).
+message_thread_id = 50
 # Seconds between native-balance polls.
 poll_interval = 300
 # Minimum seconds between repeated alerts while the balance stays below threshold.
-# 43200 = 12 hours.
-realert_interval = 43200
+# 1 = re-log on every poll. The 12-hour throttle this used to carry was for
+# the Telegram transport; alerts are log lines now, and the Grafana rule
+# (rules.yml, liquidity-bot group) treats "Low gas" as a state: it stays
+# firing while the line keeps arriving and resolves only once the balance
+# is really back above threshold. A long throttle here would make Grafana
+# report RESOLVED ten minutes after each re-alert while the wallet is still
+# empty. Grafana does the dedup, so the bot no longer needs to.
+realert_interval = 1
 
 # Native-gas balance below which low-gas alerts fire, per chain (decimal ETH).
 # Required for every chain the gas monitor runs on: one figure cannot be right
@@ -639,18 +701,66 @@ vault_id = "0xfab"
 tokenized_equity = "0xcA1A378F9a250131A2fE51c10f120FeF7EDCa56E"
 tokenized_equity_derivative = "0x295e9eCAb319006900a53b3f8D6Fcb0C131F4ada"
 
-[chains.base.trading.assets.equities.FTF]
+[chains.base.trading.assets.equities.MCD]
 trading = "disabled"
 rebalancing = "disabled"
 wrapped_equity_recovery = "disabled"
 vault_id = "0xfab"
-tokenized_equity = "0x51d5c8c8040358686952a30fac116aac32390d6a"
-tokenized_equity_derivative = "0x9bDe199Ac6E7E050334306D9267c93e3D6d38333"
+tokenized_equity = "0x6363657E19A82ABE0E210e9b8c88Ea61d96eceaB"
+tokenized_equity_derivative = "0x7ecAE30Ed8ee4F72653ada7b0941bDE7a0a8eE8d"
 
-[chains.base.trading.assets.equities.CBRS]
+[chains.base.trading.assets.equities.NKE]
 trading = "disabled"
 rebalancing = "disabled"
 wrapped_equity_recovery = "disabled"
 vault_id = "0xfab"
-tokenized_equity = "0xbeb0c2011bd5520a0998b69132e9245e39ac5d1d"
-tokenized_equity_derivative = "0xB457cfBF31995d3aAAa704dA9999cC0b011820ca"
+tokenized_equity = "0x88C3F4E2E0a977Fed97ed246c70BFD7A01070246"
+tokenized_equity_derivative = "0x0883f32d23Ed5535057a4B5E3eB1970FE08606AF"
+
+[chains.base.trading.assets.equities.GRND]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0xA4178410216F5f00C718BE88C2fF8AC24de192bc"
+tokenized_equity_derivative = "0x1197E6FA778c4D13E47875bD1761c68C22c928e0"
+
+[chains.base.trading.assets.equities.DNUT]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x6C2b6Ed57d4d9e93F3E4975FAc70eE4B180F4Eb9"
+tokenized_equity_derivative = "0x1db49Ff8BEe88ec73F82F395B0BEAd372BdcAdb7"
+
+[chains.base.trading.assets.equities.FGI]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x785BD77B8e92866f87E01416D1022d729975D529"
+tokenized_equity_derivative = "0x6aed8b1aCfb04F4e0e6db580F12fF41438a394e5"
+
+[chains.base.trading.assets.equities.PLBY]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0xe9bc7eF69f123cA2bcA1021D1BE30224271a9217"
+tokenized_equity_derivative = "0x35fDe767dBFAa610D12cf99914bCd6CFEda73B7B"
+
+[chains.base.trading.assets.equities.TR]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0xeF935b17d5BE5b7ecA803158a845A08A7A9383f2"
+tokenized_equity_derivative = "0x433fd2Fc0964B07E9820e4cd01774eDE59D1F002"
+
+[chains.base.trading.assets.equities.WEN]
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0xedA4df511dEA07b6529db2196998B30E03791d87"
+tokenized_equity_derivative = "0x31Fa821F8B1BDea7Db357ec9622d1A2f6aFE903d"

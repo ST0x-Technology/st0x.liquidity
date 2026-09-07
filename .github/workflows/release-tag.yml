@@ -13,6 +13,10 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
 
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+
 jobs:
   label:
     permissions:
@@ -25,3 +29,32 @@ jobs:
       ar_repo: europe-west3-docker.pkg.dev/t0-artifacts/t0-liquidity
       images: t0-liquidity t0-liquidity-dashboard t0-liquidity-datasette
       attestor: projects/t0-artifacts/attestors/liquidity-image
+
+  # Production deploy of the version just labeled, behind the app-deploy PAM
+  # grant in t0-liquidity: config/prod/st0x-hedge.toml at this tag is
+  # validated inside the labeled bot image, published, and images.env is
+  # rewritten (three digests + CONFIG_VERSION, SECRETS_VERSION untouched)
+  # once an approver activates the grant; the VM then verifies attestations,
+  # runs the migration + health gates and publishes deployed.env, which the
+  # job waits for. Rollback = production-release.yml workflow_dispatch with
+  # an older version.
+  deploy-production:
+    needs: label
+    permissions:
+      id-token: write
+      contents: read
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@cae26fdb27c048ba9d9d203e5c633892a27dd4aa # app-release, bump via PR
+    with:
+      environment: production
+      runtime: bot-vm
+      project: t0-liquidity
+      config_bucket: t0-liquidity-config
+      ar_repo: europe-west3-docker.pkg.dev/t0-artifacts/t0-liquidity
+      images: t0-liquidity=BOT_IMAGE t0-liquidity-dashboard=DASHBOARD_IMAGE t0-liquidity-datasette=DATASETTE_IMAGE
+      attestor: projects/t0-artifacts/attestors/liquidity-image
+      service_account: liquidity-releaser@t0-artifacts.iam.gserviceaccount.com
+      pam_entitlement: app-deploy
+      config_file: config/prod/st0x-hedge.toml
+      config_secret: liquidity-runtime-config
+      validate_entrypoint: /bin/validate-config
+      validate_command: --config /candidate.toml
