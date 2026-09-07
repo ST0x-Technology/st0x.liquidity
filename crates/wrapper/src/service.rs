@@ -452,11 +452,16 @@ mod tests {
     use alloy::providers::RootProvider;
     use alloy::providers::mock::Asserter;
     use alloy::rpc::client::RpcClient;
+    use alloy::rpc::json_rpc::{RequestPacket, Response, ResponsePacket, ResponsePayload};
     use alloy::rpc::types::Log;
     use alloy::rpc::types::TransactionReceipt;
     use alloy::sol_types::SolCall;
+    use alloy::transports::{TransportError, TransportFut};
+    use serde_json::value::RawValue;
     use st0x_evm::{Evm, EvmError};
     use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use tower::Service;
 
     use super::*;
 
@@ -1046,6 +1051,79 @@ mod tests {
         assert_eq!(confirmation.token.address(), equity.underlying);
         assert_eq!(confirmation.assets, assets);
         assert_eq!(confirmation.block, 7);
+    }
+
+    /// A transport serving the vault's `asset()` by block tag: `pinned` for an
+    /// `eth_call` at `pinned_block`, `latest` for any other tag.
+    #[derive(Clone)]
+    struct AssetByBlockTransport {
+        pinned_block: u64,
+        pinned: Address,
+        latest: Address,
+    }
+
+    impl Service<RequestPacket> for AssetByBlockTransport {
+        type Response = ResponsePacket;
+        type Error = TransportError;
+        type Future = TransportFut<'static>;
+
+        fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), TransportError>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: RequestPacket) -> Self::Future {
+            let RequestPacket::Single(request) = request else {
+                panic!("AssetByBlockTransport serves single requests only");
+            };
+            assert_eq!(request.method(), "eth_call");
+            let params: Vec<serde_json::Value> =
+                serde_json::from_str(request.params().unwrap().get()).unwrap();
+            let pinned_tag = serde_json::Value::from(format!("{:#x}", self.pinned_block));
+            let asset = if params.get(1) == Some(&pinned_tag) {
+                self.pinned
+            } else {
+                self.latest
+            };
+            let payload = serde_json::to_string(&Bytes::from(
+                <IERC4626::assetCall as SolCall>::abi_encode_returns(&asset),
+            ))
+            .unwrap();
+            let response = Response {
+                id: request.id().clone(),
+                payload: ResponsePayload::Success(RawValue::from_string(payload).unwrap()),
+            };
+
+            Box::pin(async move { Ok(ResponsePacket::Single(response)) })
+        }
+    }
+
+    /// The redeem delivered the vault's `asset()` as of the receipt block, so
+    /// the attestation reads that block rather than whatever the vault reports
+    /// later.
+    #[tokio::test]
+    async fn confirm_unwrap_reads_the_vaults_asset_at_the_redeem_block() {
+        let equity = test_equity();
+        let tx_hash = TxHash::random();
+        let assets = U256::from(5_000_000_000_000_000_000_u128);
+        let transport = AssetByBlockTransport {
+            pinned_block: 7,
+            pinned: equity.underlying,
+            latest: Address::random(),
+        };
+        let provider = ProviderBuilder::new().connect_client(RpcClient::new(transport, true));
+        let wallet = MockedWallet::new(Address::ZERO, provider)
+            .with_write_results(unwrap_receipt(tx_hash, equity.derivative, assets), tx_hash);
+        let service = WrapperService::new(
+            wallet,
+            HashMap::from([(Symbol::new("AAPL").unwrap(), equity)]),
+        );
+
+        let confirmation = service
+            .confirm_unwrap(equity.derivative, tx_hash)
+            .await
+            .unwrap();
+
+        assert_eq!(confirmation.token.address(), equity.underlying);
     }
 
     #[tokio::test]
