@@ -58,7 +58,7 @@ use st0x_raindex::{RaindexService, RaindexVaultId, RevokeOutcome};
 use st0x_registry::SymbolCache;
 use st0x_tokenization::AlpacaTokenizationService;
 use st0x_tokenization::Tokenizer;
-use st0x_wrapper::{Wrapper, WrapperService};
+use st0x_wrapper::{Wrapper, WrapperError, WrapperService};
 
 use crate::alerts::{LogNotifier, Notifier};
 use crate::bot_gas::{
@@ -2573,6 +2573,80 @@ async fn revoke_stale_orderbook_allowances<Signer: Wallet + Clone>(
     Ok(())
 }
 
+/// A watched chain's vault attestation failed at startup; the wrapper's own
+/// error names the symbol, the vault and the two disagreeing tokens.
+#[derive(Debug, thiserror::Error)]
+#[error("tokenization preflight failed on {chain}")]
+struct TokenizationPreflightError {
+    chain: Chain,
+    #[source]
+    source: WrapperError,
+}
+
+/// Read-only: every equity the bot may wrap or redeem on `chain` (trading or
+/// rebalancing enabled) must have a vault reporting the configured underlying
+/// as its `asset()` -- the attestation a redemption's unwrap step performs,
+/// pulled forward so a vault that delivers a different token refuses startup
+/// instead of the first redemption.
+async fn attest_chain_vaults<Attester: Wrapper + ?Sized>(
+    chain: Chain,
+    wrapper: &Attester,
+    assets: &ChainAssets,
+) -> Result<(), TokenizationPreflightError> {
+    let mut enabled = assets
+        .equities
+        .symbols
+        .keys()
+        .filter(|symbol| assets.is_trading_enabled(symbol) || assets.is_rebalancing_enabled(symbol))
+        .collect::<Vec<_>>();
+    enabled.sort();
+
+    for symbol in enabled {
+        let token = wrapper
+            .attest_underlying(symbol)
+            .await
+            .map_err(|source| TokenizationPreflightError { chain, source })?;
+
+        info!(
+            target: "tokenization",
+            %chain,
+            %symbol,
+            %token,
+            "Confirmed the configured vault delivers the configured underlying"
+        );
+    }
+
+    Ok(())
+}
+
+/// The tokenization preflight, per watched chain on that chain's own wrapper.
+/// The chain's redemption wallet was already required when its services were
+/// built; whether an equity is in orchestrator mode is only known to
+/// issuance, so a missing `[orchestrator.addresses]` entry is warned about
+/// there and refuses the first orchestrator-mode mint instead.
+async fn preflight_tokenization<Signer: Wallet + Clone>(
+    ctx: &Ctx,
+    tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
+) -> anyhow::Result<()> {
+    for watched in ctx.chains.watched() {
+        let Some(tokenization) = tokenizations.get(&watched.chain) else {
+            anyhow::bail!(
+                "no tokenization services were built for watched chain {}",
+                watched.chain
+            );
+        };
+
+        attest_chain_vaults(
+            watched.chain,
+            tokenization.wrapper.as_ref(),
+            &watched.assets,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 /// Resolves the resume-tokenization wiring.
 ///
 /// The ctx is built only when BOTH the queue and the recovery transfer are
@@ -2789,6 +2863,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         preflight_inventory_access(&raindex_service, &deps.ctx).await?;
         revoke_stale_orderbook_allowances(&deps.ctx, &tokenizations).await?;
+        preflight_tokenization(&deps.ctx, &tokenizations).await?;
 
         let tokenizer = primary.tokenizer.clone();
         let wrapper = primary.wrapper.clone();
