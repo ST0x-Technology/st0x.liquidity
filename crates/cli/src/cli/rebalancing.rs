@@ -76,15 +76,19 @@ fn gas_readiness(ctx: &Ctx, wallet_ctx: &OnchainWalletCtx) -> anyhow::Result<Arc
 
 /// Resolves the redemption wallet address from CLI flag or config.
 ///
-/// CLI flag takes precedence; otherwise `[tokenization]` config is used for
-/// every network. Alpaca's redemption address is the same on all EVM chains
-/// (same key → same address), so ethereum does not need a separate override.
-fn resolve_redemption_wallet(flag: Option<Address>, ctx: &Ctx) -> anyhow::Result<Address> {
+/// The CLI flag takes precedence; otherwise the selected network's own
+/// `[chains.<name>.trading].redemption_wallet`. Never the primary's entry:
+/// tokens sent to another chain's issuer address are lost.
+fn resolve_redemption_wallet(
+    flag: Option<Address>,
+    network: TokenizationNetwork,
+    ctx: &Ctx,
+) -> anyhow::Result<Address> {
     if let Some(address) = flag {
         return Ok(address);
     }
 
-    ctx.redemption_wallet().map_err(Into::into)
+    ctx.redemption_wallet(network.into()).map_err(Into::into)
 }
 
 /// The bot wallet whose chain matches the selected tokenization network,
@@ -113,7 +117,8 @@ async fn build_equity_transfer_services(
         anyhow::bail!("transfer-equity requires Alpaca Broker API configuration");
     };
 
-    let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, ctx)?;
+    let redemption_wallet =
+        resolve_redemption_wallet(redemption_wallet_flag, TokenizationNetwork::Base, ctx)?;
     let wallet_ctx = ctx.wallet()?;
     let wallet = wallet_ctx.base_wallet().address();
     let gas_readiness = gas_readiness(ctx, wallet_ctx)?;
@@ -1330,7 +1335,7 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
         anyhow::bail!("alpaca-redeem requires Alpaca Broker API configuration");
     };
 
-    let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, ctx)?;
+    let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, network, ctx)?;
     let (_, chain) = tokenization_network_context(ctx.wallet()?, network);
     writeln!(stdout, "   Redemption wallet: {redemption_wallet}")?;
 
@@ -2223,7 +2228,6 @@ mod tests {
             rest_api: None,
             ops_api: None,
             issuance: create_test_issuance_ctx(),
-            redemption_wallet: None,
             bot_gas_valuation: None,
             orchestrator: None,
         }
@@ -2278,6 +2282,7 @@ mod tests {
                         equities: ChainEquities::default(),
                         cash,
                     })
+                    .redemption_wallet(Address::ZERO)
                     .call(),
             ),
             order_polling_interval: 15,
@@ -2317,7 +2322,6 @@ mod tests {
             rest_api: None,
             ops_api: None,
             issuance: create_test_issuance_ctx(),
-            redemption_wallet: Some(Address::ZERO),
             bot_gas_valuation: None,
             orchestrator: None,
         }

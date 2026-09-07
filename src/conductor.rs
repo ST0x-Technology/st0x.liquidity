@@ -1872,7 +1872,9 @@ impl PositionAndRebalancing {
         if let Some(rebalancing_ctx) = rebalancing {
             let wallet_ctx = deps.ctx.wallet()?;
             let wallets = ChainWallets::from_wallet_ctx(wallet_ctx);
-            let redemption_wallet = deps.ctx.redemption_wallet()?;
+            let redemption_wallet = deps
+                .ctx
+                .redemption_wallet(deps.ctx.chains.primary().chain)?;
 
             // Computed before `deps` is moved into the spawn call, since
             // `WalletPollingCtx` below also needs the config behind `deps.ctx`.
