@@ -256,10 +256,10 @@ distinct — neither key alone can both mint and authorize.
   mirroring the issuance bot's shape — each chain carries its own orchestrator
   deployment. The section is optional as a whole: while every asset is
   vault-direct the bot deploys without it. Mint authorization signs against the
-  `base` entry (every tokenized equity the bot mints lives on Base); an
-  orchestrator-mode mint reaching the signing step without a base entry fails
-  loudly rather than guessing an address or another chain's deployment, and a
-  section carrying only other networks' entries is flagged with a startup
+  entry of the chain the mint lands on (today the primary chain); an
+  orchestrator-mode mint reaching the signing step without that chain's entry
+  fails loudly rather than guessing an address or another chain's deployment,
+  and a section carrying only other networks' entries is flagged with a startup
   warning instead of staying silently inert.
 
 #### Dividend NAV Bump
@@ -2432,8 +2432,9 @@ Arc<dyn Tokenizer>, wrapper: Arc<dyn Wrapper>, mint_authorizer:
 ConfiguredMintAuthorizer, .. }`
 -- shared with `EquityRedemption`. `mint_authorizer` signs MintAuthV1 recipient
 authorizations for orchestrator-mode mints; `Disabled` without an
-`[orchestrator.addresses]` base entry, so `SignMintAuthorization` fails loudly
-rather than guessing an orchestrator address.
+`[orchestrator.addresses]` entry for the chain the mint lands on, so
+`SignMintAuthorization` fails loudly rather than guessing an orchestrator
+address.
 
 ##### State Flow
 
