@@ -171,7 +171,7 @@ jobs:
             exit "$status"
           fi
 
-  # STAGING ROLLS ON EVERY MASTER MERGE — the same fast path pricing, bebop
+  # STAGING ROLLS ON EVERY MASTER MERGE, the same fast path pricing, bebop
   # and the oracle have, via the same shared workflow. This plane is a GCE
   # VM, so the deploy is a write to images.env (the deployer's only write in
   # that project: objectAdmin conditioned to that object, t0.devops
@@ -182,7 +182,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@cae26fdb27c048ba9d9d203e5c633892a27dd4aa  # app-release, bump via PR
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@0f8aab4184974e7b6bd79b8e020b3ef62f884fdc  # app-release, bump via PR
     with:
       environment: staging
       runtime: bot-vm

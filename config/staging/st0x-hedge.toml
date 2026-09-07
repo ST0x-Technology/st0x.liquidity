@@ -24,7 +24,7 @@ board_port = 8002
 # NOT trace. On 2026-08-30 trace filled this VM's 10 GB data disk with its
 # own logs (9.3 GB in /mnt/data/logs) and SQLite began failing every write
 # with SQLITE_FULL: order-fill polling stopped, no hedge fills for 20 hours,
-# and every telemetry collector went stale — while the process stayed up, so
+# and every telemetry collector went stale, while the process stayed up, so
 # nothing paged. Same failure as 2026-06-08, which is why the appender keeps
 # only 7 daily files; that bound is on FILE COUNT, and at trace each file was
 # 2-2.9 GB, so seven of them could never fit.
