@@ -1243,8 +1243,8 @@ event position).
   resumes both executing accumulated counter-trade positions and evaluating
   rebalancing triggers for any resulting inventory imbalances (same semantics as
   market close/open behavior). A fill landing on a disabled asset raises a
-  deduplicated critical operational alert (once per process per symbol): the
-  delta exposure it accumulates is deliberate, but never silent
+  deduplicated critical operational alert (once per process per chain and
+  symbol): the delta exposure it accumulates is deliberate, but never silent
 
 ### Infrastructure and Deployment
 

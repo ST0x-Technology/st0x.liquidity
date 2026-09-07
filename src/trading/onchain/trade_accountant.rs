@@ -93,10 +93,12 @@ pub(crate) struct AccountantCtx<Node, Exec> {
     pub(crate) pool: SqlitePool,
     pub(crate) job_queue: DexTradeAccountingJobQueue,
     pub(crate) notifier: Arc<dyn Notifier>,
-    /// Symbols already paged for accumulating fills while disabled, so an
-    /// ongoing stream of such fills pages once per process, not per fill
-    /// (same cadence as hedge dead-letter alerts). A restart re-pages.
-    pub(crate) disabled_asset_alerts: Arc<std::sync::Mutex<HashSet<Symbol>>>,
+    /// Chain-and-symbol pairs already paged for accumulating fills while
+    /// disabled, so an ongoing stream of such fills pages once per process,
+    /// not per fill (same cadence as hedge dead-letter alerts). Keyed per
+    /// chain because each chain's asset table disables the symbol on its own.
+    /// A restart re-pages.
+    pub(crate) disabled_asset_alerts: Arc<std::sync::Mutex<HashSet<(Chain, Symbol)>>>,
 }
 
 impl<Node, Exec> Job<AccountantCtx<Node, Exec>> for AccountForDexTrade
@@ -455,12 +457,12 @@ impl AccountForDexTrade {
     /// Critical, deduplicated alert for a fill landing on a disabled asset:
     /// the accumulated delta is deliberate (the flag is the per-symbol hedge
     /// kill switch) but must never be silent exposure. Once per process per
-    /// symbol; delivery failure releases the reservation so the next fill
-    /// re-attempts.
+    /// chain and symbol; delivery failure releases the reservation so the
+    /// next fill re-attempts.
     async fn alert_disabled_asset_fill(
         &self,
         notifier: &Arc<dyn Notifier>,
-        alerted_symbols: &std::sync::Mutex<HashSet<Symbol>>,
+        alerted_symbols: &std::sync::Mutex<HashSet<(Chain, Symbol)>>,
         trade: &OnchainTrade,
         chain: Chain,
     ) {
@@ -469,7 +471,7 @@ impl AccountForDexTrade {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            alerted.insert(trade.symbol.base().clone())
+            alerted.insert((chain, trade.symbol.base().clone()))
         };
         if !newly_reserved {
             return;
@@ -488,7 +490,7 @@ impl AccountForDexTrade {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            alerted.remove(trade.symbol.base());
+            alerted.remove(&(chain, trade.symbol.base().clone()));
         }
     }
 }
