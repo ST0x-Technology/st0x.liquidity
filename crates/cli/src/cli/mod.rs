@@ -2244,6 +2244,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn transfer_equity_parses_network() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer-equity",
+            "-d",
+            "to-raindex",
+            "-s",
+            "AAPL",
+            "-q",
+            "1",
+            "--network",
+            "ethereum",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::TransferEquity { network, .. } => {
+                assert_eq!(network, TokenizationNetwork::Ethereum);
+            }
+            other => panic!("expected transfer-equity command, got: {other:?}"),
+        }
+    }
+
     /// `reset-allowance` selects its chain with `--network` like every other
     /// chain-touching command; the old `--chain` spelling is gone.
     #[test]

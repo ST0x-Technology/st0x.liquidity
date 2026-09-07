@@ -1763,9 +1763,11 @@ mod tests {
     use alloy::primitives::{Address, B256, address, b256};
     use chrono::Utc;
     use rain_math_float::Float;
+    use std::collections::BTreeMap;
     use uuid::uuid;
 
     use st0x_bridge::cctp::CctpError;
+    use st0x_config::AlertsCtx;
     use st0x_config::ChainRegistry;
     use st0x_config::CtxError;
     use st0x_config::ExecutionThreshold;
@@ -2381,11 +2383,14 @@ mod tests {
         let mut stdout = Vec::new();
         let result = transfer_equity_command(
             &mut stdout,
-            TransferDirection::ToRaindex,
-            &symbol,
-            quantity,
-            None,
-            None,
+            TransferEquity {
+                direction: TransferDirection::ToRaindex,
+                symbol,
+                quantity,
+                issuer_request_id: None,
+                redemption_wallet: None,
+                network: TokenizationNetwork::Base,
+            },
             &ctx,
             &pool,
         )
@@ -2408,11 +2413,14 @@ mod tests {
         let mut stdout = Vec::new();
         let result = transfer_equity_command(
             &mut stdout,
-            TransferDirection::ToRaindex,
-            &symbol,
-            quantity,
-            None,
-            None,
+            TransferEquity {
+                direction: TransferDirection::ToRaindex,
+                symbol,
+                quantity,
+                issuer_request_id: None,
+                redemption_wallet: None,
+                network: TokenizationNetwork::Base,
+            },
             &ctx,
             &pool,
         )
@@ -3006,6 +3014,90 @@ mod tests {
         assert!(
             error.contains("hyperevm"),
             "expected the unpinned chain named, got: {error}"
+        );
+    }
+
+    const ETHEREUM_VAULT_OWNER: Address = address!("0xe0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0");
+    const ETHEREUM_REDEMPTION_WALLET: Address =
+        address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+    /// Alpaca broker, stub wallets, gas thresholds for every chain and an
+    /// Ethereum secondary with its own orderbook, vault owner and redemption
+    /// wallet: everything a service build needs short of a live RPC.
+    fn create_alpaca_ctx_watching_ethereum() -> Ctx {
+        let mut ctx = create_alpaca_ctx_with_rebalancing(None);
+        ctx.wallet = Some(OnchainWalletCtx::stub());
+        ctx.alerts = Some(AlertsCtx::for_test(
+            BTreeMap::from([
+                (Chain::Base, U256::from(1_u64)),
+                (Chain::Ethereum, U256::from(1_u64)),
+            ]),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .orderbook(ETHEREUM_ORDERBOOK)
+                .vault_owner(ETHEREUM_VAULT_OWNER)
+                .redemption_wallet(ETHEREUM_REDEMPTION_WALLET)
+                .call(),
+        );
+        ctx
+    }
+
+    /// `--network ethereum` builds the transfer on Ethereum's wallet and binds
+    /// its vault lookup to Ethereum's registry (chain, orderbook, vault
+    /// owner), never the primary's.
+    #[tokio::test]
+    async fn transfer_equity_services_are_built_on_the_selected_chain() {
+        let ctx = create_alpaca_ctx_watching_ethereum();
+        let pool = setup_test_db().await;
+
+        let services =
+            build_equity_transfer_services(None, TokenizationNetwork::Ethereum, &ctx, &pool)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            services.wallet,
+            ctx.wallet().unwrap().ethereum_wallet().address()
+        );
+        assert_eq!(
+            services.vault_registry,
+            VaultRegistryId::new(Chain::Ethereum, ETHEREUM_ORDERBOOK, ETHEREUM_VAULT_OWNER)
+        );
+    }
+
+    /// A network with no trading table cannot host a transfer. The redemption
+    /// wallet is passed by flag so the trading table is what refuses.
+    #[tokio::test]
+    async fn transfer_equity_refuses_a_network_without_a_trading_table() {
+        let mut ctx = create_alpaca_ctx_with_rebalancing(None);
+        ctx.wallet = Some(OnchainWalletCtx::stub());
+        let pool = setup_test_db().await;
+
+        let mut stdout = Vec::new();
+        let error = transfer_equity_command(
+            &mut stdout,
+            TransferEquity {
+                direction: TransferDirection::ToRaindex,
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(1)),
+                issuer_request_id: None,
+                redemption_wallet: Some(ETHEREUM_REDEMPTION_WALLET),
+                network: TokenizationNetwork::Ethereum,
+            },
+            &ctx,
+            &pool,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("[chains.ethereum.trading]"),
+            "expected the missing trading table named, got: {error}"
         );
     }
 
