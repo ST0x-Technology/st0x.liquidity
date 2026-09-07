@@ -17,9 +17,6 @@ name: build-oci
 # Auth: GitHub OIDC → the t0-artifacts WIF provider, bound to
 # liquidity-deployer (master only — the WIF binding lives in t0.devops
 # terraform/production-artifacts/liquidity.tf). PRs get nothing.
-#
-# Coexists with deploy-staging.yaml / deploy-prod.yaml (the DO droplet
-# deploy-rs path) until the staging cutover retires the staging half.
 
 on:
   push:

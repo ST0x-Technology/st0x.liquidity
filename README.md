@@ -273,43 +273,41 @@ metric. Scan-time transient and rate-limited preflight failures instead wait for
 
 ## Deployment
 
-The system runs on a NixOS host on DigitalOcean, managed by deploy-rs. All
-infrastructure is defined declaratively in Nix and Terraform.
+The liquidity bot, dashboard, and datasette run as OCI containers on a Google
+Compute Engine VM. Nix builds the container images reproducibly; the VM pulls
+its own deploy state and runs them. Staging and production are separate GCP
+projects.
 
 ### Architecture
 
 ```
-GitHub Actions (CI/CD)
+GitHub Actions
   |
-  | deploy-rs over SSH
+  | build OCI images (Nix), push to Artifact Registry, sign attestation
   v
-NixOS host (DigitalOcean droplet)
-  ├── st0x-hedge       (systemd, hedging bot)
-  ├── datasette        (systemd, SQLite database explorer)
-  ├── nginx            (dashboard + WebSocket proxy)
-  └── grafana          (metrics visualization)
+Artifact Registry (europe-west3-docker.pkg.dev/t0-artifacts/t0-liquidity)
+  |
+  | CD rewrites images.env in the GCS config bucket
+  v
+GCE VM (roll timer polls images.env, verifies the liquidity-image
+attestation, then restarts the container stack)
+  - bot         (server binary; also ships /bin/st0x-cli for operators)
+  - dashboard   (nginx serving the SvelteKit build, proxies the API to bot:8001)
+  - datasette   (SQLite database explorer)
+  - exporter    (metrics; image managed by t0.devops terraform)
 ```
 
-Services are deployed as independent nix profiles, allowing per-service updates
-and rollbacks without affecting other services.
+The VM verifies the Binary Authorization liquidity-image attestation of every
+digest before it adopts it, so it never runs an unsigned image. A digest counts
+as deployed only after the container stack restarts successfully; an image that
+crash loops leaves the deploy failed rather than published.
 
-Before the bot is stopped, activation validates staged config/secrets and, for
-Turnkey wallets, runs a read-only policy coverage check for every startup MAX
-approval. Coverage requires an allow policy whose consensus the authenticated
-API user can satisfy alone and whose target condition provably applies;
-applicable or unprovable denies take precedence. Missing token or wrapper
-coverage fails the deployment with the symbol and contract details while the
-existing bot and installed files remain untouched.
-
-The bot unit exposes a PID-scoped startup signal in its systemd runtime
-directory. A bot deployment succeeds only after Conductor finishes startup
-initialization and every essential runtime task has entered its run loop; an
-early exit or a missing readiness signal fails within five minutes, emits unit
-status and recent journal output in the deploy log, and triggers deploy-rs
-rollback. The first rollout requires deploying the system profile before the
-service profile; service-only deploys verify that prerequisite before stopping
-the current bot. Local server runs omit the systemd ready-file environment and
-use a no-op notifier.
+At startup, the bot validates staged config/secrets and, for Turnkey wallets,
+runs a read-only policy coverage check for every startup MAX approval. Coverage
+requires an allow policy whose consensus the authenticated API user can satisfy
+alone and whose target condition provably applies; applicable or unprovable
+denies take precedence. Missing token or wrapper coverage fails startup with the
+symbol and contract details.
 
 ### Key Files
 
@@ -324,47 +322,18 @@ use a no-op notifier.
 | `infra/`            | Terraform for DigitalOcean infrastructure              |
 | `disko.nix`         | Disk partitioning for nixos-anywhere bootstrap         |
 
-### Deploy Commands
+### Host access
+
+Reach a VM over IAP with gcloud (`docs/cli-ops.md` covers the CLI it runs):
 
 ```bash
-# Deploy everything (system config + all service binaries)
-nix run .#deployAll
+# Staging
+gcloud compute ssh t0-liquidity-staging --project t0-liquidity-staging \
+  --zone europe-west3-b --tunnel-through-iap
 
-# Deploy only NixOS system configuration (SSH, firewall, systemd units, nginx)
-nix run .#deployNixos
-
-# Deploy a specific service profile
-nix run .#deployService st0x-hedge
-nix run .#deployService datasette
-```
-
-### SSH Access
-
-```bash
-nix run .#remote              # interactive shell
-nix run .#remote -- <command> # run a command
-```
-
-### Rollback
-
-Each service profile maintains a history of deployments. Rollback requires two
-steps: reverting the nix profile, then restarting the affected services (the
-profile switch alone does not trigger a restart).
-
-deploy-rs uses legacy (`nix-env`-style) profiles internally.
-`nix profile
-rollback` is **not compatible** — you must use `nix-env`.
-
-SSH into the host and run:
-
-```bash
-# Roll back the bot profile to previous deployment
-nix-env --profile /nix/var/nix/profiles/per-service/st0x-hedge --rollback
-systemctl restart st0x-hedge
-
-# Roll back the Datasette profile
-nix-env --profile /nix/var/nix/profiles/per-service/datasette --rollback
-systemctl restart datasette
+# Production
+gcloud compute ssh t0-liquidity --project t0-liquidity \
+  --zone europe-west3-b --tunnel-through-iap
 ```
 
 ### Secrets Management
@@ -413,11 +382,24 @@ nix run .#deployAll   # first deployment
 
 ### CI/CD
 
-- **CI** (`.github/workflows/ci.yaml`): Builds all packages, runs tests and
-  clippy inside nix derivations, and builds the dashboard. Runs for pull request
-  activity and pushes to `master`.
-- **CD** (`.github/workflows/cd.yaml`): Deploys to the NixOS host via
-  `nix run .#deployAll`. Runs on push to master.
+- **CI** (`.github/workflows/ci.yaml`): builds the packages, runs tests and
+  clippy inside Nix derivations, and builds the dashboard. It never reaches a
+  deployed machine. Runs on pull request activity and pushes to `master`.
+- **CD** (`.github/workflows/build-oci.yml`): on every push to `master`, builds
+  the OCI images with Nix, pushes them to Artifact Registry, signs the Binary
+  Authorization attestation, and rewrites `images.env` in the staging config
+  bucket so the staging VM adopts the new digests. Authenticated with a GitHub
+  OIDC token federated into Google IAM: no stored keys and no human identity,
+  and each run records the person who scheduled it.
+- **Release** (`.github/workflows/release-tag.yml`): pushing a `vX.Y.Z` tag
+  labels the images already built and attested for that commit and cuts the
+  GitHub release. It does not build or deploy.
+- **Production** is promoted from `t0.devops`, not this repo: promote a digest
+  proven in staging into `terraform/production-liquidity/images.yaml` and merge.
+  The apply requires 2 of 4 approvers (Juan, Alastair, Kais, Josh).
+
+Track staging and production deploys in the Grafana deployments dashboard:
+https://grafana.t0trade.com/d/t0-deployments/deployments
 
 To reproduce CI checks locally, use the same dev shell CI uses:
 
@@ -587,36 +569,13 @@ Pass `-i <path>` to use a different key.
 **Deployment** (requires SSH key for host access and terraform state
 decryption):
 
-| Command                  | Usage                                   | Notes                                         |
-| ------------------------ | --------------------------------------- | --------------------------------------------- |
-| `prodDeployAll`          | `nix run .#prodDeployAll`               | Deploy prod system config + all services      |
-| `prodDeployNixos`        | `nix run .#prodDeployNixos`             | Deploy prod NixOS system config only          |
-| `prodDeployNixosBoot`    | `nix run .#prodDeployNixosBoot`         | Register prod NixOS config for next boot      |
-| `prodDeployService`      | `nix run .#prodDeployService <profile>` | Deploy a single prod service                  |
-| `stagingDeployAll`       | `nix run .#stagingDeployAll`            | Deploy staging system config + all services   |
-| `stagingDeployNixosBoot` | `nix run .#stagingDeployNixosBoot`      | Register staging NixOS config for next boot   |
-| `remote`                 | `nix run .#remote [-- <cmd>]`           | SSH into production host                      |
-| `secret`                 | `nix run .#secret <file.age>`           | Edit an encrypted config, then re-encrypt all |
-| `bootstrap`              | `nix run .#bootstrap`                   | One-time NixOS install on a new host          |
-
-The deploy workflows also expose a `broker-migration` mode for the one-time
-`dbus` to `dbus-broker` migration. Use that mode when a NixOS change must be
-registered for next boot instead of live-switched: it boot-deploys the system
-profile, reboots the host, waits for SSH over Tailscale, verifies `dbus-broker`,
-then runs the normal full deploy to reactivate service profiles. This keeps the
-host on the current NixOS default instead of carrying a permanent override back
-to classic `dbus`.
-
-To run the production migration:
-
-1. Draft the release tag from `master`.
-2. Open the **Deploy to Production** GitHub Actions workflow.
-3. Click **Run workflow**.
-4. Enter the release tag.
-5. Set `mode` to `broker-migration`.
-6. Start the workflow and wait for the final `Deploy all profiles after reboot`
-   step to pass.
-7. Use the default `all` mode for future production deploys.
+| Command             | Usage                                   | Notes                                         |
+| ------------------- | --------------------------------------- | --------------------------------------------- |
+| `prodDeployNixos`   | `nix run .#prodDeployNixos`             | Deploy prod NixOS system config only          |
+| `prodDeployService` | `nix run .#prodDeployService <profile>` | Deploy a single prod service                  |
+| `remote`            | `nix run .#remote [-- <cmd>]`           | SSH into production host                      |
+| `secret`            | `nix run .#secret <file.age>`           | Edit an encrypted config, then re-encrypt all |
+| `bootstrap`         | `nix run .#bootstrap`                   | One-time NixOS install on a new host          |
 
 **Infrastructure** (requires SSH key for terraform state decryption):
 
