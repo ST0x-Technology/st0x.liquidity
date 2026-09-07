@@ -109,9 +109,12 @@
           nodeName = "st0x-liquidity-staging";
           volumeName = "st0x-liquidity-staging-data";
           hostKey = keys.host-staging;
-          # Migrated to the st0x.io tailnet (tail6094d7.ts.net) so telemetry can
-          # reach the st0x-observability GCP VM.
           tailscaleMagicDnsName = "st0x-liquidity-staging.tail6094d7.ts.net";
+          dbSnapshotGcpIap = {
+            instance = "t0-liquidity-staging";
+            project = "t0-liquidity-staging";
+            zone = "europe-west3-b";
+          };
         };
       };
       envNames = builtins.attrNames environments;
@@ -198,6 +201,7 @@
             system
             ;
           environments = envNames;
+          environmentConfigs = environments;
         };
         rekeySecrets = ''ragenix --rules ./secret/secrets.nix -i "$identity" -r'';
 
@@ -610,6 +614,27 @@
           pkgs.runCommand "cli-activation-skips-config-validation-test" { } ''
             touch $out
           '';
+
+        checks.db-snapshot-transport = pkgs.runCommand "db-snapshot-transport-test" { } ''
+          grep -Fq -- "gcloud compute ssh t0-liquidity-staging" \
+            ${infraPkgs.packages.stagingDbSnapshot}/bin/staging-db-snapshot
+          grep -Fq -- "--project=t0-liquidity-staging" \
+            ${infraPkgs.packages.stagingDbSnapshot}/bin/staging-db-snapshot
+          grep -Fq -- "--zone=europe-west3-b" \
+            ${infraPkgs.packages.stagingDbSnapshot}/bin/staging-db-snapshot
+          grep -Fq -- "--tunnel-through-iap" \
+            ${infraPkgs.packages.stagingDbSnapshot}/bin/staging-db-snapshot
+          grep -Fq -- "python3 -c" \
+            ${infraPkgs.packages.stagingDbSnapshot}/bin/staging-db-snapshot
+          grep -Fq -- "VACUUM INTO" \
+            ${infraPkgs.packages.stagingDbSnapshot}/bin/staging-db-snapshot
+          if grep -Fq -- "gcloud compute ssh" \
+            ${infraPkgs.packages.prodDbSnapshot}/bin/prod-db-snapshot; then
+            echo "Production must keep its existing SSH transport" >&2
+            exit 1
+          fi
+          touch $out
+        '';
 
         formatter = pkgs.nixfmt-rfc-style;
 

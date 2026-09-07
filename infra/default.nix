@@ -3,6 +3,7 @@
   ragenix,
   system,
   environments,
+  environmentConfigs,
 }:
 
 let
@@ -169,9 +170,59 @@ let
   mkEnv =
     env:
     let
+      envConfig = environmentConfigs.${env};
       remoteFile = remoteFiles.${env};
       outputKey = "${env}_droplet_ipv4";
       sshInputs = sshBuildInputs ++ [ pkgs.openssh ];
+      dbSnapshotGcpIap = envConfig.dbSnapshotGcpIap or null;
+      dbSnapshotInputs =
+        sshInputs
+        ++ [ pkgs.coreutils ]
+        ++ pkgs.lib.optionals (dbSnapshotGcpIap != null) [ pkgs.google-cloud-sdk ];
+
+      dbSnapshotConnection =
+        if dbSnapshotGcpIap == null then
+          ''
+            ${resolveHost}
+
+            ssh_remote() {
+              # shellcheck disable=SC2029
+              ssh ''${identity:+-i "$identity"} "root@$host_ip" "$@"
+            }
+
+            download_remote_snapshot() {
+              scp ''${identity:+-i "$identity"} "root@$host_ip:$remote_snapshot" "$local_snapshot"
+            }
+
+            create_remote_snapshot() {
+              ssh_remote "sqlite3 $db_path \"VACUUM INTO '$remote_snapshot'\""
+            }
+          ''
+        else
+          ''
+            _cleanup_identity() { :; }
+
+            ssh_remote() {
+              gcloud compute ssh ${pkgs.lib.escapeShellArg dbSnapshotGcpIap.instance} \
+                --project=${pkgs.lib.escapeShellArg dbSnapshotGcpIap.project} \
+                --zone=${pkgs.lib.escapeShellArg dbSnapshotGcpIap.zone} \
+                --tunnel-through-iap \
+                --command="$1"
+            }
+
+            download_remote_snapshot() {
+              gcloud compute scp \
+                ${pkgs.lib.escapeShellArg "${dbSnapshotGcpIap.instance}:"}"$remote_snapshot" \
+                "$local_snapshot" \
+                --project=${pkgs.lib.escapeShellArg dbSnapshotGcpIap.project} \
+                --zone=${pkgs.lib.escapeShellArg dbSnapshotGcpIap.zone} \
+                --tunnel-through-iap
+            }
+
+            create_remote_snapshot() {
+              ssh_remote "python3 -c 'import sqlite3; connection = sqlite3.connect(\"file:$db_path?mode=ro\", uri=True); connection.execute(\"VACUUM INTO ?\", (\"$remote_snapshot\",)); connection.close()'"
+            }
+          '';
 
       resolveIp = ''
         ${parseIdentity}
@@ -222,15 +273,10 @@ let
       # copy gets shipped over the wire, then deleted from the remote host.
       "${env}DbSnapshot" = pkgs.writeShellApplication {
         name = "${env}-db-snapshot";
-        runtimeInputs = sshInputs ++ [ pkgs.coreutils ];
+        runtimeInputs = dbSnapshotInputs;
         text = ''
-          ${resolveHost}
+          ${dbSnapshotConnection}
           trap _cleanup_identity EXIT
-
-          ssh_remote() {
-            # shellcheck disable=SC2029
-            ssh ''${identity:+-i "$identity"} "root@$host_ip" "$@"
-          }
 
           db_path="/mnt/data/st0x-hedge.db"
           remote_snapshot="/tmp/st0x-hedge-snapshot-$(date -u +%Y%m%d%H%M%S).db"
@@ -239,7 +285,7 @@ let
           local_snapshot="$out_dir/st0x-hedge.db"
 
           echo "Taking a consistent snapshot of ${env}'s live database..." >&2
-          ssh_remote "sqlite3 $db_path \"VACUUM INTO '$remote_snapshot'\""
+          create_remote_snapshot
 
           cleanup_remote_snapshot() {
             ssh_remote "rm -f $remote_snapshot" || true
@@ -247,7 +293,7 @@ let
           trap 'cleanup_remote_snapshot; _cleanup_identity' EXIT
 
           echo "Downloading snapshot to $local_snapshot..." >&2
-          scp ''${identity:+-i "$identity"} "root@$host_ip:$remote_snapshot" "$local_snapshot"
+          download_remote_snapshot
 
           echo "$local_snapshot"
         '';
