@@ -4428,6 +4428,78 @@ mod tests {
         assert_eq!(resolved, token);
     }
 
+    fn equity_asset(tokenized_equity: Address) -> ChainEquityAsset {
+        ChainEquityAsset {
+            tokenized_equity,
+            tokenized_equity_derivative: Address::ZERO,
+            vault_ids: Vec::new(),
+            trading: OperationMode::Enabled,
+            rebalancing: OperationMode::Disabled,
+            wrapped_equity_recovery: OperationMode::Disabled,
+            operational_limit: None,
+        }
+    }
+
+    /// Each chain's trading table lists its own tStock addresses, so a mint
+    /// on Ethereum resolves Ethereum's entry without a pasted `--token`, and
+    /// never Base's.
+    #[test]
+    fn tokenization_token_resolves_from_the_selected_chains_trading_table() {
+        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        let symbol = Symbol::new("RKLB").unwrap();
+        let base_token = address!("0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b");
+        let ethereum_token = address!("0xED0c085d92C262FB46937CB0B3C9763Af7fCCf30");
+        ctx.chains
+            .primary_mut()
+            .assets
+            .equities
+            .symbols
+            .insert(symbol.clone(), equity_asset(base_token));
+        let mut ethereum_equities = ChainEquities::default();
+        ethereum_equities
+            .symbols
+            .insert(symbol.clone(), equity_asset(ethereum_token));
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .assets(ChainAssets {
+                    equities: ethereum_equities,
+                    cash: None,
+                })
+                .call(),
+        );
+
+        assert_eq!(
+            resolve_tokenization_token(None, TokenizationNetwork::Ethereum, &symbol, &ctx).unwrap(),
+            ethereum_token
+        );
+        assert_eq!(
+            resolve_tokenization_token(None, TokenizationNetwork::Base, &symbol, &ctx).unwrap(),
+            base_token
+        );
+    }
+
+    /// Without a trading table for the chain there is no config source, so
+    /// the operator must paste the address.
+    #[test]
+    fn tokenization_token_requires_an_override_without_a_trading_table() {
+        let ctx = create_alpaca_ctx_without_rebalancing();
+
+        let error = resolve_tokenization_token(
+            None,
+            TokenizationNetwork::Ethereum,
+            &Symbol::new("RKLB").unwrap(),
+            &ctx,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("--token") && error.contains("[chains.ethereum.trading]"),
+            "expected the override asked for by chain, got: {error}"
+        );
+    }
+
     fn redemption_services() -> EquityTransferServices {
         EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),

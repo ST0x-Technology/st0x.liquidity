@@ -2333,11 +2333,58 @@ mod tests {
             Cli::try_parse_from(["st0x-cli", "dividend-bump", "-s", "COIN", "-q", "10.5"]).unwrap();
 
         match cli.command {
-            Commands::DividendBump { symbol, quantity } => {
+            Commands::DividendBump {
+                symbol,
+                quantity,
+                network,
+            } => {
                 assert_eq!(symbol, Symbol::new("COIN").unwrap());
                 assert_eq!(quantity, positive_shares("10.5"));
+                assert_eq!(network, TokenizationNetwork::Base);
             }
             other => panic!("expected dividend-bump command, got: {other:?}"),
+        }
+    }
+
+    /// The dividend flow selects its chain like every other chain-touching
+    /// command: both the one-shot bump and the standalone donate take
+    /// `--network`.
+    #[test]
+    fn dividend_flow_parses_network() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "dividend-bump",
+            "-s",
+            "COIN",
+            "-q",
+            "1",
+            "--network",
+            "ethereum",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::DividendBump { network, .. } => {
+                assert_eq!(network, TokenizationNetwork::Ethereum);
+            }
+            other => panic!("expected dividend-bump command, got: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "donate-equity",
+            "-s",
+            "COIN",
+            "-q",
+            "1",
+            "--network",
+            "ethereum",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::DonateEquity { network, .. } => {
+                assert_eq!(network, TokenizationNetwork::Ethereum);
+            }
+            other => panic!("expected donate-equity command, got: {other:?}"),
         }
     }
 

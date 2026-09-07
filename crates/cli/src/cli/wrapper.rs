@@ -254,7 +254,10 @@ mod tests {
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{BrokerCtx, Ctx, LogFormat, LogLevel, TradingMode};
-    use st0x_config::{ChainEquityAsset, InventoryMode, OperationMode, TradingChain};
+    use st0x_config::{
+        ChainAssets, ChainEquities, ChainEquityAsset, InventoryMode, OperationMode, TradingChain,
+    };
+    use st0x_evm::Chain;
     use st0x_execution::{FractionalShares, Positive, Symbol};
     use st0x_hedge::operator::test_utils::try_positive_shares;
     use st0x_wrapper::MockWrapper;
@@ -683,6 +686,7 @@ mod tests {
             &mut stdout,
             Symbol::new("AAPL").unwrap(),
             positive_shares("10.5"),
+            TokenizationNetwork::Base,
             &ctx,
         )
         .await
@@ -691,6 +695,88 @@ mod tests {
         assert!(
             error.to_string().contains("configured [wallet] section"),
             "expected wallet config error, got: {error}"
+        );
+    }
+
+    /// `--network ethereum` donates from Ethereum's wallet into the wrapper
+    /// Ethereum's trading table lists, never Base's; the stub wallet stops
+    /// the run at the transfer.
+    #[tokio::test]
+    async fn donate_equity_on_ethereum_uses_that_chains_wallet_and_asset_table() {
+        let mut ctx = create_ctx_listing_aapl_without_wallet();
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        let ethereum_wrapper = Address::repeat_byte(0x33);
+        let mut ethereum_equities = ChainEquities::default();
+        ethereum_equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: Address::repeat_byte(0x44),
+                tokenized_equity_derivative: ethereum_wrapper,
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .assets(ChainAssets {
+                    equities: ethereum_equities,
+                    cash: None,
+                })
+                .call(),
+        );
+        let ethereum_wallet = ctx.wallet().unwrap().ethereum_wallet().address();
+        let mut stdout = Vec::new();
+
+        donate_equity_command(
+            &mut stdout,
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("1"),
+            TokenizationNetwork::Ethereum,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains(&format!("Source wallet: {ethereum_wallet}")),
+            "expected Ethereum's wallet, got: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "Wrapped token (NAV recipient): {ethereum_wrapper}"
+            )),
+            "expected Ethereum's wrapper, got: {output}"
+        );
+        assert!(
+            !output.contains(&Address::repeat_byte(0x22).to_string()),
+            "Base's wrapper must not appear, got: {output}"
+        );
+    }
+
+    /// A network without a trading table lists no wrapper to donate into.
+    #[tokio::test]
+    async fn donate_equity_refuses_a_network_without_a_trading_table() {
+        let ctx = create_ctx_with_stub_wallet();
+        let mut stdout = Vec::new();
+
+        let error = donate_equity_command(
+            &mut stdout,
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("1"),
+            TokenizationNetwork::Ethereum,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("[chains.ethereum.trading]"),
+            "expected the missing trading table named, got: {error}"
         );
     }
 
