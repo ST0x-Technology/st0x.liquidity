@@ -1022,6 +1022,45 @@ mod tests {
         assert!(notifier.messages()[0].contains("DISABLED"));
     }
 
+    /// The dedup key is chain and symbol: a symbol disabled on two watched
+    /// chains pages once per chain, each message naming its own chain.
+    #[tokio::test]
+    async fn disabled_asset_alert_pages_per_chain() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
+        let mut ctx = build_test_accountant_ctx(
+            pool,
+            &apalis_pool,
+            create_test_ctx_with_order_owner(Address::ZERO),
+            SymbolCache::default(),
+            provider,
+            executor,
+            ExecutionThreshold::whole_share(),
+        )
+        .await;
+        ctx.notifier = notifier.clone();
+
+        let job = test_job();
+        let trade = crate::test_utils::OnchainTradeBuilder::new().build();
+
+        let notifier_arc: Arc<dyn Notifier> = notifier.clone();
+        for chain in [Chain::Base, Chain::Ethereum, Chain::Ethereum] {
+            job.alert_disabled_asset_fill(&notifier_arc, &ctx.disabled_asset_alerts, &trade, chain)
+                .await;
+        }
+
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            2,
+            "one page per chain the disabled symbol filled on, deduplicated per chain"
+        );
+        assert!(messages[0].contains("chain base"));
+        assert!(messages[1].contains("chain ethereum"));
+    }
+
     /// A job stamped with a chain no watched entry covers fails loudly
     /// instead of silently accounting against the wrong chain's contracts.
     #[tokio::test]
