@@ -255,7 +255,7 @@ mod tests {
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{BrokerCtx, Ctx, LogFormat, LogLevel, TradingMode};
-    use st0x_config::{InventoryMode, TradingChain};
+    use st0x_config::{ChainEquityAsset, InventoryMode, OperationMode, TradingChain};
     use st0x_execution::{FractionalShares, Positive, Symbol};
     use st0x_hedge::operator::test_utils::try_positive_shares;
     use st0x_wrapper::MockWrapper;
@@ -324,6 +324,25 @@ mod tests {
     fn create_ctx_with_stub_wallet() -> Ctx {
         let mut ctx = create_ctx_without_rebalancing();
         ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        ctx
+    }
+
+    /// AAPL listed on the primary chain but no `[wallet]`: the config checks
+    /// pass and the wallet requirement is the first thing to fail.
+    fn create_ctx_listing_aapl_without_wallet() -> Ctx {
+        let mut ctx = create_ctx_without_rebalancing();
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: Address::repeat_byte(0x11),
+                tokenized_equity_derivative: Address::repeat_byte(0x22),
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
         ctx
     }
 
@@ -471,7 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrap_equity_requires_wallet_config() {
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_ctx_listing_aapl_without_wallet();
         let mut stdout = Vec::new();
 
         let error = wrap_equity_command(
@@ -493,7 +512,7 @@ mod tests {
 
     #[tokio::test]
     async fn unwrap_equity_requires_wallet_config() {
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_ctx_listing_aapl_without_wallet();
         let mut stdout = Vec::new();
 
         let error = unwrap_equity_command(
