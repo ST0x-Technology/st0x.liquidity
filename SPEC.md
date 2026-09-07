@@ -2574,8 +2574,8 @@ stateDiagram-v2
 - `WithdrawnFromRaindex` tracks wrapped tokens that left the vault but aren't
   yet unwrapped
 - `Unwrap` command converts ERC-4626 wrapped tokens to unwrapped tokens;
-  confirmation records the token the vault reports as its `asset()` as a typed
-  `UnwrappedToken`
+  confirmation records the token the vault reports as its `asset()` at the
+  redeem block as a typed `UnwrappedToken`
 - `TokensUnwrapped` tracks the attested `UnwrappedToken` ready to send
 - `Send` command sends unwrapped tokens to Alpaca and polls until terminal
 - `TokensSent` tracks tokens that have been sent to Alpaca's redemption wallet
@@ -2766,11 +2766,11 @@ redemption polling, and `Wrapper` methods for ERC-4626 wrapping/unwrapping.
 - `Redeem` only from `WithdrawnFromRaindex` state; polls Alpaca until terminal
 - If send fails after withdraw, aggregate stays in `WithdrawnFromRaindex`
   (tokens in wallet, not stranded)
-- `ConfirmUnwrap` records the token the vault reports as its `asset()`, typed
-  `UnwrappedToken`. Only a `Wrapper` implementation can produce that type, and
-  the command refuses (`UnwrapDeliveredUnexpectedToken`) when the attested token
-  differs from the configured underlying, so config drift surfaces before any
-  transfer
+- `ConfirmUnwrap` records the token the vault reports as its `asset()` at the
+  redeem block, typed `UnwrappedToken`. Only a `Wrapper` implementation can
+  produce that type, and the command refuses (`UnwrapDeliveredUnexpectedToken`)
+  when the attested token differs from the configured underlying, so config
+  drift surfaces before any transfer
 - `SendTokens` hands an `UnwrappedToken` to `Tokenizer::send_for_redemption`,
   which accepts nothing else: a wrapped ERC-4626 share address cannot reach the
   issuer's redemption wallet by construction. The operator `alpaca-redeem`

@@ -390,9 +390,11 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             })
             .ok_or(WrapperError::MissingWithdrawEvent)?;
 
+        // Read the asset as of the receipt block: that is the token the redeem
+        // delivered, whatever the vault reports later.
         let token: Address = self
             .wallet
-            .call::<OpenChainErrorRegistry, _>(wrapped_token, IERC4626::assetCall {})
+            .call_at::<OpenChainErrorRegistry, _>(wrapped_token, IERC4626::assetCall {}, block)
             .await?;
 
         Ok(UnwrapConfirmation {
