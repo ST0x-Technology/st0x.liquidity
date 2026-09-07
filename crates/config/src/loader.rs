@@ -8716,6 +8716,32 @@ mod tests {
         Ctx::validate_files(config.path(), secrets.path()).unwrap();
     }
 
+    #[test]
+    fn validate_config_file_accepts_a_valid_config_without_secrets() {
+        let config = minimal_config_toml();
+        Ctx::validate_config_file(config.path()).unwrap();
+    }
+
+    #[test]
+    fn validate_config_file_rejects_a_config_missing_a_required_field() {
+        // The 2026-09-01 staging outage in miniature: an image that grew a
+        // required field meets a mounted config that never got it.
+        let stripped = String::from_utf8(minimal_config_toml_bytes().to_vec())
+            .unwrap()
+            .lines()
+            .filter(|line| !line.contains("hedge_order_gate_reconciliation_timeout_secs"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(stripped.as_bytes()).unwrap();
+
+        let error = Ctx::validate_config_file(file.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("failed to parse config"),
+            "must surface as a config parse error: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn load_files_assembles_pricing_for_configured_equities() {
         let config = equity_pricing_config_toml(true);
