@@ -1,17 +1,18 @@
 //! CCTP bridge and recovery CLI commands.
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{B256, U256};
 use rain_math_float::Float;
 use std::io::Write;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection};
-use st0x_config::{ChainRegistry, Ctx};
-use st0x_evm::{Chain, Evm, IERC20, IntoErrorRegistry, USDC_BASE, USDC_ETHEREUM, Wallet};
+use st0x_config::Ctx;
+use st0x_evm::{Evm, IERC20, IntoErrorRegistry, USDC_BASE, USDC_ETHEREUM, Wallet};
 use st0x_finance::Usdc;
 use st0x_float_serde::format_float_with_fallback;
 
-use super::CctpChain;
+use super::rebalancing::{TradingChainContext, chain_usdc, trading_chain_context};
+use super::{CctpChain, TokenizationNetwork};
 
 impl CctpChain {
     /// Converts to the bridge direction (from this chain to its destination).
@@ -178,27 +179,26 @@ pub(super) async fn cctp_recover_command<Writer: Write>(
     Ok(())
 }
 
+/// Zeroes the selected chain's USDC allowance for that chain's orderbook.
+///
+/// The spender is the orderbook of the selected chain's own trading table:
+/// reusing another chain's address would zero an allowance nothing holds
+/// while the real spender stayed approved.
 pub(super) async fn reset_allowance_command<Registry: IntoErrorRegistry, Writer: Write>(
     stdout: &mut Writer,
-    chain: CctpChain,
+    network: TokenizationNetwork,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let wallet_ctx = ctx.wallet()?;
-
-    let (usdc_address, requested, chain_name, caller) = match chain {
-        CctpChain::Ethereum => (
-            USDC_ETHEREUM,
-            Chain::Ethereum,
-            "Ethereum",
-            wallet_ctx.ethereum_wallet(),
-        ),
-        CctpChain::Base => (USDC_BASE, Chain::Base, "Base", wallet_ctx.base_wallet()),
-    };
-    let spender = orderbook_spender(&ctx.chains, requested)?;
-
+    let TradingChainContext {
+        chain,
+        wallet: caller,
+        trading,
+    } = trading_chain_context(ctx, network)?;
+    let usdc_address = chain_usdc(chain)?;
+    let spender = trading.orderbook;
     let owner = caller.address();
 
-    writeln!(stdout, "Resetting USDC allowance on {chain_name}")?;
+    writeln!(stdout, "Resetting USDC allowance on {chain}")?;
     writeln!(stdout, "   Owner: {owner}")?;
     writeln!(stdout, "   Spender (orderbook): {spender}")?;
     writeln!(stdout, "   USDC: {usdc_address}")?;
@@ -232,25 +232,6 @@ pub(super) async fn reset_allowance_command<Registry: IntoErrorRegistry, Writer:
     writeln!(stdout, "Allowance reset to: {new_allowance}")?;
 
     Ok(())
-}
-
-/// The orderbook address whose USDC allowance the reset targets.
-///
-/// The orderbook only exists on the trading chain, so a reset requested for
-/// any other chain must refuse: reusing the trading chain's address there
-/// would zero an allowance nothing holds while the real spender on the
-/// requested chain stays approved.
-fn orderbook_spender(registry: &ChainRegistry, requested: Chain) -> anyhow::Result<Address> {
-    let trading = registry.primary();
-    if trading.chain != requested {
-        anyhow::bail!(
-            "reset-allowance targets the orderbook, which only exists on the trading chain \
-             ({trading_chain}); requested {requested}",
-            trading_chain = trading.chain,
-        );
-    }
-
-    Ok(trading.orderbook)
 }
 
 #[cfg(test)]

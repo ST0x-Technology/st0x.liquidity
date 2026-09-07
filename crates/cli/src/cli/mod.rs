@@ -667,9 +667,10 @@ pub enum Commands {
     ///
     /// Use this to investigate approval behavior or when switching orderbook addresses.
     ResetAllowance {
-        /// Chain where to reset allowance
-        #[arg(long = "chain")]
-        chain: CctpChain,
+        /// Chain whose USDC allowance to reset: its wallet, canonical USDC
+        /// and `[chains.<name>.trading]` orderbook
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
     },
 
     /// Request tokenization of shares via Alpaca (isolated test command)
@@ -1156,7 +1157,7 @@ enum ProviderCommand {
         source_chain: CctpChain,
     },
     ResetAllowance {
-        chain: CctpChain,
+        network: TokenizationNetwork,
     },
     AlpacaTokenize {
         symbol: Symbol,
@@ -1379,8 +1380,8 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
         Commands::CctpBridge { amount, all, from } => {
             CommandRoute::Provider(ProviderCommand::CctpBridge { amount, all, from })
         }
-        Commands::ResetAllowance { chain } => {
-            CommandRoute::Provider(ProviderCommand::ResetAllowance { chain })
+        Commands::ResetAllowance { network } => {
+            CommandRoute::Provider(ProviderCommand::ResetAllowance { network })
         }
         Commands::AlpacaTokenize {
             symbol,
@@ -2005,8 +2006,8 @@ async fn run_provider_command<W: Write + Send>(
             burn_tx,
             source_chain,
         } => cctp::cctp_recover_command(stdout, burn_tx, source_chain, ctx).await,
-        ProviderCommand::ResetAllowance { chain } => {
-            cctp::reset_allowance_command::<OpenChainErrorRegistry, _>(stdout, chain, ctx).await
+        ProviderCommand::ResetAllowance { network } => {
+            cctp::reset_allowance_command::<OpenChainErrorRegistry, _>(stdout, network, ctx).await
         }
         ProviderCommand::AlpacaTokenize {
             symbol,
