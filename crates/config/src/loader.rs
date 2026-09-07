@@ -245,7 +245,7 @@ struct Config {
 }
 
 fn default_hedge_order_gate_reconciliation_timeout_secs() -> NonZeroU64 {
-    NonZeroU64::new(10).unwrap()
+    const { NonZeroU64::new(10).unwrap() }
 }
 
 /// Plaintext REST API settings (URL only). Credentials live in secrets.
