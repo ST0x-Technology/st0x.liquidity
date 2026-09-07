@@ -94,6 +94,14 @@ const PERSISTED_PRECISION_HALF_UNIT: Float = float!(0.000000005);
 /// Smallest unit at `PERSISTED_DECIMAL_PRECISION` (`1e-8`).
 const PERSISTED_PRECISION_UNIT: Float = float!(0.00000001);
 
+/// Base L1 data-availability fee denominated in wei.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct L1DataFeeWei(U256);
+
+impl L1DataFeeWei {
+    const ZERO: Self = Self(U256::ZERO);
+}
+
 /// Rounds a USD cost to the precision it is persisted at, using
 /// round-half-to-even to preserve the legacy persistence contract.
 ///
@@ -274,8 +282,9 @@ pub(crate) enum BotGasReceiptCostError {
 }
 
 impl BotGasReceiptCost {
-    pub(crate) fn from_receipt(
+    fn from_receipt(
         receipt: &TransactionReceipt,
+        l1_data_fee_wei: L1DataFeeWei,
         bot_wallet: Address,
         chain: Chain,
         operation_category: BotGasOperationCategory,
@@ -302,8 +311,10 @@ impl BotGasReceiptCost {
         )?;
 
         let effective_gas_price_wei = receipt.effective_gas_price;
+        let L1DataFeeWei(l1_data_fee_wei) = l1_data_fee_wei;
         let native_cost_wei = U256::from(receipt.gas_used)
             .checked_mul(U256::from(effective_gas_price_wei))
+            .and_then(|execution_cost_wei| execution_cost_wei.checked_add(l1_data_fee_wei))
             .ok_or(BotGasCostError::NativeCostOverflow {
                 tx_hash: receipt.transaction_hash,
             })?;
@@ -553,6 +564,7 @@ mod tests {
     use alloy::primitives::{Address, TxHash};
     use alloy::rpc::types::TransactionReceipt;
     use chrono::TimeZone;
+    use proptest::prelude::*;
     use serde_json::json;
 
     use st0x_event_sorcery::{LifecycleError, TestHarness};
@@ -634,6 +646,7 @@ mod tests {
         let bot = Address::repeat_byte(0x01);
         let cost = BotGasReceiptCost::from_receipt(
             &receipt(bot),
+            L1DataFeeWei::ZERO,
             bot,
             Chain::Base,
             BotGasOperationCategory::VaultDeposit,
@@ -648,9 +661,95 @@ mod tests {
     }
 
     #[test]
+    fn receipt_cost_includes_l1_data_fee() {
+        let bot = Address::repeat_byte(0x01);
+        let l1_data_fee_wei = L1DataFeeWei(U256::from(1_032_618_724_u64));
+        let cost = BotGasReceiptCost::from_receipt(
+            &receipt(bot),
+            l1_data_fee_wei,
+            bot,
+            Chain::Base,
+            BotGasOperationCategory::VaultDeposit,
+            None,
+            price(),
+            Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 1).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cost.native_cost_wei,
+            U256::from(21_000_000_000_000_u128) + U256::from(1_032_618_724_u64)
+        );
+    }
+
+    #[test]
+    fn receipt_cost_rejects_native_cost_overflow_from_l1_data_fee() {
+        let bot = Address::repeat_byte(0x01);
+        let error = BotGasReceiptCost::from_receipt(
+            &receipt(bot),
+            L1DataFeeWei(U256::MAX),
+            bot,
+            Chain::Base,
+            BotGasOperationCategory::VaultDeposit,
+            None,
+            price(),
+            Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 1).unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, BotGasCostError::NativeCostOverflow { .. }));
+    }
+
+    proptest! {
+        #[test]
+        fn receipt_cost_checks_l1_fee_arithmetic_for_generated_values(
+            gas_used in 21_000_u64..=30_000_000,
+            effective_gas_price_wei in 1_000_000_u128..=1_000_000_000_000_000,
+            fitting_l1_data_fee_wei in any::<u128>(),
+            should_overflow in any::<bool>(),
+        ) {
+            let bot = Address::repeat_byte(0x01);
+            let mut receipt = receipt(bot);
+            receipt.gas_used = gas_used;
+            receipt.effective_gas_price = effective_gas_price_wei;
+            let execution_cost_wei =
+                U256::from(gas_used) * U256::from(effective_gas_price_wei);
+            let l1_data_fee_wei = if should_overflow {
+                L1DataFeeWei(U256::MAX - execution_cost_wei + U256::from(1))
+            } else {
+                L1DataFeeWei(U256::from(fitting_l1_data_fee_wei))
+            };
+
+            let result = BotGasReceiptCost::from_receipt(
+                &receipt,
+                l1_data_fee_wei,
+                bot,
+                Chain::Base,
+                BotGasOperationCategory::VaultDeposit,
+                None,
+                price(),
+                Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 1).unwrap(),
+            );
+
+            if should_overflow {
+                prop_assert!(
+                    matches!(result, Err(BotGasCostError::NativeCostOverflow { .. })),
+                    "expected native cost overflow"
+                );
+            } else {
+                prop_assert_eq!(
+                    result.unwrap().native_cost_wei,
+                    execution_cost_wei + U256::from(fitting_l1_data_fee_wei)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn receipt_cost_rejects_non_bot_payer() {
         let error = BotGasReceiptCost::from_receipt(
             &receipt(Address::repeat_byte(0x02)),
+            L1DataFeeWei::ZERO,
             Address::repeat_byte(0x01),
             Chain::Base,
             BotGasOperationCategory::VaultDeposit,
@@ -671,6 +770,7 @@ mod tests {
 
         let error = BotGasReceiptCost::from_receipt(
             &receipt,
+            L1DataFeeWei::ZERO,
             bot,
             Chain::Base,
             BotGasOperationCategory::VaultDeposit,
@@ -694,6 +794,7 @@ mod tests {
 
         let error = BotGasReceiptCost::from_receipt(
             &receipt,
+            L1DataFeeWei::ZERO,
             bot,
             Chain::Base,
             BotGasOperationCategory::VaultDeposit,
@@ -718,6 +819,7 @@ mod tests {
 
             let error = BotGasReceiptCost::from_receipt(
                 &receipt(bot),
+                L1DataFeeWei::ZERO,
                 bot,
                 Chain::Base,
                 BotGasOperationCategory::VaultDeposit,
@@ -783,6 +885,7 @@ mod tests {
 
         let cost = BotGasReceiptCost::from_receipt(
             &dust_receipt,
+            L1DataFeeWei::ZERO,
             bot,
             Chain::Base,
             BotGasOperationCategory::VaultDeposit,
@@ -820,6 +923,7 @@ mod tests {
                 round_to_persisted_precision(Float::parse(value.to_owned()).unwrap()).unwrap();
             let mut cost = BotGasReceiptCost::from_receipt(
                 &receipt(bot),
+                L1DataFeeWei::ZERO,
                 bot,
                 Chain::Base,
                 BotGasOperationCategory::VaultDeposit,
@@ -917,6 +1021,7 @@ mod tests {
         let bot = Address::repeat_byte(0x01);
         let cost = BotGasReceiptCost::from_receipt(
             &receipt(bot),
+            L1DataFeeWei::ZERO,
             bot,
             Chain::Base,
             BotGasOperationCategory::VaultDeposit,
@@ -940,6 +1045,7 @@ mod tests {
         let bot = Address::repeat_byte(0x01);
         let cost = BotGasReceiptCost::from_receipt(
             &receipt(bot),
+            L1DataFeeWei::ZERO,
             bot,
             Chain::Base,
             BotGasOperationCategory::VaultDeposit,
@@ -989,6 +1095,7 @@ mod tests {
 
         let freshly_computed = BotGasReceiptCost::from_receipt(
             &realistic_receipt,
+            L1DataFeeWei::ZERO,
             bot,
             Chain::Base,
             BotGasOperationCategory::VaultDeposit,
@@ -1029,6 +1136,7 @@ mod tests {
         let bot = Address::repeat_byte(0x01);
         let mut cost = BotGasReceiptCost::from_receipt(
             &receipt(bot),
+            L1DataFeeWei::ZERO,
             bot,
             Chain::Base,
             BotGasOperationCategory::VaultDeposit,
@@ -1067,6 +1175,7 @@ mod tests {
         let bot = Address::repeat_byte(0x01);
         let cost = BotGasReceiptCost::from_receipt(
             &receipt(bot),
+            L1DataFeeWei::ZERO,
             bot,
             Chain::Base,
             BotGasOperationCategory::VaultDeposit,
@@ -1092,6 +1201,7 @@ mod tests {
         let bot = Address::repeat_byte(0x01);
         let cost = BotGasReceiptCost::from_receipt(
             &receipt(bot),
+            L1DataFeeWei::ZERO,
             bot,
             Chain::Base,
             BotGasOperationCategory::VaultDeposit,

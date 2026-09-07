@@ -800,12 +800,11 @@ migration files in `migrations/`.
   reverts is not recorded: the gas it consumed is a real cost, but capture of
   reverted-transaction gas is a known, deliberately deferred gap (see "Known
   gaps" below)
-- The recorded cost covers L2/L1 execution gas only
-  (`gas_used *
-  effective_gas_price` from the transaction receipt). On Base, an
-  OP-Stack chain, the sender also pays a separate L1 data-availability fee; that
-  fee is not read from the receipt and is not included in the recorded cost (see
-  "Known gaps" below)
+- The recorded native cost is `gas_used * effective_gas_price` from the
+  transaction receipt, plus the receipt's `l1Fee` on Base. The Base fee is
+  required and decoded from the OP-Stack receipt shape; a missing or malformed
+  fee fails recording instead of silently understating the financial value.
+  Ethereum receipts have no separate L1 data-availability fee
 - A dedicated worker processes the job: it refetches the confirmed receipt,
   verifies the bot wallet paid for it, reads the ETH/USD price from Chainlink's
   standard proxy on Base pinned to a block, and records one immutable cost fact
@@ -870,10 +869,9 @@ migration files in `migrations/`.
   server's job queue
 - Known gaps (deliberately deferred, tracked as follow-up work rather than
   blocking this feature): gas paid on reverted-but-mined transactions is not
-  recorded, Base's L1 data-availability fee is not included in the recorded
-  cost, `EquityRedemption::SendTokens`'s enqueue failure is swallowed (logged
-  and not retried, to avoid re-sending tokens) so that one send's gas cost is
-  permanently lost rather than dead-lettered for recovery, a mint's
+  recorded, `EquityRedemption::SendTokens`'s enqueue failure is swallowed
+  (logged and not retried, to avoid re-sending tokens) so that one send's gas
+  cost is permanently lost rather than dead-lettered for recovery, a mint's
   vault-deposit crash-recovery path (the narrow window between broadcasting the
   deposit tx and durably persisting `SubmitVaultDeposit`) can resume with an
   unrecoverable `TxHash::ZERO` sentinel, in which case that deposit's gas cost
