@@ -46,7 +46,7 @@ use st0x_event_sorcery::{
     AggregateError, EventSourced, LifecycleError, Projection, ProjectionError, RetryOnBusy,
     SendError, Store, StoreBuilder, compact_events, incremental_vacuum, load_all_ids, load_entity,
 };
-use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, USDC_BASE, Wallet};
+use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, Wallet};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, ClientOrderId, CounterTradePreflight,
     CounterTradeReservation, CounterTradeSkipReason, ExecutionError, Executor, FractionalShares,
@@ -89,7 +89,9 @@ use crate::offchain::order::{OffchainOrderCommand, noop_order_placer};
 #[cfg(test)]
 use crate::onchain::accumulator::check_all_positions;
 use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
-use crate::onchain::approvals::{build_approval_targets, grant_startup_approvals};
+use crate::onchain::approvals::{
+    ApprovalTarget, StartupApprovalError, build_approval_targets, grant_startup_approvals,
+};
 use crate::onchain::backfill::BackfillQueues;
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
@@ -1483,17 +1485,40 @@ fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Addr
         .collect()
 }
 
+/// The startup approval targets of every watched chain, keyed by chain: each
+/// chain's enabled equities against its own orderbook, plus its canonical
+/// USDC. A watched chain this build pins no USDC for is refused rather than
+/// approving another chain's USDC address there.
+fn startup_approval_targets(
+    ctx: &Ctx,
+) -> Result<BTreeMap<Chain, Vec<ApprovalTarget>>, StartupApprovalError> {
+    ctx.chains
+        .watched()
+        .map(|watched| {
+            let chain = watched.chain;
+            let usdc = chain
+                .usdc()
+                .ok_or(StartupApprovalError::UsdcNotPinned { chain })?;
+
+            Ok((
+                chain,
+                build_approval_targets(&watched.assets, watched.orderbook, usdc),
+            ))
+        })
+        .collect()
+}
+
 /// Grants one-time idempotent MAX ERC20 approvals to the trusted spenders at
-/// startup: each configured equity's underlying -> wrapper vault and wrapped ->
-/// orderbook, plus USDC -> orderbook. Resolves token addresses from the
-/// configured equity addresses, and submits through the base wallet so
-/// confirmations and nonce handling match every other on-chain write.
+/// startup, on every watched chain: each enabled equity's underlying -> wrapper
+/// vault and wrapped -> that chain's orderbook, plus that chain's USDC ->
+/// orderbook, submitted through that chain's wallet so confirmations and nonce
+/// handling match every other on-chain write there.
 ///
 /// Skips entirely when no wallet is configured -- a standalone bot without a
 /// wallet never wraps or deposits, so it has no allowances to grant.
 async fn grant_startup_token_approvals(ctx: &Ctx) -> anyhow::Result<()> {
-    let base_wallet = match ctx.wallet() {
-        Ok(wallet_ctx) => wallet_ctx.base_wallet().clone(),
+    let wallet_ctx = match ctx.wallet() {
+        Ok(wallet_ctx) => wallet_ctx,
         Err(CtxError::WalletNotConfigured) => {
             info!(
                 target: "orderbook",
@@ -1504,19 +1529,18 @@ async fn grant_startup_token_approvals(ctx: &Ctx) -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     };
 
-    let targets = build_approval_targets(
-        &ctx.chains.primary().assets,
-        ctx.chains.primary().orderbook,
-        USDC_BASE,
-    );
+    for (chain, targets) in startup_approval_targets(ctx)? {
+        grant_startup_approvals(chain_wallet(wallet_ctx, chain), &targets)
+            .await
+            .with_context(|| format!("startup token approvals failed on {chain}"))?;
 
-    grant_startup_approvals(&base_wallet, &targets).await?;
-
-    info!(
-        target: "orderbook",
-        target_count = targets.len(),
-        "Startup token approvals ensured"
-    );
+        info!(
+            target: "orderbook",
+            %chain,
+            target_count = targets.len(),
+            "Startup token approvals ensured"
+        );
+    }
 
     Ok(())
 }
@@ -2462,41 +2486,90 @@ async fn preflight_inventory_access<Signer: Wallet + Clone>(
         %inventory,
         "OPERATOR_ROLE preflight passed",
     );
-    revoke_stale_orderbook_allowances(raindex_service, ctx).await;
     Ok(())
 }
 
-/// Best-effort: revoke any stale pre-migration allowance the bot granted the
-/// orderbook directly. Deposits now approve the inventory instead, so a
-/// leftover orderbook allowance is dead capital-exposure surface. Idempotent
-/// (a no-op once zero) and non-fatal -- a failure here must not block startup.
-async fn revoke_stale_orderbook_allowances<Signer: Wallet + Clone>(
-    raindex_service: &RaindexService<Signer>,
+/// The tokens whose stale orderbook allowance startup revokes, per watched
+/// chain in managed inventory mode: that chain's canonical USDC and every
+/// configured wrapped equity. A legacy-mode chain has no distinct inventory
+/// to have migrated from, so it has no entry; a managed chain this build
+/// pins no USDC for is refused rather than revoking another chain's USDC.
+fn stale_allowance_revocations(
     ctx: &Ctx,
-) {
-    let revoke_tokens = std::iter::once(st0x_evm::USDC_BASE).chain(
-        ctx.chains
-            .primary()
-            .assets
-            .equities
-            .symbols
-            .values()
-            .map(|equity| equity.tokenized_equity_derivative),
-    );
-    for token in revoke_tokens {
-        match raindex_service
-            .revoke_orderbook_allowance::<OpenChainErrorRegistry>(token)
-            .await
-        {
-            Ok(RevokeOutcome::Revoked | RevokeOutcome::AlreadyZero) => {}
-            Err(error) => warn!(
+) -> Result<BTreeMap<Chain, Vec<Address>>, StartupApprovalError> {
+    ctx.chains
+        .watched()
+        .filter(|watched| match watched.inventory {
+            InventoryMode::Legacy => false,
+            InventoryMode::Managed { .. } => true,
+        })
+        .map(|watched| {
+            let chain = watched.chain;
+            let usdc = chain
+                .usdc()
+                .ok_or(StartupApprovalError::UsdcNotPinned { chain })?;
+            let tokens = std::iter::once(usdc)
+                .chain(
+                    watched
+                        .assets
+                        .equities
+                        .symbols
+                        .values()
+                        .map(|equity| equity.tokenized_equity_derivative),
+                )
+                .collect();
+
+            Ok((chain, tokens))
+        })
+        .collect()
+}
+
+/// Best-effort, per watched chain: revoke any stale pre-migration allowance
+/// the bot granted that chain's orderbook directly, through that chain's own
+/// wallet. Deposits now approve the inventory instead, so a leftover orderbook
+/// allowance is dead capital-exposure surface. Idempotent (a no-op once zero)
+/// and non-fatal per token -- a failed revoke must not block startup; only a
+/// chain with no pinned USDC is.
+async fn revoke_stale_orderbook_allowances<Signer: Wallet + Clone>(
+    ctx: &Ctx,
+    tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
+) -> Result<(), StartupApprovalError> {
+    for (chain, tokens) in stale_allowance_revocations(ctx)? {
+        let (Some(watched), Some(tokenization)) =
+            (ctx.chains.watch(chain), tokenizations.get(&chain))
+        else {
+            warn!(
                 target: "inventory",
-                %token,
-                ?error,
-                "Failed to revoke stale orderbook allowance (non-fatal)",
-            ),
+                %chain,
+                "No trading entry or wallet for the planned stale-allowance revoke; \
+                 skipping the chain (non-fatal)",
+            );
+            continue;
+        };
+        let raindex_service = RaindexService::new(
+            tokenization.wallet.clone(),
+            crate::onchain::raindex_contracts(watched),
+            tokenization.wallet.address(),
+        );
+
+        for token in tokens {
+            match raindex_service
+                .revoke_orderbook_allowance::<OpenChainErrorRegistry>(token)
+                .await
+            {
+                Ok(RevokeOutcome::Revoked | RevokeOutcome::AlreadyZero) => {}
+                Err(error) => warn!(
+                    target: "inventory",
+                    %chain,
+                    %token,
+                    ?error,
+                    "Failed to revoke stale orderbook allowance (non-fatal)",
+                ),
+            }
         }
     }
+
+    Ok(())
 }
 
 /// Resolves the resume-tokenization wiring.
@@ -2714,6 +2787,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             build_rebalancing_raindex_service(&primary.wallet, &deps.ctx, market_maker_wallet);
 
         preflight_inventory_access(&raindex_service, &deps.ctx).await?;
+        revoke_stale_orderbook_allowances(&deps.ctx, &tokenizations).await?;
 
         let tokenizer = primary.tokenizer.clone();
         let wrapper = primary.wrapper.clone();
@@ -5118,8 +5192,8 @@ mod tests {
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{DomainEvent, Reconciler, StoreBuilder, test_store};
-    use st0x_evm::USDC_ETHEREUM;
     use st0x_evm::local::RawPrivateKeyWallet;
+    use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiMode, AlpacaBrokerAuth, Direction, EquityPosition,
         ExecutorOrderId, Inventory as ExecutionInventory, MarketOrder, MockExecutor, Positive,
