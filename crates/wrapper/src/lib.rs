@@ -53,7 +53,8 @@ pub struct WrapConfirmation {
 ///
 /// Only wrapper implementations construct it, so a value of this type proves
 /// the address went through that attestation. The issuer's redemption transfer
-/// accepts nothing else.
+/// accepts nothing else. `Deserialize` serves the event store alone: it decodes
+/// only tokens an aggregate recorded after an attestation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct UnwrappedToken(Address);

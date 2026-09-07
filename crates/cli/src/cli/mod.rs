@@ -685,8 +685,8 @@ pub enum Commands {
     /// Request redemption of tokenized shares via Alpaca (isolated test command)
     ///
     /// Calls the Alpaca tokenization API to convert onchain tokens back to offchain shares.
-    /// This is an isolated test command that only interacts with Alpaca's API,
-    /// without any Raindex/vault operations.
+    /// The only onchain read is the vault's `asset()`, which attests the token sent to
+    /// the issuer; no Raindex operations and no vault writes.
     AlpacaRedeem {
         /// Stock symbol (e.g., AAPL, TSLA) -- resolves the tokenized-equity
         /// address from `[chains.<name>.trading.assets.equities]`
