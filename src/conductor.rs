@@ -5118,6 +5118,7 @@ mod tests {
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{DomainEvent, Reconciler, StoreBuilder, test_store};
+    use st0x_evm::USDC_ETHEREUM;
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiMode, AlpacaBrokerAuth, Direction, EquityPosition,
@@ -5144,6 +5145,7 @@ mod tests {
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
     use crate::mint_authorization::MintAuthorizationError;
     use crate::offchain::order::{CancellationReason, OrderPlacementResult, RetainedFill};
+    use crate::onchain::approvals::{ApprovalPurpose, ApprovalTarget, StartupApprovalError};
     use crate::onchain::mock::MockRaindex;
     use crate::onchain::trade::{InventoryTrade, OnchainTrade};
     use crate::rebalancing::equity::{
@@ -14993,10 +14995,10 @@ mod tests {
         })
     }
 
-    fn equity_asset(token: Address) -> ChainEquityAsset {
+    fn equity_asset(token: Address, derivative: Address) -> ChainEquityAsset {
         ChainEquityAsset {
             tokenized_equity: token,
-            tokenized_equity_derivative: Address::random(),
+            tokenized_equity_derivative: derivative,
             vault_ids: Vec::new(),
             trading: OperationMode::Enabled,
             rebalancing: OperationMode::Disabled,
@@ -15015,7 +15017,7 @@ mod tests {
             equities: ChainEquities {
                 symbols: HashMap::from([(
                     Symbol::new("TSLA").unwrap(),
-                    equity_asset(Address::repeat_byte(0xe5)),
+                    equity_asset(Address::repeat_byte(0xe5), Address::repeat_byte(0xe6)),
                 )]),
                 operational_limit: None,
             },
@@ -15037,7 +15039,7 @@ mod tests {
             equities: ChainEquities {
                 symbols: HashMap::from([(
                     Symbol::new("AAPL").unwrap(),
-                    equity_asset(Address::repeat_byte(0xa5)),
+                    equity_asset(Address::repeat_byte(0xa5), Address::repeat_byte(0xa6)),
                 )]),
                 operational_limit: None,
             },
@@ -15095,6 +15097,135 @@ mod tests {
             Some(CtxError::RedemptionWalletNotConfigured {
                 chain: Chain::Ethereum
             })
+        ));
+    }
+
+    fn ctx_with_base_and_ethereum_trading() -> Ctx {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains.primary_mut().assets = ChainAssets {
+            equities: ChainEquities {
+                symbols: HashMap::from([(
+                    Symbol::new("AAPL").unwrap(),
+                    equity_asset(Address::repeat_byte(0xa5), Address::repeat_byte(0xa6)),
+                )]),
+                operational_limit: None,
+            },
+            cash: None,
+        };
+        ctx.chains.insert_secondary(ethereum_trading_chain(None));
+        ctx
+    }
+
+    /// Startup approvals are per watched chain: each chain's targets name
+    /// its own orderbook, its own asset table and its own canonical USDC,
+    /// so Base's USDC constant never reaches another chain's orderbook.
+    #[test]
+    fn startup_approval_targets_follow_each_watched_chain() {
+        let ctx = ctx_with_base_and_ethereum_trading();
+        let base_orderbook = ctx.chains.primary().orderbook;
+
+        let targets = startup_approval_targets(&ctx).unwrap();
+
+        assert_eq!(
+            targets.keys().copied().collect::<Vec<_>>(),
+            vec![Chain::Base, Chain::Ethereum]
+        );
+        assert_eq!(
+            targets[&Chain::Base],
+            vec![
+                ApprovalTarget {
+                    token: Address::repeat_byte(0xa5),
+                    spender: Address::repeat_byte(0xa6),
+                    symbol: Some(Symbol::new("AAPL").unwrap()),
+                    purpose: ApprovalPurpose::WrapUnderlying,
+                },
+                ApprovalTarget {
+                    token: Address::repeat_byte(0xa6),
+                    spender: base_orderbook,
+                    symbol: Some(Symbol::new("AAPL").unwrap()),
+                    purpose: ApprovalPurpose::DepositWrappedEquity,
+                },
+                ApprovalTarget {
+                    token: USDC_BASE,
+                    spender: base_orderbook,
+                    symbol: None,
+                    purpose: ApprovalPurpose::DepositUsdc,
+                },
+            ]
+        );
+        assert_eq!(
+            targets[&Chain::Ethereum],
+            vec![
+                ApprovalTarget {
+                    token: Address::repeat_byte(0xe5),
+                    spender: Address::repeat_byte(0xe6),
+                    symbol: Some(Symbol::new("TSLA").unwrap()),
+                    purpose: ApprovalPurpose::WrapUnderlying,
+                },
+                ApprovalTarget {
+                    token: Address::repeat_byte(0xe6),
+                    spender: Address::repeat_byte(0xe0),
+                    symbol: Some(Symbol::new("TSLA").unwrap()),
+                    purpose: ApprovalPurpose::DepositWrappedEquity,
+                },
+                ApprovalTarget {
+                    token: USDC_ETHEREUM,
+                    spender: Address::repeat_byte(0xe0),
+                    symbol: None,
+                    purpose: ApprovalPurpose::DepositUsdc,
+                },
+            ]
+        );
+    }
+
+    /// A watched chain this build pins no USDC for cannot have its
+    /// approvals granted: startup refuses naming the chain instead of
+    /// approving another chain's USDC there.
+    #[test]
+    fn startup_approval_targets_refuse_a_watched_chain_without_pinned_usdc() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains
+            .insert_secondary(TradingChain::test().chain(Chain::HyperEvm).call());
+
+        let error = startup_approval_targets(&ctx).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StartupApprovalError::UsdcNotPinned {
+                chain: Chain::HyperEvm
+            }
+        ));
+    }
+
+    /// The stale-allowance revoke walks each managed-inventory chain's own
+    /// wrapped tokens and canonical USDC; a legacy-mode chain has no
+    /// distinct inventory and is left out, and a managed chain with no
+    /// pinned USDC is refused up front.
+    #[test]
+    fn stale_allowance_revocations_follow_each_managed_chain() {
+        let mut ctx = ctx_with_base_and_ethereum_trading();
+
+        let revocations = stale_allowance_revocations(&ctx).unwrap();
+
+        assert_eq!(
+            revocations,
+            BTreeMap::from([(
+                Chain::Ethereum,
+                vec![USDC_ETHEREUM, Address::repeat_byte(0xe6)]
+            )]),
+            "the legacy-mode primary has no inventory to have migrated from"
+        );
+
+        ctx.chains
+            .insert_secondary(TradingChain::test().chain(Chain::HyperEvm).call());
+
+        let error = stale_allowance_revocations(&ctx).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StartupApprovalError::UsdcNotPinned {
+                chain: Chain::HyperEvm
+            }
         ));
     }
 }
