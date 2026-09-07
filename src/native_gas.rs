@@ -48,7 +48,8 @@ impl<Prov: Provider + Send + Sync> BalanceReader for ProviderBalanceReader<Prov>
 /// The signing wallets used by a fresh transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransferGasRoute {
-    /// Equity mint/redemption only submits transactions on Base.
+    /// Equity mint/redemption submits transactions on the equity chain: Base
+    /// for the rebalancer, the selected network for an operator transfer.
     Equity,
     /// USDC transfer directions submit transactions on Base and Ethereum.
     Usdc,
@@ -57,6 +58,9 @@ pub(crate) enum TransferGasRoute {
 /// Checks every signing wallet a fresh transfer route can use.
 #[derive(Clone)]
 pub struct GasReadiness {
+    /// The chain an equity mint or redemption submits its transactions on.
+    equity: ChainGasReadiness,
+    /// Both ends of the USDC corridor.
     base: ChainGasReadiness,
     ethereum: ChainGasReadiness,
     retry_interval: Duration,
@@ -64,51 +68,51 @@ pub struct GasReadiness {
 
 impl GasReadiness {
     fn new(
-        base_balance_reader: Arc<dyn BalanceReader>,
-        base_wallet: Address,
-        base_threshold: U256,
-        ethereum_balance_reader: Arc<dyn BalanceReader>,
-        ethereum_wallet: Address,
-        ethereum_threshold: U256,
+        equity: ChainGasReadiness,
+        base: ChainGasReadiness,
+        ethereum: ChainGasReadiness,
         retry_interval: Duration,
     ) -> Self {
         Self {
-            base: ChainGasReadiness {
-                balance_reader: base_balance_reader,
-                wallet: base_wallet,
-                chain: Chain::Base,
-                threshold: base_threshold,
-            },
-            ethereum: ChainGasReadiness {
-                balance_reader: ethereum_balance_reader,
-                wallet: ethereum_wallet,
-                chain: Chain::Ethereum,
-                threshold: ethereum_threshold,
-            },
+            equity,
+            base,
+            ethereum,
             retry_interval,
         }
     }
 
-    /// Build readiness from the validated alert thresholds and the two
-    /// signing wallets used by rebalancing transfers.
+    /// Build readiness for the rebalancer from the validated alert thresholds
+    /// and the two signing wallets of the USDC corridor; equity legs submit on
+    /// Base.
     pub fn from_wallets<Signer: Wallet + ?Sized>(
         alerts: &AlertsCtx,
         base_wallet: &Signer,
         ethereum_wallet: &Signer,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::for_equity_chain(
+            alerts,
+            Chain::Base,
+            base_wallet,
+            base_wallet,
+            ethereum_wallet,
+        )
+    }
+
+    /// Build readiness for an equity transfer submitted on `equity_chain`
+    /// with `equity_wallet`, keeping the USDC corridor on Base and Ethereum.
+    /// A chain with no `[alerts.low_balance_thresholds]` entry is refused by
+    /// name rather than checked against nothing.
+    pub fn for_equity_chain<Signer: Wallet + ?Sized>(
+        alerts: &AlertsCtx,
+        equity_chain: Chain,
+        equity_wallet: &Signer,
+        base_wallet: &Signer,
+        ethereum_wallet: &Signer,
+    ) -> anyhow::Result<Arc<Self>> {
         Ok(Arc::new(Self::new(
-            Arc::new(ProviderBalanceReader::new(base_wallet.provider().clone())),
-            base_wallet.address(),
-            alerts
-                .low_balance_threshold_wei(Chain::Base)
-                .context("missing Base gas threshold")?,
-            Arc::new(ProviderBalanceReader::new(
-                ethereum_wallet.provider().clone(),
-            )),
-            ethereum_wallet.address(),
-            alerts
-                .low_balance_threshold_wei(Chain::Ethereum)
-                .context("missing Ethereum gas threshold")?,
+            ChainGasReadiness::from_wallet(alerts, equity_chain, equity_wallet)?,
+            ChainGasReadiness::from_wallet(alerts, Chain::Base, base_wallet)?,
+            ChainGasReadiness::from_wallet(alerts, Chain::Ethereum, ethereum_wallet)?,
             alerts.poll_interval,
         )))
     }
@@ -118,7 +122,7 @@ impl GasReadiness {
         route: TransferGasRoute,
     ) -> Result<(), GasReadinessError> {
         match route {
-            TransferGasRoute::Equity => self.base.ensure_ready().await,
+            TransferGasRoute::Equity => self.equity.ensure_ready().await,
             TransferGasRoute::Usdc => {
                 tokio::try_join!(self.base.ensure_ready(), self.ethereum.ensure_ready())?;
                 Ok(())
@@ -148,13 +152,23 @@ impl GasReadiness {
             }
         }
 
+        let base = ChainGasReadiness {
+            balance_reader: Arc::new(StaticBalance(base_balance)),
+            wallet: Address::ZERO,
+            chain: Chain::Base,
+            threshold: base_threshold,
+        };
+        let ethereum = ChainGasReadiness {
+            balance_reader: Arc::new(StaticBalance(ethereum_balance)),
+            wallet: Address::ZERO,
+            chain: Chain::Ethereum,
+            threshold: ethereum_threshold,
+        };
+
         Arc::new(Self::new(
-            Arc::new(StaticBalance(base_balance)),
-            Address::ZERO,
-            base_threshold,
-            Arc::new(StaticBalance(ethereum_balance)),
-            Address::ZERO,
-            ethereum_threshold,
+            base.clone(),
+            base,
+            ethereum,
             Duration::from_secs(1),
         ))
     }
@@ -307,6 +321,23 @@ struct ChainGasReadiness {
 }
 
 impl ChainGasReadiness {
+    fn from_wallet<Signer: Wallet + ?Sized>(
+        alerts: &AlertsCtx,
+        chain: Chain,
+        wallet: &Signer,
+    ) -> anyhow::Result<Self> {
+        let threshold = alerts.low_balance_threshold_wei(chain).with_context(|| {
+            format!("missing {chain} gas threshold in [alerts.low_balance_thresholds]")
+        })?;
+
+        Ok(Self {
+            balance_reader: Arc::new(ProviderBalanceReader::new(wallet.provider().clone())),
+            wallet: wallet.address(),
+            chain,
+            threshold,
+        })
+    }
+
     async fn ensure_ready(&self) -> Result<(), GasReadinessError> {
         let balance = self
             .balance_reader
@@ -383,15 +414,20 @@ mod tests {
     }
 
     fn readiness(base: Arc<dyn BalanceReader>, ethereum: Arc<dyn BalanceReader>) -> GasReadiness {
-        GasReadiness::new(
-            base,
-            Address::with_last_byte(1),
-            U256::from(50_u64),
-            ethereum,
-            Address::with_last_byte(2),
-            U256::from(100_u64),
-            Duration::from_secs(30),
-        )
+        let base = ChainGasReadiness {
+            balance_reader: base,
+            wallet: Address::with_last_byte(1),
+            chain: Chain::Base,
+            threshold: U256::from(50_u64),
+        };
+        let ethereum = ChainGasReadiness {
+            balance_reader: ethereum,
+            wallet: Address::with_last_byte(2),
+            chain: Chain::Ethereum,
+            threshold: U256::from(100_u64),
+        };
+
+        GasReadiness::new(base.clone(), base, ethereum, Duration::from_secs(30))
     }
 
     #[test]

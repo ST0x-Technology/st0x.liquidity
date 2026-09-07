@@ -74,15 +74,40 @@ struct EquityTransferCliServices {
     vault_registry: VaultRegistryId,
 }
 
-fn gas_readiness(ctx: &Ctx, wallet_ctx: &OnchainWalletCtx) -> anyhow::Result<Arc<GasReadiness>> {
+/// Gas readiness for the USDC corridor (Base and Ethereum).
+fn usdc_gas_readiness(
+    ctx: &Ctx,
+    wallet_ctx: &OnchainWalletCtx,
+) -> anyhow::Result<Arc<GasReadiness>> {
     let alerts = ctx
         .alerts
         .as_ref()
         .context("rebalancing transfer requires [alerts] gas thresholds")?;
-    let base_wallet = wallet_ctx.base_wallet();
-    let ethereum_wallet = wallet_ctx.ethereum_wallet();
 
-    GasReadiness::from_wallets(alerts, base_wallet, ethereum_wallet)
+    GasReadiness::from_wallets(
+        alerts,
+        wallet_ctx.base_wallet(),
+        wallet_ctx.ethereum_wallet(),
+    )
+}
+
+/// Gas readiness for an equity transfer on the selected chain: its wallet is
+/// checked against its own `[alerts.low_balance_thresholds]` entry, refused
+/// by name when the chain has none.
+fn gas_readiness(ctx: &Ctx, equity: &TradingChainContext<'_>) -> anyhow::Result<Arc<GasReadiness>> {
+    let alerts = ctx
+        .alerts
+        .as_ref()
+        .context("rebalancing transfer requires [alerts] gas thresholds")?;
+    let wallet_ctx = ctx.wallet()?;
+
+    GasReadiness::for_equity_chain(
+        alerts,
+        equity.chain,
+        &equity.wallet,
+        wallet_ctx.base_wallet(),
+        wallet_ctx.ethereum_wallet(),
+    )
 }
 
 /// Resolves the redemption wallet address from CLI flag or config.
@@ -176,13 +201,14 @@ async fn build_equity_transfer_services(
     };
 
     let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, network, ctx)?;
+    let context = trading_chain_context(ctx, network)?;
+    let gas_readiness = gas_readiness(ctx, &context)?;
     let TradingChainContext {
         chain,
         wallet: caller,
         trading,
-    } = trading_chain_context(ctx, network)?;
+    } = context;
     let wallet = caller.address();
-    let gas_readiness = gas_readiness(ctx, ctx.wallet()?)?;
 
     let tokenization_service: Arc<dyn Tokenizer> = Arc::new(AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
@@ -681,7 +707,7 @@ async fn run_usdc_transfer<Writer: Write>(
     ));
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let gas_readiness = gas_readiness(ctx, wallet_ctx)?;
+    let gas_readiness = usdc_gas_readiness(ctx, wallet_ctx)?;
 
     let rebalance_manager = CrossVenueCashTransfer::new(
         alpaca_broker,
