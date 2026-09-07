@@ -161,9 +161,10 @@ primary = true
 # here. Per chain: a redemption delivers tokens that exist on one chain, so
 # sending them to another chain's issuer address would burn them.
 #
-# Required when [rebalancing] is configured (equity redemptions), and by the
-# alpaca-redeem and transfer-equity CLI commands (overridable there with
-# --redemption-wallet).
+# Required on every watched chain when [rebalancing] is configured: startup
+# builds each watched chain's tokenization services and refuses, naming the
+# chain, without its wallet. Also used by the alpaca-redeem and
+# transfer-equity CLI commands (overridable there with --redemption-wallet).
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 # Ethereum is a cash-corridor endpoint only: the bot holds USDC and signs
@@ -209,9 +210,11 @@ chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 # orchestrator-mode is owned by the issuance bot (the vault_mode field on its
 # per-asset status endpoint); this section only supplies contract addresses,
 # one per chain (each chain carries its own deployment; the keys are chain
-# names: base, ethereum, hyperevm). Mint authorization signs against the entry
-# of the chain the mint lands on (the primary chain today) and fails loudly
-# without it. Omit while every asset is vault-direct. When present, an empty
+# names: base, ethereum, hyperevm). Every watched chain gets a mint authorizer
+# built from its own entry; a mint signs against the entry of the chain it
+# lands on (the primary chain today) and fails loudly without it, and a
+# watched chain with no entry is warned about at startup.
+# Omit while every asset is vault-direct. When present, an empty
 # map, an unknown chain key, or a malformed or zero address fails config
 # validation even before any asset cuts over.
 # [orchestrator.addresses]
