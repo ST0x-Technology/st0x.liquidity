@@ -2109,7 +2109,6 @@ mod tests {
             rest_api: None,
             ops_api: None,
             issuance: create_test_issuance_ctx(),
-            redemption_wallet: None,
             bot_gas_valuation: None,
             orchestrator: None,
         }
