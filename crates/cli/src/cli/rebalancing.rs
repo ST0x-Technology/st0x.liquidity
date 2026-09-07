@@ -3039,9 +3039,9 @@ mod tests {
     const ETHEREUM_REDEMPTION_WALLET: Address =
         address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
-    /// Alpaca broker, stub wallets, gas thresholds for every chain and an
-    /// Ethereum secondary with its own orderbook, vault owner and redemption
-    /// wallet: everything a service build needs short of a live RPC.
+    /// Alpaca broker, stub wallets, gas thresholds for the corridor chains and
+    /// an Ethereum secondary with its own orderbook, vault owner and
+    /// redemption wallet: everything a service build needs short of a live RPC.
     fn create_alpaca_ctx_watching_ethereum() -> Ctx {
         let mut ctx = create_alpaca_ctx_with_rebalancing(None);
         ctx.wallet = Some(OnchainWalletCtx::stub());
@@ -3116,6 +3116,27 @@ mod tests {
         assert!(
             error.contains("[chains.ethereum.trading]"),
             "expected the missing trading table named, got: {error}"
+        );
+    }
+
+    /// The gas check runs on the selected chain's wallet against that chain's
+    /// `[alerts.low_balance_thresholds]` entry; a chain without one is refused
+    /// by name instead of skipping the check.
+    #[test]
+    fn gas_readiness_refuses_a_chain_without_a_low_balance_threshold() {
+        let mut ctx = create_alpaca_ctx_watching_ethereum();
+        ctx.chains
+            .insert_secondary(TradingChain::test().chain(Chain::HyperEvm).call());
+        let hyperevm = trading_chain_context(&ctx, TokenizationNetwork::HyperEvm).unwrap();
+
+        let error = gas_readiness(&ctx, &hyperevm)
+            .err()
+            .expect("a chain without a gas threshold must be refused")
+            .to_string();
+
+        assert!(
+            error.contains("hyperevm") && error.contains("low_balance_thresholds"),
+            "expected the missing threshold named by chain, got: {error}"
         );
     }
 

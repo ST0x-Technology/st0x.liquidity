@@ -414,7 +414,106 @@ mod tests {
         assert_eq!(readiness.base.threshold, U256::from(50_u64));
         assert_eq!(readiness.ethereum.wallet, ethereum_wallet.address());
         assert_eq!(readiness.ethereum.threshold, U256::from(100_u64));
+        assert_eq!(readiness.equity.chain, Chain::Base);
+        assert_eq!(readiness.equity.wallet, base_wallet.address());
         assert_eq!(readiness.retry_interval, Duration::from_secs(30));
+    }
+
+    /// An operator equity transfer on Ethereum checks Ethereum's wallet
+    /// against Ethereum's threshold on the equity route; the USDC corridor
+    /// keeps its own two slots.
+    #[test]
+    fn for_equity_chain_checks_the_equity_route_on_the_selected_chain() {
+        let base_wallet = StubWallet::stub(Address::with_last_byte(1));
+        let ethereum_wallet = StubWallet::stub(Address::with_last_byte(2));
+        let alerts = AlertsCtx::for_test(
+            BTreeMap::from([
+                (Chain::Base, U256::from(50_u64)),
+                (Chain::Ethereum, U256::from(100_u64)),
+            ]),
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        );
+
+        let readiness = GasReadiness::for_equity_chain(
+            &alerts,
+            Chain::Ethereum,
+            &ethereum_wallet,
+            &base_wallet,
+            &ethereum_wallet,
+        )
+        .unwrap();
+
+        assert_eq!(readiness.equity.chain, Chain::Ethereum);
+        assert_eq!(readiness.equity.wallet, ethereum_wallet.address());
+        assert_eq!(readiness.equity.threshold, U256::from(100_u64));
+        assert_eq!(readiness.base.wallet, base_wallet.address());
+        assert_eq!(readiness.ethereum.wallet, ethereum_wallet.address());
+    }
+
+    /// A chain with no `[alerts.low_balance_thresholds]` entry is refused by
+    /// name rather than checked against nothing.
+    #[test]
+    fn for_equity_chain_refuses_a_chain_without_a_threshold() {
+        let base_wallet = StubWallet::stub(Address::with_last_byte(1));
+        let ethereum_wallet = StubWallet::stub(Address::with_last_byte(2));
+        let hyperevm_wallet = StubWallet::stub(Address::with_last_byte(3));
+        let alerts = AlertsCtx::for_test(
+            BTreeMap::from([
+                (Chain::Base, U256::from(50_u64)),
+                (Chain::Ethereum, U256::from(100_u64)),
+            ]),
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        );
+
+        let error = GasReadiness::for_equity_chain(
+            &alerts,
+            Chain::HyperEvm,
+            &hyperevm_wallet,
+            &base_wallet,
+            &ethereum_wallet,
+        )
+        .err()
+        .expect("a chain without a threshold must be refused")
+        .to_string();
+
+        assert!(
+            error.contains("hyperevm") && error.contains("low_balance_thresholds"),
+            "expected the missing threshold named by chain, got: {error}"
+        );
+    }
+
+    /// The equity route reads the equity slot, not Base's: with Base below
+    /// threshold and Ethereum funded, an Ethereum equity transfer is ready.
+    #[tokio::test]
+    async fn equity_route_reads_the_equity_chain_not_base() {
+        let readiness = GasReadiness::new(
+            ChainGasReadiness {
+                balance_reader: Arc::new(StubBalanceReader::returning(U256::from(100_u64))),
+                wallet: Address::with_last_byte(2),
+                chain: Chain::Ethereum,
+                threshold: U256::from(100_u64),
+            },
+            ChainGasReadiness {
+                balance_reader: Arc::new(StubBalanceReader::returning(U256::from(49_u64))),
+                wallet: Address::with_last_byte(1),
+                chain: Chain::Base,
+                threshold: U256::from(50_u64),
+            },
+            ChainGasReadiness {
+                balance_reader: Arc::new(PendingBalanceReader),
+                wallet: Address::with_last_byte(2),
+                chain: Chain::Ethereum,
+                threshold: U256::from(100_u64),
+            },
+            Duration::from_secs(30),
+        );
+
+        readiness
+            .ensure_ready(TransferGasRoute::Equity)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
