@@ -9,9 +9,9 @@ use httpmock::prelude::*;
 use serde_json::json;
 use uuid::uuid;
 
-use st0x_evm::Wallet;
 use st0x_evm::local::RawPrivateKeyWallet;
-use st0x_execution::{AlpacaAccountId, Network, PollingConfig};
+use st0x_evm::{Chain, Wallet};
+use st0x_execution::{AlpacaAccountId, PollingConfig};
 use st0x_tokenization::{AlpacaTokenizationService, IssuerRequestId};
 
 pub(crate) const TEST_ACCOUNT_ID: AlpacaAccountId =
@@ -48,7 +48,7 @@ pub(crate) async fn create_test_service_from_mock(
             api_secret: "test_api_secret".to_string(),
         },
         wallet,
-        Network::new("base"),
+        Chain::Base,
         Some(redemption_wallet),
     )
     .expect("basic-auth tokenization service")

@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 use uuid::Uuid;
 
+use st0x_evm::Chain;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_ACCOUNT_ID};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_float_serde::format_float_with_fallback;
@@ -37,6 +38,9 @@ sol! {
 }
 
 pub const REDEMPTION_WALLET: Address = address!("0x1234567890123456789012345678901234567890");
+
+/// The network requests the mock observes on its own Anvil chain report.
+const MOCK_NETWORK: &str = Chain::Base.as_str();
 
 /// Status of a tokenization request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +94,9 @@ struct MockTokenizationRequest {
     request_type: TokenizationRequestType,
     /// Transaction hash (for redemption detection).
     tx_hash: String,
+    /// The ITN network the request was made on (echoed from the mint body;
+    /// detected and injected requests live on the mock's own chain).
+    network: String,
     /// Whether the background mint executor still needs to run the onchain
     /// transfer. Set to `true` when `poll_count` crosses the threshold for
     /// mint requests; the mint executor clears it after executing a real
@@ -324,6 +331,7 @@ impl AlpacaTokenizationMock {
             polls_until_complete: usize::MAX,
             request_type,
             tx_hash: String::new(),
+            network: MOCK_NETWORK.to_string(),
             needs_mint_execution: false,
         });
     }
@@ -519,6 +527,7 @@ async fn scan_block_for_redemptions<P: Provider>(
                 polls_until_complete,
                 request_type: TokenizationRequestType::Redeem,
                 tx_hash: tx_hash_hex,
+                network: MOCK_NETWORK.to_string(),
                 needs_mint_execution: false,
             });
         }
@@ -613,6 +622,14 @@ fn register_mint_endpoint(server: &MockServer, state: &Arc<Mutex<TokenizationSta
                 .as_str()
                 .map_or_else(|| Uuid::new_v4().to_string(), ToString::to_string);
 
+            let Some(network) = body["network"].as_str() else {
+                return json_response(
+                    400,
+                    &json!({"message": "missing or non-string field: network"}),
+                );
+            };
+            let network = network.to_string();
+
             let tokenization_request_id = Uuid::new_v4().to_string();
 
             {
@@ -630,6 +647,7 @@ fn register_mint_endpoint(server: &MockServer, state: &Arc<Mutex<TokenizationSta
                     polls_until_complete,
                     request_type: TokenizationRequestType::Mint,
                     tx_hash: String::new(),
+                    network: network.clone(),
                     needs_mint_execution: false,
                 });
             }
@@ -644,7 +662,7 @@ fn register_mint_endpoint(server: &MockServer, state: &Arc<Mutex<TokenizationSta
                     "token_symbol": format!("t{underlying_symbol}"),
                     "qty": format_float_with_fallback(&quantity),
                     "issuer": "st0x",
-                    "network": "base",
+                    "network": network,
                     "wallet_address": wallet_address,
                     "issuer_request_id": issuer_request_id,
                     "tx_hash": "",
@@ -756,7 +774,7 @@ fn tokenization_request_to_json(request: &MockTokenizationRequest) -> Value {
         "token_symbol": format!("t{}", request.underlying_symbol),
         "qty": format_float_with_fallback(&request.quantity),
         "issuer": "st0x",
-        "network": "base",
+        "network": request.network,
         "wallet_address": request.wallet_address,
         "issuer_request_id": request.issuer_request_id,
         "tx_hash": tx_hash,
