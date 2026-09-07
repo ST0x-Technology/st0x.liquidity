@@ -58,9 +58,20 @@ use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpr
 use super::wrapper::{WrapContext, wrap_context};
 use super::{AuditReason, TokenizationNetwork, TransferDirection, TransferType};
 
+/// One `transfer-equity` invocation.
+pub(super) struct TransferEquity {
+    pub(super) direction: TransferDirection,
+    pub(super) symbol: Symbol,
+    pub(super) quantity: FractionalShares,
+    pub(super) issuer_request_id: Option<Uuid>,
+    pub(super) redemption_wallet: Option<Address>,
+    pub(super) network: TokenizationNetwork,
+}
+
 struct EquityTransferCliServices {
     transfer: CrossVenueEquityTransfer,
     wallet: Address,
+    vault_registry: VaultRegistryId,
 }
 
 fn gas_readiness(ctx: &Ctx, wallet_ctx: &OnchainWalletCtx) -> anyhow::Result<Arc<GasReadiness>> {
@@ -151,8 +162,12 @@ pub(super) fn chain_usdc(chain: Chain) -> anyhow::Result<Address> {
         .with_context(|| format!("no canonical USDC is pinned for {chain} in this build"))
 }
 
+/// Builds the mint/redemption saga on the selected chain: its wallet signs,
+/// its trading table supplies the orderbook, vault owner and asset map, and
+/// its issuer redemption wallet receives redeemed tokens.
 async fn build_equity_transfer_services(
     redemption_wallet_flag: Option<Address>,
+    network: TokenizationNetwork,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<EquityTransferCliServices> {
@@ -160,19 +175,21 @@ async fn build_equity_transfer_services(
         anyhow::bail!("transfer-equity requires Alpaca Broker API configuration");
     };
 
-    let redemption_wallet =
-        resolve_redemption_wallet(redemption_wallet_flag, TokenizationNetwork::Base, ctx)?;
-    let wallet_ctx = ctx.wallet()?;
-    let wallet = wallet_ctx.base_wallet().address();
-    let gas_readiness = gas_readiness(ctx, wallet_ctx)?;
-    let base_caller = wallet_ctx.base_wallet().clone();
+    let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, network, ctx)?;
+    let TradingChainContext {
+        chain,
+        wallet: caller,
+        trading,
+    } = trading_chain_context(ctx, network)?;
+    let wallet = caller.address();
+    let gas_readiness = gas_readiness(ctx, ctx.wallet()?)?;
 
     let tokenization_service: Arc<dyn Tokenizer> = Arc::new(AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
         alpaca_auth.account_id,
         alpaca_auth.auth.clone(),
-        base_caller.clone(),
-        Chain::Base,
+        caller.clone(),
+        chain,
         Some(redemption_wallet),
     )?);
 
@@ -182,22 +199,19 @@ async fn build_equity_transfer_services(
             .await?;
 
     let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
-        base_caller.clone(),
-        to_wrapped_equities(&ctx.chains.primary().assets.equities.symbols),
+        caller.clone(),
+        to_wrapped_equities(&trading.assets.equities.symbols),
     ));
 
+    let vault_registry = VaultRegistryId::new(chain, trading.orderbook, trading.vault_owner);
     let vault_lookup: Arc<dyn VaultLookup> = Arc::new(VaultRegistryLookup::new(
         vault_registry_projection,
-        VaultRegistryId::new(
-            ctx.chains.primary().chain,
-            ctx.chains.primary().orderbook,
-            ctx.vault_owner(),
-        ),
+        vault_registry.clone(),
     ));
 
     let raindex = Arc::new(RaindexService::new(
-        base_caller,
-        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.primary()),
+        caller,
+        st0x_hedge::operator::onchain::raindex_contracts(trading),
         wallet,
     ));
 
@@ -237,7 +251,11 @@ async fn build_equity_transfer_services(
     )
     .with_gas_readiness(gas_readiness);
 
-    Ok(EquityTransferCliServices { transfer, wallet })
+    Ok(EquityTransferCliServices {
+        transfer,
+        wallet,
+        vault_registry,
+    })
 }
 
 /// Refuses an orchestrator-mode CLI mint before any aggregate is created.
@@ -268,14 +286,18 @@ async fn ensure_vault_direct_mint(
 
 pub(super) async fn transfer_equity_command<Writer: Write>(
     stdout: &mut Writer,
-    direction: TransferDirection,
-    symbol: &Symbol,
-    quantity: FractionalShares,
-    issuer_request_id: Option<Uuid>,
-    redemption_wallet_flag: Option<Address>,
+    transfer: TransferEquity,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
+    let TransferEquity {
+        direction,
+        symbol,
+        quantity,
+        issuer_request_id,
+        redemption_wallet,
+        network,
+    } = transfer;
     let direction_str = match direction {
         TransferDirection::ToRaindex => "Alpaca → Raindex (mint)",
         TransferDirection::ToAlpaca => "Raindex → Alpaca (redeem)",
@@ -284,8 +306,11 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
     writeln!(stdout, "🔄 Transferring equity: {direction_str}")?;
     writeln!(stdout, "   Symbol: {symbol}")?;
     writeln!(stdout, "   Quantity: {quantity}")?;
+    writeln!(stdout, "   Chain: {}", Chain::from(network))?;
 
-    let cli_services = build_equity_transfer_services(redemption_wallet_flag, ctx, pool).await?;
+    let cli_services =
+        build_equity_transfer_services(redemption_wallet, network, ctx, pool).await?;
+    writeln!(stdout, "   Vault registry: {}", cli_services.vault_registry)?;
     let equity_transfer = cli_services.transfer;
 
     match direction {
@@ -295,7 +320,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
                 ctx.issuance.api_key.header_value(),
             )
             .context("failed to build the issuance client for the vault-mode check")?;
-            ensure_vault_direct_mint(&issuance, symbol).await?;
+            ensure_vault_direct_mint(&issuance, &symbol).await?;
 
             writeln!(stdout, "   Creating mint request...")?;
             writeln!(stdout, "   Receiving Wallet: {}", cli_services.wallet)?;
@@ -317,7 +342,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
             }
 
             equity_transfer
-                .resume_equity_to_market_making(&issuer_request_id, symbol, quantity)
+                .resume_equity_to_market_making(&issuer_request_id, &symbol, quantity)
                 .await?;
 
             writeln!(stdout, "✅ Mint completed successfully")?;
@@ -328,7 +353,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 
             let aggregate_id = RedemptionAggregateId::generate();
             equity_transfer
-                .resume_equity_to_hedging(&aggregate_id, symbol, quantity)
+                .resume_equity_to_hedging(&aggregate_id, &symbol, quantity)
                 .await?;
 
             writeln!(stdout, "✅ Redemption completed successfully")?;

@@ -368,6 +368,12 @@ pub enum Commands {
         /// Alpaca redemption wallet (overrides the tokenization config section)
         #[arg(long = "redemption-wallet")]
         redemption_wallet: Option<Address>,
+        /// Chain the mint lands on or the redemption leaves from: selects the
+        /// wallet, the `[chains.<name>.trading]` table and its redemption
+        /// wallet. A resumed mint (`--issuer-request-id`) must be given the
+        /// network it started on; the aggregate records no chain yet
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
     },
 
     /// Wrap tokenized equity into wrapped ERC-4626 vault shares
@@ -1010,6 +1016,7 @@ enum SimpleCommand {
         quantity: FractionalShares,
         issuer_request_id: Option<Uuid>,
         redemption_wallet: Option<Address>,
+        network: TokenizationNetwork,
     },
     WrapEquity {
         symbol: Symbol,
@@ -1280,12 +1287,14 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
             quantity,
             issuer_request_id,
             redemption_wallet,
+            network,
         } => CommandRoute::Simple(SimpleCommand::TransferEquity {
             direction,
             symbol,
             quantity,
             issuer_request_id,
             redemption_wallet,
+            network,
         }),
         Commands::WrapEquity {
             symbol,
@@ -1577,18 +1586,17 @@ async fn run_simple_command<W: Write>(
             quantity,
             issuer_request_id,
             redemption_wallet,
+            network,
         } => {
-            rebalancing::transfer_equity_command(
-                stdout,
+            let transfer = rebalancing::TransferEquity {
                 direction,
-                &symbol,
+                symbol,
                 quantity,
                 issuer_request_id,
                 redemption_wallet,
-                ctx,
-                pool,
-            )
-            .await
+                network,
+            };
+            rebalancing::transfer_equity_command(stdout, transfer, ctx, pool).await
         }
         SimpleCommand::WrapEquity {
             symbol,
