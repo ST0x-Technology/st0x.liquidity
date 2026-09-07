@@ -210,10 +210,6 @@ pub(super) fn wrap_context(
     registry: Option<&PathBuf>,
     symbol: &Symbol,
 ) -> anyhow::Result<WrapContext> {
-    let wallet_ctx = ctx.wallet()?;
-    let (wallet, _network_wire) =
-        super::rebalancing::tokenization_network_context(wallet_ctx, network);
-
     let equities = match (network, registry) {
         (TokenizationNetwork::Base, None) => {
             to_wrapped_equities(&ctx.chains.primary().assets.equities.symbols)
@@ -239,6 +235,12 @@ pub(super) fn wrap_context(
             available.join(", ")
         );
     }
+
+    // Config-only checks first so a typo or a missing registry fails before
+    // the wallet is required.
+    let wallet_ctx = ctx.wallet()?;
+    let (wallet, _network_wire) =
+        super::rebalancing::tokenization_network_context(wallet_ctx, network);
 
     Ok(WrapContext { wallet, equities })
 }
