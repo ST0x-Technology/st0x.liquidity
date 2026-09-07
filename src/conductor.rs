@@ -5040,6 +5040,7 @@ mod tests {
     use task_supervisor::SupervisorBuilder;
     use tokio::sync::broadcast;
     use url::Url;
+    use uuid::uuid;
 
     use st0x_config::{
         BotGasValuationConfig, ChainAssets, ChainEquities, ChainEquityAsset, ExecutionThreshold,
@@ -5050,8 +5051,9 @@ mod tests {
     use st0x_event_sorcery::{DomainEvent, Reconciler, StoreBuilder, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_execution::{
-        Direction, EquityPosition, ExecutorOrderId, Inventory as ExecutionInventory, MarketOrder,
-        MockExecutor, Positive, SupportedExecutor, Symbol,
+        AlpacaAccountId, AlpacaBrokerApiMode, AlpacaBrokerAuth, Direction, EquityPosition,
+        ExecutorOrderId, Inventory as ExecutionInventory, MarketOrder, MockExecutor, Positive,
+        SupportedExecutor, Symbol, TimeInForce,
     };
     use st0x_finance::{Usd, Usdc};
     use st0x_float_macro::float;
@@ -14931,5 +14933,122 @@ mod tests {
             ConfiguredMintAuthorizer::Disabled
         ));
         assert!(!logs_contain("without an entry for the primary chain"));
+    }
+
+    fn alpaca_broker_ctx() -> BrokerCtx {
+        BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
+            auth: AlpacaBrokerAuth::Basic {
+                api_key: "test_key_id".to_owned(),
+                api_secret: "test_secret_key".to_owned(),
+            },
+            account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
+            mode: Some(AlpacaBrokerApiMode::Sandbox),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
+            counter_trade_slippage_bps: 50,
+        })
+    }
+
+    fn equity_asset(token: Address) -> ChainEquityAsset {
+        ChainEquityAsset {
+            tokenized_equity: token,
+            tokenized_equity_derivative: Address::random(),
+            vault_ids: Vec::new(),
+            trading: OperationMode::Enabled,
+            rebalancing: OperationMode::Disabled,
+            wrapped_equity_recovery: OperationMode::Disabled,
+            operational_limit: None,
+        }
+    }
+
+    fn ethereum_trading_chain(redemption_wallet: Option<Address>) -> TradingChain {
+        let mut trading = TradingChain::test()
+            .chain(Chain::Ethereum)
+            .orderbook(Address::repeat_byte(0xe0))
+            .maybe_redemption_wallet(redemption_wallet)
+            .call();
+        trading.assets = ChainAssets {
+            equities: ChainEquities {
+                symbols: HashMap::from([(
+                    Symbol::new("TSLA").unwrap(),
+                    equity_asset(Address::repeat_byte(0xe5)),
+                )]),
+                operational_limit: None,
+            },
+            cash: None,
+        };
+        trading
+    }
+
+    /// One set of tokenization services per watched chain, each bound to
+    /// that chain's own signer and asset table -- never the Base wallet
+    /// or the primary's tokens -- and none for a chain with no trading
+    /// table (HyperEVM here: a signer exists, nothing is watched).
+    #[test]
+    fn chain_tokenizations_cover_every_watched_chain_with_its_own_wallet_and_assets() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = alpaca_broker_ctx();
+        ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
+        ctx.chains.primary_mut().assets = ChainAssets {
+            equities: ChainEquities {
+                symbols: HashMap::from([(
+                    Symbol::new("AAPL").unwrap(),
+                    equity_asset(Address::repeat_byte(0xa5)),
+                )]),
+                operational_limit: None,
+            },
+            cash: None,
+        };
+        ctx.chains
+            .insert_secondary(ethereum_trading_chain(Some(Address::repeat_byte(0xe1))));
+
+        let tokenizations = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()).unwrap();
+
+        assert_eq!(
+            tokenizations.keys().copied().collect::<Vec<_>>(),
+            vec![Chain::Base, Chain::Ethereum]
+        );
+
+        let base = &tokenizations[&Chain::Base];
+        assert_eq!(base.chain, Chain::Base);
+        assert_eq!(
+            base.wallet.address(),
+            address!("0x0000000000000000000000000000000000000ba5")
+        );
+        assert_eq!(
+            base.token_addresses,
+            HashMap::from([(Symbol::new("AAPL").unwrap(), Address::repeat_byte(0xa5))])
+        );
+
+        let ethereum = &tokenizations[&Chain::Ethereum];
+        assert_eq!(ethereum.chain, Chain::Ethereum);
+        assert_eq!(
+            ethereum.wallet.address(),
+            address!("0x0000000000000000000000000000000000000e78")
+        );
+        assert_eq!(
+            ethereum.token_addresses,
+            HashMap::from([(Symbol::new("TSLA").unwrap(), Address::repeat_byte(0xe5))])
+        );
+    }
+
+    /// A watched chain without its own issuer redemption wallet cannot
+    /// redeem, so building its services fails startup naming that chain
+    /// rather than borrowing the primary's wallet.
+    #[test]
+    fn chain_tokenizations_refuse_a_watched_chain_without_its_redemption_wallet() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = alpaca_broker_ctx();
+        ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
+        ctx.chains.insert_secondary(ethereum_trading_chain(None));
+
+        let error = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()).unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<CtxError>(),
+            Some(CtxError::RedemptionWalletNotConfigured {
+                chain: Chain::Ethereum
+            })
+        ));
     }
 }
