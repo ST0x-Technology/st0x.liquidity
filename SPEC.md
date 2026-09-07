@@ -1212,11 +1212,13 @@ Alternative approaches (Ansible, Kamal) were evaluated and documented in commit
 
 #### Config validation
 
-The config TOMLs the bot runs on are baked into the OCI image from this
-repository's `config/` directory and selected at run time by the compose file's
-`--config` flag. A config edit that only the deployed service can judge is a
-config edit whose first check is a bot that will not boot, which is what the
-`validate-config` binary exists to prevent.
+The GCP production and staging config TOMLs are committed beside their stacks in
+`t0.devops`, published as pinned Secret Manager versions, and mounted at
+`/run/t0-config/st0x-hedge.toml`. The OCI image contains no environment config;
+the compose file selects the mounted file with its `--config` flag. A config
+edit that only the deployed service can judge is a config edit whose first check
+is a bot that will not boot, which is what the `validate-config` binary exists
+to prevent.
 
 `validate-config --config <path> [--secrets <path>]` runs the boot path's
 validation and exits 0 or 1, writing a plain-text report to stdout and the
