@@ -2264,8 +2264,12 @@ where
         // fill monitor starts polling.
         match probe_cutoff_block_support(chain_provider, chain_tip, watched.ingestion_cutoff)
             .await
-            .context("RPC endpoint cannot serve the configured cutoff block tag at startup")?
-        {
+            .with_context(|| {
+                format!(
+                    "{}'s RPC endpoint cannot serve the configured cutoff block tag at startup",
+                    watched.chain
+                )
+            })? {
             CutoffProbe::Supported | CutoffProbe::NotYetAvailable => {}
         }
     }
