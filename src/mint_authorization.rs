@@ -532,6 +532,7 @@ mod tests {
     use serde_json::json;
     use url::Url;
 
+    use st0x_evm::Chain;
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_float_macro::float;
 
@@ -956,6 +957,56 @@ mod tests {
             error,
             MintAuthorizationError::ChainIdDiverged { rpc: 1, .. }
         ));
+    }
+
+    /// The domain and the serving RPC can agree with each other and still
+    /// name a chain the service was never configured for -- a mis-pointed
+    /// endpoint whose orchestrator is a faithful deployment on the wrong
+    /// network. The configured [`Chain`] is the operator's intent, so an
+    /// RPC on any other chain id must refuse before the digest read. No
+    /// `mintAuthDigest` response is queued, so the exact-variant assert
+    /// also proves the service stops here.
+    #[tokio::test]
+    async fn rpc_on_another_chain_than_configured_refuses_before_digest_read() {
+        let asserter = Asserter::new();
+        asserter.push_success(&alloy::hex::encode_prefixed(
+            keccak256(MINT_AUTH_TYPE).abi_encode(),
+        ));
+        // The domain and the RPC both claim mainnet...
+        let mainnet_domain = (
+            alloy::primitives::FixedBytes::<1>::from([0x0fu8]),
+            DOMAIN_NAME.to_string(),
+            DOMAIN_VERSION.to_string(),
+            U256::from(Chain::Ethereum.chain_id()),
+            ORCHESTRATOR,
+            B256::ZERO,
+            Vec::<U256>::new(),
+        )
+            .abi_encode_params();
+        asserter.push_success(&alloy::hex::encode_prefixed(mainnet_domain));
+        asserter.push_success(&"0x1");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let private_key =
+            b256!("0x4242424242424242424242424242424242424242424242424242424242424242");
+        let wallet = RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
+        // ...while the service is bound to Base.
+        let service = MintAuthorizationService::new(Chain::Base, wallet, ORCHESTRATOR);
+
+        let error = service
+            .sign_mint_authorization(TOKEN, float!(50), NONCE)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                MintAuthorizationError::RpcChainDiverged {
+                    configured: Chain::Base,
+                    rpc: 1,
+                }
+            ),
+            "expected RpcChainDiverged, got {error:?}"
+        );
     }
 
     /// A `mintAuthDigest` answer diverging from the locally computed
