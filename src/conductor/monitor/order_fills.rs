@@ -414,6 +414,7 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
 
             self.backfill_queue
                 .push(BackfillRange {
+                    chain: self.evm_ctx.chain,
                     from_block,
                     to_block: cutoff_block,
                 })
@@ -1353,6 +1354,7 @@ mod tests {
         let mut other_handle = BackfillJobQueue::new(&apalis_pool);
         other_handle
             .push(BackfillRange {
+                chain: st0x_evm::Chain::Base,
                 from_block: 11,
                 to_block: 20,
             })
@@ -1407,6 +1409,7 @@ mod tests {
         let mut queue = BackfillJobQueue::new(&apalis_pool);
         queue
             .push(BackfillRange {
+                chain: st0x_evm::Chain::Base,
                 from_block: 11,
                 to_block: 20,
             })

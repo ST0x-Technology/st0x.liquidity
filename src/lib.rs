@@ -320,6 +320,11 @@ async fn run_bot_session_inner(
             .build()
             .run()
     });
+    let order_fill_monitor_tokens: std::collections::BTreeMap<_, _> = ctx
+        .chains
+        .watched()
+        .map(|watched| (watched.chain, startup_barrier.token()))
+        .collect();
     let mut bot_task = tokio::spawn(Box::pin(run_conductor_session(
         ctx,
         pools,
@@ -335,7 +340,7 @@ async fn run_bot_session_inner(
             apalis_monitor: startup_barrier.token(),
             job_cleanup: startup_barrier.token(),
             supervisor: SupervisorStartupTokens {
-                order_fill_monitor: startup_barrier.token(),
+                order_fill_monitors: order_fill_monitor_tokens,
                 inventory_monitor: startup_barrier.token(),
                 dashboard_trade_handoff_monitor: startup_barrier.token(),
                 executor_maintenance: startup_barrier.token(),
@@ -871,7 +876,10 @@ mod tests {
             apalis_monitor: barrier.token(),
             job_cleanup: barrier.token(),
             supervisor: SupervisorStartupTokens {
-                order_fill_monitor: barrier.token(),
+                order_fill_monitors: std::collections::BTreeMap::from([(
+                    st0x_evm::Chain::Base,
+                    barrier.token(),
+                )]),
                 inventory_monitor: barrier.token(),
                 dashboard_trade_handoff_monitor: barrier.token(),
                 executor_maintenance: barrier.token(),
