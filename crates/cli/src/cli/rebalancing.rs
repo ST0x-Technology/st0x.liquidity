@@ -3931,9 +3931,9 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.to_string().contains(
-                "equity COIN is not configured in [chains.<name>.trading.assets.equities]"
-            ),
+            error
+                .to_string()
+                .contains("COIN is not in the resolved token set"),
             "an unconfigured symbol must fail before any network call, got: {error}"
         );
     }
@@ -4049,7 +4049,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ethereum_network_requires_explicit_token_address() {
+    async fn alpaca_redeem_on_ethereum_requires_a_registry() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let mut stdout = Vec::new();
 
@@ -4066,13 +4066,13 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.to_string().contains("pass --token"),
-            "ethereum without --token must fail closed, got: {error}"
+            error.to_string().contains("pass --registry"),
+            "ethereum without --registry must fail closed, got: {error}"
         );
     }
 
     #[tokio::test]
-    async fn hyperevm_network_requires_explicit_token_address() {
+    async fn alpaca_redeem_on_hyperevm_requires_a_registry() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let mut stdout = Vec::new();
 
@@ -4089,8 +4089,8 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.to_string().contains("pass --token"),
-            "hyperevm without --token must fail closed, got: {error}"
+            error.to_string().contains("pass --registry"),
+            "hyperevm without --registry must fail closed, got: {error}"
         );
     }
 
