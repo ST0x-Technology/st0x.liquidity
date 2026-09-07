@@ -364,31 +364,102 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reset_allowance_resolves_the_trading_chain_orderbook() {
-        let ctx = create_ctx_without_rebalancing();
+    const ETHEREUM_ORDERBOOK: Address = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 
-        let spender = orderbook_spender(&ctx.chains, Chain::Base).unwrap();
+    fn create_ctx_with_stub_wallet() -> Ctx {
+        let mut ctx = create_ctx_without_rebalancing();
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        ctx
+    }
 
-        assert_eq!(
-            spender,
-            address!("0x1234567890123456789012345678901234567890")
+    /// `--network ethereum` resets the allowance Ethereum's wallet granted to
+    /// Ethereum's orderbook on Ethereum's USDC; the stub wallet stops the run
+    /// at the allowance read.
+    #[tokio::test]
+    async fn reset_allowance_on_ethereum_targets_that_chains_orderbook_and_usdc() {
+        let mut ctx = create_ctx_with_stub_wallet();
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .orderbook(ETHEREUM_ORDERBOOK)
+                .call(),
+        );
+        let ethereum_wallet = ctx.wallet().unwrap().ethereum_wallet().address();
+
+        let mut stdout = Vec::new();
+        reset_allowance_command::<OpenChainErrorRegistry, _>(
+            &mut stdout,
+            TokenizationNetwork::Ethereum,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains("on ethereum"), "got: {output}");
+        assert!(
+            output.contains(&format!("Owner: {ethereum_wallet}")),
+            "expected Ethereum's wallet, got: {output}"
+        );
+        assert!(
+            output.contains(&format!("Spender (orderbook): {ETHEREUM_ORDERBOOK}")),
+            "expected Ethereum's orderbook, got: {output}"
+        );
+        assert!(
+            output.contains(&format!("USDC: {USDC_ETHEREUM}")),
+            "expected Ethereum's USDC, got: {output}"
+        );
+        assert!(
+            !output.contains(&ctx.chains.primary().orderbook.to_string())
+                && !output.contains(&USDC_BASE.to_string()),
+            "Base's addresses must not appear, got: {output}"
         );
     }
 
-    #[test]
-    fn reset_allowance_refuses_a_chain_that_is_not_the_trading_chain() {
-        // The Base orderbook address means nothing on Ethereum: an approve(0)
-        // there would report success while the real Ethereum spender stayed
-        // approved.
-        let ctx = create_ctx_without_rebalancing();
+    /// The Base orderbook address means nothing on Ethereum: an approve(0)
+    /// there would report success while the real Ethereum spender stayed
+    /// approved. A chain without its own trading table is refused by name.
+    #[tokio::test]
+    async fn reset_allowance_refuses_a_network_without_a_trading_table() {
+        let ctx = create_ctx_with_stub_wallet();
 
-        let error = orderbook_spender(&ctx.chains, Chain::Ethereum).unwrap_err();
+        let mut stdout = Vec::new();
+        let error = reset_allowance_command::<OpenChainErrorRegistry, _>(
+            &mut stdout,
+            TokenizationNetwork::Ethereum,
+            &ctx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
-        assert_eq!(
-            error.to_string(),
-            "reset-allowance targets the orderbook, which only exists on the trading chain \
-             (base); requested ethereum"
+        assert!(
+            error.contains("[chains.ethereum.trading]"),
+            "expected the missing trading table named, got: {error}"
+        );
+    }
+
+    /// No USDC is pinned for HyperEVM, so there is nothing to reset there
+    /// and no other chain's address is tried.
+    #[tokio::test]
+    async fn reset_allowance_refuses_a_chain_without_a_pinned_usdc() {
+        let mut ctx = create_ctx_with_stub_wallet();
+        ctx.chains
+            .insert_secondary(TradingChain::test().chain(Chain::HyperEvm).call());
+
+        let mut stdout = Vec::new();
+        let error = reset_allowance_command::<OpenChainErrorRegistry, _>(
+            &mut stdout,
+            TokenizationNetwork::HyperEvm,
+            &ctx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("hyperevm") && error.contains("USDC"),
+            "expected the unpinned chain named, got: {error}"
         );
     }
 
@@ -399,7 +470,7 @@ mod tests {
         let mut stdout = Vec::new();
         let error = reset_allowance_command::<OpenChainErrorRegistry, _>(
             &mut stdout,
-            CctpChain::Ethereum,
+            TokenizationNetwork::Base,
             &ctx,
         )
         .await

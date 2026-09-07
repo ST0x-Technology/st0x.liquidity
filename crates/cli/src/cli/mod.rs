@@ -2243,6 +2243,24 @@ mod tests {
         }
     }
 
+    /// `reset-allowance` selects its chain with `--network` like every other
+    /// chain-touching command; the old `--chain` spelling is gone.
+    #[test]
+    fn reset_allowance_parses_network_and_rejects_chain() {
+        let cli =
+            Cli::try_parse_from(["st0x-cli", "reset-allowance", "--network", "ethereum"]).unwrap();
+        match cli.command {
+            Commands::ResetAllowance { network } => {
+                assert_eq!(network, TokenizationNetwork::Ethereum);
+            }
+            other => panic!("expected reset-allowance command, got: {other:?}"),
+        }
+
+        let error = Cli::try_parse_from(["st0x-cli", "reset-allowance", "--chain", "ethereum"])
+            .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
     /// The vault commands take the same `--network` flag as every other
     /// chain-touching command, defaulting to Base.
     #[test]
