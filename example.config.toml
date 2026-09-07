@@ -1,6 +1,11 @@
 server_port = 8080
 board_port = 8081
+# Minimum level written to stdout and exported through OpenTelemetry.
 log_level = "debug"
+# Local rotating files are optional, but these two fields are an inseparable
+# pair when enabled. RUST_LOG affects stdout only, never this file threshold.
+# log_dir = "/mnt/data/logs"
+# file_log_level = "info"
 # Console log output format: "text" (human readable, the default) or "json"
 # (one JSON object per line, for log shippers reading journald).
 log_format = "text"
