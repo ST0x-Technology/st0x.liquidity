@@ -214,6 +214,9 @@ equities:
   (e.g., 100 AAPL shares at Alpaca -> 100 tAAPL tokens on Base).
 - **Redemption**: The reverse - burn onchain tokens to recover broker-held
   shares (e.g., 100 tAAPL tokens -> 100 AAPL shares at Alpaca).
+- **UnwrappedToken**: a tokenized-equity address a `Wrapper` attested as an
+  ERC-4626 vault's `asset()`. The only token type a redemption transfer to the
+  issuer accepts; a wrapped share address cannot be given to it.
 
 Both operations provide an immutable audit trail, tracked as CQRS event-sourced
 aggregates (`TokenizedEquityMint`, `EquityRedemption`).

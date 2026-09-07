@@ -2573,8 +2573,10 @@ stateDiagram-v2
 - `Withdraw` command withdraws wrapped tokens from Raindex vault to wallet
 - `WithdrawnFromRaindex` tracks wrapped tokens that left the vault but aren't
   yet unwrapped
-- `Unwrap` command converts ERC-4626 wrapped tokens to unwrapped tokens
-- `TokensUnwrapped` tracks unwrapped tokens ready to send
+- `Unwrap` command converts ERC-4626 wrapped tokens to unwrapped tokens;
+  confirmation records the token the vault reports as its `asset()` as a typed
+  `UnwrappedToken`
+- `TokensUnwrapped` tracks the attested `UnwrappedToken` ready to send
 - `Send` command sends unwrapped tokens to Alpaca and polls until terminal
 - `TokensSent` tracks tokens that have been sent to Alpaca's redemption wallet
 - `Pending` indicates Alpaca detected the transfer
@@ -2596,6 +2598,7 @@ enum EquityRedemption {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
+        underlying_token: UnwrappedToken,
         raindex_withdraw_tx: TxHash,
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
@@ -2692,6 +2695,7 @@ enum EquityRedemptionEvent {
     // zeroes inflight correctly. A negative delta triggers a shortfall
     // adjustment.
     TokensUnwrapped {
+        underlying_token: UnwrappedToken,
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
         unwrapped_at: DateTime<Utc>,
@@ -2762,6 +2766,16 @@ redemption polling, and `Wrapper` methods for ERC-4626 wrapping/unwrapping.
 - `Redeem` only from `WithdrawnFromRaindex` state; polls Alpaca until terminal
 - If send fails after withdraw, aggregate stays in `WithdrawnFromRaindex`
   (tokens in wallet, not stranded)
+- `ConfirmUnwrap` records the token the vault reports as its `asset()`, typed
+  `UnwrappedToken`. Only a `Wrapper` implementation can produce that type, and
+  the command refuses (`UnwrapDeliveredUnexpectedToken`) when the attested token
+  differs from the configured underlying, so config drift surfaces before any
+  transfer
+- `SendTokens` hands an `UnwrappedToken` to `Tokenizer::send_for_redemption`,
+  which accepts nothing else: a wrapped ERC-4626 share address cannot reach the
+  issuer's redemption wallet by construction. The operator `alpaca-redeem`
+  command attests through the same wrapper path (`Wrapper::attest_underlying`)
+  instead of taking a raw token address
 - Completed and Failed are terminal states
 
 #### UsdcRebalance Aggregate
