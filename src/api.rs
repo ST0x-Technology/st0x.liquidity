@@ -15,7 +15,8 @@ use axum::http::header::{CACHE_CONTROL, HeaderName};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{get, post};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
+use rain_math_float::Float;
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -31,7 +32,7 @@ use st0x_event_sorcery::{
 };
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
 use st0x_execution::{AlpacaWalletError, Symbol};
-use st0x_finance::FractionalShares;
+use st0x_finance::{FractionalShares, Positive};
 use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
@@ -47,8 +48,13 @@ use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
 };
 use crate::iap_auth::{IapVerifier, require_iap};
+use crate::offchain::order::OffchainOrderId;
 use crate::operator::equity_transfer::{
     EquityTransferKind, FailTransferError, validate_failure_reason,
+};
+use crate::operator::portfolio_snapshot::set_equity_mark;
+use crate::operator::position::{
+    OffchainOrderOutcome, PointerOutcome, release_pending_offchain_order, set_position,
 };
 use crate::performance::equity_timing::load_equity_timings;
 use crate::performance::infra::{load_dependency_stats, load_monitor_telemetry};
@@ -2380,6 +2386,205 @@ async fn reconcile_equity_transfer(
     }))
 }
 
+/// Maps an operator write command's rejection or bad input to a `400`, the
+/// operator-facing reason preserved in the body. These recovery requests fail
+/// when the aggregate is not in a state the request can apply to, so the
+/// condition is the caller's, not the server's.
+fn ops_precondition_error(error: impl std::fmt::Display) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: format!("{error}"),
+        }),
+    )
+}
+
+fn pointer_label(pointer: PointerOutcome) -> &'static str {
+    match pointer {
+        PointerOutcome::ClearedNow => "cleared_now",
+        PointerOutcome::WasAlreadyClear => "was_already_clear",
+    }
+}
+
+fn offchain_order_label(outcome: OffchainOrderOutcome) -> &'static str {
+    match outcome {
+        OffchainOrderOutcome::MarkedFailed => "marked_failed",
+        OffchainOrderOutcome::AlreadyTerminal => "already_terminal",
+        OffchainOrderOutcome::NoAggregate => "no_aggregate",
+        OffchainOrderOutcome::TerminalConcurrently => "terminal_concurrently",
+    }
+}
+
+/// Wire contract for the position release-hedge route.
+#[derive(Deserialize)]
+struct ReleaseHedgeRequest {
+    /// Pending offchain order id recorded on the position.
+    order_id: String,
+    /// Free-text operator audit reason (required; persisted on the event).
+    reason: String,
+}
+
+/// The result of a release-hedge, describing what happened to the pointer and
+/// the orphaned aggregate.
+#[derive(Serialize)]
+struct ReleaseHedgeResponse {
+    symbol: String,
+    order_id: String,
+    pointer: &'static str,
+    offchain_order: &'static str,
+}
+
+/// Fails a position's pending offchain order pointer and drives the orphaned
+/// `OffchainOrder` aggregate to `Failed`. Operates directly on the local CQRS
+/// state; the operator must ensure the bot is not concurrently driving the same
+/// order. Mirrors `stox position release-hedge`.
+async fn release_position_hedge(
+    State(state): State<AppState>,
+    Path(symbol): Path<String>,
+    Json(request): Json<ReleaseHedgeRequest>,
+) -> Result<Json<ReleaseHedgeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let symbol = Symbol::new(&symbol).map_err(ops_precondition_error)?;
+    let order_id = OffchainOrderId::from_str(&request.order_id).map_err(ops_precondition_error)?;
+
+    let outcome = release_pending_offchain_order(&state.pool, &symbol, order_id, &request.reason)
+        .await
+        .map_err(ops_precondition_error)?;
+
+    Ok(Json(ReleaseHedgeResponse {
+        symbol: symbol.to_string(),
+        order_id: order_id.to_string(),
+        pointer: pointer_label(outcome.pointer),
+        offchain_order: offchain_order_label(outcome.offchain_order),
+    }))
+}
+
+/// Wire contract for the position set route.
+#[derive(Deserialize)]
+struct SetPositionRequest {
+    /// Signed decimal net exposure to set (negative is short).
+    target_net: String,
+    /// USDC price per share, required for nonzero targets under a dollar-value
+    /// threshold; must be strictly positive.
+    price_usdc: Option<String>,
+    /// Free-text operator audit reason (required; persisted on the event).
+    reason: String,
+}
+
+/// The net exposure change a completed set recorded.
+#[derive(Serialize)]
+struct SetPositionResponse {
+    symbol: String,
+    previous_net: String,
+    target_net: String,
+}
+
+/// Sets a position's net exposure after an operator manual correction. Refuses
+/// while the position holds a pending offchain order. Mirrors `stox position
+/// set`.
+async fn set_position_exposure(
+    State(state): State<AppState>,
+    Path(symbol): Path<String>,
+    Json(request): Json<SetPositionRequest>,
+) -> Result<Json<SetPositionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let symbol = Symbol::new(&symbol).map_err(ops_precondition_error)?;
+    let target_net =
+        FractionalShares::new(Float::parse(request.target_net).map_err(ops_precondition_error)?);
+    let price_usdc = request
+        .price_usdc
+        .map(|price| {
+            let float = Float::parse(price).map_err(ops_precondition_error)?;
+            Positive::new(float)
+                .map(|positive| positive.inner())
+                .map_err(|_| ops_precondition_error("price must be strictly positive"))
+        })
+        .transpose()?;
+    let threshold = state.ctx.execution_threshold;
+
+    let previous_net = set_position(
+        &state.pool,
+        &symbol,
+        target_net,
+        &request.reason,
+        threshold,
+        price_usdc,
+    )
+    .await
+    .map_err(ops_precondition_error)?
+    .previous_net;
+
+    Ok(Json(SetPositionResponse {
+        symbol: symbol.to_string(),
+        previous_net: previous_net.to_string(),
+        target_net: target_net.to_string(),
+    }))
+}
+
+/// Wire contract for the portfolio-snapshot mark route.
+#[derive(Deserialize)]
+struct SetEquityMarkRequest {
+    /// ET day of the captured balance snapshot (YYYY-MM-DD).
+    day: String,
+    /// Equity symbol whose mark applies at every captured location.
+    symbol: String,
+    /// Strictly-positive historical USD closing price per share.
+    usd_mark: String,
+    /// Sourced economic timestamp (RFC 3339); an earlier ET day.
+    observed_at: String,
+    /// Source used to verify the historical price (required).
+    source: String,
+    /// Free-text operator audit reason (required; persisted on the event).
+    reason: String,
+}
+
+/// The persisted historical mark.
+#[derive(Serialize)]
+struct SetEquityMarkResponse {
+    day: String,
+    symbol: String,
+    usd_mark: String,
+    observed_at: String,
+}
+
+/// Sets the audited historical closing-price mark for one captured ET day.
+/// Mirrors `stox portfolio-snapshot set`.
+async fn set_portfolio_snapshot_mark(
+    State(state): State<AppState>,
+    Json(request): Json<SetEquityMarkRequest>,
+) -> Result<Json<SetEquityMarkResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let day = request
+        .day
+        .parse::<NaiveDate>()
+        .map_err(ops_precondition_error)?;
+    let symbol = Symbol::new(&request.symbol).map_err(ops_precondition_error)?;
+    let usd_mark = Positive::new(Float::parse(request.usd_mark).map_err(ops_precondition_error)?)
+        .map_err(|_| ops_precondition_error("usd_mark must be strictly positive"))?;
+    let observed_at = request
+        .observed_at
+        .parse::<DateTime<Utc>>()
+        .map_err(ops_precondition_error)?;
+
+    let formatted_mark = set_equity_mark(
+        &state.pool,
+        &state.ctx,
+        day,
+        &symbol,
+        usd_mark,
+        observed_at,
+        &request.source,
+        &request.reason,
+    )
+    .await
+    .map_err(ops_precondition_error)?
+    .formatted_mark;
+
+    Ok(Json(SetEquityMarkResponse {
+        day: day.to_string(),
+        symbol: symbol.to_string(),
+        usd_mark: formatted_mark,
+        observed_at: observed_at.to_rfc3339(),
+    }))
+}
+
 /// The role-gated ops API: the same handlers the dashboard routes use, mounted
 /// under a prefix the load balancer routes to a role-specific IAP backend.
 ///
@@ -2495,6 +2700,18 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
         .route(
             "/liquidity-write/transfers/{kind}/{id}/reconcile",
             post(reconcile_equity_transfer),
+        )
+        .route(
+            "/liquidity-write/positions/{symbol}/release-hedge",
+            post(release_position_hedge),
+        )
+        .route(
+            "/liquidity-write/positions/{symbol}/set",
+            post(set_position_exposure),
+        )
+        .route(
+            "/liquidity-write/portfolio-snapshot/marks",
+            post(set_portfolio_snapshot_mark),
         )
         .layer(axum::middleware::from_fn(move |request, next| {
             let verifier = Arc::clone(&write_verifier);
@@ -5598,6 +5815,9 @@ mod tests {
                 "POST",
                 "/liquidity-write/transfers/equity_redemption/x/reconcile",
             ),
+            ("POST", "/liquidity-write/positions/x/release-hedge"),
+            ("POST", "/liquidity-write/positions/x/set"),
+            ("POST", "/liquidity-write/portfolio-snapshot/marks"),
         ] {
             let response = app
                 .clone()
@@ -5643,6 +5863,9 @@ mod tests {
                 "POST",
                 "/liquidity-write/transfers/equity_redemption/x/reconcile",
             ),
+            ("POST", "/liquidity-write/positions/x/release-hedge"),
+            ("POST", "/liquidity-write/positions/x/set"),
+            ("POST", "/liquidity-write/portfolio-snapshot/marks"),
         ] {
             let response = app
                 .clone()
