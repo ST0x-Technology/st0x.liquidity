@@ -427,6 +427,11 @@ pub enum Commands {
         /// Number of tokenized shares to donate into the wrapper (must be positive)
         #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
         quantity: Positive<FractionalShares>,
+        /// Chain of the wrapper: selects the wallet and the
+        /// `[chains.<name>.trading]` asset table; a chain without that table
+        /// is refused
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
     },
 
     /// Apply a dividend NAV bump in one step: buy the equity, tokenize it, and
@@ -443,6 +448,11 @@ pub enum Commands {
         /// Number of shares to buy, tokenize, and donate (must be positive)
         #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
         quantity: Positive<FractionalShares>,
+        /// Chain to tokenize on and donate into: selects the wallet and the
+        /// `[chains.<name>.trading]` asset table; a chain without that table
+        /// is refused
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
     },
 
     /// Transfer USDC between trading venues (Raindex <-> Alpaca)
@@ -699,8 +709,9 @@ pub enum Commands {
         /// value and the wallet used to observe token arrival)
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
-        /// Tokenized equity (tStock) address override. Required for
-        /// non-base networks -- `[chains.<name>.trading.assets.equities]` holds Base addresses
+        /// Tokenized equity (tStock) address override. Required for a
+        /// network with no `[chains.<name>.trading]` table, whose assets
+        /// otherwise resolve the address
         #[arg(long = "token")]
         token: Option<Address>,
     },
@@ -1033,6 +1044,7 @@ enum SimpleCommand {
     DonateEquity {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
+        network: TokenizationNetwork,
     },
     AlpacaDeposit {
         amount: Usdc,
@@ -1183,6 +1195,7 @@ enum ProviderCommand {
     DividendBump {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
+        network: TokenizationNetwork,
     },
     AlpacaTokenizationRequests,
 }
@@ -1318,9 +1331,15 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
             network,
             registry,
         }),
-        Commands::DonateEquity { symbol, quantity } => {
-            CommandRoute::Simple(SimpleCommand::DonateEquity { symbol, quantity })
-        }
+        Commands::DonateEquity {
+            symbol,
+            quantity,
+            network,
+        } => CommandRoute::Simple(SimpleCommand::DonateEquity {
+            symbol,
+            quantity,
+            network,
+        }),
         Commands::AlpacaDeposit { amount } => {
             CommandRoute::Simple(SimpleCommand::AlpacaDeposit { amount })
         }
@@ -1418,9 +1437,15 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
             network,
             registry,
         }),
-        Commands::DividendBump { symbol, quantity } => {
-            CommandRoute::Provider(ProviderCommand::DividendBump { symbol, quantity })
-        }
+        Commands::DividendBump {
+            symbol,
+            quantity,
+            network,
+        } => CommandRoute::Provider(ProviderCommand::DividendBump {
+            symbol,
+            quantity,
+            network,
+        }),
         Commands::OrderStatus { order_id } => {
             CommandRoute::Simple(SimpleCommand::OrderStatus { order_id })
         }
@@ -1610,9 +1635,11 @@ async fn run_simple_command<W: Write>(
             network,
             registry,
         } => wrapper::unwrap_equity_command(stdout, symbol, quantity, network, registry, ctx).await,
-        SimpleCommand::DonateEquity { symbol, quantity } => {
-            wrapper::donate_equity_command(stdout, symbol, quantity, ctx).await
-        }
+        SimpleCommand::DonateEquity {
+            symbol,
+            quantity,
+            network,
+        } => wrapper::donate_equity_command(stdout, symbol, quantity, network, ctx).await,
         SimpleCommand::AlpacaDeposit { amount } => {
             alpaca_wallet::alpaca_deposit_command::<OpenChainErrorRegistry, _>(stdout, amount, ctx)
                 .await
@@ -2047,9 +2074,11 @@ async fn run_provider_command<W: Write + Send>(
             )
             .await
         }
-        ProviderCommand::DividendBump { symbol, quantity } => {
-            dividend::dividend_bump_command(stdout, symbol, quantity, ctx).await
-        }
+        ProviderCommand::DividendBump {
+            symbol,
+            quantity,
+            network,
+        } => dividend::dividend_bump_command(stdout, symbol, quantity, network, ctx).await,
         ProviderCommand::AlpacaTokenizationRequests => {
             rebalancing::alpaca_tokenization_requests_command(stdout, ctx).await
         }

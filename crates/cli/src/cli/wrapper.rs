@@ -14,6 +14,7 @@ use st0x_hedge::operator::rebalancing::to_wrapped_equities;
 use st0x_wrapper::{WrappedEquity, Wrapper, WrapperService};
 
 use super::TokenizationNetwork;
+use super::rebalancing::{TradingChainContext, trading_chain_context};
 use super::token_list::load_wrapped_equities;
 
 pub(super) async fn wrap_equity_command<Writer: Write>(
@@ -134,18 +135,23 @@ async fn unwrap_equity_with_wrapper<Writer: Write, WrapperImpl: Wrapper + ?Sized
     Ok(())
 }
 
+/// Donates from the selected chain's wallet into the wrapper that chain's
+/// trading table lists; a chain without a trading table is refused, matching
+/// the vault operations (the donation must land where the vault lives).
 pub(super) async fn donate_equity_command<Writer: Write>(
     stdout: &mut Writer,
     symbol: Symbol,
     quantity: Positive<FractionalShares>,
+    network: TokenizationNetwork,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let wallet_ctx = ctx.wallet()?;
-    let base_wallet = wallet_ctx.base_wallet().clone();
-    let owner = base_wallet.address();
+    let TradingChainContext {
+        wallet, trading, ..
+    } = trading_chain_context(ctx, network)?;
+    let owner = wallet.address();
     let wrapper = WrapperService::new(
-        base_wallet,
-        to_wrapped_equities(&ctx.chains.primary().assets.equities.symbols),
+        wallet,
+        to_wrapped_equities(&trading.assets.equities.symbols),
     );
 
     donate_equity_with_wrapper(stdout, &wrapper, owner, symbol, quantity).await

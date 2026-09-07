@@ -13,6 +13,7 @@ use std::io::Write;
 use async_trait::async_trait;
 
 use st0x_config::Ctx;
+use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Positive, Symbol};
 
 use super::{TokenizationNetwork, rebalancing, trading, wrapper};
@@ -32,6 +33,7 @@ trait DividendBumpOperations: Sync {
         stdout: &mut Writer,
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
+        network: TokenizationNetwork,
         ctx: &Ctx,
     ) -> anyhow::Result<()>;
 
@@ -40,6 +42,7 @@ trait DividendBumpOperations: Sync {
         stdout: &mut Writer,
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
+        network: TokenizationNetwork,
         ctx: &Ctx,
     ) -> anyhow::Result<()>;
 }
@@ -63,6 +66,7 @@ impl DividendBumpOperations for LiveDividendBumpOperations {
         stdout: &mut Writer,
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
+        network: TokenizationNetwork,
         ctx: &Ctx,
     ) -> anyhow::Result<()> {
         rebalancing::alpaca_tokenize_command(
@@ -70,7 +74,7 @@ impl DividendBumpOperations for LiveDividendBumpOperations {
             symbol,
             quantity.inner(),
             None,
-            TokenizationNetwork::Base,
+            network,
             None,
             ctx,
         )
@@ -82,9 +86,10 @@ impl DividendBumpOperations for LiveDividendBumpOperations {
         stdout: &mut Writer,
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
+        network: TokenizationNetwork,
         ctx: &Ctx,
     ) -> anyhow::Result<()> {
-        wrapper::donate_equity_command(stdout, symbol, quantity, ctx).await
+        wrapper::donate_equity_command(stdout, symbol, quantity, network, ctx).await
     }
 }
 
@@ -92,19 +97,30 @@ pub(super) async fn dividend_bump_command<Writer: Write + Send>(
     stdout: &mut Writer,
     symbol: Symbol,
     quantity: Positive<FractionalShares>,
+    network: TokenizationNetwork,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    dividend_bump_with_operations(stdout, symbol, quantity, ctx, &LiveDividendBumpOperations).await
+    dividend_bump_with_operations(
+        stdout,
+        symbol,
+        quantity,
+        network,
+        ctx,
+        &LiveDividendBumpOperations,
+    )
+    .await
 }
 
 async fn dividend_bump_with_operations<Writer: Write + Send, Operations: DividendBumpOperations>(
     stdout: &mut Writer,
     symbol: Symbol,
     quantity: Positive<FractionalShares>,
+    network: TokenizationNetwork,
     ctx: &Ctx,
     operations: &Operations,
 ) -> anyhow::Result<()> {
-    writeln!(stdout, "Dividend NAV bump: {quantity} {symbol}")?;
+    let chain = Chain::from(network);
+    writeln!(stdout, "Dividend NAV bump: {quantity} {symbol} on {chain}")?;
 
     writeln!(
         stdout,
@@ -119,7 +135,7 @@ async fn dividend_bump_with_operations<Writer: Write + Send, Operations: Dividen
         "Step 2/3: tokenizing {filled_quantity} {symbol} onchain"
     )?;
     operations
-        .tokenize(stdout, symbol.clone(), filled_quantity, ctx)
+        .tokenize(stdout, symbol.clone(), filled_quantity, network, ctx)
         .await?;
 
     writeln!(
@@ -127,7 +143,7 @@ async fn dividend_bump_with_operations<Writer: Write + Send, Operations: Dividen
         "Step 3/3: donating {filled_quantity} {symbol} into the wrapper"
     )?;
     operations
-        .donate(stdout, symbol, filled_quantity, ctx)
+        .donate(stdout, symbol, filled_quantity, network, ctx)
         .await?;
 
     writeln!(stdout, "✅ Dividend NAV bump completed")?;

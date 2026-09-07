@@ -1200,9 +1200,9 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
 }
 
 /// Resolves the tokenized-equity (tStock) address for a tokenization
-/// command: an explicit `--token` override wins; otherwise the Base address
-/// comes from `[chains.<name>.trading.assets.equities]`. Non-base networks have no config source,
-/// so they require the override.
+/// command: an explicit `--token` override wins; otherwise the selected
+/// chain's `[chains.<name>.trading.assets.equities]` entry. A chain with no
+/// trading table has no config source, so it requires the override.
 fn resolve_tokenization_token(
     token_override: Option<Address>,
     network: TokenizationNetwork,
@@ -1213,26 +1213,19 @@ fn resolve_tokenization_token(
         return Ok(address);
     }
 
-    match network {
-        TokenizationNetwork::Base => ctx
-            .chains
-            .primary()
-            .assets
-            .tokenized_equity(symbol)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "equity {symbol} is not configured in [chains.<name>.trading.assets.equities]"
-                )
-            }),
-        TokenizationNetwork::Ethereum => Err(anyhow::anyhow!(
-            "pass --token with the Ethereum tStock address for {symbol}: \
-             [chains.base.trading.assets.equities] holds Base addresses only"
-        )),
-        TokenizationNetwork::HyperEvm => Err(anyhow::anyhow!(
-            "pass --token with the HyperEVM tStock address for {symbol}: \
-             [chains.base.trading.assets.equities] holds Base addresses only"
-        )),
-    }
+    let chain = Chain::from(network);
+    let Some(trading) = ctx.chains.watch(chain) else {
+        anyhow::bail!(
+            "pass --token with the {chain} tStock address for {symbol}: \
+             no [chains.{chain}.trading] table lists it"
+        );
+    };
+
+    trading.assets.tokenized_equity(symbol).ok_or_else(|| {
+        anyhow::anyhow!(
+            "equity {symbol} is not configured in [chains.<name>.trading.assets.equities]"
+        )
+    })
 }
 
 /// Isolated tokenization command - calls Alpaca tokenization API directly.
