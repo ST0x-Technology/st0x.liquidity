@@ -340,6 +340,17 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
         redemption_wallet,
         network,
     } = transfer;
+    let chain = Chain::from(network);
+    let primary = ctx.chains.primary().chain;
+    if chain != primary {
+        anyhow::bail!(
+            "transfer-equity on {chain} is refused until mint and redemption records carry \
+             their chain: the server's startup recovery resumes every interrupted transfer \
+             with the primary chain's ({primary}) services. Fund {chain} with alpaca-tokenize, \
+             wrap-equity and vault-deposit --network {chain} instead"
+        );
+    }
+
     let direction_str = match direction {
         TransferDirection::ToRaindex => "Alpaca → Raindex (mint)",
         TransferDirection::ToAlpaca => "Raindex → Alpaca (redeem)",
@@ -3156,28 +3167,22 @@ mod tests {
     /// A network with no trading table cannot host a transfer. The redemption
     /// wallet is passed by flag so the trading table is what refuses.
     #[tokio::test]
-    async fn transfer_equity_refuses_a_network_without_a_trading_table() {
+    async fn transfer_equity_services_refuse_a_network_without_a_trading_table() {
         let mut ctx = create_alpaca_ctx_with_rebalancing(None);
         ctx.wallet = Some(OnchainWalletCtx::stub());
         let pool = setup_test_db().await;
 
-        let mut stdout = Vec::new();
-        let error = transfer_equity_command(
-            &mut stdout,
-            TransferEquity {
-                direction: TransferDirection::ToRaindex,
-                symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(float!(1)),
-                issuer_request_id: None,
-                redemption_wallet: Some(ETHEREUM_REDEMPTION_WALLET),
-                network: TokenizationNetwork::Ethereum,
-            },
+        let Err(error) = build_equity_transfer_services(
+            Some(ETHEREUM_REDEMPTION_WALLET),
+            TokenizationNetwork::Ethereum,
             &ctx,
             &pool,
         )
         .await
-        .unwrap_err()
-        .to_string();
+        else {
+            panic!("a network without a trading table must be refused");
+        };
+        let error = error.to_string();
 
         assert!(
             error.contains("[chains.ethereum.trading]"),

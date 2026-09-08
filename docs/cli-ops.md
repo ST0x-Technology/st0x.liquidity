@@ -266,9 +266,13 @@ For USDC, deposit the chain's canonical USDC into the cash vault the same way
 (`vault-deposit --network ethereum --token <usdc> --vault-id <cash-vault-id>`);
 `vault-withdraw-usdc --network <chain>` reverses it and
 `reset-allowance --network <chain>` zeroes the orderbook's USDC allowance on
-that chain. `transfer-equity --network <chain>` runs a mint or redemption on the
-chain end to end; a resumed mint (`--issuer-request-id`) must be given the
-network it started on, since the aggregate records no chain yet.
+that chain. `transfer-equity --network <chain>` is refused for any chain but the
+primary until the mint and redemption aggregates record their chain: the
+server's startup recovery resumes every interrupted transfer with the primary
+chain's services, so a secondary-chain transfer in the shared database would be
+continued on the wrong network. Fund a secondary chain with the three asset-only
+commands above instead. A resumed mint (`--issuer-request-id`) must be given the
+network it started on.
 
 ## Alpaca Crypto Wallet Management
 

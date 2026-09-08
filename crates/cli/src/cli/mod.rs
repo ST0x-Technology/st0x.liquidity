@@ -370,8 +370,10 @@ pub enum Commands {
         redemption_wallet: Option<Address>,
         /// Chain the mint lands on or the redemption leaves from: selects the
         /// wallet, the `[chains.<name>.trading]` table and its redemption
-        /// wallet. A resumed mint (`--issuer-request-id`) must be given the
-        /// network it started on; the aggregate records no chain yet
+        /// wallet. Only the primary chain is accepted until the aggregates
+        /// record their chain: the server's recovery would resume another
+        /// chain's transfer with the primary's services. A resumed mint
+        /// (`--issuer-request-id`) must be given the network it started on
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
     },

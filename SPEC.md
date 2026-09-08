@@ -156,8 +156,11 @@ st0x.registry token list) for a chain that lists an asset but has no trading
 table. USDC is the selected chain's canonical contract, refused where this build
 pins none. An operator equity transfer checks gas on the selected chain's wallet
 against its `[alerts.low_balance_thresholds]` entry and refuses a chain without
-one. The mint and redemption aggregates record no chain yet, so a resumed
-transfer must be given the network it started on.
+one. The mint and redemption aggregates record no chain yet, and the server's
+startup recovery resumes every interrupted transfer with the primary chain's
+services, so `transfer-equity` refuses any network but the primary until the
+aggregates carry their chain; a resumed transfer must be given the network it
+started on.
 
 ##### Shared-Inventory Settlement
 
