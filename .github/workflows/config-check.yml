@@ -21,7 +21,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: ST0x-Technology/.github/.github/workflows/config-check.yml@16aab8c5db9e2a4e70dba4b1af73d3c9336c6816  # config-check @ .github main
+    uses: ST0x-Technology/.github/.github/workflows/config-check.yml@986523b8a550aefc41e34ba35320da74d2e5d784  # config-check @ .github main
     with:
       production_files: config/prod/st0x-hedge.toml
       staging_files: config/staging/st0x-hedge.toml
