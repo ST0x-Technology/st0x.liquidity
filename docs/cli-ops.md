@@ -12,15 +12,21 @@ Use `stox --help` to list all commands and `stox <command> --help` for details
 on any specific command.
 
 Every command that submits an onchain operation takes `--network` (`base`,
-`ethereum`, `hyperevm`; default `base`) and runs on that chain's signing wallet
-and `[chains.<name>.trading]` table: orderbook, inventory, vault owner, asset
-table and redemption wallet. A network with no trading table is refused by name;
-the primary's addresses are never substituted. Where a command needs USDC it
-uses the selected chain's canonical contract, refused on a chain this build pins
-none for (HyperEVM). The wrap, unwrap and redeem commands additionally accept
-`--registry` for a chain that lists an asset but runs no orderbook; the vault,
-allowance, transfer and dividend commands do not, since they need the orderbook
-a trading table provides.
+`ethereum`, `hyperevm`; default `base`) and runs on that chain's signing wallet.
+Two contracts apply, by command:
+
+- Orderbook-backed commands (`vault-deposit`, `vault-withdraw`,
+  `vault-withdraw-usdc`, `reset-allowance`, `transfer-equity`, `donate-equity`,
+  `dividend-bump`) read the chain's `[chains.<name>.trading]` table: orderbook,
+  inventory, vault owner, asset table and redemption wallet. A network with no
+  trading table is refused by name; the primary's addresses are never
+  substituted.
+- Asset-only commands (`wrap-equity`, `unwrap-equity`, `alpaca-tokenize`,
+  `alpaca-redeem`) need no orderbook and accept `--registry` (the st0x.registry
+  token list) for a chain that lists an asset but has no trading table.
+
+Where a command needs USDC it uses the selected chain's canonical contract,
+refused on a chain this build pins none for (HyperEVM).
 
 ## Running the CLI on GCP
 
