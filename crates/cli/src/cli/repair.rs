@@ -8,7 +8,7 @@ use sqlx::SqlitePool;
 use st0x_config::{Ctx, ExecutionThreshold};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_hedge::operator::offchain::order::OffchainOrderId;
-use st0x_hedge::operator::portfolio_snapshot::set_equity_mark;
+use st0x_hedge::operator::portfolio_snapshot::{EquityMarkCorrection, set_equity_mark};
 use st0x_hedge::operator::position::{
     OffchainOrderOutcome, PointerOutcome, release_pending_offchain_order, set_position,
 };
@@ -30,18 +30,17 @@ pub(super) async fn set_portfolio_snapshot_mark_command<W: Write>(
         reason,
     } = command;
 
-    let formatted_mark = set_equity_mark(
-        pool,
-        ctx,
+    let correction = EquityMarkCorrection {
         day,
-        &symbol,
+        symbol: symbol.clone(),
         usd_mark,
         observed_at,
-        source.as_ref(),
-        reason.as_ref(),
-    )
-    .await?
-    .formatted_mark;
+        source: source.to_string(),
+        reason: reason.to_string(),
+    };
+    let formatted_mark = set_equity_mark(pool, ctx, &correction)
+        .await?
+        .formatted_mark;
 
     writeln!(
         stdout,

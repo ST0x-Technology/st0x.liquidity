@@ -546,6 +546,24 @@ pub mod portfolio_snapshot {
         pub formatted_mark: String,
     }
 
+    /// The audited inputs for a historical portfolio mark correction, grouped so
+    /// the `source` and `reason` strings cannot be swapped at a call site.
+    #[derive(Debug, Clone)]
+    pub struct EquityMarkCorrection {
+        /// ET day of the captured balance snapshot.
+        pub day: NaiveDate,
+        /// Equity symbol whose mark applies at every captured location.
+        pub symbol: Symbol,
+        /// Strictly-positive historical USD closing price per share.
+        pub usd_mark: Positive<Float>,
+        /// Sourced economic timestamp; an earlier ET day.
+        pub observed_at: DateTime<Utc>,
+        /// Source used to verify the historical price.
+        pub source: String,
+        /// Operator reason persisted with the correction event.
+        pub reason: String,
+    }
+
     /// Sets the audited historical closing-price mark for one captured ET day.
     ///
     /// Shared by the operator CLI and the ops API. Rejects an `observed_at` at
@@ -553,17 +571,19 @@ pub mod portfolio_snapshot {
     /// unconfigured symbol that still holds unconverted wrapped-equity rows (a
     /// mark would price vault shares as underlying and misstate the day). On
     /// success the read model is verified to have updated every captured row.
-    #[allow(clippy::too_many_arguments)]
     pub async fn set_equity_mark(
         pool: &SqlitePool,
         ctx: &Ctx,
-        day: NaiveDate,
-        symbol: &Symbol,
-        usd_mark: Positive<Float>,
-        observed_at: DateTime<Utc>,
-        source: &str,
-        reason: &str,
+        correction: &EquityMarkCorrection,
     ) -> anyhow::Result<SetEquityMarkOutcome> {
+        let &EquityMarkCorrection {
+            day,
+            ref symbol,
+            usd_mark,
+            observed_at,
+            ref source,
+            ref reason,
+        } = correction;
         ensure!(
             !source.trim().is_empty(),
             "--source must not be blank; it is persisted as audit provenance"
@@ -636,8 +656,8 @@ pub mod portfolio_snapshot {
                     symbol: symbol.clone(),
                     usd_mark,
                     observed_at,
-                    source: source.to_string(),
-                    reason: reason.to_string(),
+                    source: source.clone(),
+                    reason: reason.clone(),
                     corrected_at: Utc::now(),
                 },
             )

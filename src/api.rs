@@ -52,7 +52,7 @@ use crate::offchain::order::OffchainOrderId;
 use crate::operator::equity_transfer::{
     EquityTransferKind, FailTransferError, validate_failure_reason,
 };
-use crate::operator::portfolio_snapshot::set_equity_mark;
+use crate::operator::portfolio_snapshot::{EquityMarkCorrection, set_equity_mark};
 use crate::operator::position::{
     OffchainOrderOutcome, PointerOutcome, release_pending_offchain_order, set_position,
 };
@@ -1290,7 +1290,7 @@ async fn raindex_orders(
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
 }
@@ -2426,7 +2426,7 @@ struct ReleaseHedgeRequest {
 
 /// The result of a release-hedge, describing what happened to the pointer and
 /// the orphaned aggregate.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct ReleaseHedgeResponse {
     symbol: String,
     order_id: String,
@@ -2471,7 +2471,7 @@ struct SetPositionRequest {
 }
 
 /// The net exposure change a completed set recorded.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct SetPositionResponse {
     symbol: String,
     previous_net: String,
@@ -2537,7 +2537,7 @@ struct SetEquityMarkRequest {
 }
 
 /// The persisted historical mark.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct SetEquityMarkResponse {
     day: String,
     symbol: String,
@@ -2563,25 +2563,24 @@ async fn set_portfolio_snapshot_mark(
         .parse::<DateTime<Utc>>()
         .map_err(ops_precondition_error)?;
 
-    let formatted_mark = set_equity_mark(
-        &state.pool,
-        &state.ctx,
+    let correction = EquityMarkCorrection {
         day,
-        &symbol,
+        symbol,
         usd_mark,
         observed_at,
-        &request.source,
-        &request.reason,
-    )
-    .await
-    .map_err(ops_precondition_error)?
-    .formatted_mark;
+        source: request.source,
+        reason: request.reason,
+    };
+    let formatted_mark = set_equity_mark(&state.pool, &state.ctx, &correction)
+        .await
+        .map_err(ops_precondition_error)?
+        .formatted_mark;
 
     Ok(Json(SetEquityMarkResponse {
-        day: day.to_string(),
-        symbol: symbol.to_string(),
+        day: correction.day.to_string(),
+        symbol: correction.symbol.to_string(),
         usd_mark: formatted_mark,
-        observed_at: observed_at.to_rfc3339(),
+        observed_at: correction.observed_at.to_rfc3339(),
     }))
 }
 
@@ -6766,5 +6765,293 @@ mod tests {
             panic!("expected an error response");
         };
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn release_hedge_rejects_a_blank_reason() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let request: ReleaseHedgeRequest = serde_json::from_value(serde_json::json!({
+            "order_id": OffchainOrderId::new().to_string(),
+            "reason": "   ",
+        }))
+        .unwrap();
+
+        let error = release_position_hedge(State(state), Path("MSTR".to_string()), Json(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_position_rejects_a_blank_reason() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let request: SetPositionRequest = serde_json::from_value(serde_json::json!({
+            "target_net": "0",
+            "reason": "   ",
+        }))
+        .unwrap();
+
+        let error = set_position_exposure(State(state), Path("MSTR".to_string()), Json(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_equity_mark_rejects_a_blank_reason() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let request: SetEquityMarkRequest = serde_json::from_value(serde_json::json!({
+            "day": "2026-07-20",
+            "symbol": "MSTR",
+            "usd_mark": "150",
+            "observed_at": "2026-07-17T20:00:00Z",
+            "source": "Nasdaq close",
+            "reason": "   ",
+        }))
+        .unwrap();
+
+        let error = set_portfolio_snapshot_mark(State(state), Json(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn operator_outcome_labels_are_stable() {
+        assert_eq!(pointer_label(PointerOutcome::ClearedNow), "cleared_now");
+        assert_eq!(
+            pointer_label(PointerOutcome::WasAlreadyClear),
+            "was_already_clear"
+        );
+        assert_eq!(
+            offchain_order_label(OffchainOrderOutcome::MarkedFailed),
+            "marked_failed"
+        );
+        assert_eq!(
+            offchain_order_label(OffchainOrderOutcome::AlreadyTerminal),
+            "already_terminal"
+        );
+        assert_eq!(
+            offchain_order_label(OffchainOrderOutcome::NoAggregate),
+            "no_aggregate"
+        );
+        assert_eq!(
+            offchain_order_label(OffchainOrderOutcome::TerminalConcurrently),
+            "terminal_concurrently"
+        );
+    }
+
+    async fn seed_pending_position(pool: &SqlitePool, symbol: &Symbol, order_id: OffchainOrderId) {
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let threshold = ExecutionThreshold::whole_share();
+        position
+            .send(
+                symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(420),
+                    block_timestamp: chrono::Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        position
+            .send(
+                symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: order_id,
+                    shares: Positive::new(FractionalShares::new(float!(0.5))).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    threshold,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn seed_submitted_order(pool: &SqlitePool, order_id: OffchainOrderId, symbol: &Symbol) {
+        st0x_event_sorcery::send_command::<OffchainOrder>(
+            pool,
+            &order_id,
+            crate::offchain::order::OffchainOrderCommand::Place {
+                symbol: symbol.clone(),
+                shares: Positive::new(FractionalShares::new(float!(0.5))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::AlpacaBrokerApi,
+                client_order_id: st0x_execution::ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                kind: crate::offchain::order::CounterTradeOrderKind::Market,
+            },
+            crate::offchain::order::noop_order_placer(),
+        )
+        .await
+        .unwrap();
+        st0x_event_sorcery::send_command::<OffchainOrder>(
+            pool,
+            &order_id,
+            crate::offchain::order::OffchainOrderCommand::MarkAccepted {
+                executor_order_id: ExecutorOrderId::new("seed-accept"),
+                placed_shares: Positive::new(FractionalShares::new(float!(0.5))).unwrap(),
+                submitted_at: chrono::Utc::now(),
+                market_session: st0x_execution::MarketSession::Regular,
+                limit_price: None,
+            },
+            crate::offchain::order::noop_order_placer(),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn seed_captured_equity_row(pool: &SqlitePool, day: NaiveDate, symbol: &Symbol) {
+        let store = StoreBuilder::<PortfolioSnapshot>::new(pool.clone())
+            .with(Arc::new(PortfolioSnapshotProjection::new(pool.clone())))
+            .build(())
+            .await
+            .unwrap();
+        store
+            .send(
+                &PortfolioSnapshotId(day),
+                PortfolioSnapshotCommand::Capture {
+                    captured_at: chrono::Utc.with_ymd_and_hms(2026, 7, 20, 4, 5, 0).unwrap(),
+                    rows: vec![PortfolioBalanceRowWithMark {
+                        row: PortfolioBalanceRow {
+                            location: PortfolioLocation::Hedging,
+                            asset: PortfolioAsset::Equity(symbol.clone()),
+                            available: float!(10),
+                            inflight: float!(0),
+                        },
+                        usd_mark: None,
+                        mark_captured_at: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_position_exposure_reports_the_change() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let request: SetPositionRequest = serde_json::from_value(serde_json::json!({
+            "target_net": "5",
+            "price_usdc": "150",
+            "reason": "manual correction",
+        }))
+        .unwrap();
+
+        let Json(response) =
+            set_position_exposure(State(state), Path("MSTR".to_string()), Json(request))
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({ "symbol": "MSTR", "previous_net": "0", "target_net": "5" })
+        );
+    }
+
+    #[tokio::test]
+    async fn set_portfolio_snapshot_mark_returns_the_recorded_mark() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let day = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let symbol = Symbol::new("MSTR").unwrap();
+        seed_captured_equity_row(&state.pool, day, &symbol).await;
+
+        let request: SetEquityMarkRequest = serde_json::from_value(serde_json::json!({
+            "day": "2026-07-20",
+            "symbol": "MSTR",
+            "usd_mark": "150",
+            "observed_at": "2026-07-17T20:00:00Z",
+            "source": "Nasdaq close",
+            "reason": "backfill",
+        }))
+        .unwrap();
+
+        let Json(response) = set_portfolio_snapshot_mark(State(state), Json(request))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({
+                "day": "2026-07-20",
+                "symbol": "MSTR",
+                "usd_mark": "150",
+                "observed_at": "2026-07-17T20:00:00+00:00",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn release_position_hedge_clears_the_pointer_and_fails_the_order() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let symbol = Symbol::new("MSTR").unwrap();
+        let order_id = OffchainOrderId::new();
+        seed_pending_position(&state.pool, &symbol, order_id).await;
+        seed_submitted_order(&state.pool, order_id, &symbol).await;
+
+        let request: ReleaseHedgeRequest = serde_json::from_value(serde_json::json!({
+            "order_id": order_id.to_string(),
+            "reason": "manual release",
+        }))
+        .unwrap();
+
+        let Json(response) =
+            release_position_hedge(State(state), Path("MSTR".to_string()), Json(request))
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({
+                "symbol": "MSTR",
+                "order_id": order_id.to_string(),
+                "pointer": "cleared_now",
+                "offchain_order": "marked_failed",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn set_portfolio_snapshot_mark_rejects_a_mark_after_the_capture_boundary() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let request: SetEquityMarkRequest = serde_json::from_value(serde_json::json!({
+            "day": "2026-07-20",
+            "symbol": "MSTR",
+            "usd_mark": "150",
+            "observed_at": "2026-07-20T05:00:00Z",
+            "source": "Nasdaq close",
+            "reason": "backfill",
+        }))
+        .unwrap();
+
+        let error = set_portfolio_snapshot_mark(State(state), Json(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn release_position_hedge_rejects_an_unknown_position() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let request: ReleaseHedgeRequest = serde_json::from_value(serde_json::json!({
+            "order_id": OffchainOrderId::new().to_string(),
+            "reason": "manual release",
+        }))
+        .unwrap();
+
+        let error = release_position_hedge(State(state), Path("MSTR".to_string()), Json(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 }
