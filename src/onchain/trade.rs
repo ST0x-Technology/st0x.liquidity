@@ -1017,6 +1017,10 @@ mod tests {
     use st0x_registry::SymbolCache;
 
     use super::*;
+    use crate::bindings::IRaindexV6;
+    use crate::test_utils::{
+        get_test_order, panic_revert_payload, seed_get_test_order_token_symbols, spawn_anvil,
+    };
 
     /// Preloads a symbol under every chain the fixtures run on, so tests
     /// exercising either Base- or Ethereum-flavored parsing hit the cache.
@@ -1025,10 +1029,6 @@ mod tests {
             cache.preload_symbol(chain, token, symbol);
         }
     }
-    use crate::bindings::IRaindexV6;
-    use crate::test_utils::{
-        get_test_order, panic_revert_payload, seed_get_test_order_token_symbols, spawn_anvil,
-    };
 
     #[tokio::test]
     async fn resolve_block_timestamp_fetches_header_when_log_timestamp_missing() {
@@ -2323,6 +2323,7 @@ mod tests {
         let bot_operator = address!("0x679df30b30ac2947aa3143490add6717af81dcc3");
 
         let ctx = TradingChain::test()
+            .chain(Chain::Base)
             .inventory(InventoryMode::Managed { inventory })
             .inventory_adapters(inventory_adapters(
                 InventoryAdapterVenue::Bebop,
