@@ -1,11 +1,9 @@
 //! Raindex vault deposit and withdrawal CLI commands.
 
 use alloy::primitives::{Address, B256, U256};
-use alloy::providers::RootProvider;
 use anyhow::Context;
 use rain_math_float::{Float, FloatError};
 use std::io::Write;
-use std::sync::Arc;
 use thiserror::Error;
 
 use st0x_config::Ctx;
@@ -57,30 +55,25 @@ async fn get_token_decimals<E: Evm>(evm: &E, token: Address) -> anyhow::Result<u
         .with_context(|| format!("failed to read decimals() for token {token}"))
 }
 
-/// Prints the selected chain and its orderbook facts, and builds the Raindex
-/// service on that chain's wallet.
+/// Prints the selected chain and its orderbook facts so the operator can
+/// verify them before the transaction is submitted.
 fn print_chain_context<Writer: Write>(
     stdout: &mut Writer,
     context: &TradingChainContext<'_>,
     wallet_label: &str,
-) -> anyhow::Result<RaindexService<Arc<dyn Wallet<Provider = RootProvider>>>> {
+) -> anyhow::Result<()> {
     let TradingChainContext {
         chain,
         wallet,
         trading,
     } = context;
-    let sender_address = wallet.address();
 
     writeln!(stdout, "   Chain: {chain}")?;
-    writeln!(stdout, "   {wallet_label}: {sender_address}")?;
+    writeln!(stdout, "   {wallet_label}: {}", wallet.address())?;
     writeln!(stdout, "   Inventory: {}", trading.inventory_address())?;
     writeln!(stdout, "   Orderbook: {}", trading.orderbook)?;
 
-    Ok(RaindexService::new(
-        wallet.clone(),
-        st0x_hedge::operator::onchain::raindex_contracts(trading),
-        sender_address,
-    ))
+    Ok(())
 }
 
 pub(super) async fn vault_deposit_command<Writer: Write>(
@@ -103,7 +96,12 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
     }
 
     let context = trading_chain_context(ctx, network)?;
-    let raindex_service = print_chain_context(stdout, &context, "Sender wallet")?;
+    print_chain_context(stdout, &context, "Sender wallet")?;
+    let raindex_service = RaindexService::new(
+        context.wallet.clone(),
+        st0x_hedge::operator::onchain::raindex_contracts(context.trading),
+        context.wallet.address(),
+    );
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
     let token_decimals = get_token_decimals(&context.wallet, token).await?;
@@ -148,7 +146,12 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
     }
 
     let context = trading_chain_context(ctx, network)?;
-    let raindex_service = print_chain_context(stdout, &context, "Recipient wallet")?;
+    print_chain_context(stdout, &context, "Recipient wallet")?;
+    let raindex_service = RaindexService::new(
+        context.wallet.clone(),
+        st0x_hedge::operator::onchain::raindex_contracts(context.trading),
+        context.wallet.address(),
+    );
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
     let token_decimals = get_token_decimals(&context.wallet, token).await?;
