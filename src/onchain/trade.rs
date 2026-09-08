@@ -998,6 +998,7 @@ pub enum TradeValidationError {
 mod tests {
     use std::collections::HashMap;
 
+    use alloy::node_bindings::Anvil;
     use alloy::primitives::{Address, IntoLogData, U256, address, b256, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::{Block, Transaction};
@@ -1026,7 +1027,7 @@ mod tests {
     }
     use crate::bindings::IRaindexV6;
     use crate::test_utils::{
-        get_test_order, panic_revert_payload, seed_get_test_order_token_symbols,
+        get_test_order, panic_revert_payload, seed_get_test_order_token_symbols, spawn_anvil,
     };
 
     #[tokio::test]
@@ -2297,6 +2298,75 @@ mod tests {
     // rather than a hand-picked round number.
     const REAL_USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
     const REAL_WTCOIN_BASE: Address = address!("0x5CdA0E1cA4ce2Af96315F7F8963c85399c172204");
+
+    /// End-to-end fork proof for RAI-2076. This reads the unmodified receipt
+    /// and token metadata from Base at the fill's block, then drives the same
+    /// receipt-recovery and OperatorDeposit/OperatorWithdraw pairing decoder
+    /// used by `process-tx`.
+    #[tokio::test]
+    async fn try_from_tx_hash_decodes_real_bebop_fill_on_base_fork() {
+        const BASE_FORK_BLOCK: u64 = 48_030_415;
+        const BASE_RPC: &str = "https://mainnet.base.org";
+
+        let anvil = spawn_anvil(
+            Anvil::new()
+                .fork(BASE_RPC)
+                .fork_block_number(BASE_FORK_BLOCK),
+        );
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+        let evm = ReadOnlyEvm::new(provider);
+
+        let tx_hash =
+            fixed_bytes!("0xe13a11de734768f08a9c1ef66e8de3bcb9072f8cdabce9f1d819e1ae9909d4b9");
+        let inventory = address!("0x6b7b523fadd1677413ad92c9404c8f0796bacf6f");
+        let venue_operator = address!("0x8b8b6e0507c125934c6129563f48e48c66f86475");
+        let bot_operator = address!("0x679df30b30ac2947aa3143490add6717af81dcc3");
+
+        let ctx = TradingChain::test()
+            .inventory(InventoryMode::Managed { inventory })
+            .inventory_adapters(inventory_adapters(
+                InventoryAdapterVenue::Bebop,
+                venue_operator,
+            ))
+            .vault_owner(inventory)
+            .assets(assets_config_with_equity("COIN", REAL_WTCOIN_BASE))
+            .call();
+
+        let trade = OnchainTrade::try_from_tx_hash(
+            tx_hash,
+            &evm,
+            &SymbolCache::default(),
+            &ctx,
+            RecoveryActors {
+                order_owner: inventory,
+                bot_operator: BotOperator(bot_operator),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the real Bebop fill must decode from its paired inventory events");
+
+        assert_eq!(trade.symbol.to_string(), "wtCOIN");
+        assert_eq!(trade.direction, Direction::Sell);
+        assert_eq!(trade.equity_token, REAL_WTCOIN_BASE);
+        assert_eq!(trade.block_number, Some(BASE_FORK_BLOCK));
+        assert_eq!(
+            trade.source,
+            OnChainTradeSource::Inventory {
+                operator: venue_operator,
+                venue: InventoryVenue::Bebop,
+            }
+        );
+
+        let expected_amount =
+            Float::from_fixed_decimal(uint!(34_172_366_621_067_031_U256), 18).unwrap();
+        assert!(trade.amount.inner().eq(expected_amount).unwrap());
+        let price_diff = (trade.price.value() - float!(146.317))
+            .unwrap()
+            .abs()
+            .unwrap();
+        assert!(price_diff.lt(float!(0.001)).unwrap());
+    }
 
     #[tokio::test]
     async fn try_from_inventory_trade_real_bebop_fill_is_sell() {
