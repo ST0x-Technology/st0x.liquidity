@@ -19,26 +19,13 @@
 server_port = 8001
 # HTTP port for the apalis-board job queue UI.
 board_port = 8002
-# Minimum log level: trace, debug, info, warn, error.
-#
-# NOT trace. On 2026-08-30 trace filled this VM's 10 GB data disk with its
-# own logs (9.3 GB in /mnt/data/logs) and SQLite began failing every write
-# with SQLITE_FULL: order-fill polling stopped, no hedge fills for 20 hours,
-# and every telemetry collector went stale, while the process stayed up, so
-# nothing paged. Same failure as 2026-06-08, which is why the appender keeps
-# only 7 daily files; that bound is on FILE COUNT, and at trace each file was
-# 2-2.9 GB, so seven of them could never fit.
-#
-# Measured on a sample of the 2026-08-29 file: TRACE was 99.0% of the bytes,
-# DEBUG 0.9%, INFO 0.1%. debug therefore cuts on-disk volume ~100x (2.4 GB/day
-# to ~24 MB/day) and keeps every line anything actually reads: the exporter
-# ships ERROR/WARN/INFO onward, /performance/reliability counts ERROR/WARN,
-# and a human browsing the SPA log viewer still gets debug detail. It also
-# ends ~$18/month of Cloud Logging ingest for trace nobody reads (this one
-# level drives the file, the console, and both OTel exporters).
-log_level = "debug"
-# Directory for rotated log files (stdout if omitted).
+# Minimum stdout log level. Docker's gcplogs driver exports TRACE to GCP.
+log_level = "trace"
+# Directory and minimum level for local rotated log files. INFO reduces
+# within-day volume on the 10 GB SQLite disk; seven-file retention caps file
+# count, not bytes, so it is not a hard disk-usage bound.
 log_dir = "/mnt/data/logs"
+file_log_level = "info"
 # SQLite database path for event store, projections, and job queue.
 database_url = "sqlite:///mnt/data/st0x-hedge.db"
 # How often (seconds) Apalis purges finished background jobs.
