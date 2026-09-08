@@ -8616,6 +8616,26 @@ mod tests {
         }
     }
 
+    fn make_onchain_fill_on_chain(
+        amount: FractionalShares,
+        direction: Direction,
+        chain: Chain,
+    ) -> PositionEvent {
+        PositionEvent::OnChainOrderFilled {
+            trade_id: TradeId {
+                chain,
+                tx_hash: TxHash::random(),
+                log_index: 0,
+            },
+            amount,
+            direction,
+            price_usdc: float!(150),
+            block_timestamp: Utc::now(),
+            block_number: None,
+            seen_at: Utc::now(),
+        }
+    }
+
     fn make_offchain_fill(shares_filled: FractionalShares, direction: Direction) -> PositionEvent {
         make_offchain_fill_at(shares_filled, direction, Utc::now())
     }
@@ -8775,6 +8795,28 @@ mod tests {
     /// table backing this service. Used by trigger tests that previously
     /// asserted on the mpsc receiver for mints and now must assert on the
     /// queue.
+    /// Counts pending `EquityRebalancingCheck` rows: the deferred rebalancing
+    /// work an inventory change asks the schedulers for.
+    async fn count_pending_equity_check_jobs(service: &RebalancingService) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<EquityRebalancingCheck>())
+        .fetch_one(service.equity_scheduler.queue().pool())
+        .await
+        .expect("count pending EquityRebalancingCheck jobs")
+    }
+
+    async fn count_pending_usdc_check_jobs(service: &RebalancingService) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<UsdcRebalancingCheck>())
+        .fetch_one(service.usdc_scheduler.queue().pool())
+        .await
+        .expect("count pending UsdcRebalancingCheck jobs")
+    }
+
     async fn count_pending_equity_mint_jobs(service: &RebalancingService) -> i64 {
         let job_type = std::any::type_name::<TransferEquityToMarketMaking>();
         sqlx_apalis::query_scalar::<_, i64>(
@@ -10535,6 +10577,130 @@ mod tests {
             .unwrap();
 
         assert_eq!(onchain_usdc, usdc(11500));
+    }
+
+    /// A fill on a watched secondary chain belongs to that chain: it moves
+    /// the secondary's own inventory slot, leaves the primary's untouched,
+    /// and asks for no rebalancing (secondaries are prefunded, with
+    /// rebalancing disabled on every asset).
+    #[tokio::test]
+    async fn secondary_chain_fill_stays_on_its_own_chain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(10000), usdc(10000))
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Ethereum,
+                    balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainUsdc {
+                    chain: Chain::Ethereum,
+                    usdc_balance: usdc(5000),
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap();
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+
+        // Ethereum buy of 10 shares at $150.
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_on_chain(shares(10), Direction::Buy, Chain::Ethereum),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(50)),
+            "an Ethereum fill must not move the primary chain's equity slot"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(10000)),
+            "an Ethereum fill must not move the primary chain's USDC slot"
+        );
+        assert_eq!(
+            inventory.onchain_equity_available_at(&symbol, Chain::Ethereum),
+            Some(shares(30)),
+            "the fill's equity leg belongs to the chain it filled on"
+        );
+        assert_eq!(
+            inventory.onchain_usdc_available_at(Chain::Ethereum),
+            Some(usdc(3500)),
+            "the fill's cash leg belongs to the chain it filled on"
+        );
+        drop(inventory);
+
+        assert_eq!(
+            count_pending_equity_check_jobs(&trigger).await,
+            0,
+            "a secondary chain's fill must not schedule the primary's equity rebalancing"
+        );
+        assert_eq!(
+            count_pending_usdc_check_jobs(&trigger).await,
+            0,
+            "a secondary chain's fill must not schedule the primary's USDC rebalancing"
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_chain_fill_schedules_rebalancing_checks() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(10000), usdc(10000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_on_chain(shares(10), Direction::Buy, Chain::Base),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(60)),
+            "the primary chain's fill applies to its own slot"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(8500)),
+            "the primary chain's fill applies its cash leg"
+        );
+        drop(inventory);
+
+        assert_eq!(
+            count_pending_equity_check_jobs(&trigger).await,
+            1,
+            "the primary chain's fill must schedule an equity rebalancing check"
+        );
+        assert_eq!(
+            count_pending_usdc_check_jobs(&trigger).await,
+            1,
+            "the primary chain's fill must schedule a USDC rebalancing check"
+        );
     }
 
     /// The RAI-1500 race, closed by ADR 0018: a pinned onchain snapshot at

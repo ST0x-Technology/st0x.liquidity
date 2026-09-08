@@ -1348,6 +1348,29 @@ impl InventoryView {
             .map(VenueBalance::inflight)
     }
 
+    /// The market-making equity available in an explicit chain's slot.
+    /// [`Self::equity_available`] resolves the trading chain, so a test
+    /// covering a secondary chain reads through here instead.
+    #[cfg(test)]
+    pub(crate) fn onchain_equity_available_at(
+        &self,
+        symbol: &Symbol,
+        chain: Chain,
+    ) -> Option<FractionalShares> {
+        self.equities
+            .get(symbol)?
+            .get_venue(Venue::MarketMaking, chain)
+            .map(VenueBalance::available)
+    }
+
+    /// The market-making USDC available in an explicit chain's slot.
+    #[cfg(test)]
+    pub(crate) fn onchain_usdc_available_at(&self, chain: Chain) -> Option<Usdc> {
+        self.usdc
+            .get_venue(Venue::MarketMaking, chain)
+            .map(VenueBalance::available)
+    }
+
     /// Returns the USDC available balance at the given venue.
     pub(crate) fn usdc_available(&self, venue: Venue) -> Option<Usdc> {
         match venue {
