@@ -378,17 +378,14 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             .block_number
             .ok_or(WrapperError::MissingBlockNumber { tx_hash })?;
 
-        let assets = receipt
-            .inner
-            .logs()
+        let logs = receipt.inner.logs();
+        let withdraw = logs
             .iter()
             .filter(|log| log.address() == wrapped_token)
-            .find_map(|log| {
-                IERC4626::Withdraw::decode_log(log.as_ref())
-                    .ok()
-                    .map(|event| event.data.assets)
-            })
+            .find_map(|log| IERC4626::Withdraw::decode_log(log.as_ref()).ok())
             .ok_or(WrapperError::MissingWithdrawEvent)?;
+        let assets = withdraw.data.assets;
+        let receiver = withdraw.data.receiver;
 
         // Read the asset as of the receipt block: that is the token the redeem
         // delivered, whatever the vault reports later.
@@ -396,6 +393,22 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             .wallet
             .call_at::<OpenChainErrorRegistry, _>(wrapped_token, IERC4626::assetCall {}, block)
             .await?;
+
+        // The vault's word is not enough: the same receipt must show that token
+        // leaving for the receiver in the withdrawn amount.
+        let delivered = logs
+            .iter()
+            .filter(|log| log.address() == token)
+            .filter_map(|log| IERC20::Transfer::decode_log(log.as_ref()).ok())
+            .any(|transfer| transfer.data.to == receiver && transfer.data.value == assets);
+        if !delivered {
+            return Err(WrapperError::MissingUnderlyingTransfer {
+                tx_hash,
+                asset: token,
+                receiver,
+                assets,
+            });
+        }
 
         Ok(UnwrapConfirmation {
             token: UnwrappedToken(token),

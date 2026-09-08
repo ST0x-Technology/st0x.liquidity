@@ -118,6 +118,19 @@ pub enum WrapperError {
     MissingDepositEvent,
     #[error("Missing Withdraw event in transaction receipt")]
     MissingWithdrawEvent,
+    /// The redeem receipt shows no transfer of the vault's `asset()` to the
+    /// withdraw receiver for the withdrawn amount, so what the unwrap
+    /// delivered cannot be proven from the receipt; refused, not inferred.
+    #[error(
+        "redeem receipt {tx_hash} shows no transfer of {assets} of {asset} \
+         to {receiver}"
+    )]
+    MissingUnderlyingTransfer {
+        tx_hash: TxHash,
+        asset: Address,
+        receiver: Address,
+        assets: U256,
+    },
     /// Preflight rejected an unwrap because the requested shares exceed the vault's
     /// `maxRedeem(owner)`. This signals inventory/balance drift: the bot believes it
     /// holds more wrapped shares than the wallet actually owns. We fail fast here
@@ -185,6 +198,7 @@ pub fn node_sync_attempts(error: &WrapperError) -> u32 {
         | WrapperError::SymbolNotConfigured(_)
         | WrapperError::MissingDepositEvent
         | WrapperError::MissingWithdrawEvent
+        | WrapperError::MissingUnderlyingTransfer { .. }
         | WrapperError::RedeemExceedsMax { .. }
         | WrapperError::VaultAssetMismatch { .. }
         | WrapperError::Contract(_)

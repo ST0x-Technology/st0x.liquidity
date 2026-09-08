@@ -2838,7 +2838,9 @@ redemption polling, and `Wrapper` methods for ERC-4626 wrapping/unwrapping.
 - If send fails after withdraw, aggregate stays in `WithdrawnFromRaindex`
   (tokens in wallet, not stranded)
 - `ConfirmUnwrap` records the token the vault reports as its `asset()` at the
-  redeem block, typed `UnwrappedToken`. Only a `Wrapper` implementation can
+  redeem block, typed `UnwrappedToken`, and requires the redeem receipt to show
+  that token transferred to the withdraw receiver for the withdrawn amount
+  (`MissingUnderlyingTransfer` otherwise). Only a `Wrapper` implementation can
   produce that type, and the command refuses (`UnwrapDeliveredUnexpectedToken`)
   when the attested token differs from the configured underlying, so config
   drift surfaces before any transfer
