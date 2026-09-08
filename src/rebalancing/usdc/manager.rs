@@ -67,13 +67,14 @@ const USD_CONVERSION_PLACEMENT_ATTEMPTS: u32 = 12;
 /// just the broadcast) means a slow pre-broadcast step can also trip the
 /// fail-closed even though no burn went out -- a deliberately conservative
 /// trade-off: an unnecessary operator reconciliation is far cheaper than a
-/// double burn, and at 120 s a non-hung allowance/fee query never reaches it.
+/// double burn. A cold Ethereum allowance approval waits for the configured
+/// confirmation depth, so a healthy submission can take nearly four minutes.
 ///
 /// MUST stay well below the job's per-attempt `transfer_attempt_timeout` (1h in
 /// prod) so this fail-closed result propagates out of the detached task while the
 /// outer per-attempt-timeout await is still active -- otherwise the outer timeout
 /// could cancel the await and redrive before the fail-closed surfaced.
-const BURN_BROADCAST_TIMEOUT: Duration = Duration::from_secs(120);
+const BURN_BROADCAST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Tuning parameters for the USDC settlement flow.
 ///
@@ -4481,6 +4482,7 @@ mod tests {
     struct MockBridge {
         submit_call_count: AtomicUsize,
         confirm_call_count: AtomicUsize,
+        submit_delay: Duration,
         // `unimplemented!()` is the default for `send_usdc_on_ethereum`, same as
         // every other unused method on this mock -- so a test that unexpectedly
         // walks into that path still panics loudly. Only
@@ -4494,8 +4496,14 @@ mod tests {
             Self {
                 submit_call_count: AtomicUsize::new(0),
                 confirm_call_count: AtomicUsize::new(0),
+                submit_delay: Duration::ZERO,
                 send_usdc_tx: None,
             }
+        }
+
+        fn with_submit_delay(mut self, submit_delay: Duration) -> Self {
+            self.submit_delay = submit_delay;
+            self
         }
 
         fn with_send_usdc_tx(mut self, tx_hash: TxHash) -> Self {
@@ -4524,6 +4532,8 @@ mod tests {
             _amount: U256,
             _recipient: Address,
         ) -> Result<TxHash, CctpError> {
+            tokio::time::sleep(self.submit_delay).await;
+
             let count = self.submit_call_count.fetch_add(1, Ordering::SeqCst);
             // Distinct, deterministic hash per call: first burn -> [1; 32],
             // second (retry) burn -> [2; 32]. The retry path issues exactly two
@@ -14630,6 +14640,67 @@ mod tests {
         assert_eq!(
             last_burn_tx, expected_second_hash,
             "last PendingBurnRecorded must carry the second-attempt hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn burn_submission_allows_observed_ethereum_approval_latency() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, 0).await;
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let vault_service = RaindexService::new(
+            wallet,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
+            recipient,
+        );
+        let mock_bridge =
+            Arc::new(MockBridge::new().with_submit_delay(Duration::from_secs(4 * 60)));
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&mock_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            recipient,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        tokio::time::pause();
+
+        let burn_tx = manager
+            .submit_and_record_burn(&id, BridgeDirection::EthereumToBase, amount_u256, recipient)
+            .await
+            .unwrap();
+
+        assert_eq!(burn_tx, TxHash::from([1u8; 32]));
+        assert!(
+            matches!(
+                cqrs.load(&id).await.unwrap().unwrap(),
+                UsdcRebalance::BridgingSubmitting {
+                    pending_burn_tx: Some(recorded_tx),
+                    ..
+                } if recorded_tx == burn_tx
+            ),
+            "a normal four-minute Ethereum submission must persist its burn hash"
         );
     }
 
