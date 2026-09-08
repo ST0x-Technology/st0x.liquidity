@@ -3536,6 +3536,141 @@ mod tests {
         );
     }
 
+    fn send_pending_event() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::SendPending {
+            pending_at: Utc::now(),
+        }
+    }
+
+    /// A `TokensUnwrapped` payload as builds before the vault attestation
+    /// wrote it: a bare address copied from config.
+    fn legacy_tokens_unwrapped_event(recorded: Address) -> EquityRedemptionEvent {
+        let mut payload = serde_json::to_value(tokens_unwrapped_event()).unwrap();
+        payload["TokensUnwrapped"]["underlying_token"] = serde_json::json!(recorded);
+        serde_json::from_value(payload).unwrap()
+    }
+
+    /// New events persist the attestation explicitly, so a replayed payload
+    /// can never be mistaken for one written before the vault check existed.
+    #[test]
+    fn tokens_unwrapped_event_persists_the_attestation_explicitly() {
+        let attested = Address::random();
+        let event = EquityRedemptionEvent::TokensUnwrapped {
+            quantity: Some(float!(50.25)),
+            underlying_token: UnwrappedProvenance::Attested {
+                attested: UnwrappedToken::unchecked(attested),
+            },
+            unwrap_tx_hash: TxHash::ZERO,
+            unwrapped_amount: U256::from(1),
+            unwrap_block: None,
+            unwrapped_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+        };
+
+        let payload = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(
+            payload["TokensUnwrapped"]["underlying_token"],
+            serde_json::json!({ "attested": attested })
+        );
+    }
+
+    #[test]
+    fn legacy_tokens_unwrapped_event_deserializes_as_unattested() {
+        let recorded = Address::random();
+
+        let EquityRedemptionEvent::TokensUnwrapped {
+            underlying_token, ..
+        } = legacy_tokens_unwrapped_event(recorded)
+        else {
+            panic!("expected TokensUnwrapped");
+        };
+
+        assert_eq!(underlying_token, UnwrappedProvenance::Legacy(recorded));
+    }
+
+    /// A redemption interrupted before the vault attestation existed carries
+    /// an address copied from config. Resuming it must re-attest through the
+    /// wrapper and refuse when the vault's asset() is not that address, even
+    /// after the config has been corrected.
+    #[tokio::test]
+    async fn send_tokens_refuses_a_legacy_underlying_the_vault_does_not_attest() {
+        let configured = Address::random();
+        let recorded = Address::random();
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: tokenizer.clone(),
+            wrapper: Arc::new(
+                MockWrapper::new()
+                    .with_tokenized_shares(configured)
+                    .attesting_unwrapped_token(configured),
+            ),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        };
+
+        let error = TestHarness::<EquityRedemption>::with(services)
+            .given(vec![
+                withdrawn_from_raindex_event(),
+                legacy_tokens_unwrapped_event(recorded),
+                send_pending_event(),
+            ])
+            .when(EquityRedemptionCommand::SendTokens)
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::LegacyUnderlyingMismatch {
+                    recorded: ref r,
+                    attested: ref a,
+                    ..
+                }) if *r == recorded && *a == configured
+            ),
+            "got: {error:?}"
+        );
+        assert_eq!(tokenizer.call_count(), 0, "nothing may be sent");
+    }
+
+    /// The same legacy record whose address the vault does attest is sent,
+    /// with the attested token rather than the recorded one.
+    #[tokio::test]
+    async fn send_tokens_reattests_a_legacy_underlying_before_sending() {
+        let configured = Address::random();
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: tokenizer.clone(),
+            wrapper: Arc::new(
+                MockWrapper::new()
+                    .with_tokenized_shares(configured)
+                    .attesting_unwrapped_token(configured),
+            ),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        };
+
+        let events = TestHarness::<EquityRedemption>::with(services)
+            .given(vec![
+                withdrawn_from_raindex_event(),
+                legacy_tokens_unwrapped_event(configured),
+                send_pending_event(),
+            ])
+            .when(EquityRedemptionCommand::SendTokens)
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            EquityRedemptionEvent::TokensSent { .. }
+        ));
+        assert_eq!(tokenizer.call_count(), 1, "exactly one send");
+    }
+
     /// `SendTokens` must persist the non-idempotent transfer hash without
     /// attempting gas accounting inside the aggregate. The transfer manager
     /// performs that accounting only after `TokensSent` is durable.
