@@ -992,19 +992,12 @@ mod tests {
 
     /// Builds a confirmed redeem receipt at block 7 whose only log is the
     /// vault's `Withdraw` event for `assets` underlying tokens.
-    fn unwrap_receipt(tx_hash: TxHash, wrapped_token: Address, assets: U256) -> TransactionReceipt {
-        let withdraw = IERC4626::Withdraw {
-            sender: Address::ZERO,
-            receiver: Address::ZERO,
-            owner: Address::ZERO,
-            assets,
-            shares: assets,
-        };
-        let log = Log {
-            inner: PrimitiveLog {
-                address: wrapped_token,
-                data: withdraw.encode_log_data(),
-            },
+    /// The wallet the redeem pays out to in the receipts below.
+    const RECEIVER: Address = Address::repeat_byte(0x77);
+
+    fn receipt_log(address: Address, data: alloy::primitives::LogData) -> Log {
+        Log {
+            inner: PrimitiveLog { address, data },
             transaction_hash: None,
             transaction_index: None,
             block_hash: None,
@@ -1012,13 +1005,40 @@ mod tests {
             block_timestamp: None,
             log_index: None,
             removed: false,
+        }
+    }
+
+    /// A confirmed redeem receipt at block 7: the vault's `Withdraw` for
+    /// `assets` to [`RECEIVER`], plus, when given, an ERC-20 `Transfer` of
+    /// `(token, value)` to the same receiver, the way a real redeem pays out.
+    fn unwrap_receipt(
+        tx_hash: TxHash,
+        wrapped_token: Address,
+        assets: U256,
+        transfer: Option<(Address, U256)>,
+    ) -> TransactionReceipt {
+        let withdraw = IERC4626::Withdraw {
+            sender: Address::ZERO,
+            receiver: RECEIVER,
+            owner: Address::ZERO,
+            assets,
+            shares: assets,
         };
+        let mut logs = vec![receipt_log(wrapped_token, withdraw.encode_log_data())];
+        if let Some((token, value)) = transfer {
+            let transfer = IERC20::Transfer {
+                from: wrapped_token,
+                to: RECEIVER,
+                value,
+            };
+            logs.push(receipt_log(token, transfer.encode_log_data()));
+        }
         let mut receipt = receipt_with_block(tx_hash, Some(7));
         receipt.inner = ReceiptEnvelope::Eip1559(ReceiptWithBloom {
             receipt: Receipt {
                 status: true.into(),
                 cumulative_gas_used: 0,
-                logs: vec![log],
+                logs,
             },
             logs_bloom: Bloom::default(),
         });
@@ -1038,8 +1058,15 @@ mod tests {
             &equity.underlying,
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let wallet = MockedWallet::new(Address::ZERO, provider)
-            .with_write_results(unwrap_receipt(tx_hash, equity.derivative, assets), tx_hash);
+        let wallet = MockedWallet::new(Address::ZERO, provider).with_write_results(
+            unwrap_receipt(
+                tx_hash,
+                equity.derivative,
+                assets,
+                Some((equity.underlying, assets)),
+            ),
+            tx_hash,
+        );
         let service = WrapperService::new(
             wallet,
             HashMap::from([(Symbol::new("AAPL").unwrap(), equity)]),
@@ -1053,6 +1080,51 @@ mod tests {
         assert_eq!(confirmation.token.address(), equity.underlying);
         assert_eq!(confirmation.assets, assets);
         assert_eq!(confirmation.block, 7);
+    }
+
+    /// The receipt must prove the redeem paid out: a `Transfer` of the vault's
+    /// `asset()` to the receiver for the withdrawn amount. Without it, or with
+    /// another token or amount, the unwrap is refused rather than inferred.
+    #[tokio::test]
+    async fn confirm_unwrap_refuses_a_receipt_that_does_not_show_the_underlying_transfer() {
+        let equity = test_equity();
+        let assets = U256::from(5_000_000_000_000_000_000_u128);
+        let other_token = Address::random();
+
+        for transfer in [
+            None,
+            Some((other_token, assets)),
+            Some((equity.underlying, assets - U256::from(1))),
+        ] {
+            let tx_hash = TxHash::random();
+            let asserter = Asserter::new();
+            asserter.push_success(&<IERC4626::assetCall as SolCall>::abi_encode_returns(
+                &equity.underlying,
+            ));
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+            let wallet = MockedWallet::new(Address::ZERO, provider).with_write_results(
+                unwrap_receipt(tx_hash, equity.derivative, assets, transfer),
+                tx_hash,
+            );
+            let service = WrapperService::new(
+                wallet,
+                HashMap::from([(Symbol::new("AAPL").unwrap(), equity)]),
+            );
+
+            let error = service
+                .confirm_unwrap(equity.derivative, tx_hash)
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(
+                    error,
+                    WrapperError::MissingUnderlyingTransfer { asset, receiver, assets: amount, .. }
+                        if asset == equity.underlying && receiver == RECEIVER && amount == assets
+                ),
+                "expected MissingUnderlyingTransfer for {transfer:?}, got: {error:?}"
+            );
+        }
     }
 
     /// A transport serving the vault's `asset()` by block tag: `pinned` for an
@@ -1113,8 +1185,15 @@ mod tests {
             latest: Address::random(),
         };
         let provider = ProviderBuilder::new().connect_client(RpcClient::new(transport, true));
-        let wallet = MockedWallet::new(Address::ZERO, provider)
-            .with_write_results(unwrap_receipt(tx_hash, equity.derivative, assets), tx_hash);
+        let wallet = MockedWallet::new(Address::ZERO, provider).with_write_results(
+            unwrap_receipt(
+                tx_hash,
+                equity.derivative,
+                assets,
+                Some((equity.underlying, assets)),
+            ),
+            tx_hash,
+        );
         let service = WrapperService::new(
             wallet,
             HashMap::from([(Symbol::new("AAPL").unwrap(), equity)]),
