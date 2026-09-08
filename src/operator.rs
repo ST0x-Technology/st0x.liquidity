@@ -4,34 +4,112 @@
 //! domain operations and types that application needs while keeping the
 //! implementation modules themselves private.
 
+use chrono::{DateTime, NaiveDate, Utc};
+use st0x_execution::Symbol;
+
+use crate::offchain::order::OffchainOrderId;
+
+/// A caller-facing reason an operator recovery command refused to apply, each
+/// variant carrying the typed context its message renders.
+#[derive(Debug, thiserror::Error)]
+pub enum RejectionReason {
+    #[error("--reason must not be blank; it is persisted as the audit record")]
+    BlankReason,
+    #[error("--source must not be blank; it is persisted as audit provenance")]
+    BlankSource,
+    #[error(
+        "--observed-at must identify the regular-session close before the {day} 00:05 ET \
+         capture boundary ({boundary})"
+    )]
+    ObservedAtAfterCaptureBoundary {
+        day: NaiveDate,
+        boundary: DateTime<Utc>,
+    },
+    #[error(
+        "{symbol} has no [chains.<name>.trading.assets.equities] entry, so its {unconverted} \
+         wrapped-location row(s) on {day} hold vault shares, not underlying shares. A mark \
+         would price them as underlying and misstate the day's capital. Reconcile the holding \
+         instead, or restore the config entry so the capture can resolve a vault ratio."
+    )]
+    UnconvertedWrappedEquityRows {
+        symbol: Symbol,
+        unconverted: i64,
+        day: NaiveDate,
+    },
+    #[error(
+        "position {symbol} has pending offchain order {pending}; run position release-hedge \
+         before setting position"
+    )]
+    PositionHasPendingOrder {
+        symbol: Symbol,
+        pending: OffchainOrderId,
+    },
+    #[error("position {symbol} not found")]
+    PositionNotFound { symbol: Symbol },
+    #[error(
+        "OffchainOrder {offchain_order_id} belongs to {owner}, not {symbol} -- refusing to \
+         repair"
+    )]
+    OffchainOrderBelongsToOtherSymbol {
+        offchain_order_id: OffchainOrderId,
+        owner: Symbol,
+        symbol: Symbol,
+    },
+    #[error(
+        "OffchainOrder {offchain_order_id} is PartiallyFilled: shares already executed \
+         offchain, and failing it would erase that hedge from the position. Reconcile the \
+         partial fill first."
+    )]
+    OffchainOrderPartiallyFilled { offchain_order_id: OffchainOrderId },
+    #[error(
+        "OffchainOrder {offchain_order_id} is Filled: the hedge executed. This command cannot \
+         repair a filled order -- reconcile the fill into the position instead of failing it."
+    )]
+    OffchainOrderFilled { offchain_order_id: OffchainOrderId },
+    #[error(
+        "OffchainOrder {offchain_order_id} is in a cancellation lifecycle state: this command \
+         fails stuck Pending/Submitted orders, not cancellations -- refusing. Confirm the \
+         intended recovery path for cancellation states."
+    )]
+    OffchainOrderInCancellationLifecycle { offchain_order_id: OffchainOrderId },
+    #[error("position {symbol} pending offchain order is {pending}, not {offchain_order_id}")]
+    PendingPointerMismatch {
+        symbol: Symbol,
+        pending: OffchainOrderId,
+        offchain_order_id: OffchainOrderId,
+    },
+    #[error(
+        "position {symbol} has no pending offchain order and no OffchainOrder aggregate \
+         {offchain_order_id} exists -- nothing to repair"
+    )]
+    NothingToRepair {
+        symbol: Symbol,
+        offchain_order_id: OffchainOrderId,
+    },
+    #[error(
+        "OffchainOrder {offchain_order_id} has executed shares -- refusing to erase the \
+         executed hedge"
+    )]
+    OffchainOrderHasExecutedShares { offchain_order_id: OffchainOrderId },
+    #[error(
+        "OffchainOrder {offchain_order_id} acquired executed shares concurrently; refusing to \
+         erase the executed hedge -- reconcile the fill into the position."
+    )]
+    AcquiredExecutedSharesConcurrently { offchain_order_id: OffchainOrderId },
+}
+
 /// The failure of a shared operator recovery command, letting a caller-facing
 /// rejection and an operational failure map to different results.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum OperatorError {
     /// The request cannot be applied in the aggregate's current state, or an
     /// input was invalid; the caller surfaces this to the operator.
-    Rejected(String),
+    #[error(transparent)]
+    Rejected(#[from] RejectionReason),
     /// An infrastructure failure while loading or sending a command.
+    #[error("{0:#}")]
     Operational(anyhow::Error),
 }
-
-impl OperatorError {
-    /// Builds a caller-facing rejection from a message.
-    pub fn rejected(message: impl Into<String>) -> Self {
-        Self::Rejected(message.into())
-    }
-}
-
-impl std::fmt::Display for OperatorError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Rejected(message) => formatter.write_str(message),
-            Self::Operational(error) => write!(formatter, "{error:#}"),
-        }
-    }
-}
-
-impl std::error::Error for OperatorError {}
 
 impl From<anyhow::Error> for OperatorError {
     fn from(error: anyhow::Error) -> Self {
@@ -567,7 +645,7 @@ pub mod portfolio_snapshot {
 
     use crate::conductor::configured_equity_symbols;
     use crate::inventory::PortfolioLocation;
-    use crate::operator::OperatorError;
+    use crate::operator::{OperatorError, RejectionReason};
 
     pub use crate::portfolio_snapshot::{
         PortfolioBalanceRowWithMark, PortfolioSnapshot, PortfolioSnapshotCommand,
@@ -621,14 +699,10 @@ pub mod portfolio_snapshot {
             ref reason,
         } = correction;
         if source.trim().is_empty() {
-            return Err(OperatorError::rejected(
-                "--source must not be blank; it is persisted as audit provenance",
-            ));
+            return Err(RejectionReason::BlankSource.into());
         }
         if reason.trim().is_empty() {
-            return Err(OperatorError::rejected(
-                "--reason must not be blank; it is persisted as the audit record",
-            ));
+            return Err(RejectionReason::BlankReason.into());
         }
 
         let capture_boundary = New_York
@@ -640,10 +714,11 @@ pub mod portfolio_snapshot {
             .context("ambiguous ET capture boundary")?
             .with_timezone(&Utc);
         if observed_at >= capture_boundary {
-            return Err(OperatorError::rejected(format!(
-                "--observed-at must identify the regular-session close before the {day} 00:05 ET \
-                 capture boundary ({capture_boundary})"
-            )));
+            return Err(RejectionReason::ObservedAtAfterCaptureBoundary {
+                day,
+                boundary: capture_boundary,
+            }
+            .into());
         }
 
         // `EquityMarkSet` prices EVERY row of the symbol (the projection's UPDATE
@@ -669,13 +744,12 @@ pub mod portfolio_snapshot {
             .context("failed to check for unconverted wrapped-equity rows")?;
 
             if unconverted > 0 {
-                return Err(OperatorError::rejected(format!(
-                    "{symbol} has no [chains.<name>.trading.assets.equities] entry, so its {unconverted} \
-                     wrapped-location row(s) on {day} hold vault shares, not underlying shares. \
-                     A mark would price them as underlying and misstate the day's capital. \
-                     Reconcile the holding instead, or restore the config entry so the capture \
-                     can resolve a vault ratio."
-                )));
+                return Err(RejectionReason::UnconvertedWrappedEquityRows {
+                    symbol: symbol.clone(),
+                    unconverted,
+                    day,
+                }
+                .into());
             }
         }
 
@@ -742,7 +816,7 @@ pub mod position {
     use st0x_execution::{FractionalShares, Symbol};
 
     use crate::offchain::order::{OffchainOrder, OffchainOrderId};
-    use crate::operator::OperatorError;
+    use crate::operator::{OperatorError, RejectionReason};
 
     pub use crate::position::{AnchorDisposition, Position, PositionCommand};
 
@@ -804,9 +878,7 @@ pub mod position {
         price_usdc: Option<Float>,
     ) -> Result<SetPositionOutcome, OperatorError> {
         if reason.trim().is_empty() {
-            return Err(OperatorError::rejected(
-                "--reason must not be blank; it is persisted as the audit record",
-            ));
+            return Err(RejectionReason::BlankReason.into());
         }
 
         let (position, projection) = StoreBuilder::<Position>::new(pool.clone())
@@ -822,10 +894,11 @@ pub mod position {
         if let Some(view) = &current
             && let Some(pending) = view.pending_offchain_order_id.as_ref()
         {
-            return Err(OperatorError::rejected(format!(
-                "position {symbol} has pending offchain order {pending}; \
-                 run position release-hedge before setting position"
-            )));
+            return Err(RejectionReason::PositionHasPendingOrder {
+                symbol: symbol.clone(),
+                pending: *pending,
+            }
+            .into());
         }
 
         let previous_net = current
@@ -864,9 +937,7 @@ pub mod position {
         reason: &str,
     ) -> Result<ReleaseHedgeOutcome, OperatorError> {
         if reason.trim().is_empty() {
-            return Err(OperatorError::rejected(
-                "--reason must not be blank; it is persisted as the audit record",
-            ));
+            return Err(RejectionReason::BlankReason.into());
         }
 
         let (position, projection) = StoreBuilder::<Position>::new(pool.clone())
@@ -879,9 +950,10 @@ pub mod position {
             .await
             .context("failed to load position view")?
         else {
-            return Err(OperatorError::rejected(format!(
-                "position {symbol} not found"
-            )));
+            return Err(RejectionReason::PositionNotFound {
+                symbol: symbol.clone(),
+            }
+            .into());
         };
 
         let order = load_entity::<OffchainOrder>(pool, &offchain_order_id)
@@ -890,33 +962,28 @@ pub mod position {
 
         if let Some(existing) = &order {
             if existing.symbol() != symbol {
-                return Err(OperatorError::rejected(format!(
-                    "OffchainOrder {offchain_order_id} belongs to {}, not {symbol} -- refusing \
-                     to repair",
-                    existing.symbol()
-                )));
+                return Err(RejectionReason::OffchainOrderBelongsToOtherSymbol {
+                    offchain_order_id,
+                    owner: existing.symbol().clone(),
+                    symbol: symbol.clone(),
+                }
+                .into());
             }
             match existing {
                 OffchainOrder::PartiallyFilled { .. } => {
-                    return Err(OperatorError::rejected(format!(
-                        "OffchainOrder {offchain_order_id} is PartiallyFilled: shares already \
-                         executed offchain, and failing it would erase that hedge from the \
-                         position. Reconcile the partial fill first."
-                    )));
+                    return Err(RejectionReason::OffchainOrderPartiallyFilled {
+                        offchain_order_id,
+                    }
+                    .into());
                 }
                 OffchainOrder::Filled { .. } => {
-                    return Err(OperatorError::rejected(format!(
-                        "OffchainOrder {offchain_order_id} is Filled: the hedge executed. This \
-                         command cannot repair a filled order -- reconcile the fill into the \
-                         position instead of failing it."
-                    )));
+                    return Err(RejectionReason::OffchainOrderFilled { offchain_order_id }.into());
                 }
                 OffchainOrder::Cancelling { .. } | OffchainOrder::Cancelled { .. } => {
-                    return Err(OperatorError::rejected(format!(
-                        "OffchainOrder {offchain_order_id} is in a cancellation lifecycle state: \
-                         this command fails stuck Pending/Submitted orders, not cancellations -- \
-                         refusing. Confirm the intended recovery path for cancellation states."
-                    )));
+                    return Err(RejectionReason::OffchainOrderInCancellationLifecycle {
+                        offchain_order_id,
+                    }
+                    .into());
                 }
                 OffchainOrder::Pending { .. }
                 | OffchainOrder::Submitted { .. }
@@ -927,16 +994,20 @@ pub mod position {
         match view.pending_offchain_order_id {
             Some(pending) if pending == offchain_order_id => {}
             Some(pending) => {
-                return Err(OperatorError::rejected(format!(
-                    "position {symbol} pending offchain order is {pending}, not {offchain_order_id}"
-                )));
+                return Err(RejectionReason::PendingPointerMismatch {
+                    symbol: symbol.clone(),
+                    pending,
+                    offchain_order_id,
+                }
+                .into());
             }
             None => {
                 if order.is_none() {
-                    return Err(OperatorError::rejected(format!(
-                        "position {symbol} has no pending offchain order and no OffchainOrder \
-                         aggregate {offchain_order_id} exists -- nothing to repair"
-                    )));
+                    return Err(RejectionReason::NothingToRepair {
+                        symbol: symbol.clone(),
+                        offchain_order_id,
+                    }
+                    .into());
                 }
 
                 let offchain_order =
@@ -983,7 +1054,7 @@ pub mod position {
     mod detail {
         use std::sync::Arc;
 
-        use crate::operator::OperatorError;
+        use crate::operator::{OperatorError, RejectionReason};
         use anyhow::Context;
         use async_trait::async_trait;
         use sqlx::SqlitePool;
@@ -1101,17 +1172,16 @@ pub mod position {
                 // refuse here too so the invariant cannot rot if a new caller skips
                 // that check.
                 Filled { .. } | PartiallyFilled { .. } => {
-                    return Err(OperatorError::rejected(format!(
-                        "OffchainOrder {offchain_order_id} has executed shares (state {order:?}) -- \
-                     refusing to erase the executed hedge"
-                    )));
+                    return Err(RejectionReason::OffchainOrderHasExecutedShares {
+                        offchain_order_id,
+                    }
+                    .into());
                 }
                 Cancelling { .. } | Cancelled { .. } => {
-                    return Err(OperatorError::rejected(format!(
-                        "OffchainOrder {offchain_order_id} is in a cancellation lifecycle state \
-                     (state {order:?}): this command fails Pending/Submitted orders, not \
-                     cancellations -- refusing. Confirm the intended recovery path."
-                    )));
+                    return Err(RejectionReason::OffchainOrderInCancellationLifecycle {
+                        offchain_order_id,
+                    }
+                    .into());
                 }
                 Pending { .. } | Submitted { .. } => {}
             }
@@ -1138,11 +1208,10 @@ pub mod position {
                 .context("failed to re-load offchain order before MarkFailed")?;
             match classify_reloaded_state(current.as_ref()) {
                 ReloadOutcome::Escalate => {
-                    return Err(OperatorError::rejected(format!(
-                        "OffchainOrder {offchain_order_id} acquired executed shares concurrently; \
-                     refusing to fail it so the executed hedge is not erased -- reconcile the \
-                     position against the fill."
-                    )));
+                    return Err(RejectionReason::AcquiredExecutedSharesConcurrently {
+                        offchain_order_id,
+                    }
+                    .into());
                 }
                 ReloadOutcome::BenignTerminal => {
                     return Ok(OffchainOrderOutcome::TerminalConcurrently);
@@ -1186,11 +1255,12 @@ pub mod position {
                         // Executed shares always escalate: PartiallyFilled cannot
                         // produce AlreadyCompleted today, but if it ever does, the
                         // same pointer-cleared-without-accounting hazard applies.
-                        ReloadOutcome::Escalate => Err(OperatorError::rejected(format!(
-                            "OffchainOrder {offchain_order_id} acquired executed shares \
-                             concurrently while failing it; the executed hedge must be \
-                             reconciled into the position."
-                        ))),
+                        ReloadOutcome::Escalate => {
+                            Err(RejectionReason::AcquiredExecutedSharesConcurrently {
+                                offchain_order_id,
+                            }
+                            .into())
+                        }
                         ReloadOutcome::BenignTerminal => {
                             Ok(OffchainOrderOutcome::TerminalConcurrently)
                         }
@@ -1239,6 +1309,7 @@ pub mod position {
             CounterTradeOrderKind, OffchainOrder, OffchainOrderCommand, OffchainOrderId,
             noop_order_placer,
         };
+        use crate::operator::{OperatorError, RejectionReason};
         use crate::test_utils::{setup_test_db, try_positive_shares};
 
         fn positive_shares(value: &str) -> Positive<FractionalShares> {
@@ -1314,9 +1385,12 @@ pub mod position {
                 .await
                 .unwrap_err();
             assert!(
-                error
-                    .to_string()
-                    .contains("acquired executed shares concurrently"),
+                matches!(
+                    error,
+                    OperatorError::Rejected(
+                        RejectionReason::AcquiredExecutedSharesConcurrently { .. }
+                    )
+                ),
                 "expected the concurrent-execution refusal; got: {error}"
             );
         }

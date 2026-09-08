@@ -2403,9 +2403,11 @@ fn ops_precondition_error(error: impl std::fmt::Display) -> (StatusCode, Json<Er
 /// the full error chain.
 fn ops_operator_error(error: OperatorError) -> (StatusCode, Json<ErrorResponse>) {
     match error {
-        OperatorError::Rejected(message) => (
+        OperatorError::Rejected(reason) => (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: message }),
+            Json(ErrorResponse {
+                error: reason.to_string(),
+            }),
         ),
         OperatorError::Operational(error) => ops_store_error(format!("{error:#}")),
     }
@@ -2860,6 +2862,7 @@ mod tests {
     use crate::onchain_trade::{
         InventoryVenue, OnChainTrade, OnChainTradeCommand, OnChainTradeId, OnChainTradeSource,
     };
+    use crate::operator::RejectionReason;
     use crate::performance::equity_timing::EquityTimingProjection;
     use crate::performance::reliability::LifecycleFailureProjection;
     use crate::portfolio_snapshot::{
@@ -6831,7 +6834,7 @@ mod tests {
     #[test]
     fn operator_error_maps_rejection_to_400_and_operational_to_500() {
         assert_eq!(
-            ops_operator_error(OperatorError::rejected("bad state")).0,
+            ops_operator_error(OperatorError::Rejected(RejectionReason::BlankReason)).0,
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
