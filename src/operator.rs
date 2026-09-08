@@ -949,29 +949,27 @@ pub mod position {
             }
         }
 
+        // Aggregate-first: drive the OffchainOrder to its Failed terminal before
+        // clearing the position pointer. If this step escalates or fails, the
+        // pointer is left intact so the pending-order safeguard still holds and a
+        // concurrent fill is accounted through the normal flow. Only once the
+        // order is confirmed terminal is the pointer cleared so hedging can retry.
+        let offchain_order =
+            detail::fail_offchain_order_aggregate(pool, order, offchain_order_id, reason).await?;
+
         position
             .send(
                 symbol,
                 PositionCommand::FailOffChainOrder {
                     offchain_order_id,
                     error: reason.to_string(),
-                    // The repaired order is typically still live at the broker
-                    // (this force-fails stuck Pending/Submitted orders, not
-                    // confirmed broker-terminal ones); releasing here would
-                    // re-arm the double-hedge the anchor exists to prevent.
+                    // The order is confirmed terminal above; Preserve keeps the
+                    // anchor so clearing the pointer cannot re-arm the double hedge.
                     anchor: AnchorDisposition::Preserve,
                 },
             )
             .await
             .context("failed to fail pending offchain order")?;
-
-        // Pointer-first: the pending pointer is cleared above. Now drive the
-        // OffchainOrder aggregate itself to its Failed terminal so it does not
-        // linger as a live-looking order in the view. The two aggregates are not
-        // transactionally atomic (separate CQRS boundaries); this second step is
-        // idempotent -- an already-terminal or absent order is left as-is.
-        let offchain_order =
-            detail::fail_offchain_order_aggregate(pool, order, offchain_order_id, reason).await?;
 
         Ok(ReleaseHedgeOutcome {
             pointer: PointerOutcome::ClearedNow,
@@ -1142,8 +1140,8 @@ pub mod position {
                 ReloadOutcome::Escalate => {
                     return Err(OperatorError::rejected(format!(
                         "OffchainOrder {offchain_order_id} acquired executed shares concurrently; \
-                     the position pointer may already be cleared -- reconcile the position \
-                     manually instead of failing the order"
+                     refusing to fail it so the executed hedge is not erased -- reconcile the \
+                     position against the fill."
                     )));
                 }
                 ReloadOutcome::BenignTerminal => {
@@ -1190,8 +1188,8 @@ pub mod position {
                         // same pointer-cleared-without-accounting hazard applies.
                         ReloadOutcome::Escalate => Err(OperatorError::rejected(format!(
                             "OffchainOrder {offchain_order_id} acquired executed shares \
-                             concurrently: the position pointer was cleared without accounting \
-                             the fill -- reconcile the position manually"
+                             concurrently while failing it; the executed hedge must be \
+                             reconciled into the position."
                         ))),
                         ReloadOutcome::BenignTerminal => {
                             Ok(OffchainOrderOutcome::TerminalConcurrently)
