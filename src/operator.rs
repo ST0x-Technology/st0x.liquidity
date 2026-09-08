@@ -722,7 +722,7 @@ pub mod portfolio_snapshot {
         .await
         .context("failed to verify historical portfolio snapshot mark")?;
         if row_count != expected_row_count || corrected_count != expected_row_count {
-            return Err(OperatorError::rejected(format!(
+            return Err(OperatorError::Operational(anyhow::anyhow!(
                 "historical mark event committed, but the portfolio-snapshot read model did not \
                  update every {day} {symbol} row; run `view rebuild --aggregate \
                  portfolio-snapshot --all` before retrying"
