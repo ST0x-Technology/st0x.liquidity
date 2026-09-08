@@ -2769,6 +2769,37 @@ fn build_rebalancing_vault_lookup(
     (registry_id, lookup)
 }
 
+/// Why the rebalancing infrastructure refuses to start on a primary chain.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EquityTransferPathsUnsupported {
+    /// The equity gas-readiness leg (`GasReadiness::from_wallets`) and the
+    /// receipt-cost jobs (`RecordBotGasReceiptCost::for_base_tx`) read Base.
+    /// On another primary they would check a wallet the transfers never use
+    /// and send the transfer hashes to the wrong RPC.
+    #[error(
+        "[chains.{primary}] is the primary chain, but equity transfers still check gas and \
+         record receipt costs on Base; a non-Base primary is refused until those paths take \
+         the chain"
+    )]
+    NonBasePrimary { primary: Chain },
+}
+
+/// The equity mint and redemption paths are bound to Base in two places
+/// that the per-chain service map does not reach yet; refuse any other
+/// primary instead of letting those checks pass against the wrong wallet.
+fn confirm_equity_transfer_paths_support(
+    primary: Chain,
+) -> Result<(), EquityTransferPathsUnsupported> {
+    match primary {
+        Chain::Base => Ok(()),
+        Chain::Ethereum | Chain::HyperEvm => {
+            Err(EquityTransferPathsUnsupported::NonBasePrimary { primary })
+        }
+    }
+}
+
+/// The equity leg is Base's wallet by construction; `confirm_equity_transfer_paths_support`
+/// guards that assumption at startup.
 fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
     wallets: &ChainWallets<Signer>,
     ctx: &Ctx,
@@ -2828,6 +2859,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         };
 
         let primary_chain = deps.ctx.chains.primary().chain;
+        confirm_equity_transfer_paths_support(primary_chain)?;
         let primary = tokenizations.get(&primary_chain).with_context(|| {
             format!("no tokenization services were built for the primary chain {primary_chain}")
         })?;
