@@ -3185,6 +3185,40 @@ mod tests {
         );
     }
 
+    /// The mint and redemption aggregates record no chain, and the server's
+    /// startup recovery resumes every interrupted transfer with the primary
+    /// chain's services. A transfer written for another chain would be
+    /// continued on the wrong network after a restart, so it is refused
+    /// before anything reaches the shared database.
+    #[tokio::test]
+    async fn transfer_equity_refuses_a_non_primary_network_until_records_carry_their_chain() {
+        let ctx = create_alpaca_ctx_watching_ethereum();
+        let pool = setup_test_db().await;
+
+        let mut stdout = Vec::new();
+        let error = transfer_equity_command(
+            &mut stdout,
+            TransferEquity {
+                direction: TransferDirection::ToRaindex,
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(1)),
+                issuer_request_id: None,
+                redemption_wallet: None,
+                network: TokenizationNetwork::Ethereum,
+            },
+            &ctx,
+            &pool,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("ethereum") && error.contains("primary") && error.contains("base"),
+            "expected the refusal to name the chain and the primary, got: {error}"
+        );
+    }
+
     /// The gas check runs on the selected chain's wallet against that chain's
     /// `[alerts.low_balance_thresholds]` entry; a chain without one is refused
     /// by name instead of skipping the check.
