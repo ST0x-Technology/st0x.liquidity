@@ -104,6 +104,11 @@
           # Still on the rainlang.xyz tailnet; migrates to st0x.io last, after
           # staging is validated on tail6094d7.ts.net.
           tailscaleMagicDnsName = "st0x-liquidity-nixos.taile5cf8a.ts.net";
+          dbSnapshotGcpIap = {
+            instance = "t0-liquidity";
+            project = "t0-liquidity";
+            zone = "europe-west3-b";
+          };
         };
         staging = {
           nodeName = "st0x-liquidity-staging";
@@ -112,6 +117,11 @@
           # Migrated to the st0x.io tailnet (tail6094d7.ts.net) so telemetry can
           # reach the st0x-observability GCP VM.
           tailscaleMagicDnsName = "st0x-liquidity-staging.tail6094d7.ts.net";
+          dbSnapshotGcpIap = {
+            instance = "t0-liquidity-staging";
+            project = "t0-liquidity-staging";
+            zone = "europe-west3-b";
+          };
         };
       };
       envNames = builtins.attrNames environments;
@@ -197,7 +207,7 @@
             ragenix
             system
             ;
-          environments = envNames;
+          environmentConfigs = environments;
         };
         rekeySecrets = ''ragenix --rules ./secret/secrets.nix -i "$identity" -r'';
 
@@ -610,6 +620,93 @@
           pkgs.runCommand "cli-activation-skips-config-validation-test" { } ''
             touch $out
           '';
+
+        checks.db-snapshot-transport = pkgs.runCommand "db-snapshot-transport-test" { } ''
+          grep -Eq -- "gcloud compute ssh '?t0-liquidity'?" \
+            ${infraPkgs.packages.prodDbSnapshot}/bin/prod-db-snapshot
+          ! grep -Fq -- "t0-liquidity-staging" \
+            ${infraPkgs.packages.prodDbSnapshot}/bin/prod-db-snapshot
+          grep -Eq -- "--project='?t0-liquidity'?" \
+            ${infraPkgs.packages.prodDbSnapshot}/bin/prod-db-snapshot
+          grep -Eq -- "--zone='?europe-west3-b'?" \
+            ${infraPkgs.packages.prodDbSnapshot}/bin/prod-db-snapshot
+          grep -Fq -- "--tunnel-through-iap" \
+            ${infraPkgs.packages.prodDbSnapshot}/bin/prod-db-snapshot
+          grep -Fq -- "VACUUM INTO" \
+            ${infraPkgs.packages.prodDbSnapshot}/bin/prod-db-snapshot
+          grep -Fq -- "gcloud compute scp" \
+            ${infraPkgs.packages.prodDbSnapshot}/bin/prod-db-snapshot
+          grep -Eq -- "'?t0-liquidity:'?\"\\\$remote_snapshot\"" \
+            ${infraPkgs.packages.prodDbSnapshot}/bin/prod-db-snapshot
+          test "$(grep -cF -- "--quiet" ${infraPkgs.packages.prodDbSnapshot}/bin/prod-db-snapshot)" -eq 2
+          grep -Eq -- "gcloud compute ssh '?t0-liquidity-staging'?" \
+            ${infraPkgs.packages.stagingDbSnapshot}/bin/staging-db-snapshot
+          grep -Eq -- "--project='?t0-liquidity-staging'?" \
+            ${infraPkgs.packages.stagingDbSnapshot}/bin/staging-db-snapshot
+          grep -Eq -- "--zone='?europe-west3-b'?" \
+            ${infraPkgs.packages.stagingDbSnapshot}/bin/staging-db-snapshot
+          grep -Fq -- "--tunnel-through-iap" \
+            ${infraPkgs.packages.stagingDbSnapshot}/bin/staging-db-snapshot
+          grep -Fq -- "VACUUM INTO" \
+            ${infraPkgs.packages.stagingDbSnapshot}/bin/staging-db-snapshot
+          grep -Fq -- "gcloud compute scp" \
+            ${infraPkgs.packages.stagingDbSnapshot}/bin/staging-db-snapshot
+          grep -Eq -- "'?t0-liquidity-staging:'?\"\\\$remote_snapshot\"" \
+            ${infraPkgs.packages.stagingDbSnapshot}/bin/staging-db-snapshot
+          test "$(grep -cF -- "--quiet" ${infraPkgs.packages.stagingDbSnapshot}/bin/staging-db-snapshot)" -eq 2
+
+          remote_root="$TMPDIR/remote"
+          result_root="$TMPDIR/results"
+          mkdir -p "$remote_root" "$result_root"
+
+          ssh_remote() {
+            if [ "$1" = "mktemp -d /tmp/st0x-hedge-snapshot.XXXXXX" ]; then
+              mktemp -d "$remote_root/st0x-hedge-snapshot.XXXXXX"
+            elif [[ "$1" =~ ^rm\ -f\ \'([^\']+)\'$ ]]; then
+              rm -f "''${BASH_REMATCH[1]}"
+            elif [[ "$1" =~ ^rmdir\ \'([^\']+)\'$ ]]; then
+              rmdir "''${BASH_REMATCH[1]}"
+            else
+              echo "unexpected remote command: $1" >&2
+              return 1
+            fi
+          }
+
+          ${infraPkgs.dbSnapshotRemoteLifecycle}
+
+          exercise_snapshot() {
+            local invocation="$1"
+            local remote_snapshot
+            remote_snapshot="$(allocate_remote_snapshot)"
+            touch "$remote_snapshot"
+            printf '%s\n' "$remote_snapshot" > "$result_root/$invocation"
+            local waited=0
+            while [ ! -e "$result_root/1" ] || [ ! -e "$result_root/2" ]; do
+              sleep 0.01
+              waited=$((waited + 1))
+              if [ "$waited" -gt 1000 ]; then
+                echo "barrier timed out waiting for both snapshot allocations" >&2
+                return 1
+              fi
+            done
+            cleanup_remote_snapshot "$remote_snapshot"
+          }
+
+          exercise_snapshot 1 &
+          first_pid=$!
+          exercise_snapshot 2 &
+          second_pid=$!
+          wait "$first_pid" "$second_pid"
+
+          first_snapshot="$(cat "$result_root/1")"
+          second_snapshot="$(cat "$result_root/2")"
+          test "$first_snapshot" != "$second_snapshot"
+          test ! -e "$first_snapshot"
+          test ! -e "$second_snapshot"
+          test ! -d "$(dirname "$first_snapshot")"
+          test ! -d "$(dirname "$second_snapshot")"
+          touch $out
+        '';
 
         formatter = pkgs.nixfmt-rfc-style;
 
