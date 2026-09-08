@@ -68,6 +68,22 @@ pub(super) struct TransferEquity {
     pub(super) network: TokenizationNetwork,
 }
 
+/// The command an operator pastes to resume an interrupted mint. It names the
+/// network because the mint aggregate records no chain: without the flag the
+/// resume would run on the CLI's default, Base.
+fn mint_resume_command(
+    symbol: &Symbol,
+    quantity: &FractionalShares,
+    network: TokenizationNetwork,
+    issuer_request_id: &IssuerRequestId,
+) -> String {
+    format!(
+        "transfer-equity --direction to-raindex --symbol {symbol} --quantity {quantity} \
+         --issuer-request-id {issuer_request_id} --network {}",
+        Chain::from(network).as_str()
+    )
+}
+
 struct EquityTransferCliServices {
     transfer: CrossVenueEquityTransfer,
     wallet: Address,
@@ -360,9 +376,8 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
                 writeln!(stdout, "Equity mint issuer_request_id: {issuer_request_id}")?;
                 writeln!(
                     stdout,
-                    "   If this is interrupted, resume with:\n   \
-                     transfer-equity --direction to-raindex --symbol {symbol} \
-                     --quantity {quantity} --issuer-request-id {issuer_request_id}"
+                    "   If this is interrupted, resume with:\n   {}",
+                    mint_resume_command(&symbol, &quantity, network, &issuer_request_id)
                 )?;
                 stdout.flush()?;
             }
