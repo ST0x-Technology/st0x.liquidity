@@ -277,6 +277,34 @@ commands above instead. The network a transfer started on has to be named only
 for `transfer-equity --issuer-request-id`, which re-runs the transfer command
 itself; the `transfer` recovery verbs carry no network at all.
 
+### Orchestrator Rollout per Chain
+
+Issuance keys an asset's `vault_mode` by symbol, so cutting an asset over to
+orchestrator mode applies on every chain it is listed on, and issuance refuses
+to start with an orchestrator-mode asset while any of its configured chains
+lacks an `[orchestrator.addresses]` entry. Complete the checklist for every
+chain the asset is listed on before the cutover:
+
+- [ ] Deploy `ST0xOrchestrator` on the chain.
+- [ ] Add its address under `[orchestrator.addresses].<chain>` in the issuance
+      bot's config and deploy issuance.
+- [ ] Add the same address under `[orchestrator.addresses].<chain>` in this
+      bot's config (`validate-config` rejects an unknown chain key or a zero
+      address) and deploy; the startup log must not warn about a watched chain
+      without an entry.
+- [ ] Extend the Turnkey signing policy to `MintAuth` typed data with that
+      chain's id and orchestrator as the verifying contract (SPEC, "Mint
+      Recipient Authorization").
+- [ ] Only now flip the asset to orchestrator mode at issuance.
+
+Until the third step is deployed, every asset listed on the chain stays
+vault-direct. If the order slips, this bot catches it in rebalancing mode at
+startup: the tokenization preflight refuses, naming the chain and symbol, when
+issuance reports a trading- or rebalancing-enabled asset as orchestrator-mode
+while the chain has no entry. Issuance being unreachable at startup only warns
+(the per-mint mode read fails closed on its own); an orchestrator-mode mint
+reaching the signing step without its chain's entry fails there.
+
 ## Alpaca Crypto Wallet Management
 
 ### USDC Deposits and Withdrawals
