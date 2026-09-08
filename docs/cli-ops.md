@@ -11,9 +11,12 @@ stox <command> [options]
 Use `stox --help` to list all commands and `stox <command> --help` for details
 on any specific command.
 
-Every command that submits an onchain operation takes `--network` (`base`,
-`ethereum`, `hyperevm`; default `base`) and runs on that chain's signing wallet.
-Two contracts apply, by command:
+Every command that itself submits an onchain operation takes `--network`
+(`base`, `ethereum`, `hyperevm`; default `base`) and runs on that chain's
+signing wallet. The `transfer` recovery verbs (`recheck`, `resume`, `reconcile`,
+`fail`) take no `--network`: they act on the bot's local records or hand the
+work to the running bot, which runs on its own configured chain. Two contracts
+apply to the network-aware commands:
 
 - Orderbook-backed commands (`vault-deposit`, `vault-withdraw`,
   `vault-withdraw-usdc`, `reset-allowance`, `transfer-equity`, `donate-equity`,
