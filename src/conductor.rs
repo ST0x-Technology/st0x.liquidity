@@ -2128,9 +2128,9 @@ where
             })? {
             CutoffProbe::Supported | CutoffProbe::NotYetAvailable => {}
         }
-    }
 
-    let trading_chain = ctx.chains.primary();
+        confirm_configured_asset_responds(chain_provider, watched).await?;
+    }
 
     confirm_transport_chain_ids(ctx).await?;
 
@@ -2141,22 +2141,24 @@ where
         .context("broker API round-trip failed at startup")?;
     info!(target: "startup", market_open, "Confirmed the broker API answers");
 
-    confirm_configured_asset_responds(provider, trading_chain).await
+    Ok(())
 }
 
 /// Startup read-path canary: one configured equity's token contract must
-/// answer a `decimals()` view call on the trading chain.
+/// answer a `decimals()` view call on the chain it is configured for.
 ///
 /// Proves the configured address is a live contract on the endpoint the
 /// registry entry names -- config, RPC transport, and ABI decoding exercised
-/// in one read, before any funds-adjacent work starts. Read-only and
-/// cold-start-safe: a chain with no configured equities is the normal
-/// bring-up state and skips with a log instead of failing.
+/// in one read, before any funds-adjacent work starts. Runs per watched
+/// chain: a secondary's addresses are as mistypeable as the primary's, and
+/// its fills need the token as much. Read-only and cold-start-safe: a chain
+/// with no configured equities is the normal bring-up state and skips with a
+/// log instead of failing.
 async fn confirm_configured_asset_responds<P: Provider + Clone + 'static>(
     provider: &P,
-    trading_chain: &TradingChain,
+    watched: &TradingChain,
 ) -> anyhow::Result<()> {
-    let Some((symbol, asset)) = trading_chain
+    let Some((symbol, asset)) = watched
         .assets
         .equities
         .symbols
@@ -2165,8 +2167,8 @@ async fn confirm_configured_asset_responds<P: Provider + Clone + 'static>(
     else {
         info!(
             target: "startup",
-            chain = %trading_chain.chain,
-            "No equities configured on the trading chain; skipping the asset read canary"
+            chain = %watched.chain,
+            "No equities configured on this chain; skipping the asset read canary"
         );
         return Ok(());
     };
@@ -2180,18 +2182,18 @@ async fn confirm_configured_asset_responds<P: Provider + Clone + 'static>(
                 "startup read canary failed: [chains.{chain}] equity {symbol} at \
                  {token} did not answer decimals() -- wrong address, wrong chain, \
                  or a broken endpoint",
-                chain = trading_chain.chain,
+                chain = watched.chain,
                 token = asset.tokenized_equity,
             )
         })?;
 
     info!(
         target: "startup",
-        chain = %trading_chain.chain,
+        chain = %watched.chain,
         %symbol,
         token = %asset.tokenized_equity,
         decimals,
-        "Confirmed a configured asset responds on the trading chain"
+        "Confirmed a configured asset responds on its chain"
     );
 
     Ok(())
