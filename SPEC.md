@@ -139,20 +139,24 @@ config carries a `[chains.<name>.trading]` table is a **watched** chain: the bot
 runs a fill watcher against its order book and accounts its fills. Exactly one
 watched chain must set `primary = true` on that table -- the **primary** chain
 is the chain whose inventory the bot polls and rebalances automatically (Base);
-fills are hedged on every watched chain. The distinction exists so that fill
-watching can go multi-chain before inventory management does: it names the chain
-the still-single-chain paths use. Once inventory polling and rebalancing are per
-chain (global rebalancer, USDC corridors), `primary` shrinks to the operator's
-default chain, or is removed. Zero or multiple primary claimants fail startup
-with a named error. Chains without a trading table are **transport** chains
-(RPC + confirmations only, e.g. Ethereum while it only carries CCTP transfers).
-Watch settings are per chain: poll interval, ingestion cutoff, asset tables with
-per-chain enable/disable flags. The periodic position check sweeps a symbol when
-any watched chain enables it and sizes the hedge with the tightest operational
-limit among those chains (one `Position` per symbol cannot say which chain its
-fills came from; the remainder is hedged on a later tick). Startup verifies
-every watched chain (chain-id identity, cutoff support) and any failure is
-fatal; degraded per-chain startup is deferred to the chain-disable work.
+fills are hedged on every watched chain. A secondary chain's fill updates that
+chain's own inventory slot and never triggers the primary chain's rebalancing
+check: inventory is not fungible across chains, and a secondary is prefunded.
+The distinction exists so that fill watching can go multi-chain before inventory
+management does: it names the chain the still-single-chain paths use. Once
+inventory polling and rebalancing are per chain (global rebalancer, USDC
+corridors), `primary` shrinks to the operator's default chain, or is removed.
+Zero or multiple primary claimants fail startup with a named error. Chains
+without a trading table are **transport** chains (RPC + confirmations only, e.g.
+Ethereum while it only carries CCTP transfers). Watch settings are per chain:
+poll interval, ingestion cutoff, asset tables with per-chain enable/disable
+flags. The periodic position check sweeps a symbol when any watched chain
+enables it and sizes the hedge with the tightest operational limit among those
+chains (one `Position` per symbol cannot say which chain its fills came from;
+the remainder is hedged on a later tick). Startup verifies every watched chain
+(chain-id identity, cutoff support, and one configured asset answering
+`decimals()` on that chain's own endpoint) and any failure is fatal; degraded
+per-chain startup is deferred to the chain-disable work.
 
 The tokenization services are built once per watched chain, never once for Base:
 each watched chain gets its own issuer client, wrapper and mint authorizer bound
@@ -164,11 +168,13 @@ Authorization). Every watched chain must have its own redemption wallet, or
 startup fails naming the chain. The rebalancer, the equity-recovery jobs and the
 portfolio snapshot consume the primary chain's set until the global rebalancer
 owns chain selection; the sets exist so that selection is a lookup rather than a
-rewire. The stale-allowance revoke and the tokenization preflight (below) run
-once per watched chain with that chain's wallet, orderbook and canonical USDC,
-as do the startup MAX approvals in either mode; a watched chain for which this
-build has no pinned USDC fails startup rather than borrowing another chain's
-address.
+rewire. A managed secondary chain's vault inventory is not polled until
+per-chain polling lands: the operator funds and watches it by hand, and startup
+warns once per such chain. The stale-allowance revoke and the tokenization
+preflight (below) run once per watched chain with that chain's wallet, orderbook
+and canonical USDC, as do the startup MAX approvals in either mode; a watched
+chain for which this build has no pinned USDC fails startup rather than
+borrowing another chain's address.
 
 The operator CLI selects its chain the same way. Every command that itself
 submits an onchain operation takes `--network` (default `base`) and runs on that

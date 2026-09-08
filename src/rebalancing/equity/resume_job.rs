@@ -68,6 +68,10 @@ pub(crate) struct ResumeTokenizationAggregate {
 }
 
 /// Dependencies the job needs.
+///
+/// `transfer` is the primary chain's: rebalancing runs there, and neither
+/// aggregate persists the chain it ran on, so a resume can only mean the
+/// primary chain. A persisted chain will replace that assumption.
 pub(crate) struct ResumeTokenizationCtx {
     pub(crate) transfer: Arc<CrossVenueEquityTransfer>,
     /// Used to delayed-redrive on a bot-gas receipt cost enqueue failure
