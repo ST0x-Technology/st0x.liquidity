@@ -49,6 +49,7 @@ use crate::equity_redemption::{
 };
 use crate::iap_auth::{IapVerifier, require_iap};
 use crate::offchain::order::OffchainOrderId;
+use crate::operator::OperatorError;
 use crate::operator::equity_transfer::{
     EquityTransferKind, FailTransferError, validate_failure_reason,
 };
@@ -2386,10 +2387,8 @@ async fn reconcile_equity_transfer(
     }))
 }
 
-/// Maps an operator write command's rejection or bad input to a `400`, the
-/// operator-facing reason preserved in the body. These recovery requests fail
-/// when the aggregate is not in a state the request can apply to, so the
-/// condition is the caller's, not the server's.
+/// Maps a request parse failure to a `400` with the operator-facing reason. The
+/// aggregate-state rejections are mapped by `ops_operator_error` instead.
 fn ops_precondition_error(error: impl std::fmt::Display) -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::BAD_REQUEST,
@@ -2397,6 +2396,19 @@ fn ops_precondition_error(error: impl std::fmt::Display) -> (StatusCode, Json<Er
             error: format!("{error}"),
         }),
     )
+}
+
+/// Maps a shared operator command failure to a response: a caller-facing
+/// rejection becomes a `400`, an operational failure a logged `500` carrying
+/// the full error chain.
+fn ops_operator_error(error: OperatorError) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        OperatorError::Rejected(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: message }),
+        ),
+        OperatorError::Operational(error) => ops_store_error(format!("{error:#}")),
+    }
 }
 
 fn pointer_label(pointer: PointerOutcome) -> &'static str {
@@ -2448,7 +2460,7 @@ async fn release_position_hedge(
 
     let outcome = release_pending_offchain_order(&state.pool, &symbol, order_id, &request.reason)
         .await
-        .map_err(ops_precondition_error)?;
+        .map_err(ops_operator_error)?;
 
     Ok(Json(ReleaseHedgeResponse {
         symbol: symbol.to_string(),
@@ -2509,7 +2521,7 @@ async fn set_position_exposure(
         price_usdc,
     )
     .await
-    .map_err(ops_precondition_error)?
+    .map_err(ops_operator_error)?
     .previous_net;
 
     Ok(Json(SetPositionResponse {
@@ -2573,7 +2585,7 @@ async fn set_portfolio_snapshot_mark(
     };
     let formatted_mark = set_equity_mark(&state.pool, &state.ctx, &correction)
         .await
-        .map_err(ops_precondition_error)?
+        .map_err(ops_operator_error)?
         .formatted_mark;
 
     Ok(Json(SetEquityMarkResponse {
@@ -6814,6 +6826,18 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn operator_error_maps_rejection_to_400_and_operational_to_500() {
+        assert_eq!(
+            ops_operator_error(OperatorError::rejected("bad state")).0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ops_operator_error(OperatorError::Operational(anyhow::anyhow!("db down"))).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]

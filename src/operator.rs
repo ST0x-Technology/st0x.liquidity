@@ -4,6 +4,41 @@
 //! domain operations and types that application needs while keeping the
 //! implementation modules themselves private.
 
+/// The failure of a shared operator recovery command, letting a caller-facing
+/// rejection and an operational failure map to different results.
+#[derive(Debug)]
+pub enum OperatorError {
+    /// The request cannot be applied in the aggregate's current state, or an
+    /// input was invalid; the caller surfaces this to the operator.
+    Rejected(String),
+    /// An infrastructure failure while loading or sending a command.
+    Operational(anyhow::Error),
+}
+
+impl OperatorError {
+    /// Builds a caller-facing rejection from a message.
+    pub fn rejected(message: impl Into<String>) -> Self {
+        Self::Rejected(message.into())
+    }
+}
+
+impl std::fmt::Display for OperatorError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(message) => formatter.write_str(message),
+            Self::Operational(error) => write!(formatter, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for OperatorError {}
+
+impl From<anyhow::Error> for OperatorError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Operational(error)
+    }
+}
+
 pub mod api {
     pub use crate::api::ResumeResponse;
 }
@@ -519,7 +554,7 @@ pub mod performance {
 pub mod portfolio_snapshot {
     use std::sync::Arc;
 
-    use anyhow::{Context, bail, ensure};
+    use anyhow::Context;
     use chrono::{DateTime, NaiveDate, TimeZone, Utc};
     use chrono_tz::America::New_York;
     use rain_math_float::Float;
@@ -532,6 +567,7 @@ pub mod portfolio_snapshot {
 
     use crate::conductor::configured_equity_symbols;
     use crate::inventory::PortfolioLocation;
+    use crate::operator::OperatorError;
 
     pub use crate::portfolio_snapshot::{
         PortfolioBalanceRowWithMark, PortfolioSnapshot, PortfolioSnapshotCommand,
@@ -575,7 +611,7 @@ pub mod portfolio_snapshot {
         pool: &SqlitePool,
         ctx: &Ctx,
         correction: &EquityMarkCorrection,
-    ) -> anyhow::Result<SetEquityMarkOutcome> {
+    ) -> Result<SetEquityMarkOutcome, OperatorError> {
         let &EquityMarkCorrection {
             day,
             ref symbol,
@@ -584,14 +620,16 @@ pub mod portfolio_snapshot {
             ref source,
             ref reason,
         } = correction;
-        ensure!(
-            !source.trim().is_empty(),
-            "--source must not be blank; it is persisted as audit provenance"
-        );
-        ensure!(
-            !reason.trim().is_empty(),
-            "--reason must not be blank; it is persisted as the audit record"
-        );
+        if source.trim().is_empty() {
+            return Err(OperatorError::rejected(
+                "--source must not be blank; it is persisted as audit provenance",
+            ));
+        }
+        if reason.trim().is_empty() {
+            return Err(OperatorError::rejected(
+                "--reason must not be blank; it is persisted as the audit record",
+            ));
+        }
 
         let capture_boundary = New_York
             .from_local_datetime(
@@ -602,10 +640,10 @@ pub mod portfolio_snapshot {
             .context("ambiguous ET capture boundary")?
             .with_timezone(&Utc);
         if observed_at >= capture_boundary {
-            bail!(
+            return Err(OperatorError::rejected(format!(
                 "--observed-at must identify the regular-session close before the {day} 00:05 ET \
                  capture boundary ({capture_boundary})"
-            );
+            )));
         }
 
         // `EquityMarkSet` prices EVERY row of the symbol (the projection's UPDATE
@@ -631,13 +669,13 @@ pub mod portfolio_snapshot {
             .context("failed to check for unconverted wrapped-equity rows")?;
 
             if unconverted > 0 {
-                bail!(
+                return Err(OperatorError::rejected(format!(
                     "{symbol} has no [chains.<name>.trading.assets.equities] entry, so its {unconverted} \
                      wrapped-location row(s) on {day} hold vault shares, not underlying shares. \
                      A mark would price them as underlying and misstate the day's capital. \
                      Reconcile the holding instead, or restore the config entry so the capture \
                      can resolve a vault ratio."
-                );
+                )));
             }
         }
 
@@ -684,11 +722,11 @@ pub mod portfolio_snapshot {
         .await
         .context("failed to verify historical portfolio snapshot mark")?;
         if row_count != expected_row_count || corrected_count != expected_row_count {
-            bail!(
+            return Err(OperatorError::rejected(format!(
                 "historical mark event committed, but the portfolio-snapshot read model did not \
                  update every {day} {symbol} row; run `view rebuild --aggregate \
                  portfolio-snapshot --all` before retrying"
-            );
+            )));
         }
 
         Ok(SetEquityMarkOutcome { formatted_mark })
@@ -696,7 +734,7 @@ pub mod portfolio_snapshot {
 }
 
 pub mod position {
-    use anyhow::{Context, bail, ensure};
+    use anyhow::Context;
     use rain_math_float::Float;
     use sqlx::SqlitePool;
     use st0x_config::ExecutionThreshold;
@@ -704,6 +742,7 @@ pub mod position {
     use st0x_execution::{FractionalShares, Symbol};
 
     use crate::offchain::order::{OffchainOrder, OffchainOrderId};
+    use crate::operator::OperatorError;
 
     pub use crate::position::{AnchorDisposition, Position, PositionCommand};
 
@@ -763,11 +802,12 @@ pub mod position {
         reason: &str,
         threshold: ExecutionThreshold,
         price_usdc: Option<Float>,
-    ) -> anyhow::Result<SetPositionOutcome> {
-        ensure!(
-            !reason.trim().is_empty(),
-            "--reason must not be blank; it is persisted as the audit record"
-        );
+    ) -> Result<SetPositionOutcome, OperatorError> {
+        if reason.trim().is_empty() {
+            return Err(OperatorError::rejected(
+                "--reason must not be blank; it is persisted as the audit record",
+            ));
+        }
 
         let (position, projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
@@ -782,10 +822,10 @@ pub mod position {
         if let Some(view) = &current
             && let Some(pending) = view.pending_offchain_order_id.as_ref()
         {
-            bail!(
+            return Err(OperatorError::rejected(format!(
                 "position {symbol} has pending offchain order {pending}; \
                  run position release-hedge before setting position"
-            );
+            )));
         }
 
         let previous_net = current
@@ -822,11 +862,12 @@ pub mod position {
         symbol: &Symbol,
         offchain_order_id: OffchainOrderId,
         reason: &str,
-    ) -> anyhow::Result<ReleaseHedgeOutcome> {
-        ensure!(
-            !reason.trim().is_empty(),
-            "--reason must not be blank; it is persisted as the audit record"
-        );
+    ) -> Result<ReleaseHedgeOutcome, OperatorError> {
+        if reason.trim().is_empty() {
+            return Err(OperatorError::rejected(
+                "--reason must not be blank; it is persisted as the audit record",
+            ));
+        }
 
         let (position, projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
@@ -838,7 +879,9 @@ pub mod position {
             .await
             .context("failed to load position view")?
         else {
-            bail!("position {symbol} not found");
+            return Err(OperatorError::rejected(format!(
+                "position {symbol} not found"
+            )));
         };
 
         let order = load_entity::<OffchainOrder>(pool, &offchain_order_id)
@@ -847,33 +890,33 @@ pub mod position {
 
         if let Some(existing) = &order {
             if existing.symbol() != symbol {
-                bail!(
+                return Err(OperatorError::rejected(format!(
                     "OffchainOrder {offchain_order_id} belongs to {}, not {symbol} -- refusing \
                      to repair",
                     existing.symbol()
-                );
+                )));
             }
             match existing {
                 OffchainOrder::PartiallyFilled { .. } => {
-                    bail!(
+                    return Err(OperatorError::rejected(format!(
                         "OffchainOrder {offchain_order_id} is PartiallyFilled: shares already \
                          executed offchain, and failing it would erase that hedge from the \
                          position. Reconcile the partial fill first."
-                    );
+                    )));
                 }
                 OffchainOrder::Filled { .. } => {
-                    bail!(
+                    return Err(OperatorError::rejected(format!(
                         "OffchainOrder {offchain_order_id} is Filled: the hedge executed. This \
                          command cannot repair a filled order -- reconcile the fill into the \
                          position instead of failing it."
-                    );
+                    )));
                 }
                 OffchainOrder::Cancelling { .. } | OffchainOrder::Cancelled { .. } => {
-                    bail!(
+                    return Err(OperatorError::rejected(format!(
                         "OffchainOrder {offchain_order_id} is in a cancellation lifecycle state: \
                          this command fails stuck Pending/Submitted orders, not cancellations -- \
                          refusing. Confirm the intended recovery path for cancellation states."
-                    );
+                    )));
                 }
                 OffchainOrder::Pending { .. }
                 | OffchainOrder::Submitted { .. }
@@ -884,16 +927,16 @@ pub mod position {
         match view.pending_offchain_order_id {
             Some(pending) if pending == offchain_order_id => {}
             Some(pending) => {
-                bail!(
+                return Err(OperatorError::rejected(format!(
                     "position {symbol} pending offchain order is {pending}, not {offchain_order_id}"
-                );
+                )));
             }
             None => {
                 if order.is_none() {
-                    bail!(
+                    return Err(OperatorError::rejected(format!(
                         "position {symbol} has no pending offchain order and no OffchainOrder \
                          aggregate {offchain_order_id} exists -- nothing to repair"
-                    );
+                    )));
                 }
 
                 let offchain_order =
@@ -942,7 +985,8 @@ pub mod position {
     mod detail {
         use std::sync::Arc;
 
-        use anyhow::{Context, bail};
+        use crate::operator::OperatorError;
+        use anyhow::Context;
         use async_trait::async_trait;
         use sqlx::SqlitePool;
         use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, load_entity};
@@ -1042,7 +1086,7 @@ pub mod position {
             order: Option<OffchainOrder>,
             offchain_order_id: OffchainOrderId,
             reason: &str,
-        ) -> anyhow::Result<OffchainOrderOutcome> {
+        ) -> Result<OffchainOrderOutcome, OperatorError> {
             use OffchainOrder::{
                 Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
             };
@@ -1059,17 +1103,17 @@ pub mod position {
                 // refuse here too so the invariant cannot rot if a new caller skips
                 // that check.
                 Filled { .. } | PartiallyFilled { .. } => {
-                    bail!(
+                    return Err(OperatorError::rejected(format!(
                         "OffchainOrder {offchain_order_id} has executed shares (state {order:?}) -- \
                      refusing to erase the executed hedge"
-                    );
+                    )));
                 }
                 Cancelling { .. } | Cancelled { .. } => {
-                    bail!(
+                    return Err(OperatorError::rejected(format!(
                         "OffchainOrder {offchain_order_id} is in a cancellation lifecycle state \
                      (state {order:?}): this command fails Pending/Submitted orders, not \
                      cancellations -- refusing. Confirm the intended recovery path."
-                    );
+                    )));
                 }
                 Pending { .. } | Submitted { .. } => {}
             }
@@ -1096,11 +1140,11 @@ pub mod position {
                 .context("failed to re-load offchain order before MarkFailed")?;
             match classify_reloaded_state(current.as_ref()) {
                 ReloadOutcome::Escalate => {
-                    bail!(
+                    return Err(OperatorError::rejected(format!(
                         "OffchainOrder {offchain_order_id} acquired executed shares concurrently; \
                      the position pointer may already be cleared -- reconcile the position \
                      manually instead of failing the order"
-                    );
+                    )));
                 }
                 ReloadOutcome::BenignTerminal => {
                     return Ok(OffchainOrderOutcome::TerminalConcurrently);
@@ -1144,13 +1188,11 @@ pub mod position {
                         // Executed shares always escalate: PartiallyFilled cannot
                         // produce AlreadyCompleted today, but if it ever does, the
                         // same pointer-cleared-without-accounting hazard applies.
-                        ReloadOutcome::Escalate => {
-                            bail!(
-                                "OffchainOrder {offchain_order_id} acquired executed shares \
+                        ReloadOutcome::Escalate => Err(OperatorError::rejected(format!(
+                            "OffchainOrder {offchain_order_id} acquired executed shares \
                              concurrently: the position pointer was cleared without accounting \
                              the fill -- reconcile the position manually"
-                            );
-                        }
+                        ))),
                         ReloadOutcome::BenignTerminal => {
                             Ok(OffchainOrderOutcome::TerminalConcurrently)
                         }
@@ -1160,18 +1202,16 @@ pub mod position {
                         // -- impossible under the append-only lifecycle. Bail loudly as
                         // an invariant violation rather than silently reporting a clean
                         // "left as-is".
-                        ReloadOutcome::Proceed => {
-                            bail!(
-                                "OffchainOrder {offchain_order_id} returned AlreadyCompleted from \
+                        ReloadOutcome::Proceed => Err(OperatorError::Operational(anyhow::anyhow!(
+                            "OffchainOrder {offchain_order_id} returned AlreadyCompleted from \
                              MarkFailed but re-loaded as a non-terminal state -- aggregate \
                              lifecycle invariant violated"
-                            );
-                        }
+                        ))),
                     }
                 }
-                Err(error) => {
-                    Err(anyhow::Error::new(error).context("failed to mark offchain order failed"))
-                }
+                Err(error) => Err(OperatorError::Operational(
+                    anyhow::Error::new(error).context("failed to mark offchain order failed"),
+                )),
             }
         }
     }
