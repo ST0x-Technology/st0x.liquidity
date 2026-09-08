@@ -1003,7 +1003,7 @@ mod tests {
     use st0x_wrapper::UnwrappedToken;
 
     use super::*;
-    use crate::equity_redemption::redemption_aggregate_id;
+    use crate::equity_redemption::{UnwrappedProvenance, redemption_aggregate_id};
     use crate::test_utils::setup_test_db;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
 
@@ -1110,7 +1110,9 @@ mod tests {
             },
             EquityRedemptionEvent::TokensUnwrapped {
                 quantity: Some(float!(5)),
-                underlying_token: UnwrappedToken::unchecked(Address::repeat_byte(0x33)),
+                underlying_token: UnwrappedProvenance::Attested {
+                    attested: UnwrappedToken::unchecked(Address::repeat_byte(0x33)),
+                },
                 unwrap_tx_hash: TxHash::random(),
                 unwrapped_amount: U256::from(5_000_000_000_000_000_000_u128),
                 unwrap_block: Some(2),

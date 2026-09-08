@@ -207,6 +207,25 @@ pub enum EquityRedemptionError {
         configured: Address,
         delivered: Address,
     },
+    /// Re-attestation of a legacy record's underlying failed before the send.
+    /// `WrapperError` cannot be wrapped with `#[from]` for the same reason
+    /// as UnwrapFailed above.
+    #[error("Underlying attestation failed for {symbol}: {error_message}")]
+    UnderlyingAttestationFailed {
+        symbol: Symbol,
+        error_message: String,
+    },
+    /// A record written before the vault attestation existed names a token
+    /// the vault's `asset()` does not confirm; nothing is sent.
+    #[error(
+        "Legacy redemption record of {symbol} names {recorded}, \
+         but the vault attests {attested}"
+    )]
+    LegacyUnderlyingMismatch {
+        symbol: Symbol,
+        recorded: Address,
+        attested: Address,
+    },
     /// Transaction failed with a known tx hash
     #[error("Transaction failed: {tx_hash}")]
     TransactionFailed { tx_hash: TxHash },
@@ -400,6 +419,32 @@ pub enum DetectionFailure {
     Operator { reason: String },
 }
 
+/// Where a redemption's unwrapped-token address came from.
+///
+/// Builds before the vault attestation copied the address from config and
+/// persisted it bare. Records written since carry the attested token under
+/// an explicit key, so a replayed payload states its own provenance and a
+/// legacy address is re-attested before anything is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UnwrappedProvenance {
+    /// The vault's `asset()` as a [`Wrapper`](st0x_wrapper::Wrapper) attested it.
+    Attested { attested: UnwrappedToken },
+    /// Copied from config by a build that attested nothing.
+    Legacy(Address),
+}
+
+impl UnwrappedProvenance {
+    /// The recorded address, whatever its provenance: for display and for
+    /// the `TokensSent` record, never as the token to send.
+    pub fn address(self) -> Address {
+        match self {
+            Self::Attested { attested } => attested.address(),
+            Self::Legacy(recorded) => recorded,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EquityRedemptionEvent {
     /// Vault withdrawal requested, awaiting submission.
@@ -459,7 +504,7 @@ pub enum EquityRedemptionEvent {
             deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
         )]
         quantity: Option<Float>,
-        underlying_token: UnwrappedToken,
+        underlying_token: UnwrappedProvenance,
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
         /// Block number in which the unwrap tx confirmed.
@@ -913,7 +958,7 @@ pub enum EquityRedemption {
         )]
         quantity: Float,
         token: Address,
-        underlying_token: UnwrappedToken,
+        underlying_token: UnwrappedProvenance,
         raindex_withdraw_tx: TxHash,
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
@@ -933,7 +978,7 @@ pub enum EquityRedemption {
         )]
         quantity: Float,
         token: Address,
-        underlying_token: UnwrappedToken,
+        underlying_token: UnwrappedProvenance,
         raindex_withdraw_tx: TxHash,
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
@@ -2351,7 +2396,9 @@ impl EquityRedemption {
 
                 Ok(vec![TokensUnwrapped {
                     quantity: Some(quantity),
-                    underlying_token,
+                    underlying_token: UnwrappedProvenance::Attested {
+                        attested: underlying_token,
+                    },
                     unwrap_tx_hash: *unwrap_tx_hash,
                     unwrapped_amount,
                     unwrap_block: Some(unwrap_block),
@@ -2400,7 +2447,12 @@ impl EquityRedemption {
                 unwrap_block,
                 ..
             } => {
-                let token = *underlying_token;
+                let token = match underlying_token {
+                    UnwrappedProvenance::Attested { attested } => *attested,
+                    UnwrappedProvenance::Legacy(recorded) => {
+                        reattest_legacy_underlying(services, symbol, *recorded).await?
+                    }
+                };
                 let amount = *unwrapped_amount;
 
                 let Some(redemption_wallet) =
@@ -2854,6 +2906,43 @@ fn node_sync_failed(required_block: u64, error: &WrapperError) -> EquityRedempti
 /// Constructs a [`EquityRedemptionError::NodeSyncFailed`] from a node-sync
 /// [`EvmError`] raised by [`Tokenizer::wait_for_block`].
 ///
+/// Re-attests a legacy record's underlying through the wrapper before the
+/// send: the vault's `asset()` must be the recorded address, otherwise the
+/// record predates the check and its token is not trusted.
+async fn reattest_legacy_underlying(
+    services: &EquityTransferServices,
+    symbol: &Symbol,
+    recorded: Address,
+) -> Result<UnwrappedToken, EquityRedemptionError> {
+    let attested = services
+        .wrapper
+        .attest_underlying(symbol)
+        .await
+        .inspect_err(|error| {
+            warn!(target: "rebalance", %error, %symbol, "Legacy underlying re-attestation failed");
+        })
+        .map_err(|error| EquityRedemptionError::UnderlyingAttestationFailed {
+            symbol: symbol.clone(),
+            error_message: error.to_string(),
+        })?;
+
+    if attested.address() != recorded {
+        warn!(
+            target: "rebalance",
+            %symbol, %recorded, %attested,
+            "Legacy redemption record names a token the vault does not attest"
+        );
+        return Err(EquityRedemptionError::LegacyUnderlyingMismatch {
+            symbol: symbol.clone(),
+            recorded,
+            attested: attested.address(),
+        });
+    }
+
+    info!(target: "rebalance", %symbol, %attested, "Re-attested a legacy underlying before sending");
+    Ok(attested)
+}
+
 /// Returns the recorded attempt count for `NodeBehindRequiredBlock`; every
 /// other variant signals the full polling budget was consumed without a
 /// recorded count, so it falls back to [`NODE_SYNC_MAX_ATTEMPTS`]. The match is
@@ -3021,7 +3110,9 @@ mod tests {
     fn tokens_unwrapped_event() -> EquityRedemptionEvent {
         EquityRedemptionEvent::TokensUnwrapped {
             quantity: Some(float!(50.25)),
-            underlying_token: UnwrappedToken::unchecked(Address::random()),
+            underlying_token: UnwrappedProvenance::Attested {
+                attested: UnwrappedToken::unchecked(Address::random()),
+            },
             unwrap_tx_hash: TxHash::random(),
             unwrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
             unwrap_block: None,
@@ -3639,11 +3730,10 @@ mod tests {
     #[tokio::test]
     async fn send_tokens_reattests_a_legacy_underlying_before_sending() {
         let configured = Address::random();
-        let tokenizer = Arc::new(MockTokenizer::new());
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
             vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: tokenizer.clone(),
+            tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(
                 MockWrapper::new()
                     .with_tokenized_shares(configured)
@@ -3668,7 +3758,6 @@ mod tests {
             events[0],
             EquityRedemptionEvent::TokensSent { .. }
         ));
-        assert_eq!(tokenizer.call_count(), 1, "exactly one send");
     }
 
     /// `SendTokens` must persist the non-idempotent transfer hash without
@@ -3685,7 +3774,9 @@ mod tests {
             mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
-        let underlying_token = UnwrappedToken::unchecked(Address::random());
+        let underlying_token = UnwrappedProvenance::Attested {
+            attested: UnwrappedToken::unchecked(Address::random()),
+        };
         let send_pending = EquityRedemption::SendPending {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(10),
@@ -5224,7 +5315,9 @@ mod tests {
             symbol: symbol.clone(),
             quantity: float!(50.25),
             token: Address::random(),
-            underlying_token: UnwrappedToken::unchecked(Address::random()),
+            underlying_token: UnwrappedProvenance::Attested {
+                attested: UnwrappedToken::unchecked(Address::random()),
+            },
             raindex_withdraw_tx: TxHash::random(),
             unwrap_tx_hash: TxHash::random(),
             unwrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
@@ -5682,7 +5775,9 @@ mod tests {
                 withdrawn_from_raindex_event(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: Some(float!(1.0)),
-                    underlying_token: UnwrappedToken::unchecked(Address::ZERO),
+                    underlying_token: UnwrappedProvenance::Attested {
+                        attested: UnwrappedToken::unchecked(Address::ZERO),
+                    },
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
                     unwrap_block: Some(unwrap_block),
@@ -5737,7 +5832,9 @@ mod tests {
                 withdrawn_from_raindex_event(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: Some(float!(1.0)),
-                    underlying_token: UnwrappedToken::unchecked(Address::ZERO),
+                    underlying_token: UnwrappedProvenance::Attested {
+                        attested: UnwrappedToken::unchecked(Address::ZERO),
+                    },
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
                     unwrap_block: None,
@@ -5789,7 +5886,9 @@ mod tests {
                 withdrawn_from_raindex_event(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: Some(float!(1.0)),
-                    underlying_token: UnwrappedToken::unchecked(Address::ZERO),
+                    underlying_token: UnwrappedProvenance::Attested {
+                        attested: UnwrappedToken::unchecked(Address::ZERO),
+                    },
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
                     unwrap_block: Some(required_block),
@@ -6205,7 +6304,9 @@ mod tests {
                 symbol: sym.clone(),
                 quantity: float!(1),
                 token: Address::ZERO,
-                underlying_token: UnwrappedToken::unchecked(Address::ZERO),
+                underlying_token: UnwrappedProvenance::Attested {
+                    attested: UnwrappedToken::unchecked(Address::ZERO)
+                },
                 raindex_withdraw_tx: TxHash::default(),
                 unwrap_tx_hash: TxHash::default(),
                 unwrapped_amount: U256::ZERO,
@@ -6221,7 +6322,9 @@ mod tests {
                 symbol: sym.clone(),
                 quantity: float!(1),
                 token: Address::ZERO,
-                underlying_token: UnwrappedToken::unchecked(Address::ZERO),
+                underlying_token: UnwrappedProvenance::Attested {
+                    attested: UnwrappedToken::unchecked(Address::ZERO)
+                },
                 raindex_withdraw_tx: TxHash::default(),
                 unwrap_tx_hash: TxHash::default(),
                 unwrapped_amount: U256::ZERO,

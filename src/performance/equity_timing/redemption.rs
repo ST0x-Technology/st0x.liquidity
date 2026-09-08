@@ -341,7 +341,7 @@ mod tests {
         timestamp,
     };
     use super::*;
-    use crate::equity_redemption::DetectionFailure;
+    use crate::equity_redemption::{DetectionFailure, UnwrappedProvenance};
 
     #[test]
     fn redemption_happy_path_completes_all_five_stages() {
@@ -468,7 +468,9 @@ mod tests {
             },
             EquityRedemptionEvent::TokensUnwrapped {
                 quantity: Some(float!(5)),
-                underlying_token: UnwrappedToken::unchecked(Address::repeat_byte(0x33)),
+                underlying_token: UnwrappedProvenance::Attested {
+                    attested: UnwrappedToken::unchecked(Address::repeat_byte(0x33)),
+                },
                 unwrap_tx_hash: TxHash::random(),
                 unwrapped_amount: U256::from(5_000_000_000_000_000_000_u128),
                 unwrap_block: Some(2),
@@ -498,7 +500,9 @@ mod tests {
         let events = vec![
             EquityRedemptionEvent::TokensUnwrapped {
                 quantity: Some(float!(5)),
-                underlying_token: UnwrappedToken::unchecked(Address::repeat_byte(0x33)),
+                underlying_token: UnwrappedProvenance::Attested {
+                    attested: UnwrappedToken::unchecked(Address::repeat_byte(0x33)),
+                },
                 unwrap_tx_hash: TxHash::random(),
                 unwrapped_amount: U256::from(5_000_000_000_000_000_000_u128),
                 unwrap_block: Some(2),
