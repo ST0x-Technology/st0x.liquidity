@@ -1258,13 +1258,28 @@ Alternative approaches (Ansible, Kamal) were evaluated and documented in commit
 
 #### Config validation
 
-The GCP production and staging config TOMLs are committed beside their stacks in
-`t0.devops`, published as pinned Secret Manager versions, and mounted at
+The GCP production and staging config TOMLs live in this repository at
+`config/prod/st0x-hedge.toml` and `config/staging/st0x-hedge.toml`. The app
+release publishes pinned Secret Manager versions, mounted at
 `/run/t0-config/st0x-hedge.toml`. The OCI image contains no environment config;
 the compose file selects the mounted file with its `--config` flag. A config
 edit that only the deployed service can judge is a config edit whose first check
 is a bot that will not boot, which is what the `validate-config` binary exists
 to prevent.
+
+The deployed configs share a 900-second pre-close budget with pricing. Their
+`[broker].extended_hours_close_flatten_window_secs` must be an integer between 1
+and 900. Pricing independently requires its deployed quoting cutoff to be at
+least 900 seconds. Together these bounds stop new executable quotes no later
+than the start of the flattening window. CI checks each repository's own files
+without credentials for the other repository.
+
+Changing that shared budget requires coordinated changes to both guards. For a
+larger budget, increase and deploy the pricing cutoff first. For a smaller
+budget, reduce and deploy the liquidity flattening window first. This deployment
+policy does not change the broker calendar, overnight eligibility, or the
+long-gap flattening policy. CI does not inspect live overrides or prove release
+order.
 
 `validate-config --config <path> [--secrets <path>]` runs the boot path's
 validation and exits 0 or 1, writing a plain-text report to stdout and the

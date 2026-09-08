@@ -159,6 +159,13 @@ config the repository ships (`config/**/*.toml`, `example.config.toml`,
 config edit is therefore caught in the pull request that makes it, rather than
 by a deployed service refusing to boot.
 
+The `pre-close-cutoff` CI check also enforces a 1..900-second flattening window
+for `config/prod/st0x-hedge.toml` and `config/staging/st0x-hedge.toml`.
+Pricing's matching guard requires a quoting cutoff of at least 900 seconds. Run
+the local check with `python3 scripts/check_pre_close_cutoff.py` (Python 3.11 or
+newer). See [Config validation](SPEC.md#config-validation) before changing this
+shared budget. These checks do not change either deployed config.
+
 ```bash
 cargo run --bin server -- --config path/to/config.toml --secrets path/to/secrets.toml
 ```
