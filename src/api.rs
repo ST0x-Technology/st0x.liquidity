@@ -202,11 +202,17 @@ async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRespon
     let uptime = Utc::now() - *STARTED_AT;
 
     // Gated on the startup barrier: every essential run loop has
-    // acknowledged before this reports healthy, which includes the conductor
-    // and therefore `startup_smoke_checks` (chain ids, cutoff probe, broker
-    // round-trip, asset read canary) plus the account verification done at
-    // executor construction. A deploy probe polling this endpoint therefore
-    // cannot see a 200 from a bot that failed its startup checks.
+    // acknowledged before this reports healthy, and the conductor
+    // acknowledges only after its ENTIRE setup path has succeeded: any
+    // `Err` on that path exits the process with this endpoint still
+    // reporting 503 "starting". That scope is wider than
+    // `startup_smoke_checks` (chain ids, cutoff probe, broker round-trip,
+    // asset read canary): it also covers the account verification done at
+    // executor construction and every startup preflight wired into setup,
+    // e.g. `preflight_inventory_access` (OPERATOR_ROLE). Preflights added
+    // to the setup path later are covered automatically. A deploy probe
+    // polling this endpoint therefore cannot see a 200 from a bot that
+    // failed ANY startup check, not just the smoke suite.
     let (status_code, status) = if state.health.is_ready() {
         (StatusCode::OK, "healthy")
     } else {
