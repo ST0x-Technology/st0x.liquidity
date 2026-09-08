@@ -3431,11 +3431,14 @@ receipt, `RecordPendingBurn` commits it to the `BridgingSubmitting` aggregate
 (`pending_burn_tx`), then `confirm_burn` awaits and validates the receipt. The
 `submit_burn -> RecordPendingBurn` critical section runs on a detached task so
 the per-attempt timeout can never cancel it between broadcasting the burn and
-recording its hash. A process crash in that same window is NOT prevented -- the
-hash is lost -- but it cannot double-burn: resume then finds no recorded hash,
-the mempool-blind scan adopts the burn only if it already mined, and otherwise
-the transfer fails closed (`BurnSubmitInconclusive`) for operator reconciliation
-rather than reburning a possibly-still-pending burn. On re-pickup,
+recording its hash. Its inner deadline covers the standing-allowance check, fee
+query, and burn broadcast. The deadline must cover a cold allowance approval at
+the configured confirmation depth while remaining below the per-attempt timeout.
+A process crash in that same window is NOT prevented -- the hash is lost -- but
+it cannot double-burn: resume then finds no recorded hash, the mempool-blind
+scan adopts the burn only if it already mined, and otherwise the transfer fails
+closed (`BurnSubmitInconclusive`) for operator reconciliation rather than
+reburning a possibly-still-pending burn. On re-pickup,
 `resume_bridging_submitting` checks the recorded tx's on-chain status
 (`burn_status`) before the scan: a mined burn is adopted (re-validated via
 `confirm_burn`), a still-pending burn yields a delayed redrive (never a reburn),
