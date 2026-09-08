@@ -5308,6 +5308,7 @@ mod tests {
     };
     use st0x_finance::{Usd, Usdc};
     use st0x_float_macro::float;
+    use st0x_issuance_dto::VaultModeTag;
     use st0x_raindex::{Raindex, RaindexContracts};
     use st0x_tokenization::mock::MockTokenizer;
     use st0x_tokenization::{IssuerRequestId, issuer_request_id, tokenization_request_id};
@@ -5324,7 +5325,7 @@ mod tests {
     use crate::equity_redemption::{EquityRedemptionCommand, redemption_aggregate_id};
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
-    use crate::mint_authorization::MintAuthorizationError;
+    use crate::mint_authorization::{MintAuthorizationError, StubVaultModeReader};
     use crate::offchain::order::{CancellationReason, OrderPlacementResult, RetainedFill};
     use crate::onchain::approvals::{ApprovalPurpose, ApprovalTarget, StartupApprovalError};
     use crate::onchain::mock::MockRaindex;
@@ -15503,5 +15504,30 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// The orchestrator preflight enforces the rollout order: an equity
+    /// issuance reports as orchestrator-mode, enabled on a watched chain
+    /// with no `[orchestrator.addresses]` entry, refuses startup naming the
+    /// chain and the symbol, before its first mint could stall at signing.
+    #[tokio::test]
+    async fn orchestrator_preflight_refuses_an_orchestrator_mode_equity_on_a_chain_without_an_entry()
+     {
+        let assets = assets_with_equity(
+            "AAPL",
+            equity_asset(Address::repeat_byte(0xa5), Address::repeat_byte(0xa6)),
+        );
+
+        let error = preflight_orchestrator_entries(
+            Chain::Ethereum,
+            &ConfiguredMintAuthorizer::Disabled,
+            &StubVaultModeReader(VaultModeTag::Orchestrator),
+            &assets,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.chain, Chain::Ethereum);
+        assert_eq!(error.symbol, Symbol::new("AAPL").unwrap());
     }
 }
