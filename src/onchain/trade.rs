@@ -999,9 +999,10 @@ mod tests {
     use std::collections::HashMap;
 
     use alloy::primitives::{Address, IntoLogData, U256, address, b256, fixed_bytes, uint};
-    use alloy::providers::{ProviderBuilder, mock::Asserter};
+    use alloy::providers::{Provider, ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::{Block, Transaction};
     use alloy::sol_types::SolCall;
+    use async_trait::async_trait;
     use rain_math_float::Float;
 
     use st0x_config::{
@@ -1010,12 +1011,16 @@ mod tests {
     };
     use st0x_evm::IERC20::decimalsCall;
     use st0x_evm::ReadOnlyEvm;
-    use st0x_evm::{Chain, USDC_BASE};
+    use st0x_evm::{Chain, IntoErrorRegistry, USDC_BASE};
     use st0x_execution::Symbol;
     use st0x_float_macro::float;
     use st0x_registry::SymbolCache;
 
     use super::*;
+    use crate::bindings::IRaindexV6;
+    use crate::test_utils::{
+        get_test_order, panic_revert_payload, seed_get_test_order_token_symbols,
+    };
 
     /// Preloads a symbol under every chain the fixtures run on, so tests
     /// exercising either Base- or Ethereum-flavored parsing hit the cache.
@@ -1024,10 +1029,37 @@ mod tests {
             cache.preload_symbol(chain, token, symbol);
         }
     }
-    use crate::bindings::IRaindexV6;
-    use crate::test_utils::{
-        get_test_order, panic_revert_payload, seed_get_test_order_token_symbols,
-    };
+
+    struct CapturedTokenMetadataEvm<ProviderImpl> {
+        provider: ProviderImpl,
+    }
+
+    #[async_trait]
+    impl<ProviderImpl> Evm for CapturedTokenMetadataEvm<ProviderImpl>
+    where
+        ProviderImpl: Provider + Clone + Send + Sync + 'static,
+    {
+        type Provider = ProviderImpl;
+
+        fn provider(&self) -> &Self::Provider {
+            &self.provider
+        }
+
+        async fn call<Registry: IntoErrorRegistry, Call: SolCall + Send>(
+            &self,
+            contract: Address,
+            _call: Call,
+        ) -> Result<Call::Return, EvmError> {
+            let decimals = match contract {
+                REAL_USDC_BASE => 6,
+                REAL_WTCOIN_BASE => 18,
+                other => panic!("no captured token metadata for {other}"),
+            };
+
+            Call::abi_decode_returns(&decimalsCall::abi_encode_returns(&decimals))
+                .map_err(EvmError::from)
+        }
+    }
 
     #[tokio::test]
     async fn resolve_block_timestamp_fetches_header_when_log_timestamp_missing() {
@@ -2297,6 +2329,148 @@ mod tests {
     // rather than a hand-picked round number.
     const REAL_USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
     const REAL_WTCOIN_BASE: Address = address!("0x5CdA0E1cA4ce2Af96315F7F8963c85399c172204");
+
+    /// Replays the real Base receipt's raw inventory logs and token metadata
+    /// through the same receipt-recovery and pairing decoder used by
+    /// `process-tx`, without making CI depend on a live RPC.
+    #[tokio::test]
+    async fn try_from_tx_hash_decodes_real_bebop_fill_from_captured_receipt() {
+        let tx_hash =
+            fixed_bytes!("0xe13a11de734768f08a9c1ef66e8de3bcb9072f8cdabce9f1d819e1ae9909d4b9");
+        let inventory = address!("0x6b7b523fadd1677413ad92c9404c8f0796bacf6f");
+        let venue_operator = address!("0x8b8b6e0507c125934c6129563f48e48c66f86475");
+        let bot_operator = address!("0x679df30b30ac2947aa3143490add6717af81dcc3");
+
+        // Exact OperatorWithdraw (0x9b) and OperatorDeposit (0xa7) logs from
+        // the production receipt. Unrelated venue/ERC20 logs are omitted.
+        let receipt = serde_json::json!({
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x3b",
+            "blockHash": "0x373307a0e2154c2de6b046e349fc27f9bb02b01fdddbb15eeba57f3ce3b24973",
+            "blockNumber": "0x2dce2cf",
+            "from": bot_operator,
+            "to": "0xbeb0009aca35087ce7ccf11637e24dd1aad3bf2a",
+            "gasUsed": "0x7a62d",
+            "effectiveGasPrice": "0x57bcf0",
+            "cumulativeGasUsed": "0xa00b4e",
+            "status": "0x1",
+            "type": "0x2",
+            "logsBloom": format!("0x{}", "0".repeat(512)),
+            "logs": [
+                {
+                    "address": inventory,
+                    "blockHash":
+                        "0x373307a0e2154c2de6b046e349fc27f9bb02b01fdddbb15eeba57f3ce3b24973",
+                    "blockNumber": "0x2dce2cf",
+                    "blockTimestamp": "0x6a442281",
+                    "data":
+                        "0x000000000000000000000000000000000000000000000000007967961d954717",
+                    "logIndex": "0x9b",
+                    "removed": false,
+                    "topics": [
+                        "0x50539c01596e1068221f68fffa4b27891c8ec42281472a03345e76561d4cfc44",
+                        "0x0000000000000000000000008b8b6e0507c125934c6129563f48e48c66f86475",
+                        "0x0000000000000000000000005cda0e1ca4ce2af96315f7f8963c85399c172204",
+                        "0x0000000000000000000000000000000000000000000000000000000000000003"
+                    ],
+                    "transactionHash": tx_hash,
+                    "transactionIndex": "0x3b"
+                },
+                {
+                    "address": inventory,
+                    "blockHash":
+                        "0x373307a0e2154c2de6b046e349fc27f9bb02b01fdddbb15eeba57f3ce3b24973",
+                    "blockNumber": "0x2dce2cf",
+                    "blockTimestamp": "0x6a442281",
+                    "data": "0x00000000000000000000000000000000000000000000000000000000004c4b40",
+                    "logIndex": "0xa7",
+                    "removed": false,
+                    "topics": [
+                        "0xa507aac739d4f580d86e1e34ebb6bd0bbd130d687ada88539711c645fd2b5480",
+                        "0x0000000000000000000000008b8b6e0507c125934c6129563f48e48c66f86475",
+                        "0x000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                        "0x0000000000000000000000000000000000000000000000000000000000000004"
+                    ],
+                    "transactionHash": tx_hash,
+                    "transactionIndex": "0x3b"
+                }
+            ]
+        });
+
+        let captured_withdraw: Log = serde_json::from_value(receipt["logs"][0].clone()).unwrap();
+        let captured_deposit: Log = serde_json::from_value(receipt["logs"][1].clone()).unwrap();
+        assert_eq!(
+            captured_withdraw
+                .log_decode::<OperatorWithdraw>()
+                .unwrap()
+                .data()
+                .amount,
+            uint!(34_172_366_621_067_031_U256)
+        );
+        assert_eq!(
+            captured_deposit
+                .log_decode::<OperatorDeposit>()
+                .unwrap()
+                .data()
+                .amount,
+            uint!(5_000_000_U256)
+        );
+
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        let evm = CapturedTokenMetadataEvm {
+            provider: ProviderBuilder::new().connect_mocked_client(asserter),
+        };
+        let cache = SymbolCache::default();
+        preload_on_all_chains(&cache, REAL_USDC_BASE, "USDC");
+        preload_on_all_chains(&cache, REAL_WTCOIN_BASE, "wtCOIN");
+
+        let ctx = TradingChain::test()
+            .chain(Chain::Base)
+            .inventory(InventoryMode::Managed { inventory })
+            .inventory_adapters(inventory_adapters(
+                InventoryAdapterVenue::Bebop,
+                venue_operator,
+            ))
+            .vault_owner(inventory)
+            .assets(assets_config_with_equity("COIN", REAL_WTCOIN_BASE))
+            .call();
+
+        let trade = OnchainTrade::try_from_tx_hash(
+            tx_hash,
+            &evm,
+            &cache,
+            &ctx,
+            RecoveryActors {
+                order_owner: inventory,
+                bot_operator: BotOperator(bot_operator),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the real Bebop fill must decode from its paired inventory events");
+
+        assert_eq!(trade.symbol.to_string(), "wtCOIN");
+        assert_eq!(trade.direction, Direction::Sell);
+        assert_eq!(trade.equity_token, REAL_WTCOIN_BASE);
+        assert_eq!(trade.block_number, Some(48_030_415));
+        assert_eq!(
+            trade.source,
+            OnChainTradeSource::Inventory {
+                operator: venue_operator,
+                venue: InventoryVenue::Bebop,
+            }
+        );
+
+        let expected_amount =
+            Float::from_fixed_decimal(uint!(34_172_366_621_067_031_U256), 18).unwrap();
+        assert!(trade.amount.inner().eq(expected_amount).unwrap());
+        let price_diff = (trade.price.value() - float!(146.317))
+            .unwrap()
+            .abs()
+            .unwrap();
+        assert!(price_diff.lt(float!(0.001)).unwrap());
+    }
 
     #[tokio::test]
     async fn try_from_inventory_trade_real_bebop_fill_is_sell() {
