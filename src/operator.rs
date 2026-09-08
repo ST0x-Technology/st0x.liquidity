@@ -934,7 +934,8 @@ pub mod position {
             OrderPlacementResult, OrderPlacer,
         };
 
-        /// An [`OrderPlacer`] for repair that must never place or cancel an order:
+        /// An [`OrderPlacer`] for repair that must never place or cancel an order.
+        ///
         /// `MarkFailed` is a pure terminal transition that never touches the placer.
         /// Returns an error on the unreachable placement/cancellation paths rather
         /// than panicking.
@@ -967,6 +968,7 @@ pub mod position {
         }
 
         /// What the repair must do with a freshly re-loaded `OffchainOrder` state.
+        ///
         /// The "executed shares always escalate" rule is the load-bearing
         /// financial-safety invariant of this command; classifying the state in one
         /// place keeps the pre-send guard and the post-send `AlreadyCompleted`
@@ -1008,7 +1010,9 @@ pub mod position {
 
         /// Drives the standalone `OffchainOrder` aggregate (pre-loaded by the caller)
         /// to its `Failed` terminal via `MarkFailed`, after its position pointer has
-        /// been cleared. Routed through the wired store so `offchain_order_view`
+        /// been cleared.
+        ///
+        /// Routed through the wired store so `offchain_order_view`
         /// updates immediately. Idempotent: an already-`Failed` or absent order is
         /// reported and left untouched rather than erroring, so a partial prior run
         /// can be re-run safely; `Filled`/`PartiallyFilled` orders are refused because

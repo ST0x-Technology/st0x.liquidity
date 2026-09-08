@@ -2494,7 +2494,7 @@ async fn set_position_exposure(
         .map(|price| {
             let float = Float::parse(price).map_err(ops_precondition_error)?;
             Positive::new(float)
-                .map(|positive| positive.inner())
+                .map(Positive::inner)
                 .map_err(|_| ops_precondition_error("price must be strictly positive"))
         })
         .transpose()?;
