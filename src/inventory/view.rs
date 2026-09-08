@@ -1495,9 +1495,9 @@ impl InventoryView {
     }
 
     /// Like [`Self::update_equity`], addressed to an explicit chain's slot:
-    /// snapshot application routes by the event's own chain rather than the
-    /// trading chain.
-    fn update_equity_at(
+    /// snapshot application and fill deltas route by the event's own chain
+    /// rather than the trading chain.
+    pub(crate) fn update_equity_at(
         self,
         symbol: &Symbol,
         chain: Chain,
@@ -1557,7 +1557,7 @@ impl InventoryView {
     }
 
     /// Like [`Self::update_usdc`], addressed to an explicit chain's slot.
-    fn update_usdc_at(
+    pub(crate) fn update_usdc_at(
         self,
         chain: Chain,
         update: impl FnOnce(Inventory<Usdc>, Chain) -> Result<Inventory<Usdc>, InventoryError<Usdc>>,

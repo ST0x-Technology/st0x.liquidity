@@ -2421,7 +2421,7 @@ impl Reactor for RebalancingService {
                         // between. An absorbed leg is normal operation under
                         // load, not an error -- the poll simply observed the
                         // fill before this event arrived.
-                        {
+                        let trading_chain = {
                             let mut inventory = self.inventory.write().await;
                             let apply_equity_leg = !inventory
                                 .onchain_fill_absorbed_by_equity_snapshot(&symbol, trade_id.chain, *block_number);
@@ -2440,16 +2440,23 @@ impl Reactor for RebalancingService {
                                 );
                             }
 
+                            // Chain-addressed: inventory is not fungible
+                            // across chains, so a fill credits and debits the
+                            // slots of the chain it filled on. Routing it
+                            // through the venue-addressed writers would move
+                            // the trading chain's balances instead.
                             let mut updated = inventory.clone();
                             if apply_equity_leg {
-                                updated = updated.update_equity(
+                                updated = updated.update_equity_at(
                                     &symbol,
+                                    trade_id.chain,
                                     Inventory::available(Venue::MarketMaking, equity_op, *amount),
                                     timestamp,
                                 )?;
                             }
                             if apply_usdc_leg {
-                                updated = updated.update_usdc(
+                                updated = updated.update_usdc_at(
+                                    trade_id.chain,
                                     Inventory::available(
                                         Venue::MarketMaking,
                                         equity_op.inverse(),
@@ -2459,10 +2466,18 @@ impl Reactor for RebalancingService {
                                 )?;
                             }
                             *inventory = updated;
+                            inventory.trading_chain()
+                        };
+
+                        // Only the trading chain rebalances: a secondary is
+                        // prefunded and holds its own inventory, so its fill
+                        // must not schedule work against the trading chain's
+                        // balances.
+                        if trade_id.chain == trading_chain {
+                            self.equity_scheduler.enqueue_check(symbol).await;
+                            self.usdc_scheduler.enqueue_check().await;
                         }
 
-                        self.equity_scheduler.enqueue_check(symbol).await;
-                        self.usdc_scheduler.enqueue_check().await;
                         return Ok(());
                     }
                     OffChainOrderFilled {
