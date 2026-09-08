@@ -1724,6 +1724,7 @@ mod tests {
 
     use st0x_bridge::cctp::CctpError;
     use st0x_config::ChainRegistry;
+    use st0x_config::CtxError;
     use st0x_config::ExecutionThreshold;
     use st0x_config::HedgingAssets;
     use st0x_config::RebalancingCtx;
@@ -2809,12 +2810,12 @@ mod tests {
         let ctx = create_alpaca_ctx_without_rebalancing();
         assert_eq!(ctx.chains.primary().redemption_wallet, None);
 
-        let result = resolve_redemption_wallet(None, TokenizationNetwork::Base, &ctx);
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("redemption_wallet"),
-            "Expected tokenization config error, got: {err_msg}"
-        );
+        let error = resolve_redemption_wallet(None, TokenizationNetwork::Base, &ctx).unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<CtxError>(),
+            Some(CtxError::RedemptionWalletNotConfigured { chain: Chain::Base })
+        ));
     }
 
     /// Redemption wallets are per chain: the selected network resolves its
@@ -2850,14 +2851,15 @@ mod tests {
         ctx.chains.primary_mut().redemption_wallet =
             Some(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
 
-        let error = resolve_redemption_wallet(None, TokenizationNetwork::Ethereum, &ctx)
-            .unwrap_err()
-            .to_string();
+        let error =
+            resolve_redemption_wallet(None, TokenizationNetwork::Ethereum, &ctx).unwrap_err();
 
-        assert!(
-            error.contains("ethereum") && error.contains("redemption_wallet"),
-            "expected a per-chain redemption wallet error naming ethereum, got: {error}"
-        );
+        assert!(matches!(
+            error.downcast_ref::<CtxError>(),
+            Some(CtxError::RedemptionWalletNotConfigured {
+                chain: Chain::Ethereum
+            })
+        ));
     }
 
     /// One match yields both the wallet and the wire value, so the pairing is
