@@ -5273,6 +5273,67 @@ mod tests {
         );
     }
 
+    /// Queues the RPC responses one watched chain's startup probes read, in
+    /// order: the chain tip, the chain id, then a null cutoff block (a cold
+    /// endpoint, which startup allows through).
+    fn watched_chain_asserter(chain: Chain) -> Asserter {
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::from(100u64));
+        asserter.push_success(&format!("0x{:x}", chain.chain_id()));
+        asserter.push_success(&serde_json::Value::Null);
+        asserter
+    }
+
+    /// The read canary belongs to every watched chain, not just the primary:
+    /// a secondary's mistyped token address is exactly the config error the
+    /// canary exists to catch, and a bot that starts anyway only discovers it
+    /// when the first fill on that chain needs the token.
+    #[tokio::test]
+    async fn asset_canary_runs_on_every_watched_chain() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        *ctx.chains.primary_mut() = trading_chain_with_equity(
+            "AAPL",
+            address!("0x1111111111111111111111111111111111111111"),
+        );
+        let mut secondary = trading_chain_with_equity(
+            "MSFT",
+            address!("0x2222222222222222222222222222222222222222"),
+        );
+        secondary.chain = Chain::Ethereum;
+        ctx.chains.insert_secondary(secondary);
+
+        let primary_asserter = watched_chain_asserter(Chain::Base);
+        primary_asserter.push_success(
+            &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
+                &18u8,
+            ),
+        );
+        let provider = ProviderBuilder::new().connect_mocked_client(primary_asserter);
+
+        // The secondary's configured token answers nothing: a dead address,
+        // a wrong-chain endpoint or a broken RPC all surface this way.
+        let secondary_asserter = watched_chain_asserter(Chain::Ethereum);
+        secondary_asserter.push_failure_msg("connection reset by peer");
+        let watch_providers = BTreeMap::from([(
+            Chain::Ethereum,
+            ProviderBuilder::new().connect_mocked_client(secondary_asserter),
+        )]);
+
+        let error = startup_smoke_checks(&MockExecutor::new(), &provider, &watch_providers, &ctx)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("did not answer decimals()"),
+            "the error must name the canary read: {message}"
+        );
+        assert!(
+            message.contains("MSFT") && message.contains("ethereum"),
+            "the error must name the secondary chain and its symbol: {message}"
+        );
+    }
+
     /// The durable double-hedge guard keys on the full chain-qualified fill
     /// identity: the same (tx_hash, log_index) on another chain is a distinct
     /// fill, never a duplicate (SPEC multi-chain invariant 3), while the same
