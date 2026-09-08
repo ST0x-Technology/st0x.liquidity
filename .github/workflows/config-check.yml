@@ -1,0 +1,33 @@
+name: config-check
+
+# PR guard for the deployed configs, parsed by the validate-config binary
+# inside the image each file targets: config/prod vs the newest RELEASED
+# bot image (highest v* label; v1.10.0's validator still demands
+# --secrets, so it reports "NOT validated" until the next release),
+# config/staging vs the newest master build. Early warning only; the
+# release itself re-validates against the exact digest it rolls.
+# config-drift.yml guards the other direction (this ref's schema against
+# the same files).
+
+on:
+  pull_request:
+    paths:
+      - "config/staging/st0x-hedge.toml"
+      - "config/prod/st0x-hedge.toml"
+      - ".github/workflows/config-check.yml"
+
+jobs:
+  validate:
+    permissions:
+      id-token: write
+      contents: read
+    uses: ST0x-Technology/.github/.github/workflows/config-check.yml@16aab8c5db9e2a4e70dba4b1af73d3c9336c6816  # config-check @ .github main
+    with:
+      production_files: config/prod/st0x-hedge.toml
+      staging_files: config/staging/st0x-hedge.toml
+      default_branch: master
+      ar_repo: europe-west3-docker.pkg.dev/t0-artifacts/t0-liquidity
+      image: t0-liquidity
+      service_account: liquidity-labeler@t0-artifacts.iam.gserviceaccount.com
+      validate_entrypoint: /bin/validate-config
+      validate_command: --config /candidate.toml

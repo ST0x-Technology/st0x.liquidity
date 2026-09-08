@@ -1,0 +1,53 @@
+name: production-release
+
+# Production releases that are NOT a new version tag (those are
+# release-tag.yml):
+#   - a merge to master touching config/prod/st0x-hedge.toml is a
+#     CONFIG-ONLY release: the file is validated inside the bot digest LIVE
+#     in production, published as a new liquidity-runtime-config version,
+#     and images.env is rewritten with that CONFIG_VERSION on the same
+#     digests (the VM restarts the stack behind its health gate);
+#   - workflow_dispatch with a version is a ROLLBACK (or re-deploy): images
+#     and config both come from that tag.
+# Both block on the app-deploy PAM grant in t0-liquidity, approved in the
+# GCP console; the justification names the digest and config version swap.
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - config/prod/st0x-hedge.toml
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to deploy (vX.Y.Z), images and config both from that tag"
+        required: true
+        type: string
+
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    permissions:
+      id-token: write
+      contents: read
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@16aab8c5db9e2a4e70dba4b1af73d3c9336c6816  # app-release @ .github main
+    with:
+      environment: production
+      runtime: bot-vm
+      project: t0-liquidity
+      config_bucket: t0-liquidity-config
+      ar_repo: europe-west3-docker.pkg.dev/t0-artifacts/t0-liquidity
+      images: t0-liquidity=BOT_IMAGE t0-liquidity-dashboard=DASHBOARD_IMAGE t0-liquidity-datasette=DATASETTE_IMAGE
+      attestor: projects/t0-artifacts/attestors/liquidity-image
+      service_account: liquidity-releaser@t0-artifacts.iam.gserviceaccount.com
+      pam_entitlement: app-deploy
+      image_tag: ${{ inputs.version || '' }}
+      ref: ${{ inputs.version || '' }}
+      config_file: config/prod/st0x-hedge.toml
+      config_secret: liquidity-runtime-config
+      validate_entrypoint: /bin/validate-config
+      validate_command: --config /candidate.toml
