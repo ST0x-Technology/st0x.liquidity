@@ -2072,6 +2072,22 @@ async fn confirm_transport_chain_ids(ctx: &Ctx) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The watched secondaries whose vaults are managed but never read: the
+/// inventory poller runs on the primary chain alone, so nothing keeps these
+/// chains' slots current. Sorted by [`ChainRegistry::watched`]'s own order so
+/// the startup warnings come out deterministically.
+fn unpolled_managed_secondaries(ctx: &Ctx) -> Vec<Chain> {
+    ctx.chains
+        .watched()
+        .filter(|watched| watched.chain != ctx.chains.primary().chain)
+        .filter(|watched| match watched.inventory {
+            InventoryMode::Legacy => false,
+            InventoryMode::Managed { .. } => true,
+        })
+        .map(|watched| watched.chain)
+        .collect()
+}
+
 /// Every startup smoke check, in one place, all read-only. `/health` reports
 /// healthy only after these pass AND every run loop has acknowledged the
 /// startup barrier, so a deploy probe cannot see a 200 from a bot that failed
@@ -2130,6 +2146,19 @@ where
         }
 
         confirm_configured_asset_responds(chain_provider, watched).await?;
+    }
+
+    // Not a refusal: a prefunded secondary is a valid rollout state, and
+    // refusing would block it. The operator tops these vaults up by hand
+    // and reads their balances offchain until per-chain polling lands.
+    for chain in unpolled_managed_secondaries(ctx) {
+        warn!(
+            target: "startup",
+            %chain,
+            "This chain's vault inventory is not polled: inventory polling runs on the \
+             primary chain only, so the chain's balances must be funded and watched by \
+             hand"
+        );
     }
 
     confirm_transport_chain_ids(ctx).await?;
@@ -5375,6 +5404,32 @@ mod tests {
             logs_contain("chain=ethereum"),
             "the warning must name the chain the operator has to manage by hand"
         );
+    }
+
+    /// The warning is owed by a managed secondary alone: the primary is
+    /// polled, and a legacy chain has no managed vaults to be missed.
+    #[test]
+    fn unpolled_managed_secondaries_selects_only_managed_non_primary_chains() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains.primary_mut().inventory = InventoryMode::Managed {
+            inventory: Address::repeat_byte(0xAA),
+        };
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .inventory(InventoryMode::Managed {
+                    inventory: Address::repeat_byte(0xBB),
+                })
+                .call(),
+        );
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::HyperEvm)
+                .inventory(InventoryMode::Legacy)
+                .call(),
+        );
+
+        assert_eq!(unpolled_managed_secondaries(&ctx), vec![Chain::Ethereum]);
     }
 
     /// The durable double-hedge guard keys on the full chain-qualified fill
