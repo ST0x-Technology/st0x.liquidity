@@ -36,9 +36,9 @@ use st0x_execution::{AlpacaTransferId, ClientOrderId, FractionalShares, Symbol};
 use st0x_finance::Usdc;
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
 use st0x_tokenization::{
-    AlpacaTokenizationError, IssuerRequestId, TokenizationRequest, TokenizationRequestId,
-    TokenizationRequestStatus, TokenizationRequestType, Tokenizer, TokenizerError,
-    tokenization_request_id,
+    AlpacaTokenizationError, ClientRequestId, IssuerRequestId, TokenizationRequest,
+    TokenizationRequestId, TokenizationRequestStatus, TokenizationRequestType, Tokenizer,
+    TokenizerError, tokenization_request_id,
 };
 use st0x_wrapper::{
     UnderlyingPerWrapped, UnwrapConfirmation, WrapConfirmation, Wrapper, WrapperError,
@@ -63,8 +63,9 @@ use crate::vault_lookup::{VaultLookup, VaultLookupError};
 /// [`seed_simulated_equity_redemption_history`]'s temporary stores.
 ///
 /// The mint fixture drives only the mint happy path (`RequestMintAt` ->
-/// `PollAt` -> `WrapTokensAt` -> `DepositToVaultAt`), which calls exactly
-/// `request_mint`/`poll_mint_until_complete`. The redemption fixture drives
+/// `SubmitMintRequestAt` -> `PollAt` -> `WrapTokensAt` -> `DepositToVaultAt`),
+/// which calls exactly `request_mint`/`poll_mint_until_complete`.
+/// The redemption fixture drives
 /// only `wait_for_block`/`redemption_wallet`/`send_for_redemption` (its
 /// `Detect`/`Complete` steps are pure state transitions with no service
 /// call). Every other `Tokenizer` method is unreachable from either path.
@@ -75,7 +76,7 @@ use crate::vault_lookup::{VaultLookup, VaultLookupError};
 /// `token_symbol == format!("t{symbol}")`, and this fixture cycles through
 /// multiple symbols in one run.
 struct FixtureTokenizer {
-    pending: Mutex<HashMap<TokenizationRequestId, (Symbol, TxHash)>>,
+    pending: Mutex<HashMap<TokenizationRequestId, (TokenizationRequest, TxHash)>>,
     redemption_wallet: Address,
     /// Feeds `send_for_redemption`'s synthetic tx hash through
     /// `simulated_transfer_uuid`, keeping it deterministic across runs like
@@ -107,12 +108,7 @@ impl Tokenizer for FixtureTokenizer {
         // `TokenizationRequestId` string: `TxHash::left_padding_from` panics
         // above 32 input bytes, and the request-id string exceeds that.
         let tx_hash = TxHash::left_padding_from(issuer_request_id.0.as_bytes());
-        self.pending
-            .lock()
-            .await
-            .insert(id.clone(), (symbol.clone(), tx_hash));
-
-        Ok(TokenizationRequest {
+        let request = TokenizationRequest {
             id,
             r#type: Some(TokenizationRequestType::Mint),
             status: TokenizationRequestStatus::Pending,
@@ -120,33 +116,51 @@ impl Tokenizer for FixtureTokenizer {
             token_symbol: None,
             quantity,
             wallet: Some(wallet),
-            issuer_request_id: Some(issuer_request_id),
+            client_request_id: Some(ClientRequestId::from(&issuer_request_id)),
+            issuer_request_id: None,
             tx_hash: None,
             fees: None,
             created_at: Utc::now(),
-        })
+        };
+        self.pending
+            .lock()
+            .await
+            .insert(request.id.clone(), (request.clone(), tx_hash));
+
+        Ok(request)
+    }
+
+    async fn find_mint_by_issuer_request_id(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<Option<TokenizationRequest>, TokenizerError> {
+        let expected_client_request_id = issuer_request_id.to_string();
+        Ok(self
+            .pending
+            .lock()
+            .await
+            .values()
+            .find(|(request, _)| {
+                request.client_request_id.as_ref().map(AsRef::as_ref)
+                    == Some(expected_client_request_id.as_str())
+            })
+            .map(|(request, _)| request.clone()))
     }
 
     async fn poll_mint_until_complete(
         &self,
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        let (symbol, tx_hash) = self.pending.lock().await.get(id).cloned().ok_or_else(|| {
+        let (request, tx_hash) = self.pending.lock().await.get(id).cloned().ok_or_else(|| {
             TokenizerError::Alpaca(AlpacaTokenizationError::RequestNotFound { id: id.clone() })
         })?;
+        let token_symbol = Some(format!("t{}", request.underlying_symbol));
 
         Ok(TokenizationRequest {
-            id: id.clone(),
-            r#type: Some(TokenizationRequestType::Mint),
             status: TokenizationRequestStatus::Completed,
-            token_symbol: Some(format!("t{symbol}")),
-            underlying_symbol: symbol,
-            quantity: FractionalShares::ZERO,
-            wallet: None,
-            issuer_request_id: None,
+            token_symbol,
             tx_hash: Some(tx_hash),
-            fees: None,
-            created_at: Utc::now(),
+            ..request
         })
     }
 
@@ -228,7 +242,7 @@ fn usdc(value: f64) -> anyhow::Result<Usdc> {
 /// Seeds deterministic equity-mint history for local dashboard simulation.
 ///
 /// Drives the `TokenizedEquityMint` aggregate's happy path
-/// (`RequestMintAt` -> `PollAt` -> `WrapTokensAt` -> `DepositToVaultAt`)
+/// (`RequestMintAt` -> `SubmitMintRequestAt` -> `PollAt` -> `WrapTokensAt` -> `DepositToVaultAt`)
 /// through a temporary store, one mint per day alternating between the same
 /// dedicated fixture symbols (`AAPL.SIM`/`TSLA.SIM`) used by
 /// [`super::seed_simulated_hedge_latency_history`].
@@ -275,6 +289,15 @@ pub async fn seed_simulated_mint_history(
                 quantity,
                 wallet,
                 requested_at,
+            },
+        )
+        .await?;
+
+        mint.send(
+            &issuer_request_id,
+            TokenizedEquityMintCommand::SubmitMintRequestAt {
+                issuer_request_id: issuer_request_id.clone(),
+                accepted_at: requested_at,
             },
         )
         .await?;
@@ -1162,7 +1185,8 @@ pub async fn seed_simulated_equity_redemption_history(
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
-    use st0x_dto::EquityOperationKind;
+
+    use st0x_dto::{EquityOperationKind, EquityStageName};
     use st0x_event_sorcery::load_entity;
 
     use super::*;
@@ -1197,6 +1221,23 @@ mod tests {
             .unwrap();
         assert_eq!(timings.total_operations, days as usize);
         assert_eq!(timings.skipped_operations, 0);
+        for operation in &timings.operations {
+            let stages: Vec<_> = operation
+                .stages
+                .iter()
+                .map(|stage| (stage.stage, stage.duration_ms))
+                .collect();
+            assert_eq!(
+                stages,
+                vec![
+                    (EquityStageName::MintAcceptance, Some(0)),
+                    (EquityStageName::MintReceipt, Some(150_000)),
+                    (EquityStageName::MintWrap, Some(45_000)),
+                    (EquityStageName::MintDeposit, Some(30_000)),
+                ]
+            );
+            assert_eq!(operation.total_ms, Some(225_000));
+        }
         assert!(
             timings
                 .operations

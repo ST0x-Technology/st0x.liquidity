@@ -1035,6 +1035,7 @@ mod tests {
     pub(super) fn mint_happy_path() -> Vec<TokenizedEquityMintEvent> {
         vec![
             TokenizedEquityMintEvent::MintRequested {
+                issuer_request_id: None,
                 symbol: symbol(),
                 quantity: float!(5),
                 wallet: Address::repeat_byte(0x11),
@@ -1230,9 +1231,8 @@ mod tests {
 
         // Seed events directly through a store with NO projection attached,
         // simulating history that accumulated before this projection existed.
-        // `RequestMint`'s `initialize()` calls `services.tokenizer.request_mint`,
-        // so the panicking stub's tokenizer is swapped for a working mock --
-        // mirrors `simulated_transfers.rs`'s `FixtureTokenizer` wiring pattern.
+        // The submission command calls the tokenizer, so the panicking stub's
+        // tokenizer is swapped for a working mock.
         let mut services = crate::rebalancing::equity::EquityTransferServices::panicking();
         services.tokenizer = Arc::new(st0x_tokenization::mock::MockTokenizer::new());
         let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
@@ -1253,11 +1253,21 @@ mod tests {
             )
             .await
             .unwrap();
+        mint_store
+            .send(
+                &operation_id,
+                TokenizedEquityMintCommand::SubmitMintRequestAt {
+                    issuer_request_id: operation_id.clone(),
+                    accepted_at: timestamp(10),
+                },
+            )
+            .await
+            .unwrap();
 
         let projection = EquityTimingProjection::new(pool.clone());
         let replayed = projection.catch_up().await.unwrap();
-        // `RequestMintAt` against a mock tokenizer that returns `Pending` (not
-        // `Rejected`) persists both `MintRequested` and `MintAccepted`.
+        // Intent persistence followed by a successful submission creates the
+        // two pre-existing events.
         assert_eq!(
             replayed, 2,
             "catch_up must replay exactly the two pre-existing events"
@@ -1266,6 +1276,10 @@ mod tests {
         let report = load_equity_timings(&pool, &range()).await.unwrap();
         assert_eq!(report.operations.len(), 1);
         assert_eq!(report.operations[0].kind, EquityOperationKind::Mint);
+        assert_eq!(
+            stage(&report.operations[0], EquityStageName::MintAcceptance).duration_ms,
+            Some(10_000)
+        );
         assert_eq!(
             report.operations[0].status,
             RebalanceTimingStatus::InProgress
@@ -1651,6 +1665,7 @@ mod tests {
             &mint_id.to_string(),
             1,
             &serde_json::to_string(&TokenizedEquityMintEvent::MintRequested {
+                issuer_request_id: None,
                 symbol: symbol(),
                 quantity: float!(5),
                 wallet: Address::repeat_byte(0x11),
@@ -1769,6 +1784,7 @@ mod tests {
         // must keep it from leaking a negative sample into percentiles.
         let events = [
             TokenizedEquityMintEvent::MintRequested {
+                issuer_request_id: None,
                 symbol: symbol(),
                 quantity: float!(5),
                 wallet: Address::repeat_byte(0x11),

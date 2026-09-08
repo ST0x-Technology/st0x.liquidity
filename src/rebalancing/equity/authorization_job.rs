@@ -446,6 +446,15 @@ mod tests {
         store
             .send(
                 &id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
                 TokenizedEquityMintCommand::SignMintAuthorization {
                     token: Address::repeat_byte(0x11),
                 },

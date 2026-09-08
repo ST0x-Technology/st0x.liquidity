@@ -11,7 +11,7 @@ use uuid::uuid;
 
 use st0x_evm::Wallet;
 use st0x_evm::local::RawPrivateKeyWallet;
-use st0x_execution::{AlpacaAccountId, Network, PollingConfig};
+use st0x_execution::{AlpacaAccountId, FractionalShares, Network, PollingConfig};
 use st0x_tokenization::{AlpacaTokenizationService, IssuerRequestId};
 
 pub(crate) const TEST_ACCOUNT_ID: AlpacaAccountId =
@@ -111,6 +111,8 @@ pub(crate) fn setup_redemption_mocks(
 pub(crate) fn sample_pending_response(
     tokenization_request_id: &str,
     issuer_request_id: &IssuerRequestId,
+    quantity: FractionalShares,
+    wallet: Address,
 ) -> serde_json::Value {
     json!({
         "tokenization_request_id": tokenization_request_id,
@@ -118,11 +120,11 @@ pub(crate) fn sample_pending_response(
         "status": "pending",
         "underlying_symbol": "AAPL",
         "token_symbol": "tAAPL",
-        "qty": "30.0",
+        "qty": quantity.to_string(),
         "issuer": "st0x",
         "network": "base",
-        "wallet_address": "0x0000000000000000000000000000000000000000",
-        "issuer_request_id": issuer_request_id.to_string(),
+        "wallet_address": wallet,
+        "client_request_id": issuer_request_id.to_string(),
         "created_at": "2024-01-15T10:30:00Z"
     })
 }
@@ -130,6 +132,8 @@ pub(crate) fn sample_pending_response(
 pub(crate) fn sample_completed_response(
     tokenization_request_id: &str,
     issuer_request_id: &IssuerRequestId,
+    quantity: FractionalShares,
+    wallet: Address,
     tx_hash: TxHash,
 ) -> serde_json::Value {
     json!({
@@ -138,11 +142,11 @@ pub(crate) fn sample_completed_response(
         "status": "completed",
         "underlying_symbol": "AAPL",
         "token_symbol": "tAAPL",
-        "qty": "30.0",
+        "qty": quantity.to_string(),
         "issuer": "st0x",
         "network": "base",
-        "wallet_address": "0x0000000000000000000000000000000000000000",
-        "issuer_request_id": issuer_request_id.to_string(),
+        "wallet_address": wallet,
+        "client_request_id": issuer_request_id.to_string(),
         "tx_hash": tx_hash,
         "created_at": "2024-01-15T10:30:00Z"
     })

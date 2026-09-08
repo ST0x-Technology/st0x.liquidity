@@ -573,6 +573,14 @@ where
     fn label(&self) -> Label;
 
     async fn perform(&self, ctx: &Ctx) -> Result<(), Self::Error>;
+
+    async fn on_terminal_attempt(
+        &self,
+        _ctx: &Ctx,
+        _task_identity: &TaskIdentity,
+    ) -> Result<(), BoxDynError> {
+        Ok(())
+    }
 }
 ```
 
@@ -580,7 +588,9 @@ The `Ctx` type parameter bundles all runtime dependencies into one struct,
 injected via apalis `Data<Arc<Ctx>>`. This keeps job structs serializable (data
 only) while the context provides access to executor, CQRS frameworks, config,
 etc. `label()` returns a human-readable `Label` used by `work` for structured
-logging.
+logging. `on_terminal_attempt()` defaults to a no-op. Jobs use it for bounded,
+idempotent reconciliation that must run immediately before a durably terminal
+failure is acknowledged.
 
 ### work
 
@@ -654,6 +664,23 @@ WorkerBuilder::new(name)
   on retry, so they rely on their own phase-aware deadlines instead. A new `Job`
   impl must decide this deliberately -- grep the impls that set `None` for the
   current opt-outs and their reasons.
+- **`Job::on_terminal_attempt`.** `perform_bounded()` invokes this hook only
+  when a handler error or `PerformTimeout` has exhausted the SQLite attempt
+  budget. Apalis marks the task killed at that point, so its in-memory retry
+  layer cannot schedule another call. The hook runs before the worker returns
+  the original error, so cleanup is at least once: a process crash can cause the
+  same terminal attempt to run it again. The hook therefore must be idempotent
+  and has its own five-second timeout. Hook errors and timeouts are logged, but
+  never replace the job's original error or prevent the queue row from reaching
+  its normal dead-letter state. Success, self-reschedule, non-final failures,
+  and injected test failures do not invoke it. Equity-transfer jobs use this
+  hook to release an in-memory active-transfer guard only when the matching
+  lifecycle aggregate does not exist. The comparison includes a process nonce
+  and monotonic counter. Before allocating claims, startup advances the counter
+  past every persisted transfer generation with the same nonce, including
+  terminal rows. A repeated nonce therefore cannot let a delayed old job clear a
+  newer guard after a restart. Legacy payloads decode with generation zero and
+  can clear only a matching zero-generation owner restored from that payload.
 - **No circuit breaker (RAI-1495).** Supervised workers do NOT install Apalis'
   `CircuitBreakerService` layer -- neither does `build_best_effort_worker!`,
   which never had one. Previously `build_supervised_worker!` did

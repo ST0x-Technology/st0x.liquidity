@@ -1472,6 +1472,9 @@ fn format_tokenization_request<Writer: Write>(
     if let Some(ref issuer_id) = request.issuer_request_id {
         writeln!(stdout, "   Issuer ID: {}", issuer_id.0)?;
     }
+    if let Some(ref client_id) = request.client_request_id {
+        writeln!(stdout, "   Client ID: {client_id}")?;
+    }
 
     Ok(())
 }
@@ -1741,10 +1744,50 @@ mod tests {
     };
     use st0x_hedge::operator::vault_lookup::MockVaultLookup;
     use st0x_tokenization::mock::MockTokenizer;
-    use st0x_tokenization::{TokenizerError, issuer_request_id, tokenization_request_id};
+    use st0x_tokenization::{
+        ClientRequestId, TokenizerError, issuer_request_id, tokenization_request_id,
+    };
     use st0x_wrapper::MockWrapper;
 
     use super::*;
+
+    #[test]
+    fn format_tokenization_request_includes_only_present_client_id() {
+        let mut request = TokenizationRequest::mock(TokenizationRequestStatus::Pending);
+        request.created_at = "2026-01-01T00:00:00Z".parse().unwrap();
+        for (client_id, expected) in [
+            (
+                None,
+                concat!(
+                    "   ─────────────────────────────────────\n",
+                    "   ID:       MOCK_REQ_ID\n",
+                    "   Type:     unknown\n",
+                    "   Status:   ⏳ pending\n",
+                    "   Symbol:   AAPL\n",
+                    "   Quantity: 0\n",
+                    "   Created:  2026-01-01 00:00:00 UTC\n",
+                ),
+            ),
+            (
+                Some(ClientRequestId::try_new("client-123").unwrap()),
+                concat!(
+                    "   ─────────────────────────────────────\n",
+                    "   ID:       MOCK_REQ_ID\n",
+                    "   Type:     unknown\n",
+                    "   Status:   ⏳ pending\n",
+                    "   Symbol:   AAPL\n",
+                    "   Quantity: 0\n",
+                    "   Created:  2026-01-01 00:00:00 UTC\n",
+                    "   Client ID: client-123\n",
+                ),
+            ),
+        ] {
+            request.client_request_id = client_id;
+            let mut output = Vec::new();
+            format_tokenization_request(&mut output, &request).unwrap();
+            assert_eq!(String::from_utf8(output).unwrap(), expected);
+        }
+    }
 
     async fn setup_test_db() -> SqlitePool {
         try_setup_test_db()
@@ -4609,48 +4652,19 @@ mod tests {
         );
     }
 
-    /// Inserts a raw event row for a `TokenizedEquityMint` aggregate. The
-    /// `MintRequested`-only state is unreachable via commands by design (the bot
-    /// requests and accepts/rejects in one atomic command), so a mint genuinely
-    /// stuck pre-acceptance only exists in an abnormal event log and must be
-    /// seeded as a raw event -- the established test-only pattern for states
-    /// unreachable via commands, mirroring this aggregate's own test module.
-    /// Sequences are 1-based (the snapshot-aware loader reads `sequence > 0`).
-    async fn insert_mint_event(
-        pool: &SqlitePool,
-        id: &IssuerRequestId,
-        sequence: i64,
-        event_type: &str,
-        payload: &str,
-    ) {
-        sqlx::query(
-            "INSERT INTO events \
-             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
-             VALUES ('TokenizedEquityMint', ?, ?, ?, '1.0', ?, '{}')",
-        )
-        .bind(id.to_string())
-        .bind(sequence)
-        .bind(event_type)
-        .bind(payload)
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
     #[tokio::test]
     async fn fail_transfer_mint_force_fails_from_requested() {
-        // RAI-999: a mint stuck at MintRequested (requested at the provider but
-        // never accepted) must force-fail via the CLI -- previously the CLI
-        // bailed with "cannot fail before acceptance". The state is unreachable
-        // via commands, so seed a bare MintRequested raw event.
         let pool = setup_test_db().await;
         let id = issuer_request_id("cli-mint-requested");
-        insert_mint_event(
+        send_mint_command(
             &pool,
             &id,
-            1,
-            "TokenizedEquityMintEvent::MintRequested",
-            r#"{"MintRequested":{"symbol":"AAPL","quantity":"10","wallet":"0x0000000000000000000000000000000000000001","requested_at":"2026-01-01T00:00:00Z"}}"#,
+            TokenizedEquityMintCommand::RequestMint {
+                issuer_request_id: id.clone(),
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: float!(10),
+                wallet: Address::from([1; 20]),
+            },
         )
         .await;
 

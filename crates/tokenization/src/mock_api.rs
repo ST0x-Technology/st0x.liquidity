@@ -14,7 +14,6 @@ use alloy::primitives::{Address, U256, address};
 use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolEvent;
-use chrono::Utc;
 use httpmock::prelude::*;
 use rain_math_float::Float;
 use serde_json::{Value, json};
@@ -77,9 +76,11 @@ impl std::fmt::Display for TokenizationRequestType {
 }
 
 /// A mock tokenization request tracked in shared state.
+#[derive(Clone)]
 struct MockTokenizationRequest {
     tokenization_request_id: String,
-    issuer_request_id: String,
+    idempotency_key: Option<String>,
+    correlation_id: String,
     underlying_symbol: String,
     quantity: Float,
     wallet_address: Address,
@@ -159,6 +160,7 @@ impl AlpacaTokenizationMock {
 
         register_mint_endpoint(server, &state);
         register_tokenization_requests_with_filter_endpoint(server, &state, &broker);
+        register_tokenization_request_by_client_id_endpoint(server, &state);
 
         Self {
             broker,
@@ -315,7 +317,8 @@ impl AlpacaTokenizationMock {
 
         state.requests.push(MockTokenizationRequest {
             tokenization_request_id: Uuid::new_v4().to_string(),
-            issuer_request_id: Uuid::new_v4().to_string(),
+            idempotency_key: None,
+            correlation_id: Uuid::new_v4().to_string(),
             underlying_symbol: symbol.to_string(),
             quantity,
             wallet_address: wallet,
@@ -507,7 +510,8 @@ async fn scan_block_for_redemptions<P: Provider>(
 
             guard.requests.push(MockTokenizationRequest {
                 tokenization_request_id: Uuid::new_v4().to_string(),
-                issuer_request_id: Uuid::new_v4().to_string(),
+                idempotency_key: None,
+                correlation_id: Uuid::new_v4().to_string(),
                 underlying_symbol: symbol.clone(),
                 quantity,
                 // Use the bot's wallet (order_owner), matching real Alpaca
@@ -609,48 +613,110 @@ fn register_mint_endpoint(server: &MockServer, state: &Arc<Mutex<TokenizationSta
                     &json!({"message": format!("invalid wallet_address: {wallet_address_str}")}),
                 );
             };
-            let issuer_request_id = body["issuer_request_id"]
+            let client_request_id = body["client_request_id"]
                 .as_str()
                 .map_or_else(|| Uuid::new_v4().to_string(), ToString::to_string);
+            let idempotency_key = request
+                .headers()
+                .get("Idempotency-Key")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string);
 
-            let tokenization_request_id = Uuid::new_v4().to_string();
+            let mut state = lock(&state);
+            if let Some(existing) = idempotency_key.as_ref().and_then(|key| {
+                state
+                    .requests
+                    .iter()
+                    .find(|existing| existing.idempotency_key.as_ref() == Some(key))
+            }) {
+                let quantities_equal = match existing.quantity.eq(quantity) {
+                    Ok(equal) => equal,
+                    Err(error) => {
+                        warn!(?error, "failed to compare idempotent mint quantities");
 
-            {
-                let mut state = lock(&state);
-                let polls_until_complete = state.polls_until_complete;
+                        return json_response(
+                            500,
+                            &json!({"message": "failed to compare mint quantities"}),
+                        );
+                    }
+                };
+                let equivalent = existing.request_type == TokenizationRequestType::Mint
+                    && existing.correlation_id == client_request_id
+                    && existing.underlying_symbol == underlying_symbol
+                    && quantities_equal
+                    && existing.wallet_address == wallet_address;
 
-                state.requests.push(MockTokenizationRequest {
-                    tokenization_request_id: tokenization_request_id.clone(),
-                    issuer_request_id: issuer_request_id.clone(),
-                    underlying_symbol: underlying_symbol.clone(),
-                    quantity,
-                    wallet_address,
-                    status: TokenizationStatus::Pending,
-                    poll_count: 0,
-                    polls_until_complete,
-                    request_type: TokenizationRequestType::Mint,
-                    tx_hash: String::new(),
-                    needs_mint_execution: false,
-                });
+                return if equivalent {
+                    json_response(200, &tokenization_request_to_json(existing))
+                } else {
+                    json_response(
+                        422,
+                        &json!({"message": "idempotency key reused with a different request body"}),
+                    )
+                };
             }
 
-            json_response(
-                200,
-                &json!({
-                    "tokenization_request_id": tokenization_request_id,
-                    "type": "mint",
-                    "status": "pending",
-                    "underlying_symbol": underlying_symbol,
-                    "token_symbol": format!("t{underlying_symbol}"),
-                    "qty": format_float_with_fallback(&quantity),
-                    "issuer": "st0x",
-                    "network": "base",
-                    "wallet_address": wallet_address,
-                    "issuer_request_id": issuer_request_id,
-                    "tx_hash": "",
-                    "created_at": Utc::now().to_rfc3339(),
-                }),
-            )
+            let polls_until_complete = state.polls_until_complete;
+            let request = MockTokenizationRequest {
+                tokenization_request_id: Uuid::new_v4().to_string(),
+                idempotency_key,
+                correlation_id: client_request_id,
+                underlying_symbol,
+                quantity,
+                wallet_address,
+                status: TokenizationStatus::Pending,
+                poll_count: 0,
+                polls_until_complete,
+                request_type: TokenizationRequestType::Mint,
+                tx_hash: String::new(),
+                needs_mint_execution: false,
+            };
+            let response = tokenization_request_to_json(&request);
+
+            state.requests.push(request);
+            drop(state);
+            json_response(200, &response)
+        });
+    });
+}
+
+fn register_tokenization_request_by_client_id_endpoint(
+    server: &MockServer,
+    state: &Arc<Mutex<TokenizationState>>,
+) {
+    let state = Arc::clone(state);
+
+    server.mock(|when, then| {
+        when.method(GET).path(format!(
+            "/v1/accounts/{TEST_ACCOUNT_ID}/tokenization/requests:by_client_request_id"
+        ));
+        then.respond_with(move |request: &HttpMockRequest| {
+            let Some(client_request_id) =
+                request.query_params_map().get("client_request_id").cloned()
+            else {
+                return json_response(
+                    422,
+                    &json!({"message": "missing client_request_id query parameter"}),
+                );
+            };
+            let found = {
+                let state = lock(&state);
+
+                state
+                    .requests
+                    .iter()
+                    .rev()
+                    .find(|existing| {
+                        existing.request_type == TokenizationRequestType::Mint
+                            && existing.correlation_id == client_request_id
+                    })
+                    .map(tokenization_request_to_json)
+            };
+            let Some(found) = found else {
+                return json_response(404, &json!({"message": "request not found"}));
+            };
+
+            json_response(200, &found)
         });
     });
 }
@@ -748,6 +814,11 @@ fn tokenization_request_to_json(request: &MockTokenizationRequest) -> Value {
         request.tx_hash.clone()
     };
 
+    let (client_request_id, issuer_request_id) = match request.request_type {
+        TokenizationRequestType::Mint => (Some(&request.correlation_id), None),
+        TokenizationRequestType::Redeem => (None, Some(&request.correlation_id)),
+    };
+
     json!({
         "tokenization_request_id": request.tokenization_request_id,
         "type": request.request_type.to_string(),
@@ -758,7 +829,8 @@ fn tokenization_request_to_json(request: &MockTokenizationRequest) -> Value {
         "issuer": "st0x",
         "network": "base",
         "wallet_address": request.wallet_address,
-        "issuer_request_id": request.issuer_request_id,
+        "client_request_id": client_request_id,
+        "issuer_request_id": issuer_request_id,
         "tx_hash": tx_hash,
         "created_at": "2025-01-01T00:00:00Z",
     })
@@ -774,5 +846,164 @@ fn json_response(status: u16, body: &Value) -> HttpMockResponse {
             "application/json".to_string(),
         )]),
         body: Some(serialized.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::StatusCode;
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use tokio::task::JoinSet;
+
+    use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_ACCOUNT_ID};
+
+    use super::{AlpacaTokenizationMock, REDEMPTION_WALLET};
+
+    async fn setup() -> (Arc<AlpacaBrokerMock>, AlpacaTokenizationMock) {
+        let broker = Arc::new(
+            AlpacaBrokerMock::start()
+                .symbol_fill_prices(vec![])
+                .symbol_positions(vec![])
+                .call()
+                .await,
+        );
+        let tokenization = AlpacaTokenizationMock::start(broker.server(), Arc::clone(&broker));
+        (broker, tokenization)
+    }
+
+    fn mint_body(client_request_id: &str, quantity: &str) -> Value {
+        json!({
+            "underlying_symbol": "AAPL",
+            "qty": quantity,
+            "issuer": "st0x",
+            "network": "base",
+            "wallet_address": REDEMPTION_WALLET,
+            "client_request_id": client_request_id,
+        })
+    }
+
+    #[tokio::test]
+    async fn mint_idempotency_key_replays_the_original_request() {
+        let (broker, tokenization) = setup().await;
+        let client = reqwest::Client::new();
+        let mint_url = format!(
+            "{}/v1/accounts/{TEST_ACCOUNT_ID}/tokenization/mint",
+            broker.base_url()
+        );
+        let body = mint_body("mint-replay-1", "1");
+
+        let first: Value = client
+            .post(&mint_url)
+            .header("Idempotency-Key", "mint-replay-1")
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let second: Value = client
+            .post(&mint_url)
+            .header("Idempotency-Key", "mint-replay-1")
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first, second,
+            "an identical replay must return the original response"
+        );
+        assert_eq!(tokenization.tokenization_requests().len(), 1);
+
+        let lookup: Value = client
+            .get(format!(
+                "{}/v1/accounts/{TEST_ACCOUNT_ID}/tokenization/requests:by_client_request_id",
+                broker.base_url()
+            ))
+            .query(&[("client_request_id", "mint-replay-1")])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            lookup["tokenization_request_id"],
+            first["tokenization_request_id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_mint_idempotency_replays_one_request() {
+        let (broker, tokenization) = setup().await;
+        let client = reqwest::Client::new();
+        let mint_url = format!(
+            "{}/v1/accounts/{TEST_ACCOUNT_ID}/tokenization/mint",
+            broker.base_url()
+        );
+        let body = mint_body("mint-concurrent-replay", "1");
+        let mut requests = JoinSet::new();
+
+        for _ in 0..32 {
+            let client = client.clone();
+            let mint_url = mint_url.clone();
+            let body = body.clone();
+            requests.spawn(async move {
+                client
+                    .post(mint_url)
+                    .header("Idempotency-Key", "mint-concurrent-replay")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<Value>()
+                    .await
+                    .unwrap()
+            });
+        }
+
+        let mut responses = Vec::new();
+        while let Some(response) = requests.join_next().await {
+            responses.push(response.unwrap());
+        }
+
+        assert_eq!(responses.len(), 32);
+        assert!(responses.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(tokenization.tokenization_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mint_idempotency_key_rejects_a_different_request_body() {
+        let (broker, tokenization) = setup().await;
+        let client = reqwest::Client::new();
+        let mint_url = format!(
+            "{}/v1/accounts/{TEST_ACCOUNT_ID}/tokenization/mint",
+            broker.base_url()
+        );
+        client
+            .post(&mint_url)
+            .header("Idempotency-Key", "mint-replay-2")
+            .json(&mint_body("mint-replay-2", "1"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        let response = client
+            .post(&mint_url)
+            .header("Idempotency-Key", "mint-replay-2")
+            .json(&mint_body("mint-replay-2", "2"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(tokenization.tokenization_requests().len(), 1);
     }
 }
