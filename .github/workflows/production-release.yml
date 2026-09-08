@@ -34,7 +34,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@ad17871dcff020e1b724949d9edb2789a76c18bd  # app-release @ .github main
+    uses: ST0x-Technology/.github/.github/workflows/app-release.yml@16aab8c5db9e2a4e70dba4b1af73d3c9336c6816  # app-release @ .github main
     with:
       environment: production
       runtime: bot-vm
