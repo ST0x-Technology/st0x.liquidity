@@ -15268,6 +15268,25 @@ mod tests {
     /// Startup approvals are per watched chain: each chain's targets name
     /// its own orderbook, its own asset table and its own canonical USDC,
     /// so Base's USDC constant never reaches another chain's orderbook.
+    /// The equity gas-readiness leg and the receipt-cost jobs still read
+    /// Base. A non-Base primary must be refused at startup rather than
+    /// checked and billed against a wallet the equity transfers never use.
+    #[test]
+    fn equity_transfer_paths_refuse_a_non_base_primary() {
+        confirm_equity_transfer_paths_support(Chain::Base).unwrap();
+
+        for chain in [Chain::Ethereum, Chain::HyperEvm] {
+            let error = confirm_equity_transfer_paths_support(chain).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    EquityTransferPathsUnsupported::NonBasePrimary { primary } if primary == chain
+                ),
+                "got: {error:?}"
+            );
+        }
+    }
+
     #[test]
     fn startup_approval_targets_follow_each_watched_chain() {
         let ctx = ctx_with_base_and_ethereum_trading();
