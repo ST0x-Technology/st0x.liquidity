@@ -5336,6 +5336,47 @@ mod tests {
         );
     }
 
+    /// Inventory polling runs on the primary chain only, so a managed
+    /// secondary's vaults are nobody's job until per-chain polling lands.
+    /// Startup must say so out loud rather than let the operator read an
+    /// inventory view that silently omits that chain.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn startup_warns_about_an_unpolled_managed_secondary() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains.primary_mut().inventory = InventoryMode::Managed {
+            inventory: Address::repeat_byte(0xAA),
+        };
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .inventory(InventoryMode::Managed {
+                    inventory: Address::repeat_byte(0xBB),
+                })
+                .call(),
+        );
+
+        let provider =
+            ProviderBuilder::new().connect_mocked_client(watched_chain_asserter(Chain::Base));
+        let watch_providers = BTreeMap::from([(
+            Chain::Ethereum,
+            ProviderBuilder::new().connect_mocked_client(watched_chain_asserter(Chain::Ethereum)),
+        )]);
+
+        startup_smoke_checks(&MockExecutor::new(), &provider, &watch_providers, &ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            logs_contain("vault inventory is not polled"),
+            "an unpolled managed secondary must be warned about at startup"
+        );
+        assert!(
+            logs_contain("chain=ethereum"),
+            "the warning must name the chain the operator has to manage by hand"
+        );
+    }
+
     /// The durable double-hedge guard keys on the full chain-qualified fill
     /// identity: the same (tx_hash, log_index) on another chain is a distinct
     /// fill, never a duplicate (SPEC multi-chain invariant 3), while the same
