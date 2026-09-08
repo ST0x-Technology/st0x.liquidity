@@ -308,15 +308,22 @@ distinct — neither key alone can both mint and authorize.
   of its configured chains lacks an `[orchestrator.addresses]` entry. For each
   chain X, in this order: (a) deploy `ST0xOrchestrator` on X; (b) add its
   address under `[orchestrator.addresses].X` in both bots' configs and deploy
-  both; (c) only then cut an asset listed on X over to orchestrator mode at
-  issuance. Until (b) every asset listed on X stays vault-direct. This bot
-  enforces the order at three points, from earliest to last: a rebalancing-mode
-  startup preflight refuses startup, naming chain and symbol, when issuance
-  reports an orchestrator-mode asset that is trading- or rebalancing-enabled on
-  a watched chain with no entry (see Startup Sequencing); a section carrying
-  only other chains' entries warns at startup; and an orchestrator-mode mint
-  reaching the signing step without its chain's entry fails loudly, the last
-  line, reached only when the preflight could not read the asset's mode.
+  both; (c) extend this bot's Turnkey signing policy to `MintAuth` typed data
+  with X's chain id and that orchestrator as the verifying contract (the
+  policy-scoped grant above), or the first mint is denied at signing; (d) only
+  then cut an asset listed on X over to orchestrator mode at issuance. Until (c)
+  every asset listed on X stays vault-direct. This bot enforces the order at
+  three points, from earliest to last: a rebalancing-mode startup preflight
+  refuses startup, naming chain and symbol, when issuance reports an
+  orchestrator-mode asset that is trading- or rebalancing-enabled on a watched
+  chain with no entry (see Startup Sequencing); a section carrying only other
+  chains' entries warns at startup; and the server-side mint path reads the
+  asset's mode again before signing and fails closed, so an orchestrator-mode
+  mint without its chain's entry stops at the signing step. That last line is
+  the only one on a deployment without `[rebalancing]` (no preflight runs there)
+  and whenever the preflight could not read the mode. The operator CLI mint
+  (`alpaca-tokenize`, `transfer-equity`) never signs: it refuses an
+  orchestrator-mode asset outright and points at the server path.
 
 #### Dividend NAV Bump
 

@@ -174,12 +174,14 @@ listed (Base included), check before enabling the asset:
 - If the asset is in orchestrator mode, `[orchestrator.addresses]` has an entry
   for that chain (keys are chain names: `base`, `ethereum`, `hyperevm`). The
   order is fixed per chain: deploy the `ST0xOrchestrator` there, add its address
-  to both bots' `[orchestrator.addresses]` and deploy both, and only then cut
-  the asset over at issuance (issuance keys the mode by symbol, so the cutover
-  applies on every chain the asset is listed on). In rebalancing mode, startup
-  refuses, naming the chain and symbol, when issuance reports the asset as
-  orchestrator-mode while the chain has no entry; see "Orchestrator rollout per
-  chain" in [cli-ops.md](cli-ops.md).
+  to both bots' `[orchestrator.addresses]` and deploy both, extend the Turnkey
+  signing policy to `MintAuth` typed data with that chain's id and orchestrator
+  as the verifying contract, and only then cut the asset over at issuance
+  (issuance keys the mode by symbol, so the cutover applies on every chain the
+  asset is listed on). In rebalancing mode, startup refuses, naming the chain
+  and symbol, when issuance reports the asset as orchestrator-mode while the
+  chain has no entry; see "Orchestrator rollout per chain" in
+  [cli-ops.md](cli-ops.md).
 
 **Fields:**
 
