@@ -2320,6 +2320,20 @@ is fundamentally about transferring inventory between these venues. The transfer
 steps differ by asset type and direction, but the core abstraction is the same:
 move assets from one venue to the other.
 
+The operator dashboard reads cross-venue transfer history from the three
+aggregates' materialized projections. Type and time filters, newest-first
+ordering, and pagination are applied in SQLite before payloads are decoded. Page
+retrieval and payload decoding are bounded by the requested page, but the
+total-count queries scan all matching projection rows. Page sizes must be
+positive and are capped at 500. History offsets above 10,000 are rejected so one
+request cannot force an unbounded SQLite result window; clients must narrow the
+type or time filters to retrieve older entries. Unreadable rows in the selected
+page are skipped and surfaced as category-specific warnings without hiding
+readable transfers. The dashboard WebSocket's initial snapshot reads the same
+projections, selecting all active transfers and only terminal transfers updated
+within the last 24 hours before decoding payloads. It never rebuilds transfer
+state from event history when a client connects.
+
 ##### Architecture: Three Layers
 
 **Top layer -- Inventory management**: Decides _when_ and _how much_ to transfer

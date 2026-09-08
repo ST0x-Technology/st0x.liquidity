@@ -6,6 +6,7 @@
   import HoverTooltip from '$lib/components/hover-tooltip.svelte'
   import CliCommandBlock from '$lib/components/cli-command-block.svelte'
   import type { EquityPrice } from '$lib/api/EquityPrice'
+  import type { TransferWarning } from '$lib/api/TransferWarning'
   import type { TransferCategory } from '$lib/transfer'
   import type { UsdcBridgeDirection } from '$lib/api/UsdcBridgeDirection'
   import MultiSelect from '$lib/components/multi-select.svelte'
@@ -35,7 +36,8 @@
     apiErrorStatus,
     stuckLocationLabel,
     stuckReasonLabel,
-    transferRecoveryCommands
+    transferRecoveryCommands,
+    transferWarningText
   } from '$lib/transfer'
 
   const isNumeric = (value: unknown): boolean =>
@@ -104,12 +106,17 @@
     queryKey: ['equity-prices'],
     enabled: false
   }))
+  const transferWarningsQuery = createQuery<TransferWarning[]>(() => ({
+    queryKey: ['transfers', 'warnings'],
+    enabled: false
+  }))
 
   const positionPrices = $derived(
     new Map(
       (equityPricesQuery.data ?? []).map((price) => [price.symbol, availablePriceUsd(price.status)])
     )
   )
+  const transferWarnings = $derived(transferWarningsQuery.data ?? [])
 
   const kindOptions = ALL_KINDS.map((kind) => ({ value: kind, label: kindLabel(kind) }))
 
@@ -375,6 +382,19 @@
       </div>
     </div>
   </Card.Header>
+
+  {#if transferWarnings.length > 0}
+    <div
+      class="mx-6 mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-500"
+    >
+      <div class="font-medium">Transfer data warnings</div>
+      <ul class="mt-1 list-disc space-y-0.5 pl-4">
+        {#each transferWarnings as warning, index (`${warning.kind}:${'id' in warning ? warning.id : String(index)}`)}
+          <li>{transferWarningText(warning)}</li>
+        {/each}
+      </ul>
+    </div>
+  {/if}
 
   <Card.Content class="relative min-h-0 flex-1 overflow-auto px-6 pt-2">
     {#if error.current}

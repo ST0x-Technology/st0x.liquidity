@@ -14,8 +14,23 @@ import {
   tradeRecoveryCommands,
   recoveryModeLabel,
   recoveryModeColor,
+  transferWarningText,
   RECOVERY_GUIDE
 } from './transfer'
+
+describe('transferWarningText', () => {
+  it('identifies every lifecycle failure by transfer category and id', () => {
+    expect(transferWarningText({ kind: 'mint_lifecycle_failed', id: 'mint-1' })).toBe(
+      'Mint mint-1 has an invalid lifecycle.'
+    )
+    expect(transferWarningText({ kind: 'redemption_lifecycle_failed', id: 'redemption-1' })).toBe(
+      'Redemption redemption-1 has an invalid lifecycle.'
+    )
+    expect(transferWarningText({ kind: 'bridge_lifecycle_failed', id: 'bridge-1' })).toBe(
+      'USDC bridge bridge-1 has an invalid lifecycle.'
+    )
+  })
+})
 
 describe('transferTypeLabel', () => {
   it('spells out the destination venue for each bridge direction', () => {

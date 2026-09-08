@@ -121,7 +121,7 @@ impl QueryManifest {
             .build(())
             .await?;
 
-        let mint = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+        let (mint, _mint_projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(rebalancing_service.clone())
             .with(broadcaster.clone())
             .with(equity_timing.clone())
@@ -130,15 +130,16 @@ impl QueryManifest {
             .build(services.clone())
             .await?;
 
-        let redemption = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .with(rebalancing_service.clone())
-            .with(broadcaster.clone())
-            .with(equity_timing)
-            .with(lifecycle_failure.clone())
-            .build(services)
-            .await?;
+        let (redemption, _redemption_projection) =
+            StoreBuilder::<EquityRedemption>::new(pool.clone())
+                .with(rebalancing_service.clone())
+                .with(broadcaster.clone())
+                .with(equity_timing)
+                .with(lifecycle_failure.clone())
+                .build(services)
+                .await?;
 
-        let usdc = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        let (usdc, _usdc_projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .with(rebalancing_service.clone())
             .with(broadcaster)
             .with(rebalance_timing)

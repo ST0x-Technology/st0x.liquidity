@@ -232,8 +232,8 @@ impl TransferOperation {
 
 /// Warning emitted when dashboard initial state is partially loaded.
 ///
-/// Variant names encode the category — no separate `TransferCategory`
-/// enum needed. Replay failures carry the dto `Id<Tag>` — the internal
+/// Variant names encode the category -- no separate `TransferCategory`
+/// enum needed. Row-specific failures carry the dto `Id<Tag>` -- the internal
 /// aggregate ID types convert to these at the boundary via `to_string()`.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(
@@ -255,6 +255,18 @@ pub enum TransferWarning {
         id: Id<EquityRedemptionTag>,
     },
     BridgeReplayFailed {
+        #[ts(type = "string")]
+        id: Id<UsdcBridgeTag>,
+    },
+    MintLifecycleFailed {
+        #[ts(type = "string")]
+        id: Id<EquityMintTag>,
+    },
+    RedemptionLifecycleFailed {
+        #[ts(type = "string")]
+        id: Id<EquityRedemptionTag>,
+    },
+    BridgeLifecycleFailed {
         #[ts(type = "string")]
         id: Id<UsdcBridgeTag>,
     },
@@ -576,6 +588,19 @@ mod tests {
 
         let serialized = serde_json::to_value(&warning).expect("serialization should succeed");
         assert_eq!(serialized, json!({"kind": "trade_history_unavailable"}));
+    }
+
+    #[test]
+    fn transfer_warning_lifecycle_failure_serializes_with_kind_and_id() {
+        let warning = TransferWarning::MintLifecycleFailed {
+            id: Id::new("mint-001"),
+        };
+
+        let serialized = serde_json::to_value(&warning).expect("serialization should succeed");
+        assert_eq!(
+            serialized,
+            json!({"kind": "mint_lifecycle_failed", "id": "mint-001"})
+        );
     }
 
     #[test]

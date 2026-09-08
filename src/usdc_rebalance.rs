@@ -83,7 +83,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
-use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 use st0x_execution::{AlpacaTransferId, ClientOrderId};
 use st0x_finance::{HasZero, Id, Usdc};
 
@@ -1638,10 +1638,10 @@ impl EventSourced for UsdcRebalance {
     type Command = UsdcRebalanceCommand;
     type Error = UsdcRebalanceError;
     type Services = ();
-    type Materialized = Nil;
+    type Materialized = Table;
 
     const AGGREGATE_TYPE: &'static str = "UsdcRebalance";
-    const PROJECTION: Nil = Nil;
+    const PROJECTION: Table = Table("usdc_rebalance_view");
     // v2: cctp_nonce widened from u64 to B256 (full CCTP V2 nonce) in the
     // Attested/BridgingFailed state variants. Bumped to clear stale snapshots
     // so they rebuild from events. No event upcaster needed: persisted events
