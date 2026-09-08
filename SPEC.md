@@ -302,6 +302,21 @@ distinct — neither key alone can both mint and authorize.
   fails loudly rather than guessing an address or another chain's deployment,
   and a section carrying only other networks' entries is flagged with a startup
   warning instead of staying silently inert.
+- **Rollout ordering per chain**: issuance keys `vault_mode` by underlying
+  symbol alone, so cutting an asset over applies on every chain it is listed on,
+  and issuance itself refuses to start with an orchestrator-mode asset while any
+  of its configured chains lacks an `[orchestrator.addresses]` entry. For each
+  chain X, in this order: (a) deploy `ST0xOrchestrator` on X; (b) add its
+  address under `[orchestrator.addresses].X` in both bots' configs and deploy
+  both; (c) only then cut an asset listed on X over to orchestrator mode at
+  issuance. Until (b) every asset listed on X stays vault-direct. This bot
+  enforces the order at three points, from earliest to last: a rebalancing-mode
+  startup preflight refuses startup, naming chain and symbol, when issuance
+  reports an orchestrator-mode asset that is trading- or rebalancing-enabled on
+  a watched chain with no entry (see Startup Sequencing); a section carrying
+  only other chains' entries warns at startup; and an orchestrator-mode mint
+  reaching the signing step without its chain's entry fails loudly, the last
+  line, reached only when the preflight could not read the asset's mode.
 
 #### Dividend NAV Bump
 
@@ -478,10 +493,18 @@ and a tokenization preflight then runs per watched chain, read-only: the chain's
 issuer redemption wallet must be configured, and every enabled equity's
 configured vault must report the configured underlying as its `asset()` (the
 same attestation a redemption's unwrap step performs). Each failure is fatal and
-names the chain and, where one applies, the symbol. Whether an equity is in
-orchestrator mode is only known to issuance's status endpoint, so the presence
-of an `[orchestrator.addresses]` entry for a chain is not preflighted; a missing
-entry is warned about at startup and refuses the first orchestrator-mode mint.
+names the chain and, where one applies, the symbol. Then, on every watched chain
+with no `[orchestrator.addresses]` entry, the preflight asks issuance's
+per-asset status endpoint (the freeze gate's endpoint, through the same client)
+for each trading- or rebalancing-enabled equity's `vault_mode` and refuses
+startup naming the chain and symbol when one is orchestrator-mode: its first
+mint would stall at the signing step. Chains with an entry are not queried,
+since their authorizer can sign whatever mode issuance reports. An indeterminate
+mode (issuance unreachable, asset unknown to issuance) is warned about per chain
+and symbol rather than refused: rebalancing mode never requires issuance to be
+reachable at startup (the freeze gate fails closed per cycle and has its own
+`freeze_check` escape hatch for an issuance outage), and the per-mint mode read
+fails closed anyway, so the signing-step failure remains the last line.
 
 Historical backfill resumes from a persisted database checkpoint. The configured
 `deployment_block` is only the initial seed for the first startup or for an
