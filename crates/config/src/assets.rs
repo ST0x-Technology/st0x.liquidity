@@ -160,6 +160,16 @@ impl ChainAssets {
             .is_some_and(|config| config.trading == OperationMode::Enabled)
     }
 
+    /// The share cap for one hedge of `symbol` on this chain: the symbol's own
+    /// `operational_limit`, else the chain-wide equities default, else uncapped.
+    pub fn operational_limit(&self, symbol: &Symbol) -> Option<Positive<FractionalShares>> {
+        self.equities
+            .symbols
+            .get(symbol)
+            .and_then(|config| config.operational_limit)
+            .or(self.equities.operational_limit)
+    }
+
     /// Returns whether rebalancing is enabled for the given equity on this
     /// chain. Assets not present in the config are treated as
     /// rebalancing-disabled.
@@ -228,7 +238,8 @@ pub struct CashHedgePolicy {
 pub struct HedgedEquities {
     /// Symbols deliberately removed from runtime configuration while
     /// retirement-compatible durable state still references them. Consumed
-    /// only by the deploy-time verifier.
+    /// only by the deploy-time verifier. Absent means no retirements.
+    #[serde(default)]
     pub retired_symbols: Vec<Symbol>,
     #[serde(flatten)]
     pub symbols: HashMap<Symbol, EquityHedgePolicy>,
@@ -337,20 +348,16 @@ mod tests {
     }
 
     #[test]
-    fn retired_symbols_policy_is_required_when_equities_are_configured() {
-        let error = toml::from_str::<HedgingAssets>(
+    fn retired_symbols_policy_defaults_to_empty() {
+        let hedging = toml::from_str::<HedgingAssets>(
             r#"
                 [equities.AAPL]
                 extended_hours_counter_trading = "disabled"
             "#,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            error
-                .to_string()
-                .contains("missing field `retired_symbols`")
-        );
+        assert!(hedging.equities.retired_symbols.is_empty());
     }
 
     #[test]

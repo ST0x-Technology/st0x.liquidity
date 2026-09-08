@@ -45,14 +45,9 @@ pub async fn check_execution_readiness<E: Executor>(
         return Ok(None);
     };
 
-    let shares_limit = assets
-        .equities
-        .symbols
-        .get(symbol)
-        .and_then(|config| config.operational_limit)
-        .or(assets.equities.operational_limit);
-
-    let Some((direction, shares)) = position.is_ready_for_execution(shares_limit)? else {
+    let Some((direction, shares)) =
+        position.is_ready_for_execution(assets.operational_limit(symbol))?
+    else {
         debug!(target: "hedge", %symbol, net = %position.net, "Position not ready for execution");
         return Ok(None);
     };
@@ -140,14 +135,9 @@ pub(crate) async fn check_all_positions<E: Executor>(
             continue;
         }
 
-        let shares_limit = assets
-            .equities
-            .symbols
-            .get(symbol)
-            .and_then(|config| config.operational_limit)
-            .or(assets.equities.operational_limit);
-
-        if let Some((direction, shares)) = position.is_ready_for_execution(shares_limit)? {
+        if let Some((direction, shares)) =
+            position.is_ready_for_execution(assets.operational_limit(symbol))?
+        {
             // Extended-hours is hardcoded false here: this helper only backs
             // the test-only check_and_execute_accumulated_positions path in
             // conductor.rs. The production CheckPositions sweep goes through

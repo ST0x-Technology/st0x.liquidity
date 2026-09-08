@@ -23,7 +23,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_config::TradingChain;
-use st0x_evm::Evm;
+use st0x_evm::{Chain, Evm};
 use st0x_execution::Executor;
 
 use super::OnChainError;
@@ -156,6 +156,65 @@ pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clon
 /// Persistent job queue for backfill jobs.
 pub(crate) type BackfillJobQueue = crate::conductor::job::JobQueue<BackfillRange>;
 
+/// One namespaced backfill queue per watched chain. A chain's scan backlog,
+/// in-flight rows, and orphan recovery are invisible to every other chain's
+/// queue and workers, so one chain's long catch-up cannot freeze another's
+/// ingestion through the monitor's overlap guard.
+#[derive(Clone)]
+pub(crate) struct BackfillQueues(std::collections::BTreeMap<Chain, BackfillJobQueue>);
+
+impl BackfillQueues {
+    /// Builds one namespaced queue per watched chain in `chains`.
+    pub(crate) fn new(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        chains: &st0x_config::ChainRegistry,
+    ) -> Self {
+        Self(
+            chains
+                .watched()
+                .map(|watched| {
+                    (
+                        watched.chain,
+                        BackfillJobQueue::new_namespaced(apalis_pool, watched.chain.as_str()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// The queue for `chain`; `None` when the chain is not watched.
+    pub(crate) fn for_chain(&self, chain: Chain) -> Option<&BackfillJobQueue> {
+        self.0.get(&chain)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&Chain, &BackfillJobQueue)> {
+        self.0.iter()
+    }
+
+    /// Re-labels durable rows written before per-chain queues existed: their
+    /// `job_type` is the bare task type name, which no namespaced queue reads,
+    /// so without this they would sit stranded until the retention sweep
+    /// DELETED them -- each one an ingested block range never scanned. All
+    /// legacy rows belong to Base by definition. Runs at startup, after the
+    /// apalis tables exist and before any worker spawns; idempotent.
+    pub(crate) async fn relabel_legacy_rows(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+    ) -> Result<u64, apalis_sqlite::SqlxError> {
+        let legacy = std::any::type_name::<BackfillRange>();
+        let namespaced = format!("{legacy}@{}", Chain::Base);
+        let result = sqlx_apalis::query(
+            "UPDATE Jobs SET job_type = ? \
+             WHERE job_type = ? AND status NOT IN ('Done', 'Failed', 'Killed')",
+        )
+        .bind(namespaced)
+        .bind(legacy)
+        .execute(apalis_pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+}
+
 /// Apalis job that backfills missed `ClearV3` / `TakeOrderV3` orderbook fills
 /// and `OperatorDeposit` / `OperatorWithdraw` inventory settlements between
 /// `from_block` and `to_block` (inclusive).
@@ -172,6 +231,10 @@ pub(crate) type BackfillJobQueue = crate::conductor::job::JobQueue<BackfillRange
 /// provide defense in depth if that assumption breaks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct BackfillRange {
+    /// The chain this range scans. Defaulted only for in-flight apalis
+    /// payloads enqueued before per-chain watchers.
+    #[serde(default = "crate::onchain::legacy_chain")]
+    pub(crate) chain: Chain,
     pub(crate) from_block: u64,
     pub(crate) to_block: u64,
 }
@@ -201,15 +264,23 @@ where
 
     fn label(&self) -> Label {
         Label::new(format!(
-            "BackfillRange:{}:{}",
-            self.from_block, self.to_block
+            "BackfillRange:{}:{}:{}",
+            self.chain, self.from_block, self.to_block
         ))
     }
 
     async fn perform(&self, ctx: &AccountantCtx<Node, Exec>) -> Result<Self::Output, Self::Error> {
+        // Both the chain's config AND its provider come from the per-chain
+        // accounting entry: scanning one chain's blocks through another
+        // chain's RPC would silently read the wrong ledger.
+        let chain_ctx = ctx
+            .chains
+            .get(&self.chain)
+            .ok_or(OnChainError::UnwatchedChain { chain: self.chain })?;
+
         backfill_range(
-            ctx.evm.provider(),
-            ctx.ctx.chains.sole_trading(),
+            chain_ctx.evm.provider(),
+            &chain_ctx.trading,
             BotOperator(ctx.ctx.order_owner()),
             &ctx.pool,
             self.from_block,
@@ -262,8 +333,10 @@ pub(crate) async fn load_backfill_checkpoint(
     evm_ctx: &TradingChain,
 ) -> Result<Option<u64>, OnChainError> {
     let row = sqlx::query_as::<_, (i64,)>(
-        "SELECT last_processed_block FROM backfill_checkpoints WHERE orderbook = ?",
+        "SELECT last_processed_block FROM backfill_checkpoints \
+         WHERE chain = ? AND orderbook = ?",
     )
+    .bind(evm_ctx.chain.to_string())
     .bind(evm_ctx.orderbook.to_string())
     .fetch_optional(pool)
     .await?;
@@ -281,15 +354,16 @@ pub(crate) async fn save_backfill_checkpoint(
     let last_processed_block = i64::try_from(last_processed_block)?;
 
     sqlx::query(
-        "INSERT INTO backfill_checkpoints (orderbook, last_processed_block) \
-         VALUES (?, ?) \
-         ON CONFLICT(orderbook) DO UPDATE SET \
+        "INSERT INTO backfill_checkpoints (chain, orderbook, last_processed_block) \
+         VALUES (?, ?, ?) \
+         ON CONFLICT(chain, orderbook) DO UPDATE SET \
          last_processed_block = MAX( \
              excluded.last_processed_block, \
              backfill_checkpoints.last_processed_block \
          ), \
          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
     )
+    .bind(evm_ctx.chain.to_string())
     .bind(evm_ctx.orderbook.to_string())
     .bind(last_processed_block)
     .execute(pool)
@@ -808,15 +882,159 @@ mod tests {
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
     use rain_math_float::Float;
-    use url::Url;
 
-    use st0x_config::{
-        ChainAssets, IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain,
-    };
+    use st0x_config::{InventoryMode, TradingChain};
     use st0x_evm::Chain;
 
     use super::*;
     use crate::bindings::IRaindexV6;
+
+    /// Each watched chain advances its own checkpoint row: writing one
+    /// chain's checkpoint neither clobbers nor reads through to another's.
+    #[tokio::test]
+    async fn checkpoints_are_scoped_per_chain() {
+        let pool = setup_test_db().await;
+        let base = TradingChain::test().deployment_block(1).call();
+        let ethereum = TradingChain::test()
+            .chain(Chain::Ethereum)
+            .orderbook(alloy::primitives::Address::repeat_byte(0x22))
+            .deployment_block(1)
+            .call();
+
+        save_backfill_checkpoint(&pool, &base, 100).await.unwrap();
+        save_backfill_checkpoint(&pool, &ethereum, 7).await.unwrap();
+
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &base).await.unwrap(),
+            Some(100)
+        );
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &ethereum).await.unwrap(),
+            Some(7)
+        );
+
+        // The monotonic MAX guard holds per (chain, orderbook).
+        save_backfill_checkpoint(&pool, &base, 50).await.unwrap();
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &base).await.unwrap(),
+            Some(100),
+            "a backwards write must not rewind the checkpoint"
+        );
+    }
+
+    /// Deterministic deployments put the same orderbook address on several
+    /// chains; each still gets its own checkpoint row.
+    #[tokio::test]
+    async fn chains_sharing_an_orderbook_address_checkpoint_independently() {
+        let pool = setup_test_db().await;
+        let base = TradingChain::test().deployment_block(1).call();
+        let ethereum = TradingChain::test()
+            .chain(Chain::Ethereum)
+            .orderbook(base.orderbook)
+            .deployment_block(1)
+            .call();
+
+        save_backfill_checkpoint(&pool, &base, 100).await.unwrap();
+        save_backfill_checkpoint(&pool, &ethereum, 7).await.unwrap();
+
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &base).await.unwrap(),
+            Some(100)
+        );
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &ethereum).await.unwrap(),
+            Some(7)
+        );
+    }
+
+    /// Admitting a second watched chain closes the rollback window: a
+    /// checkpoint write that names no chain is refused rather than silently
+    /// filed under Base.
+    #[tokio::test]
+    async fn checkpoint_without_a_chain_is_refused_once_a_second_chain_is_admitted() {
+        let pool = setup_test_db().await;
+        let base = TradingChain::test().deployment_block(1).call();
+
+        let error = sqlx::query(
+            "INSERT INTO backfill_checkpoints (orderbook, last_processed_block) \
+             VALUES (?, ?)",
+        )
+        .bind(base.orderbook.to_string())
+        .bind(250_i64)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.as_database_error().unwrap().message(),
+            "NOT NULL constraint failed: backfill_checkpoints.chain"
+        );
+        assert_eq!(load_backfill_checkpoint(&pool, &base).await.unwrap(), None);
+    }
+
+    /// Rows enqueued by a pre-per-chain binary carry the bare type name as
+    /// their job_type; startup adopts them into Base's namespaced queue so
+    /// they are neither stranded nor retention-deleted.
+    #[tokio::test]
+    async fn legacy_backfill_rows_are_adopted_into_the_base_queue() {
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let mut legacy_queue = BackfillJobQueue::new(&apalis_pool);
+        legacy_queue
+            .push(BackfillRange {
+                chain: Chain::Base,
+                from_block: 1,
+                to_block: 2,
+            })
+            .await
+            .unwrap();
+
+        let adopted = BackfillQueues::relabel_legacy_rows(&apalis_pool)
+            .await
+            .unwrap();
+        assert_eq!(adopted, 1);
+
+        let namespaced = BackfillJobQueue::new_namespaced(&apalis_pool, Chain::Base.as_str());
+        assert!(
+            namespaced.has_in_flight().await.unwrap(),
+            "the adopted row must be visible to the namespaced queue"
+        );
+
+        let legacy_view = BackfillJobQueue::new(&apalis_pool);
+        assert!(
+            !legacy_view.has_in_flight().await.unwrap(),
+            "no row may remain under the bare type name"
+        );
+    }
+
+    /// Namespaced queues of the same task type are mutually invisible: one
+    /// chain's in-flight rows and orphan recovery never touch another's.
+    #[tokio::test]
+    async fn namespaced_queues_are_mutually_invisible() {
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let mut base_queue = BackfillJobQueue::new_namespaced(&apalis_pool, Chain::Base.as_str());
+        let ethereum_queue =
+            BackfillJobQueue::new_namespaced(&apalis_pool, Chain::Ethereum.as_str());
+
+        base_queue
+            .push(BackfillRange {
+                chain: Chain::Base,
+                from_block: 1,
+                to_block: 2,
+            })
+            .await
+            .unwrap();
+
+        assert!(base_queue.has_in_flight().await.unwrap());
+        assert!(
+            !ethereum_queue.has_in_flight().await.unwrap(),
+            "another chain's rows must not read as in flight"
+        );
+        assert_eq!(
+            ethereum_queue.requeue_orphaned().await.unwrap(),
+            0,
+            "orphan recovery must not adopt another chain's rows"
+        );
+    }
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_pools};
 
     /// A bot-operator address distinct from every event operator seeded in
@@ -851,21 +1069,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_start_block_uses_deployment_block_without_checkpoint() {
         let pool = setup_test_db().await;
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 50,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(50).call();
 
         let start_block = backfill_start_block(&pool, &evm_ctx).await.unwrap();
 
@@ -875,21 +1079,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_start_block_resumes_after_checkpoint() {
         let pool = setup_test_db().await;
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 50,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(50).call();
 
         save_backfill_checkpoint(&pool, &evm_ctx, 80).await.unwrap();
 
@@ -901,21 +1091,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_start_block_respects_deployment_block_floor() {
         let pool = setup_test_db().await;
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 50,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(50).call();
 
         save_backfill_checkpoint(&pool, &evm_ctx, 20).await.unwrap();
 
@@ -952,21 +1128,7 @@ mod tests {
         asserter.push_success(&serde_json::json!([])); // inventory events
         push_tip_response(&asserter);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         backfill_events(
             &provider,
@@ -991,21 +1153,7 @@ mod tests {
     async fn test_backfill_events_skips_when_checkpoint_is_caught_up() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         save_backfill_checkpoint(&pool, &evm_ctx, 100)
             .await
@@ -1037,21 +1185,7 @@ mod tests {
     async fn test_backfill_events_skip_preserves_newer_checkpoint() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         save_backfill_checkpoint(&pool, &evm_ctx, 100)
             .await
@@ -1081,21 +1215,7 @@ mod tests {
     #[tokio::test]
     async fn test_save_backfill_checkpoint_is_monotonic() {
         let pool = setup_test_db().await;
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         save_backfill_checkpoint(&pool, &evm_ctx, 100)
             .await
@@ -1209,21 +1329,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let clear_config = IRaindexV6::ClearConfigV2 {
             aliceInputIOIndex: U256::from(0),
@@ -1286,21 +1392,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let take_event = IRaindexV6::TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
@@ -1364,21 +1456,7 @@ mod tests {
     async fn test_backfill_events_enqueues_all_events() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let different_order = get_test_order();
         let clear_event = IRaindexV6::ClearV3 {
@@ -1475,21 +1553,7 @@ mod tests {
     async fn test_backfill_events_rpc_failure() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let asserter = Asserter::new();
         // All retry attempts fail - need double since clear_logs and take_logs retry in parallel
@@ -1525,21 +1589,7 @@ mod tests {
     async fn test_backfill_events_block_range() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 50,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(50).call();
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events
@@ -1625,21 +1675,10 @@ mod tests {
         let order = get_test_order();
         // A non-Base chain, so the chain-propagation assertion below fails if
         // enqueueing hard-codes `Chain::Base` instead of the configured chain.
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Ethereum,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test()
+            .chain(Chain::Ethereum)
+            .deployment_block(1)
+            .call();
 
         // 30 take logs, 3 per block across 10 blocks, served by the
         // mock node in reverse-chronological order.
@@ -1740,21 +1779,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let tx_hash1 =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
@@ -1804,21 +1829,7 @@ mod tests {
     async fn test_backfill_events_batch_count_verification() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1000,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1000).call();
 
         let asserter = Asserter::new();
 
@@ -1859,21 +1870,7 @@ mod tests {
     async fn test_backfill_events_batch_boundary_verification() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 500,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(500).call();
 
         let asserter = Asserter::new();
 
@@ -1915,21 +1912,7 @@ mod tests {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let take_event = create_test_take_event(
             &order,
@@ -1970,21 +1953,7 @@ mod tests {
     async fn test_backfill_events_large_block_range_batching() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let asserter = Asserter::new();
 
@@ -2019,21 +1988,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let valid_take_event = create_test_take_event(
             &order,
@@ -2122,21 +2077,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let tx_hash1 =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
@@ -2180,21 +2121,7 @@ mod tests {
     async fn test_process_batch_retry_mechanism() {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let asserter = Asserter::new();
         // First two calls fail, third succeeds
@@ -2227,21 +2154,7 @@ mod tests {
     async fn test_process_batch_exhausted_retries() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let asserter = Asserter::new();
         // All retry attempts fail - need double since clear_logs and take_logs retry in parallel
@@ -2277,21 +2190,7 @@ mod tests {
     async fn test_backfill_events_partial_batch_failure() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let asserter = Asserter::new();
 
@@ -2337,21 +2236,7 @@ mod tests {
     async fn test_backfill_events_corrupted_log_data() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         // Create malformed log with invalid event signature
         let corrupted_log = Log {
@@ -2406,21 +2291,7 @@ mod tests {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let take_event = create_test_take_event(
             &order,
@@ -2465,21 +2336,7 @@ mod tests {
     async fn test_backfill_events_single_block_range() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 42,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(42).call();
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([]));
@@ -2510,21 +2367,7 @@ mod tests {
     async fn test_enqueue_batch_events_database_failure() {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let order = get_test_order();
         let take_event = create_test_take_event(
@@ -2573,21 +2416,7 @@ mod tests {
     async fn test_enqueue_batch_events_errors_when_node_tip_behind_requested_range() {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         // Both the clear and take fetches succeed at getLogs but observe a tip
         // (0x32 = 50) below the requested to_block (100), simulating a node
@@ -2629,21 +2458,7 @@ mod tests {
     async fn test_enqueue_batch_events_filter_creation() {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events
@@ -2672,21 +2487,7 @@ mod tests {
     async fn test_enqueue_batch_events_partial_enqueue_failure() {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let order = get_test_order();
 
@@ -2742,21 +2543,7 @@ mod tests {
     async fn test_backfill_events_concurrent_batch_processing() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let order = get_test_order();
         let take_event = create_test_take_event(
@@ -2808,21 +2595,7 @@ mod tests {
     async fn test_enqueue_batch_events_retry_exponential_backoff() {
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let asserter = Asserter::new();
         // First attempt fails for both parallel calls
@@ -2861,21 +2634,7 @@ mod tests {
     async fn test_backfill_events_zero_blocks() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 100,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(100).call();
 
         // No RPC calls should be made when deployment block > end block
         let asserter = Asserter::new();
@@ -2904,21 +2663,7 @@ mod tests {
         let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
         let (_pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(1).call();
 
         let order = get_test_order();
 
@@ -3003,21 +2748,7 @@ mod tests {
     async fn test_backfill_starts_from_deployment_block() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let job_queue = setup_job_queue(&apalis_pool);
-        let evm_ctx = TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
-                inventory: address!("0x1111111111111111111111111111111111111111"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 50,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        };
+        let evm_ctx = TradingChain::test().deployment_block(50).call();
 
         // Should start from deployment_block (50) to end_block (100)
         let asserter = Asserter::new();
@@ -3107,21 +2838,12 @@ mod tests {
     }
 
     fn inventory_test_evm_ctx() -> TradingChain {
-        TradingChain {
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-            chain: Chain::Base,
-            inventory_adapters: InventoryAdapters::default(),
-            rpc_url: Url::parse("http://localhost:8545").unwrap(),
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed {
+        TradingChain::test()
+            .inventory(InventoryMode::Managed {
                 inventory: address!("0x2222222222222222222222222222222222222222"),
-            },
-            vault_owner: address!("0x1111111111111111111111111111111111111111"),
-            deployment_block: 1,
-            required_confirmations: 0,
-            ingestion_cutoff: IngestionCutoff::Safe,
-        }
+            })
+            .deployment_block(1)
+            .call()
     }
 
     /// A venue-driven settlement (operator != the bot) surfaces as one

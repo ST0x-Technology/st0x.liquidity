@@ -109,7 +109,8 @@ pub struct RebalancingConfig {
     /// balances were last confirmed by a snapshot more than this many
     /// seconds ago (or never, e.g. right after a restart) is considered
     /// stale and its imbalance checks are skipped with a warning until a
-    /// fresh poll lands. Must be non-zero; suggested value: 300.
+    /// fresh poll lands. Must be non-zero; defaults to 300 when absent.
+    #[serde(default = "default_inventory_staleness_bound_secs")]
     pub inventory_staleness_bound_secs: u64,
     /// Whether the dividend freeze guard consults issuance before starting an
     /// equity rebalancing flow.
@@ -122,6 +123,10 @@ pub struct RebalancingConfig {
     /// fail-closed every equity cycle; issuance secrets stay required either way
     /// so re-enabling is a pure plaintext-config change.
     pub freeze_check: OperationMode,
+}
+
+fn default_inventory_staleness_bound_secs() -> u64 {
+    300
 }
 
 /// Runtime configuration for rebalancing operations.
@@ -477,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_missing_inventory_staleness_bound_secs_fails() {
+    fn deserialize_missing_inventory_staleness_bound_secs_defaults() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
@@ -495,11 +500,8 @@ mod tests {
             deviation = "0.3"
         "#;
 
-        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
-        assert!(
-            error.message().contains("inventory_staleness_bound_secs"),
-            "Expected missing inventory_staleness_bound_secs error, got: {error}"
-        );
+        let config = toml::from_str::<RebalancingConfig>(toml_str).unwrap();
+        assert_eq!(config.inventory_staleness_bound_secs, 300);
     }
 
     #[test]

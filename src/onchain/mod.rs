@@ -51,6 +51,8 @@ pub fn raindex_contracts(
 /// Provides error mapping between layers while maintaining separation of concerns.
 #[derive(Debug, thiserror::Error)]
 pub enum OnChainError {
+    #[error("job addressed to chain {chain}, which no watched chain matches")]
+    UnwatchedChain { chain: st0x_evm::Chain },
     #[error("Trade validation error: {0}")]
     Validation(#[from] TradeValidationError),
     #[error("Database persistence error: {0}")]
@@ -119,10 +121,7 @@ mod tests {
 
     use alloy::primitives::address;
 
-    use st0x_config::{
-        ChainAssets, IngestionCutoff, InventoryAdapters, InventoryMode, TradingChain,
-    };
-    use st0x_evm::Chain;
+    use st0x_config::{InventoryMode, TradingChain};
 
     use super::raindex_contracts;
 
@@ -133,21 +132,14 @@ mod tests {
     #[test]
     fn managed_mode_maps_each_address_to_its_own_slot() {
         let inventory = address!("0x2222222222222222222222222222222222222222");
-        let contracts = raindex_contracts(&TradingChain {
-            chain: Chain::Base,
-            // Hard-coded literal URL -- parse cannot fail in a test helper.
-            #[allow(clippy::unwrap_used)]
-            rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
-            required_confirmations: 1,
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Managed { inventory },
-            inventory_adapters: InventoryAdapters::default(),
-            vault_owner: address!("0x3333333333333333333333333333333333333333"),
-            deployment_block: 1,
-            ingestion_cutoff: IngestionCutoff::Safe,
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-        });
+        let contracts = raindex_contracts(
+            &TradingChain::test()
+                .required_confirmations(1)
+                .inventory(InventoryMode::Managed { inventory })
+                .vault_owner(address!("0x3333333333333333333333333333333333333333"))
+                .deployment_block(1)
+                .call(),
+        );
 
         assert_eq!(contracts.inventory, inventory);
         assert_eq!(
@@ -161,21 +153,14 @@ mod tests {
     /// above is the one that pins the mapping.
     #[test]
     fn legacy_mode_points_both_slots_at_the_orderbook() {
-        let contracts = raindex_contracts(&TradingChain {
-            chain: Chain::Base,
-            // Hard-coded literal URL -- parse cannot fail in a test helper.
-            #[allow(clippy::unwrap_used)]
-            rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
-            required_confirmations: 1,
-            orderbook: address!("0x1111111111111111111111111111111111111111"),
-            inventory: InventoryMode::Legacy,
-            inventory_adapters: InventoryAdapters::default(),
-            vault_owner: address!("0x3333333333333333333333333333333333333333"),
-            deployment_block: 1,
-            ingestion_cutoff: IngestionCutoff::Safe,
-            redemption_wallet: None,
-            assets: ChainAssets::default(),
-        });
+        let contracts = raindex_contracts(
+            &TradingChain::test()
+                .required_confirmations(1)
+                .inventory(InventoryMode::Legacy)
+                .vault_owner(address!("0x3333333333333333333333333333333333333333"))
+                .deployment_block(1)
+                .call(),
+        );
 
         assert_eq!(contracts.inventory, contracts.orderbook);
         assert_eq!(

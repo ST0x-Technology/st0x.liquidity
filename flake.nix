@@ -247,6 +247,10 @@
           inherit craneLib abiEnv;
           rainMathFloatAbiEnv = abiEnvs.rainMathFloat;
           rainMathFloat = rain-math-float;
+          # Commit the server compiles in and reports from /health
+          # (src/api.rs). self.rev exists only for a clean checkout, as in
+          # the build-oci.yml image build; a dirty tree has dirtyRev only.
+          gitCommit = self.rev or self.dirtyRev or null;
         };
       in
 

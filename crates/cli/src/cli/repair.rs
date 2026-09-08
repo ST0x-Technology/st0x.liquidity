@@ -67,7 +67,7 @@ pub(super) async fn set_portfolio_snapshot_mark_command<W: Write>(
     // reintroduce it. Rows at those locations exist only when nonzero: the
     // capture drops the empty ones.
     if !configured_equity_symbols(ctx).contains(&symbol) {
-        let market_making = PortfolioLocation::MarketMaking(ctx.chains.sole_trading().chain);
+        let market_making = PortfolioLocation::MarketMaking(ctx.chains.primary().chain);
         let unconverted: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM portfolio_snapshot \
              WHERE et_day = ? AND asset = ? AND location IN (?, ?)",
@@ -614,7 +614,7 @@ mod tests {
     fn ctx_with_equities(symbols: &[&str]) -> Ctx {
         let mut ctx =
             st0x_config::create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
-        ctx.chains.sole_trading_mut().assets.equities =
+        ctx.chains.primary_mut().assets.equities =
             try_rebalancing_enabled_equities(symbols).expect("test equity symbols must be valid");
         ctx
     }
@@ -826,7 +826,7 @@ mod tests {
         .await;
 
         let mut ctx = ctx_with_equities(&["AAPL"]);
-        ctx.chains.sole_trading_mut().chain = Chain::Ethereum;
+        ctx.chains.primary_mut().chain = Chain::Ethereum;
         let error = set_portfolio_snapshot_mark_command(
             &mut Vec::new(),
             &pool,

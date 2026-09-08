@@ -363,7 +363,7 @@ async fn logs(State(state): State<AppState>, Query(query): Query<LogsQuery>) -> 
     let limit = query.limit.unwrap_or(100).min(5000);
     let offset = query.offset.unwrap_or(0);
 
-    let Some(ref log_dir) = state.ctx.log_dir else {
+    let Some(ref file_logging) = state.ctx.file_logging else {
         return Json(LogResponse {
             entries: Vec::new(),
             total: 0,
@@ -407,7 +407,8 @@ async fn logs(State(state): State<AppState>, Query(query): Query<LogsQuery>) -> 
         }),
     };
 
-    let (entries, total, has_more) = read_matching_entries(log_dir, &filter, offset, limit);
+    let (entries, total, has_more) =
+        read_matching_entries(file_logging.directory(), &filter, offset, limit);
 
     Json(LogResponse {
         entries,
@@ -1652,8 +1653,8 @@ async fn performance_reliability(
 ) -> Result<Json<ReliabilityReport>, StatusCode> {
     let range = parse_report_range(&query)?;
 
-    let (entries, log_entries_truncated) = if let Some(log_dir) = state.ctx.log_dir.as_deref() {
-        let log_dir = log_dir.to_owned();
+    let (entries, log_entries_truncated) = if let Some(file_logging) = &state.ctx.file_logging {
+        let log_dir = file_logging.directory().to_owned();
         let filter = LogFilter {
             search_lower: None,
             levels: Some(vec!["ERROR".to_string(), "WARN".to_string()]),
@@ -1712,14 +1713,10 @@ async fn performance_infra(
     // than paying both round-trips in series.
     let (monitor, dependencies) = tokio::try_join!(
         async {
-            load_monitor_telemetry(
-                &state.pool,
-                &range,
-                state.ctx.chains.sole_trading().orderbook,
-            )
-            .await
-            .inspect_err(|error| error!(%error, "Failed to load monitor telemetry"))
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+            load_monitor_telemetry(&state.pool, &range, state.ctx.chains.primary().orderbook)
+                .await
+                .inspect_err(|error| error!(%error, "Failed to load monitor telemetry"))
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
         },
         async {
             load_dependency_stats(&state.pool, &range)
@@ -1934,7 +1931,8 @@ mod tests {
     use uuid::uuid;
 
     use st0x_config::{
-        BrokerCtx, Ctx, ExecutionThreshold, RestApiCtx, create_test_ctx_with_order_owner,
+        BrokerCtx, Ctx, ExecutionThreshold, FileLogging, LogLevel, RestApiCtx,
+        create_test_ctx_with_order_owner,
     };
     use st0x_dto::{Trade, TradeOutcome, TradingVenue};
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
@@ -1985,7 +1983,7 @@ mod tests {
                 sender,
             )),
             equity_prices: crate::dashboard::equity_price::EquityPriceStore::new(
-                &ctx.chains.sole_trading().assets,
+                &ctx.chains.primary().assets,
             ),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
@@ -3508,7 +3506,7 @@ mod tests {
     #[tokio::test]
     async fn performance_infra_reports_seeded_telemetry() {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let orderbook = ctx.chains.sole_trading().orderbook;
+        let orderbook = ctx.chains.primary().orderbook;
         let state = empty_app_state(ctx).await;
         let now = chrono::Utc::now();
 
@@ -3677,7 +3675,10 @@ mod tests {
         write_test_logs(temp_dir.path(), "st0x-hedge.log.2026-06-15", log_content);
 
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
+        ctx.file_logging = Some(FileLogging::new(
+            temp_dir.path().to_str().unwrap().to_string(),
+            LogLevel::Debug,
+        ));
 
         let app = build_app(empty_app_state(ctx).await);
 
@@ -4094,7 +4095,10 @@ mod tests {
         );
 
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
+        ctx.file_logging = Some(FileLogging::new(
+            temp_dir.path().to_str().unwrap().to_string(),
+            LogLevel::Debug,
+        ));
 
         let app = build_app(empty_app_state(ctx).await);
 
@@ -4117,7 +4121,10 @@ mod tests {
         );
 
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
+        ctx.file_logging = Some(FileLogging::new(
+            temp_dir.path().to_str().unwrap().to_string(),
+            LogLevel::Debug,
+        ));
 
         let app = build_app(empty_app_state(ctx).await);
 
@@ -4140,7 +4147,10 @@ mod tests {
         );
 
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
+        ctx.file_logging = Some(FileLogging::new(
+            temp_dir.path().to_str().unwrap().to_string(),
+            LogLevel::Debug,
+        ));
 
         let app = build_app(empty_app_state(ctx).await);
 
@@ -4167,7 +4177,10 @@ mod tests {
         );
 
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
+        ctx.file_logging = Some(FileLogging::new(
+            temp_dir.path().to_str().unwrap().to_string(),
+            LogLevel::Debug,
+        ));
 
         let app = build_app(empty_app_state(ctx).await);
 
@@ -4188,7 +4201,10 @@ mod tests {
         );
 
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
+        ctx.file_logging = Some(FileLogging::new(
+            temp_dir.path().to_str().unwrap().to_string(),
+            LogLevel::Debug,
+        ));
 
         let app = build_app(empty_app_state(ctx).await);
 
@@ -4210,7 +4226,10 @@ mod tests {
         );
 
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
+        ctx.file_logging = Some(FileLogging::new(
+            temp_dir.path().to_str().unwrap().to_string(),
+            LogLevel::Debug,
+        ));
 
         let app = build_app(empty_app_state(ctx).await);
 
@@ -4241,7 +4260,10 @@ mod tests {
         write_test_logs(temp_dir.path(), "st0x-hedge.log.2026-04-20", &log_content);
 
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
+        ctx.file_logging = Some(FileLogging::new(
+            temp_dir.path().to_str().unwrap().to_string(),
+            LogLevel::Debug,
+        ));
 
         let app = build_app(empty_app_state(ctx).await);
 

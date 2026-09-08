@@ -97,6 +97,7 @@ async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol, token: Address)
 
     let cqrs = test_store::<VaultRegistry>(pool.clone(), ());
     let id = VaultRegistryId {
+        chain: st0x_evm::Chain::Base,
         orderbook: TEST_ORDERBOOK,
         owner: TEST_ORDER_OWNER,
     };
@@ -291,6 +292,7 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
         test_trigger_config(),
         vault_registry,
         VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
         },
@@ -715,6 +717,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
         .aggregate_id
         .clone();
     let vault_agg_id = VaultRegistryId {
+        chain: st0x_evm::Chain::Base,
         orderbook: TEST_ORDERBOOK,
         owner: TEST_ORDER_OWNER,
     }
@@ -959,6 +962,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         .aggregate_id
         .clone();
     let vault_agg_id = VaultRegistryId {
+        chain: st0x_evm::Chain::Base,
         orderbook: TEST_ORDERBOOK,
         owner: TEST_ORDER_OWNER,
     }
@@ -1114,6 +1118,7 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         test_trigger_config(),
         vault_registry,
         VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
         },
@@ -1201,6 +1206,7 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         test_trigger_config(),
         vault_registry,
         VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
         },
@@ -1304,6 +1310,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
         trigger_config,
         Arc::clone(&vault_registry),
         VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
         },
@@ -1459,6 +1466,7 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
         test_trigger_config(),
         vault_registry,
         VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
         },
@@ -1516,6 +1524,7 @@ async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve()
         config,
         vault_registry,
         VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
         },
@@ -1568,6 +1577,7 @@ async fn usdc_none_disables_usdc_rebalancing() {
         },
         vault_registry,
         VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
         },
@@ -1690,6 +1700,7 @@ async fn mint_api_failure_produces_rejected_event() {
     mint_mock.assert();
 
     let vault_agg_id = VaultRegistryId {
+        chain: st0x_evm::Chain::Base,
         orderbook: TEST_ORDERBOOK,
         owner: TEST_ORDER_OWNER,
     }
@@ -1801,6 +1812,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         config,
         vault_registry,
         VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
         },
@@ -1933,6 +1945,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         config,
         vault_registry,
         VaultRegistryId {
+            chain: st0x_evm::Chain::Base,
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
         },
@@ -2034,6 +2047,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             wide_config,
             vault_registry,
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
@@ -2097,6 +2111,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             tight_config,
             vault_registry,
             VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
