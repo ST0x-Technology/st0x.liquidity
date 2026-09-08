@@ -3093,6 +3093,31 @@ mod tests {
     /// `--network ethereum` builds the transfer on Ethereum's wallet and binds
     /// its vault lookup to Ethereum's registry (chain, orderbook, vault
     /// owner), never the primary's.
+    /// The resume hint an interrupted mint prints must carry the network: the
+    /// mint aggregate records no chain, so a hint without it would resume an
+    /// Ethereum mint on the CLI's default, Base.
+    #[test]
+    fn mint_resume_command_names_the_selected_network() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = FractionalShares::new(float!(10));
+        let issuer_request_id = IssuerRequestId::generate();
+
+        let command = mint_resume_command(
+            &symbol,
+            &quantity,
+            TokenizationNetwork::Ethereum,
+            &issuer_request_id,
+        );
+
+        assert_eq!(
+            command,
+            format!(
+                "transfer-equity --direction to-raindex --symbol AAPL --quantity {quantity} \
+                 --issuer-request-id {issuer_request_id} --network ethereum"
+            )
+        );
+    }
+
     #[tokio::test]
     async fn transfer_equity_services_are_built_on_the_selected_chain() {
         let ctx = create_alpaca_ctx_watching_ethereum();
