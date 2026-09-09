@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use alloy::primitives::U256;
+use alloy::primitives::{TxHash, U256};
+use alloy::providers::ProviderBuilder;
 use axum::Json;
 use axum::Router;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
@@ -33,6 +34,7 @@ use st0x_event_sorcery::{
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
 use st0x_execution::{AlpacaWalletError, Symbol};
 use st0x_finance::{FractionalShares, Positive};
+use st0x_registry::SymbolCache;
 use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
@@ -48,7 +50,7 @@ use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
 };
 use crate::iap_auth::{IapVerifier, require_iap};
-use crate::offchain::order::OffchainOrderId;
+use crate::offchain::order::{OffchainOrderId, OrderPlacer};
 use crate::operator::OperatorError;
 use crate::operator::equity_transfer::{
     EquityTransferKind, FailTransferError, validate_failure_reason,
@@ -57,6 +59,7 @@ use crate::operator::portfolio_snapshot::{EquityMarkCorrection, set_equity_mark}
 use crate::operator::position::{
     OffchainOrderOutcome, PointerOutcome, release_pending_offchain_order, set_position,
 };
+use crate::operator::process_tx::{self, HedgeDisposition, ProcessTxOutcome};
 use crate::performance::equity_timing::load_equity_timings;
 use crate::performance::infra::{load_dependency_stats, load_monitor_telemetry};
 use crate::performance::rebalance::load_rebalance_timings;
@@ -1314,6 +1317,14 @@ pub(crate) struct RecoveryHandle {
     pub(crate) usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
 }
 
+/// Shared handle backing the in-bot process-tx route: the broker order placer
+/// and the submission lock the trading loop holds, set by the conductor after
+/// startup completes.
+pub(crate) struct ProcessTxHandle {
+    pub(crate) order_placer: Arc<dyn OrderPlacer>,
+    pub(crate) counter_trade_submission_lock: Arc<Mutex<()>>,
+}
+
 /// Serializes operator transfer-recovery requests so they cannot race through
 /// duplicate or conflicting mint/redemption flows.
 pub(crate) struct ResumeLock(pub(crate) Mutex<()>);
@@ -2535,6 +2546,110 @@ async fn set_position_exposure(
     }))
 }
 
+/// What processing a transaction resolved to, mirrored from
+/// [`ProcessTxOutcome`] for the wire.
+#[derive(Debug, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum ProcessTxResponse {
+    NoTradeableEvents,
+    TransactionNotFound,
+    AlreadyAccounted,
+    PendingHedgeInFlight,
+    BelowExecutionThreshold,
+    TradingDisabled {
+        symbol: String,
+    },
+    PlacementRejected {
+        symbol: String,
+    },
+    HedgePlaced {
+        symbol: String,
+        offchain_order_id: String,
+        shares: String,
+        direction: String,
+        disposition: &'static str,
+    },
+}
+
+impl From<ProcessTxOutcome> for ProcessTxResponse {
+    fn from(outcome: ProcessTxOutcome) -> Self {
+        match outcome {
+            ProcessTxOutcome::NoTradeableEvents => Self::NoTradeableEvents,
+            ProcessTxOutcome::TransactionNotFound { .. } => Self::TransactionNotFound,
+            ProcessTxOutcome::AlreadyAccounted => Self::AlreadyAccounted,
+            ProcessTxOutcome::PendingHedgeInFlight => Self::PendingHedgeInFlight,
+            ProcessTxOutcome::BelowExecutionThreshold => Self::BelowExecutionThreshold,
+            ProcessTxOutcome::TradingDisabled { symbol } => Self::TradingDisabled {
+                symbol: symbol.to_string(),
+            },
+            ProcessTxOutcome::PlacementRejected { symbol } => Self::PlacementRejected {
+                symbol: symbol.to_string(),
+            },
+            ProcessTxOutcome::HedgePlaced {
+                symbol,
+                offchain_order_id,
+                shares,
+                direction,
+                disposition,
+            } => Self::HedgePlaced {
+                symbol: symbol.to_string(),
+                offchain_order_id: offchain_order_id.to_string(),
+                shares: shares.to_string(),
+                direction: format!("{direction:?}"),
+                disposition: match disposition {
+                    HedgeDisposition::InFlight => "in_flight",
+                    HedgeDisposition::ClearedForRetry => "cleared_for_retry",
+                    HedgeDisposition::Finalized => "finalized",
+                },
+            },
+        }
+    }
+}
+
+/// Accounts a missed on-chain fill and places the opposite hedge inside the
+/// bot, serialized against the trading loop by the shared submission lock.
+/// Mirrors the CLI `process-tx` verb.
+async fn process_transaction(
+    State(state): State<AppState>,
+    Path(tx_hash): Path<String>,
+) -> Result<Json<ProcessTxResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tx_hash = TxHash::from_str(&tx_hash).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("invalid transaction hash: {error}"),
+            }),
+        )
+    })?;
+
+    let handle = state.process_tx.get().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "process-tx is unavailable until the conductor finishes startup".to_owned(),
+            }),
+        )
+    })?;
+
+    let provider =
+        ProviderBuilder::new().connect_http(state.ctx.chains.primary().rpc_url.clone());
+    let cache = SymbolCache::default();
+
+    let outcome = process_tx::process_tx(
+        tx_hash,
+        &state.ctx,
+        &state.pool,
+        &provider,
+        &cache,
+        handle.order_placer.clone(),
+        Some(&handle.counter_trade_submission_lock),
+    )
+    .await
+    .map_err(ops_operator_error)?;
+
+    Ok(Json(ProcessTxResponse::from(outcome)))
+}
+
 /// Wire contract for the portfolio-snapshot mark route.
 #[derive(Deserialize)]
 struct SetEquityMarkRequest {
@@ -2728,6 +2843,10 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
             "/liquidity-write/portfolio-snapshot/marks",
             post(set_portfolio_snapshot_mark),
         )
+        .route(
+            "/liquidity-write/transactions/{tx_hash}/process",
+            post(process_transaction),
+        )
         .layer(axum::middleware::from_fn(move |request, next| {
             let verifier = Arc::clone(&write_verifier);
             async move { require_iap(verifier, request, next).await }
@@ -2897,6 +3016,7 @@ mod tests {
                 &ctx.chains.primary().assets,
             ),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
+            process_tx: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
             pnl_report_admission: crate::dashboard::pnl::pnl_report_admission(),
             metrics_handle: crate::metrics::setup().expect("metrics setup"),
@@ -5834,6 +5954,7 @@ mod tests {
             ("POST", "/liquidity-write/positions/x/release-hedge"),
             ("POST", "/liquidity-write/positions/x/set"),
             ("POST", "/liquidity-write/portfolio-snapshot/marks"),
+            ("POST", "/liquidity-write/transactions/x/process"),
         ] {
             let response = app
                 .clone()
@@ -5882,6 +6003,7 @@ mod tests {
             ("POST", "/liquidity-write/positions/x/release-hedge"),
             ("POST", "/liquidity-write/positions/x/set"),
             ("POST", "/liquidity-write/portfolio-snapshot/marks"),
+            ("POST", "/liquidity-write/transactions/x/process"),
         ] {
             let response = app
                 .clone()
