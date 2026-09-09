@@ -15608,6 +15608,25 @@ mod tests {
         );
     }
 
+    /// The shared pre-dispatch admission check gates the equity leg on the
+    /// primary chain's own wallet, not Base's: with Ethereum as the primary
+    /// it checks the Ethereum signer.
+    #[test]
+    fn transfer_gas_readiness_checks_the_primary_chains_wallet() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.alerts = Some(gas_threshold_alerts());
+        ctx.chains.primary_mut().chain = Chain::Ethereum;
+        let wallet_ctx = OnchainWalletCtx::stub();
+        let wallets = ChainWallets::from_wallet_ctx(&wallet_ctx);
+
+        let readiness = build_transfer_gas_readiness(&wallets, &ctx).unwrap();
+
+        assert_eq!(
+            readiness.equity_route(),
+            (Chain::Ethereum, wallet_ctx.ethereum_wallet().address())
+        );
+    }
+
     #[test]
     fn startup_approval_targets_follow_each_watched_chain() {
         let ctx = ctx_with_base_and_ethereum_trading();

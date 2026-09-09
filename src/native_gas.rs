@@ -134,6 +134,12 @@ impl GasReadiness {
         self.retry_interval
     }
 
+    /// The chain and wallet the equity route checks.
+    #[cfg(test)]
+    pub(crate) fn equity_route(&self) -> (Chain, Address) {
+        (self.equity.chain, self.equity.wallet)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         base_balance: U256,
