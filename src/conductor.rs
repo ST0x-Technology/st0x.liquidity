@@ -915,6 +915,10 @@ async fn setup_trading_schedule(
 }
 
 impl Conductor {
+    // `run` is the bot's startup wiring: it threads the store, queue, and
+    // rebalancing setup values into the conductor builder in one place.
+    // Extracting a phase moves those values through a helper struct without
+    // reducing complexity, so it stays one function.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
