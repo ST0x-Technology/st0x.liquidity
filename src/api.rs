@@ -1563,8 +1563,8 @@ async fn recheck_transfer(
 /// not leak internals (the full error is logged at the call site).
 fn recheck_error_response(error: &RecheckError) -> (StatusCode, String) {
     use RecheckError::{
-        Database, MalformedTokenizationRequestId, MalformedWallet, Mint, MissingTxHash,
-        NoAcceptedRequest, Rebalancing, Redemption, Tokenizer,
+        ChainServicesMissing, Database, MalformedTokenizationRequestId, MalformedWallet, Mint,
+        MissingTxHash, NoAcceptedRequest, Rebalancing, Redemption, Tokenizer,
     };
 
     match error {
@@ -1578,7 +1578,7 @@ fn recheck_error_response(error: &RecheckError) -> (StatusCode, String) {
             StatusCode::BAD_GATEWAY,
             "Tokenization provider unavailable; retry later".to_string(),
         ),
-        Mint(_) | Redemption(_) | Rebalancing(_) | Database(_) => (
+        ChainServicesMissing(_) | Mint(_) | Redemption(_) | Rebalancing(_) | Database(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to recheck transfer".to_string(),
         ),

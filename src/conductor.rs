@@ -2840,13 +2840,12 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             bot_gas_enqueuer: bot_gas_enqueuer.clone(),
         };
 
-        // The saga's own Raindex, wrapper and vault-lookup handles stay on the
-        // primary chain; each transfer's wallet, gas admission and asset table
-        // already come from its own entry.
-        let primary_vault_lookup = equity_transfer_services
-            .for_chain(primary_chain)?
-            .vault_lookup
-            .clone();
+        // The equity recovery aggregates run where the orphaned balance sits:
+        // the primary chain, until chain selection moves into the global
+        // rebalancer. They take that chain's entry rather than loose handles,
+        // so their registry, orderbook, wrapper and wallet are the same ones
+        // the saga uses there.
+        let primary_equity_services = equity_transfer_services.for_chain(primary_chain)?.clone();
 
         let transfer_usdc_to_hedging_queue = deps.schedulers.transfer_usdc_to_hedging.clone();
         let transfer_usdc_to_market_making_queue =
@@ -2887,10 +2886,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         let recovery_transfer = Arc::new(
             CrossVenueEquityTransfer::new(
-                raindex_service.clone(),
-                primary_vault_lookup.clone(),
-                tokenizer.clone(),
-                wrapper.clone(),
                 equity_transfer_services.clone(),
                 built.mint.clone(),
                 built.redemption.clone(),
@@ -2903,11 +2898,8 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let (wrapped_equity_recovery_store, unwrapped_equity_recovery_store) =
             build_equity_recovery_stores(
                 &deps.pool,
-                raindex_service.clone(),
-                primary_vault_lookup.clone(),
-                wrapper.clone(),
+                primary_equity_services,
                 recovery_transfer.clone(),
-                market_maker_wallet,
                 bot_gas_enqueuer.clone(),
             )
             .await?;
@@ -3066,17 +3058,13 @@ async fn catch_up_stage_timing_projections(
 
 /// Builds the wrapped and unwrapped equity-recovery aggregate stores.
 ///
-/// Both share the recovery `transfer` and the raindex/vault/wrapper
-/// dependencies; the unwrapped store additionally needs the base `wallet`
-/// address to settle unwraps. Kept together because they are the recovery
-/// counterpart built from the same `recovery_transfer`.
-async fn build_equity_recovery_stores<Signer: Wallet + Clone>(
+/// Both drive the same chain entry -- its registry, orderbook, wrapper and
+/// wallet -- and the same recovery `transfer`. Kept together because they are
+/// the recovery counterpart built from the same `recovery_transfer`.
+async fn build_equity_recovery_stores(
     pool: &SqlitePool,
-    raindex: Arc<RaindexService<Signer>>,
-    vault_lookup: Arc<dyn VaultLookup>,
-    wrapper: Arc<WrapperService<Signer>>,
+    chain: ChainEquityServices,
     transfer: Arc<CrossVenueEquityTransfer>,
-    wallet: Address,
     bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
 ) -> anyhow::Result<(
     Arc<Store<WrappedEquityRecovery>>,
@@ -3084,9 +3072,7 @@ async fn build_equity_recovery_stores<Signer: Wallet + Clone>(
 )> {
     let wrapped_store = StoreBuilder::<WrappedEquityRecovery>::new(pool.clone())
         .build(WrappedEquityRecoveryServices {
-            raindex: raindex.clone(),
-            vault_lookup: vault_lookup.clone(),
-            wrapper: wrapper.clone(),
+            chain: chain.clone(),
             transfer: transfer.clone(),
             bot_gas_enqueuer: bot_gas_enqueuer.clone(),
         })
@@ -3094,11 +3080,8 @@ async fn build_equity_recovery_stores<Signer: Wallet + Clone>(
 
     let unwrapped_store = StoreBuilder::<UnwrappedEquityRecovery>::new(pool.clone())
         .build(UnwrappedEquityRecoveryServices {
-            raindex,
-            vault_lookup,
-            wrapper,
+            chain,
             transfer,
-            wallet,
             bot_gas_enqueuer,
         })
         .await?;

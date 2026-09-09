@@ -43,16 +43,14 @@ use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_raindex::Raindex;
 use st0x_tokenization::IssuerRequestId;
-use st0x_wrapper::Wrapper;
 
 use crate::bot_gas::{
     BotGasEnqueueFailure, BotGasOperationCategory, BotGasReceiptCostEnqueuer,
     enqueue_base_equity_cost,
 };
 use crate::equity_redemption::RedemptionAggregateId;
-use crate::rebalancing::equity::CrossVenueEquityTransfer;
+use crate::rebalancing::equity::{ChainEquityServices, CrossVenueEquityTransfer};
 use crate::tokenized_equity_mint::TOKENIZED_EQUITY_DECIMALS;
-use crate::vault_lookup::VaultLookup;
 
 /// Aggregate identifier. Each detection creates a fresh UUID; multiple
 /// recoveries for the same symbol are independent aggregates.
@@ -78,9 +76,9 @@ impl FromStr for WrappedEquityRecoveryId {
 /// emits the success event iff it actually completed.
 #[derive(Clone)]
 pub(crate) struct WrappedEquityRecoveryServices {
-    pub(crate) raindex: Arc<dyn Raindex>,
-    pub(crate) vault_lookup: Arc<dyn VaultLookup>,
-    pub(crate) wrapper: Arc<dyn Wrapper>,
+    /// The entry of the chain the orphaned shares sit on, so the recovery
+    /// reads the same registry, orderbook and wrapper the saga uses there.
+    pub(crate) chain: ChainEquityServices,
     pub(crate) transfer: Arc<CrossVenueEquityTransfer>,
     /// Enqueues bot-gas cost recording for the orphan-deposit path (which
     /// calls `raindex` directly rather than through `transfer`). See ADR 0017.
@@ -144,13 +142,13 @@ pub(crate) enum WrappedEquityRecoveryCommand {
     },
 
     /// Orphan path. The handler resolves the wrapped-token address via
-    /// `services.wrapper.lookup_derivative(symbol)`, looks up the Raindex
-    /// vault, calls `services.raindex.submit_deposit(...)`, and emits
-    /// `OrphanDepositSubmitted` with the returned tx hash.
+    /// `services.chain.wrapper.lookup_derivative(symbol)`, looks up the
+    /// Raindex vault, calls `services.chain.raindex.submit_deposit(...)`, and
+    /// emits `OrphanDepositSubmitted` with the returned tx hash.
     SubmitOrphanDeposit,
 
     /// Orphan path. The handler reads `vault_deposit_tx_hash` from the
-    /// current state and calls `services.raindex.confirm_tx(tx_hash)`,
+    /// current state and calls `services.chain.raindex.confirm_tx(tx_hash)`,
     /// emitting `OrphanDeposited` iff confirmation succeeds.
     ConfirmOrphanDeposit,
 
@@ -460,7 +458,7 @@ impl EventSourced for WrappedEquityRecovery {
                 ConfirmOrphanDeposit,
             ) => {
                 confirm_orphan_deposit_or_fail(
-                    &services.raindex,
+                    &services.chain.raindex,
                     &services.bot_gas_enqueuer,
                     symbol,
                     *vault_deposit_tx_hash,
@@ -536,7 +534,7 @@ async fn submit_orphan_deposit_or_fail(
     shares: FractionalShares,
     now: DateTime<Utc>,
 ) -> Result<Vec<WrappedEquityRecoveryEvent>, WrappedEquityRecoveryError> {
-    let wrapped_token = match services.wrapper.lookup_derivative(symbol) {
+    let wrapped_token = match services.chain.wrapper.lookup_derivative(symbol) {
         Ok(token) => token,
         Err(error) => {
             warn!(target: "rebalance", %symbol, ?error, "Wrapped equity recovery: lookup_derivative failed");
@@ -548,6 +546,7 @@ async fn submit_orphan_deposit_or_fail(
     };
 
     let vault_id = match services
+        .chain
         .vault_lookup
         .vault_id_for_token(wrapped_token)
         .await
@@ -574,6 +573,7 @@ async fn submit_orphan_deposit_or_fail(
     };
 
     match services
+        .chain
         .raindex
         .submit_deposit(wrapped_token, vault_id, raw, TOKENIZED_EQUITY_DECIMALS)
         .await
@@ -644,18 +644,16 @@ mod tests {
     use st0x_raindex::RaindexVaultId;
     use st0x_tokenization::issuer_request_id;
     use st0x_tokenization::mock::MockTokenizer;
-    use st0x_wrapper::MockWrapper;
+    use st0x_wrapper::{MockWrapper, Wrapper};
 
+    use super::*;
     use crate::bot_gas::pending_bot_gas_jobs;
     use crate::equity_redemption::redemption_aggregate_id;
     use crate::mint_authorization::ConfiguredMintAuthorizer;
+    use crate::native_gas::ConfiguredGasReadiness;
     use crate::onchain::mock::{DepositBehavior, MockRaindex};
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::vault_lookup::MockVaultLookup;
-
-    use super::*;
-    use crate::native_gas::ConfiguredGasReadiness;
-    use crate::rebalancing::equity::ChainEquityServices;
 
     const FAKE_TX_HASH: TxHash = TxHash::new(
         fixed_bytes!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef").0,
@@ -688,20 +686,9 @@ mod tests {
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
+        let chain = base_chain_services(raindex, wrapper);
         let services = EquityTransferServices {
-            chains: BTreeMap::from([(
-                Chain::Base,
-                ChainEquityServices {
-                    wallet: Address::ZERO,
-                    raindex: raindex.clone(),
-                    vault_lookup: Arc::new(mock_vault_lookup()),
-                    tokenizer: Arc::new(MockTokenizer::new()),
-                    wrapper: wrapper.clone(),
-                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-                    gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
-                },
-            )]),
+            chains: BTreeMap::from([(Chain::Base, chain.clone())]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let mint_store = Arc::new(st0x_event_sorcery::test_store(
@@ -710,20 +697,32 @@ mod tests {
         ));
         let redemption_store = Arc::new(st0x_event_sorcery::test_store(pool, services.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
-            raindex.clone(),
-            Arc::new(mock_vault_lookup()),
-            Arc::new(MockTokenizer::new()),
-            wrapper.clone(),
             services,
             mint_store,
             redemption_store,
         ));
         WrappedEquityRecoveryServices {
-            raindex,
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            wrapper,
+            chain,
             transfer,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        }
+    }
+
+    /// The Base entry a recovery test drives, around caller-supplied
+    /// orderbook and wrapper mocks.
+    fn base_chain_services(
+        raindex: Arc<dyn Raindex>,
+        wrapper: Arc<dyn Wrapper>,
+    ) -> ChainEquityServices {
+        ChainEquityServices {
+            wallet: Address::ZERO,
+            raindex,
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+            gas_readiness: ConfiguredGasReadiness::Unwired,
+            equities: ChainEquities::default(),
         }
     }
 
@@ -963,20 +962,9 @@ mod tests {
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
+        let chain = base_chain_services(raindex, wrapper);
         let inner_services = EquityTransferServices {
-            chains: BTreeMap::from([(
-                Chain::Base,
-                ChainEquityServices {
-                    wallet: Address::ZERO,
-                    raindex: raindex.clone(),
-                    vault_lookup: Arc::new(mock_vault_lookup()),
-                    tokenizer: Arc::new(MockTokenizer::new()),
-                    wrapper: wrapper.clone(),
-                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-                    gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
-                },
-            )]),
+            chains: BTreeMap::from([(Chain::Base, chain.clone())]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let mint_store = Arc::new(st0x_event_sorcery::test_store(
@@ -986,18 +974,12 @@ mod tests {
         let redemption_store =
             Arc::new(st0x_event_sorcery::test_store(pool, inner_services.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
-            raindex.clone(),
-            Arc::new(mock_vault_lookup()),
-            Arc::new(MockTokenizer::new()),
-            wrapper.clone(),
             inner_services,
             mint_store,
             redemption_store,
         ));
         let services = WrappedEquityRecoveryServices {
-            raindex,
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            wrapper,
+            chain,
             transfer,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };

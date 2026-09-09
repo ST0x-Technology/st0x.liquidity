@@ -631,29 +631,23 @@ mod tests {
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let vault_lookup: Arc<dyn VaultLookup> = Arc::new(MockVaultLookup::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+        let chain = ChainEquityServices {
+            wallet: Address::ZERO,
+            raindex: raindex.clone(),
+            vault_lookup: vault_lookup.clone(),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: wrapper.clone(),
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+            gas_readiness: ConfiguredGasReadiness::Unwired,
+            equities: ChainEquities::default(),
+        };
         let transfer_services = EquityTransferServices {
-            chains: BTreeMap::from([(
-                Chain::Base,
-                ChainEquityServices {
-                    wallet: Address::ZERO,
-                    raindex: raindex.clone(),
-                    vault_lookup: vault_lookup.clone(),
-                    tokenizer: Arc::new(MockTokenizer::new()),
-                    wrapper: wrapper.clone(),
-                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-                    gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
-                },
-            )]),
+            chains: BTreeMap::from([(Chain::Base, chain.clone())]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
         let redemption_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
-            raindex.clone(),
-            vault_lookup.clone(),
-            Arc::new(MockTokenizer::new()),
-            wrapper.clone(),
             transfer_services.clone(),
             mint_store.clone(),
             redemption_store.clone(),
@@ -661,9 +655,7 @@ mod tests {
         let store = Arc::new(test_store(
             pool.clone(),
             WrappedEquityRecoveryServices {
-                raindex,
-                vault_lookup,
-                wrapper,
+                chain,
                 transfer,
                 bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
             },
@@ -771,29 +763,23 @@ mod tests {
                 .with_default_vault(st0x_raindex::RaindexVaultId(B256::ZERO)),
         );
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+        let chain = ChainEquityServices {
+            wallet: Address::ZERO,
+            raindex: raindex.clone(),
+            vault_lookup: vault_lookup.clone(),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: wrapper.clone(),
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+            gas_readiness: ConfiguredGasReadiness::Unwired,
+            equities: ChainEquities::default(),
+        };
         let transfer_services = EquityTransferServices {
-            chains: BTreeMap::from([(
-                Chain::Base,
-                ChainEquityServices {
-                    wallet: Address::ZERO,
-                    raindex: raindex.clone(),
-                    vault_lookup: vault_lookup.clone(),
-                    tokenizer: Arc::new(MockTokenizer::new()),
-                    wrapper: wrapper.clone(),
-                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-                    gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
-                },
-            )]),
+            chains: BTreeMap::from([(Chain::Base, chain.clone())]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
         let redemption_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
-            raindex.clone(),
-            vault_lookup.clone(),
-            Arc::new(MockTokenizer::new()),
-            wrapper.clone(),
             transfer_services.clone(),
             mint_store.clone(),
             redemption_store.clone(),
@@ -805,9 +791,7 @@ mod tests {
         let store = Arc::new(test_store(
             pool.clone(),
             WrappedEquityRecoveryServices {
-                raindex,
-                vault_lookup,
-                wrapper,
+                chain,
                 transfer,
                 bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(bot_gas_queue),
             },

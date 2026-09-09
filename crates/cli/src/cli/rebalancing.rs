@@ -262,10 +262,10 @@ async fn build_equity_transfer_services(
             chain,
             ChainEquityServices {
                 wallet,
-                raindex: raindex.clone(),
-                vault_lookup: vault_lookup.clone(),
-                tokenizer: tokenization_service.clone(),
-                wrapper: wrapper.clone(),
+                raindex,
+                vault_lookup,
+                tokenizer: tokenization_service,
+                wrapper,
                 // The CLI transfer path never signs mint authorizations:
                 // `transfer_equity_command` rejects orchestrator-mode mints up
                 // front (`ensure_vault_direct_mint`), so only vault-direct
@@ -291,15 +291,7 @@ async fn build_equity_transfer_services(
             .build(services.clone())
             .await?;
 
-    let transfer = CrossVenueEquityTransfer::new(
-        raindex,
-        vault_lookup,
-        tokenization_service.clone(),
-        wrapper,
-        services,
-        mint_store,
-        redemption_store,
-    );
+    let transfer = CrossVenueEquityTransfer::new(services, mint_store, redemption_store);
 
     Ok(EquityTransferCliServices {
         transfer,
