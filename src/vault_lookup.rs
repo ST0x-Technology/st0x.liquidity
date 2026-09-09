@@ -111,6 +111,9 @@ pub struct MockVaultLookup {
     vaults: BTreeMap<Address, RaindexVaultId>,
     tokens: BTreeMap<Symbol, Address>,
     default_vault: Option<RaindexVaultId>,
+    /// Every lookup this instance served, so a test holding one mock per chain
+    /// can tell which chain's registry a transfer read.
+    lookups: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -120,7 +123,13 @@ impl MockVaultLookup {
             vaults: BTreeMap::new(),
             tokens: BTreeMap::new(),
             default_vault: None,
+            lookups: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// How many lookups this instance served since construction.
+    pub fn lookups(&self) -> usize {
+        self.lookups.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[must_use]
@@ -153,6 +162,8 @@ impl Default for MockVaultLookup {
 #[async_trait]
 impl VaultLookup for MockVaultLookup {
     async fn vault_id_for_token(&self, token: Address) -> Result<RaindexVaultId, VaultLookupError> {
+        self.lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.vaults
             .get(&token)
             .copied()
@@ -161,6 +172,8 @@ impl VaultLookup for MockVaultLookup {
     }
 
     async fn vault_token_for_symbol(&self, symbol: &Symbol) -> Result<Address, VaultLookupError> {
+        self.lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.tokens
             .get(symbol)
             .copied()

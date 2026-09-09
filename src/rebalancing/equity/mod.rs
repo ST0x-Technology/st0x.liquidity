@@ -2376,6 +2376,265 @@ mod tests {
         assert_eq!(chain, Chain::Ethereum);
     }
 
+    /// One chain's mocks, kept by the test so it can tell which chain's
+    /// services a resume drove.
+    struct ChainMocks {
+        raindex: Arc<MockRaindex>,
+        vault_lookup: Arc<MockVaultLookup>,
+        tokenizer: Arc<MockTokenizer>,
+        wrapper: Arc<MockWrapper>,
+    }
+
+    impl ChainMocks {
+        fn new() -> Self {
+            Self {
+                raindex: Arc::new(MockRaindex::new()),
+                vault_lookup: Arc::new(mock_vault_lookup()),
+                tokenizer: Arc::new(
+                    MockTokenizer::new()
+                        .with_detection_outcome(MockDetectionOutcome::Detected)
+                        .with_completion_outcome(MockCompletionOutcome::Completed),
+                ),
+                wrapper: Arc::new(MockWrapper::new()),
+            }
+        }
+
+        fn entry(&self) -> ChainEquityServices {
+            ChainEquityServices {
+                wallet: Address::ZERO,
+                raindex: self.raindex.clone(),
+                vault_lookup: self.vault_lookup.clone(),
+                tokenizer: self.tokenizer.clone(),
+                wrapper: self.wrapper.clone(),
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                gas_readiness: ConfiguredGasReadiness::Unwired,
+                equities: ChainEquities::default(),
+            }
+        }
+
+        /// Nothing on this chain was touched: no vault read, no wrap wait, no
+        /// deposit, no confirmation and no issuer call.
+        fn assert_untouched(&self, chain: Chain) {
+            assert_eq!(self.vault_lookup.lookups(), 0, "{chain} vault registry");
+            assert_eq!(
+                self.wrapper.wait_for_block_calls(),
+                Vec::<u64>::new(),
+                "{chain} wrapper"
+            );
+            assert_eq!(self.raindex.last_deposit_call(), None, "{chain} deposit");
+            assert_eq!(self.raindex.last_confirmed_tx(), None, "{chain} confirm");
+            assert_eq!(self.tokenizer.call_count(), 0, "{chain} issuer");
+        }
+    }
+
+    /// A transfer whose Base and Ethereum entries are distinct mocks.
+    async fn two_chain_transfer() -> (CrossVenueEquityTransfer, ChainMocks, ChainMocks) {
+        let base = ChainMocks::new();
+        let ethereum = ChainMocks::new();
+        let services = EquityTransferServices {
+            chains: BTreeMap::from([
+                (Chain::Base, base.entry()),
+                (Chain::Ethereum, ethereum.entry()),
+            ]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
+        let redemption_store = Arc::new(test_store(pool, services.clone()));
+
+        let transfer = CrossVenueEquityTransfer::new(
+            base.raindex.clone(),
+            base.vault_lookup.clone(),
+            base.tokenizer.clone(),
+            base.wrapper.clone(),
+            services,
+            mint_store,
+            redemption_store,
+        );
+
+        (transfer, base, ethereum)
+    }
+
+    async fn request_ethereum_mint(
+        transfer: &CrossVenueEquityTransfer,
+        id: &IssuerRequestId,
+    ) -> Symbol {
+        let symbol = Symbol::new("AAPL").unwrap();
+        transfer
+            .mint_store
+            .send(
+                id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    chain: Chain::Ethereum,
+                    quantity: float!(10),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+
+        symbol
+    }
+
+    /// A mint resumed from `TokensReceived` wraps and deposits on the chain
+    /// its record names, so Base's wrapper, registry and orderbook stay idle.
+    #[tokio::test]
+    async fn a_resumed_ethereum_mint_wraps_and_deposits_on_ethereum() {
+        let (transfer, base, ethereum) = two_chain_transfer().await;
+        let id = issuer_request_id("ISS-ETHEREUM-TOKENS-RECEIVED");
+        request_ethereum_mint(&transfer, &id).await;
+        transfer
+            .mint_store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        assert!(
+            ethereum.raindex.last_deposit_call().is_some(),
+            "the wrapped shares must be deposited through Ethereum's orderbook"
+        );
+        assert!(
+            ethereum.vault_lookup.lookups() > 0,
+            "the destination vault must come from Ethereum's registry"
+        );
+        base.assert_untouched(Chain::Base);
+    }
+
+    /// A mint resumed from `WrapSubmitted` confirms the wrap on the chain that
+    /// submitted it.
+    #[tokio::test]
+    async fn a_resumed_ethereum_wrap_confirms_on_ethereum() {
+        let (transfer, base, ethereum) = two_chain_transfer().await;
+        let id = issuer_request_id("ISS-ETHEREUM-WRAP-SUBMITTED");
+        request_ethereum_mint(&transfer, &id).await;
+        for command in [
+            TokenizedEquityMintCommand::Poll,
+            TokenizedEquityMintCommand::SubmitWrap {
+                wrap_tx_hash: TxHash::with_last_byte(7),
+            },
+        ] {
+            transfer.mint_store.send(&id, command).await.unwrap();
+        }
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        assert!(
+            !ethereum.wrapper.wait_for_block_calls().is_empty(),
+            "the wrap must be confirmed against Ethereum's wrapper"
+        );
+        assert!(
+            ethereum.raindex.last_deposit_call().is_some(),
+            "the deposit must follow on Ethereum's orderbook"
+        );
+        base.assert_untouched(Chain::Base);
+    }
+
+    /// A mint resumed from `VaultDepositSubmitted` confirms the deposit tx on
+    /// the chain it was broadcast to.
+    #[tokio::test]
+    async fn a_resumed_ethereum_vault_deposit_confirms_on_ethereum() {
+        let (transfer, base, ethereum) = two_chain_transfer().await;
+        let id = issuer_request_id("ISS-ETHEREUM-DEPOSIT-SUBMITTED");
+        request_ethereum_mint(&transfer, &id).await;
+        let vault_deposit_tx_hash = TxHash::with_last_byte(9);
+        for command in [
+            TokenizedEquityMintCommand::Poll,
+            TokenizedEquityMintCommand::SubmitWrap {
+                wrap_tx_hash: TxHash::with_last_byte(8),
+            },
+            TokenizedEquityMintCommand::WrapTokens {
+                wrap_tx_hash: TxHash::with_last_byte(8),
+                wrapped_shares: U256::from(1_u64),
+                wrap_block: 1,
+            },
+            TokenizedEquityMintCommand::SubmitVaultDeposit {
+                vault_deposit_tx_hash,
+            },
+        ] {
+            transfer.mint_store.send(&id, command).await.unwrap();
+        }
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        assert_eq!(
+            ethereum.raindex.last_confirmed_tx(),
+            Some(vault_deposit_tx_hash),
+            "the deposit must be confirmed on Ethereum's RPC"
+        );
+        base.assert_untouched(Chain::Base);
+    }
+
+    /// A fresh redemption resolves its vault token through the chain it was
+    /// asked for, never the primary's registry.
+    #[tokio::test]
+    async fn a_fresh_ethereum_redemption_reads_ethereums_registry() {
+        let (transfer, base, ethereum) = two_chain_transfer().await;
+        let id = redemption_aggregate_id("ETHEREUM-FRESH-REDEMPTION");
+
+        transfer
+            .resume_equity_to_hedging(
+                &id,
+                &Symbol::new("TEST").unwrap(),
+                Chain::Ethereum,
+                FractionalShares::new(float!(50)),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            ethereum.vault_lookup.lookups() > 0,
+            "the redeemed token must come from Ethereum's registry"
+        );
+        assert!(
+            ethereum.tokenizer.call_count() > 0,
+            "the redemption must be sent through Ethereum's issuer"
+        );
+        base.assert_untouched(Chain::Base);
+    }
+
+    /// A redemption resumed from `TokensSent` polls the issuer of the chain
+    /// the tokens left from.
+    #[tokio::test]
+    async fn a_resumed_ethereum_redemption_polls_ethereums_issuer() {
+        let (transfer, base, ethereum) = two_chain_transfer().await;
+        let id = redemption_aggregate_id("ETHEREUM-REDEMPTION-RESUME");
+        let symbol = Symbol::new("TEST").unwrap();
+        let quantity = FractionalShares::new(float!(50));
+        let token = ethereum
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+
+        transfer
+            .withdraw_from_raindex(
+                &id,
+                &symbol,
+                Chain::Ethereum,
+                quantity,
+                token,
+                quantity.to_u256_18_decimals().unwrap(),
+            )
+            .await
+            .unwrap();
+        transfer.unwrap_and_send(&id).await.unwrap();
+        let issuer_calls_before_resume = ethereum.tokenizer.call_count();
+
+        transfer.resume_redemption(&id).await.unwrap();
+
+        assert!(
+            ethereum.tokenizer.call_count() > issuer_calls_before_resume,
+            "the detection poll must reach Ethereum's issuer"
+        );
+        base.assert_untouched(Chain::Base);
+    }
+
     /// A resume follows the chain the record names: both the genesis request
     /// and the later poll reach that chain's issuer, never the primary's.
     #[tokio::test]
