@@ -6448,4 +6448,66 @@ mod tests {
             "failure_reason: Some(...) must serialize as a non-null string in the DTO"
         );
     }
+
+    /// Every redemption persisted before chains were tracked ran on Base, so
+    /// a genesis payload with no `chain` must read as Base rather than fail.
+    #[test]
+    fn legacy_vault_withdraw_pending_event_reads_as_base() {
+        let legacy = serde_json::json!({
+            "VaultWithdrawPending": {
+                "symbol": "AAPL",
+                "quantity": "10",
+                "token": "0x0000000000000000000000000000000000000001",
+                "wrapped_amount": "10000000000000000000",
+                "pending_at": "2026-01-01T00:00:00Z",
+            }
+        });
+
+        let event: EquityRedemptionEvent = serde_json::from_value(legacy).unwrap();
+        let EquityRedemptionEvent::VaultWithdrawPending { chain, .. } = event else {
+            panic!("expected VaultWithdrawPending, got {event:?}");
+        };
+
+        assert_eq!(chain, Chain::Base);
+    }
+
+    #[test]
+    fn vault_withdraw_pending_event_roundtrips_its_chain() {
+        let event = EquityRedemptionEvent::VaultWithdrawPending {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: float!(10),
+            token: Address::ZERO,
+            chain: Chain::Ethereum,
+            wrapped_amount: U256::from(10_000_000_000_000_000_000_u128),
+            pending_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+        };
+
+        let serialized = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            serialized["VaultWithdrawPending"]["chain"],
+            serde_json::json!("ethereum")
+        );
+
+        let roundtripped: EquityRedemptionEvent = serde_json::from_value(serialized).unwrap();
+        assert_eq!(roundtripped, event);
+    }
+
+    #[tokio::test]
+    async fn redemption_state_carries_the_chain_the_command_named() {
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given_no_previous_events()
+            .when(EquityRedemptionCommand::Redeem {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: float!(50.25),
+                token: Address::random(),
+                chain: Chain::Ethereum,
+                amount: U256::from(50_250_000_000_000_000_000_u128),
+            })
+            .await
+            .events();
+
+        let state = replay::<EquityRedemption>(events).unwrap().unwrap();
+
+        assert_eq!(state.chain(), Chain::Ethereum);
+    }
 }

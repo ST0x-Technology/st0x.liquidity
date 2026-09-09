@@ -5939,4 +5939,64 @@ mod tests {
             .is_terminal(),
         );
     }
+
+    /// Every mint persisted before chains were tracked ran on Base, so a
+    /// genesis payload with no `chain` must read as Base rather than fail.
+    #[test]
+    fn legacy_mint_requested_event_reads_as_base() {
+        let legacy = serde_json::json!({
+            "MintRequested": {
+                "symbol": "AAPL",
+                "quantity": "10",
+                "wallet": "0x0000000000000000000000000000000000000001",
+                "requested_at": "2026-01-01T00:00:00Z",
+            }
+        });
+
+        let event: TokenizedEquityMintEvent = serde_json::from_value(legacy).unwrap();
+        let TokenizedEquityMintEvent::MintRequested { chain, .. } = event else {
+            panic!("expected MintRequested, got {event:?}");
+        };
+
+        assert_eq!(chain, Chain::Base);
+    }
+
+    #[test]
+    fn mint_requested_event_roundtrips_its_chain() {
+        let event = TokenizedEquityMintEvent::MintRequested {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: float!(10),
+            wallet: Address::ZERO,
+            chain: Chain::Ethereum,
+            requested_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+        };
+
+        let serialized = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            serialized["MintRequested"]["chain"],
+            serde_json::json!("ethereum")
+        );
+
+        let roundtripped: TokenizedEquityMintEvent = serde_json::from_value(serialized).unwrap();
+        assert_eq!(roundtripped, event);
+    }
+
+    #[tokio::test]
+    async fn mint_state_carries_the_chain_the_command_named() {
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given_no_previous_events()
+            .when(TokenizedEquityMintCommand::RequestMint {
+                issuer_request_id: issuer_request_id("ISS-CHAIN"),
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: float!(10),
+                wallet: Address::ZERO,
+                chain: Chain::Ethereum,
+            })
+            .await
+            .events();
+
+        let state = replay::<TokenizedEquityMint>(events).unwrap().unwrap();
+
+        assert_eq!(state.chain(), Chain::Ethereum);
+    }
 }
