@@ -546,36 +546,37 @@ persisted checkpoint and re-scans any gap.
 Before any worker or rebalancer runs, and in both modes whenever a signing
 wallet is configured, startup grants the one-time MAX approvals on every watched
 chain with that chain's wallet: that chain's canonical USDC to its orderbook on
-every watched chain, and each enabled equity's underlying to its wrapper vault
-and wrapped to that chain's orderbook only on the primary and on a secondary
-that rebalances equity (a hedge-only secondary has no wrapper to approve, so its
-allowance work is the USDC grant alone). Only when rebalancing is configured
-does it also revoke any stale orderbook allowance, per chain in managed
-inventory mode, the same way, and a tokenization preflight then runs per watched
-chain, read-only: the chain's issuer redemption wallet must be configured, and
-every preflighted equity's configured vault must report the configured
-underlying as its `asset()` (the same attestation a redemption's unwrap step
-performs). The preflighted equities are, on the primary, every trading- or
-rebalancing-enabled equity (the bot may wrap or redeem any of them there), and
-on a secondary only its rebalancing-enabled equities; a hedge-only secondary is
-skipped with a log line and has no redemption-wallet requirement. Each failure
-is fatal and names the chain and, where one applies, the symbol. Then, on every
-preflighted chain with no `[orchestrator.addresses]` entry, the preflight asks
-issuance's per-asset status endpoint (the freeze gate's endpoint, through the
-same client) for each preflighted equity's `vault_mode` and refuses startup
-naming the chain and symbol when one is orchestrator-mode: its first mint would
-stall at the signing step. Chains with an entry are not queried: the entry is
-the only prerequisite this bot can see, and the Turnkey `MintAuth` policy for
-that chain stays invisible at startup, so a missing policy fails the first
-orchestrator-mode mint at signing rather than at preflight. An indeterminate
-mode (issuance unreachable, asset unknown to issuance) is warned about per chain
-and symbol rather than refused: rebalancing mode never requires issuance to be
-reachable at startup (the freeze gate fails closed per cycle and has its own
-`freeze_check` escape hatch for an issuance outage), and the per-mint mode read
-fails closed on its own: a mint whose mode cannot be read stops at mode
-discovery, before any signing. The signing-step failure is the last line only
-for a known orchestrator-mode mint without its chain's entry or `MintAuth`
-policy.
+every watched chain, and each wrapped equity's underlying to its wrapper vault
+and wrapped to that chain's orderbook: on the primary every equity with trading
+or rebalancing enabled, on a secondary only the equities with rebalancing
+enabled, the same selection its tokenization preflight attests (a hedge-only
+secondary has no wrapper to approve, so its allowance work is the USDC grant
+alone). Only when rebalancing is configured does it also revoke any stale
+orderbook allowance, per chain in managed inventory mode, the same way, and a
+tokenization preflight then runs per watched chain, read-only: the chain's
+issuer redemption wallet must be configured, and every preflighted equity's
+configured vault must report the configured underlying as its `asset()` (the
+same attestation a redemption's unwrap step performs). The preflighted equities
+are, on the primary, every trading- or rebalancing-enabled equity (the bot may
+wrap or redeem any of them there), and on a secondary only its
+rebalancing-enabled equities; a hedge-only secondary is skipped with a log line
+and has no redemption-wallet requirement. Each failure is fatal and names the
+chain and, where one applies, the symbol. Then, on every preflighted chain with
+no `[orchestrator.addresses]` entry, the preflight asks issuance's per-asset
+status endpoint (the freeze gate's endpoint, through the same client) for each
+preflighted equity's `vault_mode` and refuses startup naming the chain and
+symbol when one is orchestrator-mode: its first mint would stall at the signing
+step. Chains with an entry are not queried: the entry is the only prerequisite
+this bot can see, and the Turnkey `MintAuth` policy for that chain stays
+invisible at startup, so a missing policy fails the first orchestrator-mode mint
+at signing rather than at preflight. An indeterminate mode (issuance
+unreachable, asset unknown to issuance) is warned about per chain and symbol
+rather than refused: rebalancing mode never requires issuance to be reachable at
+startup (the freeze gate fails closed per cycle and has its own `freeze_check`
+escape hatch for an issuance outage), and the per-mint mode read fails closed on
+its own: a mint whose mode cannot be read stops at mode discovery, before any
+signing. The signing-step failure is the last line only for a known
+orchestrator-mode mint without its chain's entry or `MintAuth` policy.
 
 Historical backfill resumes from a persisted database checkpoint. The configured
 `deployment_block` is only the initial seed for the first startup or for an
@@ -1502,28 +1503,29 @@ systemd unit:
   and runs `validate-config` while the old process is still running. For Turnkey
   wallets it then lists policies through Turnkey's authenticated read-only API
   and proves that every startup MAX approval target on every watched chain (that
-  chain's canonical USDC to its orderbook, plus enabled equity token to wrapper
-  and wrapper to that chain's orderbook where the chain rebalances equity) is
-  covered by an allow policy whose consensus the authenticated API user can
-  satisfy alone and whose target condition provably applies on that chain's id.
-  Applicable deny policies take precedence; unknown allow or deny applicability,
-  unsupported consensus, a watched chain with no pinned USDC, and missing
-  coverage fail closed, naming the chain, symbol, token contract, and spender.
-  Only after both gates pass may activation stop the old process and install the
-  candidate files, so a policy or config failure leaves the running bot
-  untouched; a failed stop aborts before candidate files are installed. It then
-  verifies migrations, chowns data files, writes the git-rev marker, touches the
-  activation marker, and restarts the unit. The server writes its PID to a
-  systemd-managed runtime-directory file only after Conductor has completed
-  startup initialization and every essential supervised runtime task has reached
-  a pending run state. Activation waits for that PID to match the unit's live
-  main process with a bounded startup timeout. If the process exits, readiness
-  reporting fails, or the timeout expires first, activation prints the unit
-  status and recent journal, exits non-zero, and deploy-rs rolls the profile
-  back. The unit remains `Type=simple` so automatic rollback stays compatible
-  with service generations from before the readiness handshake was introduced.
-  The first rollout requires deploying the system profile before the service
-  profile; a service-only deploy verifies the installed unit exposes the
+  chain's canonical USDC to its orderbook, plus equity token to wrapper and
+  wrapper to that chain's orderbook for every equity the chain wraps in its
+  role: trading or rebalancing enabled on the primary, rebalancing enabled on a
+  secondary) is covered by an allow policy whose consensus the authenticated API
+  user can satisfy alone and whose target condition provably applies on that
+  chain's id. Applicable deny policies take precedence; unknown allow or deny
+  applicability, unsupported consensus, a watched chain with no pinned USDC, and
+  missing coverage fail closed, naming the chain, symbol, token contract, and
+  spender. Only after both gates pass may activation stop the old process and
+  install the candidate files, so a policy or config failure leaves the running
+  bot untouched; a failed stop aborts before candidate files are installed. It
+  then verifies migrations, chowns data files, writes the git-rev marker,
+  touches the activation marker, and restarts the unit. The server writes its
+  PID to a systemd-managed runtime-directory file only after Conductor has
+  completed startup initialization and every essential supervised runtime task
+  has reached a pending run state. Activation waits for that PID to match the
+  unit's live main process with a bounded startup timeout. If the process exits,
+  readiness reporting fails, or the timeout expires first, activation prints the
+  unit status and recent journal, exits non-zero, and deploy-rs rolls the
+  profile back. The unit remains `Type=simple` so automatic rollback stays
+  compatible with service generations from before the readiness handshake was
+  introduced. The first rollout requires deploying the system profile before the
+  service profile; a service-only deploy verifies the installed unit exposes the
   expected ready file before stopping the running bot and otherwise fails
   immediately with the required rollout order. Outside systemd, the server uses
   a no-op readiness notifier so local runs remain available.

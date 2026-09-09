@@ -134,9 +134,10 @@ pub(crate) enum StartupApprovalError {
     },
 }
 
-/// Builds the deterministic list of startup approval targets: on a chain that
-/// rebalances equity, the two wrap/deposit grants of every equity with trading
-/// or rebalancing enabled, then on every chain the single USDC grant. A
+/// Builds the deterministic list of startup approval targets: the two
+/// wrap/deposit grants of every equity the chain wraps in its role (the same
+/// selection the tokenization preflight attests, so no grant targets a vault
+/// the preflight never checked), then the single USDC grant on every chain. A
 /// hedge-only secondary has no wrapper to approve, so it gets the USDC grant
 /// alone.
 pub(crate) fn build_approval_targets(
@@ -146,21 +147,8 @@ pub(crate) fn build_approval_targets(
     usdc: Address,
 ) -> Vec<ApprovalTarget> {
     let mut targets = Vec::new();
-    let mut enabled_equities = if role.rebalances_equity(assets) {
-        assets
-            .equities
-            .symbols
-            .iter()
-            .filter(|(symbol, _)| {
-                assets.is_trading_enabled(symbol) || assets.is_rebalancing_enabled(symbol)
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    enabled_equities.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
 
-    for (symbol, config) in enabled_equities {
+    for (symbol, config) in role.rebalanced_equities(assets) {
         let underlying = config.tokenized_equity;
         let derivative = config.tokenized_equity_derivative;
 

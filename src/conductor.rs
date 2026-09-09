@@ -2409,31 +2409,6 @@ struct TokenizationPreflightError {
     source: WrapperError,
 }
 
-/// The equities a chain's tokenization preflight covers, in sorted order so
-/// failures are deterministic: on the primary every equity the bot may wrap
-/// or redeem there (trading or rebalancing enabled); on a secondary only the
-/// equities it rebalances, so a hedge-only secondary preflights nothing.
-fn preflighted_equities(assets: &ChainAssets, role: ChainRole) -> Vec<&Symbol> {
-    let mut enabled = match role {
-        ChainRole::Primary => assets
-            .equities
-            .symbols
-            .keys()
-            .filter(|symbol| {
-                assets.is_trading_enabled(symbol) || assets.is_rebalancing_enabled(symbol)
-            })
-            .collect::<Vec<_>>(),
-        ChainRole::Secondary => assets
-            .equities
-            .symbols
-            .keys()
-            .filter(|symbol| assets.is_rebalancing_enabled(symbol))
-            .collect::<Vec<_>>(),
-    };
-    enabled.sort();
-    enabled
-}
-
 /// Read-only: every equity the bot may wrap or redeem on `chain` (trading or
 /// rebalancing enabled) must have a vault reporting the configured underlying
 /// as its `asset()` -- the attestation a redemption's unwrap step performs,
@@ -2445,7 +2420,7 @@ async fn attest_chain_vaults<Attester: Wrapper + ?Sized>(
     assets: &ChainAssets,
     role: ChainRole,
 ) -> Result<(), TokenizationPreflightError> {
-    for symbol in preflighted_equities(assets, role) {
+    for (symbol, _) in role.rebalanced_equities(assets) {
         let token = wrapper
             .attest_underlying(symbol)
             .await
@@ -2496,7 +2471,7 @@ async fn preflight_orchestrator_entries<Reader: VaultModeReader + ?Sized>(
         ConfiguredMintAuthorizer::Disabled => {}
     }
 
-    for symbol in preflighted_equities(assets, role) {
+    for (symbol, _) in role.rebalanced_equities(assets) {
         match vault_modes.vault_mode(symbol).await {
             Ok(VaultModeTag::VaultDirect) => {}
             Ok(VaultModeTag::Orchestrator) => {
@@ -15544,7 +15519,10 @@ mod tests {
             ethereum.wallet.address(),
             address!("0x0000000000000000000000000000000000000e78")
         );
-        assert!(matches!(ethereum.equity, EquityTokenization::Rebalancing(_)));
+        assert!(matches!(
+            ethereum.equity,
+            EquityTokenization::Rebalancing(_)
+        ));
     }
 
     /// A watched chain that rebalances equity without its own issuer
