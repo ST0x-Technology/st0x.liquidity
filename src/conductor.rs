@@ -731,8 +731,8 @@ type HttpProvider = FillProvider<
 /// contract calls) with no error surfaced (RAI-2218). 30s accommodates the
 /// heavy eth_getLogs range scans backfill issues; the wallet transport uses
 /// 20s for its smaller payloads.
-const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The watched chains beyond the primary: the ones needing their own
 /// providers, watchers, and accounting entries.
