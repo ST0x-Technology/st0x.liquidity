@@ -15481,6 +15481,26 @@ mod tests {
         ));
     }
 
+    /// A secondary that rebalances no equity is hedge-only: its fills are
+    /// hedged, nothing is minted, wrapped or redeemed there, so it needs no
+    /// redemption wallet and startup keeps only its signer.
+    #[test]
+    fn chain_tokenizations_keep_only_the_signer_on_a_hedge_only_secondary() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = alpaca_broker_ctx();
+        ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
+        ctx.chains.insert_secondary(ethereum_trading_chain(None));
+
+        let tokenizations = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()).unwrap();
+
+        let ethereum = &tokenizations[&Chain::Ethereum];
+        assert_eq!(ethereum.chain, Chain::Ethereum);
+        assert_eq!(
+            ethereum.wallet.address(),
+            address!("0x0000000000000000000000000000000000000e78")
+        );
+    }
+
     fn ctx_with_base_and_ethereum_trading() -> Ctx {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.chains.primary_mut().assets = ChainAssets {
