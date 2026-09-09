@@ -1721,14 +1721,31 @@ fn chain_wallet(
     }
 }
 
-/// The tokenization services bound to one watched chain: the issuer client,
-/// the wrapper and the mint authorizer, each built on that chain's signer,
-/// asset table, issuer redemption wallet and orchestrator entry.
+/// The tokenization services bound to one watched chain: its signer, and
+/// the equity leg (issuer client, wrapper, mint authorizer) where the chain
+/// rebalances equity.
 struct ChainTokenization<Signer: Wallet> {
     chain: Chain,
+    role: ChainRole,
     wallet: Signer,
+    equity: EquityTokenization,
+}
+
+/// What a watched chain's tokenization set can do beyond signing.
+enum EquityTokenization {
+    /// The chain hedges its fills and rebalances no equity: nothing is
+    /// minted, wrapped or redeemed there, so it needs no wrapper vault,
+    /// issuer client or redemption wallet, and the preflight attests nothing.
+    HedgeOnly,
+    /// The chain moves equity between its vaults and the broker.
+    Rebalancing(EquityTokenizationServices),
+}
+
+/// One chain's issuer client, wrapper and mint authorizer, each built on
+/// that chain's signer, asset table, redemption wallet and orchestrator entry.
+struct EquityTokenizationServices {
     tokenizer: Arc<dyn Tokenizer>,
-    wrapper: Arc<WrapperService<Signer>>,
+    wrapper: Arc<dyn Wrapper>,
     mint_authorizer: ConfiguredMintAuthorizer,
 }
 
@@ -1737,48 +1754,96 @@ struct ChainTokenization<Signer: Wallet> {
 type WatchedChainTokenizations =
     BTreeMap<Chain, ChainTokenization<Arc<dyn Wallet<Provider = RootProvider>>>>;
 
-/// One [`ChainTokenization`] per watched chain. A watched chain without its
-/// own redemption wallet refuses startup naming the chain, rather than
-/// borrowing the primary's: tokens sent to another chain's issuer address
-/// are lost.
+/// One [`ChainTokenization`] per watched chain. The primary always carries
+/// the equity leg: the rebalancer, the cash corridor and the recovery jobs
+/// run on its services until chain selection moves into the global
+/// rebalancer. A secondary carries it only when one of its equities opts
+/// into rebalancing; otherwise it is hedge-only, keeps just its signer, and
+/// is logged as such. A chain carrying the leg without its own redemption
+/// wallet refuses startup naming the chain, rather than borrowing the
+/// primary's: tokens sent to another chain's issuer address are lost.
 fn build_chain_tokenizations(
     ctx: &Ctx,
     wallet_ctx: &OnchainWalletCtx,
 ) -> anyhow::Result<WatchedChainTokenizations> {
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
+    let primary_chain = ctx.chains.primary().chain;
 
     ctx.chains
         .watched()
         .map(|watched| {
             let chain = watched.chain;
             let wallet = chain_wallet(wallet_ctx, chain).clone();
-            let redemption_wallet = ctx.redemption_wallet(chain)?;
-            let tokenizer: Arc<dyn Tokenizer> = Arc::new(AlpacaTokenizationService::new(
-                alpaca_auth.base_url().to_string(),
-                alpaca_auth.account_id,
-                alpaca_auth.auth.clone(),
-                wallet.clone(),
-                chain,
-                Some(redemption_wallet),
-            )?);
-            let wrapper = build_wrapper(wallet.clone(), watched);
-            let mint_authorizer = build_mint_authorizer(
-                ctx.orchestrator.as_ref().map(|config| &config.addresses),
-                chain,
-                wallet.clone(),
-            );
+            let role = if chain == primary_chain {
+                ChainRole::Primary
+            } else {
+                ChainRole::Secondary
+            };
+            let rebalances_equity = match role {
+                ChainRole::Primary => true,
+                ChainRole::Secondary => watched.assets.rebalances_equity(),
+            };
+            let equity = if rebalances_equity {
+                EquityTokenization::Rebalancing(build_equity_tokenization_services(
+                    ctx,
+                    alpaca_auth,
+                    watched,
+                    wallet.clone(),
+                )?)
+            } else {
+                info!(
+                    target: "tokenization",
+                    %chain,
+                    "Watched chain is hedge-only (no equity opts into rebalancing): it needs \
+                     no wrapper vault, issuer client or redemption wallet, so none is built \
+                     or preflighted"
+                );
+                EquityTokenization::HedgeOnly
+            };
+
             Ok((
                 chain,
                 ChainTokenization {
                     chain,
+                    role,
                     wallet,
-                    tokenizer,
-                    wrapper,
-                    mint_authorizer,
+                    equity,
                 },
             ))
         })
         .collect()
+}
+
+/// One chain's equity leg on its own signer: the issuer client bound to the
+/// chain's redemption wallet, the wrapper over its asset table and the mint
+/// authorizer for its orchestrator entry.
+fn build_equity_tokenization_services(
+    ctx: &Ctx,
+    alpaca_auth: &AlpacaBrokerApiCtx,
+    watched: &TradingChain,
+    wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+) -> anyhow::Result<EquityTokenizationServices> {
+    let chain = watched.chain;
+    let redemption_wallet = ctx.redemption_wallet(chain)?;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(AlpacaTokenizationService::new(
+        alpaca_auth.base_url().to_string(),
+        alpaca_auth.account_id,
+        alpaca_auth.auth.clone(),
+        wallet.clone(),
+        chain,
+        Some(redemption_wallet),
+    )?);
+    let wrapper = build_wrapper(wallet.clone(), watched);
+    let mint_authorizer = build_mint_authorizer(
+        ctx.orchestrator.as_ref().map(|config| &config.addresses),
+        chain,
+        wallet,
+    );
+    Ok(EquityTokenizationServices {
+        tokenizer,
+        wrapper,
+        mint_authorizer,
+    })
 }
 
 impl PositionAndRebalancing {
@@ -2472,7 +2537,8 @@ async fn preflight_orchestrator_entries<Reader: VaultModeReader + ?Sized>(
 }
 
 /// The tokenization preflight, per watched chain on that chain's own wrapper
-/// and mint authorizer. The chain's redemption wallet was already required
+/// and mint authorizer; a hedge-only chain has neither and is skipped with a
+/// log line. A preflighted chain's redemption wallet was already required
 /// when its services were built.
 async fn preflight_tokenization<Signer: Wallet + Clone, Reader: VaultModeReader + ?Sized>(
     ctx: &Ctx,
@@ -2487,26 +2553,33 @@ async fn preflight_tokenization<Signer: Wallet + Clone, Reader: VaultModeReader 
             );
         };
 
-        let role = if watched.chain == ctx.chains.primary().chain {
-            ChainRole::Primary
-        } else {
-            ChainRole::Secondary
+        let equity = match &tokenization.equity {
+            EquityTokenization::HedgeOnly => {
+                info!(
+                    target: "tokenization",
+                    chain = %watched.chain,
+                    "Skipping the tokenization preflight on a hedge-only chain: no vault to \
+                     attest, no mint to authorize"
+                );
+                continue;
+            }
+            EquityTokenization::Rebalancing(equity) => equity,
         };
 
         attest_chain_vaults(
             watched.chain,
-            tokenization.wrapper.as_ref(),
+            equity.wrapper.as_ref(),
             &watched.assets,
-            role,
+            tokenization.role,
         )
         .await?;
 
         preflight_orchestrator_entries(
             watched.chain,
-            &tokenization.mint_authorizer,
+            &equity.mint_authorizer,
             vault_modes,
             &watched.assets,
-            role,
+            tokenization.role,
         )
         .await?;
     }
@@ -2717,8 +2790,10 @@ struct WatchedEquityServices {
 /// primary's wallet, vault registry and issuer.
 ///
 /// A chain that rebalances equities without a gas threshold refuses startup
-/// here (see [`build_equity_gas_readiness`]); one that rebalances nothing
-/// keeps the fail-closed `Unwired` check.
+/// here (see [`build_equity_gas_readiness`]). A hedge-only chain gets no
+/// entry at all, so a transfer naming it is refused by the lookup; the
+/// primary, which always carries the equity leg, keeps the fail-closed
+/// `Unwired` check when it rebalances nothing.
 fn build_watched_equity_services<Signer: Wallet + Clone>(
     deps: &RebalancingDeps,
     tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
@@ -2755,6 +2830,17 @@ fn build_watched_equity_services<Signer: Wallet + Clone>(
     let mut registry_ids = BTreeMap::new();
     let mut wrappers: BTreeMap<Chain, Arc<dyn Wrapper>> = BTreeMap::new();
     for (chain, tokenization) in tokenizations {
+        let equity = match &tokenization.equity {
+            EquityTokenization::HedgeOnly => {
+                debug!(
+                    target: "tokenization",
+                    %chain,
+                    "Hedge-only chain gets no equity transfer services"
+                );
+                continue;
+            }
+            EquityTokenization::Rebalancing(equity) => equity,
+        };
         let watched = watched_chain(*chain)?;
         let chain_wallet = tokenization.wallet.address();
         let (registry_id, vault_lookup) = build_rebalancing_vault_lookup(
@@ -2764,7 +2850,7 @@ fn build_watched_equity_services<Signer: Wallet + Clone>(
         );
 
         registry_ids.insert(*chain, registry_id);
-        wrappers.insert(*chain, tokenization.wrapper.clone());
+        wrappers.insert(*chain, equity.wrapper.clone());
         chains.insert(
             *chain,
             ChainEquityServices {
@@ -2775,9 +2861,9 @@ fn build_watched_equity_services<Signer: Wallet + Clone>(
                     chain_wallet,
                 ),
                 vault_lookup,
-                tokenizer: tokenization.tokenizer.clone(),
-                wrapper: tokenization.wrapper.clone(),
-                mint_authorizer: tokenization.mint_authorizer.clone(),
+                tokenizer: equity.tokenizer.clone(),
+                wrapper: equity.wrapper.clone(),
+                mint_authorizer: equity.mint_authorizer.clone(),
                 gas_readiness: gas_readiness
                     .remove(chain)
                     .unwrap_or(ConfiguredGasReadiness::Unwired),
@@ -2814,6 +2900,13 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let primary = tokenizations.get(&primary_chain).with_context(|| {
             format!("no tokenization services were built for the primary chain {primary_chain}")
         })?;
+        let primary_equity = match &primary.equity {
+            EquityTokenization::Rebalancing(equity) => equity,
+            EquityTokenization::HedgeOnly => anyhow::bail!(
+                "the primary chain {primary_chain} was built hedge-only, but the rebalancer \
+                 runs on its equity leg"
+            ),
+        };
         info!(
             chain = %primary.chain,
             "Initializing rebalancing infrastructure on the primary chain's tokenization services"
@@ -2847,8 +2940,8 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         revoke_stale_orderbook_allowances(&deps.ctx, &tokenizations).await?;
         preflight_tokenization(&deps.ctx, &tokenizations, issuance_client.as_ref()).await?;
 
-        let tokenizer = primary.tokenizer.clone();
-        let wrapper = primary.wrapper.clone();
+        let tokenizer = primary_equity.tokenizer.clone();
+        let wrapper = primary_equity.wrapper.clone();
 
         let mint_authorization =
             build_mint_authorization_infra(issuance_client, &deps.apalis_pool).await?;
@@ -15396,18 +15489,22 @@ mod tests {
         }
     }
 
-    fn ethereum_trading_chain(redemption_wallet: Option<Address>) -> TradingChain {
+    /// A watched Ethereum listing one TSLA that trades, with the given
+    /// rebalancing flag and issuer redemption wallet.
+    fn ethereum_trading_chain(
+        redemption_wallet: Option<Address>,
+        rebalancing: OperationMode,
+    ) -> TradingChain {
         let mut trading = TradingChain::test()
             .chain(Chain::Ethereum)
             .orderbook(Address::repeat_byte(0xe0))
             .maybe_redemption_wallet(redemption_wallet)
             .call();
+        let mut tsla = equity_asset(Address::repeat_byte(0xe5), Address::repeat_byte(0xe6));
+        tsla.rebalancing = rebalancing;
         trading.assets = ChainAssets {
             equities: ChainEquities {
-                symbols: HashMap::from([(
-                    Symbol::new("TSLA").unwrap(),
-                    equity_asset(Address::repeat_byte(0xe5), Address::repeat_byte(0xe6)),
-                )]),
+                symbols: HashMap::from([(Symbol::new("TSLA").unwrap(), tsla)]),
                 operational_limit: None,
             },
             cash: None,
@@ -15415,10 +15512,11 @@ mod tests {
         trading
     }
 
-    /// One set of tokenization services per watched chain, each bound to
-    /// that chain's own signer and asset table -- never the Base wallet
-    /// or the primary's tokens -- and none for a chain with no trading
-    /// table (HyperEVM here: a signer exists, nothing is watched).
+    /// One set of tokenization services per watched chain that rebalances
+    /// equity, each bound to that chain's own signer and asset table --
+    /// never the Base wallet or the primary's tokens -- and none for a chain
+    /// with no trading table (HyperEVM here: a signer exists, nothing is
+    /// watched).
     #[test]
     fn chain_tokenizations_cover_every_watched_chain_with_its_own_wallet_and_assets() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
@@ -15434,8 +15532,10 @@ mod tests {
             },
             cash: None,
         };
-        ctx.chains
-            .insert_secondary(ethereum_trading_chain(Some(Address::repeat_byte(0xe1))));
+        ctx.chains.insert_secondary(ethereum_trading_chain(
+            Some(Address::repeat_byte(0xe1)),
+            OperationMode::Enabled,
+        ));
 
         let tokenizations = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()).unwrap();
 
@@ -15446,28 +15546,33 @@ mod tests {
 
         let base = &tokenizations[&Chain::Base];
         assert_eq!(base.chain, Chain::Base);
+        assert_eq!(base.role, ChainRole::Primary);
         assert_eq!(
             base.wallet.address(),
             address!("0x0000000000000000000000000000000000000ba5")
         );
+        assert!(matches!(base.equity, EquityTokenization::Rebalancing(_)));
 
         let ethereum = &tokenizations[&Chain::Ethereum];
         assert_eq!(ethereum.chain, Chain::Ethereum);
+        assert_eq!(ethereum.role, ChainRole::Secondary);
         assert_eq!(
             ethereum.wallet.address(),
             address!("0x0000000000000000000000000000000000000e78")
         );
+        assert!(matches!(ethereum.equity, EquityTokenization::Rebalancing(_)));
     }
 
-    /// A watched chain without its own issuer redemption wallet cannot
-    /// redeem, so building its services fails startup naming that chain
-    /// rather than borrowing the primary's wallet.
+    /// A watched chain that rebalances equity without its own issuer
+    /// redemption wallet cannot redeem, so building its services fails
+    /// startup naming that chain rather than borrowing the primary's wallet.
     #[test]
     fn chain_tokenizations_refuse_a_watched_chain_without_its_redemption_wallet() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.broker = alpaca_broker_ctx();
         ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
-        ctx.chains.insert_secondary(ethereum_trading_chain(None));
+        ctx.chains
+            .insert_secondary(ethereum_trading_chain(None, OperationMode::Enabled));
 
         let Err(error) = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()) else {
             panic!("a watched chain without a redemption wallet must fail startup");
@@ -15489,16 +15594,23 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.broker = alpaca_broker_ctx();
         ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
-        ctx.chains.insert_secondary(ethereum_trading_chain(None));
+        ctx.chains
+            .insert_secondary(ethereum_trading_chain(None, OperationMode::Disabled));
 
         let tokenizations = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()).unwrap();
 
         let ethereum = &tokenizations[&Chain::Ethereum];
         assert_eq!(ethereum.chain, Chain::Ethereum);
+        assert_eq!(ethereum.role, ChainRole::Secondary);
         assert_eq!(
             ethereum.wallet.address(),
             address!("0x0000000000000000000000000000000000000e78")
         );
+        assert!(matches!(ethereum.equity, EquityTokenization::HedgeOnly));
+        assert!(matches!(
+            tokenizations[&Chain::Base].equity,
+            EquityTokenization::Rebalancing(_)
+        ));
     }
 
     fn ctx_with_base_and_ethereum_trading() -> Ctx {
@@ -15513,7 +15625,8 @@ mod tests {
             },
             cash: None,
         };
-        ctx.chains.insert_secondary(ethereum_trading_chain(None));
+        ctx.chains
+            .insert_secondary(ethereum_trading_chain(None, OperationMode::Disabled));
         ctx
     }
 
