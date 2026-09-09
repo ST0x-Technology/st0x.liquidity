@@ -1496,7 +1496,9 @@ mod tests {
     use crate::conductor::job::{BackpressureStreak, Job};
     use crate::equity_redemption::RedemptionAggregateId;
     use crate::mint_authorization::ConfiguredMintAuthorizer;
+    use crate::native_gas::ConfiguredGasReadiness;
     use crate::onchain::mock::MockRaindex;
+    use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::{
         EquityTransferServices, MintError, MintTransferError, RedemptionError,
         ResumeEquityToHedging, ResumeEquityToMarketMaking,
@@ -1795,19 +1797,27 @@ mod tests {
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let services = EquityTransferServices {
-            raindex,
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper,
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex,
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper,
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         Arc::new(TransferEquityToMarketMakingCtx {
             transfer,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
             mint_store: Arc::new(test_store(cqrs_pool, services)),
-            equities_config: ChainEquities::default(),
+            transfer_services: EquityTransferServices::panicking(),
             job_queue,
         })
     }
@@ -1825,12 +1835,20 @@ mod tests {
             GuardState::ActiveTransfer { generation },
         )])));
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let redemption_store = Arc::new(test_store(cqrs_pool, services));
 

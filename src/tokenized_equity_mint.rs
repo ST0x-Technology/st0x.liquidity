@@ -59,7 +59,7 @@ use st0x_tokenization::{
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::mint_authorization::SignedMintAuthorization;
-use crate::rebalancing::equity::EquityTransferServices;
+use crate::rebalancing::equity::{ChainServicesMissing, EquityTransferServices};
 
 /// Errors that can occur during tokenized equity mint operations.
 ///
@@ -67,6 +67,9 @@ use crate::rebalancing::equity::EquityTransferServices;
 /// invalid transitions.
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
 pub enum TokenizedEquityMintError {
+    /// The record names a chain no services were wired for.
+    #[error(transparent)]
+    ChainServicesMissing(#[from] ChainServicesMissing),
     /// Command sent to a non-existent aggregate (must use RequestMint to initialize)
     #[error("Aggregate not initialized: use RequestMint to start a new mint")]
     NotInitialized,
@@ -2644,10 +2647,10 @@ impl TokenizedEquityMint {
             }
         };
 
+        let tokenizer = &services.for_chain(self.chain())?.tokenizer;
         let (provider_request, submitted) = match action {
             MintProviderAction::Submit => (
-                services
-                    .tokenizer
+                tokenizer
                     .request_mint(
                         symbol.clone(),
                         FractionalShares::new(*quantity),
@@ -2657,8 +2660,7 @@ impl TokenizedEquityMint {
                     .await,
                 true,
             ),
-            MintProviderAction::Reconcile => match services
-                .tokenizer
+            MintProviderAction::Reconcile => match tokenizer
                 .find_mint_by_issuer_request_id(&issuer_request_id)
                 .await
             {
@@ -2671,8 +2673,7 @@ impl TokenizedEquityMint {
                         "Provider lookup found no mint; replaying the request with its idempotency key"
                     );
                     (
-                        services
-                            .tokenizer
+                        tokenizer
                             .request_mint(
                                 symbol.clone(),
                                 FractionalShares::new(*quantity),
@@ -2836,6 +2837,7 @@ impl TokenizedEquityMint {
             } => {
                 let nonce = B256::random();
                 let signed = services
+                    .for_chain(self.chain())?
                     .mint_authorizer
                     .sign(token, *quantity, nonce)
                     .await
@@ -3040,6 +3042,7 @@ impl TokenizedEquityMint {
                 ..
             } => {
                 let completed = match services
+                    .for_chain(self.chain())?
                     .tokenizer
                     .poll_mint_until_complete(tokenization_request_id)
                     .await
@@ -3134,8 +3137,10 @@ impl TokenizedEquityMint {
 mod tests {
     use alloy::primitives::B256;
     use sqlx::SqlitePool;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    use st0x_config::ChainEquities;
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore, replay};
     use st0x_float_macro::float;
     use st0x_raindex::RaindexVaultId;
@@ -3145,31 +3150,66 @@ mod tests {
 
     use super::*;
     use crate::mint_authorization::{ConfiguredMintAuthorizer, MockMintAuthorizer};
+    use crate::native_gas::ConfiguredGasReadiness;
     use crate::onchain::mock::MockRaindex;
+    use crate::rebalancing::equity::ChainEquityServices;
     use crate::vault_lookup::MockVaultLookup;
 
     fn mock_vault_lookup() -> MockVaultLookup {
         MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO))
     }
 
+    /// The same mocks under every chain, so a fixture can name whichever
+    /// chain its record carries. Which entry a command resolves is asserted
+    /// in `rebalancing::equity`, where the entries differ per chain.
     fn mint_services(tokenizer: MockTokenizer) -> EquityTransferServices {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(tokenizer);
+        let chains = Chain::ALL
+            .into_iter()
+            .map(|chain| {
+                (
+                    chain,
+                    ChainEquityServices {
+                        wallet: Address::ZERO,
+                        raindex: Arc::new(MockRaindex::new()),
+                        vault_lookup: Arc::new(mock_vault_lookup()),
+                        tokenizer: tokenizer.clone(),
+                        wrapper: Arc::new(MockWrapper::new()),
+                        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                        gas_readiness: ConfiguredGasReadiness::Unwired,
+                        equities: ChainEquities::default(),
+                    },
+                )
+            })
+            .collect();
+
         EquityTransferServices {
-            tokenizer: Arc::new(tokenizer),
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         }
+    }
+
+    /// Like [`mint_services`] but sharing a caller-held tokenizer under every
+    /// chain, so a test can inspect the calls the aggregate made on it.
+    fn mint_services_sharing(tokenizer: Arc<dyn Tokenizer>) -> EquityTransferServices {
+        let mut services = mint_services(MockTokenizer::new());
+        for chain_services in services.chains.values_mut() {
+            chain_services.tokenizer = tokenizer.clone();
+        }
+
+        services
     }
 
     /// Like [`mint_services`] but with a working (mock) mint authorizer, for
     /// tests exercising the orchestrator-mode signing path.
     fn mint_services_with_authorizer(tokenizer: MockTokenizer) -> EquityTransferServices {
-        EquityTransferServices {
-            mint_authorizer: ConfiguredMintAuthorizer::Enabled(Arc::new(MockMintAuthorizer)),
-            ..mint_services(tokenizer)
+        let mut services = mint_services(tokenizer);
+        for chain_services in services.chains.values_mut() {
+            chain_services.mint_authorizer =
+                ConfiguredMintAuthorizer::Enabled(Arc::new(MockMintAuthorizer));
         }
+
+        services
     }
 
     fn mint_command() -> TokenizedEquityMintCommand {
@@ -3424,10 +3464,7 @@ mod tests {
     #[tokio::test]
     async fn provider_commands_reject_identity_mismatch_before_side_effects() {
         let tokenizer = Arc::new(MockTokenizer::new());
-        let services = EquityTransferServices {
-            tokenizer: tokenizer.clone(),
-            ..mint_services(MockTokenizer::new())
-        };
+        let services = mint_services_sharing(tokenizer.clone());
         let store = TestStore::<TokenizedEquityMint>::new(services);
         let id = issuer_request_id("ISS001");
         let other = issuer_request_id("different-mint");
@@ -3460,10 +3497,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_intent_without_identity_remains_recoverable() {
         let tokenizer = Arc::new(MockTokenizer::new());
-        let services = EquityTransferServices {
-            tokenizer: tokenizer.clone(),
-            ..mint_services(MockTokenizer::new())
-        };
+        let services = mint_services_sharing(tokenizer.clone());
         let event = serde_json::from_str(&mint_requested_payload("AAPL")).unwrap();
         let state = TokenizedEquityMint::originate(&event).unwrap();
         assert!(matches!(
@@ -3497,10 +3531,7 @@ mod tests {
     #[tokio::test]
     async fn initialize_persists_intent_without_calling_provider() {
         let tokenizer = Arc::new(MockTokenizer::new());
-        let services = EquityTransferServices {
-            tokenizer: tokenizer.clone(),
-            ..mint_services(MockTokenizer::new())
-        };
+        let services = mint_services_sharing(tokenizer.clone());
         let events = TestHarness::<TokenizedEquityMint>::with(services)
             .given_no_previous_events()
             .when(mint_command())
@@ -3519,10 +3550,7 @@ mod tests {
     #[tokio::test]
     async fn first_submission_advances_requested_intent_once() {
         let tokenizer = Arc::new(MockTokenizer::new());
-        let services = EquityTransferServices {
-            tokenizer: tokenizer.clone(),
-            ..mint_services(MockTokenizer::new())
-        };
+        let services = mint_services_sharing(tokenizer.clone());
         let store = TestStore::<TokenizedEquityMint>::new(services);
         let id = issuer_request_id("ISS001");
 
@@ -3553,10 +3581,7 @@ mod tests {
         let tokenizer = Arc::new(
             MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::ApiError),
         );
-        let services = EquityTransferServices {
-            tokenizer,
-            ..mint_services(MockTokenizer::new())
-        };
+        let services = mint_services_sharing(tokenizer);
         let store = TestStore::<TokenizedEquityMint>::new(services);
         let id = issuer_request_id("ISS001");
 
@@ -3586,10 +3611,7 @@ mod tests {
         let id = issuer_request_id("ISS001");
         let request = provider_mint_request(&id, TokenizationRequestStatus::Pending);
         let tokenizer = Arc::new(MockTokenizer::new().with_pending_requests(vec![request]));
-        let services = EquityTransferServices {
-            tokenizer: tokenizer.clone(),
-            ..mint_services(MockTokenizer::new())
-        };
+        let services = mint_services_sharing(tokenizer.clone());
         let store = TestStore::<TokenizedEquityMint>::new(services);
 
         store.send(&id, mint_command()).await.unwrap();
@@ -3614,10 +3636,7 @@ mod tests {
         let id = issuer_request_id("ISS001");
         let request = provider_mint_request(&id, TokenizationRequestStatus::Completed);
         let tokenizer = Arc::new(MockTokenizer::new().with_pending_requests(vec![request]));
-        let services = EquityTransferServices {
-            tokenizer: tokenizer.clone(),
-            ..mint_services(MockTokenizer::new())
-        };
+        let services = mint_services_sharing(tokenizer.clone());
         let store = TestStore::<TokenizedEquityMint>::new(services);
 
         store.send(&id, mint_command()).await.unwrap();
@@ -3651,10 +3670,7 @@ mod tests {
         )
         .unwrap();
         let tokenizer = Arc::new(MockTokenizer::new().with_pending_requests(vec![request]));
-        let services = EquityTransferServices {
-            tokenizer: tokenizer.clone(),
-            ..mint_services(MockTokenizer::new())
-        };
+        let services = mint_services_sharing(tokenizer.clone());
         let store = TestStore::<TokenizedEquityMint>::new(services);
 
         store.send(&id, mint_command()).await.unwrap();
@@ -3679,10 +3695,7 @@ mod tests {
         let id = issuer_request_id("ISS001");
         let request = provider_mint_request(&id, TokenizationRequestStatus::Rejected);
         let tokenizer = Arc::new(MockTokenizer::new().with_pending_requests(vec![request]));
-        let services = EquityTransferServices {
-            tokenizer: tokenizer.clone(),
-            ..mint_services(MockTokenizer::new())
-        };
+        let services = mint_services_sharing(tokenizer.clone());
         let store = TestStore::<TokenizedEquityMint>::new(services);
 
         store.send(&id, mint_command()).await.unwrap();
@@ -3733,10 +3746,7 @@ mod tests {
     #[tokio::test]
     async fn reconciliation_without_match_replays_idempotent_submission() {
         let tokenizer = Arc::new(MockTokenizer::new());
-        let services = EquityTransferServices {
-            tokenizer: tokenizer.clone(),
-            ..mint_services(MockTokenizer::new())
-        };
+        let services = mint_services_sharing(tokenizer.clone());
         let store = TestStore::<TokenizedEquityMint>::new(services);
         let id = issuer_request_id("ISS001");
 
@@ -3760,10 +3770,7 @@ mod tests {
     #[tokio::test]
     async fn reconciliation_lookup_error_preserves_requested_intent() {
         let tokenizer = Arc::new(MockTokenizer::new().with_mint_lookup_failure());
-        let services = EquityTransferServices {
-            tokenizer: tokenizer.clone(),
-            ..mint_services(MockTokenizer::new())
-        };
+        let services = mint_services_sharing(tokenizer.clone());
         let store = TestStore::<TokenizedEquityMint>::new(services);
         let id = issuer_request_id("ISS001");
 
@@ -3794,10 +3801,7 @@ mod tests {
     #[tokio::test]
     async fn definitive_reconciliation_lookup_error_preserves_requested_intent() {
         let tokenizer = Arc::new(MockTokenizer::new().with_definitive_mint_lookup_failure());
-        let services = EquityTransferServices {
-            tokenizer: tokenizer.clone(),
-            ..mint_services(MockTokenizer::new())
-        };
+        let services = mint_services_sharing(tokenizer.clone());
         let store = TestStore::<TokenizedEquityMint>::new(services);
         let id = issuer_request_id("ISS001");
 
@@ -4185,10 +4189,7 @@ mod tests {
         let tokenizer = Arc::new(
             MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::DefinitiveError),
         );
-        let services = EquityTransferServices {
-            tokenizer: tokenizer.clone(),
-            ..mint_services(MockTokenizer::new())
-        };
+        let services = mint_services_sharing(tokenizer.clone());
         let store = TestStore::<TokenizedEquityMint>::new(services);
         let id = issuer_request_id("ISS001");
 
@@ -4269,12 +4270,20 @@ mod tests {
     async fn submit_mint_passes_internal_request_id_to_tokenizer() {
         let tokenizer: Arc<MockTokenizer> = Arc::new(MockTokenizer::new());
         let store = TestStore::<TokenizedEquityMint>::new(EquityTransferServices {
-            tokenizer: Arc::clone(&tokenizer) as Arc<dyn Tokenizer>,
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::clone(&tokenizer) as Arc<dyn Tokenizer>,
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         });
         let id = issuer_request_id("ISS001");
 

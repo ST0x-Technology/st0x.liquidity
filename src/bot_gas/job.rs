@@ -176,18 +176,18 @@ pub struct RecordBotGasReceiptCost {
 }
 
 impl RecordBotGasReceiptCost {
-    /// Builds a fresh (zero redrive attempts) job for a Base-chain tx.
-    /// Every current production enqueue site is Base-only (vault
-    /// deposit/withdraw, wrap/unwrap, USDC wallet transfer); the CCTP burn/
-    /// mint's `Chain::Ethereum` job is constructed inline where it
-    /// arises since it is the one exception.
-    pub(crate) fn for_base_tx(
+    /// Builds a fresh (zero redrive attempts) job for a confirmed equity or
+    /// cash transfer tx on the chain that transfer ran on. The chain is the
+    /// caller's, not an assumption: the worker resolves the receipt through
+    /// that chain's provider and prices it against that chain's payer.
+    pub(crate) fn for_transfer_tx(
+        chain: Chain,
         tx_hash: TxHash,
         category: BotGasOperationCategory,
         symbol: Symbol,
     ) -> Self {
         Self {
-            chain: Chain::Base,
+            chain,
             tx_hash,
             category,
             symbol: Some(symbol),

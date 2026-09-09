@@ -909,7 +909,9 @@ mod tests {
     use alloy::primitives::{B256, TxHash, fixed_bytes};
     use chrono::Utc;
     use rain_math_float::Float;
+    use std::collections::BTreeMap;
 
+    use st0x_config::ChainEquities;
     use st0x_event_sorcery::EventSourced;
     use st0x_evm::{Chain, NODE_SYNC_MAX_ATTEMPTS};
     use st0x_execution::{FractionalShares, Symbol};
@@ -926,6 +928,8 @@ mod tests {
     use crate::vault_lookup::{MockVaultLookup, VaultLookup};
 
     use super::*;
+    use crate::native_gas::ConfiguredGasReadiness;
+    use crate::rebalancing::equity::ChainEquityServices;
 
     const FAKE_WRAP_TX: TxHash = TxHash::new(
         fixed_bytes!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef").0,
@@ -993,27 +997,34 @@ mod tests {
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         let services = EquityTransferServices {
-            raindex: raindex.clone(),
-            vault_lookup: vault_lookup.clone(),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: wrapper.clone(),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: raindex.clone(),
+                    vault_lookup: vault_lookup.clone(),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: wrapper.clone(),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let mint_store = Arc::new(st0x_event_sorcery::test_store(
             pool.clone(),
             services.clone(),
         ));
-        let redemption_store = Arc::new(st0x_event_sorcery::test_store(pool, services));
+        let redemption_store = Arc::new(st0x_event_sorcery::test_store(pool, services.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
             vault_lookup.clone(),
             Arc::new(MockTokenizer::new()),
             wrapper.clone(),
-            Address::random(),
+            services,
             mint_store,
             redemption_store,
-            BotGasReceiptCostEnqueuer::Disabled,
         ));
         UnwrappedEquityRecoveryServices {
             raindex,

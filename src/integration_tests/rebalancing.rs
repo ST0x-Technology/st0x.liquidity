@@ -54,14 +54,15 @@ use crate::inventory::{
     BroadcastingInventory, ImbalanceThreshold, InventoryView, PollFreshness, Venue,
 };
 use crate::mint_authorization::ConfiguredMintAuthorizer;
+use crate::native_gas::ConfiguredGasReadiness;
 use crate::offchain::order::OffchainOrderId;
 use crate::onchain::mock::MockRaindex;
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::{
-    CrossVenueEquityTransfer, EquityTransferServices, MintTransferError, TransferEquityToHedging,
-    TransferEquityToHedgingCtx, TransferEquityToHedgingJobQueue, TransferEquityToMarketMaking,
-    TransferEquityToMarketMakingCtx, TransferEquityToMarketMakingJobError,
-    TransferEquityToMarketMakingJobQueue,
+    ChainEquityServices, CrossVenueEquityTransfer, EquityTransferServices, MintTransferError,
+    TransferEquityToHedging, TransferEquityToHedgingCtx, TransferEquityToHedgingJobQueue,
+    TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
+    TransferEquityToMarketMakingJobError, TransferEquityToMarketMakingJobQueue,
 };
 use crate::rebalancing::trigger::GuardState;
 use crate::rebalancing::usdc::{TransferUsdcToHedging, TransferUsdcToMarketMaking};
@@ -292,13 +293,16 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
     let service = Arc::new(RebalancingService::new(
         test_trigger_config(),
         vault_registry,
-        VaultRegistryId {
-            chain: st0x_evm::Chain::Base,
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        },
+        BTreeMap::from([(
+            Chain::Base,
+            VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+        )]),
         Arc::clone(&inventory),
-        wrapper,
+        BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
         RebalancingSchedulers::new(&apalis_pool),
         Arc::new(crate::alerts::LogNotifier),
     ));
@@ -470,12 +474,20 @@ fn build_equity_transfer_with_wrapper(
     let wrapper: Arc<dyn st0x_wrapper::Wrapper> = Arc::new(mock_wrapper);
 
     let equity_services = EquityTransferServices {
-        raindex: Arc::clone(&raindex),
-        vault_lookup: Arc::clone(&vault_lookup),
-        tokenizer: Arc::clone(&tokenizer),
-        wrapper: Arc::clone(&wrapper),
+        chains: BTreeMap::from([(
+            Chain::Base,
+            ChainEquityServices {
+                wallet,
+                raindex: Arc::clone(&raindex),
+                vault_lookup: Arc::clone(&vault_lookup),
+                tokenizer: Arc::clone(&tokenizer),
+                wrapper: Arc::clone(&wrapper),
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                gas_readiness: ConfiguredGasReadiness::Unwired,
+                equities: ChainEquities::default(),
+            },
+        )]),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
@@ -483,17 +495,16 @@ fn build_equity_transfer_with_wrapper(
     ));
     let redemption_store = Arc::new(test_store::<EquityRedemption>(
         pool.clone(),
-        equity_services,
+        equity_services.clone(),
     ));
     Arc::new(CrossVenueEquityTransfer::new(
         raindex,
         vault_lookup,
         tokenizer,
         wrapper,
-        wallet,
+        equity_services,
         mint_store,
         redemption_store,
-        BotGasReceiptCostEnqueuer::Disabled,
     ))
 }
 
@@ -513,12 +524,20 @@ async fn build_equity_transfer_with_service(
     let wrapper: Arc<dyn st0x_wrapper::Wrapper> = Arc::new(mock_wrapper);
 
     let equity_services = EquityTransferServices {
-        raindex: Arc::clone(&raindex),
-        vault_lookup: Arc::clone(&vault_lookup),
-        tokenizer: Arc::clone(&tokenizer),
-        wrapper: Arc::clone(&wrapper),
+        chains: BTreeMap::from([(
+            Chain::Base,
+            ChainEquityServices {
+                wallet,
+                raindex: Arc::clone(&raindex),
+                vault_lookup: Arc::clone(&vault_lookup),
+                tokenizer: Arc::clone(&tokenizer),
+                wrapper: Arc::clone(&wrapper),
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                gas_readiness: ConfiguredGasReadiness::Unwired,
+                equities: ChainEquities::default(),
+            },
+        )]),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
 
     let (mint_store, _mint_projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
@@ -530,7 +549,7 @@ async fn build_equity_transfer_with_service(
     let (redemption_store, _redemption_projection) =
         StoreBuilder::<EquityRedemption>::new(pool.clone())
             .with(Arc::clone(service))
-            .build(equity_services)
+            .build(equity_services.clone())
             .await
             .unwrap();
 
@@ -539,10 +558,9 @@ async fn build_equity_transfer_with_service(
         vault_lookup,
         tokenizer,
         wrapper,
-        wallet,
+        equity_services.clone(),
         mint_store,
         redemption_store,
-        BotGasReceiptCostEnqueuer::Disabled,
     ))
 }
 
@@ -697,19 +715,27 @@ async fn equity_offchain_imbalance_triggers_mint() {
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
         EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         },
     ));
     let ctx = TransferEquityToMarketMakingCtx {
         transfer: equity_transfer,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
         mint_store,
-        equities_config: ChainEquities::default(),
+        transfer_services: EquityTransferServices::panicking(),
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     Job::perform(&job, &ctx).await.unwrap();
@@ -938,12 +964,20 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     assert_eq!(job.symbol, symbol);
 
     let cleanup_services = EquityTransferServices {
-        raindex: Arc::new(MockRaindex::new()),
-        vault_lookup: Arc::new(MockVaultLookup::new()),
-        tokenizer: Arc::new(MockTokenizer::new()),
-        wrapper: Arc::new(MockWrapper::new()),
+        chains: BTreeMap::from([(
+            Chain::Base,
+            ChainEquityServices {
+                wallet: Address::ZERO,
+                raindex: Arc::new(MockRaindex::new()),
+                vault_lookup: Arc::new(MockVaultLookup::new()),
+                tokenizer: Arc::new(MockTokenizer::new()),
+                wrapper: Arc::new(MockWrapper::new()),
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                gas_readiness: ConfiguredGasReadiness::Unwired,
+                equities: ChainEquities::default(),
+            },
+        )]),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
     let ctx = TransferEquityToHedgingCtx {
         transfer: equity_transfer,
@@ -1135,13 +1169,16 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
     let trigger = RebalancingService::new(
         test_trigger_config(),
         vault_registry,
-        VaultRegistryId {
-            chain: st0x_evm::Chain::Base,
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        },
+        BTreeMap::from([(
+            Chain::Base,
+            VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+        )]),
         Arc::clone(&inventory),
-        wrapper,
+        BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
         RebalancingSchedulers::new(&apalis_pool),
         Arc::new(crate::alerts::LogNotifier),
     );
@@ -1223,13 +1260,16 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
     let trigger = RebalancingService::new(
         test_trigger_config(),
         vault_registry,
-        VaultRegistryId {
-            chain: st0x_evm::Chain::Base,
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        },
+        BTreeMap::from([(
+            Chain::Base,
+            VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+        )]),
         Arc::clone(&inventory),
-        wrapper,
+        BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
         RebalancingSchedulers::new(&apalis_pool),
         Arc::new(crate::alerts::LogNotifier),
     );
@@ -1327,13 +1367,16 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     let service = Arc::new(RebalancingService::new(
         trigger_config,
         Arc::clone(&vault_registry),
-        VaultRegistryId {
-            chain: st0x_evm::Chain::Base,
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        },
+        BTreeMap::from([(
+            Chain::Base,
+            VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+        )]),
         Arc::clone(&inventory),
-        wrapper,
+        BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
         RebalancingSchedulers::new(&apalis_pool),
         Arc::new(crate::alerts::LogNotifier),
     ));
@@ -1483,13 +1526,16 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
     let trigger = RebalancingService::new(
         test_trigger_config(),
         vault_registry,
-        VaultRegistryId {
-            chain: st0x_evm::Chain::Base,
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        },
+        BTreeMap::from([(
+            Chain::Base,
+            VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+        )]),
         Arc::clone(&inventory),
-        wrapper,
+        BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
         RebalancingSchedulers::new(&apalis_pool),
         Arc::new(crate::alerts::LogNotifier),
     );
@@ -1541,13 +1587,16 @@ async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve()
     let trigger = RebalancingService::new(
         config,
         vault_registry,
-        VaultRegistryId {
-            chain: st0x_evm::Chain::Base,
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        },
+        BTreeMap::from([(
+            Chain::Base,
+            VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+        )]),
         Arc::clone(&inventory),
-        wrapper,
+        BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
         RebalancingSchedulers::new(&apalis_pool),
         Arc::new(crate::alerts::LogNotifier),
     );
@@ -1594,13 +1643,16 @@ async fn usdc_none_disables_usdc_rebalancing() {
             ..test_trigger_config()
         },
         vault_registry,
-        VaultRegistryId {
-            chain: st0x_evm::Chain::Base,
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        },
+        BTreeMap::from([(
+            Chain::Base,
+            VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+        )]),
         Arc::clone(&inventory),
-        wrapper,
+        BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
         RebalancingSchedulers::new(&apalis_pool),
         Arc::new(crate::alerts::LogNotifier),
     );
@@ -1690,19 +1742,27 @@ async fn mint_api_failure_preserves_requested_intent() {
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
         EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         },
     ));
     let ctx = TransferEquityToMarketMakingCtx {
         transfer: equity_transfer,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
         mint_store,
-        equities_config: ChainEquities::default(),
+        transfer_services: EquityTransferServices::panicking(),
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -1838,13 +1898,16 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     let trigger = RebalancingService::new(
         config,
         vault_registry,
-        VaultRegistryId {
-            chain: st0x_evm::Chain::Base,
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        },
+        BTreeMap::from([(
+            Chain::Base,
+            VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+        )]),
         Arc::clone(&inventory),
-        wrapper,
+        BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
         RebalancingSchedulers::new(&apalis_pool),
         Arc::new(crate::alerts::LogNotifier),
     );
@@ -1971,13 +2034,16 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
     let trigger = RebalancingService::new(
         config,
         vault_registry,
-        VaultRegistryId {
-            chain: st0x_evm::Chain::Base,
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        },
+        BTreeMap::from([(
+            Chain::Base,
+            VaultRegistryId {
+                chain: st0x_evm::Chain::Base,
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+        )]),
         Arc::clone(&inventory),
-        wrapper,
+        BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
         RebalancingSchedulers::new(&apalis_pool),
         Arc::new(crate::alerts::LogNotifier),
     );
@@ -2073,13 +2139,16 @@ async fn threshold_config_controls_trigger_sensitivity() {
         let trigger = RebalancingService::new(
             wide_config,
             vault_registry,
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             Arc::clone(&inventory),
-            wrapper,
+            BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         );
@@ -2137,13 +2206,16 @@ async fn threshold_config_controls_trigger_sensitivity() {
         let trigger = RebalancingService::new(
             tight_config,
             vault_registry,
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             Arc::clone(&inventory),
-            wrapper,
+            BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         );
@@ -2303,12 +2375,20 @@ async fn mint_accepted_sets_offchain_inflight() {
     let mint_store_for_spawn = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
         EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         },
     ));
     let transfer_handle = tokio::spawn({
@@ -2320,7 +2400,7 @@ async fn mint_accepted_sets_offchain_inflight() {
                 transfer: equity_transfer,
                 equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
                 mint_store,
-                equities_config: ChainEquities::default(),
+                transfer_services: EquityTransferServices::panicking(),
                 job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
             };
             let _ = Job::perform(&job, &ctx).await;
@@ -2527,19 +2607,27 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
         EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         },
     ));
     let ctx = TransferEquityToMarketMakingCtx {
         transfer: Arc::clone(&equity_transfer) as _,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
         mint_store,
-        equities_config: ChainEquities::default(),
+        transfer_services: EquityTransferServices::panicking(),
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     Job::perform(&job, &ctx).await.unwrap();
@@ -2605,18 +2693,26 @@ async fn transfer_failed_cancels_redemption_inflight() {
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new().with_send_failure());
 
     let equity_services = EquityTransferServices {
-        raindex: Arc::new(MockRaindex::new()),
-        vault_lookup: mock_vault_lookup_for_symbol(&symbol, token_address),
-        tokenizer,
-        wrapper: Arc::new(MockWrapper::new()),
+        chains: BTreeMap::from([(
+            Chain::Base,
+            ChainEquityServices {
+                wallet: Address::ZERO,
+                raindex: Arc::new(MockRaindex::new()),
+                vault_lookup: mock_vault_lookup_for_symbol(&symbol, token_address),
+                tokenizer,
+                wrapper: Arc::new(MockWrapper::new()),
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                gas_readiness: ConfiguredGasReadiness::Unwired,
+                equities: ChainEquities::default(),
+            },
+        )]),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
 
     let (redemption_store, _redemption_projection) =
         StoreBuilder::<EquityRedemption>::new(pool.clone())
             .with(Arc::clone(&service))
-            .build(equity_services)
+            .build(equity_services.clone())
             .await
             .unwrap();
 
@@ -2733,12 +2829,20 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
 
     let equity_services = EquityTransferServices {
-        raindex: Arc::clone(&raindex),
-        vault_lookup: Arc::clone(&vault_lookup),
-        tokenizer: Arc::clone(&tokenizer),
-        wrapper: Arc::clone(&wrapper),
+        chains: BTreeMap::from([(
+            Chain::Base,
+            ChainEquityServices {
+                wallet: Address::random(),
+                raindex: Arc::clone(&raindex),
+                vault_lookup: Arc::clone(&vault_lookup),
+                tokenizer: Arc::clone(&tokenizer),
+                wrapper: Arc::clone(&wrapper),
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                gas_readiness: ConfiguredGasReadiness::Unwired,
+                equities: ChainEquities::default(),
+            },
+        )]),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
@@ -2746,17 +2850,16 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
     ));
     let redemption_store = Arc::new(test_store::<EquityRedemption>(
         pool.clone(),
-        equity_services,
+        equity_services.clone(),
     ));
     let transfer = Arc::new(CrossVenueEquityTransfer::new(
         Arc::clone(&raindex),
         Arc::clone(&vault_lookup),
         Arc::clone(&tokenizer),
         Arc::clone(&wrapper),
-        Address::random(),
+        equity_services.clone(),
         Arc::clone(&mint_store),
         Arc::clone(&redemption_store),
-        BotGasReceiptCostEnqueuer::Disabled,
     ));
     let store = Arc::new(test_store(
         pool.clone(),
@@ -2856,12 +2959,20 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
 
     let equity_services = EquityTransferServices {
-        raindex: Arc::clone(&raindex),
-        vault_lookup: Arc::clone(&vault_lookup),
-        tokenizer: Arc::clone(&tokenizer),
-        wrapper: Arc::clone(&wrapper),
+        chains: BTreeMap::from([(
+            Chain::Base,
+            ChainEquityServices {
+                wallet: Address::random(),
+                raindex: Arc::clone(&raindex),
+                vault_lookup: Arc::clone(&vault_lookup),
+                tokenizer: Arc::clone(&tokenizer),
+                wrapper: Arc::clone(&wrapper),
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                gas_readiness: ConfiguredGasReadiness::Unwired,
+                equities: ChainEquities::default(),
+            },
+        )]),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
@@ -2869,17 +2980,16 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
     ));
     let redemption_store = Arc::new(test_store::<EquityRedemption>(
         pool.clone(),
-        equity_services,
+        equity_services.clone(),
     ));
     let transfer = Arc::new(CrossVenueEquityTransfer::new(
         Arc::clone(&raindex),
         Arc::clone(&vault_lookup),
         Arc::clone(&tokenizer),
         Arc::clone(&wrapper),
-        Address::random(),
+        equity_services.clone(),
         Arc::clone(&mint_store),
         Arc::clone(&redemption_store),
-        BotGasReceiptCostEnqueuer::Disabled,
     ));
     let store = Arc::new(test_store(
         pool.clone(),
@@ -2998,12 +3108,20 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
 
     let equity_services = EquityTransferServices {
-        raindex: Arc::clone(&raindex),
-        vault_lookup: Arc::clone(&vault_lookup),
-        tokenizer: Arc::clone(&tokenizer),
-        wrapper: Arc::clone(&wrapper),
+        chains: BTreeMap::from([(
+            Chain::Base,
+            ChainEquityServices {
+                wallet: Address::random(),
+                raindex: Arc::clone(&raindex),
+                vault_lookup: Arc::clone(&vault_lookup),
+                tokenizer: Arc::clone(&tokenizer),
+                wrapper: Arc::clone(&wrapper),
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                gas_readiness: ConfiguredGasReadiness::Unwired,
+                equities: ChainEquities::default(),
+            },
+        )]),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
@@ -3011,17 +3129,16 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
     ));
     let redemption_store = Arc::new(test_store::<EquityRedemption>(
         pool.clone(),
-        equity_services,
+        equity_services.clone(),
     ));
     let transfer = Arc::new(CrossVenueEquityTransfer::new(
         Arc::clone(&raindex),
         Arc::clone(&vault_lookup),
         Arc::clone(&tokenizer),
         Arc::clone(&wrapper),
-        Address::random(),
+        equity_services.clone(),
         Arc::clone(&mint_store),
         Arc::clone(&redemption_store),
-        BotGasReceiptCostEnqueuer::Disabled,
     ));
     let store = Arc::new(test_store(
         pool.clone(),
@@ -3132,12 +3249,20 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
 
     let equity_services = EquityTransferServices {
-        raindex: Arc::clone(&raindex),
-        vault_lookup: Arc::clone(&vault_lookup),
-        tokenizer: Arc::clone(&tokenizer),
-        wrapper: Arc::clone(&wrapper),
+        chains: BTreeMap::from([(
+            Chain::Base,
+            ChainEquityServices {
+                wallet: Address::random(),
+                raindex: Arc::clone(&raindex),
+                vault_lookup: Arc::clone(&vault_lookup),
+                tokenizer: Arc::clone(&tokenizer),
+                wrapper: Arc::clone(&wrapper),
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                gas_readiness: ConfiguredGasReadiness::Unwired,
+                equities: ChainEquities::default(),
+            },
+        )]),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
@@ -3145,17 +3270,16 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
     ));
     let redemption_store = Arc::new(test_store::<EquityRedemption>(
         pool.clone(),
-        equity_services,
+        equity_services.clone(),
     ));
     let transfer = Arc::new(CrossVenueEquityTransfer::new(
         Arc::clone(&raindex),
         Arc::clone(&vault_lookup),
         Arc::clone(&tokenizer),
         Arc::clone(&wrapper),
-        Address::random(),
+        equity_services.clone(),
         Arc::clone(&mint_store),
         Arc::clone(&redemption_store),
-        BotGasReceiptCostEnqueuer::Disabled,
     ));
     let store = Arc::new(test_store(
         pool.clone(),

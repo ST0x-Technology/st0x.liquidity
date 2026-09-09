@@ -30,13 +30,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
-use st0x_config::ChainEquities;
 use st0x_event_sorcery::Store;
 use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_tokenization::IssuerRequestId;
 
-use super::{CrossVenueEquityTransfer, MintTransferError, RedemptionError};
+use super::{CrossVenueEquityTransfer, EquityTransferServices, MintTransferError, RedemptionError};
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
@@ -108,12 +107,13 @@ pub(crate) struct TransferEquityToMarketMakingCtx {
     /// transitioning the guard. Absent/pre-receipt/terminal states propagate
     /// `Err` so apalis retries normally.
     pub(crate) mint_store: Arc<Store<TokenizedEquityMint>>,
-    /// Per-symbol equity asset configuration. Used to gate the `HeldForRecovery`
-    /// handoff on `wrapped_equity_recovery = "enabled"` for the symbol — the
-    /// same predicate the inventory reactor uses when dispatching recovery jobs.
-    /// Keeping the check here ensures the two paths cannot disagree: if recovery
-    /// is disabled, `Err(PostReceipt)` is returned instead and apalis retries.
-    pub(crate) equities_config: ChainEquities,
+    /// The same per-chain services map the aggregates read. Used to gate the
+    /// `HeldForRecovery` handoff on `wrapped_equity_recovery = "enabled"` for
+    /// the symbol on the job's own chain -- the same predicate the inventory
+    /// reactor uses when dispatching recovery jobs. Keeping the check here
+    /// ensures the two paths cannot disagree: if recovery is disabled,
+    /// `Err(PostReceipt)` is returned instead and apalis retries.
+    pub(crate) transfer_services: EquityTransferServices,
     /// Used to delayed-redrive on a bot-gas receipt cost enqueue failure
     /// (ADR 0017 SS4: "failure in cost recording never blocks trading")
     /// instead of consuming the apalis retry budget or handing the symbol
@@ -300,12 +300,22 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
                     ))
                 );
 
+                // Fails closed on an unwired chain: without that chain's
+                // asset table the handoff predicate cannot be evaluated, and
+                // propagating the error retries the transfer rather than
+                // stranding the tokens in a recovery slot nothing claims.
                 let recovery_enabled =
-                    ctx.equities_config
-                        .symbols
-                        .get(&self.symbol)
-                        .is_some_and(|cfg| {
-                            cfg.wrapped_equity_recovery == st0x_config::OperationMode::Enabled
+                    ctx.transfer_services
+                        .for_chain(self.chain)
+                        .is_ok_and(|services| {
+                            services
+                                .equities
+                                .symbols
+                                .get(&self.symbol)
+                                .is_some_and(|cfg| {
+                                    cfg.wrapped_equity_recovery
+                                        == st0x_config::OperationMode::Enabled
+                                })
                         });
 
                 if is_post_receipt_recoverable && recovery_enabled {
@@ -678,6 +688,7 @@ mod tests {
 
     use alloy::primitives::{Address, TxHash, U256};
     use serde_json::json;
+    use st0x_config::ChainEquities;
     use st0x_config::{ChainEquityAsset, OperationMode};
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_evm::Chain;
@@ -686,14 +697,17 @@ mod tests {
     use st0x_tokenization::issuer_request_id;
     use st0x_tokenization::mock::MockTokenizer;
     use st0x_wrapper::{MockWrapper, Wrapper};
+    use std::collections::BTreeMap;
 
     use super::*;
     use crate::equity_redemption::{
         EquityRedemptionCommand, EquityRedemptionError, redemption_aggregate_id,
     };
     use crate::mint_authorization::ConfiguredMintAuthorizer;
+    use crate::native_gas::ConfiguredGasReadiness;
     use crate::native_gas::GasReadinessFailure;
     use crate::onchain::mock::MockRaindex;
+    use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::{EquityTransferServices, MintError};
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::vault_lookup::MockVaultLookup;
@@ -743,16 +757,6 @@ mod tests {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
-        let transfer_services = EquityTransferServices {
-            raindex: raindex.clone(),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: wrapper.clone(),
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-        };
-        let mint_store = Arc::new(test_store(pool, transfer_services));
-
         let aapl_config = ChainEquityAsset {
             tokenized_equity: Address::ZERO,
             tokenized_equity_derivative: Address::ZERO,
@@ -762,16 +766,34 @@ mod tests {
             wrapped_equity_recovery: recovery_mode,
             operational_limit: None,
         };
-        let mut equities_config = ChainEquities::default();
-        equities_config
+        let mut equities = ChainEquities::default();
+        equities
             .symbols
             .insert(Symbol::new("AAPL").unwrap(), aapl_config);
+
+        let transfer_services = EquityTransferServices {
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: raindex.clone(),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: wrapper.clone(),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities,
+                },
+            )]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+        let mint_store = Arc::new(test_store(pool, transfer_services.clone()));
 
         TransferEquityToMarketMakingCtx {
             transfer,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
             mint_store,
-            equities_config,
+            transfer_services,
             job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
         }
     }
@@ -1990,12 +2012,20 @@ mod tests {
     ) -> TransferEquityToHedgingCtx {
         let (pool, _apalis_pool) = crate::test_utils::setup_test_pools().await;
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         TransferEquityToHedgingCtx {

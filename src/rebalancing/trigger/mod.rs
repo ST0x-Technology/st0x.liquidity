@@ -210,6 +210,8 @@ fn resume_idempotency_key(id: &UsdcRebalanceId, existing_rows: i64) -> String {
 pub(crate) enum TokenAddressError {
     #[error("vault registry aggregate not initialized")]
     Uninitialized,
+    #[error("no vault registry is wired for {chain}, so its tokens cannot be resolved")]
+    UnwiredChain { chain: Chain },
     #[error(transparent)]
     Persistence(#[from] AggregateError<LifecycleError<VaultRegistry>>),
 }
@@ -690,10 +692,11 @@ enum ZombieJobKillOutcome {
 pub(crate) struct RebalancingService {
     config: RebalancingServiceConfig,
     vault_registry: Arc<Store<VaultRegistry>>,
-    /// The (orderbook, vault-owner) pair that keys vault-registry lookups. The
-    /// owner is the inventory contract post-migration, the bot EOA before it;
-    /// production sources it from `Ctx::vault_owner`.
-    registry_id: VaultRegistryId,
+    /// The (orderbook, vault-owner) pair that keys vault-registry lookups, per
+    /// watched chain. The owner is the inventory contract post-migration, the
+    /// bot EOA before it; production sources it from each chain's
+    /// `[chains.<name>.trading] vault_owner`.
+    registry_ids: BTreeMap<Chain, VaultRegistryId>,
     inventory: Arc<BroadcastingInventory>,
     /// Reads issuance's per-asset dividend freeze status so the equity trigger
     /// can skip frozen assets before starting a flow. Set after construction via
@@ -714,7 +717,9 @@ pub(crate) struct RebalancingService {
     divergence_gate: Arc<InventoryDivergenceGate>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     notifier: Arc<dyn crate::alerts::Notifier>,
-    wrapper: Arc<dyn Wrapper>,
+    /// The ERC-4626 wrapper on each watched chain: a symbol's derivative and
+    /// its share ratio are that chain's, never another's.
+    wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
     pub(super) equity_scheduler: EquityRebalancingCheckScheduler,
     pub(super) usdc_scheduler: UsdcRebalancingCheckScheduler,
     pub(super) wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
@@ -844,9 +849,9 @@ impl RebalancingService {
     pub(crate) fn new(
         config: RebalancingServiceConfig,
         vault_registry: Arc<Store<VaultRegistry>>,
-        registry_id: VaultRegistryId,
+        registry_ids: BTreeMap<Chain, VaultRegistryId>,
         inventory: Arc<BroadcastingInventory>,
-        wrapper: Arc<dyn Wrapper>,
+        wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
         schedulers: RebalancingSchedulers,
         notifier: Arc<dyn crate::alerts::Notifier>,
     ) -> Self {
@@ -863,7 +868,7 @@ impl RebalancingService {
         Self {
             config,
             vault_registry,
-            registry_id,
+            registry_ids,
             inventory,
             freeze_status: RwLock::new(None),
             gas_readiness: RwLock::new(ConfiguredGasReadiness::default()),
@@ -871,7 +876,7 @@ impl RebalancingService {
             divergence_gate: Arc::default(),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
             notifier,
-            wrapper,
+            wrappers,
             equity_scheduler,
             usdc_scheduler,
             wrapped_equity_recovery_queue,
@@ -2848,12 +2853,20 @@ impl RebalancingService {
         &self,
         symbol: &Symbol,
     ) -> Result<Option<TriggeredOperation>, equity::EquityTriggerError> {
-        let wrapped_token = self.load_token_address(symbol).await?.ok_or(
+        // The trigger still dispatches on the trading chain; every lookup is
+        // keyed by it so the global rebalancer only has to pass a different
+        // chain in.
+        let chain = self.inventory.read().await.trading_chain();
+        let wrapped_token = self.load_token_address(chain, symbol).await?.ok_or(
             equity::EquityTriggerError::TokenNotInRegistry(symbol.clone()),
         )?;
 
-        let unwrapped_token = self.wrapper.lookup_underlying(symbol)?;
-        let vault_ratio = self.wrapper.get_ratio_for_symbol(symbol).await?;
+        let wrapper = self
+            .wrappers
+            .get(&chain)
+            .ok_or(equity::EquityTriggerError::UnwiredChain { chain })?;
+        let unwrapped_token = wrapper.lookup_underlying(symbol)?;
+        let vault_ratio = wrapper.get_ratio_for_symbol(symbol).await?;
         let shares_limit = self
             .config
             .assets
@@ -3380,11 +3393,16 @@ impl RebalancingService {
 
     async fn load_token_address(
         &self,
+        chain: Chain,
         symbol: &Symbol,
     ) -> Result<Option<Address>, TokenAddressError> {
+        let registry_id = self
+            .registry_ids
+            .get(&chain)
+            .ok_or(TokenAddressError::UnwiredChain { chain })?;
         let registry = self
             .vault_registry
-            .load(&self.registry_id)
+            .load(registry_id)
             .await?
             .ok_or(TokenAddressError::Uninitialized)?;
 
@@ -6136,6 +6154,7 @@ mod tests {
     use crate::position::{
         AnchorDisposition, Position, PositionCommand, PositionEvent, TradeId, TriggerReason,
     };
+    use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::test_utils::rebalancing_enabled_equities;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
@@ -6258,13 +6277,16 @@ mod tests {
         Arc::new(RebalancingService::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             inventory,
-            wrapper,
+            BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ))
@@ -6303,13 +6325,19 @@ mod tests {
         let service = RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             inventory,
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         );
@@ -6360,13 +6388,19 @@ mod tests {
         let service = RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             inventory,
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         );
@@ -6417,13 +6451,19 @@ mod tests {
         let service = RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             inventory,
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         );
@@ -6546,13 +6586,16 @@ mod tests {
         Arc::new(RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             inventory,
-            wrapper,
+            BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ))
@@ -8375,13 +8418,16 @@ mod tests {
                 assets: ChainAssets::default(),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             inventory,
-            wrapper,
+            BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         );
@@ -9035,13 +9081,19 @@ mod tests {
         Arc::new(RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             inventory,
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             notifier,
         ))
@@ -9298,13 +9350,16 @@ mod tests {
         Arc::new(RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             inventory,
-            wrapper,
+            BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ))
@@ -9315,7 +9370,7 @@ mod tests {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
-        let result = trigger.load_token_address(&symbol).await;
+        let result = trigger.load_token_address(Chain::Base, &symbol).await;
         assert!(
             matches!(result, Err(TokenAddressError::Uninitialized)),
             "Expected Uninitialized error, got {result:?}"
@@ -9330,7 +9385,10 @@ mod tests {
         let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 
-        let result = trigger.load_token_address(&symbol).await.unwrap();
+        let result = trigger
+            .load_token_address(Chain::Base, &symbol)
+            .await
+            .unwrap();
         assert_eq!(result, Some(TEST_TOKEN));
     }
 
@@ -9343,7 +9401,10 @@ mod tests {
         let reactor = make_trigger_with_inventory_and_registry(inventory, &known).await;
         let trigger = reactor.clone();
 
-        let result = trigger.load_token_address(&unknown).await.unwrap();
+        let result = trigger
+            .load_token_address(Chain::Base, &unknown)
+            .await
+            .unwrap();
         assert_eq!(result, None);
     }
 
@@ -9372,13 +9433,19 @@ mod tests {
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             inventory,
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
@@ -16571,12 +16638,20 @@ mod tests {
         let store = test_store::<TokenizedEquityMint>(
             pool.clone(),
             EquityTransferServices {
-                raindex: Arc::new(MockRaindex::new()),
-                vault_lookup: Arc::new(MockVaultLookup::new()),
-                tokenizer: Arc::new(MockTokenizer::new()),
-                wrapper: Arc::new(MockWrapper::new()),
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainEquityServices {
+                        wallet: Address::ZERO,
+                        raindex: Arc::new(MockRaindex::new()),
+                        vault_lookup: Arc::new(MockVaultLookup::new()),
+                        tokenizer: Arc::new(MockTokenizer::new()),
+                        wrapper: Arc::new(MockWrapper::new()),
+                        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                        gas_readiness: ConfiguredGasReadiness::Unwired,
+                        equities: ChainEquities::default(),
+                    },
+                )]),
                 bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
             },
         );
         store
@@ -16611,12 +16686,20 @@ mod tests {
         let store = test_store::<TokenizedEquityMint>(
             pool.clone(),
             EquityTransferServices {
-                raindex: Arc::new(MockRaindex::new()),
-                vault_lookup: Arc::new(MockVaultLookup::new()),
-                tokenizer: Arc::new(MockTokenizer::new()),
-                wrapper: Arc::new(MockWrapper::new()),
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainEquityServices {
+                        wallet: Address::ZERO,
+                        raindex: Arc::new(MockRaindex::new()),
+                        vault_lookup: Arc::new(MockVaultLookup::new()),
+                        tokenizer: Arc::new(MockTokenizer::new()),
+                        wrapper: Arc::new(MockWrapper::new()),
+                        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                        gas_readiness: ConfiguredGasReadiness::Unwired,
+                        equities: ChainEquities::default(),
+                    },
+                )]),
                 bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
             },
         );
         store
@@ -21816,11 +21899,14 @@ mod tests {
                 assets: ChainAssets::default(),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             {
                 let (event_sender, _) = broadcast::channel::<Statement>(16);
                 Arc::new(BroadcastingInventory::new(
@@ -21828,7 +21914,7 @@ mod tests {
                     event_sender,
                 ))
             },
-            wrapper,
+            BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
             schedulers,
             Arc::new(crate::alerts::LogNotifier),
         );
@@ -22216,13 +22302,19 @@ mod tests {
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: Address::ZERO,
-                owner: Address::ZERO,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: Address::ZERO,
+                    owner: Address::ZERO,
+                },
+            )]),
             inventory,
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
@@ -22446,13 +22538,19 @@ mod tests {
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             inventory.clone(),
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
@@ -22518,13 +22616,19 @@ mod tests {
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             inventory.clone(),
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
@@ -22600,13 +22704,19 @@ mod tests {
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             inventory.clone(),
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
@@ -22666,13 +22776,19 @@ mod tests {
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             inventory.clone(),
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
@@ -28061,13 +28177,16 @@ mod tests {
         let trigger = Arc::new(RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             inventory,
-            wrapper,
+            BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
@@ -28300,13 +28419,16 @@ mod tests {
         let trigger = Arc::new(RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
             inventory,
-            wrapper,
+            BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));

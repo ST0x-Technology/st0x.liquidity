@@ -1240,7 +1240,9 @@ mod tests {
         // The submission command calls the tokenizer, so the panicking stub's
         // tokenizer is swapped for a working mock.
         let mut services = crate::rebalancing::equity::EquityTransferServices::panicking();
-        services.tokenizer = Arc::new(st0x_tokenization::mock::MockTokenizer::new());
+        for chain_services in services.chains.values_mut() {
+            chain_services.tokenizer = Arc::new(st0x_tokenization::mock::MockTokenizer::new());
+        }
         let (mint_store, _mint_projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .build(services)
             .await

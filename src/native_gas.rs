@@ -185,7 +185,7 @@ impl GasReadiness {
 /// closed; unit tests may exercise unrelated transfer stages without building
 /// live chain providers.
 #[derive(Clone, Default)]
-pub(crate) enum ConfiguredGasReadiness {
+pub enum ConfiguredGasReadiness {
     Wired(Arc<GasReadiness>),
     #[default]
     Unwired,

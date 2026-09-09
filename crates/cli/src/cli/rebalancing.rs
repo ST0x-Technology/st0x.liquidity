@@ -4,6 +4,7 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::RootProvider;
 use anyhow::Context;
 use sqlx::SqlitePool;
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,8 +27,10 @@ use st0x_hedge::operator::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
 };
 use st0x_hedge::operator::mint_authorization::{ConfiguredMintAuthorizer, VaultModeReader};
-use st0x_hedge::operator::native_gas::GasReadiness;
-use st0x_hedge::operator::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
+use st0x_hedge::operator::native_gas::{ConfiguredGasReadiness, GasReadiness};
+use st0x_hedge::operator::rebalancing::equity::{
+    ChainEquityServices, CrossVenueEquityTransfer, EquityTransferServices,
+};
 use st0x_hedge::operator::rebalancing::to_wrapped_equities;
 use st0x_hedge::operator::rebalancing::usdc::{
     CrossVenueCashTransfer, MarketMakingUsdcEndpoints, UsdcSettlementParams, UsdcTransferError,
@@ -255,19 +258,28 @@ async fn build_equity_transfer_services(
     ));
 
     let services = EquityTransferServices {
-        raindex: raindex.clone(),
-        vault_lookup: vault_lookup.clone(),
-        tokenizer: tokenization_service.clone(),
-        wrapper: wrapper.clone(),
+        chains: BTreeMap::from([(
+            chain,
+            ChainEquityServices {
+                wallet,
+                raindex: raindex.clone(),
+                vault_lookup: vault_lookup.clone(),
+                tokenizer: tokenization_service.clone(),
+                wrapper: wrapper.clone(),
+                // The CLI transfer path never signs mint authorizations:
+                // `transfer_equity_command` rejects orchestrator-mode mints up
+                // front (`ensure_vault_direct_mint`), so only vault-direct
+                // assets reach this saga, which also skips
+                // `with_mint_authorization` and therefore never consults this
+                // value. Orchestrator-mode mints run through the server, where
+                // the authorizer and vault-mode wiring come from
+                // `[orchestrator]` config.
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                gas_readiness: ConfiguredGasReadiness::Wired(gas_readiness),
+                equities: trading.assets.equities.clone(),
+            },
+        )]),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        // The CLI transfer path never signs mint authorizations:
-        // `transfer_equity_command` rejects orchestrator-mode mints up
-        // front (`ensure_vault_direct_mint`), so only vault-direct assets
-        // reach this saga, which also skips `with_mint_authorization` and
-        // therefore never consults this value. Orchestrator-mode mints run
-        // through the server, where the authorizer and vault-mode wiring
-        // come from `[orchestrator]` config.
-        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
     };
 
     let (mint_store, _mint_projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
@@ -284,12 +296,10 @@ async fn build_equity_transfer_services(
         vault_lookup,
         tokenization_service.clone(),
         wrapper,
-        wallet,
+        services,
         mint_store,
         redemption_store,
-        BotGasReceiptCostEnqueuer::Disabled,
-    )
-    .with_gas_readiness(gas_readiness);
+    );
 
     Ok(EquityTransferCliServices {
         transfer,
@@ -362,19 +372,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
                  --network {recorded}"
             );
         }
-        Some(_) => {}
-        // An id with no record behind it names nothing to resume, so this is a
-        // fresh transfer and the primary-only rule still applies.
-        None => {
-            let primary = ctx.chains.primary().chain;
-            if chain != primary {
-                anyhow::bail!(
-                    "a fresh transfer-equity on {chain} is refused while the transfer saga is \
-                     built for the primary chain ({primary}) only. Fund {chain} with \
-                     alpaca-tokenize, wrap-equity and vault-deposit --network {chain} instead"
-                );
-            }
-        }
+        Some(_) | None => {}
     }
 
     let direction_str = match direction {
@@ -3171,118 +3169,6 @@ mod tests {
         );
     }
 
-    /// The transfer saga is still wired with one chain's services, so a fresh
-    /// transfer on another chain would be driven against the primary's
-    /// orderbook and wrapper. It is refused before anything reaches the
-    /// shared database.
-    #[tokio::test]
-    async fn transfer_equity_refuses_a_non_primary_network_until_records_carry_their_chain() {
-        let ctx = create_alpaca_ctx_watching_ethereum();
-        let pool = setup_test_db().await;
-
-        let mut stdout = Vec::new();
-        let error = transfer_equity_command(
-            &mut stdout,
-            TransferEquity {
-                direction: TransferDirection::ToRaindex,
-                symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(float!(1)),
-                issuer_request_id: None,
-                redemption_wallet: None,
-                network: TokenizationNetwork::Ethereum,
-            },
-            &ctx,
-            &pool,
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-
-        assert!(
-            error.contains("ethereum") && error.contains("primary") && error.contains("base"),
-            "expected the refusal to name the chain and the primary, got: {error}"
-        );
-    }
-
-    /// An `--issuer-request-id` with no record behind it is a fresh transfer
-    /// wearing a resume flag: the primary-only rule must still apply, or an
-    /// unused id would smuggle a mint onto a secondary chain.
-    #[tokio::test]
-    async fn transfer_equity_refuses_a_non_primary_network_with_an_unused_issuer_request_id() {
-        let ctx = create_alpaca_ctx_watching_ethereum();
-        let pool = setup_test_db().await;
-
-        let mut stdout = Vec::new();
-        let error = transfer_equity_command(
-            &mut stdout,
-            TransferEquity {
-                direction: TransferDirection::ToRaindex,
-                symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(float!(1)),
-                issuer_request_id: Some(Uuid::from_u128(0x2283)),
-                redemption_wallet: None,
-                network: TokenizationNetwork::Ethereum,
-            },
-            &ctx,
-            &pool,
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-
-        assert!(
-            error.contains("ethereum") && error.contains("primary") && error.contains("base"),
-            "expected the refusal to name the chain and the primary, got: {error}"
-        );
-    }
-
-    /// Only a mint resumes by id: `to-alpaca` always starts a fresh
-    /// redemption, so a recorded Ethereum mint id must not let one through on
-    /// a non-primary network.
-    #[tokio::test]
-    async fn transfer_equity_to_alpaca_ignores_a_mint_id_and_keeps_the_primary_only_rule() {
-        let ctx = create_alpaca_ctx_watching_ethereum();
-        let pool = setup_test_db().await;
-        let id = issuer_request_id("cli-redeem-with-ethereum-mint-id");
-
-        send_mint_command(
-            &pool,
-            &id,
-            TokenizedEquityMintCommand::RequestMint {
-                issuer_request_id: id.clone(),
-                symbol: Symbol::new("AAPL").unwrap(),
-                chain: Chain::Ethereum,
-                quantity: float!(10),
-                wallet: Address::ZERO,
-            },
-        )
-        .await;
-
-        let IssuerRequestId(uuid) = id;
-        let mut stdout = Vec::new();
-        let error = transfer_equity_command(
-            &mut stdout,
-            TransferEquity {
-                direction: TransferDirection::ToAlpaca,
-                symbol: Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares::new(float!(10)),
-                issuer_request_id: Some(uuid),
-                redemption_wallet: None,
-                network: TokenizationNetwork::Ethereum,
-            },
-            &ctx,
-            &pool,
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-
-        assert!(
-            error.contains("ethereum") && error.contains("primary") && error.contains("base"),
-            "expected the refusal to name the chain and the primary, got: {error}"
-        );
-    }
-
     /// A resume continues the transfer the record describes. Naming another
     /// network would drive it against the wrong orderbook, wrapper and
     /// issuer wallet, so the recorded chain decides and a disagreement is
@@ -3372,7 +3258,7 @@ mod tests {
         let pool = setup_test_db().await;
         let id = redemption_aggregate_id("cli-ethereum-redemption");
 
-        let store = StoreBuilder::<EquityRedemption>::new(pool.clone())
+        let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(chain_keyed_redemption_services())
             .await
             .unwrap();
@@ -4801,14 +4687,22 @@ mod tests {
 
     fn redemption_services() -> EquityTransferServices {
         EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(
-                MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO)),
-            ),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(
+                        MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO)),
+                    ),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         }
     }
 
@@ -5148,7 +5042,7 @@ mod tests {
         command: TokenizedEquityMintCommand,
     ) {
         let (store, _projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-            .build(redemption_services())
+            .build(chain_keyed_redemption_services())
             .await
             .unwrap();
         store.send(id, command).await.unwrap();
