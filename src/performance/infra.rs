@@ -586,7 +586,7 @@ mod tests {
 
         assert_eq!(base_series(&telemetry).current_lag_blocks, None);
         assert_eq!(base_series(&telemetry).current_lag_sampled_at, None);
-        assert!(base_series(&telemetry).points.is_empty());
+        assert_eq!(base_series(&telemetry).points, vec![]);
     }
 
     #[tokio::test]
@@ -745,7 +745,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(base_series(&telemetry).current_lag_blocks, None);
-        assert!(base_series(&telemetry).points.is_empty());
+        assert_eq!(base_series(&telemetry).points, vec![]);
         assert_eq!(
             telemetry.poll,
             PollHealth {
