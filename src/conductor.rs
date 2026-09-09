@@ -15909,6 +15909,47 @@ mod tests {
         );
     }
 
+    /// A secondary that rebalances equity gets the wrap and deposit grants
+    /// against its own equity contracts and orderbook, for the equities that
+    /// opt into rebalancing there only: NVDA trades on Ethereum but is not
+    /// rebalanced, so it is hedged, never wrapped, and gets no grant.
+    #[test]
+    fn startup_approval_targets_follow_a_rebalancing_secondarys_own_contracts() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let mut ethereum = ethereum_trading_chain(None, OperationMode::Enabled);
+        ethereum.assets.equities.symbols.insert(
+            Symbol::new("NVDA").unwrap(),
+            equity_asset(Address::repeat_byte(0xe8), Address::repeat_byte(0xe9)),
+        );
+        ctx.chains.insert_secondary(ethereum);
+
+        let targets = startup_approval_targets(&ctx).unwrap();
+
+        assert_eq!(
+            targets[&Chain::Ethereum],
+            vec![
+                ApprovalTarget {
+                    token: Address::repeat_byte(0xe5),
+                    spender: Address::repeat_byte(0xe6),
+                    symbol: Some(Symbol::new("TSLA").unwrap()),
+                    purpose: ApprovalPurpose::WrapUnderlying,
+                },
+                ApprovalTarget {
+                    token: Address::repeat_byte(0xe6),
+                    spender: Address::repeat_byte(0xe0),
+                    symbol: Some(Symbol::new("TSLA").unwrap()),
+                    purpose: ApprovalPurpose::DepositWrappedEquity,
+                },
+                ApprovalTarget {
+                    token: USDC_ETHEREUM,
+                    spender: Address::repeat_byte(0xe0),
+                    symbol: None,
+                    purpose: ApprovalPurpose::DepositUsdc,
+                },
+            ]
+        );
+    }
+
     /// A watched chain this build pins no USDC for cannot have its
     /// approvals granted: startup refuses naming the chain instead of
     /// approving another chain's USDC there.
