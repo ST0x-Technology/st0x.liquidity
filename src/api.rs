@@ -2088,7 +2088,7 @@ async fn reconcile_usdc_transfer(
     let id = parse_usdc_rebalance_id(&id)?;
     let reason = ReconcileReason::from(request.reason);
 
-    let store = StoreBuilder::<UsdcRebalance>::new(state.pool.clone())
+    let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(state.pool.clone())
         .build(())
         .await
         .map_err(ops_store_error)?;
@@ -2160,7 +2160,7 @@ async fn clear_pending_usdc_burn(
 ) -> Result<Json<UsdcTransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
     let id = parse_usdc_rebalance_id(&id)?;
 
-    let store = StoreBuilder::<UsdcRebalance>::new(state.pool.clone())
+    let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(state.pool.clone())
         .build(())
         .await
         .map_err(ops_store_error)?;
