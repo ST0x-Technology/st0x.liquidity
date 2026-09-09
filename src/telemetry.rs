@@ -28,6 +28,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use st0x_evm::Chain;
+
 pub(crate) mod broker;
 pub(crate) mod executor;
 pub(crate) mod rpc;
@@ -41,6 +43,9 @@ const RETENTION: chrono::Duration = chrono::Duration::days(14);
 #[derive(Debug, Clone)]
 pub(crate) struct BlockLagSample {
     pub(crate) sampled_at: DateTime<Utc>,
+    /// The chain whose fill watcher took the sample: each watched chain
+    /// records its own lag series.
+    pub(crate) chain: Chain,
     pub(crate) orderbook: Address,
     pub(crate) chain_tip: u64,
     /// `None` when the configured ingestion cutoff tag is unavailable.
@@ -123,11 +128,12 @@ pub(crate) async fn record_block_lag(
 
     sqlx::query(
         "INSERT INTO block_lag_samples \
-         (sampled_at, orderbook, chain_tip, cutoff_block, last_processed_block, \
+         (sampled_at, chain, orderbook, chain_tip, cutoff_block, last_processed_block, \
           lag_blocks) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(sqlite_timestamp(sample.sampled_at))
+    .bind(sample.chain.as_str())
     .bind(sample.orderbook.to_string())
     .bind(i64::try_from(sample.chain_tip)?)
     .bind(cutoff_block)
@@ -486,8 +492,6 @@ mod tests {
     use chrono::TimeZone;
     use sqlx::migrate::{Migration, Migrator};
 
-    use st0x_evm::Chain;
-
     use crate::test_utils::setup_test_db;
 
     use super::*;
@@ -499,6 +503,7 @@ mod tests {
     fn sample(seconds: i64, chain_tip: u64, checkpoint: Option<u64>) -> BlockLagSample {
         BlockLagSample {
             sampled_at: timestamp(seconds),
+            chain: Chain::Base,
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             chain_tip,
             // Cutoff trails the tip by a few blocks in this mock.

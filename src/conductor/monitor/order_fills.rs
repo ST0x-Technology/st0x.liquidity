@@ -339,6 +339,7 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
         let sampled_checkpoint = load_backfill_checkpoint(&self.pool, &self.evm_ctx).await?;
         let sample = BlockLagSample {
             sampled_at,
+            chain: self.evm_ctx.chain,
             orderbook: self.evm_ctx.orderbook,
             chain_tip,
             cutoff_block: cutoff_opt,

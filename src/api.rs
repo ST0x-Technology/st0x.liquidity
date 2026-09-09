@@ -3735,6 +3735,7 @@ mod tests {
             &state.pool,
             &crate::telemetry::BlockLagSample {
                 sampled_at: now,
+                chain: Chain::Base,
                 orderbook,
                 chain_tip: 120,
                 cutoff_block: Some(117),

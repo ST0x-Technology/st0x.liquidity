@@ -305,6 +305,8 @@ mod tests {
     use alloy::primitives::address;
     use chrono::TimeZone;
 
+    use st0x_evm::Chain;
+
     use crate::telemetry::{BlockLagSample, record_block_lag, record_poll_cycle};
     use crate::test_utils::setup_test_db;
 
@@ -335,6 +337,7 @@ mod tests {
             pool,
             &BlockLagSample {
                 sampled_at: timestamp(seconds),
+                chain: Chain::Base,
                 orderbook,
                 chain_tip,
                 cutoff_block: Some(chain_tip.saturating_sub(3)),
@@ -385,6 +388,7 @@ mod tests {
             &pool,
             &BlockLagSample {
                 sampled_at: timestamp(20),
+                chain: Chain::Base,
                 orderbook: ORDERBOOK,
                 chain_tip: 120,
                 cutoff_block: None,
