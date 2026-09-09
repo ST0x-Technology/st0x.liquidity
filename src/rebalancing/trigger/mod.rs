@@ -8810,6 +8810,17 @@ mod tests {
     /// table backing this service. Used by trigger tests that previously
     /// asserted on the mpsc receiver for mints and now must assert on the
     /// queue.
+    async fn count_pending_equity_mint_jobs(service: &RebalancingService) -> i64 {
+        let job_type = std::any::type_name::<TransferEquityToMarketMaking>();
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .fetch_one(service.transfer_equity_to_market_making_queue.pool())
+        .await
+        .expect("count pending TransferEquityToMarketMaking jobs")
+    }
+
     /// Counts pending `EquityRebalancingCheck` rows: the deferred rebalancing
     /// work an inventory change asks the schedulers for.
     async fn count_pending_equity_check_jobs(service: &RebalancingService) -> i64 {
@@ -8830,17 +8841,6 @@ mod tests {
         .fetch_one(service.usdc_scheduler.queue().pool())
         .await
         .expect("count pending UsdcRebalancingCheck jobs")
-    }
-
-    async fn count_pending_equity_mint_jobs(service: &RebalancingService) -> i64 {
-        let job_type = std::any::type_name::<TransferEquityToMarketMaking>();
-        sqlx_apalis::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
-        )
-        .bind(job_type)
-        .fetch_one(service.transfer_equity_to_market_making_queue.pool())
-        .await
-        .expect("count pending TransferEquityToMarketMaking jobs")
     }
 
     /// Drains every pending equity mint row from the service's Jobs table and
