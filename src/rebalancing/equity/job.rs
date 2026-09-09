@@ -2415,4 +2415,53 @@ mod tests {
         assert_eq!(deserialized.quantity, job.quantity);
         assert_eq!(deserialized.generation, job.generation);
     }
+
+    /// Rows queued before the payload carried a chain were all Base.
+    #[test]
+    fn equity_transfer_payloads_without_a_chain_deserialize_as_base() {
+        let mint: TransferEquityToMarketMaking = serde_json::from_value(json!({
+            "issuer_request_id": issuer_request_id("legacy-mint").to_string(),
+            "symbol": "AAPL",
+            "quantity": "2.5",
+        }))
+        .unwrap();
+        assert_eq!(mint.chain, Chain::Base);
+
+        let redemption: TransferEquityToHedging = serde_json::from_value(json!({
+            "aggregate_id": redemption_aggregate_id("legacy-redemption").to_string(),
+            "symbol": "AAPL",
+            "quantity": "2.5",
+        }))
+        .unwrap();
+        assert_eq!(redemption.chain, Chain::Base);
+    }
+
+    #[test]
+    fn equity_transfer_payloads_roundtrip_their_chain() {
+        let mint = TransferEquityToMarketMaking {
+            issuer_request_id: issuer_request_id("mint-chain"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(2.5)),
+            chain: Chain::Ethereum,
+            generation: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+        let serialized = serde_json::to_value(&mint).unwrap();
+        assert_eq!(serialized["chain"], json!("ethereum"));
+        let roundtripped: TransferEquityToMarketMaking =
+            serde_json::from_value(serialized).unwrap();
+        assert_eq!(roundtripped.chain, Chain::Ethereum);
+
+        let redemption = TransferEquityToHedging {
+            aggregate_id: redemption_aggregate_id("redemption-chain"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(2.5)),
+            chain: Chain::Ethereum,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+        let serialized = serde_json::to_value(&redemption).unwrap();
+        assert_eq!(serialized["chain"], json!("ethereum"));
+        let roundtripped: TransferEquityToHedging = serde_json::from_value(serialized).unwrap();
+        assert_eq!(roundtripped.chain, Chain::Ethereum);
+    }
 }
