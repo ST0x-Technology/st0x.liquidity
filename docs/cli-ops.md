@@ -244,8 +244,12 @@ Go-live on a new chain starts with inventory in its Raindex vaults; there is no
 automated path for this, the operator deposits it. Prerequisites, all per chain:
 
 - A `[chains.<name>.trading]` table with the chain's orderbook, inventory, vault
-  owner, asset table and `redemption_wallet`; the bot fails startup without the
-  last one.
+  owner, asset table and `redemption_wallet`. The wallet and a deployed wrapper
+  vault per equity are required only when the chain rebalances equity (the
+  primary, or a secondary with an equity that has `rebalancing = "enabled"`);
+  the bot fails startup without them there. A hedge-only secondary (every equity
+  `rebalancing = "disabled"`) needs neither: its fills are hedged and nothing is
+  minted, wrapped or redeemed on it.
 - A signing wallet for the chain in `[wallet]`, funded with native gas, and an
   `[alerts.low_balance_thresholds]` entry for it (an operator equity transfer
   refuses a chain without a threshold).
