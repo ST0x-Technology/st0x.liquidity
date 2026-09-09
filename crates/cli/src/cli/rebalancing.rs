@@ -339,14 +339,34 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
         network,
     } = transfer;
     let chain = Chain::from(network);
-    let primary = ctx.chains.primary().chain;
-    if chain != primary {
-        anyhow::bail!(
-            "transfer-equity on {chain} is refused until mint and redemption records carry \
-             their chain: the server's startup recovery resumes every interrupted transfer \
-             with the primary chain's ({primary}) services. Fund {chain} with alpaca-tokenize, \
-             wrap-equity and vault-deposit --network {chain} instead"
-        );
+
+    // A resume continues the transfer the record describes, so the recorded
+    // chain decides: driving it on another network would use the wrong
+    // orderbook, wrapper and issuer wallet.
+    if let Some(uuid) = issuer_request_id {
+        let id = IssuerRequestId(uuid);
+        let recorded = st0x_event_sorcery::load_entity::<TokenizedEquityMint>(pool, &id)
+            .await?
+            .map(|entity| entity.chain());
+
+        if let Some(recorded) = recorded
+            && recorded != chain
+        {
+            anyhow::bail!(
+                "mint {id} was requested on {recorded}; --network {chain} would resume it \
+                 against another chain's orderbook and issuer wallet. Re-run with \
+                 --network {recorded}"
+            );
+        }
+    } else {
+        let primary = ctx.chains.primary().chain;
+        if chain != primary {
+            anyhow::bail!(
+                "a fresh transfer-equity on {chain} is refused while the transfer saga is \
+                 built for the primary chain ({primary}) only. Fund {chain} with \
+                 alpaca-tokenize, wrap-equity and vault-deposit --network {chain} instead"
+            );
+        }
     }
 
     let direction_str = match direction {
@@ -3143,11 +3163,10 @@ mod tests {
         );
     }
 
-    /// The mint and redemption aggregates record no chain, and the server's
-    /// startup recovery resumes every interrupted transfer with the primary
-    /// chain's services. A transfer written for another chain would be
-    /// continued on the wrong network after a restart, so it is refused
-    /// before anything reaches the shared database.
+    /// The transfer saga is still wired with one chain's services, so a fresh
+    /// transfer on another chain would be driven against the primary's
+    /// orderbook and wrapper. It is refused before anything reaches the
+    /// shared database.
     #[tokio::test]
     async fn transfer_equity_refuses_a_non_primary_network_until_records_carry_their_chain() {
         let ctx = create_alpaca_ctx_watching_ethereum();

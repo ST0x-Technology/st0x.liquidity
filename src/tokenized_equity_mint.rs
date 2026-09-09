@@ -1473,7 +1473,9 @@ impl TokenizedEquityMint {
     /// The chain this mint runs on. Every service the saga uses -- tokenizer,
     /// wrapper, raindex, vault lookup -- is resolved from it, so a resume
     /// reads the chain off the aggregate instead of assuming the primary.
-    pub(crate) fn chain(&self) -> Chain {
+    /// `pub` for the operator CLI, which refuses a resume whose `--network`
+    /// disagrees with the record.
+    pub fn chain(&self) -> Chain {
         match self {
             Self::MintRequested { chain, .. }
             | Self::MintAccepted { chain, .. }
