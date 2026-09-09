@@ -171,10 +171,17 @@ listed (Base included), check before enabling the asset:
   approvals (underlying to vault, vault to that chain's orderbook, that chain's
   USDC to its orderbook) are granted per watched chain, and the deploy gate
   checks coverage per chain.
-- If the asset is in orchestrator mode on that chain, `[orchestrator.addresses]`
-  has an entry for that chain (keys are chain names: `base`, `ethereum`,
-  `hyperevm`). A missing entry is only warned about at startup and fails the
-  first orchestrator-mode mint.
+- If the asset is in orchestrator mode, `[orchestrator.addresses]` has an entry
+  for that chain (keys are chain names: `base`, `ethereum`, `hyperevm`). The
+  order is fixed per chain: deploy the `ST0xOrchestrator` there, add its address
+  to both bots' `[orchestrator.addresses]` and deploy both, extend the Turnkey
+  signing policy to `MintAuth` typed data with that chain's id and orchestrator
+  as the verifying contract, and only then cut the asset over at issuance
+  (issuance keys the mode by symbol, so the cutover applies on every chain the
+  asset is listed on). In rebalancing mode, startup refuses, naming the chain
+  and symbol, when issuance reports the asset as orchestrator-mode while the
+  chain has no entry; see "Orchestrator rollout per chain" in
+  [cli-ops.md](cli-ops.md).
 
 **Fields:**
 
@@ -221,8 +228,10 @@ For adding asset **XYZ**:
       `stox alpaca-tokenize -t <token_addr> -s XYZ -q 1 -r <receiving_wallet>`
 - [ ] Add config entry to `config/staging/st0x-hedge.toml` (disabled first)
 - [ ] On each watched chain where the asset is listed: `redemption_wallet`,
-      Turnkey approval policies for that chain's id, and the orchestrator entry
-      for that chain if needed (see step 4a)
+      Turnkey approval policies for that chain's id, and, before the asset is
+      cut over to orchestrator mode, the orchestrator entry for that chain (see
+      step 4a) and the Turnkey `MintAuth` policy for that chain's id and
+      orchestrator; the first orchestrator-mode mint fails at signing without it
 - [ ] Deploy to staging, verify bot sees the asset
 - [ ] Enable trading in config, deploy again
 - [ ] Repeat for production when staging looks good

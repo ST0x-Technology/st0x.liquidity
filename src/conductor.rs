@@ -53,6 +53,7 @@ use st0x_execution::{
     MarketOrder, MarketSession, Positive, Symbol, TryIntoExecutor, Usd,
 };
 use st0x_issuance_client::IssuanceClient;
+use st0x_issuance_dto::VaultModeTag;
 use st0x_raindex::{RaindexService, RaindexVaultId, RevokeOutcome};
 use st0x_registry::SymbolCache;
 use st0x_tokenization::AlpacaTokenizationService;
@@ -75,7 +76,9 @@ use crate::equity_redemption::{
 use crate::inventory::{
     BroadcastingInventory, Inventory, InventoryProjection, InventorySnapshot, PollFreshness, Venue,
 };
-use crate::mint_authorization::{ConfiguredMintAuthorizer, MintAuthorizationService};
+use crate::mint_authorization::{
+    ConfiguredMintAuthorizer, MintAuthorizationService, VaultModeReader,
+};
 use crate::native_gas::GasReadiness;
 use crate::offchain::order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacer,
@@ -2131,9 +2134,7 @@ struct MintAuthorizationInfra {
     queue: DeliverMintAuthorizationJobQueue,
     /// The saga-side bundle: vault-mode reads, token map, delivery enqueue.
     wiring: MintAuthorizationWiring,
-    /// One issuance client serves both mint-authorization consumers (the
-    /// saga's vault-mode read and the delivery job), built from the same
-    /// `[issuance]` credentials as the freeze guard's own client instance.
+    /// The shared issuance client, handed on to the delivery job.
     issuance_client: Arc<IssuanceClient>,
 }
 
@@ -2169,7 +2170,9 @@ fn build_mint_authorizer<Signer: Wallet + 'static>(
 
 /// Builds [`MintAuthorizationInfra`] around the primary chain's services:
 /// every mint the bot requests today lands there, so the saga signs with
-/// that chain's authorizer and resolves tokens through its table.
+/// that chain's authorizer and resolves tokens through its table. The
+/// issuance client is the one the tokenization preflight already read vault
+/// modes through.
 ///
 /// Also runs the queue's orphan sweep for delivery rows a crash caught
 /// mid-run; pending rows stay queued (still-valid work for the persisted
@@ -2177,15 +2180,10 @@ fn build_mint_authorizer<Signer: Wallet + 'static>(
 /// sweep fails startup -- an unrepaired orphan would read as a live
 /// delivery and suppress resume.
 async fn build_mint_authorization_infra<Signer: Wallet>(
-    ctx: &Ctx,
+    issuance_client: Arc<IssuanceClient>,
     apalis_pool: &apalis_sqlite::SqlitePool,
     primary: &ChainTokenization<Signer>,
 ) -> anyhow::Result<MintAuthorizationInfra> {
-    let issuance_client = Arc::new(IssuanceClient::new(
-        ctx.issuance.base_url.clone(),
-        ctx.issuance.api_key.header_value(),
-    )?);
-
     let queue = DeliverMintAuthorizationJobQueue::new(apalis_pool);
 
     // Fails startup on sweep failure rather than continuing: an unrepaired
@@ -2582,6 +2580,19 @@ struct TokenizationPreflightError {
     source: WrapperError,
 }
 
+/// Every equity the bot may wrap or redeem on a chain (trading or rebalancing
+/// enabled), in sorted order so preflight failures are deterministic.
+fn preflighted_equities(assets: &ChainAssets) -> Vec<&Symbol> {
+    let mut enabled = assets
+        .equities
+        .symbols
+        .keys()
+        .filter(|symbol| assets.is_trading_enabled(symbol) || assets.is_rebalancing_enabled(symbol))
+        .collect::<Vec<_>>();
+    enabled.sort();
+    enabled
+}
+
 /// Read-only: every equity the bot may wrap or redeem on `chain` (trading or
 /// rebalancing enabled) must have a vault reporting the configured underlying
 /// as its `asset()` -- the attestation a redemption's unwrap step performs,
@@ -2592,15 +2603,7 @@ async fn attest_chain_vaults<Attester: Wrapper + ?Sized>(
     wrapper: &Attester,
     assets: &ChainAssets,
 ) -> Result<(), TokenizationPreflightError> {
-    let mut enabled = assets
-        .equities
-        .symbols
-        .keys()
-        .filter(|symbol| assets.is_trading_enabled(symbol) || assets.is_rebalancing_enabled(symbol))
-        .collect::<Vec<_>>();
-    enabled.sort();
-
-    for symbol in enabled {
+    for symbol in preflighted_equities(assets) {
         let token = wrapper
             .attest_underlying(symbol)
             .await
@@ -2618,14 +2621,69 @@ async fn attest_chain_vaults<Attester: Wrapper + ?Sized>(
     Ok(())
 }
 
-/// The tokenization preflight, per watched chain on that chain's own wrapper.
-/// The chain's redemption wallet was already required when its services were
-/// built; whether an equity is in orchestrator mode is only known to
-/// issuance, so a missing `[orchestrator.addresses]` entry is warned about
-/// there and refuses the first orchestrator-mode mint instead.
-async fn preflight_tokenization<Signer: Wallet + Clone>(
+/// The orchestrator rollout order was broken on a watched chain: issuance
+/// reports an enabled equity as orchestrator-mode while the chain has no
+/// `[orchestrator.addresses]` entry, so its first mint would stall at signing.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{symbol} is in orchestrator mode at issuance but [orchestrator.addresses] has no \
+     entry for watched chain {chain}; deploy the ST0xOrchestrator on {chain} and configure \
+     its address in both bots before cutting an asset listed there over"
+)]
+struct OrchestratorEntryMissing {
+    chain: Chain,
+    symbol: Symbol,
+}
+
+/// Read-only: on a chain whose mint authorizer is `Disabled` (no
+/// `[orchestrator.addresses]` entry), no trading- or rebalancing-enabled
+/// equity may be orchestrator-mode at issuance. A chain with an entry is not
+/// queried: its authorizer signs whatever mode issuance reports. An
+/// indeterminate mode is warned about rather than refused: rebalancing mode
+/// never needs issuance reachable at startup (the freeze gate fails closed
+/// per cycle), and the per-mint mode read fails closed on its own.
+async fn preflight_orchestrator_entries<Reader: VaultModeReader + ?Sized>(
+    chain: Chain,
+    mint_authorizer: &ConfiguredMintAuthorizer,
+    vault_modes: &Reader,
+    assets: &ChainAssets,
+) -> Result<(), OrchestratorEntryMissing> {
+    match mint_authorizer {
+        ConfiguredMintAuthorizer::Enabled(_) => return Ok(()),
+        ConfiguredMintAuthorizer::Disabled => {}
+    }
+
+    for symbol in preflighted_equities(assets) {
+        match vault_modes.vault_mode(symbol).await {
+            Ok(VaultModeTag::VaultDirect) => {}
+            Ok(VaultModeTag::Orchestrator) => {
+                return Err(OrchestratorEntryMissing {
+                    chain,
+                    symbol: symbol.clone(),
+                });
+            }
+            Err(error) => warn!(
+                target: "tokenization",
+                %chain,
+                %symbol,
+                ?error,
+                "Could not read the equity's vault mode from issuance; the orchestrator \
+                 entry check is skipped for it, and an orchestrator-mode mint would fail \
+                 at the signing step"
+            ),
+        }
+    }
+
+    Ok(())
+}
+
+/// The tokenization preflight, per watched chain on that chain's own wrapper
+/// and mint authorizer. The chain's redemption wallet was already required
+/// when its services were built.
+async fn preflight_tokenization<Signer: Wallet + Clone, Reader: VaultModeReader + ?Sized>(
     ctx: &Ctx,
     tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
+    vault_modes: &Reader,
 ) -> anyhow::Result<()> {
     for watched in ctx.chains.watched() {
         let Some(tokenization) = tokenizations.get(&watched.chain) else {
@@ -2638,6 +2696,14 @@ async fn preflight_tokenization<Signer: Wallet + Clone>(
         attest_chain_vaults(
             watched.chain,
             tokenization.wrapper.as_ref(),
+            &watched.assets,
+        )
+        .await?;
+
+        preflight_orchestrator_entries(
+            watched.chain,
+            &tokenization.mint_authorizer,
+            vault_modes,
             &watched.assets,
         )
         .await?;
@@ -2892,15 +2958,24 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let raindex_service =
             build_rebalancing_raindex_service(&primary.wallet, &deps.ctx, market_maker_wallet);
 
+        // One issuance client serves the tokenization preflight's vault-mode
+        // reads and both mint-authorization consumers (the saga's vault-mode
+        // read and the delivery job), from the same `[issuance]` credentials
+        // as the freeze guard's own instance.
+        let issuance_client = Arc::new(IssuanceClient::new(
+            deps.ctx.issuance.base_url.clone(),
+            deps.ctx.issuance.api_key.header_value(),
+        )?);
+
         preflight_inventory_access(&raindex_service, &deps.ctx).await?;
         revoke_stale_orderbook_allowances(&deps.ctx, &tokenizations).await?;
-        preflight_tokenization(&deps.ctx, &tokenizations).await?;
+        preflight_tokenization(&deps.ctx, &tokenizations, issuance_client.as_ref()).await?;
 
         let tokenizer = primary.tokenizer.clone();
         let wrapper = primary.wrapper.clone();
 
         let mint_authorization =
-            build_mint_authorization_infra(&deps.ctx, &deps.apalis_pool, primary).await?;
+            build_mint_authorization_infra(issuance_client, &deps.apalis_pool, primary).await?;
 
         let equity_transfer_services = EquityTransferServices {
             raindex: raindex_service.clone(),
@@ -5308,6 +5383,7 @@ mod tests {
     };
     use st0x_finance::{Usd, Usdc};
     use st0x_float_macro::float;
+    use st0x_issuance_dto::VaultModeTag;
     use st0x_raindex::{Raindex, RaindexContracts};
     use st0x_tokenization::mock::MockTokenizer;
     use st0x_tokenization::{IssuerRequestId, issuer_request_id, tokenization_request_id};
@@ -5324,7 +5400,9 @@ mod tests {
     use crate::equity_redemption::{EquityRedemptionCommand, redemption_aggregate_id};
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
-    use crate::mint_authorization::MintAuthorizationError;
+    use crate::mint_authorization::{
+        MintAuthorizationError, MockMintAuthorizer, StubVaultModeReader, VaultModeCheckError,
+    };
     use crate::offchain::order::{CancellationReason, OrderPlacementResult, RetainedFill};
     use crate::onchain::approvals::{ApprovalPurpose, ApprovalTarget, StartupApprovalError};
     use crate::onchain::mock::MockRaindex;
@@ -15503,5 +15581,135 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// The orchestrator preflight enforces the rollout order: an equity
+    /// issuance reports as orchestrator-mode, enabled on a watched chain
+    /// with no `[orchestrator.addresses]` entry, refuses startup naming the
+    /// chain and the symbol, before its first mint could stall at signing.
+    #[tokio::test]
+    async fn orchestrator_preflight_refuses_an_orchestrator_mode_equity_on_a_chain_without_an_entry()
+     {
+        let assets = assets_with_equity(
+            "AAPL",
+            equity_asset(Address::repeat_byte(0xa5), Address::repeat_byte(0xa6)),
+        );
+
+        let error = preflight_orchestrator_entries(
+            Chain::Ethereum,
+            &ConfiguredMintAuthorizer::Disabled,
+            &StubVaultModeReader(VaultModeTag::Orchestrator),
+            &assets,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.chain, Chain::Ethereum);
+        assert_eq!(error.symbol, Symbol::new("AAPL").unwrap());
+    }
+
+    /// The two vault-mode outcomes the stub cannot script: issuance out of
+    /// reach, and a reader the preflight must never consult.
+    enum ScriptedVaultModeReader {
+        Unreachable,
+        MustNotBeAsked,
+    }
+
+    #[async_trait::async_trait]
+    impl VaultModeReader for ScriptedVaultModeReader {
+        async fn vault_mode(&self, symbol: &Symbol) -> Result<VaultModeTag, VaultModeCheckError> {
+            match self {
+                Self::Unreachable => Err(VaultModeCheckError::Client(
+                    crate::issuance::IssuanceClientFailure::Connect,
+                )),
+                Self::MustNotBeAsked => {
+                    panic!("the preflight must not read {symbol}'s vault mode")
+                }
+            }
+        }
+    }
+
+    /// A vault-direct equity needs no entry: the dark deployment keeps
+    /// starting while every asset on the chain is vault-direct.
+    #[tokio::test]
+    async fn orchestrator_preflight_passes_vault_direct_equities_on_a_chain_without_an_entry() {
+        let assets = assets_with_equity(
+            "AAPL",
+            equity_asset(Address::repeat_byte(0xa5), Address::repeat_byte(0xa6)),
+        );
+
+        preflight_orchestrator_entries(
+            Chain::Base,
+            &ConfiguredMintAuthorizer::Disabled,
+            &StubVaultModeReader(VaultModeTag::VaultDirect),
+            &assets,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A chain with an entry can sign for any mode issuance reports, so the
+    /// preflight never asks issuance about its equities.
+    #[tokio::test]
+    async fn orchestrator_preflight_does_not_query_issuance_for_a_chain_with_an_entry() {
+        let assets = assets_with_equity(
+            "AAPL",
+            equity_asset(Address::repeat_byte(0xa5), Address::repeat_byte(0xa6)),
+        );
+
+        preflight_orchestrator_entries(
+            Chain::Base,
+            &ConfiguredMintAuthorizer::Enabled(Arc::new(MockMintAuthorizer)),
+            &ScriptedVaultModeReader::MustNotBeAsked,
+            &assets,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Only equities the bot may mint or redeem are checked: an equity with
+    /// trading and rebalancing both disabled is never looked up.
+    #[tokio::test]
+    async fn orchestrator_preflight_ignores_disabled_equities() {
+        let mut disabled = equity_asset(Address::repeat_byte(0xa5), Address::repeat_byte(0xa6));
+        disabled.trading = OperationMode::Disabled;
+        disabled.rebalancing = OperationMode::Disabled;
+
+        preflight_orchestrator_entries(
+            Chain::Base,
+            &ConfiguredMintAuthorizer::Disabled,
+            &ScriptedVaultModeReader::MustNotBeAsked,
+            &assets_with_equity("AAPL", disabled),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Issuance being out of reach at startup is warned about per chain and
+    /// symbol, never refused: rebalancing mode does not require issuance to
+    /// be reachable at startup, and the per-mint mode read fails closed on
+    /// its own.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn orchestrator_preflight_warns_rather_than_refusing_when_issuance_is_unreachable() {
+        let assets = assets_with_equity(
+            "AAPL",
+            equity_asset(Address::repeat_byte(0xa5), Address::repeat_byte(0xa6)),
+        );
+
+        preflight_orchestrator_entries(
+            Chain::Ethereum,
+            &ConfiguredMintAuthorizer::Disabled,
+            &ScriptedVaultModeReader::Unreachable,
+            &assets,
+        )
+        .await
+        .unwrap();
+
+        assert!(logs_contain(
+            "Could not read the equity's vault mode from issuance"
+        ));
+        assert!(logs_contain("chain=ethereum"));
+        assert!(logs_contain("symbol=AAPL"));
     }
 }

@@ -277,6 +277,40 @@ commands above instead. The network a transfer started on has to be named only
 for `transfer-equity --issuer-request-id`, which re-runs the transfer command
 itself; the `transfer` recovery verbs carry no network at all.
 
+### Orchestrator Rollout per Chain
+
+Issuance keys an asset's `vault_mode` by symbol, so cutting an asset over to
+orchestrator mode applies on every chain it is listed on at once. Issuance's own
+config check (in the issuance deployment, independent of this bot's preflight
+below) refuses issuance startup with an orchestrator-mode asset while any of
+issuance's configured chains lacks an `[orchestrator.addresses]` entry; it walks
+every configured chain, not only the ones the asset is listed on, so issuance's
+config needs an entry (a deployed orchestrator) for every chain it configures,
+listed or not, before the flip. Complete the checklist for every chain the asset
+is listed on before the cutover:
+
+- [ ] Deploy `ST0xOrchestrator` on the chain.
+- [ ] Add its address under `[orchestrator.addresses].<chain>` in the issuance
+      bot's config and deploy issuance.
+- [ ] Add the same address under `[orchestrator.addresses].<chain>` in this
+      bot's config (`validate-config` rejects an unknown chain key or a zero
+      address) and deploy; the startup log must not warn about a watched chain
+      without an entry.
+- [ ] Extend the Turnkey signing policy to `MintAuth` typed data with that
+      chain's id and orchestrator as the verifying contract (SPEC, "Mint
+      Recipient Authorization").
+- [ ] Only now flip the asset to orchestrator mode at issuance.
+
+Until the MintAuth policy (the fourth step) is deployed, every asset listed on
+the chain stays vault-direct. If the order slips, this bot catches it in
+rebalancing mode at startup: the tokenization preflight refuses, naming the
+chain and symbol, when issuance reports a trading- or rebalancing-enabled asset
+as orchestrator-mode while the chain has no entry. Issuance being unreachable at
+startup only warns: a mint whose mode cannot be read stops at mode discovery,
+before any signing. An orchestrator-mode mint reaching the signing step without
+its chain's entry fails there. A missing MintAuth policy is invisible at
+startup: the first orchestrator-mode mint on that chain fails at signing.
+
 ## Alpaca Crypto Wallet Management
 
 ### USDC Deposits and Withdrawals
