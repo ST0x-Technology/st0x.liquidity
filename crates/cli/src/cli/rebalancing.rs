@@ -3337,6 +3337,73 @@ mod tests {
         );
     }
 
+    /// Services keyed per chain: the Ethereum entry carries the only vault
+    /// lookup that resolves, so a withdrawal that goes through proves the
+    /// record's chain picked the entry rather than the primary's.
+    fn chain_keyed_redemption_services() -> EquityTransferServices {
+        let base = ChainEquityServices {
+            wallet: Address::ZERO,
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+            gas_readiness: ConfiguredGasReadiness::Unwired,
+            equities: ChainEquities::default(),
+        };
+        let ethereum = ChainEquityServices {
+            vault_lookup: Arc::new(
+                MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO)),
+            ),
+            ..base.clone()
+        };
+
+        EquityTransferServices {
+            chains: BTreeMap::from([(Chain::Base, base), (Chain::Ethereum, ethereum)]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        }
+    }
+
+    /// A transfer on a non-primary chain is no longer refused up front: the
+    /// record names the chain it runs on, and every later command resolves
+    /// that chain's services.
+    #[tokio::test]
+    async fn an_ethereum_transfer_records_and_follows_ethereum() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-ethereum-redemption");
+
+        let store = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(chain_keyed_redemption_services())
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    chain: Chain::Ethereum,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(1),
+                    token: Address::random(),
+                    amount: U256::from(1_000_000_000_000_000_000_u128),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
+            .await
+            .unwrap();
+
+        let recorded = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .expect("the redemption record must exist")
+            .chain();
+
+        assert_eq!(recorded, Chain::Ethereum);
+    }
+
     /// The gas check runs on the selected chain's wallet against that chain's
     /// `[alerts.low_balance_thresholds]` entry; a chain without one is refused
     /// by name instead of skipping the check.

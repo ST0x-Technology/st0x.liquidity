@@ -15383,6 +15383,105 @@ mod tests {
         }
     }
 
+    /// One equity asset that opts into rebalancing, so the chain listing it
+    /// needs a gas threshold of its own.
+    fn rebalancing_equity_assets() -> st0x_config::ChainAssets {
+        let mut equities = st0x_config::ChainEquities::default();
+        equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            st0x_config::ChainEquityAsset {
+                tokenized_equity: Address::with_last_byte(9),
+                tokenized_equity_derivative: Address::with_last_byte(10),
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+
+        st0x_config::ChainAssets {
+            equities,
+            cash: None,
+        }
+    }
+
+    fn gas_threshold_alerts() -> st0x_config::AlertsCtx {
+        st0x_config::AlertsCtx::for_test(
+            BTreeMap::from([
+                (Chain::Base, U256::from(50_u64)),
+                (Chain::Ethereum, U256::from(100_u64)),
+            ]),
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        )
+    }
+
+    /// A chain whose equities opt into rebalancing must carry its own
+    /// `[alerts.low_balance_thresholds]` entry: without one its transfers
+    /// would run against a native balance nothing ever checked.
+    #[test]
+    fn equity_gas_readiness_refuses_a_rebalancing_chain_without_a_threshold() {
+        let base_wallet = st0x_evm::StubWallet::stub(Address::with_last_byte(1));
+        let ethereum_wallet = st0x_evm::StubWallet::stub(Address::with_last_byte(2));
+        let hyperevm_wallet = st0x_evm::StubWallet::stub(Address::with_last_byte(3));
+        let assets = rebalancing_equity_assets();
+
+        let error = build_equity_gas_readiness(
+            &gas_threshold_alerts(),
+            &[EquityGasChain {
+                chain: Chain::HyperEvm,
+                assets: &assets,
+                wallet: &hyperevm_wallet,
+            }],
+            &base_wallet,
+            &ethereum_wallet,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("hyperevm") && error.contains("low_balance_thresholds"),
+            "expected the chain named alongside the missing threshold, got: {error}"
+        );
+    }
+
+    /// A watched chain that rebalances nothing needs no threshold: it gets no
+    /// readiness entry, so a transfer there is refused by the fail-closed
+    /// `Unwired` check rather than by startup.
+    #[test]
+    fn equity_gas_readiness_skips_a_chain_that_rebalances_nothing() {
+        let base_wallet = st0x_evm::StubWallet::stub(Address::with_last_byte(1));
+        let ethereum_wallet = st0x_evm::StubWallet::stub(Address::with_last_byte(2));
+        let hyperevm_wallet = st0x_evm::StubWallet::stub(Address::with_last_byte(3));
+        let idle = st0x_config::ChainAssets::default();
+        let rebalancing = rebalancing_equity_assets();
+
+        let readiness = build_equity_gas_readiness(
+            &gas_threshold_alerts(),
+            &[
+                EquityGasChain {
+                    chain: Chain::HyperEvm,
+                    assets: &idle,
+                    wallet: &hyperevm_wallet,
+                },
+                EquityGasChain {
+                    chain: Chain::Base,
+                    assets: &rebalancing,
+                    wallet: &base_wallet,
+                },
+            ],
+            &base_wallet,
+            &ethereum_wallet,
+        )
+        .unwrap();
+
+        assert_eq!(
+            readiness.keys().copied().collect::<Vec<_>>(),
+            vec![Chain::Base]
+        );
+    }
+
     #[test]
     fn startup_approval_targets_follow_each_watched_chain() {
         let ctx = ctx_with_base_and_ethereum_trading();

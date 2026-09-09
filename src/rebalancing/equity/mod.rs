@@ -2200,11 +2200,12 @@ mod tests {
     use alloy::primitives::{Address, B256, address};
     use chrono::Utc;
     use sqlx::SqlitePool;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::broadcast;
 
-    use st0x_config::ChainAssets;
+    use st0x_config::{ChainAssets, ChainEquities};
     use st0x_dto::Statement;
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, test_store};
     use st0x_evm::Chain;
@@ -2237,6 +2238,98 @@ mod tests {
             .with_symbol_token(Symbol::new("TEST").unwrap(), Address::ZERO)
             .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
             .with_default_vault(RaindexVaultId(B256::ZERO))
+    }
+
+    /// One chain's entry, distinguished by the tokenizer the caller passes so
+    /// a test can tell which chain's services a command reached.
+    fn chain_services(tokenizer: Arc<dyn Tokenizer>) -> ChainEquityServices {
+        ChainEquityServices {
+            wallet: Address::ZERO,
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer,
+            wrapper: Arc::new(MockWrapper::new()),
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+            gas_readiness: ConfiguredGasReadiness::Unwired,
+            equities: ChainEquities::default(),
+        }
+    }
+
+    /// A chain the map does not carry is named rather than served by another
+    /// chain's wallet, vault and issuer.
+    #[test]
+    fn for_chain_names_a_chain_with_no_services() {
+        let services = EquityTransferServices {
+            chains: BTreeMap::from([(Chain::Base, chain_services(Arc::new(MockTokenizer::new())))]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+
+        assert_eq!(
+            services.for_chain(Chain::Base).unwrap().wallet,
+            Address::ZERO
+        );
+
+        let ChainServicesMissing { chain } = services.for_chain(Chain::Ethereum).unwrap_err();
+        assert_eq!(chain, Chain::Ethereum);
+    }
+
+    /// A resume follows the chain the record names: both the genesis request
+    /// and the later poll reach that chain's issuer, never the primary's.
+    #[tokio::test]
+    async fn a_resumed_ethereum_mint_uses_the_ethereum_services() {
+        let base_tokenizer = Arc::new(MockTokenizer::new());
+        let ethereum_tokenizer = Arc::new(MockTokenizer::new());
+        let services = EquityTransferServices {
+            chains: BTreeMap::from([
+                (Chain::Base, chain_services(base_tokenizer.clone())),
+                (Chain::Ethereum, chain_services(ethereum_tokenizer.clone())),
+            ]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
+        let redemption_store = Arc::new(test_store(pool, services.clone()));
+        let transfer = CrossVenueEquityTransfer::new(
+            Arc::new(MockRaindex::new()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockWrapper::new()),
+            services,
+            mint_store,
+            redemption_store,
+        );
+
+        let id = issuer_request_id("ISS-ETHEREUM-RESUME");
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    chain: Chain::Ethereum,
+                    quantity: float!(10),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        assert_eq!(
+            (
+                base_tokenizer.call_count(),
+                ethereum_tokenizer.mint_lookup_call_count(),
+                ethereum_tokenizer.mint_request_call_count(),
+                ethereum_tokenizer.call_count(),
+            ),
+            (0, 1, 1, 3),
+            "the reconcile lookup, the mint request and the resumed poll must all reach \
+             Ethereum's issuer"
+        );
     }
 
     fn mock_services() -> EquityTransferServices {
