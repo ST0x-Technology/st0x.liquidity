@@ -32,7 +32,7 @@ use st0x_hedge::operator::native_gas::GasReadiness;
 use st0x_hedge::operator::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
 use st0x_hedge::operator::rebalancing::to_wrapped_equities;
 use st0x_hedge::operator::rebalancing::usdc::{
-    CrossVenueCashTransfer, UsdcSettlementParams, UsdcTransferError,
+    CrossVenueCashTransfer, MarketMakingUsdcEndpoints, UsdcSettlementParams, UsdcTransferError,
 };
 use st0x_hedge::operator::telemetry::TelemetrySender;
 use st0x_hedge::operator::telemetry::broker::InstrumentedAlpacaBroker;
@@ -187,6 +187,7 @@ async fn build_equity_transfer_services(
         wallet,
         mint_store,
         redemption_store,
+        BotGasReceiptCostEnqueuer::Disabled,
     )
     .with_gas_readiness(gas_readiness);
 
@@ -617,8 +618,7 @@ async fn run_usdc_transfer<Writer: Write>(
         bridge,
         vault_service,
         usdc_store,
-        owner,
-        RaindexVaultId(usdc_vault_id),
+        MarketMakingUsdcEndpoints::new(owner, RaindexVaultId(usdc_vault_id)),
         &UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             required_confirmations: ctx.chains.primary().required_confirmations,
@@ -635,6 +635,7 @@ async fn run_usdc_transfer<Writer: Write>(
             #[cfg(feature = "test-support")]
             message_transmitter: rebalancing_ctx.message_transmitter,
         },
+        BotGasReceiptCostEnqueuer::Disabled,
     )
     .with_gas_readiness(gas_readiness);
 

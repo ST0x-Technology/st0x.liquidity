@@ -16,7 +16,8 @@ use st0x_raindex::{RaindexService, RaindexVaultId};
 use st0x_wrapper::WrappedEquity;
 
 use super::usdc::{
-    CrossVenueCashTransfer, ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcSettlementParams,
+    CrossVenueCashTransfer, MarketMakingUsdcEndpoints, ResumeAlpacaToBase, ResumeBaseToAlpaca,
+    UsdcSettlementParams,
 };
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::native_gas::GasReadiness;
@@ -165,12 +166,11 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
                 self.cctp,
                 self.raindex,
                 usdc,
-                market_maker_wallet,
-                usdc_vault_id,
+                MarketMakingUsdcEndpoints::new(market_maker_wallet, usdc_vault_id),
                 &self.settlement,
+                bot_gas_enqueuer,
             )
-            .with_gas_readiness(gas_readiness)
-            .with_bot_gas_enqueuer(bot_gas_enqueuer),
+            .with_gas_readiness(gas_readiness),
         );
 
         let resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca> = usdc.clone();

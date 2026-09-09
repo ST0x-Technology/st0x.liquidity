@@ -1013,6 +1013,7 @@ mod tests {
             Address::random(),
             mint_store,
             redemption_store,
+            BotGasReceiptCostEnqueuer::Disabled,
         ));
         UnwrappedEquityRecoveryServices {
             raindex,

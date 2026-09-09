@@ -705,6 +705,7 @@ mod tests {
             Address::random(),
             mint_store,
             redemption_store,
+            BotGasReceiptCostEnqueuer::Disabled,
         ));
         WrappedEquityRecoveryServices {
             raindex,
@@ -972,6 +973,7 @@ mod tests {
             Address::random(),
             mint_store,
             redemption_store,
+            BotGasReceiptCostEnqueuer::Disabled,
         ));
         let services = WrappedEquityRecoveryServices {
             raindex,

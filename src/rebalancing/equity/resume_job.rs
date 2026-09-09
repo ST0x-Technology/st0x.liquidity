@@ -238,6 +238,7 @@ mod tests {
             Address::ZERO,
             mint_store.clone(),
             redemption_store.clone(),
+            BotGasReceiptCostEnqueuer::Disabled,
         ));
 
         let ctx = ResumeTokenizationCtx {
@@ -566,18 +567,16 @@ mod tests {
         let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
         let redemption_store = Arc::new(test_store(pool, transfer_services));
 
-        let transfer = Arc::new(
-            CrossVenueEquityTransfer::new(
-                raindex,
-                vault_lookup,
-                tokenizer,
-                wrapper,
-                Address::ZERO,
-                mint_store.clone(),
-                redemption_store,
-            )
-            .with_bot_gas_enqueuer(BotGasReceiptCostEnqueuer::Enabled(bot_gas_queue)),
-        );
+        let transfer = Arc::new(CrossVenueEquityTransfer::new(
+            raindex,
+            vault_lookup,
+            tokenizer,
+            wrapper,
+            Address::ZERO,
+            mint_store.clone(),
+            redemption_store,
+            BotGasReceiptCostEnqueuer::Enabled(bot_gas_queue),
+        ));
 
         let id = issuer_request_id("resume-mint-bot-gas-failure");
         let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
@@ -674,18 +673,16 @@ mod tests {
         };
         let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
         let redemption_store = Arc::new(test_store(pool, transfer_services));
-        let transfer = Arc::new(
-            CrossVenueEquityTransfer::new(
-                raindex,
-                vault_lookup,
-                tokenizer.clone(),
-                wrapper,
-                Address::ZERO,
-                mint_store,
-                redemption_store.clone(),
-            )
-            .with_bot_gas_enqueuer(bot_gas_enqueuer),
-        );
+        let transfer = Arc::new(CrossVenueEquityTransfer::new(
+            raindex,
+            vault_lookup,
+            tokenizer.clone(),
+            wrapper,
+            Address::ZERO,
+            mint_store,
+            redemption_store.clone(),
+            bot_gas_enqueuer,
+        ));
         let id = redemption_aggregate_id("resume-redemption-send-bot-gas-failure");
         let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
         redemption_store

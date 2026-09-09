@@ -67,11 +67,10 @@ impl BotGasReceiptCostEnqueuer {
             Self::Disabled => {
                 // Deliberate no-op for the two out-of-scope paths documented
                 // above -- logged at warn so an accidentally-Disabled
-                // production call site (e.g. a construction site that forgot
-                // `.with_bot_gas_enqueuer(...)`) surfaces under prod log
-                // filtering rather than silently dropping the cost fact.
-                // Disabled is only legitimate on CLI paths, where the noise
-                // is harmless.
+                // production call site surfaces under prod log filtering
+                // rather than silently dropping the cost fact.
+                // Disabled is only legitimate on CLI and test-only paths,
+                // where the noise is harmless.
                 warn!(
                     target: "rebalance",
                     chain = %job.chain,

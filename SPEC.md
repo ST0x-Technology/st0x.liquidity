@@ -851,6 +851,10 @@ migration files in `migrations/`.
   the aggregate non-terminal and permanently blocking rebalancing for the symbol
   (see "Known gaps" below). This differs from a downstream job's own execution
   failures, which dead-letter without blocking the caller
+- Every cross-venue transfer constructor requires an explicit bot-gas enqueuer.
+  Production wiring passes the durable queue-backed enqueuer, while CLI and
+  test-only construction sites must explicitly pass `Disabled`; there is no
+  silent constructor default that can omit gas accounting by accident
 - The recording worker itself treats RPC-shaped receipt/block/valuation outcomes
   as self-healing rather than a genuine failure: a receipt (or its block) not
   yet visible to the RPC endpoint, or an outright RPC error fetching the

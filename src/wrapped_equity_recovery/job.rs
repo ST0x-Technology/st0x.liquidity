@@ -644,6 +644,7 @@ mod tests {
             Address::random(),
             mint_store.clone(),
             redemption_store.clone(),
+            BotGasReceiptCostEnqueuer::Disabled,
         ));
         let store = Arc::new(test_store(
             pool.clone(),
@@ -776,6 +777,7 @@ mod tests {
             Address::random(),
             mint_store.clone(),
             redemption_store.clone(),
+            BotGasReceiptCostEnqueuer::Disabled,
         ));
         // The store's bot-gas enqueuer targets the CLOSED pool so
         // `ConfirmOrphanDeposit`'s enqueue fails with a genuine
