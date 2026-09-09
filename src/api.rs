@@ -7204,4 +7204,114 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
+
+    #[test]
+    fn process_tx_response_serializes_each_mapped_outcome() {
+        let mut cases: Vec<(ProcessTxOutcome, serde_json::Value)> = vec![
+            (
+                ProcessTxOutcome::NoTradeableEvents,
+                serde_json::json!({ "outcome": "no_tradeable_events" }),
+            ),
+            (
+                ProcessTxOutcome::TransactionNotFound {
+                    tx_hash: TxHash::repeat_byte(0x22),
+                },
+                serde_json::json!({ "outcome": "transaction_not_found" }),
+            ),
+            (
+                ProcessTxOutcome::AlreadyAccounted,
+                serde_json::json!({ "outcome": "already_accounted" }),
+            ),
+            (
+                ProcessTxOutcome::PendingHedgeInFlight,
+                serde_json::json!({ "outcome": "pending_hedge_in_flight" }),
+            ),
+            (
+                ProcessTxOutcome::BelowExecutionThreshold,
+                serde_json::json!({ "outcome": "below_execution_threshold" }),
+            ),
+            (
+                ProcessTxOutcome::TradingDisabled {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                },
+                serde_json::json!({ "outcome": "trading_disabled", "symbol": "AAPL" }),
+            ),
+            (
+                ProcessTxOutcome::PlacementRejected {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                },
+                serde_json::json!({ "outcome": "placement_rejected", "symbol": "AAPL" }),
+            ),
+        ];
+
+        for (disposition, wire) in [
+            (HedgeDisposition::InFlight, "in_flight"),
+            (HedgeDisposition::ClearedForRetry, "cleared_for_retry"),
+            (HedgeDisposition::Finalized, "finalized"),
+        ] {
+            cases.push((
+                ProcessTxOutcome::HedgePlaced {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    offchain_order_id: OffchainOrderId::from_uuid(uuid!(
+                        "11111111-1111-4111-8111-111111111111"
+                    )),
+                    shares: Positive::new(FractionalShares::new(float!(1.5))).unwrap(),
+                    direction: Direction::Buy,
+                    disposition,
+                },
+                serde_json::json!({
+                    "outcome": "hedge_placed",
+                    "symbol": "AAPL",
+                    "offchain_order_id": "11111111-1111-4111-8111-111111111111",
+                    "shares": "1.5",
+                    "direction": "Buy",
+                    "disposition": wire,
+                }),
+            ));
+        }
+
+        for (outcome, expected) in cases {
+            assert_eq!(
+                serde_json::to_value(ProcessTxResponse::from(outcome)).unwrap(),
+                expected,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn process_transaction_rejects_an_invalid_tx_hash() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+
+        let (status, Json(body)) =
+            process_transaction(State(state), Path("not-a-hash".to_string()))
+                .await
+                .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.error.contains("invalid transaction hash"),
+            "got: {}",
+            body.error
+        );
+    }
+
+    #[tokio::test]
+    async fn process_transaction_reports_unavailable_before_startup() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        // A valid hash clears the parse guard and reaches the process_tx cell,
+        // which empty_app_state leaves unset, so the handler must report 503
+        // before it ever builds an RPC provider.
+        let tx_hash = TxHash::repeat_byte(0x11).to_string();
+
+        let (status, Json(body)) = process_transaction(State(state), Path(tx_hash))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body.error.contains("process-tx is unavailable"),
+            "got: {}",
+            body.error
+        );
+    }
 }
