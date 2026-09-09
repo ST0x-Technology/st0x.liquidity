@@ -1,9 +1,10 @@
 //! Ingestion-infrastructure read model over the telemetry store.
 //!
-//! Surfaces the order-fill monitor's block-lag and poll-cycle samples
+//! Surfaces the order-fill monitors' block-lag and poll-cycle samples
 //! (recorded by `crate::telemetry`) as the dashboard's ingestion-health
-//! report: current block lag, worst lag per time bucket, and poll-cycle
-//! duration/error/skipped-tick aggregates. Strictly read-only.
+//! report: per watched chain, the current block lag and the worst lag per
+//! time bucket; plus poll-cycle duration/error/skipped-tick aggregates.
+//! Strictly read-only.
 
 use std::collections::BTreeMap;
 
@@ -12,16 +13,21 @@ use chrono::{DateTime, Duration, SubsecRound, Utc};
 use sqlx::SqlitePool;
 use tracing::warn;
 
+use st0x_config::{ChainRegistry, TradingChain};
 use st0x_dto::{
-    BlockLagPoint, DependencyBucket, DependencyName, DependencyStats, MonitorTelemetry, PollHealth,
+    BlockLagPoint, ChainBlockLag, ChainName, DependencyBucket, DependencyName, DependencyStats,
+    MonitorTelemetry, PollHealth,
 };
+use st0x_evm::Chain;
 
 use super::{PerformanceError, ReportRange, latency_stats};
 use crate::telemetry::{Monitor, PollOutcome, sqlite_timestamp};
 
-/// Load the monitor's ingestion-health telemetry for `range`, scoped to
-/// the configured `orderbook` (samples carry the orderbook they were taken
-/// against, so a database reused across configs never mixes lag series).
+/// Load the monitors' ingestion-health telemetry for `range`: one block-lag
+/// series per watched chain (primary first), each scoped to that chain and
+/// its orderbook so a database reused across configs, or two chains sharing
+/// an orderbook address, never mix lag series. Poll health stays scoped to
+/// the primary chain's orderbook.
 ///
 /// The current block lag reflects the latest sample regardless of the
 /// range: it answers "how far behind is detection right now", while the
@@ -29,30 +35,57 @@ use crate::telemetry::{Monitor, PollOutcome, sqlite_timestamp};
 pub(crate) async fn load_monitor_telemetry(
     pool: &SqlitePool,
     range: &ReportRange,
-    orderbook: Address,
+    chains: &ChainRegistry,
 ) -> Result<MonitorTelemetry, PerformanceError> {
-    let (current_lag_blocks, current_lag_sampled_at) = current_lag(pool, orderbook).await?;
-    let block_lag = block_lag_buckets(pool, range, orderbook).await?;
-    let poll_summary = poll_health(pool, range, orderbook).await?;
+    let mut block_lag = Vec::new();
+    for trading_chain in chains.watched() {
+        block_lag.push(chain_block_lag(pool, range, trading_chain).await?);
+    }
+    let poll_summary = poll_health(pool, range, chains.primary().orderbook).await?;
 
     Ok(MonitorTelemetry {
-        current_lag_blocks,
-        current_lag_sampled_at,
         block_lag,
         poll: poll_summary,
     })
 }
 
+async fn chain_block_lag(
+    pool: &SqlitePool,
+    range: &ReportRange,
+    trading_chain: &TradingChain,
+) -> Result<ChainBlockLag, PerformanceError> {
+    let (current_lag_blocks, current_lag_sampled_at) = current_lag(pool, trading_chain).await?;
+    let points = block_lag_buckets(pool, range, trading_chain).await?;
+
+    Ok(ChainBlockLag {
+        chain: chain_name(trading_chain.chain),
+        current_lag_blocks,
+        current_lag_sampled_at,
+        points,
+    })
+}
+
+/// The dashboard's chain discriminator for a chain the bot operates on.
+/// Exhaustive so a chain added to `Chain` cannot reach the report unnamed.
+fn chain_name(chain: Chain) -> ChainName {
+    match chain {
+        Chain::Base => ChainName::Base,
+        Chain::Ethereum => ChainName::Ethereum,
+        Chain::HyperEvm => ChainName::HyperEvm,
+    }
+}
+
 async fn current_lag(
     pool: &SqlitePool,
-    orderbook: Address,
+    trading_chain: &TradingChain,
 ) -> Result<(Option<i64>, Option<DateTime<Utc>>), PerformanceError> {
     let latest: Option<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
         "SELECT sampled_at, cutoff_block, lag_blocks FROM block_lag_samples \
-         WHERE orderbook = $1 \
+         WHERE chain = $1 AND orderbook = $2 \
          ORDER BY sampled_at DESC, id DESC LIMIT 1",
     )
-    .bind(orderbook.to_string())
+    .bind(trading_chain.chain.as_str())
+    .bind(trading_chain.orderbook.to_string())
     .fetch_optional(pool)
     .await?;
 
@@ -81,7 +114,7 @@ async fn current_lag(
 async fn block_lag_buckets(
     pool: &SqlitePool,
     range: &ReportRange,
-    orderbook: Address,
+    trading_chain: &TradingChain,
 ) -> Result<Vec<BlockLagPoint>, PerformanceError> {
     let width = range.bucket_width();
     // strftime('%s', ...) truncates sample timestamps to whole seconds, so
@@ -90,17 +123,18 @@ async fn block_lag_buckets(
     // sample it contains.
     let origin = range.from.trunc_subsecs(0);
     let rows: Vec<(i64, i64)> = sqlx::query_as(
-        "SELECT (CAST(strftime('%s', sampled_at) AS INTEGER) - $4) / $5 AS bucket_index, \
+        "SELECT (CAST(strftime('%s', sampled_at) AS INTEGER) - $5) / $6 AS bucket_index, \
                 MAX(lag_blocks) AS max_lag_blocks \
          FROM block_lag_samples \
-         WHERE sampled_at BETWEEN $1 AND $2 AND orderbook = $3 \
+         WHERE sampled_at BETWEEN $1 AND $2 AND chain = $3 AND orderbook = $4 \
            AND lag_blocks IS NOT NULL \
          GROUP BY bucket_index \
          ORDER BY bucket_index",
     )
     .bind(sqlite_timestamp(range.from))
     .bind(sqlite_timestamp(range.to))
-    .bind(orderbook.to_string())
+    .bind(trading_chain.chain.as_str())
+    .bind(trading_chain.orderbook.to_string())
     .bind(origin.timestamp())
     .bind(width.num_seconds())
     .fetch_all(pool)
@@ -360,6 +394,15 @@ mod tests {
         ChainRegistry::single_trading_chain(TradingChain::test().orderbook(ORDERBOOK).call())
     }
 
+    /// The one series a Base-only report carries.
+    fn base_series(telemetry: &MonitorTelemetry) -> &ChainBlockLag {
+        let [series] = telemetry.block_lag.as_slice() else {
+            panic!("expected exactly one series, got {:?}", telemetry.block_lag);
+        };
+        assert_eq!(series.chain, ChainName::Base);
+        series
+    }
+
     /// Two watched chains keep separate lag series even when the Raindex
     /// orderbook lands at the same deterministic address on both.
     #[tokio::test]
@@ -413,14 +456,17 @@ mod tests {
         insert_lag(&pool, 20, 125, Some(100)).await; // cutoff 122, lag 22
         insert_lag(&pool, 4_000, 210, Some(205)).await; // cutoff 207, lag 2
 
-        let telemetry = load_monitor_telemetry(&pool, &range(), ORDERBOOK)
+        let telemetry = load_monitor_telemetry(&pool, &range(), &base_only())
             .await
             .unwrap();
 
-        assert_eq!(telemetry.current_lag_blocks, Some(2));
-        assert_eq!(telemetry.current_lag_sampled_at, Some(timestamp(4_000)));
+        assert_eq!(base_series(&telemetry).current_lag_blocks, Some(2));
         assert_eq!(
-            telemetry.block_lag,
+            base_series(&telemetry).current_lag_sampled_at,
+            Some(timestamp(4_000))
+        );
+        assert_eq!(
+            base_series(&telemetry).points,
             vec![
                 BlockLagPoint {
                     start: timestamp(0),
@@ -452,14 +498,17 @@ mod tests {
         .await
         .unwrap();
 
-        let telemetry = load_monitor_telemetry(&pool, &range(), ORDERBOOK)
+        let telemetry = load_monitor_telemetry(&pool, &range(), &base_only())
             .await
             .unwrap();
 
-        assert_eq!(telemetry.current_lag_blocks, None);
-        assert_eq!(telemetry.current_lag_sampled_at, Some(timestamp(20)));
+        assert_eq!(base_series(&telemetry).current_lag_blocks, None);
         assert_eq!(
-            telemetry.block_lag,
+            base_series(&telemetry).current_lag_sampled_at,
+            Some(timestamp(20))
+        );
+        assert_eq!(
+            base_series(&telemetry).points,
             vec![BlockLagPoint {
                 start: timestamp(0),
                 max_lag_blocks: 7,
@@ -477,17 +526,17 @@ mod tests {
         // In range: cutoff 107, lag 7.
         insert_lag(&pool, 10, 110, Some(100)).await;
 
-        let telemetry = load_monitor_telemetry(&pool, &range(), ORDERBOOK)
+        let telemetry = load_monitor_telemetry(&pool, &range(), &base_only())
             .await
             .unwrap();
 
         assert_eq!(
-            telemetry.current_lag_blocks,
+            base_series(&telemetry).current_lag_blocks,
             Some(2),
             "current lag must come from the freshest sample, even out of range"
         );
-        assert_eq!(telemetry.block_lag.len(), 1);
-        assert_eq!(telemetry.block_lag[0].max_lag_blocks, 7);
+        assert_eq!(base_series(&telemetry).points.len(), 1);
+        assert_eq!(base_series(&telemetry).points[0].max_lag_blocks, 7);
     }
 
     #[tokio::test]
@@ -504,13 +553,13 @@ mod tests {
         )
         .await;
 
-        let telemetry = load_monitor_telemetry(&pool, &range(), ORDERBOOK)
+        let telemetry = load_monitor_telemetry(&pool, &range(), &base_only())
             .await
             .unwrap();
 
-        assert_eq!(telemetry.current_lag_blocks, Some(7));
-        assert_eq!(telemetry.block_lag.len(), 1);
-        assert_eq!(telemetry.block_lag[0].max_lag_blocks, 7);
+        assert_eq!(base_series(&telemetry).current_lag_blocks, Some(7));
+        assert_eq!(base_series(&telemetry).points.len(), 1);
+        assert_eq!(base_series(&telemetry).points[0].max_lag_blocks, 7);
     }
 
     #[tokio::test]
@@ -518,13 +567,13 @@ mod tests {
         let pool = setup_test_db().await;
         insert_lag(&pool, 10, 110, None).await;
 
-        let telemetry = load_monitor_telemetry(&pool, &range(), ORDERBOOK)
+        let telemetry = load_monitor_telemetry(&pool, &range(), &base_only())
             .await
             .unwrap();
 
-        assert_eq!(telemetry.current_lag_blocks, None);
-        assert_eq!(telemetry.current_lag_sampled_at, None);
-        assert!(telemetry.block_lag.is_empty());
+        assert_eq!(base_series(&telemetry).current_lag_blocks, None);
+        assert_eq!(base_series(&telemetry).current_lag_sampled_at, None);
+        assert!(base_series(&telemetry).points.is_empty());
     }
 
     #[tokio::test]
@@ -589,7 +638,7 @@ mod tests {
         .await
         .unwrap();
 
-        let telemetry = load_monitor_telemetry(&pool, &range(), ORDERBOOK)
+        let telemetry = load_monitor_telemetry(&pool, &range(), &base_only())
             .await
             .unwrap();
 
@@ -678,12 +727,12 @@ mod tests {
     async fn empty_store_yields_empty_report() {
         let pool = setup_test_db().await;
 
-        let telemetry = load_monitor_telemetry(&pool, &range(), ORDERBOOK)
+        let telemetry = load_monitor_telemetry(&pool, &range(), &base_only())
             .await
             .unwrap();
 
-        assert_eq!(telemetry.current_lag_blocks, None);
-        assert!(telemetry.block_lag.is_empty());
+        assert_eq!(base_series(&telemetry).current_lag_blocks, None);
+        assert!(base_series(&telemetry).points.is_empty());
         assert_eq!(
             telemetry.poll,
             PollHealth {

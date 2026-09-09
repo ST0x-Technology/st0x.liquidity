@@ -540,10 +540,30 @@ pub struct DependencyBucket {
     pub p50_ms: Option<i64>,
 }
 
-/// Ingestion-health telemetry sampled by the order-fill monitor.
+/// Ingestion-health telemetry sampled by the order-fill monitors.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct MonitorTelemetry {
+    /// One block-lag series per watched chain, the primary chain first.
+    pub block_lag: Vec<ChainBlockLag>,
+    pub poll: PollHealth,
+}
+
+/// A watched chain, by the wire name `st0x_evm::Chain` pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainName {
+    Base,
+    Ethereum,
+    #[serde(rename = "hyperevm")]
+    HyperEvm,
+}
+
+/// Block lag of one watched chain's fill watcher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainBlockLag {
+    pub chain: ChainName,
     /// Latest sampled block lag, regardless of the report range. `None`
     /// until a sample with a backfill checkpoint exists.
     #[ts(type = "number | null")]
@@ -552,8 +572,7 @@ pub struct MonitorTelemetry {
     /// monitor (no recent samples) distinctly from a healthy zero lag.
     pub current_lag_sampled_at: Option<DateTime<Utc>>,
     /// Worst observed block lag per time bucket, oldest first.
-    pub block_lag: Vec<BlockLagPoint>,
-    pub poll: PollHealth,
+    pub points: Vec<BlockLagPoint>,
 }
 
 /// Worst block lag within one time bucket.

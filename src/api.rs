@@ -1846,7 +1846,7 @@ async fn performance_infra(
     // than paying both round-trips in series.
     let (monitor, dependencies) = tokio::try_join!(
         async {
-            load_monitor_telemetry(&state.pool, &range, state.ctx.chains.primary().orderbook)
+            load_monitor_telemetry(&state.pool, &range, &state.ctx.chains)
                 .await
                 .inspect_err(|error| error!(%error, "Failed to load monitor telemetry"))
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -3687,9 +3687,13 @@ mod tests {
             report,
             serde_json::json!({
                 "monitor": {
-                    "currentLagBlocks": null,
-                    "currentLagSampledAt": null,
-                    "blockLag": [],
+                    // One series per watched chain, empty until it samples.
+                    "blockLag": [{
+                        "chain": "base",
+                        "currentLagBlocks": null,
+                        "currentLagSampledAt": null,
+                        "points": [],
+                    }],
                     "poll": {
                         "cycles": 0,
                         "errors": 0,
@@ -3780,14 +3784,13 @@ mod tests {
         let body = body_to_string(response).await;
         let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
         // Lag = cutoff_block (117) - checkpoint (100).
-        assert_eq!(report["monitor"]["currentLagBlocks"], serde_json::json!(17));
-        assert_eq!(
-            report["monitor"]["blockLag"][0]["maxLagBlocks"],
-            serde_json::json!(17)
-        );
+        let series = &report["monitor"]["blockLag"][0];
+        assert_eq!(series["chain"], serde_json::json!("base"));
+        assert_eq!(series["currentLagBlocks"], serde_json::json!(17));
+        assert_eq!(series["points"][0]["maxLagBlocks"], serde_json::json!(17));
         // The bucket start anchors the dashboard's x-axis: it must parse as
         // a timestamp inside the report's default 7-day window.
-        let bucket_start = report["monitor"]["blockLag"][0]["start"]
+        let bucket_start = series["points"][0]["start"]
             .as_str()
             .expect("bucket start must be a timestamp string");
         let bucket_start = chrono::DateTime::parse_from_rfc3339(bucket_start)
