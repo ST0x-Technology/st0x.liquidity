@@ -206,6 +206,7 @@ impl PartialEq for TokenizedEquityMintError {
                 Self::AuthorizationSigningFailed { error_message: b },
             )
             | (Self::Float(a), Self::Float(b)) => a == b,
+            (Self::ChainServicesMissing(a), Self::ChainServicesMissing(b)) => a == b,
             (
                 Self::ProviderRequestTypeMismatch {
                     actual_request_type: a,
@@ -5921,6 +5922,26 @@ mod tests {
         assert_ne!(
             TokenizedEquityMintError::NotFailed,
             TokenizedEquityMintError::AlreadyReconciled
+        );
+    }
+
+    #[test]
+    fn mint_error_partial_eq_compares_chain_services_missing_by_chain() {
+        assert_eq!(
+            TokenizedEquityMintError::ChainServicesMissing(ChainServicesMissing {
+                chain: Chain::Ethereum
+            }),
+            TokenizedEquityMintError::ChainServicesMissing(ChainServicesMissing {
+                chain: Chain::Ethereum
+            })
+        );
+        assert_ne!(
+            TokenizedEquityMintError::ChainServicesMissing(ChainServicesMissing {
+                chain: Chain::Ethereum
+            }),
+            TokenizedEquityMintError::ChainServicesMissing(ChainServicesMissing {
+                chain: Chain::Base
+            })
         );
     }
 
