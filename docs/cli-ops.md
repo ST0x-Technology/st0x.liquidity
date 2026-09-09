@@ -297,13 +297,14 @@ chain the asset is listed on before the cutover:
       Recipient Authorization").
 - [ ] Only now flip the asset to orchestrator mode at issuance.
 
-Until the third step is deployed, every asset listed on the chain stays
-vault-direct. If the order slips, this bot catches it in rebalancing mode at
-startup: the tokenization preflight refuses, naming the chain and symbol, when
-issuance reports a trading- or rebalancing-enabled asset as orchestrator-mode
-while the chain has no entry. Issuance being unreachable at startup only warns
-(the per-mint mode read fails closed on its own); an orchestrator-mode mint
-reaching the signing step without its chain's entry fails there.
+Until the MintAuth policy (the fourth step) is deployed, every asset listed on
+the chain stays vault-direct. If the order slips, this bot catches it in
+rebalancing mode at startup: the tokenization preflight refuses, naming the
+chain and symbol, when issuance reports a trading- or rebalancing-enabled asset
+as orchestrator-mode while the chain has no entry. Issuance being unreachable at
+startup only warns (the per-mint mode read fails closed on its own); an
+orchestrator-mode mint reaching the signing step without its chain's entry fails
+there.
 
 ## Alpaca Crypto Wallet Management
 

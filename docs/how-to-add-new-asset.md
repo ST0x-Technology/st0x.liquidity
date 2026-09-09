@@ -230,7 +230,8 @@ For adding asset **XYZ**:
 - [ ] On each watched chain where the asset is listed: `redemption_wallet`,
       Turnkey approval policies for that chain's id, and, before the asset is
       cut over to orchestrator mode, the orchestrator entry for that chain (see
-      step 4a)
+      step 4a) and the Turnkey `MintAuth` policy for that chain's id and
+      orchestrator; the first orchestrator-mode mint fails at signing without it
 - [ ] Deploy to staging, verify bot sees the asset
 - [ ] Enable trading in config, deploy again
 - [ ] Repeat for production when staging looks good
