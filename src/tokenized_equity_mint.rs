@@ -3191,7 +3191,7 @@ mod tests {
 
     /// Like [`mint_services`] but sharing a caller-held tokenizer under every
     /// chain, so a test can inspect the calls the aggregate made on it.
-    fn mint_services_sharing(tokenizer: Arc<dyn Tokenizer>) -> EquityTransferServices {
+    fn mint_services_sharing(tokenizer: &Arc<MockTokenizer>) -> EquityTransferServices {
         let mut services = mint_services(MockTokenizer::new());
         for chain_services in services.chains.values_mut() {
             chain_services.tokenizer = tokenizer.clone();
@@ -3464,7 +3464,7 @@ mod tests {
     #[tokio::test]
     async fn provider_commands_reject_identity_mismatch_before_side_effects() {
         let tokenizer = Arc::new(MockTokenizer::new());
-        let services = mint_services_sharing(tokenizer.clone());
+        let services = mint_services_sharing(&tokenizer);
         let store = TestStore::<TokenizedEquityMint>::new(services);
         let id = issuer_request_id("ISS001");
         let other = issuer_request_id("different-mint");
@@ -3497,7 +3497,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_intent_without_identity_remains_recoverable() {
         let tokenizer = Arc::new(MockTokenizer::new());
-        let services = mint_services_sharing(tokenizer.clone());
+        let services = mint_services_sharing(&tokenizer);
         let event = serde_json::from_str(&mint_requested_payload("AAPL")).unwrap();
         let state = TokenizedEquityMint::originate(&event).unwrap();
         assert!(matches!(
@@ -3531,7 +3531,7 @@ mod tests {
     #[tokio::test]
     async fn initialize_persists_intent_without_calling_provider() {
         let tokenizer = Arc::new(MockTokenizer::new());
-        let services = mint_services_sharing(tokenizer.clone());
+        let services = mint_services_sharing(&tokenizer);
         let events = TestHarness::<TokenizedEquityMint>::with(services)
             .given_no_previous_events()
             .when(mint_command())
@@ -3550,7 +3550,7 @@ mod tests {
     #[tokio::test]
     async fn first_submission_advances_requested_intent_once() {
         let tokenizer = Arc::new(MockTokenizer::new());
-        let services = mint_services_sharing(tokenizer.clone());
+        let services = mint_services_sharing(&tokenizer);
         let store = TestStore::<TokenizedEquityMint>::new(services);
         let id = issuer_request_id("ISS001");
 
@@ -3581,7 +3581,7 @@ mod tests {
         let tokenizer = Arc::new(
             MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::ApiError),
         );
-        let services = mint_services_sharing(tokenizer);
+        let services = mint_services_sharing(&tokenizer);
         let store = TestStore::<TokenizedEquityMint>::new(services);
         let id = issuer_request_id("ISS001");
 
@@ -3611,7 +3611,7 @@ mod tests {
         let id = issuer_request_id("ISS001");
         let request = provider_mint_request(&id, TokenizationRequestStatus::Pending);
         let tokenizer = Arc::new(MockTokenizer::new().with_pending_requests(vec![request]));
-        let services = mint_services_sharing(tokenizer.clone());
+        let services = mint_services_sharing(&tokenizer);
         let store = TestStore::<TokenizedEquityMint>::new(services);
 
         store.send(&id, mint_command()).await.unwrap();
@@ -3636,7 +3636,7 @@ mod tests {
         let id = issuer_request_id("ISS001");
         let request = provider_mint_request(&id, TokenizationRequestStatus::Completed);
         let tokenizer = Arc::new(MockTokenizer::new().with_pending_requests(vec![request]));
-        let services = mint_services_sharing(tokenizer.clone());
+        let services = mint_services_sharing(&tokenizer);
         let store = TestStore::<TokenizedEquityMint>::new(services);
 
         store.send(&id, mint_command()).await.unwrap();
@@ -3670,7 +3670,7 @@ mod tests {
         )
         .unwrap();
         let tokenizer = Arc::new(MockTokenizer::new().with_pending_requests(vec![request]));
-        let services = mint_services_sharing(tokenizer.clone());
+        let services = mint_services_sharing(&tokenizer);
         let store = TestStore::<TokenizedEquityMint>::new(services);
 
         store.send(&id, mint_command()).await.unwrap();
@@ -3695,7 +3695,7 @@ mod tests {
         let id = issuer_request_id("ISS001");
         let request = provider_mint_request(&id, TokenizationRequestStatus::Rejected);
         let tokenizer = Arc::new(MockTokenizer::new().with_pending_requests(vec![request]));
-        let services = mint_services_sharing(tokenizer.clone());
+        let services = mint_services_sharing(&tokenizer);
         let store = TestStore::<TokenizedEquityMint>::new(services);
 
         store.send(&id, mint_command()).await.unwrap();
@@ -3746,7 +3746,7 @@ mod tests {
     #[tokio::test]
     async fn reconciliation_without_match_replays_idempotent_submission() {
         let tokenizer = Arc::new(MockTokenizer::new());
-        let services = mint_services_sharing(tokenizer.clone());
+        let services = mint_services_sharing(&tokenizer);
         let store = TestStore::<TokenizedEquityMint>::new(services);
         let id = issuer_request_id("ISS001");
 
@@ -3770,7 +3770,7 @@ mod tests {
     #[tokio::test]
     async fn reconciliation_lookup_error_preserves_requested_intent() {
         let tokenizer = Arc::new(MockTokenizer::new().with_mint_lookup_failure());
-        let services = mint_services_sharing(tokenizer.clone());
+        let services = mint_services_sharing(&tokenizer);
         let store = TestStore::<TokenizedEquityMint>::new(services);
         let id = issuer_request_id("ISS001");
 
@@ -3801,7 +3801,7 @@ mod tests {
     #[tokio::test]
     async fn definitive_reconciliation_lookup_error_preserves_requested_intent() {
         let tokenizer = Arc::new(MockTokenizer::new().with_definitive_mint_lookup_failure());
-        let services = mint_services_sharing(tokenizer.clone());
+        let services = mint_services_sharing(&tokenizer);
         let store = TestStore::<TokenizedEquityMint>::new(services);
         let id = issuer_request_id("ISS001");
 
@@ -4189,7 +4189,7 @@ mod tests {
         let tokenizer = Arc::new(
             MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::DefinitiveError),
         );
-        let services = mint_services_sharing(tokenizer.clone());
+        let services = mint_services_sharing(&tokenizer);
         let store = TestStore::<TokenizedEquityMint>::new(services);
         let id = issuer_request_id("ISS001");
 
