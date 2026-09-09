@@ -2475,7 +2475,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_equity_requires_tokenization_config() {
-        let ctx = create_alpaca_ctx_without_rebalancing();
+        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        // The trading table is now resolved first, and resolving it needs a
+        // wallet, so the missing redemption wallet is what refuses only once
+        // a wallet exists.
+        ctx.wallet = Some(OnchainWalletCtx::stub());
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let quantity = FractionalShares::new(Float::parse("10.5".to_string()).unwrap());

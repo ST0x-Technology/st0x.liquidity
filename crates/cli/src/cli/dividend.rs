@@ -284,9 +284,9 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.to_string().contains(
-                "equity COIN is not configured in [chains.<name>.trading.assets.equities]"
-            ),
+            error
+                .to_string()
+                .contains("equity COIN is not configured in [chains.base.trading.assets.equities]"),
             "tokenize must fail on the unconfigured symbol, got: {error}"
         );
 
