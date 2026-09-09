@@ -2631,7 +2631,26 @@ async fn process_transaction(
         )
     })?;
 
-    let provider = ProviderBuilder::new().connect_http(state.ctx.chains.primary().rpc_url.clone());
+    // A hung RPC endpoint that accepts the connection but never responds would
+    // otherwise park this request forever (RAI-2218), so bound the transport
+    // with the same connect and request timeouts the conductor's providers use.
+    let rpc_url = state.ctx.chains.primary().rpc_url.clone();
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(crate::conductor::RPC_CONNECT_TIMEOUT)
+        .timeout(crate::conductor::RPC_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to build the RPC client: {error}"),
+                }),
+            )
+        })?;
+    let is_local = alloy::transports::utils::guess_local_url(rpc_url.as_str());
+    let transport = alloy::transports::http::Http::with_client(http_client, rpc_url);
+    let rpc_client = alloy::rpc::client::ClientBuilder::default().transport(transport, is_local);
+    let provider = ProviderBuilder::new().connect_client(rpc_client);
     let cache = SymbolCache::default();
 
     let outcome = process_tx::process_tx(
