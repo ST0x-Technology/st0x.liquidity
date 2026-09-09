@@ -25,25 +25,24 @@ pub(crate) use job::{
     RecordBotGasReceiptCostJobQueue,
 };
 
-/// Enqueues bot-gas cost recording for a confirmed Base-chain equity
-/// wrap/deposit tx. Shared by the wrapped and unwrapped equity recovery
-/// aggregates so the payload shape (notably `redrive_attempts: 0` and the
-/// per-symbol attribution) cannot drift between them; each caller `?`s the
-/// returned failure into its own `BotGasEnqueueFailed` variant.
-pub(crate) async fn enqueue_base_equity_cost(
+/// Enqueues bot-gas cost recording for a confirmed equity wrap/deposit tx on
+/// the chain the recovery runs on. Shared by the wrapped and unwrapped equity
+/// recovery aggregates so the payload shape cannot drift between them; each
+/// caller `?`s the returned failure into its own `BotGasEnqueueFailed` variant.
+pub(crate) async fn enqueue_equity_cost(
     bot_gas_enqueuer: &BotGasReceiptCostEnqueuer,
+    chain: Chain,
     tx_hash: TxHash,
     category: BotGasOperationCategory,
     symbol: &Symbol,
 ) -> Result<(), BotGasEnqueueFailure> {
     bot_gas_enqueuer
-        .enqueue(RecordBotGasReceiptCost {
-            chain: Chain::Base,
+        .enqueue(RecordBotGasReceiptCost::for_transfer_tx(
+            chain,
             tx_hash,
             category,
-            symbol: Some(symbol.clone()),
-            redrive_attempts: 0,
-        })
+            symbol.clone(),
+        ))
         .await
         .map_err(|error| BotGasEnqueueFailure::from_queue_push_error(tx_hash, &error))
 }

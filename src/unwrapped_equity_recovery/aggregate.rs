@@ -52,8 +52,7 @@ use st0x_tokenization::IssuerRequestId;
 use st0x_wrapper::{WrapConfirmation, WrapperError, node_sync_attempts};
 
 use crate::bot_gas::{
-    BotGasEnqueueFailure, BotGasOperationCategory, BotGasReceiptCostEnqueuer,
-    enqueue_base_equity_cost,
+    BotGasEnqueueFailure, BotGasOperationCategory, BotGasReceiptCostEnqueuer, enqueue_equity_cost,
 };
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::rebalancing::equity::{ChainEquityServices, CrossVenueEquityTransfer};
@@ -776,8 +775,9 @@ async fn confirm_orphan_wrap_or_fail(
         }) => {
             info!(target: "rebalance", chain = %services.chain, %symbol, %wrap_tx_hash, %wrapped_amount, "Unwrapped equity recovery: confirm_wrap succeeded");
 
-            enqueue_base_equity_cost(
+            enqueue_equity_cost(
                 &services.bot_gas_enqueuer,
+                services.chain,
                 wrap_tx_hash,
                 BotGasOperationCategory::Wrap,
                 symbol,
@@ -886,8 +886,9 @@ async fn confirm_orphan_deposit_or_fail(
         Ok(()) => {
             info!(target: "rebalance", %chain, %vault_deposit_tx_hash, "Unwrapped equity recovery: confirm_tx succeeded");
 
-            enqueue_base_equity_cost(
+            enqueue_equity_cost(
                 bot_gas_enqueuer,
+                chain,
                 vault_deposit_tx_hash,
                 BotGasOperationCategory::VaultDeposit,
                 symbol,
