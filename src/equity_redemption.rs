@@ -6682,19 +6682,24 @@ mod tests {
         .unwrap();
 
         let migration =
-            include_str!("../migrations/20260909104500_chain_qualified_equity_transfers.sql");
+            include_str!("../migrations/20260909111227_chain_qualified_equity_transfers.sql");
         // Twice: the WHERE guards make the stamp idempotent.
         sqlx::raw_sql(migration).execute(&pool).await.unwrap();
         sqlx::raw_sql(migration).execute(&pool).await.unwrap();
 
-        for table in ["events", "snapshots"] {
-            let (chain,): (String,) = sqlx::query_as(&format!(
-                "SELECT json_extract(payload, '$.VaultWithdrawPending.chain') FROM {table} \
-                 WHERE aggregate_type = 'EquityRedemption'"
-            ))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        for (table, query) in [
+            (
+                "events",
+                "SELECT json_extract(payload, '$.VaultWithdrawPending.chain') FROM events \
+                 WHERE aggregate_type = 'EquityRedemption'",
+            ),
+            (
+                "snapshots",
+                "SELECT json_extract(payload, '$.VaultWithdrawPending.chain') FROM snapshots \
+                 WHERE aggregate_type = 'EquityRedemption'",
+            ),
+        ] {
+            let (chain,): (String,) = sqlx::query_as(query).fetch_one(&pool).await.unwrap();
             assert_eq!(chain, "base", "{table} row must be stamped with the chain");
         }
     }
