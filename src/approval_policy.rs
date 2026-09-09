@@ -4,15 +4,14 @@ use std::fmt::{Display, Formatter};
 use std::path::Path;
 
 use alloy::primitives::Address;
-use st0x_config::Ctx;
-use st0x_evm::USDC_BASE;
+use st0x_config::{ChainApprovalInputs, Ctx};
+use st0x_evm::Chain;
 use st0x_evm::turnkey::{
     TurnkeyPolicy, TurnkeyPolicyClient, TurnkeyPolicyEffect, TurnkeyPolicyError,
+    TurnkeyPolicySnapshot,
 };
 
 use crate::onchain::approvals::{ApprovalTarget, build_approval_targets};
-
-const BASE_CHAIN_ID: u64 = 8_453;
 
 /// Successful result of a deploy-time policy verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,16 +26,17 @@ pub enum ApprovalPolicyVerification {
     },
 }
 
-/// Every startup approval target for which no provably matching allow policy
-/// was returned by Turnkey.
+/// Every startup approval target on one watched chain for which no provably
+/// matching allow policy was returned by Turnkey.
 #[derive(Debug)]
 pub struct MissingPolicyCoverage {
+    chain: Chain,
     missing: Vec<ApprovalTarget>,
 }
 
 impl MissingPolicyCoverage {
-    fn new(missing: Vec<ApprovalTarget>) -> Self {
-        Self { missing }
+    fn new(chain: Chain, missing: Vec<ApprovalTarget>) -> Self {
+        Self { chain, missing }
     }
 }
 
@@ -44,8 +44,9 @@ impl Display for MissingPolicyCoverage {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         writeln!(
             formatter,
-            "Turnkey policies do not cover {} startup approval target(s):",
-            self.missing.len()
+            "Turnkey policies do not cover {} startup approval target(s) on {}:",
+            self.missing.len(),
+            self.chain,
         )?;
 
         for target in &self.missing {
@@ -74,7 +75,18 @@ pub enum ApprovalPolicyVerificationError {
     #[error(transparent)]
     Turnkey(#[from] TurnkeyPolicyError),
     #[error(transparent)]
+    Coverage(#[from] ChainCoverageError),
+}
+
+/// Why one watched chain's startup approvals are not provably covered.
+#[derive(Debug, thiserror::Error)]
+pub enum ChainCoverageError {
+    #[error(transparent)]
     MissingCoverage(#[from] MissingPolicyCoverage),
+    /// This build pins no canonical USDC for the chain, so its USDC grant has
+    /// no target to prove covered; fails closed.
+    #[error("[chains.{chain}] has no canonical USDC pinned in this build")]
+    UsdcNotPinned { chain: Chain },
 }
 
 /// Validates deploy inputs, lists Turnkey policies, and fails unless every
@@ -86,7 +98,6 @@ pub async fn verify_turnkey_approval_policies(
     let Some(inputs) = Ctx::load_turnkey_approval_policy_inputs(config_path, secrets_path)? else {
         return Ok(ApprovalPolicyVerification::SkippedNonTurnkey);
     };
-    let targets = build_approval_targets(&inputs.assets, inputs.orderbook, USDC_BASE);
     let client = TurnkeyPolicyClient::new(
         inputs.organization_id,
         inputs.kms_api_key,
@@ -94,22 +105,46 @@ pub async fn verify_turnkey_approval_policies(
     )
     .await?;
     let snapshot = client.list_policies().await?;
-    let context = ApprovalPolicyContext {
-        user_id: &snapshot.user_id,
-        user_tags: &snapshot.user_tags,
-        wallet_address: inputs.wallet_address,
-        chain_id: BASE_CHAIN_ID,
-    };
-    let missing = missing_policy_coverage(&targets, &snapshot.policies, &context);
-
-    if !missing.is_empty() {
-        return Err(MissingPolicyCoverage::new(missing).into());
-    }
+    let target_count = verify_watched_chains(&inputs.watched, &snapshot, inputs.wallet_address)?;
 
     Ok(ApprovalPolicyVerification::Verified {
-        target_count: targets.len(),
+        target_count,
         policy_count: snapshot.policies.len(),
     })
+}
+
+/// Every watched chain's startup targets, each checked against the policies
+/// on that chain's own id; the covered target count on success. The first
+/// chain with an uncovered target fails the gate naming that chain.
+fn verify_watched_chains(
+    watched: &[ChainApprovalInputs],
+    snapshot: &TurnkeyPolicySnapshot,
+    wallet_address: Address,
+) -> Result<usize, ChainCoverageError> {
+    let mut target_count = 0;
+
+    for chain_inputs in watched {
+        let chain = chain_inputs.chain;
+        let usdc = chain
+            .usdc()
+            .ok_or(ChainCoverageError::UsdcNotPinned { chain })?;
+        let targets = build_approval_targets(&chain_inputs.assets, chain_inputs.orderbook, usdc);
+        let context = ApprovalPolicyContext {
+            user_id: &snapshot.user_id,
+            user_tags: &snapshot.user_tags,
+            wallet_address,
+            chain_id: chain.chain_id(),
+        };
+        let missing = missing_policy_coverage(&targets, &snapshot.policies, &context);
+
+        if !missing.is_empty() {
+            return Err(MissingPolicyCoverage::new(chain, missing).into());
+        }
+
+        target_count += targets.len();
+    }
+
+    Ok(target_count)
 }
 
 fn missing_policy_coverage(
@@ -449,7 +484,12 @@ fn trim_grouping_parentheses(mut term: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use st0x_evm::turnkey::{TurnkeyPolicy, TurnkeyPolicyEffect};
+    use alloy::primitives::address;
+    use std::collections::HashMap;
+
+    use st0x_config::{ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
+    use st0x_evm::USDC_ETHEREUM;
+    use st0x_evm::turnkey::{TurnkeyPolicy, TurnkeyPolicyEffect, TurnkeyPolicySnapshot};
 
     use super::*;
     use crate::onchain::approvals::{ApprovalPurpose, ApprovalTarget};
@@ -477,7 +517,7 @@ mod tests {
             wallet_address: "0x52908400098527886E0F7030069857D2E4169EE7"
                 .parse()
                 .unwrap(),
-            chain_id: BASE_CHAIN_ID,
+            chain_id: Chain::Base.chain_id(),
         }
     }
 
@@ -833,13 +873,111 @@ mod tests {
     }
 
     #[test]
-    fn missing_coverage_error_names_symbol_token_and_spender() {
+    fn missing_coverage_error_names_chain_symbol_token_and_spender() {
         let target = target();
-        let error = MissingPolicyCoverage::new(vec![target.clone()]);
+        let error = MissingPolicyCoverage::new(Chain::Ethereum, vec![target.clone()]);
         let message = error.to_string();
 
+        assert!(message.contains("ethereum"));
         assert!(message.contains("AAPL"));
         assert!(message.contains(&target.token.to_string()));
         assert!(message.contains(&target.spender.to_string()));
+    }
+
+    fn snapshot(policies: Vec<TurnkeyPolicy>) -> TurnkeyPolicySnapshot {
+        TurnkeyPolicySnapshot {
+            user_id: USER_ID.to_string(),
+            user_tags: vec![USER_TAG_ID.to_string()],
+            policies,
+        }
+    }
+
+    /// One watched chain listing AAPL: underlying 0x11.. wraps into vault
+    /// 0x22.., which deposits into orderbook 0x33.. -- the same addresses
+    /// the policy fixtures above name.
+    fn chain_inputs(chain: Chain) -> ChainApprovalInputs {
+        ChainApprovalInputs {
+            chain,
+            orderbook: address!("0x3333333333333333333333333333333333333333"),
+            assets: ChainAssets {
+                equities: ChainEquities {
+                    operational_limit: None,
+                    symbols: HashMap::from([(
+                        "AAPL".parse().unwrap(),
+                        ChainEquityAsset {
+                            tokenized_equity: address!(
+                                "0x1111111111111111111111111111111111111111"
+                            ),
+                            tokenized_equity_derivative: address!(
+                                "0x2222222222222222222222222222222222222222"
+                            ),
+                            vault_ids: Vec::new(),
+                            trading: OperationMode::Enabled,
+                            rebalancing: OperationMode::Disabled,
+                            wrapped_equity_recovery: OperationMode::Disabled,
+                            operational_limit: None,
+                        },
+                    )]),
+                },
+                cash: None,
+            },
+        }
+    }
+
+    /// Each watched chain's targets are checked on that chain's own id: a
+    /// policy pinned to Base's chain id covers Base's three targets and
+    /// refuses an Ethereum trading table outright, naming the chain and
+    /// listing Ethereum's own USDC among the uncovered targets.
+    #[test]
+    fn watched_chain_targets_are_checked_on_their_own_chain_id() {
+        let policies = snapshot(vec![tag_allow(
+            "activity.type == 'ACTIVITY_TYPE_SIGN_TRANSACTION_V2' && \
+             eth.tx.chain_id == 8453 && \
+             eth.tx.data[2..10] == '095ea7b3'",
+        )]);
+        let wallet_address = address!("0x52908400098527886E0F7030069857D2E4169EE7");
+
+        let covered =
+            verify_watched_chains(&[chain_inputs(Chain::Base)], &policies, wallet_address).unwrap();
+        assert_eq!(covered, 3);
+
+        let error = verify_watched_chains(
+            &[chain_inputs(Chain::Base), chain_inputs(Chain::Ethereum)],
+            &policies,
+            wallet_address,
+        )
+        .unwrap_err();
+
+        let ChainCoverageError::MissingCoverage(missing) = error else {
+            panic!("an uncovered chain must fail as missing coverage, got: {error}");
+        };
+        assert_eq!(missing.chain, Chain::Ethereum);
+        assert_eq!(missing.missing.len(), 3);
+        assert!(
+            missing
+                .missing
+                .iter()
+                .any(|target| target.token == USDC_ETHEREUM),
+            "Ethereum's uncovered targets must name Ethereum's USDC, not Base's"
+        );
+    }
+
+    /// A watched chain this build pins no USDC for fails the gate closed
+    /// before any policy is consulted: there is no target to prove covered.
+    #[test]
+    fn watched_chain_without_pinned_usdc_fails_the_gate_closed() {
+        let error = verify_watched_chains(
+            &[chain_inputs(Chain::HyperEvm)],
+            &snapshot(vec![allow(None)]),
+            address!("0x52908400098527886E0F7030069857D2E4169EE7"),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ChainCoverageError::UsdcNotPinned {
+                chain: Chain::HyperEvm
+            }
+        ));
     }
 }

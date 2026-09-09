@@ -19,7 +19,8 @@ When you add a new asset (e.g. SGOV), you need to:
 
 ## Step 1: Get the Token Addresses
 
-Every tokenized asset has two contract addresses on Base:
+Every tokenized asset has two contract addresses on each chain that lists it
+(Base today; the same two exist per chain when an asset is listed elsewhere):
 
 | Name                            | What it is                                                                                   | Example (SGOV)                               |
 | ------------------------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------- |
@@ -76,6 +77,8 @@ unset INTERNAL_API_KEY
 
 - The `vault` field = the `tokenized_equity` address (the base token, NOT the
   derivative).
+- The `network` field is the chain the asset is listed on, spelled as the bot's
+  chain name (`base`, `ethereum`, `hyperevm`). Register once per chain.
 - The `X-API-KEY` is the internal API key stored on the server. Check the `.env`
   file on the droplet if you don't know it. The `read -rsp` command above
   prompts for the key without echoing it or saving it to shell history.
@@ -154,6 +157,25 @@ extended_hours_counter_trading = "disabled"   # "enabled" or "disabled"
 Both are required: a symbol listed on a chain with no hedging policy, or a
 hedging policy for a symbol listed on no chain, fails startup.
 
+The chain table the asset goes under decides what the bot uses for it: that
+chain's signing wallet, orderbook, `redemption_wallet` and
+`[orchestrator.addresses]` entry. On each watched chain where the asset is
+listed (Base included), check before enabling the asset:
+
+- `[chains.<name>.trading]` carries a `redemption_wallet` (the issuer's wallet
+  on that chain). Startup refuses, naming the chain, without it.
+- The vault at `tokenized_equity_derivative` reports `tokenized_equity` as its
+  `asset()`. Startup attests this for every trading- or rebalancing-enabled
+  equity on every watched chain and fails naming the chain and symbol otherwise.
+- The Turnkey policies allow the startup approvals on that chain's id: the
+  approvals (underlying to vault, vault to that chain's orderbook, that chain's
+  USDC to its orderbook) are granted per watched chain, and the deploy gate
+  checks coverage per chain.
+- If the asset is in orchestrator mode on that chain, `[orchestrator.addresses]`
+  has an entry for that chain (keys are chain names: `base`, `ethereum`,
+  `hyperevm`). A missing entry is only warned about at startup and fails the
+  first orchestrator-mode mint.
+
 **Fields:**
 
 - `trading`: Set to `"disabled"` initially, enable once everything else is
@@ -198,6 +220,9 @@ For adding asset **XYZ**:
 - [ ] Test a mint via the liquidity bot CLI:
       `stox alpaca-tokenize -t <token_addr> -s XYZ -q 1 -r <receiving_wallet>`
 - [ ] Add config entry to `config/staging/st0x-hedge.toml` (disabled first)
+- [ ] On each watched chain where the asset is listed: `redemption_wallet`,
+      Turnkey approval policies for that chain's id, and the orchestrator entry
+      for that chain if needed (see step 4a)
 - [ ] Deploy to staging, verify bot sees the asset
 - [ ] Enable trading in config, deploy again
 - [ ] Repeat for production when staging looks good

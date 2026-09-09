@@ -187,8 +187,19 @@ pub fn load_deployment_symbol_policy(
     )
 }
 
+/// One watched chain's approval surface: the orderbook and asset table its
+/// startup MAX approvals target.
+#[cfg(feature = "wallet-turnkey")]
+#[derive(Clone, Debug)]
+pub struct ChainApprovalInputs {
+    pub chain: Chain,
+    pub orderbook: Address,
+    pub assets: crate::ChainAssets,
+}
+
 /// Validated, network-free inputs required by the deploy-time Turnkey approval
-/// policy coverage check.
+/// policy coverage check: one approval surface per watched chain, since
+/// startup grants approvals on every one of them.
 #[cfg(feature = "wallet-turnkey")]
 #[derive(Clone, Debug)]
 pub struct TurnkeyApprovalPolicyInputs {
@@ -196,8 +207,7 @@ pub struct TurnkeyApprovalPolicyInputs {
     pub kms_api_key: Option<st0x_evm::turnkey::TurnkeyKmsApiKey>,
     pub api_private_key: Option<st0x_evm::turnkey::TurnkeyApiPrivateKey>,
     pub wallet_address: Address,
-    pub orderbook: Address,
-    pub assets: crate::ChainAssets,
+    pub watched: Vec<ChainApprovalInputs>,
 }
 
 /// Non-secret settings deserialized from the plaintext config TOML.
@@ -2131,8 +2141,15 @@ impl Ctx {
             kms_api_key,
             api_private_key,
             wallet_address,
-            orderbook: parts.chains.primary().orderbook,
-            assets: parts.chains.primary().assets.clone(),
+            watched: parts
+                .chains
+                .watched()
+                .map(|watched| ChainApprovalInputs {
+                    chain: watched.chain,
+                    orderbook: watched.orderbook,
+                    assets: watched.assets.clone(),
+                })
+                .collect(),
         }))
     }
 
@@ -9038,18 +9055,156 @@ mod tests {
             inputs.wallet_address,
             address!("0x6666666666666666666666666666666666666666")
         );
+        assert_eq!(inputs.watched.len(), 1);
+        assert_eq!(inputs.watched[0].chain, Chain::Base);
         assert_eq!(
-            inputs.orderbook,
+            inputs.watched[0].orderbook,
             address!("0x1111111111111111111111111111111111111111")
         );
         assert!(
-            inputs
+            inputs.watched[0]
                 .assets
                 .is_trading_enabled(&Symbol::new("AAPL").unwrap())
         );
         assert!(inputs.kms_api_key.is_none());
         assert!(inputs.api_private_key.is_some());
         assert!(!format!("{inputs:?}").contains("secret-p256-key"));
+    }
+
+    /// The deploy gate proves coverage for every chain startup grants
+    /// approvals on, so the inputs list each watched chain with its own
+    /// orderbook and asset table -- not only the primary's.
+    #[cfg(feature = "wallet-turnkey")]
+    #[test]
+    fn load_turnkey_approval_policy_inputs_list_every_watched_chain() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            log_level = "debug"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
+
+            [assets.equities]
+            retired_symbols = []
+
+            [assets.equities.AAPL]
+            extended_hours_counter_trading = "disabled"
+
+            [chains.base.trading.assets.equities.AAPL]
+            tokenized_equity = "0x4444444444444444444444444444444444444444"
+            tokenized_equity_derivative = "0x5555555555555555555555555555555555555555"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+
+            [chains.ethereum.trading.assets.equities.AAPL]
+            tokenized_equity = "0x7777777777777777777777777777777777777777"
+            tokenized_equity_derivative = "0x8888888888888888888888888888888888888888"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+
+            [pricing]
+            ws_url = "wss://pricing.test/ws"
+
+            [chains.base]
+            lifecycle = "active"
+            required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
+
+            [chains.ethereum]
+            lifecycle = "active"
+            required_confirmations = 12
+
+            [chains.ethereum.trading]
+            orderbook = "0x9999999999999999999999999999999999999999"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+
+            [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [wallet]
+            kind = "turnkey"
+            address = "0x6666666666666666666666666666666666666666"
+            organization_id = "org-test"
+            "#,
+        );
+        let secrets = toml_file(
+            r#"
+            [chains.base]
+            rpc_url = "http://localhost:8545"
+
+            [chains.ethereum]
+            rpc_url = "https://ethereum.example.com"
+
+            [chains.hyperevm]
+            rpc_url = "https://hyperevm.example.com"
+
+            [broker]
+            type = "dry-run"
+
+            [wallet]
+            api_private_key = "secret-p256-key"
+
+            [issuance]
+            base_url = "http://issuance.test:8000"
+            api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+
+            [pricing]
+            api_key = "pricing-oracle-test-key"
+            "#,
+        );
+
+        let inputs = Ctx::load_turnkey_approval_policy_inputs(config.path(), secrets.path())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            inputs
+                .watched
+                .iter()
+                .map(|chain| (chain.chain, chain.orderbook))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Chain::Base,
+                    address!("0x1111111111111111111111111111111111111111")
+                ),
+                (
+                    Chain::Ethereum,
+                    address!("0x9999999999999999999999999999999999999999")
+                ),
+            ]
+        );
+        assert_eq!(
+            inputs.watched[1]
+                .assets
+                .equities
+                .symbols
+                .get(&Symbol::new("AAPL").unwrap())
+                .map(|equity| equity.tokenized_equity),
+            Some(address!("0x7777777777777777777777777777777777777777"))
+        );
     }
 
     #[cfg(feature = "wallet-turnkey")]
