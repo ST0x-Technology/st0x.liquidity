@@ -280,10 +280,11 @@ itself; the `transfer` recovery verbs carry no network at all.
 ### Orchestrator Rollout per Chain
 
 Issuance keys an asset's `vault_mode` by symbol, so cutting an asset over to
-orchestrator mode applies on every chain it is listed on, and issuance refuses
-to start with an orchestrator-mode asset while any of its configured chains
-lacks an `[orchestrator.addresses]` entry. Complete the checklist for every
-chain the asset is listed on before the cutover:
+orchestrator mode applies on every chain it is listed on at once. Issuance
+refuses to start with an orchestrator-mode asset while any of its configured
+chains lacks an `[orchestrator.addresses]` entry, and its check walks every
+configured chain, not only the ones the asset is listed on. Complete the
+checklist for every chain the asset is listed on before the cutover:
 
 - [ ] Deploy `ST0xOrchestrator` on the chain.
 - [ ] Add its address under `[orchestrator.addresses].<chain>` in the issuance

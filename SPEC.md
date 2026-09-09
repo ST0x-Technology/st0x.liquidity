@@ -305,25 +305,29 @@ distinct — neither key alone can both mint and authorize.
 - **Rollout ordering per chain**: issuance keys `vault_mode` by underlying
   symbol alone, so cutting an asset over applies on every chain it is listed on,
   and issuance itself refuses to start with an orchestrator-mode asset while any
-  of its configured chains lacks an `[orchestrator.addresses]` entry. For each
-  chain X, in this order: (a) deploy `ST0xOrchestrator` on X; (b) add its
-  address under `[orchestrator.addresses].X` in both bots' configs and deploy
-  both; (c) extend this bot's Turnkey signing policy to `MintAuth` typed data
-  with X's chain id and that orchestrator as the verifying contract (the
-  policy-scoped grant above), or the first mint is denied at signing; (d) only
-  then cut an asset listed on X over to orchestrator mode at issuance. Until (c)
-  every asset listed on X stays vault-direct. This bot enforces the order at
-  three points, from earliest to last: a rebalancing-mode startup preflight
-  refuses startup, naming chain and symbol, when issuance reports an
-  orchestrator-mode asset that is trading- or rebalancing-enabled on a watched
-  chain with no entry (see Startup Sequencing); a section carrying only other
-  chains' entries warns at startup; and the server-side mint path reads the
-  asset's mode again before signing and fails closed, so an orchestrator-mode
-  mint without its chain's entry stops at the signing step. That last line is
-  the only one on a deployment without `[rebalancing]` (no preflight runs there)
-  and whenever the preflight could not read the mode. The operator CLI mint
-  (`alpaca-tokenize`, `transfer-equity`) never signs: it refuses an
-  orchestrator-mode asset outright and points at the server path.
+  of its configured chains lacks an `[orchestrator.addresses]` entry -- its
+  config cross-check walks every configured chain, not only the ones the symbol
+  is listed on. For each chain X the symbol is listed on, in this order: (a)
+  deploy `ST0xOrchestrator` on X; (b) add its address under
+  `[orchestrator.addresses].X` in both bots' configs and deploy both; (c) extend
+  this bot's Turnkey signing policy to `MintAuth` typed data with X's chain id
+  and that orchestrator as the verifying contract (the policy-scoped grant
+  above), or the first mint is denied at signing. There is no per-chain cutover
+  to pair with these: (d) the flip to orchestrator mode at issuance is
+  symbol-wide and lands on every listed chain at once, so it may only happen
+  once (a) to (c) are complete on all of them. Until (c) is deployed on X, every
+  asset listed on X stays vault-direct. This bot enforces the order at three
+  points, from earliest to last: a rebalancing-mode startup preflight refuses
+  startup, naming chain and symbol, when issuance reports an orchestrator-mode
+  asset that is trading- or rebalancing-enabled on a watched chain with no entry
+  (see Startup Sequencing); a section carrying only other chains' entries warns
+  at startup; and the server-side mint path reads the asset's mode again before
+  signing and fails closed, so an orchestrator-mode mint without its chain's
+  entry stops at the signing step. That last line is the only one on a
+  deployment without `[rebalancing]` (no preflight runs there) and whenever the
+  preflight could not read the mode. The operator CLI mint (`alpaca-tokenize`,
+  `transfer-equity`) never signs: it refuses an orchestrator-mode asset outright
+  and points at the server path.
 
 #### Dividend NAV Bump
 
