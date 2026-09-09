@@ -691,7 +691,16 @@ mod tests {
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        let chain_services = base_chain_services(raindex, wrapper);
+        let chain_services = ChainEquityServices {
+            wallet: Address::ZERO,
+            raindex,
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+            gas_readiness: ConfiguredGasReadiness::Unwired,
+            equities: ChainEquities::default(),
+        };
         let services = EquityTransferServices {
             chains: BTreeMap::from([(Chain::Base, chain_services.clone())]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
@@ -711,24 +720,6 @@ mod tests {
             chain_services,
             transfer,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        }
-    }
-
-    /// The Base entry a recovery test drives, around caller-supplied
-    /// orderbook and wrapper mocks.
-    fn base_chain_services(
-        raindex: Arc<dyn Raindex>,
-        wrapper: Arc<dyn Wrapper>,
-    ) -> ChainEquityServices {
-        ChainEquityServices {
-            wallet: Address::ZERO,
-            raindex,
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-            gas_readiness: ConfiguredGasReadiness::Unwired,
-            equities: ChainEquities::default(),
         }
     }
 
@@ -1000,7 +991,16 @@ mod tests {
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        let chain_services = base_chain_services(raindex, wrapper);
+        let chain_services = ChainEquityServices {
+            wallet: Address::ZERO,
+            raindex,
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+            gas_readiness: ConfiguredGasReadiness::Unwired,
+            equities: ChainEquities::default(),
+        };
         let inner_services = EquityTransferServices {
             chains: BTreeMap::from([(Chain::Base, chain_services.clone())]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
