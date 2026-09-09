@@ -5,6 +5,8 @@
  * components expect.
  */
 
+import type { ChainBlockLag } from '$lib/api/ChainBlockLag'
+import type { ChainName } from '$lib/api/ChainName'
 import type { DependencyBucket } from '$lib/api/DependencyBucket'
 import type { EquityOperationTiming } from '$lib/api/EquityOperationTiming'
 import type { EquityStageName } from '$lib/api/EquityStageName'
@@ -395,6 +397,31 @@ export const buildPercentileSeries = (
       p99Ms: stats?.p99Ms ?? null
     }
   })
+
+export type BlockLagRow = { start: Date } & Partial<Record<ChainName, number | null>>
+
+/**
+ * Merges every watched chain's bucketed lag points into one row per bucket
+ * start, so a single LineChart draws one line per chain. A chain with no
+ * point in a bucket (no checkpointed sample there) is null, which LineChart
+ * renders as a gap rather than a zero.
+ */
+export const buildBlockLagRows = (series: ChainBlockLag[]): BlockLagRow[] => {
+  const starts = new Set(series.flatMap(({ points }) => points.map((point) => point.start)))
+
+  return [...starts]
+    .map((start) => new Date(start))
+    .sort((left, right) => left.getTime() - right.getTime())
+    .map((start) => {
+      const row: BlockLagRow = { start }
+      for (const { chain, points } of series) {
+        row[chain] =
+          points.find((point) => new Date(point.start).getTime() === start.getTime())
+            ?.maxLagBlocks ?? null
+      }
+      return row
+    })
+}
 
 /**
  * Thins a sequence of x-axis points down to at most `maxTicks` explicit tick

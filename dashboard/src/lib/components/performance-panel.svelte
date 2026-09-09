@@ -5,6 +5,7 @@
   import * as Chart from '$lib/components/ui/chart'
   import type { EquityOperationKind } from '$lib/api/EquityOperationKind'
   import type { EquityStageName } from '$lib/api/EquityStageName'
+  import type { ChainName } from '$lib/api/ChainName'
   import type { EquityTimings } from '$lib/api/EquityTimings'
   import type { HedgeLatencies } from '$lib/api/HedgeLatencies'
   import type { InfraReport } from '$lib/api/InfraReport'
@@ -22,7 +23,8 @@
     fetchReliabilityReport
   } from '$lib/performance/api'
   import {
-    blockLagCard,
+    CHAIN_LABELS,
+    blockLagCards,
     detectionCard,
     errorsCard,
     exposureCard,
@@ -33,6 +35,7 @@
     type RebalanceBarRow,
     type WaterfallBarRow,
     type WaterfallSort,
+    buildBlockLagRows,
     buildEquityRows,
     buildPercentileSeries,
     buildRebalanceRows,
@@ -241,7 +244,7 @@
     exposureCard(latencies.current),
     errorsCard(reliability.current, CARD_WINDOW_HOURS),
     openExposureCard(latencies.current, lastRefreshed.current),
-    blockLagCard(infra.current, lastRefreshed.current)
+    ...blockLagCards(infra.current, lastRefreshed.current)
   ])
 
   const statusClasses = (status: SloStatus): string => {
@@ -373,12 +376,11 @@
     }
   } satisfies Chart.ChartConfig
 
-  const BLOCK_LAG_CHART_CONFIG = {
-    maxLagBlocks: {
-      label: 'Block lag',
-      color: 'var(--chart-sky)'
-    }
-  } satisfies Chart.ChartConfig
+  const CHAIN_LAG_COLORS: Record<ChainName, string> = {
+    base: 'var(--chart-sky)',
+    ethereum: 'var(--chart-purple)',
+    hyperevm: 'var(--chart-emerald)'
+  }
 
   const STAGE_COLORS: Record<RebalanceStageName, string> = {
     conversion: 'var(--chart-purple)',
@@ -481,13 +483,23 @@
     Math.max(0, ...attestationChartData.map((sample) => sample.durationMs))
   )
 
-  const blockLagChartData = $derived(
-    (chartInfra.current?.monitor.blockLag ?? []).map((point) => ({
-      start: new Date(point.start),
-      maxLagBlocks: point.maxLagBlocks
-    }))
+  // One line per watched chain: the API returns one series per chain.
+  const blockLagSeries = $derived(chartInfra.current?.monitor.blockLag ?? [])
+  const blockLagChartConfig = $derived(
+    Object.fromEntries(
+      blockLagSeries.map(({ chain }) => [
+        chain,
+        { label: CHAIN_LABELS[chain], color: CHAIN_LAG_COLORS[chain] }
+      ])
+    ) satisfies Chart.ChartConfig
   )
-  const blockLagMax = $derived(Math.max(0, ...blockLagChartData.map((point) => point.maxLagBlocks)))
+  const blockLagChartData = $derived(buildBlockLagRows(blockLagSeries))
+  const blockLagMax = $derived(
+    Math.max(
+      0,
+      ...blockLagSeries.flatMap(({ points }) => points.map((point) => point.maxLagBlocks))
+    )
+  )
 
   const DIRECTION_LABELS: Record<UsdcBridgeDirection, string> = {
     alpaca_to_base: 'Alpaca → Base',
@@ -1155,11 +1167,11 @@
         <p class="mb-1 text-xs font-medium text-muted-foreground">
           Worst block lag per bucket (max {blockLagMax} blocks)
         </p>
-        <Chart.Container config={BLOCK_LAG_CHART_CONFIG} class="aspect-auto h-20 w-full">
+        <Chart.Container config={blockLagChartConfig} class="aspect-auto h-20 w-full">
           <LineChart
             data={blockLagChartData}
             x="start"
-            series={Object.entries(BLOCK_LAG_CHART_CONFIG).map(([key, { label, color }]) => ({
+            series={Object.entries(blockLagChartConfig).map(([key, { label, color }]) => ({
               key,
               label,
               color
