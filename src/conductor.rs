@@ -2914,6 +2914,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let (wrapped_equity_recovery_store, unwrapped_equity_recovery_store) =
             build_equity_recovery_stores(
                 &deps.pool,
+                primary_chain,
                 primary_equity_services,
                 recovery_transfer.clone(),
                 bot_gas_enqueuer.clone(),
@@ -3079,7 +3080,8 @@ async fn catch_up_stage_timing_projections(
 /// the recovery counterpart built from the same `recovery_transfer`.
 async fn build_equity_recovery_stores(
     pool: &SqlitePool,
-    chain: ChainEquityServices,
+    chain: Chain,
+    chain_services: ChainEquityServices,
     transfer: Arc<CrossVenueEquityTransfer>,
     bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
 ) -> anyhow::Result<(
@@ -3088,7 +3090,8 @@ async fn build_equity_recovery_stores(
 )> {
     let wrapped_store = StoreBuilder::<WrappedEquityRecovery>::new(pool.clone())
         .build(WrappedEquityRecoveryServices {
-            chain: chain.clone(),
+            chain,
+            chain_services: chain_services.clone(),
             transfer: transfer.clone(),
             bot_gas_enqueuer: bot_gas_enqueuer.clone(),
         })
@@ -3097,6 +3100,7 @@ async fn build_equity_recovery_stores(
     let unwrapped_store = StoreBuilder::<UnwrappedEquityRecovery>::new(pool.clone())
         .build(UnwrappedEquityRecoveryServices {
             chain,
+            chain_services,
             transfer,
             bot_gas_enqueuer,
         })

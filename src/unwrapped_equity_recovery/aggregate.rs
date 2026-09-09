@@ -45,6 +45,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_raindex::Raindex;
 use st0x_tokenization::IssuerRequestId;
@@ -80,9 +81,12 @@ impl FromStr for UnwrappedEquityRecoveryId {
 /// Services the aggregate calls inside its command handlers.
 #[derive(Clone)]
 pub(crate) struct UnwrappedEquityRecoveryServices {
-    /// The entry of the chain the orphaned tokens sit on. It also carries the
-    /// wrap receiver -- the wallet the deposit pulls the wrapped tokens from.
-    pub(crate) chain: ChainEquityServices,
+    /// The chain the orphaned tokens sit on: the one whose entry the recovery
+    /// drives and whose gas its confirmed txs are charged to.
+    pub(crate) chain: Chain,
+    /// That chain's entry. It also carries the wrap receiver -- the wallet
+    /// the deposit pulls the wrapped tokens from.
+    pub(crate) chain_services: ChainEquityServices,
     pub(crate) transfer: Arc<CrossVenueEquityTransfer>,
     /// Enqueues bot-gas cost recording for the orphan wrap/deposit path
     /// (which calls `wrapper`/`raindex` directly rather than through
@@ -154,26 +158,26 @@ pub(crate) enum UnwrappedEquityRecoveryCommand {
     },
 
     /// Orphan path step 1. The handler resolves the wrapped-token
-    /// address via `services.chain.wrapper.lookup_derivative(symbol)`,
-    /// calls `services.chain.wrapper.submit_wrap(...)`, and emits
+    /// address via `services.chain_services.wrapper.lookup_derivative(symbol)`,
+    /// calls `services.chain_services.wrapper.submit_wrap(...)`, and emits
     /// `OrphanWrapSubmitted` with the returned tx hash.
     SubmitOrphanWrap,
 
     /// Orphan path step 2. The handler reads `wrap_tx_hash` from the
-    /// current state and calls `services.chain.wrapper.confirm_wrap(...)`,
+    /// current state and calls `services.chain_services.wrapper.confirm_wrap(...)`,
     /// emitting `OrphanWrapped` with the actual minted wrapped amount
     /// iff confirmation succeeds.
     ConfirmOrphanWrap,
 
     /// Orphan path step 3. The handler reads `wrapped_amount` from the
     /// current state, looks up the Raindex vault, calls
-    /// `services.chain.raindex.submit_deposit(...)`, and emits
+    /// `services.chain_services.raindex.submit_deposit(...)`, and emits
     /// `OrphanDepositSubmitted` with the returned tx hash.
     SubmitOrphanDeposit,
 
     /// Orphan path step 4. The handler reads `vault_deposit_tx_hash`
     /// from the current state and calls
-    /// `services.chain.raindex.confirm_tx(tx_hash)`, emitting
+    /// `services.chain_services.raindex.confirm_tx(tx_hash)`, emitting
     /// `OrphanDeposited` iff confirmation succeeds.
     ConfirmOrphanDeposit,
 
@@ -595,7 +599,7 @@ impl EventSourced for UnwrappedEquityRecovery {
                 // Skip the wait for legacy aggregates persisted before wrap_block was added.
                 if let Some(block) = wrap_block {
                     services
-                        .chain
+                        .chain_services
                         .wrapper
                         .wait_for_block(*block)
                         .await
@@ -619,7 +623,8 @@ impl EventSourced for UnwrappedEquityRecovery {
                 ConfirmOrphanDeposit,
             ) => {
                 confirm_orphan_deposit_or_fail(
-                    &services.chain.raindex,
+                    services.chain,
+                    &services.chain_services.raindex,
                     &services.bot_gas_enqueuer,
                     symbol,
                     *vault_deposit_tx_hash,
@@ -694,7 +699,7 @@ async fn submit_orphan_wrap_or_fail(
     symbol: &Symbol,
     shares: FractionalShares,
 ) -> Result<Vec<UnwrappedEquityRecoveryEvent>, UnwrappedEquityRecoveryError> {
-    let wrapped_token = match services.chain.wrapper.lookup_derivative(symbol) {
+    let wrapped_token = match services.chain_services.wrapper.lookup_derivative(symbol) {
         Ok(token) => token,
         Err(error) => {
             warn!(target: "rebalance", %symbol, ?error, "Unwrapped equity recovery: lookup_derivative failed");
@@ -717,9 +722,13 @@ async fn submit_orphan_wrap_or_fail(
     };
 
     match services
-        .chain
+        .chain_services
         .wrapper
-        .submit_wrap(wrapped_token, underlying_amount, services.chain.wallet)
+        .submit_wrap(
+            wrapped_token,
+            underlying_amount,
+            services.chain_services.wallet,
+        )
         .await
     {
         Ok(wrap_tx_hash) => {
@@ -744,7 +753,7 @@ async fn confirm_orphan_wrap_or_fail(
     symbol: &Symbol,
     wrap_tx_hash: TxHash,
 ) -> Result<Vec<UnwrappedEquityRecoveryEvent>, UnwrappedEquityRecoveryError> {
-    let wrapped_token = match services.chain.wrapper.lookup_derivative(symbol) {
+    let wrapped_token = match services.chain_services.wrapper.lookup_derivative(symbol) {
         Ok(token) => token,
         Err(error) => {
             warn!(target: "rebalance", %symbol, ?error, "Unwrapped equity recovery: lookup_derivative failed");
@@ -756,7 +765,7 @@ async fn confirm_orphan_wrap_or_fail(
     };
 
     match services
-        .chain
+        .chain_services
         .wrapper
         .confirm_wrap(wrapped_token, wrap_tx_hash)
         .await
@@ -765,7 +774,7 @@ async fn confirm_orphan_wrap_or_fail(
             shares: wrapped_amount,
             block: wrap_block,
         }) => {
-            info!(target: "rebalance", %symbol, %wrap_tx_hash, %wrapped_amount, "Unwrapped equity recovery: confirm_wrap succeeded");
+            info!(target: "rebalance", chain = %services.chain, %symbol, %wrap_tx_hash, %wrapped_amount, "Unwrapped equity recovery: confirm_wrap succeeded");
 
             enqueue_base_equity_cost(
                 &services.bot_gas_enqueuer,
@@ -803,7 +812,7 @@ async fn submit_orphan_deposit_or_fail(
     symbol: &Symbol,
     wrapped_amount: U256,
 ) -> Result<Vec<UnwrappedEquityRecoveryEvent>, UnwrappedEquityRecoveryError> {
-    let wrapped_token = match services.chain.wrapper.lookup_derivative(symbol) {
+    let wrapped_token = match services.chain_services.wrapper.lookup_derivative(symbol) {
         Ok(token) => token,
         Err(error) => {
             warn!(target: "rebalance", %symbol, ?error, "Unwrapped equity recovery: lookup_derivative failed");
@@ -815,7 +824,7 @@ async fn submit_orphan_deposit_or_fail(
     };
 
     let vault_id = match services
-        .chain
+        .chain_services
         .vault_lookup
         .vault_id_for_token(wrapped_token)
         .await
@@ -839,7 +848,7 @@ async fn submit_orphan_deposit_or_fail(
     // `FractionalShares::to_u256_18_decimals`; a wtSTOCK minted at a different
     // precision would mis-scale this deposit.
     match services
-        .chain
+        .chain_services
         .raindex
         .submit_deposit(
             wrapped_token,
@@ -867,6 +876,7 @@ async fn submit_orphan_deposit_or_fail(
 }
 
 async fn confirm_orphan_deposit_or_fail(
+    chain: Chain,
     raindex: &Arc<dyn Raindex>,
     bot_gas_enqueuer: &BotGasReceiptCostEnqueuer,
     symbol: &Symbol,
@@ -874,7 +884,7 @@ async fn confirm_orphan_deposit_or_fail(
 ) -> Result<Vec<UnwrappedEquityRecoveryEvent>, UnwrappedEquityRecoveryError> {
     match raindex.confirm_tx(vault_deposit_tx_hash).await {
         Ok(()) => {
-            info!(target: "rebalance", %vault_deposit_tx_hash, "Unwrapped equity recovery: confirm_tx succeeded");
+            info!(target: "rebalance", %chain, %vault_deposit_tx_hash, "Unwrapped equity recovery: confirm_tx succeeded");
 
             enqueue_base_equity_cost(
                 bot_gas_enqueuer,
@@ -914,7 +924,7 @@ mod tests {
 
     use st0x_config::ChainEquities;
     use st0x_event_sorcery::EventSourced;
-    use st0x_evm::{Chain, NODE_SYNC_MAX_ATTEMPTS};
+    use st0x_evm::NODE_SYNC_MAX_ATTEMPTS;
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_raindex::RaindexVaultId;
     use st0x_tokenization::issuer_request_id;
@@ -995,7 +1005,7 @@ mod tests {
     ) -> UnwrappedEquityRecoveryServices {
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        let chain = ChainEquityServices {
+        let chain_services = ChainEquityServices {
             wallet: Address::random(),
             raindex,
             vault_lookup,
@@ -1006,7 +1016,7 @@ mod tests {
             equities: ChainEquities::default(),
         };
         let services = EquityTransferServices {
-            chains: BTreeMap::from([(Chain::Base, chain.clone())]),
+            chains: BTreeMap::from([(Chain::Base, chain_services.clone())]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let mint_store = Arc::new(st0x_event_sorcery::test_store(
@@ -1020,7 +1030,8 @@ mod tests {
             redemption_store,
         ));
         UnwrappedEquityRecoveryServices {
-            chain,
+            chain: Chain::Base,
+            chain_services,
             transfer,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         }
@@ -1559,6 +1570,36 @@ mod tests {
         assert_eq!(jobs[0].symbol, Some(aapl()));
     }
 
+    /// A recovery on Ethereum charges its confirmed orphan wrap to Ethereum's
+    /// gas ledger, not Base's.
+    #[tokio::test]
+    async fn confirm_orphan_wrap_enqueues_the_bot_gas_job_on_the_recoverys_chain() {
+        let (_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+        let wrapper_mock = Arc::new(MockWrapper::new());
+        wrapper_mock.seed_submitted_amount(FAKE_WRAP_TX, U256::from(7u64));
+        let mut services = services_with(Arc::new(MockRaindex::new()), wrapper_mock).await;
+        services.chain = Chain::Ethereum;
+        services.bot_gas_enqueuer = BotGasReceiptCostEnqueuer::Enabled(queue);
+
+        let state = UnwrappedEquityRecovery::OrphanWrapSubmitted {
+            symbol: aapl(),
+            shares: one_share(),
+            detected_at: Utc::now(),
+            wrap_tx_hash: FAKE_WRAP_TX,
+            submitted_at: Utc::now(),
+        };
+        state
+            .transition(UnwrappedEquityRecoveryCommand::ConfirmOrphanWrap, &services)
+            .await
+            .expect("ConfirmOrphanWrap should succeed from OrphanWrapSubmitted");
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
+        assert_eq!(jobs[0].chain, Chain::Ethereum);
+        assert_eq!(jobs[0].tx_hash, FAKE_WRAP_TX);
+    }
+
     /// Acceptance criterion: an enqueue failure after a confirmed
     /// orphan wrap propagates as a hard error rather than being folded into
     /// `RecoveryFailed`.
@@ -1625,6 +1666,40 @@ mod tests {
         assert_eq!(jobs[0].chain, Chain::Base);
         assert_eq!(jobs[0].tx_hash, FAKE_WRAP_TX);
         assert_eq!(jobs[0].symbol, Some(aapl()));
+    }
+
+    /// A recovery on Ethereum charges its confirmed orphan deposit to
+    /// Ethereum's gas ledger, not Base's.
+    #[tokio::test]
+    async fn confirm_orphan_deposit_enqueues_the_bot_gas_job_on_the_recoverys_chain() {
+        let (_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
+        let mut services =
+            services_with(Arc::new(MockRaindex::new()), Arc::new(MockWrapper::new())).await;
+        services.chain = Chain::Ethereum;
+        services.bot_gas_enqueuer = BotGasReceiptCostEnqueuer::Enabled(queue);
+
+        let state = UnwrappedEquityRecovery::OrphanDepositSubmitted {
+            symbol: aapl(),
+            shares: one_share(),
+            detected_at: Utc::now(),
+            wrap_tx_hash: FAKE_WRAP_TX,
+            wrapped_amount: U256::from(123u64),
+            vault_deposit_tx_hash: FAKE_WRAP_TX,
+            deposit_submitted_at: Utc::now(),
+        };
+        state
+            .transition(
+                UnwrappedEquityRecoveryCommand::ConfirmOrphanDeposit,
+                &services,
+            )
+            .await
+            .expect("ConfirmOrphanDeposit should succeed from OrphanDepositSubmitted");
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
+        assert_eq!(jobs[0].chain, Chain::Ethereum);
+        assert_eq!(jobs[0].tx_hash, FAKE_WRAP_TX);
     }
 
     /// Acceptance criterion: an enqueue failure after a confirmed
