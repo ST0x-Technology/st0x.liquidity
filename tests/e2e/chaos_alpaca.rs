@@ -376,10 +376,13 @@ async fn broker_outage_defers_hedge_until_rescan_after_restore() -> anyhow::Resu
             .bind(st0x_hedge::check_positions_job_type())
             .fetch_one(&pool)
             .await?;
-    let position = Projection::<Position>::sqlite(pool.clone())
-        .load(&Symbol::new(equity_symbol)?)
-        .await?
-        .expect("position must exist mid-outage");
+    let position = poll_for_accumulated_short(
+        &mut bot,
+        &pool,
+        &Symbol::new(equity_symbol)?,
+        FractionalShares::new(sell_amount),
+    )
+    .await?;
     pool.close().await;
 
     assert!(
@@ -411,6 +414,8 @@ async fn broker_outage_defers_hedge_until_rescan_after_restore() -> anyhow::Resu
         Duration::from_secs(120),
     )
     .await;
+
+    poll_for_hedged_position(&mut bot, &infra.db_path, equity_symbol).await;
 
     let orders = infra.broker_service.orders();
     let order_count = orders.len();
@@ -641,6 +646,8 @@ async fn broker_outage_with_submitted_order_halts_bot_and_restart_recovers() -> 
         "Exactly one broker order after the restart resumed polling; got \
          {order_count}",
     );
+
+    poll_for_hedged_position(&mut bot2, &infra.db_path, equity_symbol).await;
 
     let expected_position = ExpectedPosition::builder()
         .symbol(equity_symbol)

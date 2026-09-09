@@ -16,6 +16,7 @@ use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_API_KEY, TEST_API
 use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
 pub(crate) use st0x_execution::{FractionalShares, Positive, Symbol};
 pub(crate) use st0x_hedge::ExecutionThreshold;
+use st0x_hedge::OffchainOrderId;
 use st0x_hedge::bindings::IRaindexV6;
 use st0x_hedge::mock_api::REDEMPTION_WALLET;
 use st0x_hedge::{ImbalanceThreshold, OperationMode, RebalancingCtx, UsdcRebalancing};
@@ -123,6 +124,48 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         .maybe_inventory_mode(inventory_mode_override)
         .call()
         .map_err(Into::into)
+}
+
+pub(crate) async fn poll_for_accumulated_short(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    pool: &SqlitePool,
+    symbol: &Symbol,
+    expected: FractionalShares,
+) -> anyhow::Result<Position> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
+    let projection = Projection::<Position>::sqlite(pool.clone());
+    loop {
+        if let Some(position) = projection.load(symbol).await?
+            && position.accumulated_short == expected
+        {
+            return Ok(position);
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out waiting for accumulated short for {symbol}"
+        );
+        sleep_or_crash(bot, "accumulated short position").await;
+    }
+}
+
+pub(crate) async fn assert_offchain_order_event_sequence(
+    pool: &SqlitePool,
+    order_id: &OffchainOrderId,
+    expected: &[&str],
+) -> anyhow::Result<()> {
+    let events: Vec<String> = sqlx::query_scalar(
+        "SELECT event_type FROM events WHERE aggregate_type = ? AND aggregate_id = ? \
+         ORDER BY sequence",
+    )
+    .bind("OffchainOrder")
+    .bind(order_id.to_string())
+    .fetch_all(pool)
+    .await?;
+
+    assert_eq!(events, expected, "Unexpected lifecycle for {order_id}");
+
+    Ok(())
 }
 
 /// Polls until the Position projection for `symbol` has `net == 0`,

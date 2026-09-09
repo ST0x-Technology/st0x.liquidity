@@ -11,10 +11,11 @@
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use sqlx::{Sqlite, SqlitePool, Transaction};
+use thiserror::Error;
+
 use st0x_event_sorcery::{EntityList, EventSourced, IdempotentReactor, Reactor, deps};
 use st0x_finance::{Positive, Symbol};
 use st0x_float_serde::format_float;
-use thiserror::Error;
 
 use super::{
     PortfolioBalanceRowWithMark, PortfolioSnapshot, PortfolioSnapshotEvent, PortfolioSnapshotId,
@@ -141,12 +142,11 @@ impl PortfolioSnapshotProjection {
     /// transaction, so a parse or write failure leaves the prior table intact.
     ///
     /// Operator constraint: run with the conductor stopped. The event list is
-    /// read once at the start of the transaction; an event the live reactor
-    /// commits mid-rebuild is not replayed. Under WAL the rebuild's write-lock
-    /// upgrade then fails (`SQLITE_BUSY_SNAPSHOT`) rather than committing a
-    /// read model missing that day, but the rebuild itself must be re-run.
+    /// read after reserving the SQLite writer, so unrelated startup telemetry
+    /// cannot invalidate the snapshot before the table is rewritten. Keep live
+    /// capture and correction reactors stopped throughout an operator rebuild.
     pub async fn rebuild_all(&self) -> Result<u64, ProjectionError> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let events: Vec<(String, String)> = sqlx::query_as(
             "SELECT aggregate_id, payload FROM events WHERE aggregate_type = ? \
              ORDER BY aggregate_id, sequence ASC",
@@ -208,10 +208,11 @@ impl IdempotentReactor for PortfolioSnapshotProjection {}
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use chrono::{TimeZone, Utc};
     use sqlx::Row;
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
     use st0x_evm::Chain;
     use st0x_float_macro::float;
@@ -219,7 +220,9 @@ mod tests {
     use super::*;
     use crate::inventory::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
     use crate::portfolio_snapshot::{PortfolioBalanceRowWithMark, PortfolioSnapshotId};
-    use crate::test_utils::setup_test_db;
+    use crate::test_utils::{
+        replay_after_competing_writer, setup_file_backed_test_db, setup_test_db,
+    };
 
     fn captured_at() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 20, 4, 5, 0).unwrap()
@@ -402,6 +405,45 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(marks, vec!["151", "151"]);
+    }
+
+    #[tokio::test]
+    async fn rebuild_waits_for_competing_writer() {
+        let (pool, _apalis, _path, _guard) =
+            setup_file_backed_test_db(Duration::from_secs(1)).await;
+        let store = StoreBuilder::<PortfolioSnapshot>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let id = PortfolioSnapshotId(chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap());
+        store
+            .send(
+                &id,
+                super::super::PortfolioSnapshotCommand::Capture {
+                    captured_at: captured_at(),
+                    rows: vec![equity_row(PortfolioLocation::Hedging)],
+                },
+            )
+            .await
+            .unwrap();
+        let projection = PortfolioSnapshotProjection::new(pool.clone());
+
+        let replayed = replay_after_competing_writer(&pool, projection.rebuild_all())
+            .await
+            .unwrap();
+
+        assert_eq!(replayed, 1);
+        let assets: Vec<String> = sqlx::query_scalar("SELECT asset FROM portfolio_snapshot")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(assets, vec!["AAPL"]);
+        assert_eq!(projection.rebuild_all().await.unwrap(), 1);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM portfolio_snapshot")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]

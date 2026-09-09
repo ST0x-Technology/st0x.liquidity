@@ -1918,10 +1918,10 @@ impl PositionAndRebalancing {
 /// Then catches the lifecycle-failure read model up to the event log before
 /// its OffchainOrder reactor goes live, in both modes. Must run BEFORE
 /// `PositionAndRebalancing::setup`: setup spawns resume workers that write
-/// the event store concurrently, and this catch-up's deferred
-/// read-then-write transaction surfaces SQLITE_BUSY_SNAPSHOT immediately
-/// (busy_timeout does not apply to deferred-upgrade conflicts), failing the
-/// whole boot.
+/// the event store concurrently. The telemetry writer is already active here,
+/// so read-model replays reserve the SQLite writer before reading their
+/// snapshots; a deferred read-to-write upgrade can fail immediately instead
+/// of waiting for the current writer.
 async fn run_startup_maintenance(ctx: &Ctx, pool: &SqlitePool) -> anyhow::Result<()> {
     grant_startup_token_approvals(ctx).await?;
     catch_up_lifecycle_failures(pool).await?;

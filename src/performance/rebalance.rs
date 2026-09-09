@@ -286,7 +286,7 @@ impl RebalanceTimingProjection {
     /// fresh deploy and recovers anything the forward-only live path dropped in
     /// the previous run, so the live path has no permanent drop window.
     pub(crate) async fn catch_up(&self) -> Result<u64, ProjectionError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let replayed = Self::replay_pending(&mut tx).await?;
 
@@ -992,6 +992,7 @@ fn observed_at(event: &UsdcRebalanceEvent) -> DateTime<Utc> {
 mod tests {
     use alloy::primitives::{B256, TxHash, fixed_bytes};
     use chrono::TimeZone;
+    use std::time::Duration;
     use uuid::Uuid;
 
     use st0x_dto::UsdcBridgeDirection;
@@ -1001,7 +1002,9 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::test_utils::setup_test_db;
+    use crate::test_utils::{
+        replay_after_competing_writer, setup_file_backed_test_db, setup_test_db,
+    };
     use crate::usdc_rebalance::{
         ConversionAmounts, ReconcileReason, TransferRef, UsdcRebalanceCommand,
     };
@@ -1256,6 +1259,34 @@ mod tests {
             live, rebuilt,
             "rebuilding from the event log must reproduce the exact live table state"
         );
+    }
+
+    #[tokio::test]
+    async fn catch_up_waits_for_competing_writer() {
+        let (pool, _apalis, _path, _guard) =
+            setup_file_backed_test_db(Duration::from_secs(1)).await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(400)),
+                    withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(1)),
+                },
+            )
+            .await
+            .unwrap();
+        let projection = RebalanceTimingProjection::new(pool.clone());
+
+        let replayed = replay_after_competing_writer(&pool, projection.catch_up())
+            .await
+            .unwrap();
+
+        assert_eq!(replayed, 1);
+        assert_eq!(fetch_timing_rows(&pool).await.len(), 1);
+        assert_eq!(projection.catch_up().await.unwrap(), 0);
     }
 
     /// Startup catch-up must replay only the events past each operation's

@@ -1943,12 +1943,13 @@ impl CrossVenueEquityTransfer {
         // a reactor-less failure injection -- is not a conflict; that is exactly
         // the stale state recovery reconciles. The check is atomic with the
         // in-flight restore so a concurrent mint cannot claim the slot in between.
-        let rollback = match rebalancing
+        let (rollback, recovery_guard) = match rebalancing
             .rebuild_mint_tracking_for_recovery(issuer_request_id, &entity, request.id.clone())
             .await?
         {
             RecoveryClaim::Conflict => return Ok(RecheckOutcome::Conflict),
-            RecoveryClaim::Claimed(rollback) => rollback,
+            RecoveryClaim::Claimed(rollback) => (rollback, None),
+            RecoveryClaim::Guarded { rollback, guard } => (rollback, Some(guard)),
         };
 
         if let Err(error) = self
@@ -2005,6 +2006,10 @@ impl CrossVenueEquityTransfer {
             rebalancing
                 .abandon_mint_recovery_guard(issuer_request_id, &symbol)
                 .await;
+        }
+
+        if let Some(guard) = recovery_guard {
+            guard.release();
         }
 
         Ok(RecheckOutcome::Recovered)
@@ -2079,16 +2084,29 @@ impl CrossVenueEquityTransfer {
             return Ok(RecheckOutcome::LeftUnchanged);
         }
 
+        // `load` can observe the committed failure before that command's inline
+        // terminal reactor has cleaned up its live tracking. A no-event command
+        // on the same aggregate waits behind that command and all its reactors,
+        // so the rebuild below cannot be erased by delayed terminal cleanup.
+        self.redemption_store
+            .send(
+                aggregate_id,
+                EquityRedemptionCommand::SynchronizeProviderCompletionRecovery,
+            )
+            .await
+            .map_err(RedemptionError::from)?;
+
         // Compare-and-claim: refuse recovery while a *different* redemption for
         // this symbol is live (see recover_mint for the rationale). A slot still
         // owned by this same redemption is not a conflict. The check is atomic
         // with the in-flight restore.
-        let rollback = match rebalancing
+        let (rollback, recovery_guard) = match rebalancing
             .rebuild_redemption_tracking_for_recovery(aggregate_id, &entity)
             .await?
         {
             RecoveryClaim::Conflict => return Ok(RecheckOutcome::Conflict),
-            RecoveryClaim::Claimed(rollback) => rollback,
+            RecoveryClaim::Claimed(rollback) => (rollback, None),
+            RecoveryClaim::Guarded { rollback, guard } => (rollback, Some(guard)),
         };
 
         if let Err(error) = self
@@ -2118,6 +2136,10 @@ impl CrossVenueEquityTransfer {
             }
 
             return Err(RedemptionError::from(error).into());
+        }
+
+        if let Some(guard) = recovery_guard {
+            guard.release();
         }
 
         Ok(RecheckOutcome::Recovered)
@@ -2354,16 +2376,20 @@ mod tests {
     use alloy::primitives::{Address, B256, Bytes, address};
     use async_trait::async_trait;
     use chrono::Utc;
+    use futures_util::poll;
     use rain_math_float::Float;
     use sqlx::SqlitePool;
     use std::collections::{BTreeMap, HashMap};
+    use std::pin::pin;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use tokio::sync::broadcast;
+    use tokio::sync::{Notify, broadcast};
 
     use st0x_config::{ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
     use st0x_dto::Statement;
-    use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, test_store};
+    use st0x_event_sorcery::{
+        AggregateError, EntityList, LifecycleError, Never, Reactor, StoreBuilder, deps, test_store,
+    };
     use st0x_evm::Chain;
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_float_macro::float;
@@ -2377,7 +2403,9 @@ mod tests {
 
     use super::*;
     use crate::bot_gas::{RecordBotGasReceiptCostJobQueue, pending_bot_gas_jobs};
-    use crate::equity_redemption::{EquityRedemptionError, redemption_aggregate_id};
+    use crate::equity_redemption::{
+        EquityRedemptionError, EquityRedemptionEvent, redemption_aggregate_id,
+    };
     use crate::inventory::{
         BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Venue,
     };
@@ -2398,6 +2426,31 @@ mod tests {
             .with_symbol_token(Symbol::new("TEST").unwrap(), Address::ZERO)
             .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
             .with_default_vault(RaindexVaultId(B256::ZERO))
+    }
+
+    struct BlockingRedemptionTerminalReactor {
+        entered: Notify,
+        release: Notify,
+    }
+
+    deps!(BlockingRedemptionTerminalReactor, [EquityRedemption]);
+
+    #[async_trait]
+    impl Reactor for BlockingRedemptionTerminalReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (_id, event) = event.into_inner();
+            if matches!(event, EquityRedemptionEvent::RedemptionRejected { .. }) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+
+            Ok(())
+        }
     }
 
     /// One chain's entry, distinguished by the tokenizer the caller passes so
@@ -3528,6 +3581,165 @@ mod tests {
         assert!(
             matches!(outcome, RecheckOutcome::AlreadyCompleted),
             "a reconciled redemption must recheck as AlreadyCompleted, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_completion_recovery_waits_for_committed_failure_reactor() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let symbol = Symbol::new("TEST").unwrap();
+        let id = redemption_aggregate_id("recover-after-terminal-reactor");
+        let request_id = tokenization_request_id("TOK-recover-after-terminal-reactor");
+        let mut completed_request = TokenizationRequest::mock_completed();
+        completed_request.id = request_id.clone();
+        let tokenizer =
+            Arc::new(MockTokenizer::new().with_pending_requests(vec![completed_request]));
+        let services = mock_services_with(
+            &(tokenizer.clone() as Arc<dyn Tokenizer>),
+            &(Arc::new(MockRaindex::new()) as Arc<dyn Raindex>),
+            &(Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>),
+        );
+        let (event_sender, _event_receiver) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default().with_equity(
+                symbol.clone(),
+                FractionalShares::new(float!(100)),
+                FractionalShares::ZERO,
+            ),
+            event_sender,
+        ));
+        let service = Arc::new(RebalancingService::new(
+            RebalancingServiceConfig {
+                poll_freshness: PollFreshness::always_fresh(),
+                inventory_staleness_bound: Duration::from_secs(300),
+                cash_reserved: None,
+                equity: ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
+                },
+                usdc: None,
+                transfer_timeout: Duration::from_secs(1800),
+                assets: ChainAssets::default(),
+            },
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: address!("0x0000000000000000000000000000000000000001"),
+                    owner: address!("0x0000000000000000000000000000000000000002"),
+                },
+            )]),
+            inventory.clone(),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
+            RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::LogNotifier),
+        ));
+        let blocker = Arc::new(BlockingRedemptionTerminalReactor {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let (mint_store, _mint_projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .with(service.clone())
+            .build(services.clone())
+            .await
+            .unwrap();
+        let (redemption_store, _redemption_projection) =
+            StoreBuilder::<EquityRedemption>::new(pool.clone())
+                .with(blocker.clone())
+                .with(service.clone())
+                .build(services.clone())
+                .await
+                .unwrap();
+        service
+            .set_stores(
+                mint_store.clone(),
+                redemption_store.clone(),
+                Arc::new(test_store::<UsdcRebalance>(pool, ())),
+            )
+            .await;
+        let transfer =
+            CrossVenueEquityTransfer::new(services, mint_store, redemption_store.clone());
+
+        advance_redemption_to_tokens_sent(&transfer, &id, &symbol).await;
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Detect {
+                    tokenization_request_id: request_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let rejecting_store = redemption_store.clone();
+        let rejecting_id = id.clone();
+        let failure = tokio::spawn(async move {
+            rejecting_store
+                .send(
+                    &rejecting_id,
+                    EquityRedemptionCommand::RejectRedemption {
+                        reason: "provider rejected redemption".to_string(),
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), blocker.entered.notified())
+            .await
+            .expect("rejection must reach the blocking reactor");
+
+        assert!(matches!(
+            redemption_store.load(&id).await.unwrap().unwrap(),
+            EquityRedemption::Failed { .. }
+        ));
+        let provider_calls_before_recovery = tokenizer.call_count();
+        let mut recovery = pin!(transfer.recover_redemption(&id, &service));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                assert!(poll!(&mut recovery).is_pending());
+                if tokenizer.call_count() > provider_calls_before_recovery {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery must reach the completed provider request");
+
+        blocker.release.notify_one();
+        let (failure_result, recovery_result) =
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(failure, recovery)
+            })
+            .await
+            .expect("failure cleanup and provider recovery must finish without deadlock");
+        failure_result.unwrap().unwrap();
+        assert_eq!(recovery_result.unwrap(), RecheckOutcome::Recovered);
+
+        let inventory = inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::new(float!(50)))
+        );
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::ZERO)
+        );
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(FractionalShares::new(float!(50)))
+        );
+        assert_eq!(inventory.active_redemption(&symbol), None);
+        drop(inventory);
+        assert!(
+            !service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
         );
     }
 

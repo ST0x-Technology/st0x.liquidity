@@ -62,7 +62,7 @@ use st0x_hedge::{
 use crate::assert::ExpectedPosition;
 use crate::base_chain::{self, TakeDirection};
 use crate::cctp::{CctpInfra, CctpOverrides, USDC_ETHEREUM};
-use crate::hedging::assertions::assert_full_hedging_flow;
+use crate::hedging::assertions::{assert_full_hedging_flow, poll_for_hedged_position};
 use crate::poll::{
     connect_db, count_events, count_events_of_type, free_port_pair, poll_for_broker_fills,
     poll_for_events, poll_for_events_with_timeout, poll_for_ready, spawn_bot_with_event_channel,
@@ -833,6 +833,8 @@ async fn full_system() -> anyhow::Result<()> {
 
     poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Filled", 1).await;
 
+    poll_for_hedged_position(&mut bot, &infra.db_path, "AAPL").await;
+
     let pool = connect_db(&infra.db_path).await?;
     let aapl_position = Projection::<Position>::sqlite(pool.clone())
         .load(&Symbol::new("AAPL")?)
@@ -854,6 +856,8 @@ async fn full_system() -> anyhow::Result<()> {
         .await?;
 
     poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Filled", 2).await;
+
+    poll_for_hedged_position(&mut bot, &infra.db_path, "TSLA").await;
 
     let pool = connect_db(&infra.db_path).await?;
     let tsla_position = Projection::<Position>::sqlite(pool.clone())

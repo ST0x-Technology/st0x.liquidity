@@ -175,7 +175,7 @@ impl LifecycleFailureProjection {
     /// events: this seeds the table after a fresh deploy and recovers anything the
     /// forward-only live path dropped in the previous run.
     pub(crate) async fn catch_up(&self) -> Result<u64, FailureProjectionError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let replayed = Self::replay_pending(&mut tx).await?;
 
@@ -708,14 +708,19 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use st0x_event_sorcery::{DomainEvent, ReactorHarness, RetryOnBusy};
+    use st0x_event_sorcery::{DomainEvent, ReactorHarness, RetryOnBusy, test_store};
     use st0x_execution::Symbol;
+    use st0x_finance::Usdc;
     use st0x_float_macro::float;
 
     use crate::equity_redemption::DetectionFailure;
     use crate::offchain::order::OffchainOrderId;
-    use crate::test_utils::{setup_file_backed_test_db, setup_test_db};
-    use crate::usdc_rebalance::UsdcRebalanceId;
+    use crate::test_utils::{
+        replay_after_competing_writer, setup_file_backed_test_db, setup_test_db,
+    };
+    use crate::usdc_rebalance::{
+        RebalanceDirection, TransferRef, UsdcRebalanceCommand, UsdcRebalanceId,
+    };
 
     use super::*;
 
@@ -835,6 +840,48 @@ mod tests {
             filled_shares: None,
             failed_at: timestamp(failed_offset),
         }
+    }
+
+    #[tokio::test]
+    async fn catch_up_waits_for_competing_writer() {
+        let (pool, _apalis, _path, _guard) =
+            setup_file_backed_test_db(Duration::from_secs(1)).await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(400)),
+                    withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(1)),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailWithdrawal {
+                    reason: "reverted".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let projection = LifecycleFailureProjection::new(pool.clone());
+
+        let replayed = replay_after_competing_writer(&pool, projection.catch_up())
+            .await
+            .unwrap();
+
+        assert_eq!(replayed, 2);
+        let rows = fetch_failure_rows(&pool).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            fetch_checkpoint(&pool, UsdcRebalance::AGGREGATE_TYPE, &id.to_string()).await,
+            Some(2)
+        );
+        assert_eq!(projection.catch_up().await.unwrap(), 0);
     }
 
     #[tokio::test]

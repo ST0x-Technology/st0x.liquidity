@@ -860,7 +860,9 @@ mod tests {
     use alloy::primitives::{Address, B256, U256, address};
     use alloy::providers::mock::Asserter;
     use alloy::providers::{ProviderBuilder, RootProvider};
-    use alloy::sol_types::SolCall;
+    use alloy::rpc::types::Filter;
+    use alloy::sol_types::{SolCall, SolEvent};
+    use httpmock::MockServer;
     use rain_math_float::Float;
 
     use st0x_config::ExecutionThreshold;
@@ -879,10 +881,11 @@ mod tests {
     use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
     use crate::bindings::IRaindexV6;
     use crate::bindings::IRaindexV6::{
-        AfterClearV2, ClearConfigV2, ClearStateChangeV2, SignedContextV1, TakeOrderConfigV4,
-        TakeOrderV3 as TakeOrderV3Event,
+        AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3, SignedContextV1,
+        TakeOrderConfigV4, TakeOrderV3 as TakeOrderV3Event,
     };
     use crate::offchain::order::{OffchainOrder, noop_order_placer};
+    use crate::onchain::backfill::{BackfillRange, load_backfill_checkpoint};
     use crate::onchain::trade::{INVENTORY_TOKEN_DECIMALS_MAX_RETRIES, InventoryTrade};
     use crate::onchain_trade::OnChainTrade;
     use crate::position::Position;
@@ -974,6 +977,108 @@ mod tests {
             pool,
             job_queue,
         }
+    }
+
+    #[tokio::test]
+    async fn backfill_worker_uses_secondary_provider_and_block_limit() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let primary_server = MockServer::start();
+        let primary_requests = primary_server.mock(|_when, then| {
+            then.status(500);
+        });
+        let secondary_server = MockServer::start();
+        let tip = secondary_server.mock(|when, then| {
+            when.json_body_includes(r#"{"method":"eth_blockNumber"}"#);
+            then.json_body(serde_json::json!({"jsonrpc": "2.0", "id": 0, "result": "0x96"}));
+        });
+        let primary_provider =
+            ProviderBuilder::new().connect_http(primary_server.base_url().parse().unwrap());
+        let secondary_provider =
+            ProviderBuilder::new().connect_http(secondary_server.base_url().parse().unwrap());
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let mut ctx = build_test_accountant_ctx(
+            pool.clone(),
+            &apalis_pool,
+            create_test_ctx_with_order_owner(Address::ZERO),
+            SymbolCache::default(),
+            primary_provider,
+            executor,
+            ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(0.01))).unwrap()),
+        )
+        .await;
+        let mut secondary = ctx.ctx.chains.primary().clone();
+        secondary.chain = Chain::HyperEvm;
+        let batches: Vec<_> = [(100, 149), (150, 150)]
+            .into_iter()
+            .flat_map(|(start, end)| {
+                [
+                    (secondary.orderbook, vec![ClearV3::SIGNATURE_HASH]),
+                    (secondary.orderbook, vec![TakeOrderV3Event::SIGNATURE_HASH]),
+                    (
+                        secondary.inventory_address(),
+                        vec![
+                            OperatorDeposit::SIGNATURE_HASH,
+                            OperatorWithdraw::SIGNATURE_HASH,
+                        ],
+                    ),
+                ]
+                .into_iter()
+                .map(move |(address, topics)| {
+                    Filter::new()
+                        .address(address)
+                        .from_block(start)
+                        .to_block(end)
+                        .event_signature(topics)
+                })
+            })
+            .map(|expected| {
+                secondary_server.mock(|when, then| {
+                    when.json_body_includes(r#"{"method":"eth_getLogs"}"#)
+                        .is_true(move |request| {
+                            serde_json::from_slice::<serde_json::Value>(request.body_ref())
+                                .ok()
+                                .and_then(|body| {
+                                    serde_json::from_value::<Filter>(body["params"][0].clone()).ok()
+                                })
+                                .is_some_and(|actual| actual == expected)
+                        });
+                    then.json_body(serde_json::json!({"jsonrpc": "2.0", "id": 0, "result": []}));
+                })
+            })
+            .collect();
+        ctx.chains.insert(
+            Chain::HyperEvm,
+            ChainAccounting {
+                contracts: crate::onchain::raindex_contracts(&secondary),
+                trading: secondary.clone(),
+                evm: st0x_evm::ReadOnlyEvm::new(secondary_provider),
+            },
+        );
+
+        BackfillRange {
+            chain: Chain::HyperEvm,
+            from_block: 100,
+            to_block: 150,
+        }
+        .perform(&ctx)
+        .await
+        .unwrap();
+
+        primary_requests.assert_calls(0);
+        for batch in batches {
+            batch.assert_calls(1);
+        }
+        tip.assert_calls(6);
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &secondary).await.unwrap(),
+            Some(150)
+        );
+        assert_eq!(
+            load_backfill_checkpoint(&pool, ctx.ctx.chains.primary())
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     /// The disabled-asset alert fires once per process per symbol; a second

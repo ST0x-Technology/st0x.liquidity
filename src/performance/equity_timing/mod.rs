@@ -316,7 +316,7 @@ impl EquityTimingProjection {
     /// (identical here): run at startup, before the live reactor begins
     /// consuming events.
     pub(crate) async fn catch_up(&self) -> Result<u64, ProjectionError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let replayed = Self::replay_pending(&mut tx).await?;
 
@@ -994,6 +994,7 @@ mod tests {
     use alloy::primitives::{Address, TxHash, U256};
     use chrono::TimeZone;
     use std::sync::Arc;
+    use std::time::Duration;
     use uuid::Uuid;
 
     use st0x_dto::EquityOperationKind;
@@ -1005,7 +1006,9 @@ mod tests {
 
     use super::*;
     use crate::equity_redemption::{UnwrappedProvenance, redemption_aggregate_id};
-    use crate::test_utils::setup_test_db;
+    use crate::test_utils::{
+        replay_after_competing_writer, setup_file_backed_test_db, setup_test_db,
+    };
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
 
     pub(super) fn timestamp(seconds: i64) -> DateTime<Utc> {
@@ -1229,6 +1232,42 @@ mod tests {
         assert_eq!(operation.kind, EquityOperationKind::Redeem);
         assert_eq!(operation.status, RebalanceTimingStatus::Completed);
         assert_eq!(operation.total_ms, Some(100_000));
+    }
+
+    #[tokio::test]
+    async fn catch_up_waits_for_competing_writer() {
+        let (pool, _apalis, _path, _guard) =
+            setup_file_backed_test_db(Duration::from_secs(1)).await;
+        let (store, _) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .build(crate::rebalancing::equity::EquityTransferServices::panicking())
+            .await
+            .unwrap();
+        let id = issuer_request_id("writer-contention");
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMintAt {
+                    chain: Chain::Base,
+                    issuer_request_id: id.clone(),
+                    symbol: symbol(),
+                    quantity: float!(5),
+                    wallet: Address::repeat_byte(0x11),
+                    requested_at: timestamp(0),
+                },
+            )
+            .await
+            .unwrap();
+        let projection = EquityTimingProjection::new(pool.clone());
+
+        let replayed = replay_after_competing_writer(&pool, projection.catch_up())
+            .await
+            .unwrap();
+
+        assert_eq!(replayed, 1);
+        let report = load_equity_timings(&pool, &range()).await.unwrap();
+        assert_eq!(report.operations.len(), 1);
+        assert_eq!(report.operations[0].kind, EquityOperationKind::Mint);
+        assert_eq!(projection.catch_up().await.unwrap(), 0);
     }
 
     #[tokio::test]

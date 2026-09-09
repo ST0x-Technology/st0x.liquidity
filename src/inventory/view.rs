@@ -1342,9 +1342,18 @@ impl InventoryView {
         symbol: &Symbol,
         venue: Venue,
     ) -> Option<FractionalShares> {
+        self.equity_inflight_at(symbol, venue, self.trading_chain)
+    }
+
+    pub(crate) fn equity_inflight_at(
+        &self,
+        symbol: &Symbol,
+        venue: Venue,
+        chain: Chain,
+    ) -> Option<FractionalShares> {
         let inventory = self.equities.get(symbol)?;
         inventory
-            .get_venue(venue, self.trading_chain)
+            .get_venue(venue, chain)
             .map(VenueBalance::inflight)
     }
 
