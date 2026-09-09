@@ -921,6 +921,7 @@ mod tests {
         CounterTradePreflight, ExecutionError, InventoryResult, LimitOrder, MockExecutor, Positive,
         SupportedExecutor, Usd,
     };
+    use st0x_hedge::operator::offchain::order::OffchainOrderId;
     use st0x_hedge::operator::test_utils::{
         mock_alpaca_broker_ctx, try_positive_shares, try_setup_test_db,
     };
@@ -2727,5 +2728,86 @@ mod tests {
             "a NotTerminal failure must tell the operator the order may still \
              resolve, got: {output}"
         );
+    }
+
+    #[test]
+    fn render_process_tx_outcome_covers_every_arm() {
+        let tx_hash = TxHash::repeat_byte(0x11);
+        let not_found = TxHash::repeat_byte(0x22);
+        let symbol = || Symbol::new("MSTR").expect("test symbol must be valid");
+
+        let mut cases: Vec<(ProcessTxOutcome, String)> = vec![
+            (
+                ProcessTxOutcome::NoTradeableEvents,
+                format!("No tradeable events found in transaction {tx_hash}\nThis transaction may not contain orderbook events matching the configured order hash.\n"),
+            ),
+            (
+                ProcessTxOutcome::TransactionNotFound { tx_hash: not_found },
+                format!("Transaction not found: {not_found}\n"),
+            ),
+            (
+                ProcessTxOutcome::AlreadyAccounted,
+                "Fill is already fully accounted. Nothing to do; the normal pipeline will hedge any unhedged position exposure.\n".to_string(),
+            ),
+            (
+                ProcessTxOutcome::PendingHedgeInFlight,
+                "An existing pending hedge is in flight; settled the fill without placing a new hedge.\n".to_string(),
+            ),
+            (
+                ProcessTxOutcome::BelowExecutionThreshold,
+                "Trade accumulated but did not trigger execution yet (waiting to accumulate enough shares for a whole share execution).\n".to_string(),
+            ),
+            (
+                ProcessTxOutcome::TradingDisabled { symbol: symbol() },
+                format!("Trading disabled by configuration for {}\n", symbol()),
+            ),
+            (
+                ProcessTxOutcome::PlacementRejected { symbol: symbol() },
+                format!("Placement for {} was rejected by domain state; a concurrent placement already claimed the position. Settled the fill.\n", symbol()),
+            ),
+        ];
+
+        for (disposition, disposition_line) in [
+            (
+                HedgeDisposition::InFlight,
+                "Order submitted; it will be reconciled to a terminal state by the order-status recovery sweep on the next bot startup.",
+            ),
+            (
+                HedgeDisposition::ClearedForRetry,
+                "Hedge placement failed or the order vanished; pending order cleared so the normal pipeline can re-hedge.",
+            ),
+            (
+                HedgeDisposition::Finalized,
+                "The order reached a terminal broker state and the position was finalized.",
+            ),
+        ] {
+            let order_id = OffchainOrderId::new();
+            let shares = positive_shares("1.5");
+            let expected = format!(
+                "Placed {:?} hedge for {shares} {} (order {order_id})\n{disposition_line}\n",
+                Direction::Buy,
+                symbol()
+            );
+            cases.push((
+                ProcessTxOutcome::HedgePlaced {
+                    symbol: symbol(),
+                    offchain_order_id: order_id,
+                    shares,
+                    direction: Direction::Buy,
+                    disposition,
+                },
+                expected,
+            ));
+        }
+
+        for (outcome, expected) in cases {
+            let mut buf = Vec::new();
+            render_process_tx_outcome(tx_hash, &outcome, &mut buf).expect("render must succeed");
+            assert_eq!(
+                String::from_utf8(buf).expect("output must be valid UTF-8"),
+                expected,
+                "unexpected output for {outcome:?}"
+            );
+        }
     }
 }
