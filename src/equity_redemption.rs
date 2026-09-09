@@ -6656,4 +6656,46 @@ mod tests {
 
         assert_eq!(state.chain(), Chain::Ethereum);
     }
+
+    #[tokio::test]
+    async fn migration_stamps_base_on_legacy_redemption_genesis_records() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let legacy = r#"{"VaultWithdrawPending":{"symbol":"AAPL","quantity":"10","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"10000000000000000000","pending_at":"2026-01-01T00:00:00Z"}}"#;
+        let id = redemption_aggregate_id("legacy-redemption");
+
+        insert_event(
+            &pool,
+            &id,
+            0,
+            "EquityRedemptionEvent::VaultWithdrawPending",
+            legacy,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO snapshots (aggregate_type, aggregate_id, last_sequence, payload, \
+             timestamp) VALUES ('EquityRedemption', ?1, 0, ?2, '2026-01-01T00:00:00Z')",
+        )
+        .bind(id.to_string())
+        .bind(legacy)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let migration =
+            include_str!("../migrations/20260909104500_chain_qualified_equity_transfers.sql");
+        // Twice: the WHERE guards make the stamp idempotent.
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+
+        for table in ["events", "snapshots"] {
+            let (chain,): (String,) = sqlx::query_as(&format!(
+                "SELECT json_extract(payload, '$.VaultWithdrawPending.chain') FROM {table} \
+                 WHERE aggregate_type = 'EquityRedemption'"
+            ))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(chain, "base", "{table} row must be stamped with the chain");
+        }
+    }
 }

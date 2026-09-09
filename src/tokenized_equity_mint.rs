@@ -6156,4 +6156,47 @@ mod tests {
 
         assert_eq!(state.chain(), Chain::Ethereum);
     }
+
+    /// Belt-and-braces beside the serde default: the migration stamps `base`
+    /// into legacy genesis payloads so raw SQL readers see the field too.
+    #[tokio::test]
+    async fn migration_stamps_base_on_legacy_mint_genesis_records() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let legacy = r#"{"MintRequested":{"symbol":"AAPL","quantity":"10","wallet":"0x0000000000000000000000000000000000000001","requested_at":"2026-01-01T00:00:00Z"}}"#;
+
+        insert_event(
+            &pool,
+            "legacy-mint",
+            0,
+            "TokenizedEquityMintEvent::MintRequested",
+            legacy,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO snapshots (aggregate_type, aggregate_id, last_sequence, payload, \
+             timestamp) VALUES ('TokenizedEquityMint', 'legacy-mint', 0, ?1, \
+             '2026-01-01T00:00:00Z')",
+        )
+        .bind(legacy)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let migration =
+            include_str!("../migrations/20260909104500_chain_qualified_equity_transfers.sql");
+        // Twice: the WHERE guards make the stamp idempotent.
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+
+        for table in ["events", "snapshots"] {
+            let (chain,): (String,) = sqlx::query_as(&format!(
+                "SELECT json_extract(payload, '$.MintRequested.chain') FROM {table} \
+                 WHERE aggregate_type = 'TokenizedEquityMint'"
+            ))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(chain, "base", "{table} row must be stamped with the chain");
+        }
+    }
 }
