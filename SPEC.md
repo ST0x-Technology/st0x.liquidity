@@ -307,14 +307,16 @@ distinct — neither key alone can both mint and authorize.
   Issuance's own config check, independent of this bot's preflight, refuses
   issuance startup with an orchestrator-mode asset while any of issuance's
   configured chains lacks an `[orchestrator.addresses]` entry; it walks every
-  configured chain, not only the ones the symbol is listed on. For each chain X
-  the symbol is listed on, in this order: (a) deploy `ST0xOrchestrator` on X;
-  (b) add its address under `[orchestrator.addresses].X` in both bots' configs
-  and deploy both; (c) extend this bot's Turnkey signing policy to `MintAuth`
-  typed data with X's chain id and that orchestrator as the verifying contract
-  (the policy-scoped grant above), or the first mint is denied at signing. There
-  is no per-chain cutover to pair with these: (d) the flip to orchestrator mode
-  at issuance is symbol-wide and lands on every listed chain at once, so it may
+  configured chain, not only the ones the symbol is listed on, so before the
+  flip issuance's config needs an entry (a deployed orchestrator) for every
+  chain issuance configures, listed or not. For each chain X the symbol is
+  listed on, in this order: (a) deploy `ST0xOrchestrator` on X; (b) add its
+  address under `[orchestrator.addresses].X` in both bots' configs and deploy
+  both; (c) extend this bot's Turnkey signing policy to `MintAuth` typed data
+  with X's chain id and that orchestrator as the verifying contract (the
+  policy-scoped grant above), or the first mint is denied at signing. There is
+  no per-chain cutover to pair with these: (d) the flip to orchestrator mode at
+  issuance is symbol-wide and lands on every listed chain at once, so it may
   only happen once (a) to (c) are complete on all of them. Until (c) is deployed
   on X, every asset listed on X stays vault-direct. This bot enforces the order
   at three points, from earliest to last: a rebalancing-mode startup preflight
@@ -517,8 +519,10 @@ indeterminate mode (issuance unreachable, asset unknown to issuance) is warned
 about per chain and symbol rather than refused: rebalancing mode never requires
 issuance to be reachable at startup (the freeze gate fails closed per cycle and
 has its own `freeze_check` escape hatch for an issuance outage), and the
-per-mint mode read fails closed anyway, so the signing-step failure remains the
-last line.
+per-mint mode read fails closed on its own: a mint whose mode cannot be read
+stops at mode discovery, before any signing. The signing-step failure is the
+last line only for a known orchestrator-mode mint without its chain's entry or
+`MintAuth` policy.
 
 Historical backfill resumes from a persisted database checkpoint. The configured
 `deployment_block` is only the initial seed for the first startup or for an
