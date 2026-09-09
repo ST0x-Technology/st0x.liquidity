@@ -833,24 +833,24 @@ migration files in `migrations/`.
   dead-lettering the job, so recording self-heals once the queue write succeeds
   (ADR 0017 SS4). Every one of these callers classifies and redrives through one
   shared mechanism (`crate::bot_gas::redrive`) rather than each hand-rolling its
-  own check, so a new caller inherits the same behavior by construction. On the
-  mint side this redrive also bypasses the post-receipt recovery handoff: a
-  bot-gas enqueue failure during wrap confirmation is never misclassified as a
+  own check, so a new caller inherits the same behavior by construction.
+  `EquityRedemption::SendTokens` persists `TokensSent` before the transfer
+  manager enqueues the redemption-send gas fact. If that enqueue fails, the
+  delayed redrive resumes from the persisted transaction hash and retries only
+  accounting; it never reissues the non-idempotent token transfer. On the mint
+  side this redrive also bypasses the post-receipt recovery handoff: a bot-gas
+  enqueue failure during wrap confirmation is never misclassified as a
   wrap/deposit failure that would hand a healthy mint off to
-  `UnwrappedEquityRecovery`. `EquityRedemption::SendTokens` is the one call site
-  that swallows the enqueue failure and logs-and-continues instead of retrying,
-  because retrying the send itself would risk sending tokens twice; that gas
-  fact is then permanently lost (see "Known gaps" below). The wrapped/unwrapped
-  equity-recovery aggregates' `DispatchToMint`/`DispatchToRedemption` handoff to
-  a mint/redemption resume is a second such swallowing site: a bot-gas enqueue
-  failure there is folded into the aggregate's normal `RecoveryFailed` event
-  rather than redriven, because `WrappedEquityRecoveryJob` (and, for
-  consistency, its unwrapped twin) has no resume arm for the `Detected` state a
-  redrive would land back on -- redriving would re-send `Detect`, which is
-  rejected as `AlreadyInitialized`, stranding the aggregate non-terminal and
-  permanently blocking rebalancing for the symbol (see "Known gaps" below). This
-  differs from a downstream job's own execution failures, which dead-letter
-  without blocking the caller
+  `UnwrappedEquityRecovery`. The wrapped/unwrapped equity-recovery aggregates'
+  `DispatchToMint`/`DispatchToRedemption` handoff to a mint/redemption resume is
+  the remaining swallowing site: a bot-gas enqueue failure there is folded into
+  the aggregate's normal `RecoveryFailed` event rather than redriven, because
+  `WrappedEquityRecoveryJob` (and, for consistency, its unwrapped twin) has no
+  resume arm for the `Detected` state a redrive would land back on -- redriving
+  would re-send `Detect`, which is rejected as `AlreadyInitialized`, stranding
+  the aggregate non-terminal and permanently blocking rebalancing for the symbol
+  (see "Known gaps" below). This differs from a downstream job's own execution
+  failures, which dead-letter without blocking the caller
 - The recording worker itself treats RPC-shaped receipt/block/valuation outcomes
   as self-healing rather than a genuine failure: a receipt (or its block) not
   yet visible to the RPC endpoint, or an outright RPC error fetching the
@@ -869,24 +869,22 @@ migration files in `migrations/`.
   server's job queue
 - Known gaps (deliberately deferred, tracked as follow-up work rather than
   blocking this feature): gas paid by reverted non-CCTP-burn transactions is not
-  recorded, `EquityRedemption::SendTokens`'s enqueue failure is swallowed
-  (logged and not retried, to avoid re-sending tokens) so that one send's gas
-  cost is permanently lost rather than dead-lettered for recovery, a mint's
-  vault-deposit crash-recovery path (the narrow window between broadcasting the
-  deposit tx and durably persisting `SubmitVaultDeposit`) can resume with an
-  unrecoverable `TxHash::ZERO` sentinel, in which case that deposit's gas cost
-  is permanently lost (logged loudly, not silently) rather than recorded, and
-  the wrapped/unwrapped equity-recovery aggregates' `DispatchToMint`/
-  `DispatchToRedemption` handoff swallows a bot-gas enqueue failure into
-  `RecoveryFailed` (permanently losing that mint/redemption-resume gas fact)
-  rather than redriving it, because `WrappedEquityRecoveryJob` has no resume arm
-  for the `Detected` state a redrive would land back on -- redriving would
-  re-send `Detect`, rejected as `AlreadyInitialized`, stranding the aggregate
-  non-terminal. `UnwrappedEquityRecoveryJob` already resumes safely from
-  `Detected` (`resume_from_detected`), but its aggregate folds the failure the
-  same way for consistency with its wrapped twin pending the fix below. The
-  proper fix is to add a `Detected` resume arm to `WrappedEquityRecoveryJob`
-  mirroring `UnwrappedEquityRecoveryJob::resume_from_detected`, after which both
+  recorded, a mint's vault-deposit crash-recovery path (the narrow window
+  between broadcasting the deposit tx and durably persisting
+  `SubmitVaultDeposit`) can resume with an unrecoverable `TxHash::ZERO`
+  sentinel, in which case that deposit's gas cost is permanently lost (logged
+  loudly, not silently) rather than recorded, and the wrapped/unwrapped
+  equity-recovery aggregates' `DispatchToMint`/ `DispatchToRedemption` handoff
+  swallows a bot-gas enqueue failure into `RecoveryFailed` (permanently losing
+  that mint/redemption-resume gas fact) rather than redriving it, because
+  `WrappedEquityRecoveryJob` has no resume arm for the `Detected` state a
+  redrive would land back on -- redriving would re-send `Detect`, rejected as
+  `AlreadyInitialized`, stranding the aggregate non-terminal.
+  `UnwrappedEquityRecoveryJob` already resumes safely from `Detected`
+  (`resume_from_detected`), but its aggregate folds the failure the same way for
+  consistency with its wrapped twin pending the fix below. The proper fix is to
+  add a `Detected` resume arm to `WrappedEquityRecoveryJob` mirroring
+  `UnwrappedEquityRecoveryJob::resume_from_detected`, after which both
   aggregates can safely redrive this handoff again -- so `/pnl`'s bot-gas line
   is a lower bound on actual gas spend, not an exact figure
 

@@ -15712,9 +15712,7 @@ mod tests {
     }
 
     /// An enqueue failure while failing an adopted withdrawal for
-    /// reconciliation must propagate (redrive), not be swallowed --
-    /// SPEC.md documents `EquityRedemption::SendTokens` as the ONE call site
-    /// that swallows instead of retrying. Mirrors
+    /// reconciliation must propagate (redrive), not be swallowed. Mirrors
     /// `record_vault_withdrawal_enqueue_failure_propagates`: the enqueue runs
     /// BEFORE `Initiate`/`FailWithdrawal`, so the aggregate stays un-advanced
     /// and a retry safely re-attempts both.

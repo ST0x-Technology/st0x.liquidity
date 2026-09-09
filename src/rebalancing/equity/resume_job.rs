@@ -648,6 +648,109 @@ mod tests {
         );
     }
 
+    /// A redemption-send gas enqueue failure originates in the transfer
+    /// manager after `TokensSent` has persisted. Startup recovery must
+    /// delayed-redrive that exact error without calling the tokenizer again.
+    #[tokio::test]
+    async fn perform_redemption_send_bot_gas_enqueue_failure_redrives_without_resend() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let closed_apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        closed_apalis_pool.close().await;
+        let bot_gas_queue =
+            crate::bot_gas::RecordBotGasReceiptCostJobQueue::new(&closed_apalis_pool);
+        let bot_gas_enqueuer = BotGasReceiptCostEnqueuer::Enabled(bot_gas_queue);
+        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+        let vault_lookup =
+            Arc::new(MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO)));
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let transfer_services = EquityTransferServices {
+            raindex: raindex.clone(),
+            vault_lookup: vault_lookup.clone(),
+            tokenizer: tokenizer.clone(),
+            wrapper: wrapper.clone(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        };
+        let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
+        let redemption_store = Arc::new(test_store(pool, transfer_services));
+        let transfer = Arc::new(
+            CrossVenueEquityTransfer::new(
+                raindex,
+                vault_lookup,
+                tokenizer.clone(),
+                wrapper,
+                Address::ZERO,
+                mint_store,
+                redemption_store.clone(),
+            )
+            .with_bot_gas_enqueuer(bot_gas_enqueuer),
+        );
+        let id = redemption_aggregate_id("resume-redemption-send-bot-gas-failure");
+        let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    symbol,
+                    quantity: float!(1.0),
+                    token: Address::ZERO,
+                    amount: U256::from(1_000_000_000_000_000_000_u128),
+                },
+            )
+            .await
+            .unwrap();
+        for command in [
+            EquityRedemptionCommand::SubmitWithdraw,
+            EquityRedemptionCommand::ConfirmWithdraw,
+            EquityRedemptionCommand::UnwrapTokens,
+            EquityRedemptionCommand::SubmitUnwrap,
+            EquityRedemptionCommand::ConfirmUnwrap,
+            EquityRedemptionCommand::PrepareSend,
+            EquityRedemptionCommand::SendTokens,
+        ] {
+            redemption_store.send(&id, command).await.unwrap();
+        }
+        let calls_before_resume = tokenizer.call_count();
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Redemption(id.clone()),
+            backpressure_streak: BackpressureStreak::default(),
+        };
+        let ctx = ResumeTokenizationCtx {
+            transfer,
+            job_queue: ResumeTokenizationJobQueue::new(&apalis_pool),
+        };
+
+        Job::perform(&job, &ctx)
+            .await
+            .expect("the persisted-send enqueue failure must delayed-redrive");
+
+        assert_eq!(
+            tokenizer.call_count(),
+            calls_before_resume,
+            "accounting redrive must not call the tokenizer or resend tokens"
+        );
+        let entity = redemption_store.load(&id).await.unwrap();
+        assert!(matches!(entity, Some(EquityRedemption::TokensSent { .. })));
+        let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<ResumeTokenizationAggregate>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        let redriven: ResumeTokenizationAggregate = serde_json::from_slice(&payload).unwrap();
+        assert!(matches!(
+            redriven.target,
+            ResumeTokenizationTarget::Redemption(redriven_id) if redriven_id == id
+        ));
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            run_at >= now + i64::try_from(BOT_GAS_ENQUEUE_REDRIVE_DELAY.as_secs()).unwrap() - 5,
+            "replacement job must use the bot-gas redrive delay"
+        );
+    }
+
     /// `perform` on a `Mint` target with a non-existent aggregate propagates
     /// the error so apalis retries.
     #[tokio::test]
