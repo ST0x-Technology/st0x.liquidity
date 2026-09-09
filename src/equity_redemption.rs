@@ -657,14 +657,7 @@ impl PartialEq for EquityRedemptionEvent {
                     wrapped_amount: w2,
                     pending_at: pa2,
                 },
-            ) => {
-                s1 == s2
-                    && c1 == c2
-                    && q1.eq(*q2).unwrap_or(false)
-                    && t1 == t2
-                    && w1 == w2
-                    && pa1 == pa2
-            }
+            ) => (s1, c1, t1, w1, pa1) == (s2, c2, t2, w2, pa2) && q1.eq(*q2).unwrap_or(false),
             (
                 Self::VaultWithdrawSubmitted {
                     symbol: s1,
