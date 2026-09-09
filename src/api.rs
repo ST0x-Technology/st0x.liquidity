@@ -2102,30 +2102,16 @@ async fn reconcile_usdc_transfer(
         ));
     };
 
-    let is_post_burn_failure = matches!(
-        rebalance,
-        UsdcRebalance::DepositFailed { .. }
-            | UsdcRebalance::BridgingFailed {
-                burn_tx_hash: Some(_),
-                ..
-            }
-            | UsdcRebalance::BridgingFailed {
-                cctp_nonce: Some(_),
-                ..
-            }
-            | UsdcRebalance::ConversionFailed {
-                direction: RebalanceDirection::BaseToAlpaca,
-                ..
-            }
-    );
-    if !is_post_burn_failure {
+    if !rebalance.is_reconcilable_failure() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: format!(
-                    "Transfer {id} is in {rebalance:?}, not a post-burn terminal failure \
-                     (DepositFailed, post-burn BridgingFailed, or a BaseToAlpaca \
-                     ConversionFailed); refusing to reconcile."
+                    "Transfer {id} is in {}, not a reconcilable terminal failure \
+                     (DepositFailed, post-burn BridgingFailed, a BaseToAlpaca \
+                     ConversionFailed, or an AlpacaToBase BridgingFailed); refusing \
+                     to reconcile.",
+                    rebalance.state_name()
                 ),
             }),
         ));
@@ -2248,8 +2234,16 @@ async fn reconcile_equity_transfer(
     }
     let services = EquityTransferServices::panicking();
 
-    match kind.as_str() {
-        "mint" => {
+    let transfer_kind = TransferKind::from_str(&kind).map_err(|error| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Unknown transfer kind: {error}"),
+            }),
+        )
+    })?;
+    match transfer_kind {
+        TransferKind::EquityMint => {
             let mint_id: IssuerRequestId = id.parse().map_err(|error| {
                 (
                     StatusCode::BAD_REQUEST,
@@ -2289,7 +2283,7 @@ async fn reconcile_equity_transfer(
             .await
             .map_err(ops_store_error)?;
         }
-        "redemption" => {
+        TransferKind::EquityRedemption => {
             let redemption_id: RedemptionAggregateId = id.parse().map_err(|error| {
                 (
                     StatusCode::BAD_REQUEST,
@@ -2329,11 +2323,13 @@ async fn reconcile_equity_transfer(
             .await
             .map_err(ops_store_error)?;
         }
-        other => {
+        TransferKind::UsdcBridge => {
             return Err((
-                StatusCode::NOT_FOUND,
+                StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: format!("Unknown transfer kind {other:?} (expected mint or redemption)"),
+                    error: "usdc_bridge transfers reconcile via the \
+                            transfers/usdc/{id}/reconcile route"
+                        .to_string(),
                 }),
             ));
         }
