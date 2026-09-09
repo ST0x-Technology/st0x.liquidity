@@ -342,15 +342,16 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 
     // A resume continues the transfer the record describes, so the recorded
     // chain decides: driving it on another network would use the wrong
-    // orderbook, wrapper and issuer wallet.
-    let recorded = match issuer_request_id {
-        Some(uuid) => {
+    // orderbook, wrapper and issuer wallet. Only a mint resumes by id; a
+    // redemption always starts fresh, so `to-alpaca` never consults the record.
+    let recorded = match (direction, issuer_request_id) {
+        (TransferDirection::ToRaindex, Some(uuid)) => {
             let id = IssuerRequestId(uuid);
             st0x_event_sorcery::load_entity::<TokenizedEquityMint>(pool, &id)
                 .await?
                 .map(|entity| (id, entity.chain()))
         }
-        None => None,
+        (TransferDirection::ToRaindex, None) | (TransferDirection::ToAlpaca, _) => None,
     };
 
     match recorded {
