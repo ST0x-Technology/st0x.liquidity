@@ -4489,6 +4489,7 @@ impl CounterTradeBatchBudget {
             CounterTradeReservation::BuyingPower {
                 estimated_cost_cents,
                 available_buying_power_cents,
+                ..
             } => {
                 let remaining = available_buying_power_cents
                     .checked_sub(self.reserved_buying_power_cents)
@@ -4677,31 +4678,29 @@ where
     }
 }
 
-/// When the preflight returns an equity reservation with fewer shares than
-/// requested, clamp the execution context to the allowed amount. This enables
-/// partial hedging: sell what's available instead of skipping entirely.
+/// Clamp the execution context when preflight prepared fewer shares than the
+/// original request.
 pub(crate) fn clamp_shares_to_reservation(
     execution: &mut ExecutionCtx,
     reservation: Option<&CounterTradeReservation>,
 ) {
-    match reservation {
-        Some(CounterTradeReservation::Equity { required, .. }) if *required < execution.shares => {
-            info!(
-                target: "hedge",
-                symbol = %execution.symbol,
-                requested = %execution.shares,
-                allowed = %required,
-                "Partial hedge: reducing order to available inventory"
-            );
-            execution.shares = *required;
-        }
+    let Some(
+        CounterTradeReservation::Equity { required, .. }
+        | CounterTradeReservation::BuyingPower { required, .. },
+    ) = reservation
+    else {
+        return;
+    };
 
-        // Equity with required == execution.shares: full inventory, no clamping needed.
-        // BuyingPower: buy-side reservations control dollar amounts, not share counts.
-        Some(
-            CounterTradeReservation::Equity { .. } | CounterTradeReservation::BuyingPower { .. },
-        )
-        | None => {}
+    if *required < execution.shares {
+        info!(
+            target: "hedge",
+            symbol = %execution.symbol,
+            requested = %execution.shares,
+            allowed = %required,
+            "Preflight reduced counter-trade quantity"
+        );
+        execution.shares = *required;
     }
 }
 
@@ -4711,6 +4710,14 @@ fn log_counter_trade_skip(
     reason: &CounterTradeSkipReason,
 ) {
     match reason {
+        CounterTradeSkipReason::NonFractionableQuantityBelowOne { symbol, requested } => {
+            debug!(
+                %symbol,
+                shares = %requested,
+                source,
+                "Deferring counter trade until a non-fractionable asset accumulates one whole share"
+            );
+        }
         CounterTradeSkipReason::InsufficientEquity {
             required,
             available,
@@ -5438,6 +5445,29 @@ mod tests {
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
+    }
+
+    #[test]
+    fn buying_power_preflight_clamps_execution_to_the_prepared_quantity() {
+        let mut execution = ExecutionCtx {
+            symbol: Symbol::new("FGI").unwrap(),
+            direction: Direction::Buy,
+            shares: Positive::new(FractionalShares::new(float!(3.75))).unwrap(),
+            executor: SupportedExecutor::AlpacaBrokerApi,
+            market_session: MarketSession::Regular,
+        };
+        let reservation = CounterTradeReservation::BuyingPower {
+            required: Positive::new(FractionalShares::new(float!(3))).unwrap(),
+            estimated_cost_cents: 30_300,
+            available_buying_power_cents: 100_000,
+        };
+
+        clamp_shares_to_reservation(&mut execution, Some(&reservation));
+
+        assert_eq!(
+            execution.shares,
+            Positive::new(FractionalShares::new(float!(3))).unwrap()
+        );
     }
 
     fn trading_chain_with_equity(symbol: &str, token: Address) -> TradingChain {
