@@ -124,18 +124,19 @@ fills came from; the remainder is hedged on a later tick). Startup verifies
 every watched chain (chain-id identity, cutoff support) and any failure is
 fatal; degraded per-chain startup is deferred to the chain-disable work.
 
-The tokenization services are built once per watched chain, never once for Base:
-each watched chain gets its own issuer client, wrapper and mint authorizer bound
-to that chain's signing wallet, orderbook, asset table, issuer redemption wallet
-and `[orchestrator.addresses]` entry. Building the set for a chain whose
-redemption wallet is missing fails startup naming the chain. The rebalancer, the
-equity-recovery jobs and the portfolio snapshot consume the primary chain's set
-until the global rebalancer owns chain selection; the sets exist so that
-selection is a lookup rather than a rewire. The startup MAX approvals, the
-stale-allowance revoke and the tokenization preflight (below) run once per
-watched chain with that chain's wallet, orderbook and canonical USDC; a watched
-chain this build pins no USDC for fails startup rather than borrowing another
-chain's address.
+When rebalancing is configured, the tokenization services are built once per
+watched chain, never once for Base: each watched chain gets its own issuer
+client, wrapper and mint authorizer bound to that chain's signing wallet,
+orderbook, asset table, issuer redemption wallet and `[orchestrator.addresses]`
+entry. Every watched chain must then have its own redemption wallet, or startup
+fails naming the chain. Standalone mode builds no tokenization set at all. The
+rebalancer, the equity-recovery jobs and the portfolio snapshot consume the
+primary chain's set until the global rebalancer owns chain selection; the sets
+exist so that selection is a lookup rather than a rewire. The startup MAX
+approvals, the stale-allowance revoke and the tokenization preflight (below) run
+once per watched chain with that chain's wallet, orderbook and canonical USDC; a
+watched chain for which this build has no pinned USDC fails startup rather than
+borrowing another chain's address.
 
 ##### Shared-Inventory Settlement
 
