@@ -352,6 +352,19 @@ mod tests {
         Utc.timestamp_opt(1_750_000_000 + seconds, 0).unwrap()
     }
 
+    /// The dashboard's chain discriminator serializes to the wire name
+    /// `st0x_evm::Chain` pins, for every chain the bot can watch.
+    #[test]
+    fn chain_name_wire_names_match_the_evm_chain_names() {
+        for chain in Chain::ALL {
+            assert_eq!(
+                serde_json::to_value(chain_name(chain)).unwrap(),
+                serde_json::json!(chain.as_str()),
+                "{chain:?} must reach the dashboard under its pinned wire name"
+            );
+        }
+    }
+
     /// Orderbook all test samples are recorded against.
     const ORDERBOOK: Address = address!("0x1111111111111111111111111111111111111111");
 
