@@ -852,6 +852,19 @@ fn publish_recovery_handle(
     });
 }
 
+/// Publishes the process-tx handle backing the in-bot process-tx route, set
+/// after startup so the endpoint returns 503 until the conductor is ready.
+fn publish_process_tx_handle(
+    process_tx_cell: &tokio::sync::OnceCell<crate::api::ProcessTxHandle>,
+    order_placer: Arc<dyn OrderPlacer>,
+    counter_trade_submission_lock: Arc<Mutex<()>>,
+) {
+    let _ = process_tx_cell.set(crate::api::ProcessTxHandle {
+        order_placer,
+        counter_trade_submission_lock,
+    });
+}
+
 /// Handles the conductor shares with the axum server's `AppState`: the
 /// dashboard event stream, the broadcasting inventory, the recovery cell the
 /// conductor populates for `/transfers/resume`, and the PnL ledger whose
@@ -865,6 +878,7 @@ pub(crate) struct ServerHandles {
 }
 
 impl Conductor {
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
         ctx: Ctx,
@@ -894,10 +908,8 @@ impl Conductor {
 
         let cache = SymbolCache::default();
 
-        // Shared with the trading loop's placement paths so the in-bot
-        // process-tx route serializes its broker submission against live
-        // hedging (ADR 0014). The same lock feeds the builder's hedge and
-        // position-check contexts below, and the process-tx handle above.
+        // Shared with every placement path so the in-bot process-tx route
+        // serializes its broker submission against live hedging (ADR 0014).
         let counter_trade_submission_lock = Arc::new(Mutex::new(()));
         let process_tx_order_placer: Arc<dyn OrderPlacer> =
             Arc::new(ExecutorOrderPlacer(executor.clone()));
@@ -1126,10 +1138,11 @@ impl Conductor {
             usdc_recheck,
         );
 
-        let _ = process_tx_cell.set(crate::api::ProcessTxHandle {
-            order_placer: process_tx_order_placer,
+        publish_process_tx_handle(
+            &process_tx_cell,
+            process_tx_order_placer,
             counter_trade_submission_lock,
-        });
+        );
 
         conductor
             .run_until_completion(startup_tokens.initialized)
