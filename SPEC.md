@@ -180,8 +180,8 @@ The operator CLI selects its chain the same way. Every command that itself
 submits an onchain operation takes `--network` (default `base`) and runs on that
 chain's signing wallet; the `transfer` recovery verbs (`recheck`, `resume`,
 `reconcile`, `fail`) take none, since they act on local records or hand the work
-to the running bot, whose recovery runs on the primary chain's services. The
-orderbook-backed commands -- `vault-deposit`, `vault-withdraw`,
+to the running bot, and a resumed transfer resolves the chain its record names.
+The orderbook-backed commands -- `vault-deposit`, `vault-withdraw`,
 `vault-withdraw-usdc`, `reset-allowance`, `transfer-equity`, `donate-equity` and
 `dividend-bump` -- read that chain's `[chains.<name>.trading]` table (orderbook,
 inventory, vault owner, asset table and redemption wallet) and refuse a network
