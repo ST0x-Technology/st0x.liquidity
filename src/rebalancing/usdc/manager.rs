@@ -3723,6 +3723,7 @@ impl<
         {
             Ok(burn_receipt) => return Ok(burn_receipt),
             Err(error) if error.is_revert() => {
+                self.enqueue_cctp_burn_gas_cost(direction, burn_tx).await?;
                 warn!(target: "rebalance", %burn_tx, "CCTP burn reverted on confirm; re-submitting once");
             }
             Err(error) => {
@@ -3743,6 +3744,7 @@ impl<
         {
             Ok(burn_receipt) => Ok(burn_receipt),
             Err(error) if error.is_revert() => {
+                self.enqueue_cctp_burn_gas_cost(direction, burn_tx).await?;
                 warn!(target: "rebalance", "CCTP burn reverted on confirm after retry: {error}");
                 Err(UsdcTransferError::BurnRevert(Box::new(error)))
             }
@@ -3982,6 +3984,7 @@ impl<
                 })
             }
             BurnTxStatus::MinedReverted => {
+                self.enqueue_cctp_burn_gas_cost(direction, burn_tx).await?;
                 warn!(
                     target: "rebalance",
                     %id,
@@ -4020,16 +4023,8 @@ impl<
     ) -> Result<BurnReceipt, UsdcTransferError> {
         // Enqueue BEFORE `InitiateBridging` (see `enqueue_bot_gas_cost`'s doc
         // for why the ordering matters here).
-        let burn_chain = match direction {
-            BridgeDirection::BaseToEthereum => Chain::Base,
-            BridgeDirection::EthereumToBase => Chain::Ethereum,
-        };
-        self.enqueue_bot_gas_cost(
-            burn_chain,
-            burn_receipt.tx,
-            BotGasOperationCategory::CctpBurn,
-        )
-        .await?;
+        self.enqueue_cctp_burn_gas_cost(direction, burn_receipt.tx)
+            .await?;
 
         self.cqrs
             .send(
@@ -4042,6 +4037,20 @@ impl<
 
         info!(target: "rebalance", burn_tx = %burn_receipt.tx, "CCTP burn executed");
         Ok(burn_receipt)
+    }
+
+    async fn enqueue_cctp_burn_gas_cost(
+        &self,
+        direction: BridgeDirection,
+        tx_hash: TxHash,
+    ) -> Result<(), UsdcTransferError> {
+        let burn_chain = match direction {
+            BridgeDirection::BaseToEthereum => Chain::Base,
+            BridgeDirection::EthereumToBase => Chain::Ethereum,
+        };
+
+        self.enqueue_bot_gas_cost(burn_chain, tx_hash, BotGasOperationCategory::CctpBurn)
+            .await
     }
 
     /// Emits `BeginBridging` (durable intent), burns on Ethereum, then records
@@ -4476,15 +4485,18 @@ mod tests {
 
     /// A minimal bridge double for tests that exercise `burn_recording_pending`.
     ///
-    /// `submit_burn` returns a different hash on each call (first: all-1 bytes,
-    /// second: all-2 bytes). `confirm_burn` returns an `EvmError::Reverted` on
-    /// the first call and a successful `BurnReceipt` on the second call.
-    /// All other Bridge and UsdcBridgeHelper methods `unimplemented!()`.
+    /// By default, `submit_burn` returns a different hash on each call (first:
+    /// all-1 bytes, second: all-2 bytes), while `confirm_burn` reverts once and
+    /// then succeeds. Tests can override the number of confirmation reverts or
+    /// supply a `burn_status`; all other Bridge and UsdcBridgeHelper methods
+    /// remain `unimplemented!()`.
     struct MockBridge {
         submit_call_count: AtomicUsize,
         confirm_call_count: AtomicUsize,
         submit_delay: Duration,
         submit_started: Option<Arc<Notify>>,
+        confirm_revert_count: usize,
+        burn_status: Option<st0x_bridge::BurnTxStatus>,
         // `unimplemented!()` is the default for `send_usdc_on_ethereum`, same as
         // every other unused method on this mock -- so a test that unexpectedly
         // walks into that path still panics loudly. Only
@@ -4500,6 +4512,8 @@ mod tests {
                 confirm_call_count: AtomicUsize::new(0),
                 submit_delay: Duration::ZERO,
                 submit_started: None,
+                confirm_revert_count: 1,
+                burn_status: None,
                 send_usdc_tx: None,
             }
         }
@@ -4511,6 +4525,16 @@ mod tests {
         ) -> Self {
             self.submit_delay = submit_delay;
             self.submit_started = Some(submit_started);
+            self
+        }
+
+        fn with_confirm_revert_count(mut self, confirm_revert_count: usize) -> Self {
+            self.confirm_revert_count = confirm_revert_count;
+            self
+        }
+
+        fn with_burn_status(mut self, burn_status: st0x_bridge::BurnTxStatus) -> Self {
+            self.burn_status = Some(burn_status);
             self
         }
 
@@ -4567,7 +4591,7 @@ mod tests {
             amount: U256,
         ) -> Result<BurnReceipt, CctpError> {
             let count = self.confirm_call_count.fetch_add(1, Ordering::SeqCst);
-            if count == 0 {
+            if count < self.confirm_revert_count {
                 Err(CctpError::Evm(EvmError::Reverted { tx_hash }))
             } else {
                 Ok(BurnReceipt {
@@ -4582,7 +4606,11 @@ mod tests {
             _direction: BridgeDirection,
             _tx_hash: TxHash,
         ) -> Result<st0x_bridge::BurnTxStatus, CctpError> {
-            unimplemented!("MockBridge: burn_status not used in this test")
+            let Some(status) = self.burn_status else {
+                unimplemented!("MockBridge: burn_status not used in this test")
+            };
+
+            Ok(status)
         }
 
         async fn poll_attestation(
@@ -14553,38 +14581,12 @@ mod tests {
 
         advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, 0).await;
 
-        let server = MockServer::start();
-        let alpaca_broker = InstrumentedAlpacaBroker::new(
-            create_test_broker_service(&server).await,
-            TelemetrySender::disabled(),
-        );
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
-
         // A real wallet is required for the Signer type parameter even though
         // burn_recording_pending never calls into RaindexService.
         let (_anvil, endpoint, private_key) = setup_anvil();
         let wallet = create_test_wallet(&endpoint, &private_key);
-        let vault_service = RaindexService::new(
-            wallet,
-            RaindexContracts {
-                inventory: ORDERBOOK_ADDRESS,
-                orderbook: ORDERBOOK_ADDRESS,
-            },
-            recipient,
-        );
-
-        let mock_bridge = Arc::new(MockBridge::new());
-
-        let manager = CrossVenueCashTransfer::new(
-            alpaca_broker,
-            alpaca_wallet,
-            Arc::clone(&mock_bridge),
-            Arc::new(vault_service),
-            cqrs.clone(),
-            recipient,
-            TEST_VAULT_ID,
-            &test_settlement_params(),
-        );
+        let (manager, apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs.clone(), wallet, MockBridge::new()).await;
 
         let receipt = manager
             .burn_recording_pending(&id, BridgeDirection::EthereumToBase, amount_u256, recipient)
@@ -14601,6 +14603,16 @@ mod tests {
             receipt.amount, amount_u256,
             "receipt amount must match input amount"
         );
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(
+            jobs.len(),
+            1,
+            "the reverted burn must enqueue one gas-cost job"
+        );
+        assert_eq!(jobs[0].tx_hash, TxHash::from([1u8; 32]));
+        assert_eq!(jobs[0].chain, Chain::Ethereum);
+        assert_eq!(jobs[0].category, BotGasOperationCategory::CctpBurn);
 
         // Assertion 2: the aggregate is at BridgingSubmitting with the second hash.
         let state = cqrs.load(&id).await.unwrap().unwrap();
@@ -14651,6 +14663,152 @@ mod tests {
         assert_eq!(
             last_burn_tx, expected_second_hash,
             "last PendingBurnRecorded must carry the second-attempt hash"
+        );
+    }
+
+    /// Both mined reverts consume gas, including the final attempt that is
+    /// returned to the job layer for bounded redrive.
+    #[tokio::test]
+    async fn burn_recording_pending_enqueues_every_reverted_attempt() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, 0).await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let bridge = MockBridge::new().with_confirm_revert_count(2);
+        let (manager, apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, bridge).await;
+
+        let error = manager
+            .burn_recording_pending(&id, BridgeDirection::EthereumToBase, amount_u256, recipient)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, UsdcTransferError::BurnRevert(_)));
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(
+            jobs.len(),
+            2,
+            "each reverted burn must enqueue its gas cost"
+        );
+        assert_eq!(jobs[0].tx_hash, TxHash::from([1u8; 32]));
+        assert_eq!(jobs[1].tx_hash, TxHash::from([2u8; 32]));
+        assert!(jobs.iter().all(|job| {
+            job.chain == Chain::Ethereum && job.category == BotGasOperationCategory::CctpBurn
+        }));
+    }
+
+    /// Resume can discover that a durably recorded burn reverted without
+    /// calling `confirm_burn`; that path must enqueue the same cost fact before
+    /// allowing a safe reburn.
+    #[tokio::test]
+    async fn pending_reverted_burn_enqueues_gas_cost_before_reburn() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let burn_tx = TxHash::from([7u8; 32]);
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let bridge = MockBridge::new().with_burn_status(st0x_bridge::BurnTxStatus::MinedReverted);
+        let (manager, apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, bridge).await;
+
+        let receipt = manager
+            .check_pending_burn(
+                &id,
+                BridgeDirection::BaseToEthereum,
+                usdc_to_u256(amount).unwrap(),
+                Some(burn_tx),
+            )
+            .await
+            .unwrap();
+
+        assert!(receipt.is_none(), "a reverted burn remains safe to retry");
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].tx_hash, burn_tx);
+        assert_eq!(jobs[0].chain, Chain::Base);
+        assert_eq!(jobs[0].category, BotGasOperationCategory::CctpBurn);
+    }
+
+    /// A failed gas-cost enqueue must stop the immediate retry so a reverted
+    /// burn cannot be replaced before its cost job is durable.
+    #[tokio::test]
+    async fn reverted_burn_enqueue_failure_prevents_immediate_retry() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, 0).await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (manager, apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, MockBridge::new()).await;
+        apalis_pool.close().await;
+
+        let error = manager
+            .burn_recording_pending(
+                &id,
+                BridgeDirection::EthereumToBase,
+                usdc_to_u256(amount).unwrap(),
+                recipient,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, UsdcTransferError::BotGasEnqueue(_)));
+        assert_eq!(
+            manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+            1,
+            "the replacement burn must not be submitted before accounting is durable"
+        );
+    }
+
+    /// Recovery must return the enqueue failure instead of declaring the
+    /// reverted burn safe to replace.
+    #[tokio::test]
+    async fn pending_reverted_burn_enqueue_failure_prevents_reburn() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let burn_tx = TxHash::from([7u8; 32]);
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let bridge = MockBridge::new().with_burn_status(st0x_bridge::BurnTxStatus::MinedReverted);
+        let (manager, apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, bridge).await;
+        apalis_pool.close().await;
+
+        let error = manager
+            .check_pending_burn(
+                &id,
+                BridgeDirection::BaseToEthereum,
+                usdc_to_u256(amount).unwrap(),
+                Some(burn_tx),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, UsdcTransferError::BotGasEnqueue(_)));
+        assert_eq!(
+            manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+            0,
+            "recovery must not submit a replacement burn after enqueue failure"
         );
     }
 

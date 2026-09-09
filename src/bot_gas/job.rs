@@ -1,11 +1,12 @@
-//! Apalis job that records a confirmed bot-paid gas receipt cost.
+//! Records mined bot-paid gas receipt costs.
 //!
-//! Enqueued by a consumer right after its existing on-chain confirmation step
-//! succeeds (vault deposit/withdraw, wrap/unwrap, CCTP burn/mint, USDC
-//! transfer). The consumer only holds a `TxHash` at that point (the domain
-//! traits strip the receipt), so this job refetches the receipt by hash,
-//! reads the block for its timestamp, values the gas in USD (see
-//! `super::valuation`), and records the fact through `BotGasCostLedger`.
+//! Enqueued by a consumer after its existing on-chain confirmation step
+//! (vault deposit/withdraw, wrap/unwrap, CCTP burn/mint, USDC transfer),
+//! including a CCTP burn that mined but reverted. The consumer only holds a
+//! `TxHash` at that point (the domain traits strip the receipt), so this job
+//! refetches the receipt by hash, reads the block for its timestamp, values
+//! the gas in USD (see `super::valuation`), and records the fact through
+//! `BotGasCostLedger`.
 //!
 //! Runs as a best-effort worker (see ADR 0020): a terminal failure
 //! dead-letters that one receipt without blocking or slowing trading.
@@ -331,27 +332,6 @@ impl Job<RecordBotGasReceiptCostCtx> for RecordBotGasReceiptCost {
                 }
                 Err(error) => return Err(error),
             };
-
-        // SPEC scopes recording to successful transactions ("a transaction
-        // that mines but reverts is not recorded"). Every current enqueue
-        // site only enqueues after a confirmation helper that already errors
-        // on revert, so this should never actually trigger in production --
-        // it is a defense-in-depth check at the one place that validates
-        // every enqueued receipt, guarding against a future enqueue site
-        // that tolerates reverts. Skip rather than dead-letter: a reverted
-        // receipt reaching here is an expected outcome of a known revert
-        // race (see ADR 0017 and follow-up-candidates.json for the broader
-        // "record reverted-tx gas" work), not an invariant violation that
-        // needs operator attention.
-        if !receipt.status() {
-            warn!(
-                target: "rebalance",
-                chain = ?self.chain,
-                tx_hash = %self.tx_hash,
-                "Bot-gas receipt cost: skipping a reverted receipt, not recording a cost for it",
-            );
-            return Ok(());
-        }
 
         // A confirmed receipt should already carry its block number/hash; a
         // missing one here is the same lagging-RPC-node condition as a
@@ -1062,37 +1042,47 @@ mod tests {
         );
     }
 
-    /// A mined-but-reverted receipt must be skipped (no cost recorded, no
-    /// error), not recorded as a normal cost -- SPEC scopes recording to
-    /// successful transactions.
+    /// A mined-but-reverted CCTP burn still consumed gas and must be recorded
+    /// using the same immutable receipt facts as a successful transaction.
     #[tokio::test]
-    async fn reverted_receipt_is_skipped_not_recorded() {
+    async fn reverted_receipt_cost_is_recorded() {
+        let occurred_at = Utc.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap();
         let asserter = Asserter::new();
         asserter.push_success(&base_receipt(reverted_receipt(BOT_WALLET, Some(123))));
+        asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
+        asserter.push_success(&encode_decimals_return(8));
+        asserter.push_success(&encode_price_return(
+            I256::try_from(200_000_000_000_i64).unwrap(),
+            occurred_at,
+        ));
         let (ledger, store) = ledger_and_store().await;
         let ctx = ctx_with_asserter(&asserter, ledger).await;
 
         let job = RecordBotGasReceiptCost {
             chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
-            category: BotGasOperationCategory::VaultDeposit,
+            category: BotGasOperationCategory::CctpBurn,
             symbol: None,
             redrive_attempts: 0,
         };
 
-        job.perform(&ctx)
-            .await
-            .expect("a reverted receipt must be skipped, not fail the job");
+        job.perform(&ctx).await.unwrap();
 
         let id = super::super::BotGasReceiptCostId {
             chain: Chain::Base,
             tx_hash: TxHash::repeat_byte(0x11),
         };
-        let recorded = store.load(&id).await.unwrap();
-        assert!(
-            recorded.is_none(),
-            "a reverted receipt must not be recorded as a cost, got {recorded:?}"
+        let recorded = store
+            .load(&id)
+            .await
+            .unwrap()
+            .expect("a reverted receipt's gas cost must be recorded");
+        assert_eq!(recorded.gas_used, 21_000);
+        assert_eq!(
+            recorded.native_cost_wei,
+            U256::from(21_000_000_000_000_u128) + U256::from(1_038_618_340_u64)
         );
+        assert_eq!(recorded.occurred_at, occurred_at);
     }
 
     #[tokio::test]
