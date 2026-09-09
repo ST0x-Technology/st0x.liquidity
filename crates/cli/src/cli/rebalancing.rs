@@ -3196,6 +3196,38 @@ mod tests {
         );
     }
 
+    /// An `--issuer-request-id` with no record behind it is a fresh transfer
+    /// wearing a resume flag: the primary-only rule must still apply, or an
+    /// unused id would smuggle a mint onto a secondary chain.
+    #[tokio::test]
+    async fn transfer_equity_refuses_a_non_primary_network_with_an_unused_issuer_request_id() {
+        let ctx = create_alpaca_ctx_watching_ethereum();
+        let pool = setup_test_db().await;
+
+        let mut stdout = Vec::new();
+        let error = transfer_equity_command(
+            &mut stdout,
+            TransferEquity {
+                direction: TransferDirection::ToRaindex,
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(1)),
+                issuer_request_id: Some(Uuid::from_u128(0x2283)),
+                redemption_wallet: None,
+                network: TokenizationNetwork::Ethereum,
+            },
+            &ctx,
+            &pool,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("ethereum") && error.contains("primary") && error.contains("base"),
+            "expected the refusal to name the chain and the primary, got: {error}"
+        );
+    }
+
     /// A resume continues the transfer the record describes. Naming another
     /// network would drive it against the wrong orderbook, wrapper and
     /// issuer wallet, so the recorded chain decides and a disagreement is
