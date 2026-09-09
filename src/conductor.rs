@@ -2627,14 +2627,7 @@ fn build_equity_gas_readiness<Signer: Wallet>(
 ) -> anyhow::Result<BTreeMap<Chain, ConfiguredGasReadiness>> {
     chains
         .iter()
-        .filter(|entry| {
-            entry
-                .assets
-                .equities
-                .symbols
-                .values()
-                .any(|equity| equity.rebalancing == OperationMode::Enabled)
-        })
+        .filter(|entry| entry.assets.rebalances_equity())
         .map(|entry| {
             let readiness = GasReadiness::for_equity_chain(
                 alerts,

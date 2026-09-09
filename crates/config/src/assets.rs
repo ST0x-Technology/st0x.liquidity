@@ -184,7 +184,10 @@ impl ChainAssets {
     /// makes the chain need the equity-rebalancing wiring (wrapper, issuer
     /// client, redemption wallet). A chain with none is hedge-only.
     pub fn rebalances_equity(&self) -> bool {
-        todo!("any equity with rebalancing enabled")
+        self.equities
+            .symbols
+            .values()
+            .any(|equity| equity.rebalancing == OperationMode::Enabled)
     }
 
     /// Returns whether wrapped/unwrapped wallet equity recovery is enabled
