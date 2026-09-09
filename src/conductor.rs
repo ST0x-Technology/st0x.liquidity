@@ -2635,10 +2635,11 @@ fn build_equity_gas_readiness<Signer: Wallet>(
 }
 
 /// The pre-dispatch admission check the trigger and the USDC corridor share:
-/// the corridor spans Base and Ethereum, and the trigger's equity leg still
-/// gates on the primary until the global rebalancer picks the chain. Each
-/// transfer's own chain is checked again from its
-/// [`ChainEquityServices`] entry.
+/// the corridor spans Base and Ethereum, and the trigger's equity leg gates
+/// on the primary chain's own wallet until the global rebalancer picks the
+/// chain. Each transfer's own chain is checked again from its
+/// [`ChainEquityServices`] entry. Only the corridor's two wallets are wired
+/// here, so a primary outside the corridor refuses startup by name.
 fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
     wallets: &ChainWallets<Signer>,
     ctx: &Ctx,
@@ -2648,8 +2649,23 @@ fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
         .as_ref()
         .context("rebalancing requires [alerts] gas thresholds")?;
     let (EthereumWallet(ethereum_wallet), BaseWallet(base_wallet)) = wallets.clone().into_parts();
+    let primary_chain = ctx.chains.primary().chain;
+    let primary_wallet = match primary_chain {
+        Chain::Base => &base_wallet,
+        Chain::Ethereum => &ethereum_wallet,
+        Chain::HyperEvm => anyhow::bail!(
+            "the transfer gas readiness has no {primary_chain} wallet: \
+             only the Base and Ethereum signers are wired"
+        ),
+    };
 
-    GasReadiness::from_wallets(alerts, &base_wallet, &ethereum_wallet)
+    GasReadiness::for_equity_chain(
+        alerts,
+        primary_chain,
+        primary_wallet,
+        &base_wallet,
+        &ethereum_wallet,
+    )
 }
 
 /// Builds the trigger service from the validated rebalancing config plus the
@@ -15624,6 +15640,27 @@ mod tests {
         assert_eq!(
             readiness.equity_route(),
             (Chain::Ethereum, wallet_ctx.ethereum_wallet().address())
+        );
+    }
+
+    /// A primary chain outside the Base/Ethereum corridor has no wallet in
+    /// the shared check, so startup refuses it by name rather than gating
+    /// its transfers on Base's balance.
+    #[test]
+    fn transfer_gas_readiness_refuses_a_hyperevm_primary_by_name() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.alerts = Some(gas_threshold_alerts());
+        ctx.chains.primary_mut().chain = Chain::HyperEvm;
+        let wallets = ChainWallets::from_wallet_ctx(&OnchainWalletCtx::stub());
+
+        let Err(error) = build_transfer_gas_readiness(&wallets, &ctx) else {
+            panic!("a primary chain without a wired wallet must be refused");
+        };
+        let error = error.to_string();
+
+        assert!(
+            error.contains("hyperevm") && error.contains("wallet"),
+            "expected the unwired chain named, got: {error}"
         );
     }
 
