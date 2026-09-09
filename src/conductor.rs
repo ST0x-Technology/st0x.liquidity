@@ -2374,9 +2374,12 @@ fn preflighted_equities(assets: &ChainAssets, role: ChainRole) -> Vec<&Symbol> {
                 assets.is_trading_enabled(symbol) || assets.is_rebalancing_enabled(symbol)
             })
             .collect::<Vec<_>>(),
-        ChainRole::Secondary => {
-            todo!("a secondary chain preflights only rebalancing-enabled equities")
-        }
+        ChainRole::Secondary => assets
+            .equities
+            .symbols
+            .keys()
+            .filter(|symbol| assets.is_rebalancing_enabled(symbol))
+            .collect::<Vec<_>>(),
     };
     enabled.sort();
     enabled
