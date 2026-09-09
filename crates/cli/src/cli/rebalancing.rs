@@ -6,6 +6,7 @@ use anyhow::Context;
 use sqlx::SqlitePool;
 use std::future::Future;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
@@ -54,6 +55,7 @@ use st0x_tokenization::{
 use st0x_wrapper::{Wrapper, WrapperService};
 
 use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpressure};
+use super::wrapper::{WrapContext, wrap_context};
 use super::{AuditReason, TokenizationNetwork, TransferDirection, TransferType};
 
 struct EquityTransferCliServices {
@@ -1318,7 +1320,7 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
     quantity: FractionalShares,
     redemption_wallet_flag: Option<Address>,
     network: TokenizationNetwork,
-    token_override: Option<Address>,
+    registry: Option<PathBuf>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "🔄 Requesting redemption via Alpaca API")?;
@@ -1326,17 +1328,22 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
     writeln!(stdout, "   Quantity: {quantity}")?;
     writeln!(stdout, "   Network: {network:?}")?;
 
-    let token = resolve_tokenization_token(token_override, network, &symbol, ctx)?;
-    writeln!(stdout, "   Token: {token}")?;
+    let WrapContext { wallet, equities } = wrap_context(ctx, network, registry.as_ref(), &symbol)?;
 
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("alpaca-redeem requires Alpaca Broker API configuration");
     };
 
     let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, ctx)?;
-    let wallet_ctx = ctx.wallet()?;
-    let (wallet, wire_network) = tokenization_network_context(wallet_ctx, network);
+    let (_, wire_network) = tokenization_network_context(ctx.wallet()?, network);
     writeln!(stdout, "   Redemption wallet: {redemption_wallet}")?;
+
+    // The issuer redeems only the vault's underlying, so the token comes from
+    // the vault's own `asset()` rather than from a pasted address.
+    let token = WrapperService::new(wallet.clone(), equities)
+        .attest_underlying(&symbol)
+        .await?;
+    writeln!(stdout, "   Token: {token} (attested as the vault's asset)")?;
 
     let tokenization_service = AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
@@ -3976,9 +3983,9 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.to_string().contains(
-                "equity COIN is not configured in [chains.<name>.trading.assets.equities]"
-            ),
+            error
+                .to_string()
+                .contains("COIN is not in the resolved token set"),
             "an unconfigured symbol must fail before any network call, got: {error}"
         );
     }
@@ -4094,7 +4101,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ethereum_network_requires_explicit_token_address() {
+    async fn alpaca_redeem_on_ethereum_requires_a_registry() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let mut stdout = Vec::new();
 
@@ -4111,13 +4118,13 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.to_string().contains("pass --token"),
-            "ethereum without --token must fail closed, got: {error}"
+            error.to_string().contains("pass --registry"),
+            "ethereum without --registry must fail closed, got: {error}"
         );
     }
 
     #[tokio::test]
-    async fn hyperevm_network_requires_explicit_token_address() {
+    async fn alpaca_redeem_on_hyperevm_requires_a_registry() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let mut stdout = Vec::new();
 
@@ -4134,8 +4141,8 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.to_string().contains("pass --token"),
-            "hyperevm without --token must fail closed, got: {error}"
+            error.to_string().contains("pass --registry"),
+            "hyperevm without --registry must fail closed, got: {error}"
         );
     }
 

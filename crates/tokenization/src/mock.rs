@@ -9,6 +9,7 @@ use std::sync::{Mutex, PoisonError};
 
 use st0x_evm::{EvmError, NODE_SYNC_MAX_ATTEMPTS};
 use st0x_execution::{FractionalShares, Symbol};
+use st0x_wrapper::UnwrappedToken;
 
 use super::{
     AlpacaTokenizationError, ClientRequestId, IssuerRequestId, MintVerificationError,
@@ -111,6 +112,7 @@ pub struct MockTokenizer {
     send_outcome: MockSendOutcome,
     wait_for_block_outcome: MockWaitForBlockOutcome,
     wait_for_block_calls: Mutex<Vec<u64>>,
+    send_for_redemption_calls: Mutex<Vec<UnwrappedToken>>,
     list_pending_outcome: MockListPendingOutcome,
     mint_lookup_outcome: MockMintLookupOutcome,
     last_issuer_request_id: Mutex<Option<IssuerRequestId>>,
@@ -138,6 +140,7 @@ impl MockTokenizer {
             send_outcome: MockSendOutcome::Succeed,
             wait_for_block_outcome: MockWaitForBlockOutcome::Succeed,
             wait_for_block_calls: Mutex::new(Vec::new()),
+            send_for_redemption_calls: Mutex::new(Vec::new()),
             list_pending_outcome: MockListPendingOutcome::Succeed,
             mint_lookup_outcome: MockMintLookupOutcome::Succeed,
             last_issuer_request_id: Mutex::new(None),
@@ -210,6 +213,14 @@ impl MockTokenizer {
     /// Returns the block numbers passed to `wait_for_block`, in call order.
     pub fn wait_for_block_calls(&self) -> Vec<u64> {
         self.wait_for_block_calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Returns the tokens passed to `send_for_redemption`, in call order.
+    pub fn send_for_redemption_calls(&self) -> Vec<UnwrappedToken> {
+        self.send_for_redemption_calls
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -435,10 +446,15 @@ impl Tokenizer for MockTokenizer {
 
     async fn send_for_redemption(
         &self,
-        _token: Address,
+        token: UnwrappedToken,
         _amount: U256,
     ) -> Result<TxHash, TokenizerError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
+        self.send_for_redemption_calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(token);
+
         match self.send_outcome {
             MockSendOutcome::ApiError => {
                 Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {

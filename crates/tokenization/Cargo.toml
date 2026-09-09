@@ -30,6 +30,7 @@ uuid.workspace = true
 st0x-evm.workspace = true
 st0x-execution.workspace = true
 st0x-float-serde.workspace = true
+st0x-wrapper.workspace = true
 
 [dev-dependencies]
 httpmock.workspace = true
@@ -41,6 +42,7 @@ st0x-evm = { workspace = true, features = [
 ] }
 st0x-execution = { workspace = true, features = ["mock", "test-support"] }
 st0x-float-macro.workspace = true
+st0x-wrapper = { workspace = true, features = ["mock"] }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-test.workspace = true
 

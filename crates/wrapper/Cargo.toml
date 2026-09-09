@@ -11,6 +11,7 @@ mock = []
 [dependencies]
 alloy.workspace = true
 async-trait.workspace = true
+serde.workspace = true
 st0x-evm.workspace = true
 st0x-execution.workspace = true
 thiserror.workspace = true
@@ -24,6 +25,7 @@ rain-math-float.workspace = true
 serde_json.workspace = true
 st0x-float-macro.workspace = true
 tokio = { workspace = true, features = ["full"] }
+tower = "0.5.3"
 
 [lints]
 workspace = true

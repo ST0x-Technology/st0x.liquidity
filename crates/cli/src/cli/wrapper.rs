@@ -190,10 +190,11 @@ async fn donate_equity_with_wrapper<Writer: Write, WrapperImpl: Wrapper + ?Sized
     Ok(())
 }
 
-/// The wallet and symbol to address map a wrap or unwrap runs against.
-struct WrapContext {
-    wallet: Arc<dyn Wallet<Provider = RootProvider>>,
-    equities: HashMap<Symbol, WrappedEquity>,
+/// The wallet and symbol to address map a wrap, unwrap or redemption runs
+/// against.
+pub(super) struct WrapContext {
+    pub(super) wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    pub(super) equities: HashMap<Symbol, WrappedEquity>,
 }
 
 /// Resolves the wallet and the symbol to address map for a wrap or unwrap.
@@ -203,16 +204,12 @@ struct WrapContext {
 /// and a stray one on Base is rejected instead of silently ignored. The
 /// resolved map must contain the requested symbol so a typo fails here with
 /// the available symbols instead of deeper in the vault call.
-fn wrap_context(
+pub(super) fn wrap_context(
     ctx: &Ctx,
     network: TokenizationNetwork,
     registry: Option<&PathBuf>,
     symbol: &Symbol,
 ) -> anyhow::Result<WrapContext> {
-    let wallet_ctx = ctx.wallet()?;
-    let (wallet, _network_wire) =
-        super::rebalancing::tokenization_network_context(wallet_ctx, network);
-
     let equities = match (network, registry) {
         (TokenizationNetwork::Base, None) => {
             to_wrapped_equities(&ctx.chains.primary().assets.equities.symbols)
@@ -239,6 +236,12 @@ fn wrap_context(
         );
     }
 
+    // Config-only checks first so a typo or a missing registry fails before
+    // the wallet is required.
+    let wallet_ctx = ctx.wallet()?;
+    let (wallet, _network_wire) =
+        super::rebalancing::tokenization_network_context(wallet_ctx, network);
+
     Ok(WrapContext { wallet, equities })
 }
 
@@ -252,7 +255,7 @@ mod tests {
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{BrokerCtx, Ctx, LogFormat, LogLevel, TradingMode};
-    use st0x_config::{InventoryMode, TradingChain};
+    use st0x_config::{ChainEquityAsset, InventoryMode, OperationMode, TradingChain};
     use st0x_execution::{FractionalShares, Positive, Symbol};
     use st0x_hedge::operator::test_utils::try_positive_shares;
     use st0x_wrapper::MockWrapper;
@@ -321,6 +324,25 @@ mod tests {
     fn create_ctx_with_stub_wallet() -> Ctx {
         let mut ctx = create_ctx_without_rebalancing();
         ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        ctx
+    }
+
+    /// AAPL listed on the primary chain but no `[wallet]`: the config checks
+    /// pass and the wallet requirement is the first thing to fail.
+    fn create_ctx_listing_aapl_without_wallet() -> Ctx {
+        let mut ctx = create_ctx_without_rebalancing();
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: Address::repeat_byte(0x11),
+                tokenized_equity_derivative: Address::repeat_byte(0x22),
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
         ctx
     }
 
@@ -468,7 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrap_equity_requires_wallet_config() {
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_ctx_listing_aapl_without_wallet();
         let mut stdout = Vec::new();
 
         let error = wrap_equity_command(
@@ -490,7 +512,7 @@ mod tests {
 
     #[tokio::test]
     async fn unwrap_equity_requires_wallet_config() {
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_ctx_listing_aapl_without_wallet();
         let mut stdout = Vec::new();
 
         let error = unwrap_equity_command(

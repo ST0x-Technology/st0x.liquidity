@@ -685,8 +685,8 @@ pub enum Commands {
     /// Request redemption of tokenized shares via Alpaca (isolated test command)
     ///
     /// Calls the Alpaca tokenization API to convert onchain tokens back to offchain shares.
-    /// This is an isolated test command that only interacts with Alpaca's API,
-    /// without any Raindex/vault operations.
+    /// The only onchain read is the vault's `asset()`, which attests the token sent to
+    /// the issuer; no Raindex operations and no vault writes.
     AlpacaRedeem {
         /// Stock symbol (e.g., AAPL, TSLA) -- resolves the tokenized-equity
         /// address from `[chains.<name>.trading.assets.equities]`
@@ -702,10 +702,12 @@ pub enum Commands {
         /// the tokens and therefore the chain the transfer lands on)
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
-        /// Tokenized equity (tStock) address override. Required for
-        /// non-base networks -- `[chains.<name>.trading.assets.equities]` holds Base addresses
-        #[arg(long = "token")]
-        token: Option<Address>,
+        /// Path to the st0x.registry token list for the selected network
+        /// (`token-lists/<network>.json`). Required for non Base networks;
+        /// Base resolves from `[chains.<name>.trading.assets.equities]`. The
+        /// token sent to the issuer is attested against the vault's `asset()`
+        #[arg(long = "registry")]
+        registry: Option<std::path::PathBuf>,
     },
 
     /// Convert USDC to/from USD on Alpaca
@@ -1149,7 +1151,7 @@ enum ProviderCommand {
         quantity: FractionalShares,
         redemption_wallet: Option<Address>,
         network: TokenizationNetwork,
-        token: Option<Address>,
+        registry: Option<std::path::PathBuf>,
     },
     DividendBump {
         symbol: Symbol,
@@ -1375,13 +1377,13 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
             quantity,
             redemption_wallet,
             network,
-            token,
+            registry,
         } => CommandRoute::Provider(ProviderCommand::AlpacaRedeem {
             symbol,
             quantity,
             redemption_wallet,
             network,
-            token,
+            registry,
         }),
         Commands::DividendBump { symbol, quantity } => {
             CommandRoute::Provider(ProviderCommand::DividendBump { symbol, quantity })
@@ -1996,7 +1998,7 @@ async fn run_provider_command<W: Write + Send>(
             quantity,
             redemption_wallet,
             network,
-            token,
+            registry,
         } => {
             rebalancing::alpaca_redeem_command(
                 stdout,
@@ -2004,7 +2006,7 @@ async fn run_provider_command<W: Write + Send>(
                 quantity,
                 redemption_wallet,
                 network,
-                token,
+                registry,
                 ctx,
             )
             .await

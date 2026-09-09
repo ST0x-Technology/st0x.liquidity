@@ -51,7 +51,8 @@ use st0x_tokenization::{
     TokenizerError,
 };
 use st0x_wrapper::{
-    UnderlyingPerWrapped, UnwrapConfirmation, WrapConfirmation, Wrapper, WrapperError,
+    UnderlyingPerWrapped, UnwrapConfirmation, UnwrappedToken, WrapConfirmation, Wrapper,
+    WrapperError,
 };
 
 use super::RebalancingService;
@@ -343,7 +344,11 @@ impl Tokenizer for PanickingTokenizer {
         unimplemented!("PanickingTokenizer: not available in CLI context")
     }
 
-    async fn send_for_redemption(&self, _: Address, _: U256) -> Result<TxHash, TokenizerError> {
+    async fn send_for_redemption(
+        &self,
+        _: UnwrappedToken,
+        _: U256,
+    ) -> Result<TxHash, TokenizerError> {
         unimplemented!("PanickingTokenizer: not available in CLI context")
     }
 
@@ -394,6 +399,10 @@ impl Wrapper for PanickingWrapper {
     }
 
     fn lookup_derivative(&self, _: &Symbol) -> Result<Address, WrapperError> {
+        unimplemented!("PanickingWrapper: not available in CLI context")
+    }
+
+    async fn attest_underlying(&self, _: &Symbol) -> Result<UnwrappedToken, WrapperError> {
         unimplemented!("PanickingWrapper: not available in CLI context")
     }
 

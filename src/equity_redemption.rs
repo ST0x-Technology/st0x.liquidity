@@ -76,7 +76,7 @@ use st0x_execution::Symbol;
 use st0x_finance::{FractionalShares, Id};
 use st0x_tokenization::TokenizationRequestId;
 use st0x_tokenization::Tokenizer;
-use st0x_wrapper::WrapperError;
+use st0x_wrapper::{UnwrappedToken, WrapperError};
 
 use crate::bot_gas::{
     BotGasEnqueueFailure, BotGasOperationCategory, BotGasReceiptCostEnqueuer,
@@ -194,6 +194,37 @@ pub enum EquityRedemptionError {
     UnderlyingLookupFailed {
         symbol: Symbol,
         error_message: String,
+    },
+    /// The vault reported an `asset()` other than the configured underlying:
+    /// the unwrap delivered a token the config does not describe, so neither
+    /// address is trusted for the issuer transfer.
+    #[error(
+        "Unwrap of {symbol} delivered {delivered}, \
+         but the configured underlying is {configured}"
+    )]
+    UnwrapDeliveredUnexpectedToken {
+        symbol: Symbol,
+        configured: Address,
+        delivered: Address,
+    },
+    /// Re-attestation of a legacy record's underlying failed before the send.
+    /// `WrapperError` cannot be wrapped with `#[from]` for the same reason
+    /// as UnwrapFailed above.
+    #[error("Underlying attestation failed for {symbol}: {error_message}")]
+    UnderlyingAttestationFailed {
+        symbol: Symbol,
+        error_message: String,
+    },
+    /// A record written before the vault attestation existed names a token
+    /// the vault's `asset()` does not confirm; nothing is sent.
+    #[error(
+        "Legacy redemption record of {symbol} names {recorded}, \
+         but the vault attests {attested}"
+    )]
+    LegacyUnderlyingMismatch {
+        symbol: Symbol,
+        recorded: Address,
+        attested: Address,
     },
     /// Transaction failed with a known tx hash
     #[error("Transaction failed: {tx_hash}")]
@@ -388,6 +419,32 @@ pub enum DetectionFailure {
     Operator { reason: String },
 }
 
+/// Where a redemption's unwrapped-token address came from.
+///
+/// Builds before the vault attestation copied the address from config and
+/// persisted it bare. Records written since carry the attested token under
+/// an explicit key, so a replayed payload states its own provenance and a
+/// legacy address is re-attested before anything is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UnwrappedProvenance {
+    /// The vault's `asset()` as a [`Wrapper`](st0x_wrapper::Wrapper) attested it.
+    Attested { attested: UnwrappedToken },
+    /// Copied from config by a build that attested nothing.
+    Legacy(Address),
+}
+
+impl UnwrappedProvenance {
+    /// The recorded address, whatever its provenance: for display and for
+    /// the `TokensSent` record, never as the token to send.
+    pub fn address(self) -> Address {
+        match self {
+            Self::Attested { attested } => attested.address(),
+            Self::Legacy(recorded) => recorded,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EquityRedemptionEvent {
     /// Vault withdrawal requested, awaiting submission.
@@ -447,7 +504,7 @@ pub enum EquityRedemptionEvent {
             deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
         )]
         quantity: Option<Float>,
-        underlying_token: Address,
+        underlying_token: UnwrappedProvenance,
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
         /// Block number in which the unwrap tx confirmed.
@@ -901,7 +958,7 @@ pub enum EquityRedemption {
         )]
         quantity: Float,
         token: Address,
-        underlying_token: Address,
+        underlying_token: UnwrappedProvenance,
         raindex_withdraw_tx: TxHash,
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
@@ -921,7 +978,7 @@ pub enum EquityRedemption {
         )]
         quantity: Float,
         token: Address,
-        underlying_token: Address,
+        underlying_token: UnwrappedProvenance,
         raindex_withdraw_tx: TxHash,
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
@@ -1645,7 +1702,7 @@ impl EventSourced for EquityRedemption {
                 } => Some(Self::TokensSent {
                     symbol: symbol.clone(),
                     quantity: *quantity,
-                    token: *underlying_token,
+                    token: underlying_token.address(),
                     raindex_withdraw_tx: *raindex_withdraw_tx,
                     unwrap_tx_hash: Some(*unwrap_tx_hash),
                     redemption_wallet: *redemption_wallet,
@@ -2280,7 +2337,7 @@ impl EquityRedemption {
                 unwrap_tx_hash,
                 ..
             } => {
-                let underlying_token = services
+                let configured = services
                     .wrapper
                     .lookup_underlying(symbol)
                     .inspect_err(|error| {
@@ -2303,6 +2360,20 @@ impl EquityRedemption {
                         wrapped_amount: *wrapped_amount,
                         error_message: error.to_string(),
                     })?;
+                let underlying_token = unwrap_confirmation.token;
+                if underlying_token.address() != configured {
+                    warn!(
+                        target: "rebalance",
+                        %symbol, %configured, delivered = %underlying_token,
+                        "Unwrap delivered a token other than the configured underlying"
+                    );
+                    return Err(EquityRedemptionError::UnwrapDeliveredUnexpectedToken {
+                        symbol: symbol.clone(),
+                        configured,
+                        delivered: underlying_token.address(),
+                    });
+                }
+
                 let unwrapped_amount = unwrap_confirmation.assets;
                 let unwrap_block = unwrap_confirmation.block;
                 let quantity =
@@ -2325,7 +2396,9 @@ impl EquityRedemption {
 
                 Ok(vec![TokensUnwrapped {
                     quantity: Some(quantity),
-                    underlying_token,
+                    underlying_token: UnwrappedProvenance::Attested {
+                        attested: underlying_token,
+                    },
                     unwrap_tx_hash: *unwrap_tx_hash,
                     unwrapped_amount,
                     unwrap_block: Some(unwrap_block),
@@ -2374,7 +2447,12 @@ impl EquityRedemption {
                 unwrap_block,
                 ..
             } => {
-                let token = *underlying_token;
+                let token = match underlying_token {
+                    UnwrappedProvenance::Attested { attested } => *attested,
+                    UnwrappedProvenance::Legacy(recorded) => {
+                        reattest_legacy_underlying(services, symbol, *recorded).await?
+                    }
+                };
                 let amount = *unwrapped_amount;
 
                 let Some(redemption_wallet) =
@@ -2828,6 +2906,43 @@ fn node_sync_failed(required_block: u64, error: &WrapperError) -> EquityRedempti
 /// Constructs a [`EquityRedemptionError::NodeSyncFailed`] from a node-sync
 /// [`EvmError`] raised by [`Tokenizer::wait_for_block`].
 ///
+/// Re-attests a legacy record's underlying through the wrapper before the
+/// send: the vault's `asset()` must be the recorded address, otherwise the
+/// record predates the check and its token is not trusted.
+async fn reattest_legacy_underlying(
+    services: &EquityTransferServices,
+    symbol: &Symbol,
+    recorded: Address,
+) -> Result<UnwrappedToken, EquityRedemptionError> {
+    let attested = services
+        .wrapper
+        .attest_underlying(symbol)
+        .await
+        .inspect_err(|error| {
+            warn!(target: "rebalance", %error, %symbol, "Legacy underlying re-attestation failed");
+        })
+        .map_err(|error| EquityRedemptionError::UnderlyingAttestationFailed {
+            symbol: symbol.clone(),
+            error_message: error.to_string(),
+        })?;
+
+    if attested.address() != recorded {
+        warn!(
+            target: "rebalance",
+            %symbol, %recorded, %attested,
+            "Legacy redemption record names a token the vault does not attest"
+        );
+        return Err(EquityRedemptionError::LegacyUnderlyingMismatch {
+            symbol: symbol.clone(),
+            recorded,
+            attested: attested.address(),
+        });
+    }
+
+    info!(target: "rebalance", %symbol, %attested, "Re-attested a legacy underlying before sending");
+    Ok(attested)
+}
+
 /// Returns the recorded attempt count for `NodeBehindRequiredBlock`; every
 /// other variant signals the full polling budget was consumed without a
 /// recorded count, so it falls back to [`NODE_SYNC_MAX_ATTEMPTS`]. The match is
@@ -2995,7 +3110,9 @@ mod tests {
     fn tokens_unwrapped_event() -> EquityRedemptionEvent {
         EquityRedemptionEvent::TokensUnwrapped {
             quantity: Some(float!(50.25)),
-            underlying_token: Address::random(),
+            underlying_token: UnwrappedProvenance::Attested {
+                attested: UnwrappedToken::unchecked(Address::random()),
+            },
             unwrap_tx_hash: TxHash::random(),
             unwrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
             unwrap_block: None,
@@ -3439,10 +3556,11 @@ mod tests {
         let wrapped_token = Address::random();
         let underlying_token = Address::random();
 
+        let tokenizer = Arc::new(MockTokenizer::new());
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
             vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
+            tokenizer: tokenizer.clone(),
             wrapper: Arc::new(MockWrapper::new().with_tokenized_shares(underlying_token)),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
             mint_authorizer: ConfiguredMintAuthorizer::Disabled,
@@ -3508,6 +3626,149 @@ mod tests {
             token, underlying_token,
             "SendTokens should use the underlying token, not the wrapped token"
         );
+
+        assert_eq!(
+            tokenizer
+                .send_for_redemption_calls()
+                .into_iter()
+                .map(UnwrappedToken::address)
+                .collect::<Vec<_>>(),
+            vec![underlying_token],
+            "the issuer transfer should receive the underlying token, not the wrapped token"
+        );
+    }
+
+    fn send_pending_event() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::SendPending {
+            pending_at: Utc::now(),
+        }
+    }
+
+    /// A `TokensUnwrapped` payload as builds before the vault attestation
+    /// wrote it: a bare address copied from config.
+    fn legacy_tokens_unwrapped_event(recorded: Address) -> EquityRedemptionEvent {
+        let mut payload = serde_json::to_value(tokens_unwrapped_event()).unwrap();
+        payload["TokensUnwrapped"]["underlying_token"] = serde_json::json!(recorded);
+        serde_json::from_value(payload).unwrap()
+    }
+
+    /// New events persist the attestation explicitly, so a replayed payload
+    /// can never be mistaken for one written before the vault check existed.
+    #[test]
+    fn tokens_unwrapped_event_persists_the_attestation_explicitly() {
+        let attested = Address::random();
+        let event = EquityRedemptionEvent::TokensUnwrapped {
+            quantity: Some(float!(50.25)),
+            underlying_token: UnwrappedProvenance::Attested {
+                attested: UnwrappedToken::unchecked(attested),
+            },
+            unwrap_tx_hash: TxHash::ZERO,
+            unwrapped_amount: U256::from(1),
+            unwrap_block: None,
+            unwrapped_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+        };
+
+        let payload = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(
+            payload["TokensUnwrapped"]["underlying_token"],
+            serde_json::json!({ "attested": attested })
+        );
+    }
+
+    #[test]
+    fn legacy_tokens_unwrapped_event_deserializes_as_unattested() {
+        let recorded = Address::random();
+
+        let EquityRedemptionEvent::TokensUnwrapped {
+            underlying_token, ..
+        } = legacy_tokens_unwrapped_event(recorded)
+        else {
+            panic!("expected TokensUnwrapped");
+        };
+
+        assert_eq!(underlying_token, UnwrappedProvenance::Legacy(recorded));
+    }
+
+    /// A redemption interrupted before the vault attestation existed carries
+    /// an address copied from config. Resuming it must re-attest through the
+    /// wrapper and refuse when the vault's asset() is not that address, even
+    /// after the config has been corrected.
+    #[tokio::test]
+    async fn send_tokens_refuses_a_legacy_underlying_the_vault_does_not_attest() {
+        let configured = Address::random();
+        let recorded = Address::random();
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: tokenizer.clone(),
+            wrapper: Arc::new(
+                MockWrapper::new()
+                    .with_tokenized_shares(configured)
+                    .attesting_unwrapped_token(configured),
+            ),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        };
+
+        let error = TestHarness::<EquityRedemption>::with(services)
+            .given(vec![
+                withdrawn_from_raindex_event(),
+                legacy_tokens_unwrapped_event(recorded),
+                send_pending_event(),
+            ])
+            .when(EquityRedemptionCommand::SendTokens)
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::LegacyUnderlyingMismatch {
+                    recorded: ref r,
+                    attested: ref a,
+                    ..
+                }) if *r == recorded && *a == configured
+            ),
+            "got: {error:?}"
+        );
+        assert_eq!(tokenizer.call_count(), 0, "nothing may be sent");
+    }
+
+    /// The same legacy record whose address the vault does attest is sent,
+    /// with the attested token rather than the recorded one.
+    #[tokio::test]
+    async fn send_tokens_reattests_a_legacy_underlying_before_sending() {
+        let configured = Address::random();
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(
+                MockWrapper::new()
+                    .with_tokenized_shares(configured)
+                    .attesting_unwrapped_token(configured),
+            ),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        };
+
+        let events = TestHarness::<EquityRedemption>::with(services)
+            .given(vec![
+                withdrawn_from_raindex_event(),
+                legacy_tokens_unwrapped_event(configured),
+                send_pending_event(),
+            ])
+            .when(EquityRedemptionCommand::SendTokens)
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            EquityRedemptionEvent::TokensSent { .. }
+        ));
     }
 
     /// `SendTokens` must persist the non-idempotent transfer hash without
@@ -3524,7 +3785,9 @@ mod tests {
             mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
-        let underlying_token = Address::random();
+        let underlying_token = UnwrappedProvenance::Attested {
+            attested: UnwrappedToken::unchecked(Address::random()),
+        };
         let send_pending = EquityRedemption::SendPending {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(10),
@@ -4362,6 +4625,85 @@ mod tests {
         );
     }
 
+    /// The token sent to the issuer is the one the vault attests as its
+    /// `asset()`. When that differs from the configured underlying, unwrap
+    /// confirmation refuses instead of carrying either address forward, and
+    /// the redemption stays at `UnwrapSubmitted`.
+    #[tokio::test]
+    async fn confirm_unwrap_refuses_a_vault_that_delivered_another_token() {
+        let configured = Address::random();
+        let delivered = Address::random();
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(
+                MockWrapper::new()
+                    .with_tokenized_shares(configured)
+                    .attesting_unwrapped_token(delivered),
+            ),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        };
+
+        let store = TestStore::<EquityRedemption>::new(services);
+        let id = redemption_aggregate_id("unwrap-delivered-another-token");
+
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    token: Address::random(),
+                    amount: U256::from(10_000_000_000_000_000_000_u128),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
+            .await
+            .unwrap();
+        store
+            .send(&id, EquityRedemptionCommand::ConfirmWithdraw)
+            .await
+            .unwrap();
+        store
+            .send(&id, EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .unwrap();
+        store
+            .send(&id, EquityRedemptionCommand::SubmitUnwrap)
+            .await
+            .unwrap();
+
+        let error = store
+            .send(&id, EquityRedemptionCommand::ConfirmUnwrap)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    EquityRedemptionError::UnwrapDeliveredUnexpectedToken {
+                        configured: reported_configured,
+                        delivered: reported_delivered,
+                        ..
+                    }
+                )) if reported_configured == configured && reported_delivered == delivered
+            ),
+            "expected UnwrapDeliveredUnexpectedToken, got: {error:?}"
+        );
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::UnwrapSubmitted { .. }),
+            "a refused attestation must leave the redemption at UnwrapSubmitted, got: {entity:?}"
+        );
+    }
+
     #[tokio::test]
     async fn underlying_lookup_failure_returns_underlying_lookup_failed_error() {
         let services = EquityTransferServices {
@@ -4984,7 +5326,9 @@ mod tests {
             symbol: symbol.clone(),
             quantity: float!(50.25),
             token: Address::random(),
-            underlying_token: Address::random(),
+            underlying_token: UnwrappedProvenance::Attested {
+                attested: UnwrappedToken::unchecked(Address::random()),
+            },
             raindex_withdraw_tx: TxHash::random(),
             unwrap_tx_hash: TxHash::random(),
             unwrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
@@ -5442,7 +5786,9 @@ mod tests {
                 withdrawn_from_raindex_event(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: Some(float!(1.0)),
-                    underlying_token: Address::ZERO,
+                    underlying_token: UnwrappedProvenance::Attested {
+                        attested: UnwrappedToken::unchecked(Address::ZERO),
+                    },
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
                     unwrap_block: Some(unwrap_block),
@@ -5497,7 +5843,9 @@ mod tests {
                 withdrawn_from_raindex_event(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: Some(float!(1.0)),
-                    underlying_token: Address::ZERO,
+                    underlying_token: UnwrappedProvenance::Attested {
+                        attested: UnwrappedToken::unchecked(Address::ZERO),
+                    },
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
                     unwrap_block: None,
@@ -5549,7 +5897,9 @@ mod tests {
                 withdrawn_from_raindex_event(),
                 EquityRedemptionEvent::TokensUnwrapped {
                     quantity: Some(float!(1.0)),
-                    underlying_token: Address::ZERO,
+                    underlying_token: UnwrappedProvenance::Attested {
+                        attested: UnwrappedToken::unchecked(Address::ZERO),
+                    },
                     unwrap_tx_hash: TxHash::random(),
                     unwrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
                     unwrap_block: Some(required_block),
@@ -5965,7 +6315,9 @@ mod tests {
                 symbol: sym.clone(),
                 quantity: float!(1),
                 token: Address::ZERO,
-                underlying_token: Address::ZERO,
+                underlying_token: UnwrappedProvenance::Attested {
+                    attested: UnwrappedToken::unchecked(Address::ZERO)
+                },
                 raindex_withdraw_tx: TxHash::default(),
                 unwrap_tx_hash: TxHash::default(),
                 unwrapped_amount: U256::ZERO,
@@ -5981,7 +6333,9 @@ mod tests {
                 symbol: sym.clone(),
                 quantity: float!(1),
                 token: Address::ZERO,
-                underlying_token: Address::ZERO,
+                underlying_token: UnwrappedProvenance::Attested {
+                    attested: UnwrappedToken::unchecked(Address::ZERO)
+                },
                 raindex_withdraw_tx: TxHash::default(),
                 unwrap_tx_hash: TxHash::default(),
                 unwrapped_amount: U256::ZERO,

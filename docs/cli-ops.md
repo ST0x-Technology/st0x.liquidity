@@ -148,6 +148,10 @@ Reverse of buying and minting: redeem tokens offchain, then sell the shares.
 stox alpaca-redeem -s COIN -q 10
 ```
 
+The token sent to the issuer is attested against the vault's `asset()`, never
+pasted. On a non Base network pass `--registry token-lists/<network>.json`, as
+for `wrap-equity`.
+
 **Step 2: Sell shares offchain**
 
 ```
