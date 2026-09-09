@@ -2372,7 +2372,7 @@ mod tests {
     };
     use crate::mint_authorization::{MockMintAuthorizer, StubVaultModeReader};
     use crate::native_gas::GasReadiness;
-    use crate::onchain::mock::{DepositBehavior, MockRaindex};
+    use crate::onchain::mock::{DepositBehavior, DepositCall, MockRaindex};
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
     use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
     use crate::usdc_rebalance::UsdcRebalance;
@@ -2538,12 +2538,19 @@ mod tests {
 
         transfer.resume_mint(&id).await.unwrap();
 
-        assert!(
-            ethereum.raindex.last_deposit_call().is_some(),
+        assert_eq!(
+            ethereum.raindex.last_deposit_call(),
+            Some(DepositCall {
+                token: Address::ZERO,
+                vault_id: RaindexVaultId(B256::ZERO),
+                amount: U256::from(10_000_000_000_000_000_000_u128),
+                decimals: TOKENIZED_EQUITY_DECIMALS,
+            }),
             "the wrapped shares must be deposited through Ethereum's orderbook"
         );
-        assert!(
-            ethereum.vault_lookup.lookups() > 0,
+        assert_eq!(
+            ethereum.vault_lookup.lookups(),
+            1,
             "the destination vault must come from Ethereum's registry"
         );
         base.assert_untouched(Chain::Base);
@@ -2569,12 +2576,19 @@ mod tests {
 
         transfer.resume_mint(&id).await.unwrap();
 
-        assert!(
-            !ethereum.wrapper.wait_for_block_calls().is_empty(),
+        assert_eq!(
+            ethereum.wrapper.wait_for_block_calls(),
+            vec![0],
             "the wrap must be confirmed against Ethereum's wrapper"
         );
-        assert!(
-            ethereum.raindex.last_deposit_call().is_some(),
+        assert_eq!(
+            ethereum.raindex.last_deposit_call(),
+            Some(DepositCall {
+                token: Address::ZERO,
+                vault_id: RaindexVaultId(B256::ZERO),
+                amount: U256::from(1_u64),
+                decimals: TOKENIZED_EQUITY_DECIMALS,
+            }),
             "the deposit must follow on Ethereum's orderbook"
         );
         base.assert_untouched(Chain::Base);
@@ -2632,12 +2646,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            ethereum.vault_lookup.lookups() > 0,
+        assert_eq!(
+            ethereum.vault_lookup.lookups(),
+            2,
             "the redeemed token must come from Ethereum's registry"
         );
-        assert!(
-            ethereum.tokenizer.call_count() > 0,
+        assert_eq!(
+            ethereum.tokenizer.call_count(),
+            5,
             "the redemption must be sent through Ethereum's issuer"
         );
         base.assert_untouched(Chain::Base);
@@ -2673,9 +2689,10 @@ mod tests {
 
         transfer.resume_redemption(&id).await.unwrap();
 
-        assert!(
-            ethereum.tokenizer.call_count() > issuer_calls_before_resume,
-            "the detection poll must reach Ethereum's issuer"
+        assert_eq!(
+            ethereum.tokenizer.call_count(),
+            issuer_calls_before_resume + 2,
+            "the detection and completion polls must reach Ethereum's issuer"
         );
         base.assert_untouched(Chain::Base);
     }
@@ -2720,8 +2737,9 @@ mod tests {
 
         transfer.resume_redemption(&id).await.unwrap();
 
-        assert!(
-            ethereum.tokenizer.call_count() > issuer_calls_before_resume,
+        assert_eq!(
+            ethereum.tokenizer.call_count(),
+            issuer_calls_before_resume + 1,
             "the completion poll must reach Ethereum's issuer"
         );
         base.assert_untouched(Chain::Base);
