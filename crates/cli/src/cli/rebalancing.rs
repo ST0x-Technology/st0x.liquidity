@@ -343,29 +343,36 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
     // A resume continues the transfer the record describes, so the recorded
     // chain decides: driving it on another network would use the wrong
     // orderbook, wrapper and issuer wallet.
-    if let Some(uuid) = issuer_request_id {
-        let id = IssuerRequestId(uuid);
-        let recorded = st0x_event_sorcery::load_entity::<TokenizedEquityMint>(pool, &id)
-            .await?
-            .map(|entity| entity.chain());
+    let recorded = match issuer_request_id {
+        Some(uuid) => {
+            let id = IssuerRequestId(uuid);
+            st0x_event_sorcery::load_entity::<TokenizedEquityMint>(pool, &id)
+                .await?
+                .map(|entity| (id, entity.chain()))
+        }
+        None => None,
+    };
 
-        if let Some(recorded) = recorded
-            && recorded != chain
-        {
+    match recorded {
+        Some((id, recorded)) if recorded != chain => {
             anyhow::bail!(
                 "mint {id} was requested on {recorded}; --network {chain} would resume it \
                  against another chain's orderbook and issuer wallet. Re-run with \
                  --network {recorded}"
             );
         }
-    } else {
-        let primary = ctx.chains.primary().chain;
-        if chain != primary {
-            anyhow::bail!(
-                "a fresh transfer-equity on {chain} is refused while the transfer saga is \
-                 built for the primary chain ({primary}) only. Fund {chain} with \
-                 alpaca-tokenize, wrap-equity and vault-deposit --network {chain} instead"
-            );
+        Some(_) => {}
+        // An id with no record behind it names nothing to resume, so this is a
+        // fresh transfer and the primary-only rule still applies.
+        None => {
+            let primary = ctx.chains.primary().chain;
+            if chain != primary {
+                anyhow::bail!(
+                    "a fresh transfer-equity on {chain} is refused while the transfer saga is \
+                     built for the primary chain ({primary}) only. Fund {chain} with \
+                     alpaca-tokenize, wrap-equity and vault-deposit --network {chain} instead"
+                );
+            }
         }
     }
 
