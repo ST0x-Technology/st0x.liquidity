@@ -39,7 +39,7 @@ use tracing::{debug, error, info, trace, warn};
 use url::{Host, Url};
 
 use st0x_evm::{
-    EvmError, IERC20, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
+    Chain, EvmError, IERC20, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
     OpenChainErrorRegistry, Wallet, wait_for_node_sync,
 };
 use st0x_execution::{
@@ -62,13 +62,14 @@ pub struct AlpacaTokenizationService<W: Wallet> {
 }
 
 impl<W: Wallet> AlpacaTokenizationService<W> {
-    /// Create a new tokenization service.
+    /// Create a new tokenization service bound to `chain`: mint requests
+    /// name it on the wire and responses for any other network are refused.
     pub fn new(
         base_url: String,
         account_id: AlpacaAccountId,
         auth: AlpacaBrokerAuth,
         wallet: W,
-        network: Network,
+        chain: Chain,
         redemption_wallet: Option<Address>,
     ) -> Result<Self, AlpacaTokenizationError> {
         let client = AlpacaTokenizationClient::new(
@@ -76,7 +77,7 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
             account_id,
             auth,
             wallet,
-            network,
+            chain,
             redemption_wallet,
         )?;
 
@@ -105,7 +106,7 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
             underlying_symbol,
             quantity,
             issuer: Issuer::new("st0x"),
-            network: self.client.network.clone(),
+            network: Network::new(self.client.chain.as_str()),
             wallet,
             client_request_id: issuer_request_id,
         };
@@ -329,6 +330,12 @@ pub struct TokenizationRequest {
     #[serde(rename = "wallet_address")]
     pub wallet: Option<Address>,
     pub client_request_id: Option<ClientRequestId>,
+    /// The chain the request settles on, as the issuer names it. `None` when
+    /// the issuer omitted it: the read-only list keeps such an entry so
+    /// inflight equity is never understated, while every path that acts on a
+    /// single request refuses it (`confirm_network`).
+    #[serde(default)]
+    pub network: Option<Network>,
     pub issuer_request_id: Option<IssuerRequestId>,
     #[serde(default, deserialize_with = "deserialize_tx_hash")]
     pub tx_hash: Option<TxHash>,
@@ -356,6 +363,7 @@ impl TokenizationRequest {
             quantity: FractionalShares::ZERO,
             wallet: None,
             client_request_id: None,
+            network: Some(Network::new(Chain::Base.as_str())),
             issuer_request_id: None,
             tx_hash: None,
             fees: None,
@@ -376,6 +384,7 @@ impl TokenizationRequest {
             quantity: FractionalShares::ZERO,
             wallet: None,
             client_request_id: None,
+            network: Some(Network::new(Chain::Base.as_str())),
             issuer_request_id: None,
             tx_hash: Some(TxHash::ZERO),
             fees: None,
@@ -485,6 +494,21 @@ pub enum AlpacaTokenizationError {
          redemption operations"
     )]
     MissingRedemptionWallet,
+
+    /// The issuer answered for a request on another network than the one
+    /// this client is bound to; acting on it would drive a mint or
+    /// redemption on the wrong chain.
+    #[error("tokenization request {id} is on network '{actual}', not '{expected}'")]
+    WrongNetwork {
+        id: TokenizationRequestId,
+        expected: Chain,
+        actual: Network,
+    },
+
+    /// The issuer reported the request without a network, so this client
+    /// cannot prove it is the one it is bound to; refused rather than assumed.
+    #[error("tokenization request {id} reports no network")]
+    NetworkMissing { id: TokenizationRequestId },
 }
 
 /// Opaque body text from an Alpaca tokenization API error response.
@@ -554,6 +578,8 @@ impl AlpacaTokenizationError {
             | Self::DuplicateMintIssuerRequestId { .. }
             | Self::InvalidBaseUrl(_)
             | Self::InsecureBaseUrl
+            | Self::WrongNetwork { .. }
+            | Self::NetworkMissing { .. }
             | Self::Evm(_)
             | Self::PollTimeout { .. }
             | Self::MissingRedemptionWallet => false,
@@ -605,6 +631,8 @@ impl AlpacaTokenizationError {
             | Self::DuplicateMintIssuerRequestId { .. }
             | Self::InvalidBaseUrl(_)
             | Self::InsecureBaseUrl
+            | Self::WrongNetwork { .. }
+            | Self::NetworkMissing { .. }
             | Self::Evm(_)
             | Self::PollTimeout { .. }
             | Self::MissingRedemptionWallet => None,
@@ -684,7 +712,7 @@ struct AlpacaTokenizationClient<W: Wallet> {
     account_id: AlpacaAccountId,
     auth: AuthRuntime,
     wallet: W,
-    network: Network,
+    chain: Chain,
     redemption_wallet: Option<Address>,
 }
 
@@ -694,7 +722,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         account_id: AlpacaAccountId,
         auth: AlpacaBrokerAuth,
         wallet: W,
-        network: Network,
+        chain: Chain,
         redemption_wallet: Option<Address>,
     ) -> Result<Self, AlpacaTokenizationError> {
         validate_credentialed_base_url(&base_url)?;
@@ -709,9 +737,45 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             account_id,
             auth: AuthRuntime::build(auth)?,
             wallet,
-            network,
+            chain,
             redemption_wallet,
         })
+    }
+
+    /// Refuses a request the issuer reports on another network than this
+    /// client's chain. Every read that yields one request for this client
+    /// passes through here, so a foreign-chain mint or redemption cannot be
+    /// polled, verified or credited as if it were ours.
+    fn confirm_network(
+        &self,
+        request: TokenizationRequest,
+    ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+        match request.network {
+            Some(ref network) if network.as_ref() == self.chain.as_str() => Ok(request),
+            Some(actual) => {
+                warn!(
+                    target: "tokenization",
+                    request_id = %request.id,
+                    expected = %self.chain,
+                    %actual,
+                    "Refusing tokenization request reported on another network"
+                );
+                Err(AlpacaTokenizationError::WrongNetwork {
+                    id: request.id,
+                    expected: self.chain,
+                    actual,
+                })
+            }
+            None => {
+                warn!(
+                    target: "tokenization",
+                    request_id = %request.id,
+                    expected = %self.chain,
+                    "Refusing tokenization request reported without a network"
+                );
+                Err(AlpacaTokenizationError::NetworkMissing { id: request.id })
+            }
+        }
     }
 
     /// Request a mint operation to convert offchain shares to onchain tokens.
@@ -779,7 +843,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
                 })?;
 
             info!(target: "tokenization", request_id = %tokenization_request.id, "Mint request created");
-            return Ok(tokenization_request);
+            return self.confirm_network(tokenization_request);
         }
 
         let message = String::from_utf8_lossy(&response.bytes().await?).into_owned();
@@ -863,6 +927,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             );
         })?
         .ok_or_else(|| AlpacaTokenizationError::RequestNotFound { id: id.clone() })
+        .and_then(|request| self.confirm_network(request))
     }
 
     /// Send tokens to the redemption wallet to initiate a redemption.
@@ -956,8 +1021,9 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
                 tx_hash = %expected_tx_hash,
                 "Failed to scan list requests response for redemption request"
             );
-        })
-        .map_err(AlpacaTokenizationError::from)
+        })?
+        .map(|request| self.confirm_network(request))
+        .transpose()
     }
 
     async fn find_mint_by_issuer_request_id(
@@ -1301,8 +1367,8 @@ pub(crate) mod tests {
     use std::time::Duration;
     use uuid::uuid;
 
-    use st0x_evm::OpenChainErrorRegistry;
     use st0x_evm::local::RawPrivateKeyWallet;
+    use st0x_evm::{Chain, OpenChainErrorRegistry};
 
     use super::*;
     use crate::bindings::TestERC20;
@@ -1352,7 +1418,7 @@ pub(crate) mod tests {
                 api_secret: "test_api_secret".to_string(),
             },
             wallet,
-            Network::new("base"),
+            Chain::Base,
             Some(redemption_wallet),
         )
         .expect("basic-auth tokenization client")
@@ -1401,7 +1467,7 @@ pub(crate) mod tests {
                 api_secret: "test_api_secret".to_string(),
             },
             wallet.clone(),
-            Network::new("base"),
+            Chain::Base,
             Some(TEST_REDEMPTION_WALLET),
         );
         assert!(matches!(
@@ -1417,7 +1483,7 @@ pub(crate) mod tests {
                 api_secret: "test_api_secret".to_string(),
             },
             wallet,
-            Network::new("base"),
+            Chain::Base,
             Some(TEST_REDEMPTION_WALLET),
         );
 
@@ -1525,14 +1591,19 @@ pub(crate) mod tests {
         mint_mock.assert();
     }
 
-    #[tokio::test]
-    async fn service_mint_request_carries_configured_network() {
-        let server = MockServer::start();
-        let (_anvil, endpoint, key) = setup_anvil();
-        let provider = ProviderBuilder::new().connect(&endpoint).await.unwrap();
-        let wallet = RawPrivateKeyWallet::new(&key, provider, 1).unwrap();
+    async fn create_test_client_on(
+        server: &MockServer,
+        anvil_endpoint: &str,
+        private_key: &B256,
+        chain: Chain,
+    ) -> AlpacaTokenizationClient<impl Wallet> {
+        let provider = ProviderBuilder::new()
+            .connect(anvil_endpoint)
+            .await
+            .unwrap();
+        let wallet = RawPrivateKeyWallet::new(private_key, provider, 1).unwrap();
 
-        let client = AlpacaTokenizationClient::new(
+        AlpacaTokenizationClient::new(
             server.base_url(),
             TEST_ACCOUNT_ID,
             AlpacaBrokerAuth::Basic {
@@ -1540,49 +1611,181 @@ pub(crate) mod tests {
                 api_secret: "test_api_secret".to_string(),
             },
             wallet,
-            Network::new("ethereum"),
+            chain,
             Some(TEST_REDEMPTION_WALLET),
         )
-        .expect("basic-auth tokenization client");
-        let service = create_test_service(client);
+        .expect("basic-auth tokenization client")
+    }
 
+    /// The ITN `network` wire value is derived from the client's `Chain`, so
+    /// every variant must reach the mint endpoint under its pinned name and
+    /// the matching response must be accepted.
+    #[tokio::test]
+    async fn mint_request_carries_the_chain_wire_name_for_every_chain() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
         let recipient = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let issuer_id = issuer_request_id("test-ethereum-mint");
-        let issuer_id_str = issuer_id.to_string();
+
+        for chain in Chain::ALL {
+            let client = create_test_client_on(&server, &endpoint, &key, chain).await;
+            let service = create_test_service(client);
+            let issuer_id = issuer_request_id(&format!("mint-on-{chain}"));
+            let issuer_id_str = issuer_id.to_string();
+            let request_id = format!("tok_req_{chain}");
+
+            let mint_mock = server.mock(|when, then| {
+                when.method(POST)
+                    .path(tokenization_mint_path())
+                    .json_body_includes(json!({ "network": chain.as_str() }).to_string());
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(json!({
+                        "tokenization_request_id": request_id,
+                        "type": "mint",
+                        "status": "pending",
+                        "underlying_symbol": "RKLB",
+                        "token_symbol": "tRKLB",
+                        "qty": "1",
+                        "issuer": "st0x",
+                        "network": chain.as_str(),
+                        "wallet_address": recipient,
+                        "client_request_id": issuer_id_str,
+                        "created_at": "2026-08-02T10:30:00Z"
+                    }));
+            });
+
+            let result = service
+                .request_mint(
+                    Symbol::new("RKLB").unwrap(),
+                    FractionalShares::new(float!(1.0)),
+                    recipient,
+                    issuer_id,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(result.id, tokenization_request_id(&request_id));
+            assert_eq!(result.network, Some(Network::new(chain.as_str())));
+            mint_mock.assert();
+        }
+    }
+
+    /// A mint acknowledged on another network would be polled, verified and
+    /// deposited as if it had landed on this client's chain; the response is
+    /// refused before any of that.
+    #[tokio::test]
+    async fn mint_response_on_another_network_is_refused() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client_on(&server, &endpoint, &key, Chain::Base).await;
+
+        let request = create_mint_request();
+        let issuer_id = request.client_request_id.to_string();
 
         let mint_mock = server.mock(|when, then| {
-            when.method(POST)
-                .path(tokenization_mint_path())
-                .json_body_includes(r#"{"network":"ethereum"}"#);
+            when.method(POST).path(tokenization_mint_path());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "tokenization_request_id": "tok_req_eth_1",
+                    "tokenization_request_id": "tok_req_foreign",
                     "type": "mint",
                     "status": "pending",
-                    "underlying_symbol": "RKLB",
-                    "token_symbol": "tRKLB",
-                    "qty": "1",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "100.5",
                     "issuer": "st0x",
                     "network": "ethereum",
                     "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "client_request_id": issuer_id_str,
-                    "created_at": "2026-08-02T10:30:00Z"
+                    "client_request_id": issuer_id,
+                    "created_at": "2024-01-15T10:30:00Z"
                 }));
         });
 
-        let result = service
-            .request_mint(
-                Symbol::new("RKLB").unwrap(),
-                FractionalShares::new(float!(1.0)),
-                recipient,
-                issuer_id,
-            )
-            .await
-            .unwrap();
+        let error = client.request_mint(request).await.unwrap_err();
 
-        assert_eq!(result.id, tokenization_request_id("tok_req_eth_1"));
+        assert!(
+            matches!(
+                &error,
+                AlpacaTokenizationError::WrongNetwork { id, expected: Chain::Base, actual }
+                    if *id == tokenization_request_id("tok_req_foreign")
+                        && *actual == Network::new("ethereum")
+            ),
+            "expected WrongNetwork, got {error:?}"
+        );
         mint_mock.assert();
+    }
+
+    /// The mint poll reads the request back by id; a history entry for the
+    /// same id on another network is refused rather than driving the mint
+    /// to completion on the wrong chain.
+    #[tokio::test]
+    async fn mint_poll_on_another_network_is_refused() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client_on(&server, &endpoint, &key, Chain::Base).await;
+
+        let mut foreign = sample_tokenization_request_json("req_foreign", "mint", "AAPL");
+        foreign["network"] = json!("hyperevm");
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET).path(tokenization_requests_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([foreign]));
+        });
+
+        let error = client
+            .get_request(&tokenization_request_id("req_foreign"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                AlpacaTokenizationError::WrongNetwork { id, expected: Chain::Base, actual }
+                    if *id == tokenization_request_id("req_foreign")
+                        && *actual == Network::new("hyperevm")
+            ),
+            "expected WrongNetwork, got {error:?}"
+        );
+        list_mock.assert();
+    }
+
+    /// Redemption detection matches on the transfer hash alone; a redeem
+    /// entry carrying that hash on another network is refused instead of
+    /// being taken as this chain's detection.
+    #[tokio::test]
+    async fn redemption_detection_on_another_network_is_refused() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client_on(&server, &endpoint, &key, Chain::Base).await;
+
+        let hash: TxHash =
+            fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+        let mut foreign = sample_redemption_request_json_with_tx("redeem_foreign", "AAPL", hash);
+        foreign["network"] = json!("ethereum");
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(tokenization_requests_path())
+                .query_param("type", "redeem");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([foreign]));
+        });
+
+        let error = client.find_redemption_by_tx(&hash).await.unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                AlpacaTokenizationError::WrongNetwork { id, expected: Chain::Base, actual }
+                    if *id == tokenization_request_id("redeem_foreign")
+                        && *actual == Network::new("ethereum")
+            ),
+            "expected WrongNetwork, got {error:?}"
+        );
+        list_mock.assert();
     }
 
     #[tracing_test::traced_test]
@@ -2296,7 +2499,7 @@ pub(crate) mod tests {
                 api_secret: "test_api_secret".to_string(),
             },
             wallet,
-            Network::new("base"),
+            Chain::Base,
             Some(TEST_REDEMPTION_WALLET),
         )
         .expect("basic-auth tokenization client");
@@ -2344,7 +2547,7 @@ pub(crate) mod tests {
                 api_secret: "test_api_secret".to_string(),
             },
             wallet,
-            Network::new("base"),
+            Chain::Base,
             Some(TEST_REDEMPTION_WALLET),
         )
         .expect("basic-auth tokenization client");
@@ -2377,7 +2580,7 @@ pub(crate) mod tests {
                 api_secret: "test_api_secret".to_string(),
             },
             wallet,
-            Network::new("base"),
+            Chain::Base,
             Some(TEST_REDEMPTION_WALLET),
         )
         .expect("basic-auth tokenization client");
@@ -3362,6 +3565,80 @@ pub(crate) mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, tokenization_request_id("req_1"));
         pending_mock.assert();
+    }
+
+    /// The pending list feeds inflight-equity reconciliation, so an entry the
+    /// issuer reports without a network must still count rather than vanish
+    /// as a "malformed" row.
+    #[tokio::test]
+    async fn list_pending_requests_keeps_an_entry_that_omits_network() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let service =
+            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let with_network = sample_tokenization_request_json("req_1", "mint", "AAPL");
+        let mut without_network = sample_tokenization_request_json("req_2", "redeem", "TSLA");
+        without_network.as_object_mut().unwrap().remove("network");
+
+        let pending_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(tokenization_requests_path())
+                .query_param("status", "pending");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([with_network, without_network]));
+        });
+
+        let result = service.list_pending_requests().await.unwrap();
+
+        assert_eq!(
+            result
+                .iter()
+                .map(|request| request.id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                tokenization_request_id("req_1"),
+                tokenization_request_id("req_2")
+            ],
+            "an entry without a network must not be dropped from the pending list"
+        );
+        assert_eq!(result[1].network, None);
+        pending_mock.assert();
+    }
+
+    /// Acting on a single request needs its network: one the issuer reports
+    /// without it is refused by name, never assumed to be ours.
+    #[tokio::test]
+    async fn get_request_refuses_an_entry_that_omits_network() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let service =
+            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let mut without_network = sample_tokenization_request_json("req_1", "mint", "AAPL");
+        without_network.as_object_mut().unwrap().remove("network");
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET).path(tokenization_requests_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([without_network]));
+        });
+
+        let error = Tokenizer::get_request(&service, &tokenization_request_id("req_1"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                TokenizerError::Alpaca(AlpacaTokenizationError::NetworkMissing { ref id })
+                    if *id == tokenization_request_id("req_1")
+            ),
+            "expected NetworkMissing, got {error:?}"
+        );
+        list_mock.assert();
     }
 
     #[tokio::test]

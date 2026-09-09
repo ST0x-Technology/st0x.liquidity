@@ -759,9 +759,6 @@ pub struct Ctx {
     /// unmounted.
     pub ops_api: Option<OpsApiConfig>,
     pub issuance: IssuanceStatusCtx,
-    /// Alpaca redemption wallet from `[chains.<name>.trading].redemption_wallet`.
-    /// `Some` when the config includes a `[chains.<name>.trading].redemption_wallet` section.
-    pub redemption_wallet: Option<Address>,
     /// ETH/USD valuation source for bot-gas cost recording (ADR 0020).
     /// Bot-gas cost recording only runs on rebalancing paths (vault
     /// deposit/withdraw, wrap/unwrap, CCTP burn/mint, USDC transfer), so this
@@ -1246,7 +1243,6 @@ impl std::fmt::Debug for Ctx {
             .field("execution_threshold", &self.execution_threshold)
             .field("assets", &self.assets)
             .field("travel_rule_configured", &self.travel_rule.is_some())
-            .field("redemption_wallet", &self.redemption_wallet)
             .field("rest_api", &self.rest_api)
             .field("ops_api", &self.ops_api)
             .field("issuance", &self.issuance)
@@ -1371,7 +1367,6 @@ struct ValidatedParts {
     rest_api: Option<RestApiCtx>,
     ops_api: Option<OpsApiConfig>,
     issuance: IssuanceStatusCtx,
-    redemption_wallet: Option<Address>,
     bot_gas_valuation: Option<BotGasValuationConfig>,
     orchestrator: Option<OrchestratorConfig>,
     /// Wallet construction inputs. Always present — `parse_and_validate`
@@ -1782,7 +1777,6 @@ fn parse_and_validate(
         None => TradingMode::Standalone,
     };
 
-    let redemption_wallet = chains.primary().redemption_wallet;
     let log_format = config.log_format.unwrap_or(LogFormat::Text);
 
     let ExtendedHoursBrokerWindows {
@@ -1852,7 +1846,6 @@ fn parse_and_validate(
         issuance: issuance_ctx(config.issuance, secrets.issuance, &mut startup_notices)?,
         ops_api: config.ops_api,
         startup_notices,
-        redemption_wallet,
         bot_gas_valuation: config.bot_gas_valuation,
         orchestrator: config.orchestrator,
         wallet_inputs,
@@ -2019,7 +2012,6 @@ impl Ctx {
             rest_api: parts.rest_api,
             ops_api: parts.ops_api,
             issuance: parts.issuance,
-            redemption_wallet: parts.redemption_wallet,
             bot_gas_valuation: parts.bot_gas_valuation,
             orchestrator: parts.orchestrator,
         })
@@ -2159,9 +2151,14 @@ impl Ctx {
         self.wallet.as_ref().ok_or(CtxError::WalletNotConfigured)
     }
 
-    /// Returns the redemption wallet from the `[chains.<name>.trading].redemption_wallet` config section.
-    pub fn redemption_wallet(&self) -> Result<Address, CtxError> {
-        self.redemption_wallet.ok_or(CtxError::MissingTokenization)
+    /// The issuer's redemption wallet on `chain`
+    /// (`[chains.<name>.trading].redemption_wallet`). Per chain, never the
+    /// primary's: tokens sent to another chain's issuer address are lost.
+    pub fn redemption_wallet(&self, chain: Chain) -> Result<Address, CtxError> {
+        self.chains
+            .watch(chain)
+            .and_then(|trading| trading.redemption_wallet)
+            .ok_or(CtxError::RedemptionWalletNotConfigured { chain })
     }
 
     pub const fn order_polling_interval(&self) -> std::time::Duration {
@@ -2363,7 +2360,6 @@ impl Ctx {
             rest_api,
             ops_api,
             issuance,
-            redemption_wallet,
             bot_gas_valuation,
             orchestrator,
         })
@@ -2552,6 +2548,8 @@ pub enum CtxError {
          ([chains.<name>.trading].redemption_wallet)"
     )]
     MissingTokenization,
+    #[error("[chains.{chain}.trading].redemption_wallet is required to redeem on {chain}")]
+    RedemptionWalletNotConfigured { chain: Chain },
     #[error(
         "[bot_gas_valuation] section is required when rebalancing is enabled \
          (see ADR 0020)"
@@ -2637,6 +2635,7 @@ impl CtxError {
             Self::Pricing(_) => "pricing configuration error",
             Self::NotRebalancing => "operation requires rebalancing mode",
             Self::MissingTokenization => "operation requires tokenization config",
+            Self::RedemptionWalletNotConfigured { .. } => "missing per-chain redemption wallet",
             Self::MissingBotGasValuation => "missing bot gas valuation config",
             Self::MissingAlertsForRebalancing => "missing rebalancing gas thresholds",
             Self::ConfigIo { .. } => "failed to read config file",
@@ -2835,7 +2834,6 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         rest_api: None,
         ops_api: None,
         issuance: create_test_issuance_ctx(),
-        redemption_wallet: None,
         bot_gas_valuation: None,
         orchestrator: None,
     }

@@ -9,9 +9,9 @@
 //!
 //! Each chain carries its own orchestrator deployment, so addresses are keyed
 //! by chain under `[orchestrator.addresses]`, mirroring the issuance bot's
-//! config shape. Mint authorization signs against the chain the mint's
-//! tokenized equity lives on -- Base for every equity today, so the authorizer
-//! resolves the `base` entry.
+//! config shape. Mint authorization signs against the entry of the chain the
+//! mint lands on (the primary chain today); an orchestrator-mode mint on a
+//! chain without an entry fails loudly rather than borrowing another chain's.
 //!
 //! The section is optional as a whole: while every asset is vault-direct the
 //! bot runs unchanged without it ("deploys dark"). A mint that discovers an

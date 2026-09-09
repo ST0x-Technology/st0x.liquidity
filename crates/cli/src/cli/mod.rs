@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use st0x_config::{Ctx, Env};
 use st0x_event_sorcery::Projection;
-use st0x_evm::OpenChainErrorRegistry;
+use st0x_evm::{Chain, OpenChainErrorRegistry};
 use st0x_execution::alpaca_broker_api::AlpacaLimitPrice;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 use st0x_finance::Usdc;
@@ -153,10 +153,10 @@ pub enum CctpChain {
 
 /// Target network for Alpaca tokenization mint/redeem commands.
 ///
-/// Selects both the Alpaca ITN `network` wire value and the bot wallet
-/// (and therefore the chain) used for onchain legs of the flow; the pairing
-/// is produced by a single match in `rebalancing::tokenization_network_context`
-/// so the two cannot diverge.
+/// A clap-facing spelling of [`Chain`]: converting it selects the chain the
+/// tokenization service binds to (and so the ITN `network` wire value) and,
+/// via `rebalancing::tokenization_network_context`, the bot wallet for the
+/// onchain legs of the flow.
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum TokenizationNetwork {
     /// Base mainnet
@@ -168,14 +168,12 @@ pub enum TokenizationNetwork {
     HyperEvm,
 }
 
-impl TokenizationNetwork {
-    /// Canonical EVM chain id of the selected network, used to validate
-    /// registry token lists against the network they claim to serve.
-    const fn chain_id(self) -> u64 {
-        match self {
-            Self::Base => 8453,
-            Self::Ethereum => 1,
-            Self::HyperEvm => 999,
+impl From<TokenizationNetwork> for Chain {
+    fn from(network: TokenizationNetwork) -> Self {
+        match network {
+            TokenizationNetwork::Base => Self::Base,
+            TokenizationNetwork::Ethereum => Self::Ethereum,
+            TokenizationNetwork::HyperEvm => Self::HyperEvm,
         }
     }
 }
@@ -2111,7 +2109,6 @@ mod tests {
             rest_api: None,
             ops_api: None,
             issuance: create_test_issuance_ctx(),
-            redemption_wallet: None,
             bot_gas_valuation: None,
             orchestrator: None,
         }

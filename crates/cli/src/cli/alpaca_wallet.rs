@@ -767,7 +767,6 @@ mod tests {
             rest_api: None,
             ops_api: None,
             issuance: create_test_issuance_ctx(),
-            redemption_wallet: None,
             bot_gas_valuation: None,
             orchestrator: None,
         }
@@ -829,6 +828,7 @@ mod tests {
                     })
                     .vault_owner(Address::ZERO)
                     .deployment_block(1)
+                    .redemption_wallet(Address::ZERO)
                     .call(),
             ),
             order_polling_interval: 15,
@@ -879,7 +879,6 @@ mod tests {
             rest_api: None,
             ops_api: None,
             issuance: create_test_issuance_ctx(),
-            redemption_wallet: Some(Address::ZERO),
             bot_gas_valuation: None,
             orchestrator: None,
         }

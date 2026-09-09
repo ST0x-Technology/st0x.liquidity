@@ -30,8 +30,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use st0x_event_sorcery::{RetryOnBusy, Store, StoreBuilder};
-use st0x_evm::IERC20;
-use st0x_execution::{AlpacaTransferId, ClientOrderId, FractionalShares, Symbol};
+use st0x_evm::{Chain, IERC20};
+use st0x_execution::{AlpacaTransferId, ClientOrderId, FractionalShares, Network, Symbol};
 use st0x_finance::Usdc;
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
 use st0x_tokenization::{
@@ -118,6 +118,7 @@ impl Tokenizer for FixtureTokenizer {
             wallet: Some(wallet),
             client_request_id: Some(ClientRequestId::from(&issuer_request_id)),
             issuer_request_id: None,
+            network: Some(Network::new(Chain::Base.as_str())),
             tx_hash: None,
             fees: None,
             created_at: Utc::now(),
