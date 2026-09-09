@@ -230,10 +230,40 @@ redemption_wallet = "0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE"
 # table. Confirmations are deeper than Base's because an L1 reorg is a
 # different risk from an OP-Stack sequencer batch.
 [chains.ethereum]
-# Holds and moves USDC for the corridor; it runs no orderbook, so it has
-# no [trading] table.
 lifecycle = "active"
 required_confirmations = 12
+
+# Ethereum trading, added now that the chain's Raindex vault-accounting set is
+# deployed (RAI-1993). Mirrors the Base table; only the addresses differ.
+#
+# DO NOT DEPLOY THIS UNTIL THE OPERATOR_ROLE GRANT LANDS. `inventory_mode =
+# "managed"` makes startup verify the wallet holds OPERATOR_ROLE on `inventory`
+# and refuse to boot otherwise, so shipping this ahead of the Turnkey-signed
+# grant takes the bot down rather than degrading it.
+[chains.ethereum.trading]
+# Canonical RaindexV6, same deterministic address as every other chain.
+orderbook = "0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20"
+inventory_mode = "managed"
+# The Ethereum Bebop hook. Only one entry, unlike Base: there is no retiring
+# pre-NAV hook here, this chain started on the NAV-asserting one.
+inventory_adapters = [
+  { venue = "bebop", operator = "0x2D539fe4C1e72B239735AB79A7858040016Bf134" },
+]
+# RaindexInventory deployed 2026-09-08, owned by the T0 Turnkey wallet. NOT the
+# earlier 0x7A4445… deploy, which was mistakenly admin'd by the S01 token-owner
+# Safe and is void.
+inventory = "0x59401C9302E79Eb8AC6aea659B8B3ae475715e86"
+# Managed mode requires this to equal `inventory`.
+vault_owner = "0x59401C9302E79Eb8AC6aea659B8B3ae475715e86"
+# Backfill floor: the inventory's own deployment block. No inventory-owned
+# event can predate it.
+deployment_block = 25935094
+# Ethereum is not OP-Stack, so Base's "safe" block does not apply. Use a fixed
+# depth behind the tip; 12 is the documented L1 figure and matches this chain's
+# required_confirmations.
+ingestion_cutoff = "confirmations"
+ingestion_cutoff_confirmations = 12
+order_fill_poll_interval_secs = 5
 
 # HyperEVM, same shape as Ethereum.
 [chains.hyperevm]
