@@ -2352,15 +2352,32 @@ struct TokenizationPreflightError {
     source: WrapperError,
 }
 
-/// Every equity the bot may wrap or redeem on a chain (trading or rebalancing
-/// enabled), in sorted order so preflight failures are deterministic.
-fn preflighted_equities(assets: &ChainAssets) -> Vec<&Symbol> {
-    let mut enabled = assets
-        .equities
-        .symbols
-        .keys()
-        .filter(|symbol| assets.is_trading_enabled(symbol) || assets.is_rebalancing_enabled(symbol))
-        .collect::<Vec<_>>();
+/// A watched chain's place in the registry, which sets how much of its asset
+/// table the tokenization preflight covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainRole {
+    Primary,
+    Secondary,
+}
+
+/// The equities a chain's tokenization preflight covers, in sorted order so
+/// failures are deterministic: on the primary every equity the bot may wrap
+/// or redeem there (trading or rebalancing enabled); on a secondary only the
+/// equities it rebalances, so a hedge-only secondary preflights nothing.
+fn preflighted_equities(assets: &ChainAssets, role: ChainRole) -> Vec<&Symbol> {
+    let mut enabled = match role {
+        ChainRole::Primary => assets
+            .equities
+            .symbols
+            .keys()
+            .filter(|symbol| {
+                assets.is_trading_enabled(symbol) || assets.is_rebalancing_enabled(symbol)
+            })
+            .collect::<Vec<_>>(),
+        ChainRole::Secondary => {
+            todo!("a secondary chain preflights only rebalancing-enabled equities")
+        }
+    };
     enabled.sort();
     enabled
 }
@@ -2374,8 +2391,9 @@ async fn attest_chain_vaults<Attester: Wrapper + ?Sized>(
     chain: Chain,
     wrapper: &Attester,
     assets: &ChainAssets,
+    role: ChainRole,
 ) -> Result<(), TokenizationPreflightError> {
-    for symbol in preflighted_equities(assets) {
+    for symbol in preflighted_equities(assets, role) {
         let token = wrapper
             .attest_underlying(symbol)
             .await
@@ -2419,13 +2437,14 @@ async fn preflight_orchestrator_entries<Reader: VaultModeReader + ?Sized>(
     mint_authorizer: &ConfiguredMintAuthorizer,
     vault_modes: &Reader,
     assets: &ChainAssets,
+    role: ChainRole,
 ) -> Result<(), OrchestratorEntryMissing> {
     match mint_authorizer {
         ConfiguredMintAuthorizer::Enabled(_) => return Ok(()),
         ConfiguredMintAuthorizer::Disabled => {}
     }
 
-    for symbol in preflighted_equities(assets) {
+    for symbol in preflighted_equities(assets, role) {
         match vault_modes.vault_mode(symbol).await {
             Ok(VaultModeTag::VaultDirect) => {}
             Ok(VaultModeTag::Orchestrator) => {
@@ -2465,10 +2484,17 @@ async fn preflight_tokenization<Signer: Wallet + Clone, Reader: VaultModeReader 
             );
         };
 
+        let role = if watched.chain == ctx.chains.primary().chain {
+            ChainRole::Primary
+        } else {
+            ChainRole::Secondary
+        };
+
         attest_chain_vaults(
             watched.chain,
             tokenization.wrapper.as_ref(),
             &watched.assets,
+            role,
         )
         .await?;
 
@@ -2477,6 +2503,7 @@ async fn preflight_tokenization<Signer: Wallet + Clone, Reader: VaultModeReader 
             &tokenization.mint_authorizer,
             vault_modes,
             &watched.assets,
+            role,
         )
         .await?;
     }
@@ -15775,7 +15802,7 @@ mod tests {
             .attesting_unwrapped_token(Address::repeat_byte(0xa7));
         let assets = assets_with_equity("AAPL", equity_asset(underlying, vault));
 
-        let error = attest_chain_vaults(Chain::Ethereum, &wrapper, &assets)
+        let error = attest_chain_vaults(Chain::Ethereum, &wrapper, &assets, ChainRole::Primary)
             .await
             .unwrap_err();
 
@@ -15806,6 +15833,7 @@ mod tests {
             Chain::Base,
             &disagreeing,
             &assets_with_equity("AAPL", disabled),
+            ChainRole::Primary,
         )
         .await
         .unwrap();
@@ -15822,6 +15850,7 @@ mod tests {
             Chain::Base,
             &agreeing,
             &assets_with_equity("AAPL", rebalancing_only),
+            ChainRole::Primary,
         )
         .await
         .unwrap();
@@ -15844,12 +15873,79 @@ mod tests {
             &ConfiguredMintAuthorizer::Disabled,
             &StubVaultModeReader(VaultModeTag::Orchestrator),
             &assets,
+            ChainRole::Primary,
         )
         .await
         .unwrap_err();
 
         assert_eq!(error.chain, Chain::Ethereum);
         assert_eq!(error.symbol, Symbol::new("AAPL").unwrap());
+    }
+
+    /// A secondary chain's preflight covers only the equities it rebalances:
+    /// a trading-only equity there needs no wrapper vault, so its vault is
+    /// neither attested nor its mode read, while a rebalancing-enabled one
+    /// still fails a disagreeing vault and an orchestrator-mode read.
+    #[tokio::test]
+    async fn secondary_chain_preflight_covers_only_rebalancing_enabled_equities() {
+        let underlying = Address::repeat_byte(0xe5);
+        let vault = Address::repeat_byte(0xe6);
+        let disagreeing = MockWrapper::new()
+            .with_tokenized_shares(underlying)
+            .with_wrapped_token(vault)
+            .attesting_unwrapped_token(Address::repeat_byte(0xe7));
+        let trading_only = assets_with_equity("TSLA", equity_asset(underlying, vault));
+
+        attest_chain_vaults(
+            Chain::Ethereum,
+            &disagreeing,
+            &trading_only,
+            ChainRole::Secondary,
+        )
+        .await
+        .unwrap();
+        preflight_orchestrator_entries(
+            Chain::Ethereum,
+            &ConfiguredMintAuthorizer::Disabled,
+            &ScriptedVaultModeReader::MustNotBeAsked,
+            &trading_only,
+            ChainRole::Secondary,
+        )
+        .await
+        .unwrap();
+
+        let mut rebalanced = equity_asset(underlying, vault);
+        rebalanced.rebalancing = OperationMode::Enabled;
+        let rebalanced = assets_with_equity("TSLA", rebalanced);
+
+        let error = attest_chain_vaults(
+            Chain::Ethereum,
+            &disagreeing,
+            &rebalanced,
+            ChainRole::Secondary,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.chain, Chain::Ethereum);
+        assert!(matches!(
+            error.source,
+            st0x_wrapper::WrapperError::VaultAssetMismatch { ref symbol, .. }
+                if symbol.as_str() == "TSLA"
+        ));
+
+        let error = preflight_orchestrator_entries(
+            Chain::Ethereum,
+            &ConfiguredMintAuthorizer::Disabled,
+            &StubVaultModeReader(VaultModeTag::Orchestrator),
+            &rebalanced,
+            ChainRole::Secondary,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.chain, Chain::Ethereum);
+        assert_eq!(error.symbol, Symbol::new("TSLA").unwrap());
     }
 
     /// The two vault-mode outcomes the stub cannot script: issuance out of
@@ -15887,6 +15983,7 @@ mod tests {
             &ConfiguredMintAuthorizer::Disabled,
             &StubVaultModeReader(VaultModeTag::VaultDirect),
             &assets,
+            ChainRole::Primary,
         )
         .await
         .unwrap();
@@ -15906,6 +16003,7 @@ mod tests {
             &ConfiguredMintAuthorizer::Enabled(Arc::new(MockMintAuthorizer)),
             &ScriptedVaultModeReader::MustNotBeAsked,
             &assets,
+            ChainRole::Primary,
         )
         .await
         .unwrap();
@@ -15924,6 +16022,7 @@ mod tests {
             &ConfiguredMintAuthorizer::Disabled,
             &ScriptedVaultModeReader::MustNotBeAsked,
             &assets_with_equity("AAPL", disabled),
+            ChainRole::Primary,
         )
         .await
         .unwrap();
@@ -15946,6 +16045,7 @@ mod tests {
             &ConfiguredMintAuthorizer::Disabled,
             &ScriptedVaultModeReader::Unreachable,
             &assets,
+            ChainRole::Primary,
         )
         .await
         .unwrap();
