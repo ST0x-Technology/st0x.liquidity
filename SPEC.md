@@ -193,12 +193,12 @@ table, and `alpaca-tokenize` takes the tStock address directly with `--token`.
 USDC is the selected chain's canonical contract, refused where this build pins
 none. An operator equity transfer checks gas on the selected chain's wallet
 against its `[alerts.low_balance_thresholds]` entry and refuses a chain without
-one. The mint and redemption aggregates record no chain yet, and the server's
-startup recovery resumes every interrupted transfer with the primary chain's
-services, so `transfer-equity` refuses any network but the primary until the
-aggregates carry their chain. The network a transfer started on has to be named
-only for `transfer-equity --issuer-request-id`, which re-runs the transfer
-command itself; the recovery verbs above carry no network at all.
+one. The mint and redemption aggregates record the chain they run on, and both
+the server's startup recovery and the operator's resume drive an interrupted
+transfer with that chain's services. The network a transfer started on has to be
+named only for `transfer-equity --issuer-request-id`, which re-runs the transfer
+command itself, and a `--network` that disagrees with the record is refused; the
+recovery verbs above carry no network at all.
 
 ##### Shared-Inventory Settlement
 
