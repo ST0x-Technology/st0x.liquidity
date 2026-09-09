@@ -572,7 +572,7 @@ mod tests {
 
         assert!(
             err_msg.contains(
-                "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+                "vault_ids in [chains.base.trading.assets.cash] is required but not configured"
             ),
             "Expected vault_id missing error, got: {err_msg}"
         );
@@ -613,7 +613,7 @@ mod tests {
 
         assert!(
             err_msg.contains(
-                "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+                "vault_ids in [chains.base.trading.assets.cash] is required but not configured"
             ),
             "Expected vault_id missing error, got: {err_msg}"
         );

@@ -4366,9 +4366,9 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.to_string().contains(
-                "equity COIN is not configured in [chains.<name>.trading.assets.equities]"
-            ),
+            error
+                .to_string()
+                .contains("equity COIN is not configured in [chains.base.trading.assets.equities]"),
             "an unconfigured symbol must fail before any network call, got: {error}"
         );
     }
