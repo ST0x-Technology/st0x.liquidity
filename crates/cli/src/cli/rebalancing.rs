@@ -1275,7 +1275,7 @@ fn resolve_tokenization_token(
 
     trading.assets.tokenized_equity(symbol).ok_or_else(|| {
         anyhow::anyhow!(
-            "equity {symbol} is not configured in [chains.<name>.trading.assets.equities]"
+            "equity {symbol} is not configured in [chains.{chain}.trading.assets.equities]"
         )
     })
 }

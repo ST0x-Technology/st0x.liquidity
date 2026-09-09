@@ -184,13 +184,13 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
 
     let cash = trading.assets.cash.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
-            "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+            "vault_ids in [chains.{chain}.trading.assets.cash] is required but not configured"
         )
     })?;
 
     let vault_id = cash.vault_ids.first().copied().ok_or_else(|| {
         anyhow::anyhow!(
-            "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+            "vault_ids in [chains.{chain}.trading.assets.cash] is required but not configured"
         )
     })?;
 
