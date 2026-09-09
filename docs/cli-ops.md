@@ -15,8 +15,8 @@ Every command that itself submits an onchain operation takes `--network`
 (`base`, `ethereum`, `hyperevm`; default `base`) and runs on that chain's
 signing wallet. The `transfer` recovery verbs (`recheck`, `resume`, `reconcile`,
 `fail`) take no `--network`: they act on the bot's local records or hand the
-work to the running bot, which runs on its own configured chain. Two contracts
-apply to the network-aware commands:
+work to the running bot, whose recovery runs on the primary chain's services.
+Two contracts apply to the network-aware commands:
 
 - Orderbook-backed commands (`vault-deposit`, `vault-withdraw`,
   `vault-withdraw-usdc`, `reset-allowance`, `transfer-equity`, `donate-equity`,
@@ -25,8 +25,10 @@ apply to the network-aware commands:
   trading table is refused by name; the primary's addresses are never
   substituted.
 - Asset-only commands (`wrap-equity`, `unwrap-equity`, `alpaca-tokenize`,
-  `alpaca-redeem`) need no orderbook and accept `--registry` (the st0x.registry
-  token list) for a chain that lists an asset but has no trading table.
+  `alpaca-redeem`) need no orderbook. For a chain that lists an asset but has no
+  trading table, `wrap-equity`, `unwrap-equity` and `alpaca-redeem` accept
+  `--registry` (the st0x.registry token list), and `alpaca-tokenize` accepts the
+  tStock address directly with `--token`.
 
 Where a command needs USDC it uses the selected chain's canonical contract,
 refused on a chain this build pins none for (HyperEVM).
@@ -263,16 +265,17 @@ stox vault-deposit --amount 10 --token <wrapped-token> --vault-id <vault-id> --n
 ```
 
 For USDC, deposit the chain's canonical USDC into the cash vault the same way
-(`vault-deposit --network ethereum --token <usdc> --vault-id <cash-vault-id>`);
-`vault-withdraw-usdc --network <chain>` reverses it and
+(`vault-deposit --amount <amount> --network ethereum --token <usdc> --vault-id <cash-vault-id>`);
+`vault-withdraw-usdc --amount <amount> --network <chain>` reverses it and
 `reset-allowance --network <chain>` zeroes the orderbook's USDC allowance on
 that chain. `transfer-equity --network <chain>` is refused for any chain but the
 primary until the mint and redemption aggregates record their chain: the
 server's startup recovery resumes every interrupted transfer with the primary
 chain's services, so a secondary-chain transfer in the shared database would be
 continued on the wrong network. Fund a secondary chain with the three asset-only
-commands above instead. A resumed mint (`--issuer-request-id`) must be given the
-network it started on.
+commands above instead. The network a transfer started on has to be named only
+for `transfer-equity --issuer-request-id`, which re-runs the transfer command
+itself; the `transfer` recovery verbs carry no network at all.
 
 ## Alpaca Crypto Wallet Management
 
