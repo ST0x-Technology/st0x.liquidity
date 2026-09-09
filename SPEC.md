@@ -127,16 +127,19 @@ fatal; degraded per-chain startup is deferred to the chain-disable work.
 When rebalancing is configured, the tokenization services are built once per
 watched chain, never once for Base: each watched chain gets its own issuer
 client, wrapper and mint authorizer bound to that chain's signing wallet,
-orderbook, asset table, issuer redemption wallet and `[orchestrator.addresses]`
-entry. Every watched chain must then have its own redemption wallet, or startup
-fails naming the chain. Standalone mode builds no tokenization set at all. The
-rebalancer, the equity-recovery jobs and the portfolio snapshot consume the
-primary chain's set until the global rebalancer owns chain selection; the sets
-exist so that selection is a lookup rather than a rewire. The startup MAX
-approvals, the stale-allowance revoke and the tokenization preflight (below) run
-once per watched chain with that chain's wallet, orderbook and canonical USDC; a
-watched chain for which this build has no pinned USDC fails startup rather than
-borrowing another chain's address.
+orderbook, asset table and issuer redemption wallet, plus that chain's
+`[orchestrator.addresses]` entry when the section carries one; without the entry
+the chain's mint authorizer is disabled with a startup warning and only an
+orchestrator-mode mint fails (see Mint Recipient Authorization). Every watched
+chain must have its own redemption wallet, or startup fails naming the chain.
+Standalone mode builds no tokenization set at all. The rebalancer, the
+equity-recovery jobs and the portfolio snapshot consume the primary chain's set
+until the global rebalancer owns chain selection; the sets exist so that
+selection is a lookup rather than a rewire. The stale-allowance revoke and the
+tokenization preflight (below) run once per watched chain with that chain's
+wallet, orderbook and canonical USDC, as do the startup MAX approvals in either
+mode; a watched chain for which this build has no pinned USDC fails startup
+rather than borrowing another chain's address.
 
 ##### Shared-Inventory Settlement
 
@@ -441,12 +444,13 @@ checkpoint-driven `eth_getLogs` poll rather than a live subscription, no events
 can be missed across downtime: the order fill monitor always resumes from the
 persisted checkpoint and re-scans any gap.
 
-Before any worker or rebalancer runs, startup grants the one-time MAX approvals
-on every watched chain (each enabled equity's underlying to its wrapper vault,
-wrapped to that chain's orderbook, that chain's canonical USDC to its orderbook)
-with that chain's wallet, and in managed inventory mode revokes any stale
-orderbook allowance per chain the same way. When rebalancing is configured, a
-tokenization preflight then runs per watched chain, read-only: the chain's
+Before any worker or rebalancer runs, and in both modes whenever a signing
+wallet is configured, startup grants the one-time MAX approvals on every watched
+chain (each enabled equity's underlying to its wrapper vault, wrapped to that
+chain's orderbook, that chain's canonical USDC to its orderbook) with that
+chain's wallet. Only when rebalancing is configured does it also revoke any
+stale orderbook allowance, per chain in managed inventory mode, the same way,
+and a tokenization preflight then runs per watched chain, read-only: the chain's
 issuer redemption wallet must be configured, and every enabled equity's
 configured vault must report the configured underlying as its `asset()` (the
 same attestation a redemption's unwrap step performs). Each failure is fatal and
