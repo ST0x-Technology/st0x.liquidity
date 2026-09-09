@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx};
@@ -13,11 +13,11 @@ use super::journal::JournalResponse;
 use super::order::{AlpacaLimitOrder, ConversionOrder, CryptoOrderResponse};
 use super::{AlpacaBrokerApiError, AssetStatus, MissingOrderField, TimeInForce};
 use crate::{
-    CancellationOutcome, ClientOrderId, CounterTradePreflight, Direction, Executor,
-    ExecutorOrderId, FractionalShares, InventoryResult, LatestQuote, LimitOrder, MarketOrder,
-    MarketSession, MarketSessionStatus, OrderPlacement, OrderState, OrderStatus, Positive,
-    SupportedExecutor, Symbol, TryIntoExecutor, Usd, buying_power_counter_trade_preflight,
-    estimate_buffered_cost_cents,
+    CancellationOutcome, ClientOrderId, CounterTradePreflight, CounterTradeSkipReason, Direction,
+    Executor, ExecutorOrderId, FractionalShares, InventoryResult, LatestQuote, LimitOrder,
+    MarketOrder, MarketSession, MarketSessionStatus, OrderPlacement, OrderState, OrderStatus,
+    Positive, SupportedExecutor, Symbol, TryIntoExecutor, Usd,
+    buying_power_counter_trade_preflight, estimate_buffered_cost_cents,
 };
 
 /// Response from the asset endpoint
@@ -25,6 +25,9 @@ use crate::{
 pub(super) struct AssetResponse {
     pub status: AssetStatus,
     pub tradable: bool,
+    /// Missing metadata is treated as whole-share-only by order sizing.
+    #[serde(default)]
+    pub fractionable: Option<bool>,
 }
 
 /// Cached asset information with expiration tracking
@@ -32,6 +35,7 @@ pub(super) struct AssetResponse {
 struct CachedAsset {
     status: AssetStatus,
     tradable: bool,
+    fractionable: Option<bool>,
     cached_at: Instant,
 }
 
@@ -40,6 +44,7 @@ impl CachedAsset {
         Self {
             status: response.status,
             tradable: response.tradable,
+            fractionable: response.fractionable,
             cached_at: Instant::now(),
         }
     }
@@ -47,6 +52,26 @@ impl CachedAsset {
     fn is_expired(&self, ttl: Duration) -> bool {
         self.cached_at.elapsed() > ttl
     }
+}
+
+fn truncate_non_fractionable_shares(
+    shares: Positive<FractionalShares>,
+    fractionable: Option<bool>,
+) -> Result<Option<Positive<FractionalShares>>, AlpacaBrokerApiError> {
+    if fractionable == Some(true) {
+        return Ok(Some(shares));
+    }
+
+    let Some(truncated) = crate::truncate_to_decimal_places(shares.inner().inner(), 0)? else {
+        return Ok(None);
+    };
+    Ok(Some(Positive::new(FractionalShares::new(truncated))?))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreparedCounterTradeShares {
+    shares: Option<Positive<FractionalShares>>,
+    fractional_orders_supported: bool,
 }
 
 /// Alpaca Broker API executor implementation
@@ -124,10 +149,11 @@ impl Executor for AlpacaBrokerApi {
 
     async fn place_market_order(
         &self,
-        order: MarketOrder,
+        mut order: MarketOrder,
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
-        let asset = self.get_asset_cached(&order.symbol).await?;
-        Self::validate_asset(&order.symbol, &asset)?;
+        order.shares = self
+            .prepare_order_shares_for_placement(&order.symbol, order.shares)
+            .await?;
 
         super::order::place_market_order(&self.client, order, self.time_in_force).await
     }
@@ -262,8 +288,22 @@ impl Executor for AlpacaBrokerApi {
 
     async fn preflight_counter_trade(
         &self,
-        order: MarketOrder,
+        mut order: MarketOrder,
     ) -> Result<CounterTradePreflight, Self::Error> {
+        let requested = order.shares;
+        let prepared = self
+            .prepare_counter_trade_shares(&order.symbol, requested)
+            .await?;
+        let Some(shares) = prepared.shares else {
+            return Ok(CounterTradePreflight::Skipped(
+                CounterTradeSkipReason::NonFractionableQuantityBelowOne {
+                    symbol: order.symbol,
+                    requested,
+                },
+            ));
+        };
+        order.shares = shares;
+
         match order.direction {
             Direction::Sell => {
                 let inventory = super::positions::fetch_inventory(&self.client).await?;
@@ -273,7 +313,22 @@ impl Executor for AlpacaBrokerApi {
                     .find(|position| position.symbol == order.symbol)
                     .map_or(FractionalShares::ZERO, |position| position.quantity);
 
-                Ok(crate::resolve_sell_preflight(order, available)?)
+                let tradable_available = if prepared.fractional_orders_supported {
+                    available
+                } else {
+                    let Some(truncated) = crate::truncate_to_decimal_places(available.inner(), 0)?
+                    else {
+                        return Ok(CounterTradePreflight::Skipped(
+                            CounterTradeSkipReason::InsufficientEquity {
+                                required: order.shares,
+                                available,
+                            },
+                        ));
+                    };
+                    FractionalShares::new(truncated)
+                };
+
+                Ok(crate::resolve_sell_preflight(order, tradable_available)?)
             }
             Direction::Buy => {
                 let latest_trade_price = crate::alpaca_market_data::fetch_latest_trade_price(
@@ -297,7 +352,23 @@ impl Executor for AlpacaBrokerApi {
             // Inventory availability doesn't depend on price; keep the
             // ordinary preflight for sells.
             Direction::Sell => self.preflight_counter_trade(order).await,
-            Direction::Buy => self.preflight_buy_cash(&order, limit_price, 0).await,
+            Direction::Buy => {
+                let mut order = order;
+                let requested = order.shares;
+                let prepared = self
+                    .prepare_counter_trade_shares(&order.symbol, requested)
+                    .await?;
+                let Some(shares) = prepared.shares else {
+                    return Ok(CounterTradePreflight::Skipped(
+                        CounterTradeSkipReason::NonFractionableQuantityBelowOne {
+                            symbol: order.symbol,
+                            requested,
+                        },
+                    ));
+                };
+                order.shares = shares;
+                self.preflight_buy_cash(&order, limit_price, 0).await
+            }
         }
     }
 
@@ -328,10 +399,11 @@ impl Executor for AlpacaBrokerApi {
 
     async fn place_limit_order(
         &self,
-        order: LimitOrder,
+        mut order: LimitOrder,
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
-        let asset = self.get_asset_cached(&order.symbol).await?;
-        Self::validate_asset(&order.symbol, &asset)?;
+        order.shares = self
+            .prepare_order_shares_for_placement(&order.symbol, order.shares)
+            .await?;
 
         let alpaca_limit_price = super::order::AlpacaLimitPrice::try_new(order.limit_price)?;
 
@@ -520,6 +592,67 @@ impl AlpacaBrokerApi {
         Ok(())
     }
 
+    async fn prepare_counter_trade_shares(
+        &self,
+        symbol: &Symbol,
+        shares: Positive<FractionalShares>,
+    ) -> Result<PreparedCounterTradeShares, AlpacaBrokerApiError> {
+        let asset = self.get_asset_cached(symbol).await?;
+        Self::validate_asset(symbol, &asset)?;
+
+        let fractional_orders_supported = asset.fractionable == Some(true);
+
+        if asset.fractionable.is_none() {
+            warn!(
+                %symbol,
+                requested = %shares,
+                "Alpaca asset metadata omits fractionable; sizing order as whole shares"
+            );
+        }
+
+        let Some(truncated) = truncate_non_fractionable_shares(shares, asset.fractionable)? else {
+            warn!(
+                %symbol,
+                requested = %shares,
+                "Non-fractionable quantity truncates below one share; deferring order"
+            );
+            return Ok(PreparedCounterTradeShares {
+                shares: None,
+                fractional_orders_supported,
+            });
+        };
+
+        if truncated != shares {
+            debug!(
+                %symbol,
+                requested = %shares,
+                placed = %truncated,
+                "Truncated non-fractionable asset order to whole shares"
+            );
+        }
+
+        Ok(PreparedCounterTradeShares {
+            shares: Some(truncated),
+            fractional_orders_supported,
+        })
+    }
+
+    async fn prepare_order_shares_for_placement(
+        &self,
+        symbol: &Symbol,
+        requested: Positive<FractionalShares>,
+    ) -> Result<Positive<FractionalShares>, AlpacaBrokerApiError> {
+        let prepared = self.prepare_counter_trade_shares(symbol, requested).await?;
+        let Some(shares) = prepared.shares else {
+            return Err(AlpacaBrokerApiError::BelowPrecision {
+                shares: requested,
+                max_decimals: 0,
+            });
+        };
+
+        Ok(shares)
+    }
+
     /// Shared buying-power check for counter-trade buy branches.
     ///
     /// Ordinary market-order preflight supplies the configured slippage band;
@@ -540,6 +673,7 @@ impl AlpacaBrokerApi {
 
         let available_buying_power_cents = account_funds.buying_power;
         let preflight = buying_power_counter_trade_preflight(
+            order.shares,
             estimated_cost_cents,
             available_buying_power_cents,
         );
@@ -581,11 +715,38 @@ mod tests {
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
+    fn positive_shares(value: &str) -> Positive<FractionalShares> {
+        Positive::new(FractionalShares::new(
+            Float::parse(value.to_string()).unwrap(),
+        ))
+        .unwrap()
+    }
+
     #[test]
     fn test_asset_status_deserialize_active() {
         let json = r#""active""#;
         let status: AssetStatus = serde_json::from_str(json).unwrap();
         assert_eq!(status, AssetStatus::Active);
+    }
+
+    #[test]
+    fn fractionable_quantity_retains_fractional_precision() {
+        let requested = positive_shares("1951.126");
+
+        assert_eq!(
+            truncate_non_fractionable_shares(requested, Some(true)).unwrap(),
+            Some(requested)
+        );
+    }
+
+    #[test]
+    fn missing_fractionability_uses_whole_share_precision() {
+        let requested = positive_shares("3.75");
+
+        assert_eq!(
+            truncate_non_fractionable_shares(requested, None).unwrap(),
+            Some(positive_shares("3"))
+        );
     }
 
     #[test]
@@ -618,6 +779,34 @@ mod tests {
         let response: AssetResponse = serde_json::from_value(json).unwrap();
         assert_eq!(response.status, AssetStatus::Active);
         assert!(response.tradable);
+        assert_eq!(response.fractionable, None);
+    }
+
+    #[test]
+    fn test_asset_response_deserializes_real_sandbox_payload() {
+        // Captured from Alpaca sandbox on 2026-08-25. Fractionability is a
+        // top-level boolean; other eligibility flags are array attributes.
+        let json = json!({
+            "id": "91cee411-1675-48eb-a902-45c8c152f2a1",
+            "class": "us_equity",
+            "exchange": "NASDAQ",
+            "symbol": "RKLB",
+            "name": "Rocket Lab Corporation Common Stock",
+            "status": "active",
+            "tradable": true,
+            "marginable": true,
+            "maintenance_margin_requirement": 30,
+            "margin_requirement_long": "30",
+            "margin_requirement_short": "30",
+            "shortable": true,
+            "easy_to_borrow": true,
+            "borrow_status": "easy_to_borrow",
+            "fractionable": true,
+            "attributes": ["fractional_eh_enabled", "has_options", "overnight_tradable"]
+        });
+
+        let response: AssetResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(response.fractionable, Some(true));
     }
 
     #[test]
@@ -625,12 +814,14 @@ mod tests {
         let response = AssetResponse {
             status: AssetStatus::Active,
             tradable: true,
+            fractionable: Some(false),
         };
 
         let cached = CachedAsset::from_response(&response);
 
         assert_eq!(cached.status, AssetStatus::Active);
         assert!(cached.tradable);
+        assert_eq!(cached.fractionable, Some(false));
         // cached_at should be very recent (within last second)
         assert!(cached.cached_at.elapsed() < Duration::from_secs(1));
     }
@@ -640,6 +831,7 @@ mod tests {
         let cached = CachedAsset {
             status: AssetStatus::Active,
             tradable: true,
+            fractionable: None,
             cached_at: Instant::now(),
         };
 
@@ -654,6 +846,7 @@ mod tests {
         let cached = CachedAsset {
             status: AssetStatus::Active,
             tradable: true,
+            fractionable: None,
             cached_at: Instant::now()
                 .checked_sub(Duration::from_secs(100))
                 .unwrap(),
@@ -672,6 +865,7 @@ mod tests {
         let cached = CachedAsset {
             status: AssetStatus::Active,
             tradable: true,
+            fractionable: None,
             cached_at: Instant::now(),
         };
 
@@ -685,6 +879,7 @@ mod tests {
         let cached = CachedAsset {
             status: AssetStatus::Active,
             tradable: true,
+            fractionable: None,
             cached_at: Instant::now(),
         };
 
@@ -702,6 +897,7 @@ mod tests {
         let cached = CachedAsset {
             status: AssetStatus::Active,
             tradable: true,
+            fractionable: None,
             cached_at: Instant::now(),
         };
 
@@ -1059,6 +1255,7 @@ mod tests {
                 }));
         });
         let latest_trade_mock = create_latest_trade_mock(&server, "100.00");
+        let asset_mock = create_asset_mock(&server, "AAPL", "active", true);
 
         let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
         let preflight = executor
@@ -1073,6 +1270,7 @@ mod tests {
 
         account_mock.assert_calls(2);
         latest_trade_mock.assert();
+        asset_mock.assert();
         assert!(matches!(
             preflight,
             CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientBuyingPower {
@@ -1104,6 +1302,7 @@ mod tests {
                 }));
         });
         let latest_trade_mock = create_latest_trade_mock(&server, "100.00");
+        let asset_mock = create_asset_mock(&server, "AAPL", "active", true);
 
         let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
         let preflight = executor
@@ -1118,14 +1317,18 @@ mod tests {
 
         account_mock.assert_calls(2);
         latest_trade_mock.assert();
+        asset_mock.assert();
         assert!(matches!(
             preflight,
             CounterTradePreflight::Allowed {
                 reservation: Some(CounterTradeReservation::BuyingPower {
+                    required,
                     estimated_cost_cents,
                     available_buying_power_cents,
                 }),
-            } if estimated_cost_cents == 20_200 && available_buying_power_cents == 3_500_000
+            } if required == positive_shares("2")
+                && estimated_cost_cents == 20_200
+                && available_buying_power_cents == 3_500_000
         ));
     }
 
@@ -1146,6 +1349,7 @@ mod tests {
                 }));
         });
         let latest_trade_mock = create_latest_trade_mock(&server, "1.00");
+        let asset_mock = create_asset_mock(&server, "AAPL", "active", true);
 
         let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
         let preflight = executor
@@ -1162,14 +1366,18 @@ mod tests {
             .unwrap();
 
         latest_trade_mock.assert_calls(0);
+        asset_mock.assert();
         assert!(matches!(
             preflight,
             CounterTradePreflight::Allowed {
                 reservation: Some(CounterTradeReservation::BuyingPower {
+                    required,
                     estimated_cost_cents,
                     available_buying_power_cents,
                 }),
-            } if estimated_cost_cents == 20_000 && available_buying_power_cents == 20_000
+            } if required == positive_shares("2")
+                && estimated_cost_cents == 20_000
+                && available_buying_power_cents == 20_000
         ));
     }
 
@@ -1199,6 +1407,7 @@ mod tests {
                 .header("content-type", "application/json")
                 .json_body(json!([]));
         });
+        let asset_mock = create_asset_mock(&server, "AAPL", "active", true);
 
         let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
         let preflight = executor
@@ -1215,6 +1424,7 @@ mod tests {
             .unwrap();
 
         positions_mock.assert();
+        asset_mock.assert();
         assert!(matches!(
             preflight,
             CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientEquity {
@@ -1238,7 +1448,27 @@ mod tests {
                     "id": "904837e3-3b76-47ec-b432-046db621571b",
                     "symbol": symbol,
                     "status": status,
-                    "tradable": tradable
+                    "tradable": tradable,
+                    "fractionable": true
+                }));
+        })
+    }
+
+    fn create_asset_fractionability_mock<'a>(
+        server: &'a MockServer,
+        symbol: &str,
+        fractionable: bool,
+    ) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method(GET).path(format!("/v1/assets/{symbol}"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": symbol,
+                    "status": "active",
+                    "tradable": true,
+                    "fractionable": fractionable
                 }));
         })
     }
@@ -1385,6 +1615,222 @@ mod tests {
         let placement = result.unwrap();
         assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(placement.symbol.to_string(), "AAPL");
+    }
+
+    #[tokio::test]
+    async fn market_order_truncates_non_fractionable_quantity_to_whole_shares() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let asset_mock = create_asset_fractionability_mock(&server, "FGI", false);
+        let order_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "FGI",
+                    "qty": "1951",
+                    "side": "buy",
+                    "type": "market",
+                    "time_in_force": "day",
+                    "extended_hours": false,
+                    "client_order_id": "99999999-9999-4999-8999-999999999999"
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "FGI",
+                    "qty": "1951",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+        let placement = executor
+            .place_market_order(MarketOrder {
+                symbol: Symbol::new("FGI").unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(1951.126))).unwrap(),
+                direction: Direction::Buy,
+                client_order_id: ClientOrderId::from_uuid(uuid!(
+                    "99999999-9999-4999-8999-999999999999"
+                )),
+            })
+            .await
+            .unwrap();
+
+        asset_mock.assert();
+        order_mock.assert();
+        assert_eq!(placement.shares, positive_shares("1951"));
+    }
+
+    #[tokio::test]
+    async fn non_fractionable_quantity_below_one_skips_preflight_without_broker_order() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let asset_mock = create_asset_fractionability_mock(&server, "FGI", false);
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let requested = positive_shares("0.75");
+        let preflight = executor
+            .preflight_counter_trade(MarketOrder {
+                symbol: Symbol::new("FGI").unwrap(),
+                shares: requested,
+                direction: Direction::Buy,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            })
+            .await
+            .unwrap();
+
+        asset_mock.assert();
+        assert!(matches!(
+            preflight,
+            CounterTradePreflight::Skipped(
+                CounterTradeSkipReason::NonFractionableQuantityBelowOne {
+                    ref symbol,
+                    requested: skipped,
+                }
+            ) if *symbol == Symbol::new("FGI").unwrap() && skipped == requested
+        ));
+    }
+
+    #[tokio::test]
+    async fn market_order_below_one_non_fractionable_share_is_not_placed() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let asset_mock = create_asset_fractionability_mock(&server, "FGI", false);
+        let order_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(200);
+        });
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let requested = positive_shares("0.75");
+        let error = executor
+            .place_market_order(MarketOrder {
+                symbol: Symbol::new("FGI").unwrap(),
+                shares: requested,
+                direction: Direction::Buy,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            })
+            .await
+            .unwrap_err();
+
+        asset_mock.assert();
+        order_mock.assert_calls(0);
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::BelowPrecision {
+                shares,
+                max_decimals: 0,
+            } if shares == requested
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_fractionable_buy_preflight_reserves_the_whole_share_quantity() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE",
+                    "cash": "1000.00"
+                }));
+        });
+        let latest_trade_mock = create_latest_trade_mock(&server, "100.00");
+        let asset_mock = create_asset_fractionability_mock(&server, "AAPL", false);
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+
+        let preflight = executor
+            .preflight_counter_trade(MarketOrder {
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: positive_shares("3.75"),
+                direction: Direction::Buy,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            })
+            .await
+            .unwrap();
+
+        account_mock.assert_calls(2);
+        latest_trade_mock.assert();
+        asset_mock.assert();
+        assert!(matches!(
+            preflight,
+            CounterTradePreflight::Allowed {
+                reservation: Some(CounterTradeReservation::BuyingPower {
+                    required,
+                    estimated_cost_cents,
+                    ..
+                }),
+            } if required == positive_shares("3") && estimated_cost_cents == 30_300
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_fractionable_sell_preflight_caps_fractional_inventory_to_whole_shares() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE",
+                    "cash": "100.00"
+                }));
+        });
+        let positions_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "symbol": "FGI",
+                    "asset_class": "us_equity",
+                    "qty_available": "1.9"
+                }]));
+        });
+        let asset_mock = create_asset_fractionability_mock(&server, "FGI", false);
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+
+        let preflight = executor
+            .preflight_counter_trade(MarketOrder {
+                symbol: Symbol::new("FGI").unwrap(),
+                shares: positive_shares("2.75"),
+                direction: Direction::Sell,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            })
+            .await
+            .unwrap();
+
+        account_mock.assert_calls(2);
+        positions_mock.assert();
+        asset_mock.assert();
+        assert!(matches!(
+            preflight,
+            CounterTradePreflight::Allowed {
+                reservation: Some(CounterTradeReservation::Equity {
+                    required,
+                    available,
+                    ..
+                }),
+            } if required == positive_shares("1")
+                && available == FractionalShares::new(float!(1))
+        ));
     }
 
     #[tokio::test]
@@ -1614,6 +2060,100 @@ mod tests {
         assert_eq!(result.direction, Direction::Buy);
         assert!(result.extended_hours);
         assert_eq!(result.limit_price, Some(limit_price));
+    }
+
+    #[tokio::test]
+    async fn extended_hours_order_truncates_non_fractionable_quantity_to_whole_shares() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let asset_mock = create_asset_fractionability_mock(&server, "FGI", false);
+        let order_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "FGI",
+                    "qty": "1951",
+                    "side": "buy",
+                    "type": "limit",
+                    "limit_price": "7.36",
+                    "time_in_force": "day",
+                    "extended_hours": true,
+                    "client_order_id": "77777777-7777-4777-8777-777777777777"
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "FGI",
+                    "qty": "1951",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+        let placement = <AlpacaBrokerApi as Executor>::place_limit_order(
+            &executor,
+            LimitOrder {
+                symbol: Symbol::new("FGI").unwrap(),
+                shares: positive_shares("1951.126"),
+                direction: Direction::Buy,
+                limit_price: Positive::new(Usd::new(float!(7.36))).unwrap(),
+                extended_hours: true,
+                client_order_id: ClientOrderId::from_uuid(uuid!(
+                    "77777777-7777-4777-8777-777777777777"
+                )),
+            },
+        )
+        .await
+        .unwrap();
+
+        asset_mock.assert();
+        order_mock.assert();
+        assert_eq!(placement.shares, positive_shares("1951"));
+    }
+
+    #[tokio::test]
+    async fn limit_order_below_one_non_fractionable_share_is_not_placed() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let asset_mock = create_asset_fractionability_mock(&server, "FGI", false);
+        let order_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(200);
+        });
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let requested = positive_shares("0.75");
+        let error = <AlpacaBrokerApi as Executor>::place_limit_order(
+            &executor,
+            LimitOrder {
+                symbol: Symbol::new("FGI").unwrap(),
+                shares: requested,
+                direction: Direction::Buy,
+                limit_price: Positive::new(Usd::new(float!(7.36))).unwrap(),
+                extended_hours: true,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        asset_mock.assert();
+        order_mock.assert_calls(0);
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::BelowPrecision {
+                shares,
+                max_decimals: 0,
+            } if shares == requested
+        ));
     }
 
     #[tokio::test]

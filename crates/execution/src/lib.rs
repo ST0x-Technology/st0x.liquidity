@@ -556,6 +556,13 @@ pub enum InventoryResult {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CounterTradeSkipReason {
     #[error(
+        "non-fractionable asset {symbol} requires at least one whole share; requested {requested}"
+    )]
+    NonFractionableQuantityBelowOne {
+        symbol: Symbol,
+        requested: Positive<FractionalShares>,
+    },
+    #[error(
         "insufficient offchain equity inventory: need {required}, but only {available} shares are available"
     )]
     InsufficientEquity {
@@ -580,6 +587,7 @@ pub enum CounterTradeReservation {
         available: FractionalShares,
     },
     BuyingPower {
+        required: Positive<FractionalShares>,
         estimated_cost_cents: i64,
         available_buying_power_cents: i64,
     },
@@ -672,12 +680,14 @@ pub(crate) fn estimate_buffered_cost_cents(
 }
 
 pub(crate) fn buying_power_counter_trade_preflight(
+    required: Positive<FractionalShares>,
     estimated_cost_cents: i64,
     available_buying_power_cents: i64,
 ) -> CounterTradePreflight {
     if available_buying_power_cents >= estimated_cost_cents {
         CounterTradePreflight::Allowed {
             reservation: Some(CounterTradeReservation::BuyingPower {
+                required,
                 estimated_cost_cents,
                 available_buying_power_cents,
             }),

@@ -1173,6 +1173,7 @@ fn register_asset_endpoint(server: &MockServer) {
                     "symbol": symbol,
                     "status": "active",
                     "tradable": true,
+                    "fractionable": true,
                 }),
             )
         });
@@ -2438,6 +2439,21 @@ mod tests {
 
         assert_eq!(quote.bid().inner(), Usd::new(float!(150)));
         assert_eq!(quote.ask().inner(), Usd::new(float!(150)));
+    }
+
+    #[tokio::test]
+    async fn asset_endpoint_marks_default_mock_assets_fractionable() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        let client = AlpacaBrokerApiClient::new(&activities_ctx(&mock)).unwrap();
+
+        let asset = client.get_asset(&symbol).await.unwrap();
+
+        assert_eq!(asset.fractionable, Some(true));
     }
 
     #[tokio::test]

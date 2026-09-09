@@ -145,6 +145,9 @@ impl CloseFlattenCrossRamp {
 /// identically to the scan-time preflight.
 pub(crate) fn preflight_skip_reason_label(reason: &CounterTradeSkipReason) -> &'static str {
     match reason {
+        CounterTradeSkipReason::NonFractionableQuantityBelowOne { .. } => {
+            "non_fractionable_quantity_below_one"
+        }
         CounterTradeSkipReason::InsufficientEquity { .. } => "insufficient_equity",
         CounterTradeSkipReason::InsufficientBuyingPower { .. } => "insufficient_buying_power",
     }

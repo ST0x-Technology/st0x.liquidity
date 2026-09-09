@@ -575,6 +575,7 @@ enum CloseFlattenBlockReason {
     ReferencePriceUnavailable,
     MarkFetchFailed,
     QuoteFetchFailed,
+    NonFractionableQuantityBelowOne,
     InsufficientEquity,
     InsufficientBuyingPower,
 }
@@ -585,6 +586,7 @@ impl CloseFlattenBlockReason {
             Self::ReferencePriceUnavailable => "reference_price_unavailable",
             Self::MarkFetchFailed => "mark_fetch_failed",
             Self::QuoteFetchFailed => "quote_fetch_failed",
+            Self::NonFractionableQuantityBelowOne => "non_fractionable_quantity_below_one",
             Self::InsufficientEquity => "insufficient_equity",
             Self::InsufficientBuyingPower => "insufficient_buying_power",
         }
@@ -604,6 +606,9 @@ impl From<&ReferencePriceError> for CloseFlattenBlockReason {
 impl From<&CounterTradeSkipReason> for CloseFlattenBlockReason {
     fn from(reason: &CounterTradeSkipReason) -> Self {
         match reason {
+            CounterTradeSkipReason::NonFractionableQuantityBelowOne { .. } => {
+                Self::NonFractionableQuantityBelowOne
+            }
             CounterTradeSkipReason::InsufficientEquity { .. } => Self::InsufficientEquity,
             CounterTradeSkipReason::InsufficientBuyingPower { .. } => Self::InsufficientBuyingPower,
         }
@@ -2431,6 +2436,10 @@ mod tests {
         assert_eq!(
             CloseFlattenBlockReason::QuoteFetchFailed.metric_label(),
             "quote_fetch_failed"
+        );
+        assert_eq!(
+            CloseFlattenBlockReason::NonFractionableQuantityBelowOne.metric_label(),
+            "non_fractionable_quantity_below_one"
         );
         assert_eq!(
             CloseFlattenBlockReason::InsufficientEquity.metric_label(),

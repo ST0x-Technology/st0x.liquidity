@@ -254,6 +254,7 @@ impl MockExecutor {
         if inventory.usd_balance_cents >= estimated_cost_cents {
             Ok(CounterTradePreflight::Allowed {
                 reservation: Some(CounterTradeReservation::BuyingPower {
+                    required: order.shares,
                     estimated_cost_cents,
                     available_buying_power_cents: inventory.usd_balance_cents,
                 }),
@@ -912,10 +913,13 @@ mod tests {
             preflight,
             CounterTradePreflight::Allowed {
                 reservation: Some(CounterTradeReservation::BuyingPower {
+                    required,
                     estimated_cost_cents,
                     available_buying_power_cents,
                 }),
-            } if estimated_cost_cents == 20_000 && available_buying_power_cents == 20_000
+            } if required == positive_shares("2")
+                && estimated_cost_cents == 20_000
+                && available_buying_power_cents == 20_000
         ));
     }
 

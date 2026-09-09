@@ -71,9 +71,15 @@ and the system proves market fit.
 
 #### Note on Fractional Share Handling
 
-- **Alpaca Broker API**: Supports fractional share trading. Production can use
-  dollar-value execution thresholds to reduce unhedged exposure while still
-  respecting buying-power constraints.
+- **Alpaca Broker API**: Fractional-share support is declared per asset by the
+  broker's `fractionable` attribute. Before placing a market or extended-hours
+  limit counter-trade, the bot reads the cached asset attribute and truncates a
+  non-fractionable asset's quantity down to whole shares. A quantity below one
+  whole share is deferred without a broker call; it remains in the position to
+  accumulate. A missing `fractionable` attribute is treated conservatively as
+  whole-share-only. Fractionable assets retain Alpaca's nine-decimal quantity
+  bound. Production can use dollar-value execution thresholds to reduce unhedged
+  exposure while still respecting buying-power constraints.
 - **Dry run**: Supports fractional arithmetic for simulation and testing.
   Operators may still configure whole-share thresholds when that is useful for
   conservative modeling.
