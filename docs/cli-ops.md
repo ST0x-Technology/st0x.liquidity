@@ -280,10 +280,11 @@ itself; the `transfer` recovery verbs carry no network at all.
 ### Orchestrator Rollout per Chain
 
 Issuance keys an asset's `vault_mode` by symbol, so cutting an asset over to
-orchestrator mode applies on every chain it is listed on at once. Issuance
-refuses to start with an orchestrator-mode asset while any of its configured
-chains lacks an `[orchestrator.addresses]` entry, and its check walks every
-configured chain, not only the ones the asset is listed on. Complete the
+orchestrator mode applies on every chain it is listed on at once. Issuance's own
+config check (in the issuance deployment, independent of this bot's preflight
+below) refuses issuance startup with an orchestrator-mode asset while any of
+issuance's configured chains lacks an `[orchestrator.addresses]` entry; it walks
+every configured chain, not only the ones the asset is listed on. Complete the
 checklist for every chain the asset is listed on before the cutover:
 
 - [ ] Deploy `ST0xOrchestrator` on the chain.
@@ -305,7 +306,8 @@ chain and symbol, when issuance reports a trading- or rebalancing-enabled asset
 as orchestrator-mode while the chain has no entry. Issuance being unreachable at
 startup only warns (the per-mint mode read fails closed on its own); an
 orchestrator-mode mint reaching the signing step without its chain's entry fails
-there.
+there. A missing MintAuth policy is invisible at startup: the first
+orchestrator-mode mint on that chain fails at signing.
 
 ## Alpaca Crypto Wallet Management
 
