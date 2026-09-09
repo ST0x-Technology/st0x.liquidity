@@ -3190,6 +3190,29 @@ mod tests {
         );
     }
 
+    /// With no `--redemption-wallet`, the missing trading table is still what
+    /// the operator hears about: the redemption wallet lives inside that same
+    /// table, so reporting it first would send the operator after a flag that
+    /// cannot fix the real gap.
+    #[tokio::test]
+    async fn transfer_equity_services_name_the_trading_table_before_the_redemption_wallet() {
+        let mut ctx = create_alpaca_ctx_with_rebalancing(None);
+        ctx.wallet = Some(OnchainWalletCtx::stub());
+        let pool = setup_test_db().await;
+
+        let Err(error) =
+            build_equity_transfer_services(None, TokenizationNetwork::Ethereum, &ctx, &pool).await
+        else {
+            panic!("a network without a trading table must be refused");
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "ethereum has no [chains.ethereum.trading] table: vault operations need that \
+             chain's orderbook, and the primary's addresses do not apply there"
+        );
+    }
+
     /// The mint and redemption aggregates record no chain, and the server's
     /// startup recovery resumes every interrupted transfer with the primary
     /// chain's services. A transfer written for another chain would be
