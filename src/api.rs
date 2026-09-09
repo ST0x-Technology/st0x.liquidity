@@ -2355,8 +2355,8 @@ async fn reconcile_equity_transfer(
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: "usdc_bridge transfers reconcile via the \
-                            transfers/usdc/{id}/reconcile route"
+                    error: "usdc_bridge transfers reconcile via the dedicated \
+                            transfers/usdc/<id>/reconcile route"
                         .to_string(),
                 }),
             ));
@@ -2606,7 +2606,7 @@ mod tests {
         DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutorOrderId, Positive,
         SupportedExecutor, Symbol, TimeInForce,
     };
-    use st0x_finance::{FractionalShares, Usd};
+    use st0x_finance::{FractionalShares, Usd, Usdc};
     use st0x_float_macro::float;
     use st0x_tokenization::{
         MintVerificationError, TokenizerError, issuer_request_id, tokenization_request_id,
@@ -2614,6 +2614,7 @@ mod tests {
 
     use super::*;
     use crate::dashboard;
+    use crate::equity_redemption::redemption_aggregate_id;
     use crate::inventory::{
         self, BroadcastingInventory, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
     };
@@ -2631,6 +2632,7 @@ mod tests {
     use crate::rebalancing::equity::ChainServicesMissing;
     use crate::rebalancing::usdc::UsdcTransferError;
     use crate::tokenized_equity_mint::TokenizedEquityMint;
+    use crate::usdc_rebalance::{RebalanceDirection, TransferRef};
 
     async fn empty_app_state(ctx: Ctx) -> AppState {
         let (sender, _) = broadcast::channel(16);
@@ -5929,5 +5931,579 @@ mod tests {
         )));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "Failed to recheck transfer");
+    }
+
+    /// Seeds a `UsdcRebalance` (BaseToAlpaca) into a post-burn `BridgingFailed`
+    /// terminal via its own commands: withdraw, bridge-submit, burn, then fail
+    /// the bridge after the burn is recorded so `burn_tx_hash` is `Some`.
+    async fn seed_usdc_bridging_failed(pool: &SqlitePool, id: &UsdcRebalanceId) {
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let amount = Usdc::new(float!(500));
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    from_block: 1,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x22)),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::BeginBridging {
+                    from_block: 2,
+                    burn_amount: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::InitiateBridging {
+                    burn_tx: TxHash::repeat_byte(0x33),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "seed: bridge failed".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Seeds a `UsdcRebalance` (BaseToAlpaca) into `BridgingSubmitting`, then
+    /// records a pending burn tx when `with_pending_burn` so the state carries
+    /// `pending_burn_tx: Some(_)`.
+    async fn seed_usdc_bridging_submitting(
+        pool: &SqlitePool,
+        id: &UsdcRebalanceId,
+        with_pending_burn: bool,
+    ) {
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let amount = Usdc::new(float!(500));
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    from_block: 1,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x22)),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::BeginBridging {
+                    from_block: 2,
+                    burn_amount: None,
+                },
+            )
+            .await
+            .unwrap();
+        if with_pending_burn {
+            store
+                .send(
+                    id,
+                    UsdcRebalanceCommand::RecordPendingBurn {
+                        burn_tx: TxHash::repeat_byte(0x44),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn load_usdc_rebalance(pool: &SqlitePool, id: &UsdcRebalanceId) -> UsdcRebalance {
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        store.load(id).await.unwrap().expect("aggregate must exist")
+    }
+
+    /// Seeds a `TokenizedEquityMint` into the terminal `Failed` state via
+    /// `RequestMint` then `FailAcceptance`.
+    async fn seed_mint_failed(pool: &SqlitePool, id: &IssuerRequestId) {
+        let (store, _projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .build(EquityTransferServices::panicking())
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                TokenizedEquityMintCommand::FailAcceptance {
+                    reason: "seed: timed out".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Seeds a `TokenizedEquityMint` into the non-terminal `MintRequested`
+    /// state (requested but not failed).
+    async fn seed_mint_requested(pool: &SqlitePool, id: &IssuerRequestId) {
+        let (store, _projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .build(EquityTransferServices::panicking())
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Seeds an `EquityRedemption` into the terminal `Failed` state via
+    /// `Redeem` then `FailTransfer`.
+    async fn seed_redemption_failed(pool: &SqlitePool, id: &RedemptionAggregateId) {
+        let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(EquityTransferServices::panicking())
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    token: Address::ZERO,
+                    amount: U256::from(1000u64),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                EquityRedemptionCommand::FailTransfer {
+                    reason: "seed: transfer failed".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Seeds an `EquityRedemption` into the non-terminal `VaultWithdrawPending`
+    /// state (redeem requested but not failed).
+    async fn seed_redemption_pending(pool: &SqlitePool, id: &RedemptionAggregateId) {
+        let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(EquityTransferServices::panicking())
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    token: Address::ZERO,
+                    amount: U256::from(1000u64),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_reconciles_a_post_burn_failure() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_failed(&state.pool, &id).await;
+
+        let resp = reconcile_usdc_transfer(
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(ReconcileUsdcRequest {
+                reason: ReconcileReasonWire::FundsMovedManually,
+            }),
+        )
+        .await;
+
+        let Ok(Json(body)) = resp else {
+            panic!("post-burn failure must reconcile");
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({ "transferId": id.to_string(), "outcome": "reconciled" }),
+        );
+        assert!(
+            matches!(
+                load_usdc_rebalance(&state.pool, &id).await,
+                UsdcRebalance::Reconciled { .. }
+            ),
+            "the rebalance must land in the Reconciled terminal",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_rejects_a_pre_burn_in_flight_state() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_submitting(&state.pool, &id, false).await;
+
+        let resp = reconcile_usdc_transfer(
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(ReconcileUsdcRequest {
+                reason: ReconcileReasonWire::FundsMovedManually,
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_404_for_unseeded_id() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+
+        let resp = reconcile_usdc_transfer(
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(ReconcileUsdcRequest {
+                reason: ReconcileReasonWire::FundsMovedManually,
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn clear_pending_usdc_burn_clears_a_recorded_pending_burn() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_submitting(&state.pool, &id, true).await;
+
+        let resp = clear_pending_usdc_burn(
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(ClearPendingBurnRequest {
+                reason: "audit: burn dropped".to_string(),
+            }),
+        )
+        .await;
+
+        let Ok(Json(body)) = resp else {
+            panic!("a recorded pending burn must clear");
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({ "transferId": id.to_string(), "outcome": "pending_burn_cleared" }),
+        );
+        assert!(
+            matches!(
+                load_usdc_rebalance(&state.pool, &id).await,
+                UsdcRebalance::BridgingSubmitting {
+                    pending_burn_tx: None,
+                    ..
+                }
+            ),
+            "clearing must return BridgingSubmitting with no pending burn",
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_pending_usdc_burn_rejects_when_no_pending_burn_recorded() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_submitting(&state.pool, &id, false).await;
+
+        let resp = clear_pending_usdc_burn(
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(ClearPendingBurnRequest {
+                reason: "audit: nothing to clear".to_string(),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_transfer_reconciles_a_failed_mint() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = issuer_request_id("api-mint-reconcile");
+        seed_mint_failed(&state.pool, &id).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_mint".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "handled out-of-band".to_string(),
+            }),
+        )
+        .await;
+
+        let Ok(Json(body)) = resp else {
+            panic!("a failed mint must reconcile");
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({ "transferId": id.to_string(), "outcome": "reconciled" }),
+        );
+        let entity = load_entity::<TokenizedEquityMint>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("mint aggregate must exist");
+        assert!(
+            matches!(entity, TokenizedEquityMint::Reconciled { .. }),
+            "the mint must land in the Reconciled terminal, got {entity:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_transfer_reconciles_a_failed_redemption() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = redemption_aggregate_id("api-redemption-reconcile");
+        seed_redemption_failed(&state.pool, &id).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "handled out-of-band".to_string(),
+            }),
+        )
+        .await;
+
+        let Ok(Json(body)) = resp else {
+            panic!("a failed redemption must reconcile");
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({ "transferId": id.to_string(), "outcome": "reconciled" }),
+        );
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(entity, EquityRedemption::Reconciled { .. }),
+            "the redemption must land in the Reconciled terminal, got {entity:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_transfer_rejects_a_non_failed_mint() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = issuer_request_id("api-mint-non-failed");
+        seed_mint_requested(&state.pool, &id).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_mint".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "handled out-of-band".to_string(),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_transfer_rejects_a_non_failed_redemption() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = redemption_aggregate_id("api-redemption-non-failed");
+        seed_redemption_pending(&state.pool, &id).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "handled out-of-band".to_string(),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_transfer_404_for_unseeded_mint() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = issuer_request_id("api-mint-missing");
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_mint".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "handled out-of-band".to_string(),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_transfer_rejects_a_blank_reason() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = issuer_request_id("api-mint-blank-reason");
+        seed_mint_failed(&state.pool, &id).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_mint".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "   ".to_string(),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_transfer_404_for_unknown_kind() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = issuer_request_id("api-unknown-kind");
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("bogus".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "handled out-of-band".to_string(),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_transfer_rejects_usdc_bridge_kind() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("usdc_bridge".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "handled out-of-band".to_string(),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }
