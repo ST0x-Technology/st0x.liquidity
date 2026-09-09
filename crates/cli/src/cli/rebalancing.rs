@@ -3326,8 +3326,14 @@ mod tests {
         .to_string();
 
         assert!(
-            error.contains("ethereum") && error.contains("base"),
-            "expected the refusal to name the recorded chain and the requested one, got: {error}"
+            error.starts_with(&format!(
+                "mint {uuid} was requested on ethereum; --network base would resume it"
+            )),
+            "expected the recorded-chain mismatch refusal, got: {error}"
+        );
+        assert!(
+            error.ends_with("Re-run with --network ethereum"),
+            "expected the refusal to point at the recorded chain, got: {error}"
         );
     }
 
