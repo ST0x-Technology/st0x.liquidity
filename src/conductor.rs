@@ -15876,6 +15876,10 @@ mod tests {
         );
     }
 
+    /// Each watched chain's targets use its own orderbook and USDC. The
+    /// primary carries its equities' wrap and deposit grants; a hedge-only
+    /// secondary (Ethereum here: TSLA trades but does not rebalance) has no
+    /// wrapper to approve, so only its USDC grant remains.
     #[test]
     fn startup_approval_targets_follow_each_watched_chain() {
         let ctx = ctx_with_base_and_ethereum_trading();
@@ -15912,26 +15916,12 @@ mod tests {
         );
         assert_eq!(
             targets[&Chain::Ethereum],
-            vec![
-                ApprovalTarget {
-                    token: Address::repeat_byte(0xe5),
-                    spender: Address::repeat_byte(0xe6),
-                    symbol: Some(Symbol::new("TSLA").unwrap()),
-                    purpose: ApprovalPurpose::WrapUnderlying,
-                },
-                ApprovalTarget {
-                    token: Address::repeat_byte(0xe6),
-                    spender: Address::repeat_byte(0xe0),
-                    symbol: Some(Symbol::new("TSLA").unwrap()),
-                    purpose: ApprovalPurpose::DepositWrappedEquity,
-                },
-                ApprovalTarget {
-                    token: USDC_ETHEREUM,
-                    spender: Address::repeat_byte(0xe0),
-                    symbol: None,
-                    purpose: ApprovalPurpose::DepositUsdc,
-                },
-            ]
+            vec![ApprovalTarget {
+                token: USDC_ETHEREUM,
+                spender: Address::repeat_byte(0xe0),
+                symbol: None,
+                purpose: ApprovalPurpose::DepositUsdc,
+            }]
         );
     }
 
