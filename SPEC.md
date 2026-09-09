@@ -158,26 +158,32 @@ the remainder is hedged on a later tick). Startup verifies every watched chain
 `decimals()` on that chain's own endpoint) and any failure is fatal; degraded
 per-chain startup is deferred to the chain-disable work.
 
-The tokenization services are built once per watched chain, never once for Base:
-each watched chain gets its own issuer client, wrapper and mint authorizer bound
-to that chain's signing wallet, orderbook, asset table and issuer redemption
-wallet, plus that chain's `[orchestrator.addresses]` entry when the section
-carries one; without the entry the chain's mint authorizer is disabled with a
-startup warning and only an orchestrator-mode mint fails (see Mint Recipient
-Authorization). Every watched chain must have its own redemption wallet, or
-startup fails naming the chain. The rebalancer, the portfolio snapshot and the
-wrapped- and unwrapped-equity orphan-recovery aggregates consume the primary
-chain's entry until the global rebalancer owns chain selection; the sets exist
-so that selection is a lookup rather than a rewire. A mint or redemption
-transfer is not among them: it resolves the entry of the chain its record names
-(see below), so only the orphan-recovery aggregates still borrow the primary's.
-A managed secondary chain's vault inventory is not polled until per-chain
-polling lands: the operator funds and watches it by hand, and startup warns once
-per such chain. The tokenization preflight (below) runs once per watched chain
-with that chain's wallet, orderbook and canonical USDC, as do the startup MAX
-approvals in either mode and the stale-allowance revoke on each chain in managed
-inventory mode; a watched chain for which this build has no pinned USDC fails
-startup rather than borrowing another chain's address.
+The tokenization services are built per watched chain, never once for Base, on
+the chain's own signing wallet. The primary, and every secondary with at least
+one rebalancing-enabled equity (the same per-asset flags that make the chain
+require the equity-rebalancing capability), get the full set: an issuer client,
+wrapper and mint authorizer bound to that chain's wallet, orderbook, asset table
+and issuer redemption wallet, plus that chain's `[orchestrator.addresses]` entry
+when the section carries one; without the entry the chain's mint authorizer is
+disabled with a startup warning and only an orchestrator-mode mint fails (see
+Mint Recipient Authorization). Such a chain must have its own redemption wallet,
+or startup fails naming the chain. A **hedge-only** secondary -- a trading table
+whose equities all have `rebalancing = "disabled"` -- needs no wrapper
+deployment, issuer client or redemption wallet: only its signer is kept, for the
+startup allowance work, and startup logs the chain as hedge-only. The
+rebalancer, the portfolio snapshot and the wrapped- and unwrapped-equity
+orphan-recovery aggregates consume the primary chain's entry until the global
+rebalancer owns chain selection; the sets exist so that selection is a lookup
+rather than a rewire. A mint or redemption transfer is not among them: it
+resolves the entry of the chain its record names (see below), so only the
+orphan-recovery aggregates still borrow the primary's. A managed secondary
+chain's vault inventory is not polled until per-chain polling lands: the
+operator funds and watches it by hand, and startup warns once per such chain.
+The tokenization preflight (below) runs once per watched chain with that chain's
+wallet, orderbook and canonical USDC, as do the startup MAX approvals in either
+mode and the stale-allowance revoke on each chain in managed inventory mode; a
+watched chain for which this build has no pinned USDC fails startup rather than
+borrowing another chain's address.
 
 The operator CLI selects its chain the same way. Every command that itself
 submits an onchain operation takes `--network` (default `base`) and runs on that
@@ -359,15 +365,15 @@ distinct — neither key alone can both mint and authorize.
   on X, every asset listed on X stays vault-direct. This bot enforces the order
   at three points, from earliest to last: a rebalancing-mode startup preflight
   refuses startup, naming chain and symbol, when issuance reports an
-  orchestrator-mode asset that is trading- or rebalancing-enabled on a watched
-  chain with no entry (see Startup Sequencing); a section carrying only other
-  chains' entries warns at startup; and the server-side mint path reads the
-  asset's mode again before signing and fails closed, so an orchestrator-mode
-  mint without its chain's entry stops at the signing step. That last line is
-  the only one on a deployment without `[rebalancing]` (no preflight runs there)
-  and whenever the preflight could not read the mode. The operator CLI mint
-  (`alpaca-tokenize`, `transfer-equity`) never signs: it refuses an
-  orchestrator-mode asset outright and points at the server path.
+  orchestrator-mode asset the preflight covers on a watched chain with no entry
+  (see Startup Sequencing); a section carrying only other chains' entries warns
+  at startup; and the server-side mint path reads the asset's mode again before
+  signing and fails closed, so an orchestrator-mode mint without its chain's
+  entry stops at the signing step. That last line is the only one on a
+  deployment without `[rebalancing]` (no preflight runs there) and whenever the
+  preflight could not read the mode. The operator CLI mint (`alpaca-tokenize`,
+  `transfer-equity`) never signs: it refuses an orchestrator-mode asset outright
+  and points at the server path.
 
 #### Dividend NAV Bump
 
@@ -541,26 +547,29 @@ chain's orderbook, that chain's canonical USDC to its orderbook) with that
 chain's wallet. Only when rebalancing is configured does it also revoke any
 stale orderbook allowance, per chain in managed inventory mode, the same way,
 and a tokenization preflight then runs per watched chain, read-only: the chain's
-issuer redemption wallet must be configured, and every enabled equity's
+issuer redemption wallet must be configured, and every preflighted equity's
 configured vault must report the configured underlying as its `asset()` (the
-same attestation a redemption's unwrap step performs). Each failure is fatal and
-names the chain and, where one applies, the symbol. Then, on every watched chain
-with no `[orchestrator.addresses]` entry, the preflight asks issuance's
-per-asset status endpoint (the freeze gate's endpoint, through the same client)
-for each trading- or rebalancing-enabled equity's `vault_mode` and refuses
-startup naming the chain and symbol when one is orchestrator-mode: its first
-mint would stall at the signing step. Chains with an entry are not queried: the
-entry is the only prerequisite this bot can see, and the Turnkey `MintAuth`
-policy for that chain stays invisible at startup, so a missing policy fails the
-first orchestrator-mode mint at signing rather than at preflight. An
-indeterminate mode (issuance unreachable, asset unknown to issuance) is warned
-about per chain and symbol rather than refused: rebalancing mode never requires
-issuance to be reachable at startup (the freeze gate fails closed per cycle and
-has its own `freeze_check` escape hatch for an issuance outage), and the
-per-mint mode read fails closed on its own: a mint whose mode cannot be read
-stops at mode discovery, before any signing. The signing-step failure is the
-last line only for a known orchestrator-mode mint without its chain's entry or
-`MintAuth` policy.
+same attestation a redemption's unwrap step performs). The preflighted equities
+are, on the primary, every trading- or rebalancing-enabled equity (the bot may
+wrap or redeem any of them there), and on a secondary only its
+rebalancing-enabled equities; a hedge-only secondary is skipped with a log line
+and has no redemption-wallet requirement. Each failure is fatal and names the
+chain and, where one applies, the symbol. Then, on every preflighted chain with
+no `[orchestrator.addresses]` entry, the preflight asks issuance's per-asset
+status endpoint (the freeze gate's endpoint, through the same client) for each
+preflighted equity's `vault_mode` and refuses startup naming the chain and
+symbol when one is orchestrator-mode: its first mint would stall at the signing
+step. Chains with an entry are not queried: the entry is the only prerequisite
+this bot can see, and the Turnkey `MintAuth` policy for that chain stays
+invisible at startup, so a missing policy fails the first orchestrator-mode mint
+at signing rather than at preflight. An indeterminate mode (issuance
+unreachable, asset unknown to issuance) is warned about per chain and symbol
+rather than refused: rebalancing mode never requires issuance to be reachable at
+startup (the freeze gate fails closed per cycle and has its own `freeze_check`
+escape hatch for an issuance outage), and the per-mint mode read fails closed on
+its own: a mint whose mode cannot be read stops at mode discovery, before any
+signing. The signing-step failure is the last line only for a known
+orchestrator-mode mint without its chain's entry or `MintAuth` policy.
 
 Historical backfill resumes from a persisted database checkpoint. The configured
 `deployment_block` is only the initial seed for the first startup or for an
