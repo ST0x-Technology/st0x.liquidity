@@ -2072,7 +2072,7 @@ mod tests {
     use uuid::uuid;
 
     use st0x_config::{
-        BrokerCtx, Ctx, ExecutionThreshold, FileLogging, LogLevel, RestApiCtx,
+        BrokerCtx, Ctx, ExecutionThreshold, FileLogging, LogLevel, RestApiCtx, TradingChain,
         create_test_ctx_with_order_owner,
     };
     use st0x_dto::{Trade, TradeOutcome, TradingVenue};
@@ -3824,6 +3824,66 @@ mod tests {
             report["dependencies"][0]["buckets"][0]["p50Ms"],
             serde_json::json!(120)
         );
+    }
+
+    /// A secondary chain's watcher shares the primary's orderbook address;
+    /// the report still shows it as its own series under its own chain.
+    #[tokio::test]
+    async fn performance_infra_reports_one_lag_series_per_watched_chain() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let orderbook = ctx.chains.primary().orderbook;
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .orderbook(orderbook)
+                .call(),
+        );
+        let state = empty_app_state(ctx).await;
+        let now = chrono::Utc::now();
+
+        for (chain, last_processed_block) in [(Chain::Base, 100), (Chain::Ethereum, 110)] {
+            crate::telemetry::record_block_lag(
+                &state.pool,
+                &crate::telemetry::BlockLagSample {
+                    sampled_at: now,
+                    chain,
+                    orderbook,
+                    chain_tip: 120,
+                    cutoff_block: Some(117),
+                    last_processed_block: Some(last_processed_block),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let app = build_app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/performance/infra")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let series = report["monitor"]["blockLag"]
+            .as_array()
+            .expect("one block-lag series per watched chain");
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0]["chain"], serde_json::json!("base"));
+        assert_eq!(series[0]["currentLagBlocks"], serde_json::json!(17));
+        assert_eq!(
+            series[0]["points"][0]["maxLagBlocks"],
+            serde_json::json!(17)
+        );
+        assert_eq!(series[1]["chain"], serde_json::json!("ethereum"));
+        assert_eq!(series[1]["currentLagBlocks"], serde_json::json!(7));
+        assert_eq!(series[1]["points"][0]["maxLagBlocks"], serde_json::json!(7));
     }
 
     #[tokio::test]

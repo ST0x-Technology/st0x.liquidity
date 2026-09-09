@@ -305,6 +305,8 @@ mod tests {
     use alloy::primitives::address;
     use chrono::TimeZone;
 
+    use st0x_config::{ChainRegistry, TradingChain};
+    use st0x_dto::{ChainBlockLag, ChainName};
     use st0x_evm::Chain;
 
     use crate::telemetry::{BlockLagSample, record_block_lag, record_poll_cycle};
@@ -328,6 +330,7 @@ mod tests {
 
     async fn insert_lag_for(
         pool: &SqlitePool,
+        chain: Chain,
         orderbook: Address,
         seconds: i64,
         chain_tip: u64,
@@ -337,7 +340,7 @@ mod tests {
             pool,
             &BlockLagSample {
                 sampled_at: timestamp(seconds),
-                chain: Chain::Base,
+                chain,
                 orderbook,
                 chain_tip,
                 cutoff_block: Some(chain_tip.saturating_sub(3)),
@@ -349,7 +352,58 @@ mod tests {
     }
 
     async fn insert_lag(pool: &SqlitePool, seconds: i64, chain_tip: u64, checkpoint: Option<u64>) {
-        insert_lag_for(pool, ORDERBOOK, seconds, chain_tip, checkpoint).await;
+        insert_lag_for(pool, Chain::Base, ORDERBOOK, seconds, chain_tip, checkpoint).await;
+    }
+
+    /// Base watched alone, against [`ORDERBOOK`].
+    fn base_only() -> ChainRegistry {
+        ChainRegistry::single_trading_chain(TradingChain::test().orderbook(ORDERBOOK).call())
+    }
+
+    /// Two watched chains keep separate lag series even when the Raindex
+    /// orderbook lands at the same deterministic address on both.
+    #[tokio::test]
+    async fn each_watched_chain_gets_its_own_lag_series() {
+        let pool = setup_test_db().await;
+        let mut chains = base_only();
+        chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .orderbook(ORDERBOOK)
+                .call(),
+        );
+        insert_lag(&pool, 10, 110, Some(100)).await; // base: cutoff 107, lag 7
+        // ethereum, same orderbook address: cutoff 497, lag 97.
+        insert_lag_for(&pool, Chain::Ethereum, ORDERBOOK, 20, 500, Some(400)).await;
+
+        let telemetry = load_monitor_telemetry(&pool, &range(), &chains)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            telemetry.block_lag,
+            vec![
+                ChainBlockLag {
+                    chain: ChainName::Base,
+                    current_lag_blocks: Some(7),
+                    current_lag_sampled_at: Some(timestamp(10)),
+                    points: vec![BlockLagPoint {
+                        start: timestamp(0),
+                        max_lag_blocks: 7,
+                    }],
+                },
+                ChainBlockLag {
+                    chain: ChainName::Ethereum,
+                    current_lag_blocks: Some(97),
+                    current_lag_sampled_at: Some(timestamp(20)),
+                    points: vec![BlockLagPoint {
+                        start: timestamp(0),
+                        max_lag_blocks: 97,
+                    }],
+                },
+            ],
+            "the primary's series comes first; the secondary's is never merged into it"
+        );
     }
 
     #[tokio::test]
@@ -442,6 +496,7 @@ mod tests {
         insert_lag(&pool, 10, 110, Some(100)).await; // lag 7
         insert_lag_for(
             &pool,
+            Chain::Base,
             address!("0x2222222222222222222222222222222222222222"),
             20,
             500,
