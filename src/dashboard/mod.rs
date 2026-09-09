@@ -745,6 +745,7 @@ mod tests {
             equity_prices: equity_price::EquityPriceStore::new(&ChainAssets::default()),
             settings: empty_settings(),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
+            process_tx: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(crate::api::ResumeLock(tokio::sync::Mutex::new(()))),
             pnl_report_admission: pnl::pnl_report_admission(),
             metrics_handle: crate::metrics::setup().expect("metrics setup"),

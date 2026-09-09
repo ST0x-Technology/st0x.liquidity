@@ -860,6 +860,7 @@ pub(crate) struct ServerHandles {
     pub(crate) event_sender: broadcast::Sender<Statement>,
     pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) recovery_cell: Arc<tokio::sync::OnceCell<crate::api::RecoveryHandle>>,
+    pub(crate) process_tx_cell: Arc<tokio::sync::OnceCell<crate::api::ProcessTxHandle>>,
     pub(crate) pnl_ledger: Arc<PnlLedger>,
 }
 
@@ -875,6 +876,7 @@ impl Conductor {
             event_sender,
             inventory,
             recovery_cell,
+            process_tx_cell,
             pnl_ledger,
         }: ServerHandles,
         shutdown_token: CancellationToken,
@@ -891,6 +893,14 @@ impl Conductor {
             setup_instrumentation(executor_ctx, &ctx, pool.clone()).await?;
 
         let cache = SymbolCache::default();
+
+        // Shared with the trading loop's placement paths so the in-bot
+        // process-tx route serializes its broker submission against live
+        // hedging (ADR 0014). The same lock feeds the builder's hedge and
+        // position-check contexts below, and the process-tx handle above.
+        let counter_trade_submission_lock = Arc::new(Mutex::new(()));
+        let process_tx_order_placer: Arc<dyn OrderPlacer> =
+            Arc::new(ExecutorOrderPlacer(executor.clone()));
 
         let (job_queue, backfill_queues, dashboard_delivery, schedulers) =
             setup_apalis_queues(&pool, &apalis_pool, event_sender, &ctx.chains).await?;
@@ -1064,6 +1074,7 @@ impl Conductor {
 
         let conductor = builder::spawn()
             .context(conductor_ctx)
+            .counter_trade_submission_lock(counter_trade_submission_lock.clone())
             .job_queue(job_queue)
             .backfill_queues(backfill_queues)
             .dashboard_trade_delivery_queue(dashboard_delivery.queue)
@@ -1114,6 +1125,11 @@ impl Conductor {
             recovery_service,
             usdc_recheck,
         );
+
+        let _ = process_tx_cell.set(crate::api::ProcessTxHandle {
+            order_placer: process_tx_order_placer,
+            counter_trade_submission_lock,
+        });
 
         conductor
             .run_until_completion(startup_tokens.initialized)
