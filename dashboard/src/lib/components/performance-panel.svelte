@@ -489,7 +489,10 @@
     Object.fromEntries(
       blockLagSeries.map(({ chain }) => [
         chain,
-        { label: CHAIN_LABELS[chain], color: CHAIN_LAG_COLORS[chain] }
+        {
+          label: CHAIN_LABELS[chain],
+          color: CHAIN_LAG_COLORS[chain]
+        }
       ])
     ) satisfies Chart.ChartConfig
   )
