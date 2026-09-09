@@ -49,6 +49,12 @@ missing_panics_doc = "allow"
 must_use_candidate = "allow"
 redundant_pub_crate = "allow"
 
+# Full DWARF makes the st0x-hedge test binary about 1 GB and every test cycle
+# relinks it. Line tables keep file:line in panics and backtraces at a third of
+# the size and link time. `test` inherits from `dev`, so this covers nextest.
+[profile.dev]
+debug = "line-tables-only"
+
 [workspace.dependencies]
 aes-gcm = "0.10.3"
 alloy = { version = "1.0.38", features = ["full", "rand", "node-bindings"] }

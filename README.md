@@ -557,6 +557,13 @@ cargo fmt                    # format Rust code
 nix fmt                      # format Nix code (when editing .nix files)
 ```
 
+Debug builds use `debug = "line-tables-only"` (workspace `Cargo.toml`) and the
+Linux dev shells link with mold (`flake.nix`), which keeps the `st0x-hedge` test
+binary well under 1 GB and takes about 20 s of link time off every test cycle.
+Panics still report file and line. To confirm mold linked a binary:
+`readelf -p .comment target/debug/deps/st0x_hedge-<hash> | grep mold`. Nix
+release builds (`nix build`, OCI images) are not affected.
+
 ### Flake Commands
 
 All commands are run via `nix run .#<name>`. Commands that access infrastructure
