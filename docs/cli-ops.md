@@ -249,7 +249,9 @@ automated path for this, the operator deposits it. Prerequisites, all per chain:
   primary, or a secondary with an equity that has `rebalancing = "enabled"`);
   the bot fails startup without them there. A hedge-only secondary (every equity
   `rebalancing = "disabled"`) needs neither: its fills are hedged and nothing is
-  minted, wrapped or redeemed on it.
+  minted, wrapped or redeemed on it, so its startup MAX approvals (and the
+  Turnkey policies `verify-approvals` demands for them) are the
+  USDC-to-orderbook grant alone, with no wrapper to approve.
 - A signing wallet for the chain in `[wallet]`, funded with native gas, and an
   `[alerts.low_balance_thresholds]` entry for it (an operator equity transfer
   refuses a chain without a threshold).
