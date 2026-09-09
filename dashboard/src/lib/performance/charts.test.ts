@@ -1,11 +1,15 @@
 import { describe, expect, it } from 'vitest'
 
+import type { BlockLagPoint } from '$lib/api/BlockLagPoint'
+import type { ChainBlockLag } from '$lib/api/ChainBlockLag'
+import type { ChainName } from '$lib/api/ChainName'
 import type { EquityOperationTiming } from '$lib/api/EquityOperationTiming'
 import type { HedgeCycleReport } from '$lib/api/HedgeCycleReport'
 import type { LatencyBucket } from '$lib/api/LatencyBucket'
 import type { RebalanceOperationTiming } from '$lib/api/RebalanceOperationTiming'
 
 import {
+  buildBlockLagRows,
   buildEquityRows,
   buildPercentileSeries,
   buildRebalanceRows,
@@ -788,6 +792,34 @@ describe('buildPercentileSeries', () => {
 
   it('returns an empty array for no buckets', () => {
     expect(buildPercentileSeries([], 'execution')).toEqual([])
+  })
+})
+
+describe('buildBlockLagRows', () => {
+  const series = (chain: ChainName, points: BlockLagPoint[]): ChainBlockLag => ({
+    chain,
+    currentLagBlocks: null,
+    currentLagSampledAt: null,
+    points
+  })
+
+  it('merges chains into one row per bucket, null where a chain has no point', () => {
+    const rows = buildBlockLagRows([
+      series('base', [
+        { start: '2026-06-01T01:00:00Z', maxLagBlocks: 2 },
+        { start: '2026-06-01T00:00:00Z', maxLagBlocks: 7 }
+      ]),
+      series('ethereum', [{ start: '2026-06-01T01:00:00Z', maxLagBlocks: 97 }])
+    ])
+
+    expect(rows).toEqual([
+      { start: new Date('2026-06-01T00:00:00Z'), base: 7, ethereum: null },
+      { start: new Date('2026-06-01T01:00:00Z'), base: 2, ethereum: 97 }
+    ])
+  })
+
+  it('yields no rows when no chain has a point', () => {
+    expect(buildBlockLagRows([series('base', [])])).toEqual([])
   })
 })
 
