@@ -4212,6 +4212,7 @@ mod tests {
                 operation_id,
                 TokenizedEquityMintEvent::MintRequested {
                     issuer_request_id: None,
+                    chain: Chain::Base,
                     symbol: st0x_execution::Symbol::new("AAPL").unwrap(),
                     quantity: float!(5),
                     wallet: Address::repeat_byte(0x11),

@@ -392,7 +392,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
             }
 
             equity_transfer
-                .resume_equity_to_market_making(&issuer_request_id, &symbol, quantity)
+                .resume_equity_to_market_making(&issuer_request_id, &symbol, chain, quantity)
                 .await?;
 
             writeln!(stdout, "✅ Mint completed successfully")?;
@@ -403,7 +403,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 
             let aggregate_id = RedemptionAggregateId::generate();
             equity_transfer
-                .resume_equity_to_hedging(&aggregate_id, &symbol, quantity)
+                .resume_equity_to_hedging(&aggregate_id, &symbol, chain, quantity)
                 .await?;
 
             writeln!(stdout, "✅ Redemption completed successfully")?;
@@ -4600,6 +4600,7 @@ mod tests {
             .send(
                 id,
                 Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(50.25),
                     token: Address::random(),
@@ -4894,6 +4895,7 @@ mod tests {
             .send(
                 id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
@@ -4954,6 +4956,7 @@ mod tests {
             &pool,
             &id,
             TokenizedEquityMintCommand::RequestMint {
+                chain: Chain::Base,
                 issuer_request_id: id.clone(),
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: float!(10),
@@ -5082,6 +5085,7 @@ mod tests {
                 issuer_request_id: id.clone(),
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: float!(10),
+                chain: Chain::Base,
                 wallet: Address::from([1; 20]),
             },
         )

@@ -590,6 +590,7 @@ fn manual_adjustment_event(
 fn mint_requested_event(symbol: &str, timestamp: &str) -> TokenizedEquityMintEvent {
     TokenizedEquityMintEvent::MintRequested {
         issuer_request_id: None,
+        chain: Chain::Base,
         symbol: Symbol::new(symbol).unwrap(),
         quantity: float!(1),
         wallet: Address::repeat_byte(0x22),

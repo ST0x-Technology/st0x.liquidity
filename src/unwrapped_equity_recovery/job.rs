@@ -757,6 +757,7 @@ mod tests {
     use uuid::Uuid;
 
     use st0x_event_sorcery::test_store;
+    use st0x_evm::Chain;
     use st0x_raindex::{Raindex, RaindexVaultId};
     use st0x_tokenization::Tokenizer;
     use st0x_tokenization::issuer_request_id;
@@ -1307,6 +1308,7 @@ mod tests {
             .send(
                 &mint_id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: mint_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
@@ -1335,6 +1337,7 @@ mod tests {
             .send(
                 &mint_id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: mint_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(3),
@@ -1746,6 +1749,7 @@ mod tests {
             .send(
                 &mint_id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: mint_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
@@ -1841,6 +1845,7 @@ mod tests {
             .send(
                 &redemption_id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(5),
                     token: Address::random(),

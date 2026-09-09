@@ -298,6 +298,7 @@ mod tests {
     use uuid::Uuid;
 
     use st0x_dto::{EquityOperationKind, EquityStageName, RebalanceTimingStatus, StageOutcome};
+    use st0x_evm::Chain;
     use st0x_float_macro::float;
     use st0x_tokenization::{TokenizationRequestId, issuer_request_id};
 
@@ -335,6 +336,7 @@ mod tests {
         let events = vec![
             TokenizedEquityMintEvent::MintRequested {
                 issuer_request_id: None,
+                chain: Chain::Base,
                 symbol: symbol(),
                 quantity: float!(5),
                 wallet: Address::repeat_byte(0x11),
@@ -360,6 +362,7 @@ mod tests {
         let events = vec![
             TokenizedEquityMintEvent::MintRequested {
                 issuer_request_id: None,
+                chain: Chain::Base,
                 symbol: symbol(),
                 quantity: float!(5),
                 wallet: Address::repeat_byte(0x11),

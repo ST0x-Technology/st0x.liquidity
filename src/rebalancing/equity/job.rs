@@ -32,6 +32,7 @@ use tracing::warn;
 
 use st0x_config::ChainEquities;
 use st0x_event_sorcery::Store;
+use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_tokenization::IssuerRequestId;
 
@@ -65,6 +66,7 @@ pub(crate) trait ResumeEquityToMarketMaking: Send + Sync + 'static {
         &self,
         issuer_request_id: &IssuerRequestId,
         symbol: &Symbol,
+        chain: Chain,
         quantity: FractionalShares,
     ) -> Result<(), MintTransferError>;
 }
@@ -75,9 +77,10 @@ impl ResumeEquityToMarketMaking for CrossVenueEquityTransfer {
         &self,
         issuer_request_id: &IssuerRequestId,
         symbol: &Symbol,
+        chain: Chain,
         quantity: FractionalShares,
     ) -> Result<(), MintTransferError> {
-        Self::resume_equity_to_market_making(self, issuer_request_id, symbol, quantity).await
+        Self::resume_equity_to_market_making(self, issuer_request_id, symbol, chain, quantity).await
     }
 }
 
@@ -144,6 +147,10 @@ pub(crate) struct TransferEquityToMarketMaking {
     pub(crate) issuer_request_id: IssuerRequestId,
     pub(crate) symbol: Symbol,
     pub(crate) quantity: FractionalShares,
+    /// The chain the mint lands on. Rows queued before this field existed
+    /// were all enqueued against Base, the only chain rebalancing ran on.
+    #[serde(default = "crate::onchain::legacy_chain")]
+    pub(crate) chain: Chain,
     /// Generation of the `ActiveTransfer` slot this job holds. Used by
     /// `mark_held_for_recovery` to detect if the timeout sweeper cleared this
     /// job's slot and a new transfer claimed it before the PostReceipt handler ran.
@@ -202,7 +209,12 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
     ) -> Result<Self::Output, Self::Error> {
         let result = ctx
             .transfer
-            .resume_equity_to_market_making(&self.issuer_request_id, &self.symbol, self.quantity)
+            .resume_equity_to_market_making(
+                &self.issuer_request_id,
+                &self.symbol,
+                self.chain,
+                self.quantity,
+            )
             .await;
 
         // Success needs no post-processing. Only a `PostReceipt` error (Alpaca
@@ -489,6 +501,7 @@ pub(crate) trait ResumeEquityToHedging: Send + Sync + 'static {
         &self,
         aggregate_id: &RedemptionAggregateId,
         symbol: &Symbol,
+        chain: Chain,
         quantity: FractionalShares,
     ) -> Result<(), RedemptionError>;
 }
@@ -499,9 +512,10 @@ impl ResumeEquityToHedging for CrossVenueEquityTransfer {
         &self,
         aggregate_id: &RedemptionAggregateId,
         symbol: &Symbol,
+        chain: Chain,
         quantity: FractionalShares,
     ) -> Result<(), RedemptionError> {
-        Self::resume_equity_to_hedging(self, aggregate_id, symbol, quantity).await
+        Self::resume_equity_to_hedging(self, aggregate_id, symbol, chain, quantity).await
     }
 }
 
@@ -546,6 +560,10 @@ pub(crate) struct TransferEquityToHedging {
     /// decode to zero, which can release only a restored legacy zero-generation owner.
     #[serde(default)]
     pub(crate) generation: GuardGeneration,
+    /// The chain the redemption withdraws from. Rows queued before this
+    /// field existed were all enqueued against Base.
+    #[serde(default = "crate::onchain::legacy_chain")]
+    pub(crate) chain: Chain,
     /// Count of consecutive broker rate-limit (429) reschedules leading up to
     /// this attempt (RAI-1494). `#[serde(default)]` so a row enqueued under
     /// the pre-this-change payload shape still deserializes to `0` instead of
@@ -586,7 +604,7 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
     async fn perform(&self, ctx: &TransferEquityToHedgingCtx) -> Result<Self::Output, Self::Error> {
         let result = ctx
             .transfer
-            .resume_equity_to_hedging(&self.aggregate_id, &self.symbol, self.quantity)
+            .resume_equity_to_hedging(&self.aggregate_id, &self.symbol, self.chain, self.quantity)
             .await;
 
         let Err(error) = result else {
@@ -800,6 +818,7 @@ mod tests {
             &self,
             issuer_request_id: &IssuerRequestId,
             symbol: &Symbol,
+            _chain: Chain,
             quantity: FractionalShares,
         ) -> Result<(), MintTransferError> {
             *self.captured.lock().unwrap() =
@@ -836,6 +855,7 @@ mod tests {
             &self,
             _issuer_request_id: &IssuerRequestId,
             _symbol: &Symbol,
+            _chain: Chain,
             _quantity: FractionalShares,
         ) -> Result<(), MintTransferError> {
             Err(MintTransferError::PreReceipt(MintError::GasReadiness(
@@ -858,6 +878,7 @@ mod tests {
             },
         );
         let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
             issuer_request_id: issuer_request_id("low-gas"),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
@@ -898,11 +919,13 @@ mod tests {
             &self,
             issuer_request_id: &IssuerRequestId,
             symbol: &Symbol,
+            _chain: Chain,
             quantity: FractionalShares,
         ) -> Result<(), MintTransferError> {
             let mut queue = self.0.clone();
             let error = queue
                 .push(TransferEquityToMarketMaking {
+                    chain: Chain::Base,
                     issuer_request_id: issuer_request_id.clone(),
                     symbol: symbol.clone(),
                     quantity,
@@ -940,6 +963,7 @@ mod tests {
         );
 
         let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
             issuer_request_id: issuer_request_id("bot-gas-enqueue-failure"),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
@@ -997,11 +1021,13 @@ mod tests {
             &self,
             issuer_request_id: &IssuerRequestId,
             symbol: &Symbol,
+            _chain: Chain,
             quantity: FractionalShares,
         ) -> Result<(), MintTransferError> {
             let mut queue = self.0.clone();
             let error = queue
                 .push(TransferEquityToMarketMaking {
+                    chain: Chain::Base,
                     issuer_request_id: issuer_request_id.clone(),
                     symbol: symbol.clone(),
                     quantity,
@@ -1034,6 +1060,7 @@ mod tests {
         ctx.job_queue = TransferEquityToMarketMakingJobQueue::new(&apalis_pool);
 
         let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
             issuer_request_id: issuer_request_id("pre-receipt-bot-gas-enqueue-failure"),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
@@ -1063,6 +1090,7 @@ mod tests {
         let stub = Arc::new(RecordingResume::success());
         let ctx = test_ctx(Arc::clone(&stub) as Arc<dyn ResumeEquityToMarketMaking>).await;
         let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
             issuer_request_id: issuer_request_id("mint-forward"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
@@ -1085,6 +1113,7 @@ mod tests {
     async fn perform_propagates_pre_receipt_failure() {
         let ctx = test_ctx(Arc::new(RecordingResume::pre_receipt_failure())).await;
         let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
             issuer_request_id: issuer_request_id("mint-fail"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
@@ -1115,6 +1144,7 @@ mod tests {
         // error must propagate for apalis retry.
         let ctx = test_ctx(Arc::new(RecordingResume::post_receipt_failure())).await;
         let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
             issuer_request_id: issuer_request_id("test-post-receipt"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
@@ -1154,6 +1184,7 @@ mod tests {
             .send(
                 issuer_id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: issuer_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
@@ -1205,6 +1236,7 @@ mod tests {
         seed_tokens_wrapped(&ctx, &issuer_id, &symbol).await;
 
         let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
             issuer_request_id: issuer_id.clone(),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
@@ -1269,6 +1301,7 @@ mod tests {
             .expect("SubmitVaultDeposit must transition to VaultDepositSubmitted");
 
         let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
             issuer_request_id: issuer_id.clone(),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
@@ -1324,6 +1357,7 @@ mod tests {
             .send(
                 &issuer_id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: issuer_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
@@ -1341,6 +1375,7 @@ mod tests {
             .expect("Poll must transition to TokensReceived");
 
         let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
             issuer_request_id: issuer_id.clone(),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
@@ -1383,6 +1418,7 @@ mod tests {
             .send(
                 &issuer_id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: issuer_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
@@ -1410,6 +1446,7 @@ mod tests {
             .expect("SubmitWrap must transition to WrapSubmitted");
 
         let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
             issuer_request_id: issuer_id.clone(),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
@@ -1454,6 +1491,7 @@ mod tests {
             .send(
                 &issuer_id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: issuer_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
@@ -1480,6 +1518,7 @@ mod tests {
         );
 
         let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
             issuer_request_id: issuer_id.clone(),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
@@ -1529,6 +1568,7 @@ mod tests {
             .send(
                 &issuer_id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: issuer_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
@@ -1546,6 +1586,7 @@ mod tests {
             .expect("Poll must transition to TokensReceived");
 
         let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
             issuer_request_id: issuer_id.clone(),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
@@ -1600,6 +1641,7 @@ mod tests {
             .send(
                 &issuer_id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: issuer_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
@@ -1627,6 +1669,7 @@ mod tests {
             .expect("FailWrapping must transition to terminal Failed");
 
         let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
             issuer_request_id: issuer_id.clone(),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
@@ -1677,6 +1720,7 @@ mod tests {
             .send(
                 &issuer_id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: issuer_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
@@ -1694,6 +1738,7 @@ mod tests {
             .expect("Poll must transition to TokensReceived");
 
         let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
             issuer_request_id: issuer_id.clone(),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
@@ -1728,6 +1773,7 @@ mod tests {
             .send(
                 &issuer_id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: issuer_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
@@ -1745,6 +1791,7 @@ mod tests {
             .expect("Poll must transition to TokensReceived");
 
         let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
             issuer_request_id: issuer_id.clone(),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
@@ -1771,6 +1818,7 @@ mod tests {
     #[test]
     fn payload_roundtrips_through_json() {
         let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
             issuer_request_id: issuer_request_id("mint-roundtrip"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(2.5)),
@@ -1782,6 +1830,7 @@ mod tests {
             "issuer_request_id": issuer_request_id("mint-roundtrip").to_string(),
             "symbol": "AAPL",
             "quantity": "2.5",
+            "chain": "base",
             "generation": 0_u64,
             "backpressure_streak": 0_u32,
         });
@@ -1855,6 +1904,7 @@ mod tests {
             &self,
             _aggregate_id: &RedemptionAggregateId,
             _symbol: &Symbol,
+            _chain: Chain,
             _quantity: FractionalShares,
         ) -> Result<(), RedemptionError> {
             Err(RedemptionError::GasReadiness(
@@ -1873,6 +1923,7 @@ mod tests {
         )
         .await;
         let job = TransferEquityToHedging {
+            chain: Chain::Base,
             aggregate_id: redemption_aggregate_id("low-gas"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
@@ -1908,6 +1959,7 @@ mod tests {
             &self,
             aggregate_id: &RedemptionAggregateId,
             symbol: &Symbol,
+            _chain: Chain,
             quantity: FractionalShares,
         ) -> Result<(), RedemptionError> {
             *self.captured.lock().unwrap() = Some((aggregate_id.clone(), symbol.clone(), quantity));
@@ -1963,6 +2015,7 @@ mod tests {
             &self,
             _aggregate_id: &RedemptionAggregateId,
             _symbol: &Symbol,
+            _chain: Chain,
             _quantity: FractionalShares,
         ) -> Result<(), RedemptionError> {
             Err(RedemptionError::Send(AggregateError::UserError(
@@ -1983,6 +2036,7 @@ mod tests {
             &self,
             _aggregate_id: &RedemptionAggregateId,
             _symbol: &Symbol,
+            _chain: Chain,
             _quantity: FractionalShares,
         ) -> Result<(), RedemptionError> {
             Err(RedemptionError::BotGasEnqueue(
@@ -1999,6 +2053,7 @@ mod tests {
         let ctx =
             redemption_test_ctx(transfer, TransferEquityToHedgingJobQueue::new(&apalis_pool)).await;
         let job = TransferEquityToHedging {
+            chain: Chain::Base,
             aggregate_id,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
@@ -2065,6 +2120,7 @@ mod tests {
         });
         let ctx = redemption_test_ctx(stub.clone(), hedging_test_job_queue().await).await;
         let job = TransferEquityToHedging {
+            chain: Chain::Base,
             aggregate_id: redemption_aggregate_id("redeem-forward"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
@@ -2093,6 +2149,7 @@ mod tests {
         )
         .await;
         let job = TransferEquityToHedging {
+            chain: Chain::Base,
             aggregate_id: redemption_aggregate_id("redeem-fail"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
@@ -2130,6 +2187,7 @@ mod tests {
                 issuer_request_id: issuer_request_id("terminal-mint-cleanup"),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
+                chain: Chain::Base,
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
             };
@@ -2159,6 +2217,7 @@ mod tests {
                     issuer_request_id: issuer_request_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(1),
+                    chain: Chain::Base,
                     wallet: Address::ZERO,
                 },
             )
@@ -2172,6 +2231,7 @@ mod tests {
             issuer_request_id,
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(1)),
+            chain: Chain::Base,
             generation,
             backpressure_streak: BackpressureStreak::default(),
         };
@@ -2205,6 +2265,7 @@ mod tests {
             issuer_request_id: issuer_request_id("legacy-terminal-mint-cleanup"),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(1)),
+            chain: Chain::Base,
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
         };
@@ -2212,6 +2273,7 @@ mod tests {
             issuer_request_id: issuer_request_id("old-terminal-mint-cleanup"),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(1)),
+            chain: Chain::Base,
             generation: GuardGeneration::from_parts(NonZeroU32::new(3).unwrap(), 2),
             backpressure_streak: BackpressureStreak::default(),
         };
@@ -2239,6 +2301,7 @@ mod tests {
             issuer_request_id: issuer_request_id("held-terminal-mint-cleanup"),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(1)),
+            chain: Chain::Base,
             generation: current_generation,
             backpressure_streak: BackpressureStreak::default(),
         };
@@ -2273,6 +2336,7 @@ mod tests {
             aggregate_id: redemption_aggregate_id("terminal-redemption-cleanup"),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(1)),
+            chain: Chain::Base,
             generation,
             backpressure_streak: BackpressureStreak::default(),
         };
@@ -2320,6 +2384,7 @@ mod tests {
                 aggregate_id: redemption_aggregate_id("stale-terminal-redemption-cleanup"),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
+                chain: Chain::Base,
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
             };
@@ -2357,6 +2422,7 @@ mod tests {
                 &aggregate_id,
                 EquityRedemptionCommand::Redeem {
                     symbol: symbol.clone(),
+                    chain: Chain::Base,
                     quantity: float!(1),
                     token: Address::ZERO,
                     amount: U256::from(1_u64),
@@ -2372,6 +2438,7 @@ mod tests {
             aggregate_id,
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(1)),
+            chain: Chain::Base,
             generation,
             backpressure_streak: BackpressureStreak::default(),
         };
@@ -2393,6 +2460,7 @@ mod tests {
     #[test]
     fn redemption_payload_roundtrips_through_json() {
         let job = TransferEquityToHedging {
+            chain: Chain::Base,
             aggregate_id: redemption_aggregate_id("redeem-roundtrip"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(2.5)),
@@ -2401,6 +2469,7 @@ mod tests {
         };
 
         let expected = json!({
+            "chain": "base",
             "aggregate_id": redemption_aggregate_id("redeem-roundtrip").to_string(),
             "symbol": "AAPL",
             "quantity": "2.5",
@@ -2443,7 +2512,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(2.5)),
             chain: Chain::Ethereum,
-            generation: 0,
+            generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
         };
         let serialized = serde_json::to_value(&mint).unwrap();
@@ -2457,6 +2526,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(2.5)),
             chain: Chain::Ethereum,
+            generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
         };
         let serialized = serde_json::to_value(&redemption).unwrap();

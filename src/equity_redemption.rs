@@ -71,7 +71,7 @@ use uuid::Uuid;
 
 use st0x_dto::{EquityRedemptionOperation, EquityRedemptionStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
-use st0x_evm::{EvmError, IERC20, NODE_SYNC_MAX_ATTEMPTS};
+use st0x_evm::{Chain, EvmError, IERC20, NODE_SYNC_MAX_ATTEMPTS};
 use st0x_execution::Symbol;
 use st0x_finance::{FractionalShares, Id};
 use st0x_tokenization::TokenizationRequestId;
@@ -296,6 +296,10 @@ pub enum EquityRedemptionCommand {
     /// Submits vault withdrawal tx and emits VaultWithdrawSubmitted.
     Redeem {
         symbol: Symbol,
+        /// The chain this redemption runs on. Carried by the genesis command
+        /// because `initialize` has no state to read it from, and persisted
+        /// so a resume never has to guess where the redemption is running.
+        chain: Chain,
         quantity: Float,
         token: Address,
         amount: U256,
@@ -306,6 +310,7 @@ pub enum EquityRedemptionCommand {
     #[cfg(any(test, feature = "test-support"))]
     RedeemAt {
         symbol: Symbol,
+        chain: Chain,
         quantity: Float,
         token: Address,
         amount: U256,
@@ -450,6 +455,10 @@ pub enum EquityRedemptionEvent {
     /// Vault withdrawal requested, awaiting submission.
     VaultWithdrawPending {
         symbol: Symbol,
+        /// The chain this redemption runs on. Absent in events recorded
+        /// before chains were tracked, which all ran on Base.
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -634,6 +643,7 @@ impl PartialEq for EquityRedemptionEvent {
             (
                 Self::VaultWithdrawPending {
                     symbol: s1,
+                    chain: c1,
                     quantity: q1,
                     token: t1,
                     wrapped_amount: w1,
@@ -641,12 +651,20 @@ impl PartialEq for EquityRedemptionEvent {
                 },
                 Self::VaultWithdrawPending {
                     symbol: s2,
+                    chain: c2,
                     quantity: q2,
                     token: t2,
                     wrapped_amount: w2,
                     pending_at: pa2,
                 },
-            ) => s1 == s2 && q1.eq(*q2).unwrap_or(false) && t1 == t2 && w1 == w2 && pa1 == pa2,
+            ) => {
+                s1 == s2
+                    && c1 == c2
+                    && q1.eq(*q2).unwrap_or(false)
+                    && t1 == t2
+                    && w1 == w2
+                    && pa1 == pa2
+            }
             (
                 Self::VaultWithdrawSubmitted {
                     symbol: s1,
@@ -873,6 +891,11 @@ pub enum EquityRedemption {
     /// Vault withdrawal requested, awaiting submission
     VaultWithdrawPending {
         symbol: Symbol,
+        /// The chain this redemption runs on, carried from the genesis event
+        /// so a resume never has to guess. Absent in aggregates persisted
+        /// before chains were tracked, which all ran on Base.
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -886,6 +909,8 @@ pub enum EquityRedemption {
     /// Vault withdrawal submitted, awaiting confirmation
     VaultWithdrawSubmitted {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -900,6 +925,8 @@ pub enum EquityRedemption {
     /// Tokens withdrawn from Raindex vault to wallet, not yet sent to Alpaca
     WithdrawnFromRaindex {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -917,6 +944,8 @@ pub enum EquityRedemption {
     /// Unwrap requested, awaiting submission
     UnwrapPending {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -934,6 +963,8 @@ pub enum EquityRedemption {
     /// Unwrap transaction submitted, awaiting confirmation
     UnwrapSubmitted {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -952,6 +983,8 @@ pub enum EquityRedemption {
     /// Wrapped tokens have been unwrapped, ready to send to Alpaca
     TokensUnwrapped {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -972,6 +1005,8 @@ pub enum EquityRedemption {
     /// Send requested, awaiting submission
     SendPending {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -996,6 +1031,8 @@ pub enum EquityRedemption {
     /// Tokens sent to Alpaca's redemption wallet
     TokensSent {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -1012,6 +1049,8 @@ pub enum EquityRedemption {
     /// Alpaca detected the token transfer and returned tracking identifier
     Pending {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -1026,6 +1065,8 @@ pub enum EquityRedemption {
     /// Redemption successfully completed and account credited (terminal state)
     Completed {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -1046,6 +1087,8 @@ pub enum EquityRedemption {
     /// - `tokenization_request_id`: Present if Alpaca detected the transfer
     Failed {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -1069,6 +1112,8 @@ pub enum EquityRedemption {
     /// record.
     Reconciled {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -1101,6 +1146,26 @@ impl EquityRedemption {
             | Self::Completed { symbol, .. }
             | Self::Failed { symbol, .. }
             | Self::Reconciled { symbol, .. } => symbol,
+        }
+    }
+
+    /// The chain this redemption runs on. Every service the saga uses --
+    /// raindex, wrapper, tokenizer -- is resolved from it, so a resume reads
+    /// the chain off the aggregate instead of assuming the primary.
+    pub(crate) fn chain(&self) -> Chain {
+        match self {
+            Self::VaultWithdrawPending { chain, .. }
+            | Self::VaultWithdrawSubmitted { chain, .. }
+            | Self::WithdrawnFromRaindex { chain, .. }
+            | Self::UnwrapPending { chain, .. }
+            | Self::UnwrapSubmitted { chain, .. }
+            | Self::TokensUnwrapped { chain, .. }
+            | Self::SendPending { chain, .. }
+            | Self::TokensSent { chain, .. }
+            | Self::Pending { chain, .. }
+            | Self::Completed { chain, .. }
+            | Self::Failed { chain, .. }
+            | Self::Reconciled { chain, .. } => *chain,
         }
     }
 
@@ -1339,19 +1404,24 @@ impl EventSourced for EquityRedemption {
     // event for operator reconciliation of stuck `Failed` redemptions. Additive
     // only; bumped to clear stale snapshots so they rebuild from events under the
     // new schema (existing events replay unchanged).
-    const SCHEMA_VERSION: u64 = 5;
+    // v6: added `chain` to `VaultWithdrawPending` and to every state variant,
+    // so a resume resolves the transfer's own chain instead of assuming the
+    // primary. Bumped to clear snapshots whose state predates the field.
+    const SCHEMA_VERSION: u64 = 6;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use EquityRedemptionEvent::*;
         match event {
             VaultWithdrawPending {
                 symbol,
+                chain,
                 quantity,
                 token,
                 wrapped_amount,
                 pending_at,
             } => Some(Self::VaultWithdrawPending {
                 symbol: symbol.clone(),
+                chain: *chain,
                 quantity: *quantity,
                 token: *token,
                 wrapped_amount: *wrapped_amount,
@@ -1367,6 +1437,7 @@ impl EventSourced for EquityRedemption {
                 submitted_at,
             } => Some(Self::VaultWithdrawSubmitted {
                 symbol: symbol.clone(),
+                chain: crate::onchain::legacy_chain(),
                 quantity: *quantity,
                 token: *token,
                 wrapped_amount: *wrapped_amount,
@@ -1385,6 +1456,7 @@ impl EventSourced for EquityRedemption {
                 withdrawn_at,
             } => Some(Self::WithdrawnFromRaindex {
                 symbol: symbol.clone(),
+                chain: crate::onchain::legacy_chain(),
                 quantity: *quantity,
                 token: *token,
                 wrapped_amount: resolve_withdrawn_wrapped_amount(
@@ -1403,6 +1475,10 @@ impl EventSourced for EquityRedemption {
     fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
         use EquityRedemptionEvent::*;
 
+        // Every state carries the chain the genesis event named; no later
+        // event can move a redemption to another chain.
+        let chain = entity.chain();
+
         Ok(match event {
             VaultWithdrawPending { .. } => None,
             VaultWithdrawSubmitted {
@@ -1415,6 +1491,7 @@ impl EventSourced for EquityRedemption {
             } => match entity {
                 Self::VaultWithdrawPending { .. } => Some(Self::VaultWithdrawSubmitted {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     token: *token,
                     wrapped_amount: *wrapped_amount,
@@ -1437,6 +1514,7 @@ impl EventSourced for EquityRedemption {
                 Self::VaultWithdrawPending { .. } | Self::VaultWithdrawSubmitted { .. } => {
                     Some(Self::WithdrawnFromRaindex {
                         symbol: symbol.clone(),
+                        chain,
                         quantity: *quantity,
                         token: *token,
                         wrapped_amount: resolve_withdrawn_wrapped_amount(
@@ -1464,6 +1542,7 @@ impl EventSourced for EquityRedemption {
                     ..
                 } => Some(Self::Failed {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     raindex_withdraw_tx: None,
                     redemption_tx: *tx_hash,
@@ -1479,6 +1558,7 @@ impl EventSourced for EquityRedemption {
                     ..
                 } => Some(Self::Failed {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     raindex_withdraw_tx: None,
                     redemption_tx: *tx_hash,
@@ -1523,6 +1603,7 @@ impl EventSourced for EquityRedemption {
                     ..
                 } => Some(Self::Failed {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     raindex_withdraw_tx: Some(*raindex_withdraw_tx),
                     redemption_tx: *tx_hash,
@@ -1544,8 +1625,10 @@ impl EventSourced for EquityRedemption {
                     raindex_withdraw_tx,
                     raindex_withdraw_block,
                     withdrawn_at,
+                    ..
                 } => Some(Self::UnwrapPending {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     token: *token,
                     wrapped_amount: *wrapped_amount,
@@ -1568,6 +1651,7 @@ impl EventSourced for EquityRedemption {
                     raindex_withdraw_tx,
                     raindex_withdraw_block,
                     withdrawn_at,
+                    ..
                 }
                 | Self::UnwrapPending {
                     symbol,
@@ -1577,8 +1661,10 @@ impl EventSourced for EquityRedemption {
                     raindex_withdraw_tx,
                     raindex_withdraw_block,
                     withdrawn_at,
+                    ..
                 } => Some(Self::UnwrapSubmitted {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     token: *token,
                     wrapped_amount: *wrapped_amount,
@@ -1623,6 +1709,7 @@ impl EventSourced for EquityRedemption {
                     ..
                 } => Some(Self::TokensUnwrapped {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: actual_quantity.unwrap_or(*quantity),
                     token: *token,
                     underlying_token: *underlying_token,
@@ -1648,8 +1735,10 @@ impl EventSourced for EquityRedemption {
                     unwrap_block,
                     withdrawn_at,
                     unwrapped_at,
+                    ..
                 } => Some(Self::SendPending {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     token: *token,
                     underlying_token: *underlying_token,
@@ -1676,6 +1765,7 @@ impl EventSourced for EquityRedemption {
                     ..
                 } => Some(Self::TokensSent {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     token: *token,
                     raindex_withdraw_tx: *raindex_withdraw_tx,
@@ -1701,6 +1791,7 @@ impl EventSourced for EquityRedemption {
                     ..
                 } => Some(Self::TokensSent {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     token: underlying_token.address(),
                     raindex_withdraw_tx: *raindex_withdraw_tx,
@@ -1729,6 +1820,7 @@ impl EventSourced for EquityRedemption {
 
                 Some(Self::Pending {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     redemption_tx: *redemption_tx,
                     tokenization_request_id: tokenization_request_id.clone(),
@@ -1757,6 +1849,7 @@ impl EventSourced for EquityRedemption {
 
                 Some(Self::Failed {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     raindex_withdraw_tx: Some(*raindex_withdraw_tx),
                     redemption_tx: Some(*redemption_tx),
@@ -1782,6 +1875,7 @@ impl EventSourced for EquityRedemption {
 
                 Some(Self::Completed {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     redemption_tx: *redemption_tx,
                     tokenization_request_id: tokenization_request_id.clone(),
@@ -1808,6 +1902,7 @@ impl EventSourced for EquityRedemption {
 
                 Some(Self::Failed {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     raindex_withdraw_tx: None,
                     redemption_tx: Some(*redemption_tx),
@@ -1835,6 +1930,7 @@ impl EventSourced for EquityRedemption {
 
                 Some(Self::Completed {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     redemption_tx: *redemption_tx,
                     tokenization_request_id: tokenization_request_id.clone(),
@@ -1863,6 +1959,7 @@ impl EventSourced for EquityRedemption {
 
                 Some(Self::Reconciled {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     raindex_withdraw_tx: *raindex_withdraw_tx,
                     redemption_tx: *redemption_tx,
@@ -1885,11 +1982,13 @@ impl EventSourced for EquityRedemption {
         match command {
             Redeem {
                 symbol,
+                chain,
                 quantity,
                 token,
                 amount,
             } => Ok(vec![VaultWithdrawPending {
                 symbol,
+                chain,
                 quantity,
                 token,
                 wrapped_amount: amount,
@@ -1898,12 +1997,14 @@ impl EventSourced for EquityRedemption {
             #[cfg(any(test, feature = "test-support"))]
             RedeemAt {
                 symbol,
+                chain,
                 quantity,
                 token,
                 amount,
                 pending_at,
             } => Ok(vec![VaultWithdrawPending {
                 symbol,
+                chain,
                 quantity,
                 token,
                 wrapped_amount: amount,
@@ -3078,6 +3179,7 @@ mod tests {
 
     fn vault_withdraw_pending_event() -> EquityRedemptionEvent {
         EquityRedemptionEvent::VaultWithdrawPending {
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(50.25),
             token: Address::random(),
@@ -3145,6 +3247,7 @@ mod tests {
         let events = TestHarness::<EquityRedemption>::with(mock_services())
             .given_no_previous_events()
             .when(EquityRedemptionCommand::Redeem {
+                chain: Chain::Base,
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: float!(50.25),
                 token: Address::random(),
@@ -3199,6 +3302,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(50.25),
                     token: Address::random(),
@@ -3298,6 +3402,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(50.25),
                     token: Address::random(),
@@ -3362,6 +3467,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(50.25),
                     token: Address::random(),
@@ -3440,6 +3546,7 @@ mod tests {
         let events = TestHarness::<EquityRedemption>::with(mock_services())
             .given_no_previous_events()
             .when(EquityRedemptionCommand::RedeemAt {
+                chain: Chain::Base,
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: float!(50.25),
                 token: Address::random(),
@@ -3573,6 +3680,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     token: wrapped_token,
@@ -3789,6 +3897,7 @@ mod tests {
             attested: UnwrappedToken::unchecked(Address::random()),
         };
         let send_pending = EquityRedemption::SendPending {
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(10),
             token: Address::random(),
@@ -3834,6 +3943,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("COIN").unwrap(),
                     quantity: float!(37.143292455),
                     token: Address::random(),
@@ -3884,6 +3994,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("COIN").unwrap(),
                     quantity: float!(37.143292455),
                     token: Address::random(),
@@ -3945,6 +4056,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("COIN").unwrap(),
                     quantity: float!(10),
                     token: Address::random(),
@@ -4002,6 +4114,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("COIN").unwrap(),
                     quantity: float!(10),
                     token: Address::random(),
@@ -4345,6 +4458,7 @@ mod tests {
     fn test_evolve_detected_rejects_wrong_state() {
         let now = Utc::now();
         let completed = EquityRedemption::Completed {
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(50.25),
             redemption_tx: TxHash::random(),
@@ -4365,6 +4479,7 @@ mod tests {
     #[test]
     fn test_evolve_completed_rejects_wrong_state() {
         let tokens_sent = EquityRedemption::TokensSent {
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(50.25),
             token: Address::random(),
@@ -4386,6 +4501,7 @@ mod tests {
     #[test]
     fn test_evolve_detection_failed_rejects_non_tokens_sent_states() {
         let pending = EquityRedemption::Pending {
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(50.25),
             redemption_tx: TxHash::random(),
@@ -4406,6 +4522,7 @@ mod tests {
     #[test]
     fn test_evolve_redemption_rejected_rejects_non_pending_states() {
         let tokens_sent = EquityRedemption::TokensSent {
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(50.25),
             token: Address::random(),
@@ -4428,6 +4545,7 @@ mod tests {
     #[test]
     fn test_evolve_rejects_tokens_sent_event_on_live_state() {
         let tokens_sent = EquityRedemption::TokensSent {
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(50.25),
             token: Address::random(),
@@ -4477,6 +4595,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(50.25),
                     token: Address::random(),
@@ -4546,6 +4665,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(50.25),
                     token: Address::random(),
@@ -4653,6 +4773,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     token: Address::random(),
@@ -4744,6 +4865,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     token: Address::random(),
@@ -4757,6 +4879,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     token: Address::random(),
@@ -4781,6 +4904,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     token: Address::random(),
@@ -4839,6 +4963,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     token: Address::random(),
@@ -5297,6 +5422,7 @@ mod tests {
         let later = now + chrono::Duration::seconds(60);
 
         let withdrawn = EquityRedemption::WithdrawnFromRaindex {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(50.25),
             token: Address::random(),
@@ -5323,6 +5449,7 @@ mod tests {
         assert_eq!(op.updated_at, now);
 
         let unwrapped = EquityRedemption::TokensUnwrapped {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(50.25),
             token: Address::random(),
@@ -5348,6 +5475,7 @@ mod tests {
         assert_eq!(op.updated_at, later);
 
         let sent = EquityRedemption::TokensSent {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(50.25),
             token: Address::random(),
@@ -5369,6 +5497,7 @@ mod tests {
         assert_eq!(op.updated_at, now);
 
         let pending = EquityRedemption::Pending {
+            chain: Chain::Base,
             symbol,
             quantity: float!(50.25),
             redemption_tx: TxHash::random(),
@@ -5545,6 +5674,7 @@ mod tests {
         let later = now + chrono::Duration::seconds(60);
 
         let completed = EquityRedemption::Completed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(50.25),
             redemption_tx: TxHash::random(),
@@ -5563,6 +5693,7 @@ mod tests {
         assert_eq!(op.updated_at, later);
 
         let failed = EquityRedemption::Failed {
+            chain: Chain::Base,
             symbol,
             quantity: float!(50.25),
             raindex_withdraw_tx: Some(TxHash::random()),
@@ -5590,6 +5721,7 @@ mod tests {
         let recovered_at = started_at + chrono::Duration::seconds(60);
         let redemption_tx = TxHash::repeat_byte(1);
         let failed = EquityRedemption::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             raindex_withdraw_tx: None,
@@ -6203,6 +6335,7 @@ mod tests {
         let started_at = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reconciled_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reconciled = EquityRedemption::Reconciled {
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(50.25),
             raindex_withdraw_tx: Some(TxHash::random()),
@@ -6249,6 +6382,7 @@ mod tests {
 
         assert!(
             !EquityRedemption::VaultWithdrawPending {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 token: Address::ZERO,
@@ -6260,6 +6394,7 @@ mod tests {
 
         assert!(
             !EquityRedemption::VaultWithdrawSubmitted {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 token: Address::ZERO,
@@ -6272,6 +6407,7 @@ mod tests {
 
         assert!(
             !EquityRedemption::WithdrawnFromRaindex {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 token: Address::ZERO,
@@ -6285,6 +6421,7 @@ mod tests {
 
         assert!(
             !EquityRedemption::UnwrapPending {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 token: Address::ZERO,
@@ -6298,6 +6435,7 @@ mod tests {
 
         assert!(
             !EquityRedemption::UnwrapSubmitted {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 token: Address::ZERO,
@@ -6312,6 +6450,7 @@ mod tests {
 
         assert!(
             !EquityRedemption::TokensUnwrapped {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 token: Address::ZERO,
@@ -6330,6 +6469,7 @@ mod tests {
 
         assert!(
             !EquityRedemption::SendPending {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 token: Address::ZERO,
@@ -6348,6 +6488,7 @@ mod tests {
 
         assert!(
             !EquityRedemption::TokensSent {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 token: Address::ZERO,
@@ -6362,6 +6503,7 @@ mod tests {
 
         assert!(
             !EquityRedemption::Pending {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 redemption_tx: TxHash::default(),
@@ -6374,6 +6516,7 @@ mod tests {
 
         assert!(
             EquityRedemption::Completed {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 redemption_tx: TxHash::default(),
@@ -6386,6 +6529,7 @@ mod tests {
 
         assert!(
             EquityRedemption::Reconciled {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 raindex_withdraw_tx: None,
@@ -6401,6 +6545,7 @@ mod tests {
 
         assert!(
             EquityRedemption::Failed {
+                chain: Chain::Base,
                 symbol: sym,
                 quantity: float!(1),
                 raindex_withdraw_tx: None,
@@ -6424,6 +6569,7 @@ mod tests {
         let started_at = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reconciled_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reconciled = EquityRedemption::Reconciled {
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(50.25),
             raindex_withdraw_tx: Some(TxHash::random()),

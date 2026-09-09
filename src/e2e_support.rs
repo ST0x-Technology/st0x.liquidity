@@ -6,6 +6,7 @@ use rain_math_float::Float;
 use sqlx::SqlitePool;
 
 use st0x_config::Ctx;
+use st0x_evm::Chain;
 use st0x_execution::Symbol;
 use st0x_tokenization::{IssuerRequestId, tokenization_request_id};
 
@@ -59,6 +60,7 @@ pub async fn seed_mint_at_tokens_wrapped(
         TokenizedEquityMintEvent::MintRequested {
             issuer_request_id: None,
             symbol: symbol.clone(),
+            chain: Chain::Base,
             quantity,
             wallet,
             requested_at: now,

@@ -998,6 +998,7 @@ mod tests {
 
     use st0x_dto::EquityOperationKind;
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
+    use st0x_evm::Chain;
     use st0x_float_macro::float;
     use st0x_tokenization::{TokenizationRequestId, issuer_request_id};
     use st0x_wrapper::UnwrappedToken;
@@ -1037,6 +1038,7 @@ mod tests {
         vec![
             TokenizedEquityMintEvent::MintRequested {
                 issuer_request_id: None,
+                chain: Chain::Base,
                 symbol: symbol(),
                 quantity: float!(5),
                 wallet: Address::repeat_byte(0x11),
@@ -1077,6 +1079,7 @@ mod tests {
     pub(super) fn redemption_happy_path() -> Vec<EquityRedemptionEvent> {
         vec![
             EquityRedemptionEvent::VaultWithdrawPending {
+                chain: Chain::Base,
                 symbol: symbol(),
                 quantity: float!(5),
                 token: Address::repeat_byte(0x22),
@@ -1247,6 +1250,7 @@ mod tests {
             .send(
                 &operation_id,
                 TokenizedEquityMintCommand::RequestMintAt {
+                    chain: Chain::Base,
                     issuer_request_id: operation_id.clone(),
                     symbol: symbol(),
                     quantity: float!(5),
@@ -1367,6 +1371,7 @@ mod tests {
             &valid_id.to_string(),
             1,
             &serde_json::to_string(&EquityRedemptionEvent::VaultWithdrawPending {
+                chain: Chain::Base,
                 symbol: symbol(),
                 quantity: float!(5),
                 token: Address::repeat_byte(0x22),
@@ -1404,6 +1409,7 @@ mod tests {
             &corrupt_row_id.to_string(),
             1,
             &serde_json::to_string(&EquityRedemptionEvent::VaultWithdrawPending {
+                chain: Chain::Base,
                 symbol: symbol(),
                 quantity: float!(5),
                 token: Address::repeat_byte(0x22),
@@ -1522,6 +1528,7 @@ mod tests {
             &operation_id.to_string(),
             1,
             &serde_json::to_string(&EquityRedemptionEvent::VaultWithdrawPending {
+                chain: Chain::Base,
                 symbol: symbol(),
                 quantity: float!(5),
                 token: Address::repeat_byte(0x22),
@@ -1669,6 +1676,7 @@ mod tests {
             1,
             &serde_json::to_string(&TokenizedEquityMintEvent::MintRequested {
                 issuer_request_id: None,
+                chain: Chain::Base,
                 symbol: symbol(),
                 quantity: float!(5),
                 wallet: Address::repeat_byte(0x11),
@@ -1685,6 +1693,7 @@ mod tests {
             &redemption_id.to_string(),
             1,
             &serde_json::to_string(&EquityRedemptionEvent::VaultWithdrawPending {
+                chain: Chain::Base,
                 symbol: symbol(),
                 quantity: float!(5),
                 token: Address::repeat_byte(0x22),
@@ -1788,6 +1797,7 @@ mod tests {
         let events = [
             TokenizedEquityMintEvent::MintRequested {
                 issuer_request_id: None,
+                chain: Chain::Base,
                 symbol: symbol(),
                 quantity: float!(5),
                 wallet: Address::repeat_byte(0x11),
@@ -1812,6 +1822,7 @@ mod tests {
         // stage-close event timestamped before the stage-open event.
         let events = [
             EquityRedemptionEvent::VaultWithdrawPending {
+                chain: Chain::Base,
                 symbol: symbol(),
                 quantity: float!(5),
                 token: Address::repeat_byte(0x22),

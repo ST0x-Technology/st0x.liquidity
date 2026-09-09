@@ -287,6 +287,7 @@ pub async fn seed_simulated_mint_history(
             TokenizedEquityMintCommand::RequestMintAt {
                 issuer_request_id: issuer_request_id.clone(),
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 quantity,
                 wallet,
                 requested_at,
@@ -1107,6 +1108,7 @@ pub async fn seed_simulated_equity_redemption_history(
                 &id,
                 EquityRedemptionCommand::RedeemAt {
                     symbol: symbol.clone(),
+                    chain: Chain::Base,
                     quantity,
                     token,
                     amount: wrapped_amount,

@@ -6324,6 +6324,7 @@ mod tests {
             .send(
                 &mint_id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: mint_id.clone(),
                     symbol: st0x_execution::Symbol::new("AAPL").unwrap(),
                     quantity: st0x_float_macro::float!(10.0),
@@ -6337,6 +6338,7 @@ mod tests {
             .send(
                 &redemption_id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: st0x_execution::Symbol::new("AAPL").unwrap(),
                     quantity: st0x_float_macro::float!(5.0),
                     token: alloy::primitives::Address::from([wallet_byte; 20]),
@@ -6405,6 +6407,7 @@ mod tests {
             .send(
                 id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(5),
@@ -6628,6 +6631,7 @@ mod tests {
             crate::rebalancing::equity::TransferEquityToMarketMakingJobQueue::new(&apalis_pool);
         transfer_queue
             .push(TransferEquityToMarketMaking {
+                chain: Chain::Base,
                 issuer_request_id: mint_id.clone(),
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(10)),
@@ -6683,6 +6687,7 @@ mod tests {
                 issuer_request_id: issuer_request_id("invalid-status"),
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
+                chain: Chain::Base,
                 generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -6726,8 +6731,8 @@ mod tests {
                 issuer_request_id: mint_id.clone(),
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
+                chain: Chain::Base,
                 generation: GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
             })
             .await
@@ -6739,6 +6744,7 @@ mod tests {
                 aggregate_id: redemption_id,
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
+                chain: Chain::Base,
                 generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -6807,6 +6813,7 @@ mod tests {
                 issuer_request_id: issuer_request_id("guardless-row"),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
+                chain: Chain::Base,
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -6817,6 +6824,7 @@ mod tests {
                 issuer_request_id: issuer_request_id("guardless-legacy-row"),
                 symbol: legacy_symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
+                chain: Chain::Base,
                 generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -6887,6 +6895,7 @@ mod tests {
                 issuer_request_id: mint_id.clone(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
+                chain: Chain::Base,
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
             },
@@ -6961,6 +6970,7 @@ mod tests {
                     issuer_request_id: terminal_id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(1),
+                    chain: Chain::Base,
                     wallet: Address::from([7; 20]),
                 },
             )
@@ -6983,6 +6993,7 @@ mod tests {
                 issuer_request_id: terminal_id,
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
+                chain: Chain::Base,
                 generation: GuardGeneration::from_parts(NonZeroU32::new(7).unwrap(), 12),
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -7034,6 +7045,7 @@ mod tests {
             crate::rebalancing::equity::TransferEquityToMarketMakingJobQueue::new(&apalis_pool);
         transfer_queue
             .push(TransferEquityToMarketMaking {
+                chain: Chain::Base,
                 issuer_request_id: mint_id.clone(),
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
@@ -7122,6 +7134,7 @@ mod tests {
                 aggregate_id: fixture.redemption_id.clone(),
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(5)),
+                chain: Chain::Base,
                 generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -14896,6 +14909,7 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new()));
 
         let tokens_received = TokenizedEquityMint::TokensReceived {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(5),
             wallet: Address::ZERO,
@@ -14909,6 +14923,7 @@ mod tests {
             received_at: now,
         };
         let wrap_submitted = TokenizedEquityMint::WrapSubmitted {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(5),
             wallet: Address::ZERO,
@@ -14923,6 +14938,7 @@ mod tests {
             wrap_tx_hash: TxHash::ZERO,
         };
         let tokens_wrapped = TokenizedEquityMint::TokensWrapped {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(5),
             wallet: Address::ZERO,
