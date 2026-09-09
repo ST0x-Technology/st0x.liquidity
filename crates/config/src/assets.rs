@@ -180,6 +180,13 @@ impl ChainAssets {
             .is_some_and(|config| config.rebalancing == OperationMode::Enabled)
     }
 
+    /// Whether any equity on this chain opts into rebalancing: the flag that
+    /// makes the chain need the equity-rebalancing wiring (wrapper, issuer
+    /// client, redemption wallet). A chain with none is hedge-only.
+    pub fn rebalances_equity(&self) -> bool {
+        todo!("any equity with rebalancing enabled")
+    }
+
     /// Returns whether wrapped/unwrapped wallet equity recovery is enabled
     /// for the given equity on this chain.
     ///
@@ -328,6 +335,39 @@ mod tests {
         assert_eq!(cash.rebalancing, OperationMode::Disabled);
         assert_eq!(cash.vault_ids.len(), 1);
     }
+    /// A chain rebalances equity when at least one listed equity opts in;
+    /// trading flags and cash do not count, and an empty table does not.
+    #[test]
+    fn rebalances_equity_only_when_some_equity_opts_in() {
+        let equity = |rebalancing: &str| {
+            format!(
+                r#"
+                tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+                tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+                trading = "enabled"
+                rebalancing = "{rebalancing}"
+                wrapped_equity_recovery = "disabled"
+                "#
+            )
+        };
+        let hedge_only: ChainAssets = toml::from_str(&format!(
+            "[equities.AAPL]\n{}\n[equities.TSLA]\n{}\n[cash]\nrebalancing = \"enabled\"",
+            equity("disabled"),
+            equity("disabled"),
+        ))
+        .unwrap();
+        let rebalancing: ChainAssets = toml::from_str(&format!(
+            "[equities.AAPL]\n{}\n[equities.TSLA]\n{}",
+            equity("disabled"),
+            equity("enabled"),
+        ))
+        .unwrap();
+
+        assert!(!ChainAssets::default().rebalances_equity());
+        assert!(!hedge_only.rebalances_equity());
+        assert!(rebalancing.rebalances_equity());
+    }
+
     #[test]
     fn extended_hours_counter_trading_parses_enabled_and_disabled_from_toml() {
         let toml_str = r#"
