@@ -1449,6 +1449,484 @@ pub mod position {
     }
 }
 
+/// In-bot transaction processing: account a missed on-chain fill and place the
+/// opposite hedge, shared by the operator CLI and the ops API.
+pub mod process_tx {
+    use std::sync::Arc;
+
+    use alloy::primitives::TxHash;
+    use alloy::providers::Provider;
+    use sqlx::SqlitePool;
+    use tokio::sync::Mutex;
+    use tracing::{error, info};
+
+    use st0x_config::Ctx;
+    use st0x_event_sorcery::{Store, StoreBuilder};
+    use st0x_evm::ReadOnlyEvm;
+    use st0x_execution::{Direction, FractionalShares, MockExecutor, Positive, Symbol};
+    use st0x_registry::SymbolCache;
+
+    use crate::conductor::{
+        FillAccountingOutcome, account_for_onchain_fill, execute_mark_acknowledged,
+        execute_settle_fill, is_expected_place_offchain_order_rejection,
+    };
+    use crate::offchain::order::{
+        OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacer,
+        TerminalPositionFinalization, client_order_id_for_placement,
+        place_offchain_order_at_broker, position_command_for_finalization,
+        terminal_position_finalization,
+    };
+    use crate::onchain::accumulator::check_execution_readiness;
+    use crate::onchain::trade::{BotOperator, RecoveryActors};
+    use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
+    use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
+    use crate::position::{AnchorDisposition, Position, PositionCommand};
+
+    use super::OperatorError;
+
+    /// The state of a hedge order after (attempted) broker placement, or of an
+    /// existing pending hedge found before placement.
+    #[derive(Debug, Clone, Copy)]
+    pub enum HedgeDisposition {
+        /// The broker accepted the order; the next order-status recovery sweep
+        /// reconciles it to a terminal state.
+        InFlight,
+        /// Placement failed or the order vanished; the position's pending marker
+        /// was cleared so the normal pipeline can re-hedge.
+        ClearedForRetry,
+        /// The order reached a terminal broker state and the position was
+        /// finalized.
+        Finalized,
+    }
+
+    /// What processing a transaction's fill resolved to.
+    #[derive(Debug)]
+    pub enum ProcessTxOutcome {
+        /// No orderbook events in the transaction matched the configured order.
+        NoTradeableEvents,
+        /// The RPC endpoint did not find the transaction.
+        TransactionNotFound { tx_hash: TxHash },
+        /// The fill was already fully accounted; nothing to do.
+        AlreadyAccounted,
+        /// An existing pending hedge is in flight, so the fill was settled
+        /// without placing a new hedge.
+        PendingHedgeInFlight,
+        /// The fill was accounted but net exposure is below the execution
+        /// threshold, so no hedge was placed yet.
+        BelowExecutionThreshold,
+        /// Trading is disabled by configuration for the symbol; the fill was
+        /// settled without placing a hedge.
+        TradingDisabled { symbol: Symbol },
+        /// A concurrent placement already claimed the position, so the fill was
+        /// settled without placing a hedge.
+        PlacementRejected { symbol: Symbol },
+        /// A hedge order was placed at the broker.
+        HedgePlaced {
+            symbol: Symbol,
+            offchain_order_id: OffchainOrderId,
+            shares: Positive<FractionalShares>,
+            direction: Direction,
+            disposition: HedgeDisposition,
+        },
+    }
+
+    /// Accounts a missed on-chain fill from `tx_hash` and, when the resulting
+    /// net exposure warrants it, places the opposite hedge.
+    ///
+    /// Run inside the bot process, pass the live `submission_lock` so the broker
+    /// placement serializes against the trading loop (ADR 0014); the shared
+    /// `Position` aggregate's pending-order gate and the event store's
+    /// per-aggregate sequence already prevent a racing tick from double-placing
+    /// the hedge. The CLI runs in a separate process with no shared lock and
+    /// passes `None`.
+    pub async fn process_tx<P: Provider + Clone + 'static>(
+        tx_hash: TxHash,
+        ctx: &Ctx,
+        pool: &SqlitePool,
+        provider: &P,
+        cache: &SymbolCache,
+        order_placer: Arc<dyn OrderPlacer>,
+        submission_lock: Option<&Mutex<()>>,
+    ) -> Result<ProcessTxOutcome, OperatorError> {
+        let trading_chain = ctx.chains.sole_trading();
+        let actors = RecoveryActors {
+            order_owner: ctx.vault_owner(),
+            bot_operator: BotOperator(ctx.order_owner()),
+        };
+        let read_evm = ReadOnlyEvm::new(provider.clone());
+
+        match OnchainTrade::try_from_tx_hash(tx_hash, &read_evm, cache, trading_chain, actors).await
+        {
+            Ok(Some(onchain_trade)) => {
+                process_found_trade(onchain_trade, ctx, pool, order_placer, submission_lock)
+                    .await
+                    .map_err(OperatorError::Operational)
+            }
+            Ok(None) => Ok(ProcessTxOutcome::NoTradeableEvents),
+            Err(OnChainError::Validation(TradeValidationError::TransactionNotFound(_))) => {
+                Ok(ProcessTxOutcome::TransactionNotFound { tx_hash })
+            }
+            Err(error) => Err(OperatorError::Operational(anyhow::Error::new(error))),
+        }
+    }
+
+    async fn process_found_trade(
+        onchain_trade: OnchainTrade,
+        ctx: &Ctx,
+        pool: &SqlitePool,
+        order_placer: Arc<dyn OrderPlacer>,
+        submission_lock: Option<&Mutex<()>>,
+    ) -> anyhow::Result<ProcessTxOutcome> {
+        let trade_id = OnChainTradeId::new(
+            onchain_trade.chain,
+            onchain_trade.tx_hash,
+            onchain_trade.log_index,
+        );
+
+        let (onchain_trade_store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await?;
+        let (position_store, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await?;
+        let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+            .build(order_placer.clone())
+            .await?;
+
+        let Some(block_number) = onchain_trade.block_number else {
+            anyhow::bail!("Fill {trade_id}: missing block_number, cannot witness fill");
+        };
+
+        let FillAccountingOutcome::Accounted { trade_id } = account_for_onchain_fill(
+            pool,
+            &onchain_trade_store,
+            &position_store,
+            &onchain_trade,
+            block_number,
+            ctx.execution_threshold,
+        )
+        .await?
+        else {
+            return Ok(ProcessTxOutcome::AlreadyAccounted);
+        };
+
+        let base_symbol = onchain_trade.symbol();
+
+        match reconcile_existing_pending_order(&offchain_order_store, &position_store, base_symbol)
+            .await?
+        {
+            None | Some(HedgeDisposition::ClearedForRetry | HedgeDisposition::Finalized) => {}
+            Some(HedgeDisposition::InFlight) => {
+                mark_and_settle_fill(
+                    &onchain_trade_store,
+                    &position_store,
+                    &trade_id,
+                    &onchain_trade,
+                )
+                .await?;
+                return Ok(ProcessTxOutcome::PendingHedgeInFlight);
+            }
+        }
+
+        let trading_enabled = ctx
+            .chains
+            .sole_trading()
+            .assets
+            .is_trading_enabled(base_symbol);
+
+        if !trading_enabled {
+            mark_and_settle_fill(
+                &onchain_trade_store,
+                &position_store,
+                &trade_id,
+                &onchain_trade,
+            )
+            .await?;
+            return Ok(ProcessTxOutcome::TradingDisabled {
+                symbol: base_symbol.clone(),
+            });
+        }
+
+        let executor_type = ctx.broker.to_supported_executor();
+        // process-tx is a manual recovery verb: a `MockExecutor` forces the
+        // readiness check to treat the market as open so the operator can place
+        // the hedge regardless of session, matching the CLI path.
+        let executor = MockExecutor::new();
+        let Some(params) = check_execution_readiness(
+            &executor,
+            &position_projection,
+            base_symbol,
+            executor_type,
+            &ctx.chains.sole_trading().assets,
+            &ctx.assets,
+            trading_enabled,
+        )
+        .await?
+        else {
+            mark_and_settle_fill(
+                &onchain_trade_store,
+                &position_store,
+                &trade_id,
+                &onchain_trade,
+            )
+            .await?;
+            return Ok(ProcessTxOutcome::BelowExecutionThreshold);
+        };
+
+        let offchain_order_id = OffchainOrderId::new();
+
+        let anchor = position_store
+            .load(&params.symbol)
+            .await
+            .inspect_err(|error| {
+                error!(
+                    %offchain_order_id,
+                    symbol = %params.symbol,
+                    %error,
+                    "Failed to load position for the idempotency anchor; refusing \
+                     placement until it can be read"
+                );
+            })?
+            .and_then(|position| position.last_failed_offchain_order_id);
+
+        // Serialize the aggregate claim and the broker placement against the
+        // live trading loop (ADR 0014). Held only on the in-bot path; released
+        // when this scope ends.
+        let _submission_guard = match submission_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+
+        match position_store
+            .send(
+                &params.symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares: params.shares,
+                    direction: params.direction,
+                    executor: params.executor,
+                    threshold: ctx.execution_threshold,
+                },
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(error) if is_expected_place_offchain_order_rejection(&error) => {
+                info!(
+                    %offchain_order_id,
+                    symbol = %params.symbol,
+                    "Position::PlaceOffChainOrder rejected by domain state: {error}"
+                );
+                mark_and_settle_fill(
+                    &onchain_trade_store,
+                    &position_store,
+                    &trade_id,
+                    &onchain_trade,
+                )
+                .await?;
+                return Ok(ProcessTxOutcome::PlacementRejected {
+                    symbol: params.symbol.clone(),
+                });
+            }
+            Err(error) => return Err(anyhow::Error::new(error)),
+        }
+
+        let client_order_id = client_order_id_for_placement(offchain_order_id, anchor);
+
+        place_offchain_order_at_broker(
+            &offchain_order_store,
+            order_placer.as_ref(),
+            &offchain_order_id,
+            OffchainOrderPlacement::market(
+                params.symbol.clone(),
+                params.shares,
+                params.direction,
+                params.executor,
+                client_order_id,
+            ),
+        )
+        .await?;
+
+        let disposition = reconcile_post_place_state(
+            &offchain_order_store,
+            &position_store,
+            &params.symbol,
+            offchain_order_id,
+        )
+        .await?;
+
+        mark_and_settle_fill(
+            &onchain_trade_store,
+            &position_store,
+            &trade_id,
+            &onchain_trade,
+        )
+        .await?;
+
+        Ok(ProcessTxOutcome::HedgePlaced {
+            symbol: params.symbol.clone(),
+            offchain_order_id,
+            shares: params.shares,
+            direction: params.direction,
+            disposition,
+        })
+    }
+
+    async fn mark_and_settle_fill(
+        onchain_trade_store: &Store<OnChainTrade>,
+        position_store: &Store<Position>,
+        trade_id: &OnChainTradeId,
+        onchain_trade: &OnchainTrade,
+    ) -> anyhow::Result<()> {
+        execute_mark_acknowledged(onchain_trade_store, trade_id).await?;
+        execute_settle_fill(position_store, onchain_trade).await?;
+        Ok(())
+    }
+
+    /// Inspects any pending hedge already recorded on the position before
+    /// placing a new one. `None` means no pending order; otherwise the returned
+    /// disposition reports whether it is still live (`InFlight`) or was resolved
+    /// (`ClearedForRetry`/`Finalized`) so the caller may place a fresh hedge.
+    async fn reconcile_existing_pending_order(
+        offchain_order_store: &Store<OffchainOrder>,
+        position_store: &Store<Position>,
+        symbol: &Symbol,
+    ) -> anyhow::Result<Option<HedgeDisposition>> {
+        let Some(position) = position_store.load(symbol).await? else {
+            return Ok(None);
+        };
+        let Some(offchain_order_id) = position.pending_offchain_order_id else {
+            return Ok(None);
+        };
+        let loaded_order = offchain_order_store
+            .load(&offchain_order_id)
+            .await
+            .inspect_err(|error| {
+                error!(
+                    %offchain_order_id,
+                    %symbol,
+                    %error,
+                    "Failed to load existing pending offchain order; cannot safely acknowledge fill"
+                );
+            })?;
+        reconcile_offchain_order_state(loaded_order, position_store, symbol, offchain_order_id)
+            .await
+            .map(Some)
+    }
+
+    /// Mirrors dispatch_post_place_state in the normal pipeline: inspect the
+    /// persisted offchain order state and clear the position pending marker on
+    /// failure so the normal pipeline can re-hedge on its next cycle.
+    async fn reconcile_post_place_state(
+        offchain_order_store: &Store<OffchainOrder>,
+        position_store: &Store<Position>,
+        symbol: &Symbol,
+        offchain_order_id: OffchainOrderId,
+    ) -> anyhow::Result<HedgeDisposition> {
+        let loaded_order = offchain_order_store
+            .load(&offchain_order_id)
+            .await
+            .inspect_err(|error| {
+                error!(
+                    %offchain_order_id,
+                    %symbol,
+                    %error,
+                    "Failed to load offchain order after Place; cannot determine post-broker state"
+                );
+            })?;
+        reconcile_offchain_order_state(loaded_order, position_store, symbol, offchain_order_id)
+            .await
+    }
+
+    async fn reconcile_offchain_order_state(
+        loaded_order: Option<OffchainOrder>,
+        position_store: &Store<Position>,
+        symbol: &Symbol,
+        offchain_order_id: OffchainOrderId,
+    ) -> anyhow::Result<HedgeDisposition> {
+        match loaded_order {
+            Some(OffchainOrder::Failed { error, .. }) => {
+                // Broker placement failed: clear pending_offchain_order_id so the
+                // position is not permanently stuck and the normal pipeline can
+                // retry. No broker terminality classification available here;
+                // fail-safe preserves.
+                position_store
+                    .send(
+                        symbol,
+                        PositionCommand::FailOffChainOrder {
+                            offchain_order_id,
+                            error,
+                            anchor: AnchorDisposition::Preserve,
+                        },
+                    )
+                    .await?;
+                Ok(HedgeDisposition::ClearedForRetry)
+            }
+            Some(
+                OffchainOrder::Submitted { .. }
+                | OffchainOrder::PartiallyFilled { .. }
+                | OffchainOrder::Cancelling { .. },
+            ) => Ok(HedgeDisposition::InFlight),
+            None => {
+                position_store
+                    .send(
+                        symbol,
+                        PositionCommand::FailOffChainOrder {
+                            offchain_order_id,
+                            error: "Offchain order missing after Place".to_owned(),
+                            anchor: AnchorDisposition::Preserve,
+                        },
+                    )
+                    .await?;
+                Ok(HedgeDisposition::ClearedForRetry)
+            }
+            Some(OffchainOrder::Pending { .. }) => anyhow::bail!(
+                "offchain order {offchain_order_id} for {symbol} is in an unexpected \
+                 post-placement state; refusing to clear the position claim"
+            ),
+            Some(order @ (OffchainOrder::Filled { .. } | OffchainOrder::Cancelled { .. })) => {
+                reconcile_terminal_offchain_order(&order, position_store, symbol, offchain_order_id)
+                    .await
+            }
+        }
+    }
+
+    async fn reconcile_terminal_offchain_order(
+        order: &OffchainOrder,
+        position_store: &Store<Position>,
+        symbol: &Symbol,
+        offchain_order_id: OffchainOrderId,
+    ) -> anyhow::Result<HedgeDisposition> {
+        let Some(finalization) = terminal_position_finalization(order) else {
+            anyhow::bail!(
+                "offchain order {offchain_order_id} for {symbol} is terminal but did not \
+                 produce a position finalization; refusing to clear the position claim"
+            );
+        };
+
+        let command = match finalization {
+            TerminalPositionFinalization::UnpricedFill { shares_filled } => anyhow::bail!(
+                "offchain order {offchain_order_id} for {symbol} has {shares_filled} filled \
+                 shares without an average price; refusing to clear the position claim"
+            ),
+            finalization => {
+                let Some(command) =
+                    position_command_for_finalization(finalization, offchain_order_id)
+                else {
+                    anyhow::bail!(
+                        "offchain order {offchain_order_id} for {symbol} could not be mapped to a \
+                         position finalization command; refusing to clear the position claim"
+                    );
+                };
+                command
+            }
+        };
+
+        position_store.send(symbol, command).await?;
+        Ok(HedgeDisposition::Finalized)
+    }
+}
+
 pub mod rebalancing {
     pub use crate::rebalancing::to_wrapped_equities;
 
