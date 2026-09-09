@@ -780,7 +780,7 @@ mod tests {
     /// job's `perform` can be tested without broker/onchain setup.
     struct RecordingResume {
         outcome: ResumeOutcome,
-        captured: Mutex<Option<(IssuerRequestId, Symbol, FractionalShares)>>,
+        captured: Mutex<Option<(IssuerRequestId, Symbol, Chain, FractionalShares)>>,
     }
 
     enum ResumeOutcome {
@@ -818,11 +818,11 @@ mod tests {
             &self,
             issuer_request_id: &IssuerRequestId,
             symbol: &Symbol,
-            _chain: Chain,
+            chain: Chain,
             quantity: FractionalShares,
         ) -> Result<(), MintTransferError> {
             *self.captured.lock().unwrap() =
-                Some((issuer_request_id.clone(), symbol.clone(), quantity));
+                Some((issuer_request_id.clone(), symbol.clone(), chain, quantity));
             match self.outcome {
                 ResumeOutcome::Success => Ok(()),
                 ResumeOutcome::PreReceipt => {
@@ -1090,7 +1090,7 @@ mod tests {
         let stub = Arc::new(RecordingResume::success());
         let ctx = test_ctx(Arc::clone(&stub) as Arc<dyn ResumeEquityToMarketMaking>).await;
         let job = TransferEquityToMarketMaking {
-            chain: Chain::Base,
+            chain: Chain::Ethereum,
             issuer_request_id: issuer_request_id("mint-forward"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
@@ -1102,10 +1102,11 @@ mod tests {
         Job::perform(&job, &ctx).await.unwrap();
 
         let captured = stub.captured.lock().unwrap().take();
-        let (issuer_request_id, symbol, quantity) =
+        let (issuer_request_id, symbol, chain, quantity) =
             captured.expect("perform must call resume_equity_to_market_making");
         assert_eq!(issuer_request_id, job.issuer_request_id);
         assert_eq!(symbol, job.symbol);
+        assert_eq!(chain, job.chain);
         assert_eq!(quantity, job.quantity);
     }
 
@@ -1893,7 +1894,7 @@ mod tests {
     /// Records the redemption resume call and returns a configurable outcome.
     struct RecordingRedemptionResume {
         fail: bool,
-        captured: Mutex<Option<(RedemptionAggregateId, Symbol, FractionalShares)>>,
+        captured: Mutex<Option<(RedemptionAggregateId, Symbol, Chain, FractionalShares)>>,
     }
 
     struct GasReadinessFailureRedemptionResume(Duration);
@@ -1959,10 +1960,11 @@ mod tests {
             &self,
             aggregate_id: &RedemptionAggregateId,
             symbol: &Symbol,
-            _chain: Chain,
+            chain: Chain,
             quantity: FractionalShares,
         ) -> Result<(), RedemptionError> {
-            *self.captured.lock().unwrap() = Some((aggregate_id.clone(), symbol.clone(), quantity));
+            *self.captured.lock().unwrap() =
+                Some((aggregate_id.clone(), symbol.clone(), chain, quantity));
 
             if self.fail {
                 Err(RedemptionError::EntityNotFound {
@@ -2120,7 +2122,7 @@ mod tests {
         });
         let ctx = redemption_test_ctx(stub.clone(), hedging_test_job_queue().await).await;
         let job = TransferEquityToHedging {
-            chain: Chain::Base,
+            chain: Chain::Ethereum,
             aggregate_id: redemption_aggregate_id("redeem-forward"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
@@ -2131,10 +2133,11 @@ mod tests {
         Job::perform(&job, &ctx).await.unwrap();
 
         let captured = stub.captured.lock().unwrap().take();
-        let (aggregate_id, symbol, quantity) =
+        let (aggregate_id, symbol, chain, quantity) =
             captured.expect("perform must call resume_equity_to_hedging");
         assert_eq!(aggregate_id, job.aggregate_id);
         assert_eq!(symbol, job.symbol);
+        assert_eq!(chain, job.chain);
         assert_eq!(quantity, job.quantity);
     }
 
