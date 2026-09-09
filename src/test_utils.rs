@@ -38,7 +38,7 @@ use crate::onchain_trade::OnChainTradeSource;
 #[cfg(test)]
 const MAX_CONCURRENT_TEST_ANVILS: usize = 4;
 
-/// Shared `order_polling_interval` equivalent for tests.
+/// Shared `order_polling_interval_secs` equivalent for tests.
 ///
 /// Tests use a
 /// realistic-but-arbitrary poll interval (e.g. to derive a staleness bound or

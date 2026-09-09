@@ -350,7 +350,7 @@ where
 
     let inventory_monitor = InventoryMonitor {
         poller: polling_service,
-        interval: std::time::Duration::from_secs(context.ctx.inventory_poll_interval),
+        interval: std::time::Duration::from_secs(context.ctx.inventory_poll_interval_secs),
     };
 
     // Build the gas monitors before `context.provider` is consumed by the
@@ -451,7 +451,7 @@ where
         poll_status_queue: poll_status_queue.clone(),
         ctx: context.ctx.clone(),
         pool: context.pool.clone(),
-        check_interval: std::time::Duration::from_secs(context.ctx.position_check_interval),
+        check_interval: std::time::Duration::from_secs(context.ctx.position_check_interval_secs),
         close_flatten_policy,
         close_flatten_ramp,
         poll_interval,

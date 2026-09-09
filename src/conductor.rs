@@ -984,7 +984,7 @@ impl Conductor {
                 mint_store: mint_store.clone(),
                 redemption_store: redemption_store.clone(),
                 inventory: inventory.clone(),
-                inventory_poll_interval: Duration::from_secs(ctx.inventory_poll_interval),
+                inventory_poll_interval: Duration::from_secs(ctx.inventory_poll_interval_secs),
             },
             &frameworks.offchain_order_projection,
             executor.to_supported_executor(),

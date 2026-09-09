@@ -185,7 +185,7 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
             },
             cash: cash_reserved.map(|reserved| CashHedgePolicy { reserved }),
         })
-        .inventory_poll_interval(15)
+        .inventory_poll_interval_secs(15)
         .server_port(server_port)
         .board_port(board_port)
         .maybe_rest_api(
