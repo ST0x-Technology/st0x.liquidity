@@ -3556,10 +3556,11 @@ mod tests {
         let wrapped_token = Address::random();
         let underlying_token = Address::random();
 
+        let tokenizer = Arc::new(MockTokenizer::new());
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
             vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
+            tokenizer: tokenizer.clone(),
             wrapper: Arc::new(MockWrapper::new().with_tokenized_shares(underlying_token)),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
             mint_authorizer: ConfiguredMintAuthorizer::Disabled,
@@ -3624,6 +3625,16 @@ mod tests {
         assert_eq!(
             token, underlying_token,
             "SendTokens should use the underlying token, not the wrapped token"
+        );
+
+        assert_eq!(
+            tokenizer
+                .send_for_redemption_calls()
+                .into_iter()
+                .map(UnwrappedToken::address)
+                .collect::<Vec<_>>(),
+            vec![underlying_token],
+            "the issuer transfer should receive the underlying token, not the wrapped token"
         );
     }
 
