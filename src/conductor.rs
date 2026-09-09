@@ -37,7 +37,7 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 
 use st0x_config::{
-    AlertsCtx, BrokerCtx, ChainAssets, Ctx, CtxError, ExecutionThreshold, HedgingAssets,
+    AlertsCtx, BrokerCtx, ChainAssets, ChainRole, Ctx, CtxError, ExecutionThreshold, HedgingAssets,
     InventoryMode, IssuanceStatusCtx, OnchainWalletCtx, OperationMode, OrchestratorAddresses,
     RebalancingCtx, TradingChain,
 };
@@ -1365,16 +1365,17 @@ fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Addr
         .collect()
 }
 
-/// The startup approval targets of every watched chain, keyed by chain: each
-/// chain's enabled equities against its own orderbook, plus its canonical
-/// USDC. A watched chain this build pins no USDC for is refused rather than
-/// approving another chain's USDC address there.
+/// The startup approval targets of every watched chain, keyed by chain: its
+/// canonical USDC against its own orderbook, plus, where the chain rebalances
+/// equity, each enabled equity's wrap and deposit grants. A watched chain this
+/// build pins no USDC for is refused rather than approving another chain's
+/// USDC address there.
 fn startup_approval_targets(
     ctx: &Ctx,
 ) -> Result<BTreeMap<Chain, Vec<ApprovalTarget>>, StartupApprovalError> {
     ctx.chains
-        .watched()
-        .map(|watched| {
+        .watched_with_roles()
+        .map(|(role, watched)| {
             let chain = watched.chain;
             let usdc = chain
                 .usdc()
@@ -1382,17 +1383,18 @@ fn startup_approval_targets(
 
             Ok((
                 chain,
-                build_approval_targets(&watched.assets, watched.orderbook, usdc),
+                build_approval_targets(role, &watched.assets, watched.orderbook, usdc),
             ))
         })
         .collect()
 }
 
 /// Grants one-time idempotent MAX ERC20 approvals to the trusted spenders at
-/// startup, on every watched chain: each enabled equity's underlying -> wrapper
-/// vault and wrapped -> that chain's orderbook, plus that chain's USDC ->
-/// orderbook, submitted through that chain's wallet so confirmations and nonce
-/// handling match every other on-chain write there.
+/// startup, on every watched chain: that chain's USDC -> orderbook, and on the
+/// primary and every secondary that rebalances equity each enabled equity's
+/// underlying -> wrapper vault and wrapped -> that chain's orderbook, submitted
+/// through that chain's wallet so confirmations and nonce handling match every
+/// other on-chain write there.
 ///
 /// Skips entirely when no wallet is configured -- without one the bot never
 /// wraps or deposits, so it has no allowances to grant.
@@ -1767,23 +1769,13 @@ fn build_chain_tokenizations(
     wallet_ctx: &OnchainWalletCtx,
 ) -> anyhow::Result<WatchedChainTokenizations> {
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
-    let primary_chain = ctx.chains.primary().chain;
 
     ctx.chains
-        .watched()
-        .map(|watched| {
+        .watched_with_roles()
+        .map(|(role, watched)| {
             let chain = watched.chain;
             let wallet = chain_wallet(wallet_ctx, chain).clone();
-            let role = if chain == primary_chain {
-                ChainRole::Primary
-            } else {
-                ChainRole::Secondary
-            };
-            let rebalances_equity = match role {
-                ChainRole::Primary => true,
-                ChainRole::Secondary => watched.assets.rebalances_equity(),
-            };
-            let equity = if rebalances_equity {
+            let equity = if role.rebalances_equity(&watched.assets) {
                 EquityTokenization::Rebalancing(build_equity_tokenization_services(
                     ctx,
                     alpaca_auth,
@@ -2415,14 +2407,6 @@ struct TokenizationPreflightError {
     chain: Chain,
     #[source]
     source: WrapperError,
-}
-
-/// A watched chain's place in the registry, which sets how much of its asset
-/// table the tokenization preflight covers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChainRole {
-    Primary,
-    Secondary,
 }
 
 /// The equities a chain's tokenization preflight covers, in sorted order so

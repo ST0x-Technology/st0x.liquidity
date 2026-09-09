@@ -128,7 +128,12 @@ fn verify_watched_chains(
         let usdc = chain
             .usdc()
             .ok_or(ChainCoverageError::UsdcNotPinned { chain })?;
-        let targets = build_approval_targets(&chain_inputs.assets, chain_inputs.orderbook, usdc);
+        let targets = build_approval_targets(
+            chain_inputs.role,
+            &chain_inputs.assets,
+            chain_inputs.orderbook,
+            usdc,
+        );
         let context = ApprovalPolicyContext {
             user_id: &snapshot.user_id,
             user_tags: &snapshot.user_tags,
@@ -487,7 +492,7 @@ mod tests {
     use alloy::primitives::address;
     use std::collections::HashMap;
 
-    use st0x_config::{ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
+    use st0x_config::{ChainAssets, ChainEquities, ChainEquityAsset, ChainRole, OperationMode};
     use st0x_evm::USDC_ETHEREUM;
     use st0x_evm::turnkey::{TurnkeyPolicy, TurnkeyPolicyEffect, TurnkeyPolicySnapshot};
 
@@ -892,12 +897,13 @@ mod tests {
         }
     }
 
-    /// One watched chain listing AAPL: underlying 0x11.. wraps into vault
-    /// 0x22.., which deposits into orderbook 0x33.. -- the same addresses
-    /// the policy fixtures above name.
-    fn chain_inputs(chain: Chain) -> ChainApprovalInputs {
+    /// One watched chain listing a trading-only AAPL: underlying 0x11..
+    /// wraps into vault 0x22.., which deposits into orderbook 0x33.. -- the
+    /// same addresses the policy fixtures above name.
+    fn chain_inputs(chain: Chain, role: ChainRole) -> ChainApprovalInputs {
         ChainApprovalInputs {
             chain,
+            role,
             orderbook: address!("0x3333333333333333333333333333333333333333"),
             assets: ChainAssets {
                 equities: ChainEquities {
@@ -926,8 +932,9 @@ mod tests {
 
     /// Each watched chain's targets are checked on that chain's own id: a
     /// policy pinned to Base's chain id covers Base's three targets and
-    /// refuses an Ethereum trading table outright, naming the chain and
-    /// listing Ethereum's own USDC among the uncovered targets.
+    /// refuses an Ethereum trading table outright, naming the chain. The
+    /// hedge-only secondary's one uncovered target is Ethereum's own USDC:
+    /// its trading-only AAPL has no wrapper there to approve.
     #[test]
     fn watched_chain_targets_are_checked_on_their_own_chain_id() {
         let policies = snapshot(vec![tag_allow(
@@ -937,12 +944,19 @@ mod tests {
         )]);
         let wallet_address = address!("0x52908400098527886E0F7030069857D2E4169EE7");
 
-        let covered =
-            verify_watched_chains(&[chain_inputs(Chain::Base)], &policies, wallet_address).unwrap();
+        let covered = verify_watched_chains(
+            &[chain_inputs(Chain::Base, ChainRole::Primary)],
+            &policies,
+            wallet_address,
+        )
+        .unwrap();
         assert_eq!(covered, 3);
 
         let error = verify_watched_chains(
-            &[chain_inputs(Chain::Base), chain_inputs(Chain::Ethereum)],
+            &[
+                chain_inputs(Chain::Base, ChainRole::Primary),
+                chain_inputs(Chain::Ethereum, ChainRole::Secondary),
+            ],
             &policies,
             wallet_address,
         )
@@ -952,13 +966,14 @@ mod tests {
             panic!("an uncovered chain must fail as missing coverage, got: {error}");
         };
         assert_eq!(missing.chain, Chain::Ethereum);
-        assert_eq!(missing.missing.len(), 3);
-        assert!(
+        assert_eq!(
             missing
                 .missing
                 .iter()
-                .any(|target| target.token == USDC_ETHEREUM),
-            "Ethereum's uncovered targets must name Ethereum's USDC, not Base's"
+                .map(|target| (target.token, target.purpose))
+                .collect::<Vec<_>>(),
+            vec![(USDC_ETHEREUM, ApprovalPurpose::DepositUsdc)],
+            "Ethereum's uncovered target must be Ethereum's own USDC, not Base's"
         );
     }
 
@@ -967,7 +982,7 @@ mod tests {
     #[test]
     fn watched_chain_without_pinned_usdc_fails_the_gate_closed() {
         let error = verify_watched_chains(
-            &[chain_inputs(Chain::HyperEvm)],
+            &[chain_inputs(Chain::HyperEvm, ChainRole::Secondary)],
             &snapshot(vec![allow(None)]),
             address!("0x52908400098527886E0F7030069857D2E4169EE7"),
         )

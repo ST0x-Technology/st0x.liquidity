@@ -22,7 +22,7 @@ use std::future::Future;
 use alloy::primitives::{Address, TxHash, U256};
 use futures_util::{StreamExt, TryStreamExt, stream};
 
-use st0x_config::ChainAssets;
+use st0x_config::{ChainAssets, ChainRole};
 use st0x_evm::{Chain, IERC20, OpenChainErrorRegistry, Wallet};
 use st0x_execution::Symbol;
 
@@ -134,23 +134,30 @@ pub(crate) enum StartupApprovalError {
     },
 }
 
-/// Builds the deterministic list of startup approval targets: for every equity
-/// with trading or rebalancing enabled, the two wrap/deposit grants, plus the
-/// single USDC grant.
+/// Builds the deterministic list of startup approval targets: on a chain that
+/// rebalances equity, the two wrap/deposit grants of every equity with trading
+/// or rebalancing enabled, then on every chain the single USDC grant. A
+/// hedge-only secondary has no wrapper to approve, so it gets the USDC grant
+/// alone.
 pub(crate) fn build_approval_targets(
+    role: ChainRole,
     assets: &ChainAssets,
     orderbook: Address,
     usdc: Address,
 ) -> Vec<ApprovalTarget> {
     let mut targets = Vec::new();
-    let mut enabled_equities = assets
-        .equities
-        .symbols
-        .iter()
-        .filter(|(symbol, _)| {
-            assets.is_trading_enabled(symbol) || assets.is_rebalancing_enabled(symbol)
-        })
-        .collect::<Vec<_>>();
+    let mut enabled_equities = if role.rebalances_equity(assets) {
+        assets
+            .equities
+            .symbols
+            .iter()
+            .filter(|(symbol, _)| {
+                assets.is_trading_enabled(symbol) || assets.is_rebalancing_enabled(symbol)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     enabled_equities.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
 
     for (symbol, config) in enabled_equities {
@@ -539,7 +546,7 @@ mod tests {
             ),
         )]);
 
-        let targets = build_approval_targets(&assets, orderbook, usdc);
+        let targets = build_approval_targets(ChainRole::Primary, &assets, orderbook, usdc);
 
         assert_eq!(
             targets,
@@ -562,6 +569,69 @@ mod tests {
                     symbol: None,
                     purpose: ApprovalPurpose::DepositUsdc,
                 },
+            ]
+        );
+    }
+
+    /// A secondary that rebalances no equity has no wrapper to approve: its
+    /// trading-enabled equity gets no wrap or deposit grant and only the USDC
+    /// grant remains, where the same table on the primary keeps all three.
+    #[test]
+    fn build_targets_keep_only_usdc_on_a_hedge_only_secondary() {
+        let orderbook = Address::random();
+        let usdc = Address::random();
+        let assets = assets_with([(
+            "AAPL",
+            equity_asset(
+                Address::random(),
+                Address::random(),
+                OperationMode::Enabled,
+                OperationMode::Disabled,
+            ),
+        )]);
+
+        let targets = build_approval_targets(ChainRole::Secondary, &assets, orderbook, usdc);
+
+        assert_eq!(
+            targets,
+            vec![ApprovalTarget {
+                token: usdc,
+                spender: orderbook,
+                symbol: None,
+                purpose: ApprovalPurpose::DepositUsdc,
+            }]
+        );
+    }
+
+    /// A secondary with an equity that opts into rebalancing carries the
+    /// wrapper, so its grants are targeted there as they are on the primary.
+    #[test]
+    fn build_targets_keep_equity_grants_on_a_rebalancing_secondary() {
+        let underlying = Address::random();
+        let derivative = Address::random();
+        let orderbook = Address::random();
+        let usdc = Address::random();
+        let assets = assets_with([(
+            "AAPL",
+            equity_asset(
+                underlying,
+                derivative,
+                OperationMode::Disabled,
+                OperationMode::Enabled,
+            ),
+        )]);
+
+        let targets = build_approval_targets(ChainRole::Secondary, &assets, orderbook, usdc);
+
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| (target.token, target.spender, target.purpose))
+                .collect::<Vec<_>>(),
+            vec![
+                (underlying, derivative, ApprovalPurpose::WrapUnderlying),
+                (derivative, orderbook, ApprovalPurpose::DepositWrappedEquity),
+                (usdc, orderbook, ApprovalPurpose::DepositUsdc),
             ]
         );
     }
@@ -604,7 +674,7 @@ mod tests {
             ),
         ]);
 
-        let targets = build_approval_targets(&assets, orderbook, usdc);
+        let targets = build_approval_targets(ChainRole::Primary, &assets, orderbook, usdc);
 
         assert_eq!(targets.len(), 5);
         assert_eq!(targets[0].symbol.as_ref().unwrap().as_str(), "AAPL");

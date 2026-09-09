@@ -636,6 +636,28 @@ fn enabled_chains(
     })
 }
 
+/// A watched chain's place in the registry: THE primary, which always carries
+/// the equity-rebalancing wiring, or a secondary, which carries it only when
+/// one of its equities opts into rebalancing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainRole {
+    Primary,
+    Secondary,
+}
+
+impl ChainRole {
+    /// Whether a chain in this role rebalances equity on `assets`, and so
+    /// needs a wrapper vault, issuer client, redemption wallet and the equity
+    /// MAX approvals there. The primary always does; a secondary only when one
+    /// of its equities opts in.
+    pub fn rebalances_equity(self, assets: &ChainAssets) -> bool {
+        match self {
+            Self::Primary => true,
+            Self::Secondary => assets.rebalances_equity(),
+        }
+    }
+}
+
 impl ChainRegistry {
     /// Pairs each configured chain with its secrets entry.
     ///
@@ -736,7 +758,16 @@ impl ChainRegistry {
     /// Every watched chain (primary first, then secondaries): the chains a
     /// fill watcher runs against.
     pub fn watched(&self) -> impl Iterator<Item = &TradingChain> {
-        std::iter::once(&self.primary).chain(self.secondary.values())
+        self.watched_with_roles().map(|(_, watched)| watched)
+    }
+
+    /// Every watched chain tagged with its [`ChainRole`], primary first.
+    pub fn watched_with_roles(&self) -> impl Iterator<Item = (ChainRole, &TradingChain)> {
+        std::iter::once((ChainRole::Primary, &self.primary)).chain(
+            self.secondary
+                .values()
+                .map(|secondary| (ChainRole::Secondary, secondary)),
+        )
     }
 
     /// The watched chain with this id, if any.
@@ -801,14 +832,65 @@ impl ChainRegistry {
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;
+    use std::collections::HashMap;
 
     use st0x_execution::Symbol;
 
     use super::*;
+    use crate::assets::{ChainEquities, ChainEquityAsset, OperationMode};
 
     #[derive(Debug, Deserialize)]
     struct CutoffWrapper {
         ingestion_cutoff: IngestionCutoffTag,
+    }
+
+    /// The primary carries the equity leg whatever its table says; a
+    /// secondary only when one of its equities opts into rebalancing.
+    #[test]
+    fn role_rebalances_equity_on_the_primary_and_on_an_opted_in_secondary() {
+        let hedge_only = ChainAssets::default();
+        let rebalancing = ChainAssets {
+            equities: ChainEquities {
+                symbols: HashMap::from([(
+                    Symbol::new("AAPL").unwrap(),
+                    ChainEquityAsset {
+                        tokenized_equity: Address::repeat_byte(0xa5),
+                        tokenized_equity_derivative: Address::repeat_byte(0xa6),
+                        vault_ids: Vec::new(),
+                        trading: OperationMode::Disabled,
+                        rebalancing: OperationMode::Enabled,
+                        wrapped_equity_recovery: OperationMode::Disabled,
+                        operational_limit: None,
+                    },
+                )]),
+                operational_limit: None,
+            },
+            cash: None,
+        };
+
+        assert!(ChainRole::Primary.rebalances_equity(&hedge_only));
+        assert!(ChainRole::Primary.rebalances_equity(&rebalancing));
+        assert!(!ChainRole::Secondary.rebalances_equity(&hedge_only));
+        assert!(ChainRole::Secondary.rebalances_equity(&rebalancing));
+    }
+
+    /// Watched chains come primary first, each tagged with its role.
+    #[test]
+    fn watched_with_roles_tags_the_primary_and_each_secondary() {
+        let mut chains =
+            ChainRegistry::single_trading_chain(TradingChain::test().chain(Chain::Base).call());
+        chains.insert_secondary(TradingChain::test().chain(Chain::Ethereum).call());
+
+        assert_eq!(
+            chains
+                .watched_with_roles()
+                .map(|(role, watched)| (role, watched.chain))
+                .collect::<Vec<_>>(),
+            vec![
+                (ChainRole::Primary, Chain::Base),
+                (ChainRole::Secondary, Chain::Ethereum),
+            ]
+        );
     }
 
     /// The confirmations mode needs its companion depth and produces the
