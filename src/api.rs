@@ -26,7 +26,9 @@ use st0x_dto::{
     EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, Trade,
     TradingVenue,
 };
-use st0x_event_sorcery::{StoreBuilder, load_entity, send_command};
+use st0x_event_sorcery::{
+    AggregateError, EventSourced, SendError, StoreBuilder, load_entity, send_command,
+};
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
 use st0x_execution::{AlpacaWalletError, Symbol};
 use st0x_finance::FractionalShares;
@@ -2066,9 +2068,35 @@ fn ops_store_error(error: impl std::fmt::Display) -> (StatusCode, Json<ErrorResp
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse {
-            error: format!("{error}"),
+            error: "Operator write command failed".to_string(),
         }),
     )
+}
+
+/// Maps an aggregate command failure: a caller-visible state conflict (the
+/// aggregate rejected the command, or its version advanced between the
+/// handler's state check and the send) to `409`, and an infrastructure failure
+/// to the generic `500`.
+fn ops_command_error<Entity: EventSourced>(
+    error: SendError<Entity>,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        AggregateError::UserError(reason) => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("{reason}"),
+            }),
+        ),
+        AggregateError::AggregateConflict => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "Transfer state changed concurrently; reload and retry".to_string(),
+            }),
+        ),
+        infra @ (AggregateError::DatabaseConnectionError(_)
+        | AggregateError::DeserializationError(_)
+        | AggregateError::UnexpectedError(_)) => ops_store_error(infra),
+    }
 }
 
 /// Reconciles a USDC rebalance stranded in a post-burn terminal failure to the
@@ -2123,7 +2151,7 @@ async fn reconcile_usdc_transfer(
             UsdcRebalanceCommand::ReconcileStuckRebalance { reason },
         )
         .await
-        .map_err(ops_store_error)?;
+        .map_err(ops_command_error)?;
 
     info!(%id, ?reason, "USDC transfer reconciled via API");
     Ok(Json(UsdcTransferOpResponse {
@@ -2195,7 +2223,7 @@ async fn clear_pending_usdc_burn(
     store
         .send(&id, UsdcRebalanceCommand::ClearPendingBurn)
         .await
-        .map_err(ops_store_error)?;
+        .map_err(ops_command_error)?;
 
     info!(%id, reason = %request.reason, "USDC pending burn cleared via API");
     Ok(Json(UsdcTransferOpResponse {
@@ -2281,7 +2309,7 @@ async fn reconcile_equity_transfer(
                 services,
             )
             .await
-            .map_err(ops_store_error)?;
+            .map_err(ops_command_error)?;
         }
         TransferKind::EquityRedemption => {
             let redemption_id: RedemptionAggregateId = id.parse().map_err(|error| {
@@ -2321,7 +2349,7 @@ async fn reconcile_equity_transfer(
                 services,
             )
             .await
-            .map_err(ops_store_error)?;
+            .map_err(ops_command_error)?;
         }
         TransferKind::UsdcBridge => {
             return Err((
@@ -5553,8 +5581,11 @@ mod tests {
                 "POST",
                 "/liquidity-write/transfers/usdc/x/clear-pending-burn",
             ),
-            ("POST", "/liquidity-write/transfers/mint/x/reconcile"),
-            ("POST", "/liquidity-write/transfers/redemption/x/reconcile"),
+            ("POST", "/liquidity-write/transfers/equity_mint/x/reconcile"),
+            (
+                "POST",
+                "/liquidity-write/transfers/equity_redemption/x/reconcile",
+            ),
         ] {
             let response = app
                 .clone()
@@ -5595,8 +5626,11 @@ mod tests {
                 "POST",
                 "/liquidity-write/transfers/usdc/x/clear-pending-burn",
             ),
-            ("POST", "/liquidity-write/transfers/mint/x/reconcile"),
-            ("POST", "/liquidity-write/transfers/redemption/x/reconcile"),
+            ("POST", "/liquidity-write/transfers/equity_mint/x/reconcile"),
+            (
+                "POST",
+                "/liquidity-write/transfers/equity_redemption/x/reconcile",
+            ),
         ] {
             let response = app
                 .clone()
