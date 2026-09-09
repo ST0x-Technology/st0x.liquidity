@@ -3235,6 +3235,53 @@ mod tests {
         );
     }
 
+    /// Only a mint resumes by id: `to-alpaca` always starts a fresh
+    /// redemption, so a recorded Ethereum mint id must not let one through on
+    /// a non-primary network.
+    #[tokio::test]
+    async fn transfer_equity_to_alpaca_ignores_a_mint_id_and_keeps_the_primary_only_rule() {
+        let ctx = create_alpaca_ctx_watching_ethereum();
+        let pool = setup_test_db().await;
+        let id = issuer_request_id("cli-redeem-with-ethereum-mint-id");
+
+        send_mint_command(
+            &pool,
+            &id,
+            TokenizedEquityMintCommand::RequestMint {
+                issuer_request_id: id.clone(),
+                symbol: Symbol::new("AAPL").unwrap(),
+                chain: Chain::Ethereum,
+                quantity: float!(10),
+                wallet: Address::ZERO,
+            },
+        )
+        .await;
+
+        let IssuerRequestId(uuid) = id;
+        let mut stdout = Vec::new();
+        let error = transfer_equity_command(
+            &mut stdout,
+            TransferEquity {
+                direction: TransferDirection::ToAlpaca,
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(10)),
+                issuer_request_id: Some(uuid),
+                redemption_wallet: None,
+                network: TokenizationNetwork::Ethereum,
+            },
+            &ctx,
+            &pool,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("ethereum") && error.contains("primary") && error.contains("base"),
+            "expected the refusal to name the chain and the primary, got: {error}"
+        );
+    }
+
     /// A resume continues the transfer the record describes. Naming another
     /// network would drive it against the wrong orderbook, wrapper and
     /// issuer wallet, so the recorded chain decides and a disagreement is
