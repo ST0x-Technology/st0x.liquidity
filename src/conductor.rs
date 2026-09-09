@@ -15630,6 +15630,85 @@ mod tests {
         ctx
     }
 
+    /// The tokenization sets startup builds for a Base primary and a
+    /// hedge-only Ethereum secondary, with the primary's wrapper supplied.
+    fn base_and_hedge_only_ethereum_tokenizations(
+        base_wrapper: MockWrapper,
+    ) -> BTreeMap<Chain, ChainTokenization<Arc<dyn Wallet<Provider = RootProvider>>>> {
+        BTreeMap::from([
+            (
+                Chain::Base,
+                ChainTokenization {
+                    chain: Chain::Base,
+                    role: ChainRole::Primary,
+                    wallet: st0x_evm::StubWallet::stub(Address::repeat_byte(0xb0)),
+                    equity: EquityTokenization::Rebalancing(EquityTokenizationServices {
+                        tokenizer: Arc::new(MockTokenizer::new()),
+                        wrapper: Arc::new(base_wrapper),
+                        mint_authorizer: ConfiguredMintAuthorizer::Enabled(Arc::new(
+                            MockMintAuthorizer,
+                        )),
+                        token_addresses: HashMap::new(),
+                    }),
+                },
+            ),
+            (
+                Chain::Ethereum,
+                ChainTokenization {
+                    chain: Chain::Ethereum,
+                    role: ChainRole::Secondary,
+                    wallet: st0x_evm::StubWallet::stub(Address::repeat_byte(0xe0)),
+                    equity: EquityTokenization::HedgeOnly,
+                },
+            ),
+        ])
+    }
+
+    /// Startup with a hedge-only Ethereum next to the Base primary: the
+    /// secondary is skipped with a log line and never asked about vault
+    /// modes, while the primary is still attested, so a primary vault that
+    /// disagrees with its config refuses startup naming Base.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn tokenization_preflight_skips_a_hedge_only_secondary_and_still_attests_the_primary() {
+        let ctx = ctx_with_base_and_ethereum_trading();
+        let underlying = Address::repeat_byte(0xa5);
+        let vault = Address::repeat_byte(0xa6);
+
+        let agreeing = MockWrapper::new()
+            .with_tokenized_shares(underlying)
+            .with_wrapped_token(vault)
+            .attesting_unwrapped_token(underlying);
+        preflight_tokenization(
+            &ctx,
+            &base_and_hedge_only_ethereum_tokenizations(agreeing),
+            &ScriptedVaultModeReader::MustNotBeAsked,
+        )
+        .await
+        .unwrap();
+
+        assert!(logs_contain(
+            "Skipping the tokenization preflight on a hedge-only chain"
+        ));
+        assert!(logs_contain("chain=ethereum"));
+
+        let disagreeing = MockWrapper::new()
+            .with_tokenized_shares(underlying)
+            .with_wrapped_token(vault)
+            .attesting_unwrapped_token(Address::repeat_byte(0xa7));
+        let error = preflight_tokenization(
+            &ctx,
+            &base_and_hedge_only_ethereum_tokenizations(disagreeing),
+            &ScriptedVaultModeReader::MustNotBeAsked,
+        )
+        .await
+        .unwrap_err()
+        .downcast::<TokenizationPreflightError>()
+        .unwrap();
+
+        assert_eq!(error.chain, Chain::Base);
+    }
+
     /// Mint and redemption services on one chain's mocks, for the startup
     /// recovery fixtures: they exercise which aggregates are resumed, not
     /// which chain's services drive them.
