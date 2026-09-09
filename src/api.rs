@@ -2042,7 +2042,7 @@ struct ClearPendingBurnRequest {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UsdcTransferOpResponse {
+struct TransferOpResponse {
     transfer_id: String,
     outcome: &'static str,
 }
@@ -2112,7 +2112,7 @@ async fn reconcile_usdc_transfer(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(request): Json<ReconcileUsdcRequest>,
-) -> Result<Json<UsdcTransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<TransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
     let id = parse_usdc_rebalance_id(&id)?;
     let reason = ReconcileReason::from(request.reason);
 
@@ -2154,7 +2154,7 @@ async fn reconcile_usdc_transfer(
         .map_err(ops_command_error)?;
 
     info!(%id, ?reason, "USDC transfer reconciled via API");
-    Ok(Json(UsdcTransferOpResponse {
+    Ok(Json(TransferOpResponse {
         transfer_id: id.to_string(),
         outcome: "reconciled",
     }))
@@ -2171,8 +2171,18 @@ async fn clear_pending_usdc_burn(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(request): Json<ClearPendingBurnRequest>,
-) -> Result<Json<UsdcTransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<TransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
     let id = parse_usdc_rebalance_id(&id)?;
+
+    let reason = request.reason.trim().to_owned();
+    if reason.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "reason is required".to_string(),
+            }),
+        ));
+    }
 
     let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(state.pool.clone())
         .build(())
@@ -2225,8 +2235,8 @@ async fn clear_pending_usdc_burn(
         .await
         .map_err(ops_command_error)?;
 
-    info!(%id, reason = %request.reason, "USDC pending burn cleared via API");
-    Ok(Json(UsdcTransferOpResponse {
+    info!(%id, %reason, "USDC pending burn cleared via API");
+    Ok(Json(TransferOpResponse {
         transfer_id: id.to_string(),
         outcome: "pending_burn_cleared",
     }))
@@ -2250,7 +2260,7 @@ async fn reconcile_equity_transfer(
     State(state): State<AppState>,
     Path((kind, id)): Path<(String, String)>,
     Json(request): Json<ReconcileEquityRequest>,
-) -> Result<Json<UsdcTransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<TransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
     let reason = request.reason.trim().to_owned();
     if reason.is_empty() {
         return Err((
@@ -2291,7 +2301,7 @@ async fn reconcile_equity_transfer(
                         }),
                     )
                 })?;
-            if !matches!(entity, TokenizedEquityMint::Failed { .. }) {
+            if !entity.is_failed() {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     Json(ErrorResponse {
@@ -2331,7 +2341,7 @@ async fn reconcile_equity_transfer(
                         }),
                     )
                 })?;
-            if !matches!(entity, EquityRedemption::Failed { .. }) {
+            if !entity.is_failed() {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     Json(ErrorResponse {
@@ -2364,7 +2374,7 @@ async fn reconcile_equity_transfer(
     }
 
     info!(%id, kind = %kind, "Equity transfer reconciled via API");
-    Ok(Json(UsdcTransferOpResponse {
+    Ok(Json(TransferOpResponse {
         transfer_id: id,
         outcome: "reconciled",
     }))
@@ -6302,6 +6312,30 @@ mod tests {
             Path(id.to_string()),
             Json(ClearPendingBurnRequest {
                 reason: "audit: nothing to clear".to_string(),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn clear_pending_usdc_burn_rejects_a_blank_reason() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        // A recorded pending burn would otherwise clear, so a 400 here proves
+        // the blank-reason guard fires before the state check.
+        seed_usdc_bridging_submitting(&state.pool, &id, true).await;
+
+        let resp = clear_pending_usdc_burn(
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(ClearPendingBurnRequest {
+                reason: "   ".to_string(),
             }),
         )
         .await;
