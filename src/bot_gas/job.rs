@@ -12,6 +12,8 @@
 
 use alloy::primitives::{Address, TxHash};
 use alloy::providers::{Provider, RootProvider};
+use alloy::rpc::types::TransactionReceipt;
+use alloy::serde::WithOtherFields;
 use alloy::transports::{RpcError, TransportErrorKind};
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
@@ -23,7 +25,9 @@ use st0x_evm::{Chain, Wallet};
 use st0x_finance::Symbol;
 
 use super::valuation::{EthUsdValuationError, read_eth_usd_price};
-use super::{BotGasCostError, BotGasCostLedger, BotGasOperationCategory, BotGasReceiptCost};
+use super::{
+    BotGasCostError, BotGasCostLedger, BotGasOperationCategory, BotGasReceiptCost, L1DataFeeWei,
+};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 
 /// Persistent job queue for [`RecordBotGasReceiptCost`].
@@ -241,6 +245,12 @@ pub(crate) struct RecordBotGasReceiptCostCtx {
 pub(crate) enum RecordBotGasReceiptCostError {
     #[error(transparent)]
     Rpc(#[from] RpcError<TransportErrorKind>),
+    #[error("receipt {tx_hash} on Base has no valid l1Fee")]
+    InvalidBaseL1Fee {
+        tx_hash: TxHash,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("invalid block timestamp {timestamp} on {chain:?}")]
     InvalidBlockTimestamp { chain: Chain, timestamp: u64 },
     #[error(transparent)]
@@ -306,19 +316,21 @@ impl Job<RecordBotGasReceiptCostCtx> for RecordBotGasReceiptCost {
         // yet (or is transiently unreachable), not a genuine failure --
         // redrive within the bounded budget rather than burn apalis's tiny
         // fixed retry budget in ~7 seconds.
-        let receipt = match provider.get_transaction_receipt(self.tx_hash).await {
-            Ok(Some(receipt)) => receipt,
-            Ok(None) => {
-                return self
-                    .redrive_or_dead_letter(ctx, "receipt not yet visible", None)
-                    .await;
-            }
-            Err(error) => {
-                return self
-                    .redrive_or_dead_letter(ctx, "receipt fetch RPC error", Some(&error))
-                    .await;
-            }
-        };
+        let (receipt, l1_data_fee_wei) =
+            match fetch_receipt(provider, self.chain, self.tx_hash).await {
+                Ok(Some(receipt)) => receipt,
+                Ok(None) => {
+                    return self
+                        .redrive_or_dead_letter(ctx, "receipt not yet visible", None)
+                        .await;
+                }
+                Err(RecordBotGasReceiptCostError::Rpc(error)) => {
+                    return self
+                        .redrive_or_dead_letter(ctx, "receipt fetch RPC error", Some(&error))
+                        .await;
+                }
+                Err(error) => return Err(error),
+            };
 
         // SPEC scopes recording to successful transactions ("a transaction
         // that mines but reverts is not recorded"). Every current enqueue
@@ -429,6 +441,7 @@ impl Job<RecordBotGasReceiptCostCtx> for RecordBotGasReceiptCost {
         // like any other error.
         let cost = BotGasReceiptCost::from_receipt(
             &receipt,
+            l1_data_fee_wei,
             bot_wallet,
             self.chain,
             self.category,
@@ -441,6 +454,60 @@ impl Job<RecordBotGasReceiptCostCtx> for RecordBotGasReceiptCost {
 
         Ok(())
     }
+}
+
+async fn fetch_receipt(
+    provider: &RootProvider,
+    chain: Chain,
+    tx_hash: TxHash,
+) -> Result<Option<(TransactionReceipt, L1DataFeeWei)>, RecordBotGasReceiptCostError> {
+    match chain {
+        Chain::Base => {
+            // The Ethereum network receipt type used by
+            // `get_transaction_receipt` discards OP-Stack extensions. Keep
+            // those fields long enough to decode Base's `l1Fee`.
+            let receipt: Option<WithOtherFields<TransactionReceipt>> = provider
+                .raw_request("eth_getTransactionReceipt".into(), (tx_hash,))
+                .await?;
+
+            receipt.map(decode_fetched_base_receipt).transpose()
+        }
+        Chain::Ethereum => provider
+            .get_transaction_receipt(tx_hash)
+            .await
+            .map(|receipt| receipt.map(|receipt| (receipt, L1DataFeeWei::ZERO)))
+            .map_err(Into::into),
+        Chain::HyperEvm => Err(RecordBotGasReceiptCostError::UnwiredChain { chain }),
+    }
+}
+
+fn decode_base_receipt(
+    receipt: WithOtherFields<TransactionReceipt>,
+) -> Result<(TransactionReceipt, L1DataFeeWei), RecordBotGasReceiptCostError> {
+    let tx_hash = receipt.transaction_hash;
+    let l1_data_fee_wei = receipt
+        .other
+        .try_get_deserialized("l1Fee")
+        .map_err(|source| RecordBotGasReceiptCostError::InvalidBaseL1Fee { tx_hash, source })?;
+
+    Ok((receipt.into_inner(), L1DataFeeWei(l1_data_fee_wei)))
+}
+
+fn decode_fetched_base_receipt(
+    receipt: WithOtherFields<TransactionReceipt>,
+) -> Result<(TransactionReceipt, L1DataFeeWei), RecordBotGasReceiptCostError> {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        if receipt.other.get_with("l1Fee", |_| ()).is_none() {
+            warn!(
+                tx_hash = %receipt.transaction_hash,
+                "test Base receipt has no OP-Stack l1Fee; treating the unsupported Anvil fee as zero"
+            );
+            return Ok((receipt.into_inner(), L1DataFeeWei::ZERO));
+        }
+    }
+
+    decode_base_receipt(receipt)
 }
 
 impl RecordBotGasReceiptCost {
@@ -644,6 +711,69 @@ mod tests {
         }
     }
 
+    fn base_receipt(receipt: TransactionReceipt) -> WithOtherFields<TransactionReceipt> {
+        let mut receipt = WithOtherFields::new(receipt);
+        receipt
+            .other
+            .insert_value("l1Fee".to_owned(), "0x3de80ee4")
+            .unwrap();
+        receipt
+    }
+
+    #[test]
+    fn decodes_l1_fee_from_real_base_mainnet_receipt_shape() {
+        let receipt: WithOtherFields<TransactionReceipt> =
+            serde_json::from_str(include_str!("fixtures/base_mainnet_receipt.json")).unwrap();
+
+        let (receipt, l1_data_fee_wei) = decode_base_receipt(receipt).unwrap();
+
+        assert_eq!(
+            receipt.transaction_hash,
+            "0x7d16d30b3d7f9df02e2de469696a194a9df459f6170e5f28ca546ac5cd64bab0"
+                .parse::<TxHash>()
+                .unwrap()
+        );
+        assert_eq!(l1_data_fee_wei, L1DataFeeWei(U256::from(1_038_618_340_u64)));
+    }
+
+    #[test]
+    fn rejects_base_receipt_without_l1_fee() {
+        let error =
+            decode_base_receipt(WithOtherFields::new(receipt(BOT_WALLET, Some(123)))).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RecordBotGasReceiptCostError::InvalidBaseL1Fee { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_base_receipt_with_malformed_l1_fee() {
+        let mut receipt = WithOtherFields::new(receipt(BOT_WALLET, Some(123)));
+        receipt
+            .other
+            .insert_value("l1Fee".to_owned(), "not-a-quantity")
+            .unwrap();
+
+        let error = decode_base_receipt(receipt).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RecordBotGasReceiptCostError::InvalidBaseL1Fee { .. }
+        ));
+    }
+
+    #[test]
+    fn test_receipt_decoder_treats_anvils_missing_l1_fee_as_zero() {
+        let receipt = receipt(BOT_WALLET, Some(123));
+
+        let (decoded, l1_data_fee_wei) =
+            decode_fetched_base_receipt(WithOtherFields::new(receipt.clone())).unwrap();
+
+        assert_eq!(decoded, receipt);
+        assert_eq!(l1_data_fee_wei, L1DataFeeWei::ZERO);
+    }
+
     /// A mined-but-reverted receipt: same shape as `receipt` except
     /// `status: false`.
     fn reverted_receipt(from: Address, block_number: Option<u64>) -> TransactionReceipt {
@@ -743,7 +873,7 @@ mod tests {
     }
 
     fn queue_happy_path_responses(asserter: &Asserter, occurred_at: DateTime<Utc>) {
-        asserter.push_success(&receipt(BOT_WALLET, Some(123)));
+        asserter.push_success(&base_receipt(receipt(BOT_WALLET, Some(123))));
         asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
         asserter.push_success(&encode_decimals_return(8));
         asserter.push_success(&encode_price_return(
@@ -757,7 +887,7 @@ mod tests {
     ) -> (RecordBotGasReceiptCostError, i64) {
         let occurred_at = Utc.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap();
         let asserter = Asserter::new();
-        asserter.push_success(&receipt(BOT_WALLET, Some(123)));
+        asserter.push_success(&base_receipt(receipt(BOT_WALLET, Some(123))));
         asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
         asserter.push_success(&encode_decimals_return(8));
         asserter.push_success(&price_response);
@@ -848,6 +978,10 @@ mod tests {
             .expect("cost should be recorded");
         assert_eq!(recorded.gas_used, 21_000);
         assert_eq!(
+            recorded.native_cost_wei,
+            U256::from(21_000_000_000_000_u128) + U256::from(1_038_618_340_u64)
+        );
+        assert_eq!(
             recorded.operation_category,
             BotGasOperationCategory::VaultDeposit
         );
@@ -858,7 +992,10 @@ mod tests {
     async fn non_bot_payer_is_terminal_not_skipped() {
         let occurred_at = Utc.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap();
         let asserter = Asserter::new();
-        asserter.push_success(&receipt(Address::repeat_byte(0x99), Some(123)));
+        asserter.push_success(&base_receipt(receipt(
+            Address::repeat_byte(0x99),
+            Some(123),
+        )));
         asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
         asserter.push_success(&encode_decimals_return(8));
         asserter.push_success(&encode_price_return(
@@ -895,7 +1032,10 @@ mod tests {
     #[tokio::test]
     async fn relayer_paid_cctp_mint_is_skipped_not_terminal() {
         let asserter = Asserter::new();
-        asserter.push_success(&receipt(Address::repeat_byte(0x99), Some(123)));
+        asserter.push_success(&base_receipt(receipt(
+            Address::repeat_byte(0x99),
+            Some(123),
+        )));
         let (ledger, store) = ledger_and_store().await;
         let ctx = ctx_with_asserter(&asserter, ledger).await;
 
@@ -928,7 +1068,7 @@ mod tests {
     #[tokio::test]
     async fn reverted_receipt_is_skipped_not_recorded() {
         let asserter = Asserter::new();
-        asserter.push_success(&reverted_receipt(BOT_WALLET, Some(123)));
+        asserter.push_success(&base_receipt(reverted_receipt(BOT_WALLET, Some(123))));
         let (ledger, store) = ledger_and_store().await;
         let ctx = ctx_with_asserter(&asserter, ledger).await;
 
@@ -980,7 +1120,7 @@ mod tests {
         let second_asserter = Asserter::new();
         let mut conflicting_receipt = receipt(BOT_WALLET, Some(123));
         conflicting_receipt.gas_used += 1;
-        second_asserter.push_success(&conflicting_receipt);
+        second_asserter.push_success(&base_receipt(conflicting_receipt));
         second_asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
         second_asserter.push_success(&encode_decimals_return(8));
         second_asserter.push_success(&encode_price_return(
@@ -1030,7 +1170,7 @@ mod tests {
             let mut realistic_receipt = receipt(BOT_WALLET, Some(123));
             realistic_receipt.gas_used = 150_000;
             realistic_receipt.effective_gas_price = 5_000_257;
-            asserter.push_success(&realistic_receipt);
+            asserter.push_success(&base_receipt(realistic_receipt));
             asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
             asserter.push_success(&encode_decimals_return(8));
             asserter.push_success(&encode_price_return(
@@ -1075,7 +1215,7 @@ mod tests {
     #[tokio::test]
     async fn missing_block_redrives_without_terminal_error() {
         let asserter = Asserter::new();
-        asserter.push_success(&receipt(BOT_WALLET, Some(123)));
+        asserter.push_success(&base_receipt(receipt(BOT_WALLET, Some(123))));
         asserter.push_success(&Option::<Block>::None);
         let (ledger, _store) = ledger_and_store().await;
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
@@ -1204,7 +1344,7 @@ mod tests {
         let asserter = Asserter::new();
         let mut receipt_without_hash = receipt(BOT_WALLET, Some(123));
         receipt_without_hash.block_hash = None;
-        asserter.push_success(&receipt_without_hash);
+        asserter.push_success(&base_receipt(receipt_without_hash));
         let (ledger, _store) = ledger_and_store().await;
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         let job_queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
@@ -1280,7 +1420,7 @@ mod tests {
     async fn unsupported_feed_decimals_dead_letter_without_redrive() {
         let occurred_at = Utc.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap();
         let asserter = Asserter::new();
-        asserter.push_success(&receipt(BOT_WALLET, Some(123)));
+        asserter.push_success(&base_receipt(receipt(BOT_WALLET, Some(123))));
         asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
         asserter.push_success(&encode_decimals_return(30));
         let (ledger, _store) = ledger_and_store().await;
@@ -1380,7 +1520,7 @@ mod tests {
     async fn rpc_error_reading_price_redrives_without_terminal_error() {
         let occurred_at = Utc.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap();
         let asserter = Asserter::new();
-        asserter.push_success(&receipt(BOT_WALLET, Some(123)));
+        asserter.push_success(&base_receipt(receipt(BOT_WALLET, Some(123))));
         asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
         asserter.push_failure_msg("eth_call decimals boom");
         let (ledger, _store) = ledger_and_store().await;
@@ -1414,7 +1554,7 @@ mod tests {
     #[tokio::test]
     async fn receipt_without_block_number_is_retryable() {
         let asserter = Asserter::new();
-        asserter.push_success(&receipt(BOT_WALLET, None));
+        asserter.push_success(&base_receipt(receipt(BOT_WALLET, None)));
         let (ledger, _store) = ledger_and_store().await;
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         let job_queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
@@ -1496,6 +1636,10 @@ mod tests {
             .unwrap()
             .expect("cost should be recorded");
         assert_eq!(recorded.eth_usd_price_block_number, Some(999));
+        assert_eq!(
+            recorded.native_cost_wei,
+            U256::from(21_000_000_000_000_u128)
+        );
     }
 
     /// Acceptance criterion: a cost recorded through the real
@@ -1534,7 +1678,7 @@ mod tests {
             .await
             .unwrap();
         assert!(latest_report.as_of_rowid > as_of_rowid_before_recording);
-        assert_eq!(latest_report.costs.bot_gas_usd, "0.042");
+        assert_eq!(latest_report.costs.bot_gas_usd, "0.04200208");
         assert_eq!(latest_report.cost_entries.len(), 1);
         assert_eq!(latest_report.cost_entries[0].category, "bot_gas");
         let bot_gas_coverage = latest_report
