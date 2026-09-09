@@ -338,6 +338,7 @@ mod tests {
         assert_eq!(cash.rebalancing, OperationMode::Disabled);
         assert_eq!(cash.vault_ids.len(), 1);
     }
+
     /// A chain rebalances equity when at least one listed equity opts in;
     /// trading flags and cash do not count, and an empty table does not.
     #[test]
