@@ -3475,6 +3475,82 @@ pub mod process_tx {
                 "successful broker submission must account the onchain fill exactly once"
             );
         }
+
+        /// A concurrent process-tx and a live trading tick both racing to hedge
+        /// the same symbol must place a single broker order. Both converge on the
+        /// same Position `PlaceOffChainOrder` gate under the shared
+        /// `counter_trade_submission` lock, so the loser is rejected before it
+        /// reaches the broker. The second concurrent placement stands in for the
+        /// live trading loop, which drives the identical gate and lock.
+        #[tokio::test]
+        async fn concurrent_process_tx_and_tick_place_one_hedge() {
+            let pool = setup_test_db().await;
+
+            let mut ctx = create_base_test_ctx();
+            ctx.chains
+                .sole_trading_mut()
+                .assets
+                .equities
+                .symbols
+                .insert(
+                    Symbol::new("AAPL").unwrap(),
+                    ChainEquityAsset {
+                        tokenized_equity: Address::ZERO,
+                        tokenized_equity_derivative: Address::ZERO,
+                        vault_ids: vec![],
+                        trading: OperationMode::Enabled,
+                        rebalancing: OperationMode::Disabled,
+                        wrapped_equity_recovery: OperationMode::Disabled,
+                        operational_limit: None,
+                    },
+                );
+
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(SucceedingOrderPlacer);
+
+            // Two distinct fills for the same symbol so both are accounted and
+            // both reach the hedge-placement path, rather than one deduping the
+            // other on fill identity.
+            let fill_a = onchain_trade_builder().with_block_number(10).build();
+            let fill_b = onchain_trade_builder()
+                .with_log_index(2)
+                .with_block_number(11)
+                .build();
+
+            // The one submission lock the conductor shares with every placement
+            // path; passing it to both calls is what serializes them.
+            let lock = Mutex::new(());
+
+            let (outcome_a, outcome_b) = tokio::join!(
+                process_found_trade(fill_a, &ctx, &pool, order_placer.clone(), Some(&lock)),
+                process_found_trade(fill_b, &ctx, &pool, order_placer.clone(), Some(&lock)),
+            );
+
+            // Exactly one path placed a hedge. The loser either observed the
+            // pending hedge (PendingHedgeInFlight / PlacementRejected) or lost the
+            // optimistic-concurrency race on the shared Position aggregate
+            // (aggregate conflict, retried upstream); never a second placement.
+            let placed = |result: &anyhow::Result<ProcessTxOutcome>| {
+                matches!(result, Ok(ProcessTxOutcome::HedgePlaced { .. }))
+            };
+            let placed_count = usize::from(placed(&outcome_a)) + usize::from(placed(&outcome_b));
+            assert_eq!(
+                placed_count, 1,
+                "exactly one concurrent path may place a hedge, got a={outcome_a:?}, b={outcome_b:?}"
+            );
+
+            // And the store holds exactly one offchain order: no double hedge.
+            let (order_count,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(DISTINCT aggregate_id) FROM events \
+                 WHERE event_type LIKE 'OffchainOrderEvent%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                order_count, 1,
+                "concurrent process-tx and tick must place exactly one hedge order, got {order_count}"
+            );
+        }
     }
 }
 
